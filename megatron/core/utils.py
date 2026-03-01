@@ -44,7 +44,9 @@ except ImportError:
     HAVE_TRITON = False
 
 from megatron.core import config
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from torch.distributed._tensor import DTensor
@@ -90,6 +92,7 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+_flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
 
@@ -154,7 +157,9 @@ def experimental_fn(introduced_with_version: str):
             PkgVersion(introduced_with_version).minor + max_lifetime
             < PkgVersion(mcore_version).minor
         ):
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "%s has reached end of life. Please migrate to a non-experimental function.",
                 func.__name__,
             )
@@ -219,7 +224,9 @@ def experimental_cls(introduced_with_version: str):
             PkgVersion(introduced_with_version).minor + max_lifetime
             < PkgVersion(mcore_version).minor
         ):
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "%s has reached end of life. Please migrate to a non-experimental function.",
                 cls.__name__,
             )
@@ -479,13 +486,42 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
-def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
-    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
-    if not is_causal_conv1d_min_version("1.5.3.post1"):
-        return False, "causal_conv1d >= 1.5.3.post1 is required"
-    elif not is_mamba_min_version("2.2.6.post3"):
-        return False, "mamba_ssm >= 2.2.6.post3 is required"
-    return True, None
+def get_flashinfer_version():
+    """Get flashinfer version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_flashinfer_version_str():
+        try:
+            import flashinfer
+        except ImportError:
+            return None
+
+        if hasattr(flashinfer, "__version__"):
+            return str(flashinfer.__version__)
+        else:
+            return version("flashinfer")
+
+    global _flashinfer_version
+    if _flashinfer_version is None:
+        if (flashinfer_version_str := get_flashinfer_version_str()) is not None:
+            _flashinfer_version = PkgVersion(flashinfer_version_str)
+    return _flashinfer_version
+
+
+def is_flashinfer_min_version(version, check_equality=True):
+    """Check if minimum version of `flashinfer` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if (flashinfer_version := get_flashinfer_version()) is None:
+        return False
+    if check_equality:
+        return flashinfer_version >= PkgVersion(version)
+    return flashinver_version > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -498,17 +534,6 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
-
-
-def deprecate_inference_params(inference_context, inference_params):
-    """Print warning for deprecated `inference_params`."""
-    if inference_context is None and inference_params is not None:
-        warnings.warn(
-            "`inference_params` renamed to `inference_context`, and will be "
-            "removed in `megatron-core` 0.13."
-        )
-        return inference_params
-    return inference_context
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
@@ -835,25 +860,6 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     std = sigma / math.sqrt(multiplier * num_layers)
 
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
-
-
-def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, write log on only one rank
-
-    Args:
-        logger (logging.Logger): The logger to write the logs
-
-        args (Tuple[Any]): All logging.Logger.log positional arguments
-
-        rank (int, optional): The rank to write on. Defaults to 0.
-
-        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
-    """
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == rank:
-            logger.log(*args, **kwargs)
-    else:
-        logger.log(*args, **kwargs)
 
 
 def log_on_each_pipeline_stage(
@@ -2099,7 +2105,8 @@ def get_thd_batch_on_this_cp_rank(
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     max_seqlen: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
 ):
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized
@@ -2115,12 +2122,8 @@ def get_thd_batch_on_this_cp_rank(
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
 
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+    cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
     if cp_size > 1:  # slice batch along sequence dimension for context parallelism
         assert tex is not None and is_te_min_version("1.10.0"), (
             "Please update Transformer Engine to >= 1.10 to use "
@@ -2186,7 +2189,7 @@ def get_batch_on_this_hybrid_cp_rank(
     if cp_group is not None and cp_group.size() > 1:
         # When using hybrid_context_parallel, each sub-sample of a packed sample is
         # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(batch, cp_group)
+        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
 
     return batch, packed_seq_params
 
@@ -2346,16 +2349,6 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def maybe_cat(a, b, dim=0, *, required=False):
-    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
-    xs = [t for t in (a, b) if t is not None]
-    if not xs:
-        if required:
-            raise ValueError("both tensors are None")
-        return None
-    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
-
-
 _ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
 
 
@@ -2372,6 +2365,11 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
@@ -2446,25 +2444,6 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
         return wrapper
 
     return _decorate if func is None else _decorate(func)
-
-
-def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
-    """Returns Mamba inference state config from the model if it is a hybrid model."""
-    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-        MambaInferenceStateConfig,
-    )
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
-
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-        return MambaInferenceStateConfig(
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
-        )
-    return None
 
 
 # ============================================================================
@@ -2601,3 +2580,43 @@ def experimental_api(func: Callable) -> Callable:
     """
     func._experimental_api = True
     return func
+
+
+def deprecate_args(
+    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
+):
+    """
+    Intercepts specific keyword arguments to raise a custom TypeError.
+
+    Args:
+        *deprecated_keys: Strings representing the argument names to block.
+        message: Custom error message string. Use {name} as a placeholder.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Check if any deprecated key is present in kwargs
+            found_deprecated = set(deprecated_keys) & set(kwargs.keys())
+
+            if found_deprecated:
+                bad_key = list(found_deprecated)[0]
+                raise TypeError(message.format(name=bad_key))
+
+            # Send args to the real function
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context

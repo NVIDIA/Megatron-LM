@@ -1,25 +1,20 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # API Guide
 
+API reference documentation for Megatron Core components.
+
 ```{toctree}
-:maxdepth: 2
+:maxdepth: 3
 
-models
-tensor_parallel
-context_parallel
-pipeline_parallel
-custom_fsdp
-fusions
-transformer
-moe
-dist_checkpointing
-dist_optimizer
-distributed
-datasets
-multi_latent_attention
-num_microbatches_calculator
-optimizer_param_scheduler
-optimizer_cpu_offload
-multi_token_prediction
-tokenizers
+models/index
+core/index
+internal/index
 ```
-

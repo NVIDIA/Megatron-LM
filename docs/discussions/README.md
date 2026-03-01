@@ -1,14 +1,17 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Megatron Discussions
 
 This directory contains in-depth guides, tutorials, and discussions about optimizing and using Megatron for various use cases.
 
 ## Available Guides
-
-### Performance Optimization
-
-- **[A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200](deepseek-v3-gb200-optimization/deepseek-v3-gb200-reproduce-guide.md)**
-  
-  A detailed guide on how to reproduce the DeepSeek-V3 pre-training performance on GB200, incluing the dockerfile, package requirements and training scripts.
 
 ### Training Guides
 

@@ -299,7 +299,11 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     expert_bias_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if hasattr(module, 'expert_bias'):
+            # Only update expert_bias if this module is in the training mode. There are special
+            # cases where only the student is in training mode but the teacher is in eval mode
+            # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
+            # to avoid updating teacher's expert_bias.
+            if hasattr(module, 'expert_bias') and module.training:
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
@@ -397,6 +401,7 @@ def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
@@ -439,7 +444,7 @@ def finalize_model_grads(
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
     for model_chunk in model:
-        model_chunk.finish_grad_sync()
+        model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 

@@ -18,22 +18,30 @@ Shape = Union[List[int], torch.Size]
 
 @dataclass
 class RankModuleInfo:
-    """Information about a rank in a module."""
+    """Information about a rank in a module.
 
-    # the stage of the current rank in the current module's pipeline.
-    pp_rank: int  # the stage of the current rank in the current module's pipeline
-    pp_size: int  # the number of ranks in the current module's pipeline
+    Attributes:
+        pp_rank: The stage index of the current rank within the module's pipeline.
+        pp_size: The total number of pipeline stages (ranks) in the module.
+        p2p_communicator: Intra-module point-to-point communicator.
+        bridge_comms_as_src_module: Bridge communicators for outgoing connections
+            from this module to downstream modules. One module may have multiple
+            bridge communicators if it has multiple outgoing connections.
+        bridge_comms_as_dest_module: Bridge communicators for incoming connections
+            to this module from upstream modules. One module may have multiple
+            bridge communicators if it has multiple incoming connections.
+        is_source_stage: True if this rank is at the absolute first stage in the
+            overall model (no incoming connections).
+        is_terminal_stage: True if this rank is at the absolute last stage in the
+            overall model (no outgoing connections).
+    """
+
+    pp_rank: int
+    pp_size: int
     p2p_communicator: Optional[P2PCommunicator]
-    # key is either the src or dst module name connected to the current module
-    # one module may have multiple bridge communicators if it has multiple
-    # incoming or outgoing connections.
     bridge_comms_as_src_module: Optional[List[BridgeCommunicator]]
     bridge_comms_as_dest_module: Optional[List[BridgeCommunicator]]
-    # the absolute first stage in the overall model
-    # no incoming connections
     is_source_stage: Optional[bool] = True
-    # the absolute last stage in the overall model
-    # no outgoing connections
     is_terminal_stage: Optional[bool] = True
 
 

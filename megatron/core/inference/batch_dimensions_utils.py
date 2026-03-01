@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.utils import get_pg_size
 
 
 @dataclass(order=True, frozen=True)
@@ -129,41 +129,75 @@ class InferenceBatchDimensions:
 
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
-        local_batch_dims, decode_only_cuda_graphs: bool
-    ) -> "InferenceBatchDimensions":
+        local_batch_dims,
+        strict: bool,
+        decode_only_cuda_graphs: bool,
+        explicit_chunked_prefill: bool,
+        ep_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
+
+        Args:
+            local_batch_dims: The local batch dimensions to adjust.
+            strict: Whether to use strict matching for batch dimensions.
+            decode_only_cuda_graphs: Whether CUDA graphs are only used for decode steps.
+            explicit_chunked_prefill: Whether chunked prefill is enabled with explicit requests
+            ep_group: Optional expert parallel process group. If None, uses global parallel state.
+                      When using different EP sizes for inference vs training, pass the
+                      inference EP group explicitly.
+
         Return:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with
-            adjusted dimensions.
+            adjusted dimensions, or None if eager mode should be used.
         """
-
-        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
-
-        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         # all reduce local work across expert model parallel group
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
-
         sync_tensor = torch.tensor(
-            [local_batch_dims.token_count, int(is_non_decode)],
+            [
+                local_batch_dims.token_count,
+                int(is_non_decode),
+                local_batch_dims.prefill_req_count,
+                local_batch_dims.decode_req_count,
+            ],
             dtype=torch.int32,
             device=torch.cuda.current_device(),
         )
-        torch.distributed.all_reduce(
-            sync_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_model_parallel_group
-        )
+
+        torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group)
+
         sync_tensor = sync_tensor.cpu()
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
-        if decode_only_cuda_graphs and is_any_ep_rank_in_non_decode:
+
+        # We force eager mode for scenarios where some ranks will run with CUDA graphs
+        # while others will not. Without this check, the all-to-all communication in the
+        # expert routing layer would pad up to the maximum capacity only for the ranks that
+        # are using CUDA graphs in this step, leading to a NCCL hang.
+        # This can happen in the following cases:
+        #   1. If we only allow decode CUDA graphs but some ranks are running non-decode batches
+        #   2. Some ranks are running explicit chunked prefill requests
+        #       (graphs are not recorded for batches with explicit chunked prefill requests)
+        if is_any_ep_rank_in_non_decode and (decode_only_cuda_graphs or explicit_chunked_prefill):
             return None  # indicate no match, run in eager mode
+
+        # If strict matching is enabled, we sync the request counts across EP ranks
+        # to ensure the graph captures the maximum needed capacity.
+        # TODO(ksanthanam): Add functional test for this scenario
+        adjusted_prefill_req_count = (
+            int(sync_tensor[2].item()) if strict else local_batch_dims.prefill_req_count
+        )
+        adjusted_decode_req_count = (
+            int(sync_tensor[3].item()) if strict else local_batch_dims.decode_req_count
+        )
 
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=int(sync_tensor[0].item()),
-            prefill_req_count=local_batch_dims.prefill_req_count,
-            decode_req_count=local_batch_dims.decode_req_count,
+            prefill_req_count=adjusted_prefill_req_count,
+            decode_req_count=adjusted_decode_req_count,
         )
         return adjusted_batch_dim
 
@@ -201,6 +235,25 @@ class CUDAGraphBatchDimensionBuilder:
             (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
             [1000, 752, 504, 256]
         """
+        if num_cuda_graphs == -1:
+            # automatically determine the number of CUDA graphs to
+            # capture based on the `max_requests` value
+            cuda_graph_token_counts = (
+                [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
+            )
+            # Align each entry to TP size
+            cuda_graph_token_counts = list(
+                dict.fromkeys(math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts)
+            )
+            # Clamp to max tokens
+            cuda_graph_token_counts = [
+                s for s in cuda_graph_token_counts if s <= cuda_graph_max_tokens
+            ]
+            if not cuda_graph_token_counts or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
+                cuda_graph_token_counts.append(cuda_graph_max_tokens)
+            cuda_graph_token_counts.reverse()
+            return cuda_graph_token_counts
+
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
         assert (
             cuda_graph_max_tokens > 0
@@ -306,7 +359,12 @@ class CUDAGraphBatchDimensionBuilder:
                 or cuda_graph_max_tokens <= 0
             ):
                 cuda_graph_max_tokens = max_tokens
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
+
+            if num_cuda_graphs != -1:
+                # if -1, no need to adjust. This will be taken care of in
+                # the _calculate_cuda_graph_token_counts function where we will generate
+                # the token counts based on the max_tokens value and the step size.
+                num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
             # Calculate token counts for prefill and mixed graphs.
             # These need the full cuda_graph_max_tokens to handle variable-length sequences.
@@ -400,6 +458,8 @@ class CUDAGraphBatchDimensionBuilder:
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
+        explicit_chunked_prefill: bool = False,
+        ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -412,6 +472,10 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs: Used by expert parallel matching. If this is true,
             and one of the EP ranks is running a non-decode step, we elect to run in
             eager mode instead of matching a decode-only cuda graph.
+            explicit_chunked_prefill: Whether chunked prefill is enabled with explicit requests
+            ep_group: Optional expert parallel process group. If None, uses global parallel state.
+                      When using different EP sizes for inference vs training, pass the
+                      inference EP group explicitly.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -421,13 +485,20 @@ class CUDAGraphBatchDimensionBuilder:
             return None
 
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-            real_batch_dim, decode_only_cuda_graphs
+            real_batch_dim,
+            strict=strict,
+            decode_only_cuda_graphs=decode_only_cuda_graphs,
+            explicit_chunked_prefill=explicit_chunked_prefill,
+            ep_group=ep_group,
         )
 
         if adjusted_batch_dim is None:
             # we hit this scenario if decode_only_cuda_graphs is true,
             # and one of the EP ranks is running a non-decode step
             # in that case, all ranks have to run in eager mode
+            return None
+
+        if explicit_chunked_prefill and real_batch_dim.prefill_req_count > 0:
             return None
 
         # first filter out batch dimensions with smaller token count, prefill req count,

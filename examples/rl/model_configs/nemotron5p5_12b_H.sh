@@ -65,7 +65,7 @@ MODEL_OPTIONS="\
   --calculate-per-token-loss \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --fp8-recipe blockwise \
   --fp8-format e4m3 \
@@ -137,6 +137,6 @@ MODEL_OPTIONS="\
     --straggler-minmax-count 16 \
     --check-weight-hash-across-dp-replicas-interval 20000 \
     --rerun-mode disabled \
-    --grpo-default-temperature 0.9 \
-    --grpo-default-top-p 0.95 \
+    --rl-default-temperature 0.9 \
+    --rl-default-top-p 0.95 \
   "

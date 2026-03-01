@@ -132,8 +132,8 @@ MODEL_ARGS:
     # Add checkpointing args
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --save-interval: 500
-  --save-retain-interval: 10000
+  --save-interval: 250
+  --save-retain-interval: 5000
   --dist-ckpt-strictness: log_all
 
   # Add initialization args
@@ -150,6 +150,7 @@ MODEL_ARGS:
   --logging-level: 40
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
 

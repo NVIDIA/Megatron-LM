@@ -56,20 +56,23 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         mtp_num_moe_layers = 0
         mtp_num_dense_layers = 0
 
+    # RMSNorm does not have bias, but LayerNorm has.
+    norm_size = 1 if args.normalization == "RMSNorm" else 2
+
     if args.multi_latent_attention:
         assert not args.group_query_attention
         if args.q_lora_rank is None:
             q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
         else:
             ## q lora + rope + q norm
-            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1) 
+            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + norm_size) 
         
         self_attn_term = (
             q_term
 
             ## kv lora + rope + kv norm
             + args.kv_lora_rank
-            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1)
+            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + norm_size)
             + args.hidden_size * args.qk_pos_emb_head_dim
 
             ## o proj
@@ -96,7 +99,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             # Dense MoE MLP.
             (args.ffn_hidden_size * gated_linear_multiplier)
             # Transformer layernorms.
-            + (2)
+            + norm_size
         )
         + self_attn_term
     )
@@ -109,12 +112,12 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             # Shared MoE MLP.
             + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
             # Transformer layernorms.
-            + (2)
+            + norm_size
         )
         + self_attn_term
     )
     embedding_size = args.hidden_size * args.padded_vocab_size
-    final_layernorm = 2 * args.hidden_size
+    final_layernorm = norm_size * args.hidden_size
     if args.untie_embeddings_and_output_weights:
         num_parameters_in_embedding_layers = 2 * embedding_size
     else:

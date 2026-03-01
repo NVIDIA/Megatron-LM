@@ -1,11 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import errno
 import faulthandler
 import logging
 import signal
+import socket
 from collections import deque
 from itertools import cycle
 from multiprocessing import Event
+from multiprocessing.connection import Connection
 
 import torch
 
@@ -65,7 +68,14 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    def __init__(self, inference_coordinator_port: int, data_parallel_size: int):
+    def __init__(
+        self,
+        pipe_connection: Connection,
+        data_parallel_size: int,
+        tokenizer,
+        inference_coordinator_port: int | None = None,
+        deterministic_mode: bool = False,
+    ):
         """
         Initializes the inference coordinator.
 
@@ -74,9 +84,11 @@ class DataParallelInferenceCoordinator:
         ranks to connect before proceeding.
 
         Args:
-            inference_coordinator_port (int): The TCP port number to bind the server to.
+            pipe_connection (Connection): A connecting pipe to the parent process.
             data_parallel_size (int): The number of TP-coordinator workers that are
                 expected to connect.
+            tokenizer: The tokenizer to use for prompt tokenization and detokenization.
+            inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -86,6 +98,8 @@ class DataParallelInferenceCoordinator:
             "please install the messagepack library to use DataParallelInferenceCoordinator\n"
             "pip install msgpack"
         )
+        self.pipe_connection = pipe_connection
+        self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
 
         # This is the central router socket
@@ -95,9 +109,33 @@ class DataParallelInferenceCoordinator:
         # 3. data parallel ranks return completed requests to this socket. We route them back to
         #    the user that had submitted the request originally.
 
+        # Get local IP.
+        local_ip = socket.gethostname()
+
         self.router_socket = self.context.socket(zmq.ROUTER)
-        self.router_socket.bind(f"tcp://0.0.0.0:{inference_coordinator_port}")
-        self.data_parallel_size = data_parallel_size
+        is_bound = False
+        if inference_coordinator_port is not None:
+            try:
+                self.router_socket.bind(f"tcp://{local_ip}:{inference_coordinator_port}")
+                is_bound = True
+            except zmq.error.ZMQError as e:
+                if e.errno == errno.EADDRINUSE:
+                    logging.warning(
+                        f"Port {inference_coordinator_port} is already in use. "
+                        "Binding to a random available port instead."
+                    )
+            except Exception:
+                logging.warning(
+                    f"Unknown error when binding to port {inference_coordinator_port}. "
+                    "Attempting to bind to a random available port instead."
+                )
+        if not is_bound:
+            self.router_socket.bind_to_random_port(f"tcp://{local_ip}")
+        self.addr = self.router_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+
+        # Send the address to the parent process.
+        self.pipe_connection.send(self.addr)
+        self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
@@ -108,6 +146,12 @@ class DataParallelInferenceCoordinator:
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
+
+        # In deterministic mode, sort identities for consistent scheduling order.
+        if deterministic_mode:
+            self.identities_of_data_parallel_ranks = deque(
+                sorted(self.identities_of_data_parallel_ranks)
+            )
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
         self.data_parallel_pause_acks = set()
         self.data_parallel_stop_acks = set()
@@ -116,6 +160,7 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
+        self.tokenizer = tokenizer
 
     def get_next_data_parallel_rank(self):
         """
@@ -200,6 +245,7 @@ class DataParallelInferenceCoordinator:
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
+                Headers.INCREMENT_STALENESS,
                 Headers.STOP,
             ]:
                 # control signals for the engine
@@ -261,6 +307,7 @@ class DataParallelInferenceCoordinator:
                 finished_request_records = deserialized_payload[1]
 
                 for finished_request_record in finished_request_records:
+                    self.detokenize(finished_request_record)
                     fid = finished_request_record["requests"][0]["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
@@ -280,9 +327,31 @@ class DataParallelInferenceCoordinator:
             else:
                 raise UnknownHeaderError(header)
 
+    def detokenize(self, finished_request_record):
+        """
+        Detokenizes the generated tokens in the finished request record.
+
+        This method uses the coordinator's tokenizer to convert the list of
+        generated token IDs back into human-readable text.
+
+        Args:
+            finished_request_record (dict): The record containing the generated
+                tokens to be detokenized. It is modified in place.
+        """
+        for request in finished_request_record["requests"]:
+            if request["prompt"] is None:
+                request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
+            request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
+
     @classmethod
     def entrypoint(
-        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int
+        cls,
+        pipe_connection: Connection,
+        ready_event: Event,
+        data_parallel_size: int,
+        tokenizer,
+        inference_coordinator_port: int | None = None,
+        deterministic_mode: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -291,12 +360,20 @@ class DataParallelInferenceCoordinator:
         that it is fully initialized and listening, and then starts the main event loop.
 
         Args:
+            pipe_connection (Connection): A connecting pipe to the parent process.
             ready_event (Event): A threading or multiprocessing event object that is set()
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
+            deterministic_mode (bool): Whether to enable deterministic scheduling.
         """
-        coordinator = cls(inference_coordinator_port, data_parallel_size)
+        coordinator = cls(
+            pipe_connection,
+            data_parallel_size,
+            tokenizer,
+            inference_coordinator_port,
+            deterministic_mode=deterministic_mode,
+        )
         ready_event.set()
         try:
             coordinator.start()

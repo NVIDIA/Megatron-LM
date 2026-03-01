@@ -599,7 +599,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 2,
+        thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):
@@ -658,12 +658,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+
+        sequential = False
+        if self.separation_hint is not None and self.thread_count <= 1:
+            self.thread_count = 2
+            sequential = True
+
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            sequential=sequential,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -697,8 +704,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer,
             None,
             coordinator,
+            # flatten_sharded_tensors=False: MCore doesn't use nested ShardedTensors (FSDP 2D),
+            # so skip the expensive traverse_state_dict copy in _flatten_sharded_tensors
             planner=MCoreSavePlanner(
-                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
+                dedup_replicated_tensors=not self.keep_only_main_replica,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
@@ -802,6 +813,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
         )
 

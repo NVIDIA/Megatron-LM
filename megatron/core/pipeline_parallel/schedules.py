@@ -9,7 +9,6 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -112,9 +111,9 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
     decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
         transformer. This is ignored for a single-stack transformer.
 
-    forward_only (optional, default = False): Perform only the forward step
+    forward_only (optional, default = False): Perform only the forward step.
 
-    collect_non_loss_data (optional, bool, default=False): TODO
+    collect_non_loss_data (optional, bool, default=False): TODO.
 
     first_val_step (bool, optional): Is the first step of the validation phase. Used by
         Transformer Engine modules to only update their fp8 weights only on the first validation
@@ -126,11 +125,17 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         respective list of shapes. Thus it is not used in the other forward-backward functions
         which have different shape handling.
 
+    force_all_reduce (bool, optional): If true, force use of all-reduce for gradient reduction
+        instead of reduce-scatter (if using distributed optimizer) in this iteration to ensure all
+        data-parallel ranks have fully reduced gradients. This is useful for easier wgrad saving
+        (can just inspect DP replica 0 to get full set of wgrads for entire model).
+
     Args:
         pp_size (Optional[int]): Pipeline model parallel size to use.
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
+
     """
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -207,7 +212,10 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                layer.transformer_layer.current_microbatch = microbatch_id
+                assert hasattr(
+                    layer, 'mtp_model_layer'
+                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
@@ -527,6 +535,7 @@ def forward_backward_no_pipelining(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
@@ -677,6 +686,7 @@ def forward_backward_no_pipelining(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     if not forward_only and config.fine_grained_activation_offloading:
@@ -965,6 +975,7 @@ def forward_backward_pipelining_with_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1003,10 +1014,6 @@ def forward_backward_pipelining_with_interleaving(
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
@@ -2044,6 +2051,7 @@ def forward_backward_pipelining_with_interleaving(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     if not forward_only and config.fine_grained_activation_offloading:
@@ -2107,6 +2115,7 @@ def forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2149,10 +2158,6 @@ def forward_backward_pipelining_without_interleaving(
         )
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model)
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
@@ -2434,6 +2439,7 @@ def forward_backward_pipelining_without_interleaving(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     if not forward_only and config.fine_grained_activation_offloading:

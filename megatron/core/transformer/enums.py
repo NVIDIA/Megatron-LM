@@ -9,18 +9,9 @@ class ModelType(enum.Enum):
     """Model Type
 
     encoder_or_decoder for bert, gpt etc
-    encoder_and_decoder for multimodal , T5 etc
     """
 
     encoder_or_decoder = 1
-
-    @property
-    def encoder_and_decoder(self):
-        """Deprecated property - use encoder_or_decoder instead."""
-        raise ValueError(
-            "ModelType.encoder_and_decoder is deprecated. Please use ModelType.encoder_or_decoder "
-            "instead."
-        )
 
 
 class LayerType(enum.Enum):
@@ -70,10 +61,11 @@ class AttnBackend(enum.Enum):
 class CudaGraphScope(enum.Enum):
     """Cuda Graph Scope - defines which parts of the model to capture."""
 
-    full_iteration = 1  # Captures the entire training/inference iteration
+    full_iteration = 1  # Captures the entire training iteration
     attn = 2  # Captures attention layers
     mlp = 3  # Captures MLP layers (dense layers only)
     moe = 4  # Captures MoE layers (drop-and-pad MoE layers only)
     moe_router = 5  # Captures MoE router part
     moe_preprocess = 6  # Captures MoE preprocessing part (requires moe_router)
     mamba = 7  # Captures Mamba layers
+    full_iteration_inference = 8  # Captures the entire inference iteration

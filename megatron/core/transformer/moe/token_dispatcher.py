@@ -296,11 +296,13 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
-        (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
-            hidden_states,
-            self.local_map,
-            num_out_tokens=tokens_per_expert.sum(),
-            fused=self.config.moe_permute_fusion,
+        permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
+            permute(
+                hidden_states,
+                self.local_map,
+                num_out_tokens=tokens_per_expert.sum().item(),
+                fused=self.config.moe_permute_fusion,
+            )
         )
 
         self.local_probs = self.local_probs.T.contiguous().masked_select(
@@ -437,13 +439,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
-        if (
-            config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+        self.cuda_dtoh_point = "before_permutation_1"
+        if config.cuda_graph_impl != "none" and (
+            CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            or not self.config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
-        else:
-            self.cuda_dtoh_point = "before_permutation_1"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
@@ -637,6 +638,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             permuted_probs,
             self.reversed_local_input_permutation_mapping,
+            _,
+            _,
         ) = permute(
             hidden_states,
             self.routing_map,
@@ -863,7 +866,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_sync_point = point
 
     def _maybe_dtoh_and_synchronize(
-        self, point: str, tokens_per_expert: torch.Tensor = None
+        self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
@@ -1298,12 +1301,20 @@ class _DeepepManager(_DispatchManager):
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(
+        (
+            hidden_states,
+            permuted_probs,
+            self.reversed_mapping_for_combine,
+            self.pad_offsets,
+            self.tokens_per_expert,
+        ) = permute(
             hidden_states,
             self.dispatched_routing_map,
             probs=self.dispatched_probs,
             num_out_tokens=self.tokens_per_expert.sum().item(),
             fused=self.permute_fusion,
+            tokens_per_expert=self.tokens_per_expert,
+            align_size=get_align_size_for_quantization(self.config),
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
@@ -1316,6 +1327,7 @@ class _DeepepManager(_DispatchManager):
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.dispatched_routing_map,
             fused=self.permute_fusion,
+            pad_offsets=self.pad_offsets,
         )
         return hidden_states
 
@@ -1433,7 +1445,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
-        probs: torch.Tensor = None,
+        probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):

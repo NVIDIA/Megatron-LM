@@ -2,6 +2,20 @@
 
 """Pretrain and SFT GPT."""
 
+# Capture the true program start time BEFORE any heavy imports.
+import time
+_PROGRAM_START_TIME = time.time()
+
+import json
+
+# Suppress warnings on all ranks but rank 0.
+import os
+import warnings
+rank = int(os.environ.get('RANK', 0))
+if rank != 0:
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -14,12 +28,20 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.training import (
+    get_args,
+    get_timers,
+    inprocess_restart,
+    pretrain,
+    print_rank_0,
+    set_startup_timestamps,
+)
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
-from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -190,15 +212,17 @@ def is_dataset_built_on_rank(vp_stage=None):
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
 
     data_args = {
         "random_seed": args.seed,
@@ -219,6 +243,9 @@ def core_gpt_dataset_config_from_args(args):
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
+        "fast_cache_load": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
@@ -297,6 +324,11 @@ def get_embedding_ranks(pp_ranks: List[int]):
 
 
 if __name__ == "__main__":
+    # Timestamp right after entering __main__ block (after all imports/library setup)
+    _MAIN_ENTRY_TIME = time.time()
+
+    # Register startup timestamps for timing report in pretrain()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True

@@ -85,9 +85,6 @@ def initialize_gpt_model(
         else:
             mtp_block_spec = None
 
-        # print("========================")
-        # print("[DEBUG] mtp_block_spec is ", mtp_block_spec)
-        # exit()
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (
@@ -129,7 +126,6 @@ def create_args():
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
     args.use_dist_ckpt = True
@@ -150,6 +146,7 @@ def create_args():
     args.use_megatron_fsdp = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
 
     yield args
 

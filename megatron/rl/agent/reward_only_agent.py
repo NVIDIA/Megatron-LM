@@ -7,8 +7,6 @@ import numpy as np
 from tqdm.asyncio import tqdm
 
 from ..inference import (
-    ChatInferenceInterface,
-    ChatInferenceResponse,
     InferenceResponse,
     LLMChatMessage,
     ReturnsRaw,
@@ -91,11 +89,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         ), "InferenceInterface must support raw_text return to provide rollouts."
         raw_text = response.raw_text
 
-        response_text = (
-            response.response.content
-            if isinstance(response, ChatInferenceResponse)
-            else response.response
-        )
+        response_text = response.response.content
 
         if isinstance(request.inference_interface, ReturnsTokens):
             logprobs = response.logprobs
@@ -104,16 +98,16 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 for x in range(len(response.token_ids))
             ]
             rollout = TokenRollout(
-                trajectory=response.token_ids,
+                trajectory=[response.token_ids],
                 reward=await self.get_reward(response_text, golden),
-                logprobs=logprobs,
-                generation_mask=generation_mask,
+                logprobs=[logprobs],
+                generation_mask=[generation_mask],
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
             )
         else:
             rollout = Rollout(
-                trajectory=raw_text,
+                trajectory=[raw_text],
                 reward=await self.get_reward(response_text, golden),
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
@@ -126,14 +120,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
+            prompt, request.generation_args
         )
 
-        responses = await request.inference_interface.agenerate(inference_request)
-        assert (
-            len(responses) == 1
-        ), "get_reward_rollouts only requested a single response but got multiple responses"
-        response = responses[0]
+        response = await request.inference_interface.agenerate(inference_request)
 
         return await self.rollout_from_response(request, response, golden)
 
@@ -142,41 +132,22 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
-        )
-        inference_request.n = request.rollouts_per_group
-
-        groups = await request.inference_interface.agenerate(inference_request)
-        assert (
-            len(groups) == 1
-        ), "get_grouped_rollouts only requested a single group but got multiple groups"
-        responses = groups[0].responses
-
-        rollouts = await asyncio.gather(
-            *[self.rollout_from_response(request, response, golden) for response in responses]
+            prompt, request.generation_args
         )
 
-        return rollouts
+        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
+        return [await self.rollout_from_response(request, response, golden) for response in responses]
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
     ) -> RewardOnlyEvaluationResponse:
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
+            prompt, request.generation_args
         )
 
-        responses = await request.inference_interface.agenerate(inference_request)
-        assert (
-            len(responses) == 1
-        ), "evaluation only requested a single response but got multiple responses"
-        response = responses[0]
-
-        response_text = (
-            response.response.content
-            if isinstance(response, ChatInferenceResponse)
-            else response.response
-        )
+        response = await request.inference_interface.agenerate(inference_request)
+        response_text = response.response.content
 
         result = RewardEvaluationResult(
             env_id=self.env_id,
@@ -189,11 +160,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return RewardOnlyEvaluationResponse(results=[result], env_id=self.env_id)
 
     async def run_evaluation(self, request: EvaluationRequest):
-
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
 
         # Get all prompts first
         all_prompts = list(

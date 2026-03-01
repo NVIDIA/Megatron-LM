@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -14,7 +14,6 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -24,6 +23,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
@@ -125,68 +125,6 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
-
-    def compute_output_layer_and_language_model_loss(
-        self,
-        hidden: Tensor,
-        labels: Optional[Tensor],
-        weight: Tensor = None,
-        sequence_parallel_enabled: bool = False,
-        column_parallel_linear: torch.nn.Module = None,
-        col_linear_kwargs: Dict[str, Any] = {},
-        reduction: Literal["none", "sum", "mean"] = "none",
-        ignore_index: int = -100,
-    ) -> Tensor:
-        """Computes the language model logits and loss (Cross entropy across vocabulary)
-
-        Args:
-            hidden (Tensor): The hidden states from the transformer model
-            labels (Optional[Tensor]): The labels of dimension [batch size, seq length]
-            weight (Tensor): The weight tensor of shape [vocab size, hidden size].
-                Required if using fused linear cross entropy.
-            column_parallel_linear (torch.nn.Module): The column parallel linear
-                layer to use for computing logits when not using fused linear cross entropy.
-            col_linear_kwargs (Dict[str, Any]): Additional kwargs for column parallel linear layer
-            reduction (Optional[str]): The reduction method. Defaults to "none", and can be
-                one of "none", "sum", "mean".
-            ignore_index (Optional[int]): The index to ignore in the loss calculation.
-                Defaults to -100.
-
-        Returns:
-            Tensor: Loss tensor of dimensions [batch size, sequence_length].
-        """
-        if (
-            self.config.cross_entropy_loss_fusion
-            and self.config.cross_entropy_fusion_impl == 'linear'
-        ):
-            assert (
-                weight is not None
-            ), "weight cannot be None when using fused linear cross entropy."
-            assert (
-                labels is not None
-            ), "labels cannot be None when using fused linear cross entropy."
-            # [b s] => [s b]
-            labels = labels.transpose(0, 1).contiguous()
-            loss = linear_cross_entropy(
-                hidden,
-                weight,
-                labels,
-                tp_group=self.pg_collection.tp,
-                sequence_parallel=sequence_parallel_enabled,
-                reduction=reduction,
-                ignore_index=ignore_index,
-            )
-
-            # [s b] => [b, s]
-            loss = loss.view_as(labels).transpose(0, 1).contiguous()
-            return loss
-        else:
-            assert (
-                column_parallel_linear is not None
-            ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
-            logits, _ = column_parallel_linear(hidden, **col_linear_kwargs)
-
-            return self.compute_language_model_loss(labels, logits)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
@@ -302,7 +240,7 @@ class LanguageModule(MegatronModule):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
-            if self._is_in_embd_group():
+            if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.cuda()
                 torch.distributed.all_reduce(weight.data, group=self.embd_group)
@@ -318,12 +256,20 @@ class LanguageModule(MegatronModule):
             LanguageModule.embedding_warning_printed = True
 
     def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the emedding weight or output logit weights when share embedding and output weights set to True.
+        """Gets the embedding weight or output logit weights when share embedding and output weights set to True
+          or when use Multi-Token Prediction (MTP).
 
         Returns:
-            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
+            Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
         """
-        if self.pre_process:
+        if self.pre_process or getattr(self, 'mtp_process', False):
+            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
+            # So there will be both embedding layer and output layer in the mtp process stage.
+            # When share_embeddings_and_output_weights is True, the embedding weight is the
+            # canonical shared weight and is passed to the output layer during forward.
+            assert hasattr(
+                self, 'embedding'
+            ), f"embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
@@ -356,6 +302,21 @@ class LanguageModule(MegatronModule):
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
 
+        # Multi-Token Prediction (MTP) needs embedding layer in mtp process stage.
+        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
+        # embedding layer in the mtp process stage and tie it to the embedding in the pre
+        # processing stage.
+        # Note: MTP loss is computed at post_process stage, so the output_layer on mtp_process
+        # rank doesn't need special tying - it's not used for loss computation.
+        if getattr(self, 'mtp_process', False) and not self.pre_process:
+            emb_weight = self.embedding.word_embeddings.weight
+            tie_word_embeddings_state_dict(
+                sharded_state_dict,
+                emb_weight,
+                first_stage_word_emb_key,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata

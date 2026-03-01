@@ -25,12 +25,13 @@ from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+
 stimer = StragglerDetector()
 
 import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
-
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
@@ -255,6 +256,13 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
 
+    if packed_seq_params is None:
+        packed_seq_params = get_default_packed_seq_params(
+            seq_length=tokens.shape[1],
+            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+            device=tokens.device,
+        )
+
     # Clear RoPE cache to avoid inference tensor errors
     try:
         for module in model_to_use.modules():
@@ -361,6 +369,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
+    from megatron.inference.utils import add_inference_args
+
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
@@ -392,4 +402,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={},
+        extra_args_provider=add_inference_args,
     )

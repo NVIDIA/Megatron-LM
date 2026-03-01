@@ -8,13 +8,14 @@ import os
 import pickle
 import warnings
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -43,12 +44,14 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -64,10 +67,17 @@ try:
 
     HAVE_TE = True
 except ImportError:
-    from unittest.mock import MagicMock
+    if TYPE_CHECKING:
+        # For type checking, treat transformer_engine as always available.
+        import transformer_engine as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
-    te = MagicMock()
-    HAVE_TE = False
+        HAVE_TE = True
+    else:
+        from unittest.mock import MagicMock
+
+        te = MagicMock()
+        HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
@@ -428,7 +438,9 @@ class TENorm:
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
+    ) -> LayerNormInterface:
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -457,7 +469,7 @@ class TENorm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
-        return instance
+        return cast(LayerNormInterface, instance)
 
 
 class TELinear(te.pytorch.Linear):
@@ -642,6 +654,8 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                    # Mark as NOT tensor parallel since weight is duplicated
+                    setattr(param, "tensor_model_parallel", False)
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -719,6 +733,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -810,6 +825,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
+        self.stride = stride
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -835,6 +852,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
 
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
+
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(
@@ -844,7 +866,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=self.tp_rank,
                 world_size=self.tp_size,
@@ -854,7 +876,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
@@ -904,10 +926,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -934,6 +960,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -947,6 +974,7 @@ class TEColumnParallelLinear(TELinear):
         self._tp_group = tp_group
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
+        self.stride = stride
 
         super().__init__(
             input_size=input_size,
@@ -967,6 +995,11 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
         )
 
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
+
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, world_size)
             _ = _initialize_affine_weight_cpu(
@@ -976,7 +1009,7 @@ class TEColumnParallelLinear(TELinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=rank,
                 world_size=world_size,
@@ -986,7 +1019,7 @@ class TEColumnParallelLinear(TELinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
@@ -1003,10 +1036,14 @@ class TEColumnParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1103,10 +1140,14 @@ class TERowParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1137,8 +1178,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         num_splits: Optional[int] = None,
-        cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = "p2p",
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1313,12 +1354,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Optional[Tensor],
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
-    ):
+    ) -> torch.Tensor:
         """Forward."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
@@ -1885,6 +1926,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
@@ -2394,6 +2436,14 @@ except ImportError:
     fused_sort_chunks_by_index = None
     fused_sort_chunks_by_index_with_probs = None
     fused_unpermute = None
+
+try:
+    from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs
+
+    fused_permute_and_pad_with_probs = moe_permute_and_pad_with_probs
+
+except ImportError:
+    fused_permute_and_pad_with_probs = None
 
 try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy

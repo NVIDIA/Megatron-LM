@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{platforms}'
+  name: "{test_case}_{environment}_{platforms}"
   model: moe2.0
   build: mcore-pyt-{environment}
   nodes: 1
@@ -166,4 +166,23 @@ products:
         runtime_config: tp2pp2ep4
         environment: [dev]
         scope: [mr, mr-github]
+        platforms: [dgx_h100]
+
+  ###########################
+  # BERT model tests        #
+  ###########################
+  - test_case: [bert_mcore_tp1_pp2]
+    products:
+      - environment: [dev]
+        scope: [nightly-broken]
+        platforms: [dgx_h100]
+  - test_case: [bert_mcore_tp1_pp4_vp2]
+    products:
+      - environment: [dev]
+        scope: [nightly-broken]
+        platforms: [dgx_h100]
+  - test_case: [bert_mcore_tp4_pp1]
+    products:
+      - environment: [dev]
+        scope: [nightly-broken]
         platforms: [dgx_h100]
