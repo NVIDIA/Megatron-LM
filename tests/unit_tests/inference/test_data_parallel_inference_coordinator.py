@@ -9,8 +9,6 @@ import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
-import msgpack
-import numpy as np
 import pytest
 import torch
 
@@ -18,12 +16,12 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
 )
+from megatron.core.inference.engines.engine_coordinator_client import _CollectiveChannel
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -38,6 +36,7 @@ from tests.unit_tests.test_utilities import Utils
 
 try:
     import zmq
+    import zmq.asyncio
 
     HAVE_ZMQ = True
 except ImportError:
@@ -105,7 +104,6 @@ class DummyEngine(DynamicInferenceEngine):
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
-        self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
 
@@ -113,7 +111,6 @@ class DummyEngine(DynamicInferenceEngine):
         self.state = EngineState.RUNNING
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
         self._state_events[EngineState.RUNNING].set()
-        self._pending_signals = deque()
         self.resume_request_ids = None
         self.use_coordinator = False
 
@@ -122,20 +119,14 @@ class DummyEngine(DynamicInferenceEngine):
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
 
-        # ZMQ-based world barrier (async-friendly, no NCCL).
-        self.zmq_context = zmq.Context()
-        total_world_size = torch.distributed.get_world_size()
-        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
-        self.use_synchronous_zmq_collectives = False
-
-    async def run_engine_with_coordinator(self, *, loop=None):
+    async def run_engine(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
 
         In production, @trace_async_exceptions converts AssertionError to sys.exit(1) -> SystemExit.
         In Python 3.12+, asyncio re-raises SystemExit from tasks in the main thread.
         For tests, we let AssertionErrors propagate directly so pytest.raises can catch them.
         """
-        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
+        return await DynamicInferenceEngine.run_engine.__wrapped__(self, loop=loop)
 
     def suspend(self):
         pass
@@ -188,11 +179,7 @@ class DummyEngine(DynamicInferenceEngine):
                 to_remove.append(request_id)
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
-                        use_bin_type=True,
-                    )
-                    self.socket_for_receiving_requests.send(payload)
+                    self.coordinator_client.send_engine_reply([entry.record.merge().serialize()])
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -222,32 +209,25 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
             client.pause_engines()
         try:
             await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        except Exception:
+            logging.warning("cleanup_engine: PAUSE did not complete, proceeding to STOP anyway.")
 
         if client is not None:
             client.stop_engines()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            # Graceful stop failed — fall back to forcible cleanup.
-            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
-                comm = getattr(engine, attr, None)
-                if comm is not None:
-                    comm.close()
-
-            for socket in getattr(engine, 'zmq_sockets', []):
-                if not socket.closed:
-                    socket.close(linger=0)
-
+        except asyncio.CancelledError:
+            pass  # Expected — task.cancel() from the engine's own shutdown path.
+        except Exception:
+            logging.warning("cleanup_engine: engine loop did not exit cleanly, force-cancelling.")
             task.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await task
+            except (asyncio.CancelledError, Exception):
                 pass
 
     if client is not None:
-        client.stop()
+        await client.shutdown()
 
 
 @pytest.fixture
@@ -272,16 +252,21 @@ def initialize_model_parallel(request, monkeypatch):
 
 
 @pytest.fixture
-def test_case_communicator():
-    """A separate ZMQ communicator for test sync barriers.
+async def test_case_communicator():
+    """A separate ZMQ collective channel for test sync barriers.
 
     Use this instead of engine._world_barrier() when the engine loop may be
     calling _world_barrier() concurrently (e.g. during state transitions).
+
+    The fixture creates a private ZMQ context and passes it to the channel, then
+    terminates it after shutdown. This keeps the fixture's sockets isolated from
+    any context owned by the engine or other fixtures in the same process.
     """
-    ctx = zmq.Context()
-    comm = AsyncZMQCommunicator(ctx, process_group=None)
+    ctx = zmq.asyncio.Context()
+    comm = _CollectiveChannel(process_group=None, context=ctx)
+    comm.start()
     yield comm
-    comm.close()
+    await comm.shutdown()
     ctx.term()
 
 
@@ -336,9 +321,9 @@ def coordinator():
         ctx = zmq.Context()
         sock = ctx.socket(zmq.DEALER)
         sock.connect(dp_addr)
-        sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-        sock.recv()  # CONNECT_ACK
-        sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+        sock.send_multipart([Headers.CLIENT_CONNECT.value.to_bytes()])
+        sock.recv_multipart()  # ACK
+        sock.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
         sock.close(linger=1000)
         ctx.term()
         proc.join(timeout=10.0)
@@ -632,10 +617,10 @@ class TestCoordinator:
         finally:
             await cleanup_engine(engine, client)
 
-        # cleanup_engine called client.stop() which cancels pending futures.
+        # cleanup_engine called client.shutdown() which cancels pending futures.
         if torch.distributed.get_rank() == 0:
             for f in doomed_futures:
-                assert f.cancelled(), "Client futures should be cancelled after client.stop()"
+                assert f.cancelled(), "Client futures should be cancelled after client.shutdown()"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
