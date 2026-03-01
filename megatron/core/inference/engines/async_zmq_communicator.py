@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
 import socket
 import struct
 
@@ -86,27 +85,19 @@ class AsyncZMQCommunicator:
         if self.is_leader:
             rows = [local_vals]
 
-            while len(rows) < self.world_size:
-                try:
-                    msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
-                    rows.append(struct.unpack(fmt, msg))
-                except zmq.Again:
-                    await asyncio.sleep(0.001)
+            for _ in range(self.world_size - 1):
+                msg = await self.gather_sock.recv()
+                rows.append(struct.unpack(fmt, msg))
 
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
-            self.bcast_sock.send(struct.pack(fmt, *maxes))
+            await self.bcast_sock.send(struct.pack(fmt, *maxes))
             return maxes[0] if n == 1 else maxes
 
         else:
-            self.gather_sock.send(payload)
-
-            while True:
-                try:
-                    msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
-                    result = struct.unpack(fmt, msg)
-                    return result[0] if n == 1 else result
-                except zmq.Again:
-                    await asyncio.sleep(0.001)
+            await self.gather_sock.send(payload)
+            msg = await self.bcast_sock.recv()
+            result = struct.unpack(fmt, msg)
+            return result[0] if n == 1 else result
 
     def close(self):
         """
