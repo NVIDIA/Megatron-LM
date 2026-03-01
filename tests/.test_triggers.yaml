@@ -1,0 +1,3 @@
+# Test infrastructure -- conftest.py, test_utilities.py, test_utils/, etc.
+# Changes here can affect any test, so run everything.
+test_buckets: ALL

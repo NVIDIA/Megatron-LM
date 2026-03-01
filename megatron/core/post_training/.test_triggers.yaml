@@ -1,0 +1,6 @@
+# Post-training module (modelopt integration).
+#
+# Test imports traced:
+#   post_training → post_training.modelopt.* (test suite)
+test_buckets:
+  - post_training
