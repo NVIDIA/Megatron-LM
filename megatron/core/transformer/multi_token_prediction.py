@@ -146,7 +146,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     from different sequences.
 
     Args:
-        tensor (Tensor): The input tensor to roll.
+        tensor (Tensor): The input tensor to roll. If None, returns (None, None).
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
@@ -156,6 +156,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
+    if tensor is None:
+        return None, None
+
     # Handle packed sequences cases
     if packed_seq_params is not None:
         return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
@@ -999,22 +1002,38 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
+        tensor_kwargs = {}
+        non_tensor_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, Tensor) or v is None:
+                tensor_kwargs[k] = v
+            else:
+                non_tensor_kwargs[k] = v
+
+        def wrapped_forward(*checkpoint_args):
+            num_pos_args = len(args)
+            pos_args = checkpoint_args[:num_pos_args]
+            tensor_vals = checkpoint_args[num_pos_args:]
+            reconstructed_kwargs = dict(zip(tensor_kwargs.keys(), tensor_vals))
+            full_kwargs = {**reconstructed_kwargs, **non_tensor_kwargs}
+            return forward_func(*pos_args, **full_kwargs)
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    wrapped_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     *args,
-                    **kwargs,
+                    *tensor_kwargs.values(),
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    wrapped_forward, self.config.distribute_saved_activations, *args, *tensor_kwargs.values()
                 )
 
         if self.config.recompute_method == 'uniform':
