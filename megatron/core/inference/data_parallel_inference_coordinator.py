@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import errno
 import faulthandler
 import logging
@@ -9,24 +10,21 @@ from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
+from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.async_zmq_socket import AsyncZmqSendRecv
 from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
     import zmq
+    import zmq.asyncio
 
     HAVE_ZMQ = True
 except:
     HAVE_ZMQ = False
-
-try:
-    import msgpack
-
-    HAVE_MSGPACK = True
-except:
-    HAVE_MSGPACK = False
 
 # Register faulthandler to emit stack traces upon process kill.
 faulthandler.enable()
@@ -56,8 +54,13 @@ class DataParallelInferenceCoordinator:
     5.  **Control Signal Broadcasting**: It relays control signals (e.g., PAUSE, STOP)
         from a client to all connected data parallel ranks.
 
+    Sends are decoupled from the main recv loop via a send queue pattern:
+    ``_isend()`` enqueues send futures, and a background ``_send_task`` drains
+    and awaits them.
+
     Attributes:
-        router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
+        router_socket (zmq.asyncio.Socket): The central async ZMQ ROUTER socket for
+            all communication.
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
             identities of connected TP-coordinators, used for round-robin scheduling.
@@ -87,9 +90,9 @@ class DataParallelInferenceCoordinator:
         """
         Initializes the inference coordinator.
 
-        This sets up the ZMQ context and a ROUTER socket, binding it to the given
-        port. It then enters a blocking loop to wait for all expected data parallel
-        ranks to connect before proceeding.
+        This sets up the async ZMQ context and a ROUTER socket, binding it to the
+        given port. Worker registration is deferred to the ``_recv_task`` which
+        handles ENGINE_CONNECT messages.
 
         Args:
             pipe_connection (Connection): A connecting pipe to the parent process.
@@ -97,18 +100,18 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
+            deterministic_mode (bool): Whether to enable deterministic scheduling.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
             "pip install pyzmq"
         )
-        assert HAVE_MSGPACK, (
-            "please install the messagepack library to use DataParallelInferenceCoordinator\n"
-            "pip install msgpack"
-        )
         self.pipe_connection = pipe_connection
         self.data_parallel_size = data_parallel_size
-        self.context = zmq.Context()
+        self.deterministic_mode = deterministic_mode
+        self.ready_event = None  # Set in start()
+
+        self.context = zmq.asyncio.Context.instance()
 
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
@@ -121,6 +124,7 @@ class DataParallelInferenceCoordinator:
         local_ip = socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
+        self._zmq = AsyncZmqSendRecv()
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         is_bound = False
@@ -147,21 +151,7 @@ class DataParallelInferenceCoordinator:
         self.pipe_connection.send(self.addr)
         self.pipe_connection.close()
 
-        logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
-        # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
-        # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
-        for _ in range(data_parallel_size):
-            identity, _ = self.router_socket.recv_multipart()
-            assert identity not in self.identities_of_data_parallel_ranks
-            self.identities_of_data_parallel_ranks.append(identity)
-        logging.info("Inference Coordinator: Connected with data parallel ranks...")
-
-        # In deterministic mode, sort identities for consistent scheduling order.
-        if deterministic_mode:
-            self.identities_of_data_parallel_ranks = deque(
-                sorted(self.identities_of_data_parallel_ranks)
-            )
         self._round_robin_idx = 0
 
         self.request_id_to_client_id = {}
@@ -194,77 +184,90 @@ class DataParallelInferenceCoordinator:
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, payload):
-        """Send payload to an engine, removing it from the pool if unreachable.
-
-        Returns:
-            True if the send succeeded, False if the engine was unreachable and removed.
-        """
-        try:
-            self.router_socket.send_multipart([identity, payload])
-            return True
-        except zmq.error.ZMQError as e:
-            if e.errno == zmq.EHOSTUNREACH:
-                self._remove_engine(identity)
-                return False
-            raise
-
-    def start(self):
+    def start(self, ready_event: Event, loop: Optional[asyncio.AbstractEventLoop] = None):
         """
         Starts the main event loop for the coordinator.
 
-        This method runs an infinite loop, continuously listening for incoming
-        messages on the ZMQ ROUTER socket. It parses the message header to
-        determine the message type and takes appropriate action, such as
-        handling new client connections, forwarding requests, broadcasting
-        control signals, or processing replies from the engines.
+        Creates background tasks for receiving, sending, and startup send buffering.
+        Returns immediately — the actual work happens in the background tasks driven
+        by the event loop.
+
+        Args:
+            ready_event (Event): Set when all engines have connected.
+            loop (Optional[asyncio.AbstractEventLoop]): The event loop to use.
         """
-        # Todo [Siddharth]: Make this more robust to handle invalid messages.
+        logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
+        loop = get_asyncio_loop(loop)
+
+        self.ready_event = ready_event
+
+        # Attempt to connect, and do not allow any sends until we are connected.
+        self.is_running = asyncio.Event()
+        self._startup_sends = []
+
+        if self.data_parallel_size == 0:
+            self.is_running.set()
+            if self.ready_event is not None:
+                self.ready_event.set()
+
+        self.startup_sends_task = loop.create_task(self._startup_sends_task())
+        self.send_task = loop.create_task(self._zmq.send_task(on_send_error=self._on_send_error))
+        self.recv_task = loop.create_task(self._recv_task())
+
+    @trace_async_exceptions
+    async def _recv_task(self):
+        """Main loop of the inference coordinator.
+
+        Listens for incoming messages and dispatches based on header type.
+        Handles engine registration (ENGINE_CONNECT), client handshake
+        (CLIENT_CONNECT), request forwarding, control signals, and replies.
+        """
         known_clients = set()
         while True:
-            sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            identity, header, data = await self._irecv()
 
-            # Allow for re-registration if connecting to a running coordinator.
-            if serialized_payload == b"":
-                if sender_identity not in self.identities_of_data_parallel_ranks:
-                    self.identities_of_data_parallel_ranks.append(sender_identity)
-                continue
+            if header == Headers.ENGINE_CONNECT:
+                if identity in self.identities_of_data_parallel_ranks:
+                    logging.warning("Coordinator: duplicate ENGINE_CONNECT from %s, ignoring.", identity)
+                    continue
+                self.identities_of_data_parallel_ranks.append(identity)
+                logging.info(f"Inference Coordinator: Data parallel rank connected: {identity}")
+                if len(self.identities_of_data_parallel_ranks) == self.data_parallel_size:
+                    # In deterministic mode, sort identities for consistent scheduling order.
+                    if self.deterministic_mode:
+                        self.identities_of_data_parallel_ranks = deque(
+                            sorted(self.identities_of_data_parallel_ranks)
+                        )
+                    self.is_running.set()
+                    if self.ready_event is not None:
+                        self.ready_event.set()
+                    logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
-            deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
-            header = Headers(deserialized_payload[0])
-
-            if header == Headers.CONNECT:
-                if sender_identity in known_clients:
+            elif header == Headers.CLIENT_CONNECT:
+                if identity in known_clients:
                     logging.info(
-                        f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
+                        f"Client {identity} sent a duplicate connect request. Ignoring .."
                     )
                     continue
-
-                # print(f"New client connected: {sender_identity}")
-                known_clients.add(sender_identity)
-                self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
-                )
+                known_clients.add(identity)
+                # Due to the `startup_sends` logic, this will not be sent until we are connected.
+                self._isend(identity, Headers.ACK)
 
             elif header == Headers.SUBMIT_REQUEST:
-                # ToDo [Siddharth]: We might want to tokenize the prompt on the
-                # assigned data parallel rank for this process instead
-                # of the coordinator.
-
                 # Message from a known client
-                if sender_identity not in known_clients:
+                if identity not in known_clients:
                     logging.info(
-                        f"Received message from unknown client {sender_identity}. Ignoring."
+                        f"Received message from unknown client {identity}. Ignoring."
                     )
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
+                client_request_id, prompt, sampling_params = data
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
                 request_id = self.next_request_id
                 self.next_request_id += 1
-                self.request_id_to_client_id[request_id] = sender_identity
+                self.request_id_to_client_id[request_id] = identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
 
                 # Serialize prompt.
@@ -275,20 +278,12 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
-                payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                    use_bin_type=True,
+                next_data_parallel_rank_identity = self.get_next_data_parallel_rank()
+                self._isend(
+                    next_data_parallel_rank_identity,
+                    Headers.SUBMIT_REQUEST,
+                    [request_id, prompt, sampling_params],
                 )
-                # Account for the fact that some engines may have died.
-                for _ in range(len(self.identities_of_data_parallel_ranks)):
-                    next_identity = self.get_next_data_parallel_rank()
-                    if self._send_to_engine(next_identity, payload):
-                        break
-                else:
-                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
-                    logging.error("Coordinator: no reachable engines for request %d", request_id)
-                    del self.request_id_to_client_id[request_id]
-                    del self.request_id_to_client_request_id[request_id]
 
             elif header in (
                 Headers.PAUSE,
@@ -299,7 +294,7 @@ class DataParallelInferenceCoordinator:
                 Headers.STOP,
             ):
                 # Start by checking the current state against the control signal.
-                if sender_identity not in known_clients:
+                if identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
 
@@ -335,15 +330,16 @@ class DataParallelInferenceCoordinator:
                         continue
                     self.state = self.CoordinatorState.STOPPING
 
-                # Broadcast the control signal if we're in a good state.
-                broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
+                # Broadcast the control signal to all data parallel ranks.
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+                    self._isend(data_parallel_rank_id, header)
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_request_records = deserialized_payload[1]
+                if identity not in self.identities_of_data_parallel_ranks:
+                    logging.warning("Coordinator: ENGINE_REPLY from unknown engine %s, ignoring.", identity)
+                    continue
+                finished_request_records = data
 
                 for finished_request_record in finished_request_records:
                     self.detokenize(finished_request_record)
@@ -353,28 +349,76 @@ class DataParallelInferenceCoordinator:
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
 
-                    self.router_socket.send_multipart(
-                        [
-                            client_identity,
-                            msgpack.packb(
-                                [header.value, client_request_identity, finished_request_record],
-                                use_bin_type=True,
-                            ),
-                        ]
+                    self._isend(
+                        client_identity,
+                        Headers.ENGINE_REPLY,
+                        [client_request_identity, finished_request_record],
                     )
 
             elif header == Headers.SHUTDOWN:
-                if sender_identity not in known_clients:
+                if identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
                 break
 
             elif header == Headers.DISCONNECT:
-                if sender_identity in self.identities_of_data_parallel_ranks:
-                    self._remove_engine(sender_identity)
+                if identity in self.identities_of_data_parallel_ranks:
+                    self._remove_engine(identity)
 
             else:
                 raise UnknownHeaderError(header)
+
+    def _on_send_error(self, e, identity):
+        """Handle send errors from the background send task."""
+        if isinstance(e, zmq.error.ZMQError) and e.errno == zmq.EHOSTUNREACH:
+            if identity is not None and identity in self.identities_of_data_parallel_ranks:
+                self._remove_engine(identity)
+            else:
+                logging.warning("Coordinator: send failed, recipient unreachable (identity=%s)", identity)
+            return True
+        return False
+
+    @trace_async_exceptions
+    async def _startup_sends_task(self):
+        """Before all engines are connected, we queue up sends for later."""
+        await self.is_running.wait()
+        for (identity, header, data) in self._startup_sends:
+            self._isend(identity, header, data)
+        self._startup_sends = None
+
+    def _isend(
+        self, identity: bytes, header: Headers, data: Optional[List] = None
+    ):
+        """
+        Asynchronously send a signal via the ROUTER socket.
+
+        Args:
+            identity (bytes): The ZMQ identity of the recipient.
+            header (Headers): The signal header to send.
+            data (Optional[List]): The data payload to send.
+        """
+        # If we have not connected yet, wait on sends.
+        if not self.is_running.is_set():
+            if header not in [Headers.ENGINE_CONNECT, Headers.CLIENT_CONNECT]:
+                self._startup_sends.append((identity, header, data))
+                return
+
+        self._zmq.isend(self.router_socket, header, data, identity=identity)
+
+    async def _irecv(
+        self, deserialize: bool = True
+    ) -> Tuple[Optional[bytes], Headers, List | bytes | None]:
+        """
+        Asynchronously receive a signal from the ROUTER socket.
+
+        Returns:
+            identity (Optional[bytes]): The source of the signal.
+            header (Headers): The signal header received.
+            data (List | bytes | None): The data payload received.
+        """
+        return await self._zmq.irecv(
+            self.router_socket, socket_uses_identity=True, deserialize=deserialize
+        )
 
     def detokenize(self, finished_request_record):
         """
@@ -405,8 +449,8 @@ class DataParallelInferenceCoordinator:
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
 
-        This method initializes the coordinator, signals a `ready_event` to indicate
-        that it is fully initialized and listening, and then starts the main event loop.
+        This method initializes the coordinator, starts the background tasks, and
+        runs the event loop forever until interrupted or stopped.
 
         Args:
             pipe_connection (Connection): A connecting pipe to the parent process.
@@ -423,17 +467,22 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port,
             deterministic_mode=deterministic_mode,
         )
-        ready_event.set()
+        loop = get_asyncio_loop()
+        coordinator.start(ready_event, loop=loop)
         try:
-            coordinator.start()
+            loop.run_forever()
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
-        coordinator.stop()
+        finally:
+            coordinator.stop()
         logging.info("Inference Coordinator: shut down successfully.")
 
     def stop(self):
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
+        self._zmq.shutdown()
+        self.recv_task.cancel()
+        self.startup_sends_task.cancel()
         self.router_socket.close()
         self.context.term()
