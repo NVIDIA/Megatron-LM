@@ -7,7 +7,7 @@ import torch.distributed as dist
 from pydantic import PrivateAttr
 
 from megatron.core.inference.config import KVCacheManagementMode
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
@@ -100,7 +100,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
             loop = asyncio.get_event_loop()
             client = InferenceClient(inference_coordinator_address=dp_addr)
-            await client.start()
+            client.start()
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
@@ -124,8 +124,16 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def kill(self):
         if dist.get_rank() == 0:
-            await self._client.stop_engines()
-        await self._inference_engine.stopped.wait()
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
+            self._client.stop_engines()
+        await self._inference_engine.wait_until(EngineState.STOPPED)
+
+        if dist.get_rank() == 0:
+            self._client.shutdown_coordinator()
+            self._client.stop()
 
     def increment_staleness(self):
         if dist.get_rank() == 0:
@@ -133,12 +141,19 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         if dist.get_rank() == 0:
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
             self._client.suspend_engines()
-        await self._inference_engine.paused.wait()
-        self._inference_engine.suspend()
+        await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
     async def resume(self):
+        if self._inference_engine.running.is_set():
+            return
+
         if dist.get_rank() == 0:
             self._client.resume_engines()
-        await self._inference_engine.running.wait()
-        self._inference_engine.resume()
+            self._client.unpause_engines()
+
+        await self._inference_engine.wait_until(EngineState.RUNNING)

@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from examples.inference.gpt.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
@@ -71,7 +72,7 @@ async def main(
     # Create client and run example.
     if dist.get_rank() == 0:
         client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
-        await client.start()
+        client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
             request.time_arrival = request.time_offset + base_arrival_time
@@ -172,14 +173,19 @@ async def main(
                     )
                 )
 
-        # kill the engines and suspend the client
-        # Right now, we can only call stop when all requests are done.
-        # Todo: Make this explicit in the Client class....
-        await client.stop_engines()
-        client.stop()
+        # Pause before stopping: STOP requires PAUSED or SUSPENDED state.
+        client.pause_engines()
 
-    # once the stop signal eventually makes its way to each GPU, the engines will stop.
-    await asyncio.gather(engine.engine_loop_task)
+    await engine.wait_until(EngineState.PAUSED)
+
+    if dist.get_rank() == 0:
+        client.stop_engines()
+
+    await engine.wait_until(EngineState.STOPPED)
+
+    if dist.get_rank() == 0:
+        client.shutdown_coordinator()
+        client.stop()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 
 

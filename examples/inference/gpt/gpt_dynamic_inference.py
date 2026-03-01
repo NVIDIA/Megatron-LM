@@ -227,8 +227,7 @@ def run_inference(
             break
 
     # Resume engine (NOOP if not suspended).
-    if engine.is_suspended:
-        engine.resume()
+    engine.resume()
 
     return {
         "step_times": step_times,
