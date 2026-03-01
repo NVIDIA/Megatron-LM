@@ -4,12 +4,12 @@ from enum import Enum, auto
 
 
 class Headers(Enum):
-    """
-    Enum representing headers used for communication with the inference-coordinator.
-    """
+    """Enum representing headers used for communication with the inference-coordinator."""
 
-    CONNECT = auto()
-    CONNECT_ACK = auto()
+    ENGINE_CONNECT = auto()
+    CLIENT_CONNECT = auto()
+    ACK = auto()
+    MESSAGES = auto()
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
     PAUSE = auto()
@@ -20,6 +20,9 @@ class Headers(Enum):
     STOP = auto()
     DISCONNECT = auto()
     SHUTDOWN = auto()
+    COLLECTIVE_DATA = auto()
+    COLLECTIVE_RESULT = auto()
+    COLLECTIVE_SIGNAL = auto()
 
 
 class UnknownHeaderError(Exception):

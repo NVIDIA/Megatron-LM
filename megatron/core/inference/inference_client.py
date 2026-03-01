@@ -3,52 +3,22 @@
 import asyncio
 import logging
 import time
-from typing import List, Optional, Union
+from typing import Optional, Union
 
+from megatron.core.inference.async_zmq_communicator import AsyncZmqEndpoint
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
-try:
-    import zmq
 
-    HAVE_ZMQ = True
-except:
-    HAVE_ZMQ = False
-
-try:
-    import msgpack
-
-    HAVE_MSGPACK = True
-except:
-    HAVE_MSGPACK = False
-
-
-class InferenceClient:
+class InferenceClient(AsyncZmqEndpoint):
     """
     An asynchronous client for communicating with an inference coordinator service.
 
-    This client uses ZeroMQ (ZMQ) for messaging and MessagePack (msgpack) for
-    serialization. It is designed to work within an asyncio event loop. It can
-    submit inference requests, listen for completed results, and send control
-    signals (e.g., pause, stop) to the inference engines.
-
-    The client operates by connecting a ZMQ DEALER socket to the inference
-    coordinator's ROUTER socket. Requests are sent with a unique ID, and an
-    `asyncio.Future` is created for each request. A background task listens for
-    replies from the coordinator, and when a reply is received, it resolves the
-    corresponding future with the result.
-
-    Attributes:
-        context (zmq.Context): The ZeroMQ context.
-        socket (zmq.Socket): The ZMQ DEALER socket used for communication.
-        completion_futures (dict[int, asyncio.Future]): A dictionary mapping
-            request IDs to the asyncio Future objects that will hold the results.
-        next_request_id (int): A counter for generating unique request IDs.
-        listener_task (asyncio.Task): The background task that listens for
-            completed requests.
+    This client submits inference requests, listens for completed results, and
+    sends control signals to the inference engines through the coordinator.
     """
 
     def __init__(self, inference_coordinator_address: str):
@@ -56,32 +26,12 @@ class InferenceClient:
         Initializes the InferenceClient.
 
         Args:
-            inference_coordinator_address (str): The address on which the
-                inference coordinator is listening.
+            inference_coordinator_address (str): The address on which the coordinator is listening.
         """
-        assert (
-            HAVE_ZMQ
-        ), "please install the pyzmq library to use InferenceClient - pip install pyzmq"
-        assert (
-            HAVE_MSGPACK
-        ), "please install the messagepack library to use InferenceClient - pip install msgpack"
-        self.context = zmq.Context()
-        socket = self.context.socket(zmq.DEALER)
-
-        # Prevent socket.send() from thread-blocking at >1000 concurrent requests
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.RCVHWM, 0)
-
-        socket.connect(inference_coordinator_address)
-
-        self._loop = None
-        self.socket = socket
-        self.completion_futures = {}
-        self.request_submission_times = {}
-        self.next_request_id = 0
+        super().__init__("DEALER", connect=inference_coordinator_address)
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self, prompt: Union[str, list[int]], sampling_params: SamplingParams
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -102,33 +52,21 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self._isend(Headers.SUBMIT_REQUEST, [request_id, prompt, sampling_params.serialize()])
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
+        self.completion_futures[request_id] = get_asyncio_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
     @trace_async_exceptions
     async def _recv_task(self):
-        """
-        Listens for completed inference requests from the coordinator.
-
-        This coroutine runs in an infinite loop, continuously polling the socket
-        for data.
-        When a request reply is received, it unpacks the message, finds the
-        corresponding Future using the request ID, and sets the result.
-        Other control packets are handled appropriately.
-
-        This method is started as a background task by the `start()` method.
-        """
+        """Listen for replies from the coordinator and resolve futures."""
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
-                header = Headers(data[0])
+                _, header, data = await self._irecv()
+
                 if header == Headers.ENGINE_REPLY:
-                    request_id, reply = data[1:]
+                    request_id, reply = data
                     reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
                         request_id
                     )
@@ -138,108 +76,80 @@ class InferenceClient:
                         continue
                     completed_request = DynamicInferenceRequestRecord.deserialize(reply)
                     completion_future.set_result(completed_request)
-            except zmq.Again:
-                await asyncio.sleep(0.005)
-                continue
-            except KeyboardInterrupt:
+                elif header == Headers.ACK:
+                    pass  # Coordinator acknowledged our connect; no action needed.
+            except asyncio.CancelledError:
                 break
 
-    def _connect_with_inference_coordinator(self):
-        """
-        Performs the initial handshake with the inference coordinator.
-
-        Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
-        connection is established and acknowledged by the coordinator.
-        """
-        payload = [Headers.CONNECT.value]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        assert Headers(reply) == Headers.CONNECT_ACK
-
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
-        """
-        Connects to the coordinator and starts the background listener task.
-
-        This must be called before submitting any requests. It handles
-        the initial handshake and spawns the `listen_for_completed_requests`
-        coroutine.
-        """
+        """Connects to the coordinator and starts the background tasks."""
         logging.info("Client: Connecting to InferenceCoordinator...")
-        self._loop = get_asyncio_loop(loop)
-        self._connect_with_inference_coordinator()
-        self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
-        """
-        Sends a generic control signal to the inference coordinator.
+        self.completion_futures = {}
+        self.request_submission_times = {}
+        self.next_request_id = 0
 
-        Args:
-            signal: The signal to send, typically a value from the `Headers` enum.
-        """
-        payload = [signal.value]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self._isend(Headers.CLIENT_CONNECT)
+        super().start(loop)
+
+    def send_signal(self, header: Union[str, Headers]):
+        """Send a control signal to the coordinator (e.g. "PAUSE", "STOP", "SHUTDOWN")."""
+        if isinstance(header, str):
+            header = Headers[header]
+        self._isend(header)
 
     def pause_engines(self):
         """Sends PAUSE to all engines via coordinator.
 
-        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
-        then synchronizes via a world-wide barrier before transitioning to
-        PAUSED. Callers should await engine.paused for confirmation.
+        Callers should await engine.paused for confirmation.
         """
-        self._send_signal_to_engines(Headers.PAUSE)
+        self._isend(Headers.PAUSE)
 
-    def unpause_engines(self) -> None:
-        """Sends UNPAUSE to all engines. No synchronization needed."""
-        self._send_signal_to_engines(Headers.UNPAUSE)
+    def unpause_engines(self):
+        """Sends UNPAUSE to all engines."""
+        self._isend(Headers.UNPAUSE)
 
     def increment_staleness(self):
         """Sends a signal to increment staleness on all in-flight requests."""
-        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+        self._isend(Headers.INCREMENT_STALENESS)
 
     def suspend_engines(self):
         """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
 
         Callers should await engine.suspended for confirmation.
         """
-        self._send_signal_to_engines(Headers.SUSPEND)
+        self._isend(Headers.SUSPEND)
 
     def resume_engines(self):
         """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
 
-        Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
+        Callers should await engine.resumed for confirmation.
         """
-        self._send_signal_to_engines(Headers.RESUME)
+        self._isend(Headers.RESUME)
 
     def stop_engines(self):
         """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
 
         Callers should await engine.stopped for confirmation.
-        Does not affect the coordinator.
         """
-        self._send_signal_to_engines(Headers.STOP)
+        self._isend(Headers.STOP)
 
     def shutdown_coordinator(self):
-        """Tells the coordinator process to exit its main loop.
+        """Tells the coordinator process to exit its main loop."""
+        self._isend(Headers.SHUTDOWN)
 
-        Does not affect the engines.
-        """
-        self._send_signal_to_engines(Headers.SHUTDOWN)
-
-    def stop(self):
+    async def shutdown(self):
         """
         Stops the client and cleans up all resources.
 
-        This method cancels the background listener task, closes the ZMQ socket,
+        This method awaits background tasks, closes the ZMQ sockets,
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        if hasattr(self, 'listener_task') and not self.listener_task.done():
-            self.listener_task.cancel()
+        await super().shutdown()
         # Wake up any listeners.
         for future in self.completion_futures.values():
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        self.socket.close(linger=0)
-        self.context.term()
+        self._ctx.term()
