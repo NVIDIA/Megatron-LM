@@ -63,16 +63,11 @@ def inprocess_restart(train, args):
             )
         )
 
+    # Note: CUDA cache is now automatically cleared in destroy_state(),
+    # so the --inprocess-empty-cuda-cache flag is deprecated but kept for backwards compatibility
     finalize = [
         inprocess.finalize.ThreadedFinalize(timeout=timedelta(seconds=10), fn=destroy_state)
     ]
-
-    if args.inprocess_empty_cuda_cache:
-        finalize.append(
-            inprocess.finalize.ThreadedFinalize(
-                timeout=timedelta(seconds=10), fn=torch.cuda.empty_cache
-            )
-        )
 
     initialize = inprocess.Compose(
         inprocess.initialize.RetryController(min_world_size=args.inprocess_active_world_size),
