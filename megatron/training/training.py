@@ -1569,7 +1569,7 @@ def setup_model_and_optimizer(
             unwrapped_model,
             dense_model_for_upcycling,
             load_kwargs={
-                'model': dense_model_for_upcycling,
+                'ddp_model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
             },
