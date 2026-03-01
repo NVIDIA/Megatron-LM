@@ -254,5 +254,9 @@ class InferenceClient:
         no longer needed to ensure a graceful shutdown.
         """
         self.listener_task.cancel()
+
+        # Prevent context.term() from hanging
+        self.socket.setsockopt(zmq.LINGER, 0)
+
         self.socket.close()
         self.context.term()
