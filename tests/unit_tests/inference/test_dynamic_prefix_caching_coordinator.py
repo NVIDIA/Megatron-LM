@@ -13,7 +13,6 @@ from collections import deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
 
-import msgpack
 import pytest
 import torch
 
@@ -21,7 +20,11 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -80,6 +83,7 @@ class DummyContext:
 
     def __init__(self):
         self.active_cnt = 0
+        self.step_count = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -99,21 +103,27 @@ class DummyEngine(DynamicInferenceEngine):
     """Dummy inference engine that only implements coordinator-related methods."""
 
     def __init__(self):
+        """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
         self.requests: Dict[int, RequestEntry] = {}
-        self.suspend_signal = False
-        self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
-        self.pending_microbatch = deque()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
+
+        # State machine (mirrors dynamic_engine.py reset()).
+        self.state = EngineState.RUNNING
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        self._state_events[EngineState.RUNNING].set()
+        self._pending_signals = deque()
+        self.resume_request_ids = None
+        self.use_coordinator = False
+
+        self.ep_world_size = 1
+
+        self.step_start_event = MagicMock()
+        self.step_end_event = MagicMock()
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -132,7 +142,21 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids.append(request_id)
         return self.requests[request_id].future
 
+    async def run_engine(self, *, loop=None):
+        """Override to bypass @trace_async_exceptions for testability."""
+        return await DynamicInferenceEngine.run_engine.__wrapped__(self, loop=loop)
+
+    def suspend(self):
+        pass
+
+    def resume(self):
+        pass
+
     async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+        """Dummy async_step."""
+        await asyncio.sleep(0)
+
+        # Finish "active" requests.
         finished_request_records = []
         to_remove = []
         for request_id, entry in self.requests.items():
@@ -147,14 +171,12 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
-                    )
-                    self.socket_for_receiving_requests.send(payload)
+                    self.coordinator_client.send_engine_reply([entry.record.serialize()])
 
         for request_id in to_remove:
             del self.requests[request_id]
 
+        # Activate queued requests. They will "process" for 1 step.
         active_request_ids = []
         while self.waiting_request_ids:
             request_id = self.waiting_request_ids.popleft()
@@ -455,8 +477,8 @@ class TestCoordinatorEndToEnd:
                     assert record[-1].status == Status.COMPLETED
         finally:
             if torch.distributed.get_rank() == 0:
-                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
+                client.stop_engines()
+                await client.shutdown()
             try:
                 await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
             except asyncio.TimeoutError:
