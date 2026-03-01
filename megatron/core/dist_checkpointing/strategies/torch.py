@@ -804,7 +804,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
-        checkpoint.load_state_dict(
+        checkpoint.load(
             pyt_state_dict,
             fsr,
             planner=MCoreLoadPlanner(
@@ -813,6 +813,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
+            no_dist=True,
         )
 
         self.cached_global_metadata = (
