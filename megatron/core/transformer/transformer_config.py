@@ -1147,10 +1147,11 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            warnings.warn(
+                "moe_ffn_hidden_size is ignored for dense layers (num_moe_experts is None)."
+            )
+            self.moe_ffn_hidden_size = None
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
