@@ -31,14 +31,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     host: str
     port: int
 
-    _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-
-        assert self._server_task is not None, "Inference server is not initialized"
         tokenizer = get_tokenizer()
         args = get_args()
 
@@ -97,24 +94,24 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
-            loop = asyncio.get_event_loop()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_flask_server
+
             client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
-            server_task = loop.create_task(run_flask_server_on_client(
-                client=client,
+
+            start_flask_server(
+                coordinator_addr=dp_addr,
                 tokenizer=inference_engine.controller.tokenizer,
+                rank=dist.get_rank(),
                 flask_port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
-            ))
+            )
         else:
             client = None
-            server_task = None
-            
+
         launched_server = cls(**kwargs)
         launched_server._client = client
-        launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
@@ -125,6 +122,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def kill(self):
         if dist.get_rank() == 0:
             await self._client.stop_engines()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_flask_server
+            stop_flask_server()
+
         await self._inference_engine.stopped.wait()
 
     def increment_staleness(self):
