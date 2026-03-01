@@ -13,7 +13,6 @@ from collections import deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
 
-import msgpack
 import pytest
 import torch
 
@@ -80,6 +79,7 @@ class DummyContext:
 
     def __init__(self):
         self.active_cnt = 0
+        self.step_count = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -109,7 +109,6 @@ class DummyEngine(DynamicInferenceEngine):
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.pending_microbatch = deque()
         self.received_pause: bool = False
         self.received_stop: bool = False
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -147,10 +146,7 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
-                    )
-                    self.socket_for_receiving_requests.send(payload)
+                    self.coordinator_client.send_engine_reply([entry.record.serialize()])
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -455,8 +451,8 @@ class TestCoordinatorEndToEnd:
                     assert record[-1].status == Status.COMPLETED
         finally:
             if torch.distributed.get_rank() == 0:
-                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
+                await asyncio.wait_for(client.send_signal(Headers.STOP), timeout=10.0)
+                await client.shutdown()
             try:
                 await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
             except asyncio.TimeoutError:

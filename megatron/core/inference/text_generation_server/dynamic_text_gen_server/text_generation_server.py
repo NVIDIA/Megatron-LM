@@ -105,7 +105,7 @@ async def _run_text_gen_server(
 
     finally:
         # Gracefully shut down the client when the server stops
-        inference_client.stop()
+        await inference_client.shutdown()
         logger.info(f"Rank {rank}: Web server and client shut down.")
 
 

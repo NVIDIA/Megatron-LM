@@ -160,7 +160,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
-            self._client.stop()
+            await self._client.shutdown()
 
         if dist.get_rank() == 0:
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
