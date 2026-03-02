@@ -720,9 +720,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
 
-        # Reset attention and Mamba state.
-        self.reset_attention_state()
-        self.reset_mamba_state()
+        # Reset entire context state.
+        self.reset()
 
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
@@ -736,24 +735,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        if self._uses_torch_memory_saver:
-            # Need to bring back the memory block before we do anything else.
-            torch_memory_saver.resume("inference_context")
-        elif self.unified_memory_level != 0:
-            # Include this for code readability.
-            pass
-        else:
-            if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
-                for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
-                    tensor.storage().resize_(self._offloadable_storage_sizes[name])
-                    tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
-            elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-                self.is_tensor_state_allocated = False
-                self.initialize_all_tensors()
+        if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
+            # Need to bring back the memory block before we reset it.
+            if self._uses_torch_memory_saver:
+                torch_memory_saver.resume("inference_context")
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset()
+            return
 
-        # No matter which memory mode, in RECOMPUTE we need to reset the context.
-        if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self.reset()
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
+            self.initialize_all_tensors()
 
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
