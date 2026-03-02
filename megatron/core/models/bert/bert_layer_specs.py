@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import warnings
+from functools import partial
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -70,8 +71,8 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
             ),
         ),
         self_attn_bda=get_bias_dropout_add,
-        mlp=ModuleSpec(
-            module=MLP,
+        mlp=partial(
+            MLP.as_mlp_submodule,
             submodules=MLPSubmodules(
                 linear_fc1=not_none(TELayerNormColumnParallelLinear),
                 linear_fc2=not_none(TERowParallelLinear),
@@ -121,8 +122,8 @@ bert_layer_local_spec = ModuleSpec(
         ),
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=LNImpl,
-        mlp=ModuleSpec(
-            module=MLP,
+        mlp=partial(
+            MLP.as_mlp_submodule,
             submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
         ),
         mlp_bda=get_bias_dropout_add,
