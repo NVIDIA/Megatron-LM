@@ -1363,7 +1363,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.delay_offload_until_cuda_graph:
                 assert (
-                    self.external_cuda_graph or self.enable_cuda_graph
+                    self.transformer_impl == "transformer_engine"
                 ), "delay_offload_until_cuda_graph must be used with cuda graph."
             assert (
                 self.min_offloaded_tensor_size >= 0
@@ -1378,6 +1378,7 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.cuda_graph_impl == "transformer_engine"
                 ), "cuda_graph_impl must be transformer_engine when enabling offloading."
+            if self.cuda_graph_impl == "transformer_engine":
                 assert (
                     self.cuda_graph_scope is not None
                 ), "cuda_graph_scope must be set when enabling offloading."
