@@ -285,9 +285,25 @@ class MockSFTLowLevelDataset:
         # later in MockSFTDataset.__getitem__, making the total 'length' tokens.
         length = int(self.sequence_lengths[idx % self.size])
         if hasattr(self, 'indexed_dataset'):
-            doc_idx = idx % len(self.indexed_dataset)
+            target = length - 1
+            num_docs = len(self.indexed_dataset)
+            doc_idx = idx % num_docs
             raw = self.indexed_dataset[doc_idx]
-            sample = raw[:length - 1]
+            if len(raw) >= target:
+                sample = raw[:target]
+            else:
+                # Concatenate documents until we reach the target length.
+                chunks = [raw]
+                total = len(raw)
+                next_doc = doc_idx + 1
+                while total < target:
+                    raw_next = self.indexed_dataset[next_doc % num_docs]
+                    need = target - total
+                    chunks.append(raw_next[:need])
+                    total += min(len(raw_next), need)
+                    next_doc += 1
+                sample = np.concatenate(chunks)[:target]
+            assert len(sample) == target
             return sample.astype(np.int64)
         else:
             return np.arange(1, length, dtype=np.int64)
