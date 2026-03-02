@@ -91,7 +91,13 @@ def _test_fused_apply_mla_rope_for_q(input_format):
 
     no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
     pe_output = apply_rotary_pos_emb(
-        pe, freqs, transformer_config, cu_seqlens=cu_seqlens, mscale=mscale, cp_group=FakeCPGroup()
+        pe,
+        freqs,
+        transformer_config,
+        cu_seqlens=cu_seqlens,
+        mscale=mscale,
+        cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
     )
     pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
@@ -190,6 +196,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
     )
     if input_format == "sbhd":
         pe_output = pe_output.expand(-1, -1, num_heads, -1)
