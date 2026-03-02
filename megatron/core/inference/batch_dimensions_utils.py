@@ -176,9 +176,9 @@ class InferenceBatchDimensions:
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
 
         # We force eager mode for scenarios where some ranks will run with CUDA graphs
-        # while others will not. Without this check, the all-to-all communication in the
+        # while others will not. Without this check, communication in the
         # expert routing layer would pad up to the maximum capacity only for the ranks that
-        # are using CUDA graphs in this step, leading to a NCCL hang.
+        # are using CUDA graphs in this step, leading to a hang.
         # This can happen in the following cases:
         #   1. If we only allow decode CUDA graphs but some ranks are running non-decode batches
         #   2. Some ranks are running explicit chunked prefill requests
