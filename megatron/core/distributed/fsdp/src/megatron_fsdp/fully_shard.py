@@ -20,6 +20,7 @@ from typing import Callable, Optional, Sequence, Type
 import torch
 from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from .megatron_fsdp import MegatronFSDP
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
@@ -456,6 +457,20 @@ def fully_shard_optimizer(
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
+    # Pre-initialize the optimizer state for checkpoint loading via DCP.
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.numel() == 0 or (
+                hasattr(param, "_local_tensor") and param._local_tensor.numel() == 0
+            ):
+                # Avoid FusedAdam errors on empty tensor input.
+                continue
+            # Optimizer state is built from wgrad.
+            param.grad = torch.zeros_like(param)
+    # Non-lazy optimizer state initialization.
+    optimizer.step()
+    optimizer.zero_grad()
+
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
     # waits for asynchronous gradient reduce-scatter work to be completed, and updates
     # model weights. These options can be turned off via arguments in optimizer.step().
@@ -509,13 +524,88 @@ def fully_shard_optimizer(
     optimizer.zero_grad = types.MethodType(megatron_fsdp_optimizer_zero_grad, optimizer)
 
     if preproc_state_dict_for_dcp_ckpt:
-        # Requires a non-empty, DTensor-type optimizer state dictionary.
-        # This is satisfied naturally by calling optimizer.state_dict()
-        # after the first optimizer.step() initializes the state to match
-        # the Megatron-FSDP
-        optimizer_state_dict = optimizer.state_dict()
+
+        def dict_nested_shallow_copy(d: dict):
+            """Create a nested shallow copy of a dict. Same values, different pointers."""
+            if not isinstance(d, dict):
+                return d
+            return {
+                k: dict_nested_shallow_copy(v) if isinstance(v, dict) else v for k, v in d.items()
+            }
+
+        def preprocess_optimizer_state_dict_for_uneven_dtensor(optimizer, state_dict):
+            """
+            Hook that mocks the global optimizer state for unevenly-distributed
+            DTensors, as the optimizer state is only initialized for non-empty
+            parameters, and preprocesses the optimizer `state_dict` DTensors
+            in-place for Torch DCP.
+            """
+            # Retrieve a template optimizer state.
+            optim_state_template = next(iter(optimizer.state.values())) if optimizer.state else {}
+            # All-gather the optimizer state keys as this rank could have empty state.
+            optim_state_dtensor_keys = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                optim_state_dtensor_keys,
+                [
+                    # Only track keys associated with DTensors for DCP.
+                    key
+                    for key, val in optim_state_template.items()
+                    if isinstance(val, DTensor)
+                ],
+            )
+            optim_state_dtensor_keys = list(
+                set([key for state in optim_state_dtensor_keys for key in state])
+            )
+
+            # NOTE(@cspades): Re-construct the Megatron-FSDP distributed parameter
+            # to index mapping as implemented in torch.optim.Optimizer.state_dict():
+            # https://github.com/pytorch/pytorch/blob/main/torch/optim/optimizer.py
+            # Simply put, the index maps to the very first appearance of id(param)
+            # looping through all parameters in all groups with memory address
+            # equivalent to the distributed parameter managed by Megatron-FSDP.
+            param_state_idx = {}
+            idx = 0
+            # For all empty parameters, mock empty DTensors for all empty parameters
+            # of Megatron-FSDP's unevenly-distributed optimizer state into a shallow
+            # copy of the state dictionary to synchronize and pre-process a global
+            # variant of the optimizer state in preparation for Torch DCP. This allows
+            # us to sync the non-empty DTensor shard metadata across sharding groups
+            # while excluding empty DTensor shards from the optimizer checkpoint.
+            optim_state_extended = dict_nested_shallow_copy(state_dict)
+            for param_group in optimizer.param_groups:
+                for param in param_group["params"]:
+                    # Update the parameter state index.
+                    # For shared params, use same index.
+                    if id(param) not in param_state_idx:
+                        # New parameter, assign an index.
+                        param_state_idx[id(param)] = idx
+                        idx += 1
+                    if param in optimizer.state or not isinstance(param, DTensor):
+                        # Only mock optimizer state for parameters that are missing state.
+                        # No need to mock for non-DTensor params. Not relevant to DCP.
+                        continue
+                    for key in optim_state_dtensor_keys:
+                        # Construct a mock DTensor state for the empty DTensor parameter.
+                        param_idx = param_state_idx[id(param)]
+                        optim_state_extended["state"].setdefault(param_idx, {})[key] = (
+                            DTensor.from_local(
+                                local_tensor=torch.empty(0, dtype=param.dtype, device=param.device),
+                                device_mesh=param.device_mesh,
+                                placements=param.placements,
+                                shape=param.shape,
+                                stride=param.stride(),
+                            )
+                        )
+
+            # Synchronize and preprocess DTensor metadata for Torch DCP.
+            preprocess_state_dict_for_uneven_dtensor(optim_state_extended)
+
+        # Attach the optimizer state_dict() post-hook to prepare DTensors for Torch DCP.
+        # args = (optimizer, state_dict)
         optimizer.register_state_dict_post_hook(
-            lambda *args, **kwargs: preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+            lambda *args, **kwargs: preprocess_optimizer_state_dict_for_uneven_dtensor(
+                args[0], args[1]
+            )
         )
 
     # Return the in-place modified optimizer.

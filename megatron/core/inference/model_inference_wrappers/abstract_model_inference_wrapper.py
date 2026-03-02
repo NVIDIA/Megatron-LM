@@ -62,7 +62,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
-        if self.config.fp8 is not None:
+        if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)
 
         # TODO(ksanthanam): Add support for fp4

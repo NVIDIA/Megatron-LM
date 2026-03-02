@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -13,6 +13,8 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -39,6 +41,21 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
+
+
+def _apply_linear(
+    x: torch.Tensor,
+    weight: Union[torch.Tensor, MXFP8Tensor],
+    config: TransformerConfig,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Helper to apply either MXFP8 or standard GEMM based on the configuration.
+    """
+    kwargs = {"out": out} if out is not None else {}
+    if config.fp8_recipe == "mxfp8":
+        return mm_mxfp8(x, weight, **kwargs)
+    return torch.matmul(x, weight.t(), **kwargs)
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
@@ -156,7 +173,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
 
-        x = torch.matmul(x, self.weight.t())
+        x = _apply_linear(x, self.weight, self.config)
 
         return x, None
 
@@ -218,10 +235,15 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         # 1. check if bf16
         is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if hopper
+        # 2. check if mxfp8
+        use_mxfp8 = self.config.fp8_recipe == "mxfp8"
+        # 3. check if hopper or newer
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        # 3. attempt to ask for symmetric memory
+        # 4. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
+        if use_mxfp8:
+            # Remove batch dimension for FlashInfer mxfp8
+            del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
@@ -230,10 +252,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         can_use_custom_nvls_collectives = (
             is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
         )
+
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
-            torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
-            x = symm_mem_buffer["tensor"]
+
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
+
             # perform nvls reduce-scatter
             if self.next_layer_norm_weights is None:
                 output_dims = list(x.size())
@@ -263,7 +287,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 return residual
         else:
             # revert to torch dist (NCCL) reduce-scatter
-            x = torch.matmul(x, self.weight.t())
+            x = _apply_linear(x, self.weight, self.config)
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
@@ -287,7 +311,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Forward pass.
         """
         if self.tp_size == 1:
-            x = torch.matmul(x, self.weight.t())
+            x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
             x = self._matmul_reduce_scatter(x)

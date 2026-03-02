@@ -133,6 +133,7 @@ class InferenceBatchDimensions:
         strict: bool,
         decode_only_cuda_graphs: bool,
         explicit_chunked_prefill: bool,
+        cuda_graph_mixed_prefill_count: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
@@ -157,6 +158,7 @@ class InferenceBatchDimensions:
         # all reduce local work across expert model parallel group
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
+
         sync_tensor = torch.tensor(
             [
                 local_batch_dims.token_count,
@@ -193,12 +195,22 @@ class InferenceBatchDimensions:
         adjusted_decode_req_count = (
             int(sync_tensor[3].item()) if strict else local_batch_dims.decode_req_count
         )
+        adjusted_token_count = int(sync_tensor[0].item())
+
+        # When any EP rank has prefill requests (non-strict mode), elevate
+        # the token count to be >= the smallest prefill/mixed cuda graph.
+        # This ensures decode-only ranks don't match a fine-grained decode
+        # graph while prefill ranks match a coarser mixed graph, which would
+        # produce inconsistent token counts across EP ranks.
+        if is_any_ep_rank_in_non_decode and not strict:
+            adjusted_token_count = max(adjusted_token_count, cuda_graph_mixed_prefill_count)
 
         adjusted_batch_dim = InferenceBatchDimensions(
-            token_count=int(sync_tensor[0].item()),
+            token_count=adjusted_token_count,
             prefill_req_count=adjusted_prefill_req_count,
             decode_req_count=adjusted_decode_req_count,
         )
+
         return adjusted_batch_dim
 
 
@@ -235,6 +247,25 @@ class CUDAGraphBatchDimensionBuilder:
             (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
             [1000, 752, 504, 256]
         """
+        if num_cuda_graphs == -1:
+            # automatically determine the number of CUDA graphs to
+            # capture based on the `max_requests` value
+            cuda_graph_token_counts = (
+                [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
+            )
+            # Align each entry to TP size
+            cuda_graph_token_counts = list(
+                dict.fromkeys(math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts)
+            )
+            # Clamp to max tokens
+            cuda_graph_token_counts = [
+                s for s in cuda_graph_token_counts if s <= cuda_graph_max_tokens
+            ]
+            if not cuda_graph_token_counts or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
+                cuda_graph_token_counts.append(cuda_graph_max_tokens)
+            cuda_graph_token_counts.reverse()
+            return cuda_graph_token_counts
+
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
         assert (
             cuda_graph_max_tokens > 0
@@ -340,7 +371,18 @@ class CUDAGraphBatchDimensionBuilder:
                 or cuda_graph_max_tokens <= 0
             ):
                 cuda_graph_max_tokens = max_tokens
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
+
+            assert cuda_graph_max_tokens == max_requests, (
+                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests "
+                f"({max_requests}). This is required for correctly syncing EP ranks: "
+                f"prefill and decode graph pools must have the same token count granularity."
+            )
+
+            if num_cuda_graphs != -1:
+                # if -1, no need to adjust. This will be taken care of in
+                # the _calculate_cuda_graph_token_counts function where we will generate
+                # the token counts based on the max_tokens value and the step size.
+                num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
             # Calculate token counts for prefill and mixed graphs.
             # These need the full cuda_graph_max_tokens to handle variable-length sequences.
@@ -432,6 +474,7 @@ class CUDAGraphBatchDimensionBuilder:
     def match_graph_config(
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
+        cuda_graph_mixed_prefill_count: int,
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         explicit_chunked_prefill: bool = False,
@@ -466,6 +509,7 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             explicit_chunked_prefill=explicit_chunked_prefill,
             ep_group=ep_group,
+            cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
         )
 
         if adjusted_batch_dim is None:
@@ -488,4 +532,5 @@ class CUDAGraphBatchDimensionBuilder:
             return None
         # then find the best batch dimension
         best_batch_dim = min(graph_batch_dims_applicable)
+
         return best_batch_dim
