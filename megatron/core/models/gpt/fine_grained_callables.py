@@ -602,7 +602,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         # Flush the delayed groups.
         # This process happens only during the warmup steps of cuda graph.
-        if node.chunk_state.flush_delayed_groups:
+        if layer.config.delay_offload_until_cuda_graph and node.chunk_state.flush_delayed_groups:
             off_interface.flush_delayed_groups()
 
         # Need to record tensors created on comp stream to comm stream
