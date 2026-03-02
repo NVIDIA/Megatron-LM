@@ -792,6 +792,9 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
+            # This flag is for the MLA-style interleaving in RoPE.
+            # Set it to False, as indexer does not apply interleaved RoPE.
+            mla_rotary_interleaved=False,
         )
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_pe, x_nope], dim=-1)
