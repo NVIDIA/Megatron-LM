@@ -95,14 +95,13 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         )
     else:
         raise ValueError(
-            'expert_type can only be one of ["sequential", "te_sequential", "grouped",'
-            ' "te_grouped"]'
+            'expert_type can only be one of ["sequential", "te_sequential", "te_grouped"]'
         )
     return model
 
 
-expert_type = ['sequential', 'grouped']
-src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
+expert_type = ['sequential']
+src_dest_expert_type = []
 if is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
