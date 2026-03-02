@@ -189,21 +189,18 @@ class GroupedRolloutGenerator(Agent, ABC):
             maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
-        yielded_groups = 0
 
         @trace_async_exceptions(verbose=True)
         async def group_task():
-            nonlocal submitted_groups, yielded_groups
+            nonlocal submitted_groups
             while request.streaming or submitted_groups < request.num_groups:
+                group_index = submitted_groups
                 submitted_groups += 1
                 group = await self.group_rollout(request=request)
                 if (
                     not request.filter_groups_with_same_reward
                     or np.std([r.reward for r in group]) > 1e-6
                 ):
-                    # Tag each rollout with its submission order.
-                    group_index = yielded_groups
-                    yielded_groups += 1
                     for rollout in group:
                         rollout.submission_index = group_index
                     await grouped_rollouts.put(group)
