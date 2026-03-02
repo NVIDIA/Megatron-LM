@@ -11,7 +11,6 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -117,7 +116,7 @@ class TestCPUTensors:
         ) as ckpt_dir:
             save(sharded_state_dict, ckpt_dir)
 
-            distcp_files = [(ckpt_dir / '__0_0.distcp'), (ckpt_dir / '__0_1.distcp')]
+            distcp_files = [(ckpt_dir / '__0_0.distcp')]
             for file in distcp_files:
                 assert file.exists()
                 file_size = file.stat().st_size

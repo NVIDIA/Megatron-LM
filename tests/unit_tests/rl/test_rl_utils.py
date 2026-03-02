@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
-import os
-from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,7 +14,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
@@ -77,6 +78,7 @@ class MockTokenizer:
         self.eod = 43
         self.vocab_size = VOCAB
         self.bos = None
+        self.library = None
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
@@ -314,6 +316,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=[[1, 2, 3, 4]],
@@ -322,6 +328,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
 
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -340,6 +350,10 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
@@ -348,9 +362,13 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
-        data_iter = rl_utils.prepare_data_for_update(
+        data_iter, _, _ = rl_utils.prepare_data_for_update(
             [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
 
@@ -381,6 +399,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
+            policy_staleness=[[0, 0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
             trajectory=[[4, 5, 6, 7, tokenizer.eod]] * num_turns,
@@ -389,6 +411,10 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
             trajectory=[[8, 9, tokenizer.eod]] * num_turns,
@@ -397,6 +423,10 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
+            policy_staleness=[[0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
 
         rollouts = [r1, r2, r3]
@@ -671,6 +701,76 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2, 4], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_gpt_logprobs(self, initialize_model_parallel):
+        """Test get logprobs on an actual model, not on a mocked one.
+
+        This can be useful for quick benchmarking/analyzing regressions too.
+        """
+
+        world_size, dp, tp, pp = initialize_model_parallel
+        micro_batch_size = 2
+        self.create_test_args(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            bf16=True,
+            micro_batch_size=micro_batch_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        transformer_config = TransformerConfig(
+            num_layers=10,
+            hidden_size=128,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            embedding_init_method_std=1.0,
+            bf16=True,
+            pipeline_dtype=torch.bfloat16,  # Without this, pp!=1 runs will fail.
+        )
+        vocab_size = 10_000
+        pp_group = ProcessGroupCollection.use_mpu_process_groups().pp
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=vocab_size,
+            max_sequence_length=4192,
+            pre_process=is_pp_first_stage(pp_group),
+            post_process=is_pp_last_stage(pp_group),
+        ).cuda()
+        sequence_length = gpt_model.max_sequence_length
+
+        gpt_model = Float16Module(gpt_model.config, gpt_model)
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+
+        with torch.no_grad():
+            logprobs = rl_utils.compute_logprobs_batch(
+                model=gpt_model,
+                data_loader=[(input_ids, position_ids)],
+                forward_backward_func=get_forward_backward_func(pp_size=pp),
+                packing_context=None,
+                trajs_batch_size=micro_batch_size,
+                seq_length=sequence_length,
+                logprobs_batch_size=micro_batch_size,
+                decoder_seq_length=sequence_length,
+                dtype=torch.bfloat16,
+                pp_group=gpt_model.pg_collection.pp,
+                is_correction=False,
+                collect_non_loss_data=True,
+            )
+        if is_pp_last_stage(pp_group):
+            assert logprobs.shape == (micro_batch_size, sequence_length - 1)
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
@@ -795,3 +895,87 @@ class TestRLUtils:
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
+
+    def test_compute_true_staleness(self):
+        # Single group, 2 turns: turn 1 has 1 token, turn 2 has 2 tokens
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[1, 2, 3]],
+            completed_at_steps=[[8, 7]],
+            turn_lens=[[1, 2]],
+            current_iteration=10,
+        )
+        # token 0: 1 + (10-8) = 3
+        # token 1: 2 + (10-7) = 5
+        # token 2: 3 + (10-7) = 6
+        assert result == [3, 5, 6]
+
+        # Multiple groups
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[0, 0], [1]],
+            completed_at_steps=[[5], [5]],
+            turn_lens=[[2], [1]],
+            current_iteration=6,
+        )
+        # group 1: [0+1, 0+1] = [1, 1]
+        # group 2: [1+1] = [2]
+        assert result == [1, 1, 2]
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prep_wandb_metrics(self, initialize_model_parallel):
+        # This tests the computation and makes us fail noisily if
+        # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
+        traj_lens = [[3, 3], [1, 2]]
+        turn_lens = [[1, 2, 1, 1, 1], [1, 2]]
+        rewards = [[1, 1], [-1, 2]]
+        num_turns = [[42, 2], [10, 8]]
+        advantages = [0, 1]
+        # Per-token staleness (6 tokens in group 1, 3 in group 2; matching turn_lens)
+        policy_staleness = [[1, 2, 2, 0, 0, 3], [0, 3, 3]]
+        kv_cache_staleness = [[1, 1, 1, 0, 0, 2], [0, 2, 2]]
+        num_evictions = [[0, 1], [0, 0]]
+        # Per-turn completed_at_steps (5 turns in group 1, 2 in group 2; matching turn_lens)
+        completed_at_steps = [[5, 4, 5, 5, 3], [5, 3]]
+        current_iteration = 6
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_staleness=policy_staleness,
+            kv_cache_staleness=kv_cache_staleness,
+            num_evictions=num_evictions,
+            completed_at_steps=completed_at_steps,
+            current_iteration=current_iteration,
+        )
+        assert metrics["mean_reward"] == 0.75
+        assert metrics["mean_advantage"] == 0.5
+        assert metrics["nonzero_groups_ratio"] == 0.5
+        assert metrics["max_traj_length"] == 3
+        assert metrics["min_traj_length"] == 1
+        assert metrics["mean_traj_length"] == 2.25
+        assert metrics["mean_traj_length_std"] == 0.25
+        assert metrics["max_turn_length"] == 2
+        assert metrics["min_turn_length"] == 1
+        assert metrics["mean_turn_length"] == 1.35
+        assert np.isclose(metrics["mean_turn_length_std"], 0.45)
+        assert metrics["mean_num_turns"] == 15.5
+        assert metrics["max_num_turns"] == 42
+        assert metrics["min_num_turns"] == 2
+        # true_policy_staleness = [2, 4, 4, 1, 1, 6, 1, 6, 6]
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 4, 1, 1, 6, 1, 6, 6])
+        assert metrics["max_policy_staleness"] == 6
+        assert metrics["min_policy_staleness"] == 1
+        # true_kv_staleness = [2, 3, 3, 1, 1, 5, 1, 5, 5]
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 3, 1, 1, 5, 1, 5, 5])
+        assert metrics["max_kv_cache_staleness"] == 5
+        assert metrics["min_kv_cache_staleness"] == 1
+        assert metrics["total_eviction_count"] == 1
+        assert metrics["max_num_evictions"] == 1
+        # completion_gaps per-turn = [1, 2, 1, 1, 3, 1, 3]
+        assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 1, 3, 1, 3])

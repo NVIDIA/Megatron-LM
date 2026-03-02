@@ -99,8 +99,19 @@ class RemoteCopyService:
         PELogger.init(self.my_pe, level=log_level)
         PELogger.info(f"Initializing RemoteCopyService on PE {self.my_pe}/{self.n_pes}")
 
+        # Barrier to ensure ALL PEs finish NVSHMEM init before ANY PE starts buffer allocation
+        # buffer_manager.allocate() calls bytetensor() which is a collective operation
+        # Without this barrier, early PEs call bytetensor() while late PEs
+        # are still in init() -> deadlock
+        nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
+        self.gpu_resources.send_stream.sync()  # Ensure barrier completes on CPU
+
         # Allocate double-buffered send/recv slots
         self.buffer_manager.allocate()
+
+        # Barrier to ensure all PEs complete buffer allocation before proceeding
+        nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
+
         PELogger.debug("Allocated double-buffered send/recv slots")
 
         # Load CUDA kernels
@@ -128,6 +139,15 @@ class RemoteCopyService:
             self.gpu_resources.torch_unpack_stream,
             self.gpu_resources.torch_copy_stream,
         )
+
+        # Synchronize all NVSHMEM streams before returning
+        # This ensures all barrier operations complete and streams are idle
+        # Without this, subsequent torch.cuda.synchronize() may hang waiting for pending work
+        self.gpu_resources.send_stream.sync()
+        self.gpu_resources.pack_stream.sync()
+        self.gpu_resources.unpack_stream.sync()
+        self.gpu_resources.copy_stream.sync()
+
         PELogger.info("Initialization complete")
 
     def register_send(

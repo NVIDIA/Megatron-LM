@@ -59,6 +59,7 @@ class TestDynamicContext:
         is_hybrid_model=False,
         layer_type_list=None,
         paused_buffer_size_gb=None,
+        num_cuda_graphs=None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -80,7 +81,7 @@ class TestDynamicContext:
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
-                num_cuda_graphs=None,
+                num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=True,
                 buffer_size_gb=buffer_size_gb,
                 paused_buffer_size_gb=(
@@ -1287,3 +1288,208 @@ class TestDynamicContext:
         assert (
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
+    @rounder_override(64)
+    def test_mamba_memory_ratio_allocation(self, ratio):
+        """
+        Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        buffer_gb = 0.05
+        paused_gb = 0.01
+        block_size = 256
+        num_attention_heads = 8
+        kv_channels = 64
+        params_dtype = torch.float32
+
+        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+        )
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=2,  # 1 Attn, 1 Mamba
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=buffer_gb,
+                paused_buffer_size_gb=paused_gb,
+                block_size_tokens=block_size,
+                max_tokens=2048,
+                mamba_inference_state_config=mamba_config,
+                mamba_memory_ratio=ratio,
+                unified_memory_level=0,
+            ),
+        )
+
+        dtype_size = torch.tensor([], dtype=params_dtype).element_size()
+
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
+        mamba_mem_per_req *= dtype_size
+
+        kv_buffer_bytes = int(buffer_gb * 1024**3)
+        kv_paused_bytes = int(paused_gb * 1024**3)
+        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+        expected_mamba_mem = total_mem_bytes * ratio
+        expected_mamba_max_reqs = int(expected_mamba_mem // mamba_mem_per_req)
+
+        # KV block calculation with buffer size reduced by Mamba memory ratio
+        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
+        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
+
+        expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+        expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
+        expected_total_blocks = expected_active_blocks + expected_paused_blocks
+
+        # Check that block allocator received the reduced block counts
+        assert context.block_allocator.total_count == expected_active_blocks
+        assert context.block_allocator.paused_count == expected_paused_blocks
+
+        # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
+        # or the block count - 1 if that is smaller
+        expected_limit = min(expected_total_blocks - 1, expected_mamba_max_reqs)
+
+        # Apply rounding (REQUEST_ROUNDER = 64 in this test)
+        expected_max_requests = (expected_limit // 64) * 64
+
+        assert context.max_requests == expected_max_requests
+        assert context.is_hybrid_model is True
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_max_requests_less_than_tp_size(self):
+        tp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp_size,
+        )
+
+        inference_config = InferenceConfig(
+            max_sequence_length=512, buffer_size_gb=0.1, block_size_tokens=128, max_requests=1
+        )
+
+        with pytest.raises(AssertionError):
+            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize("num_cuda_graphs", [-1, 16, 32])
+    def test_add_dummy_requests_for_expert_parallel_step_matches_slow_path(
+        self, is_hybrid_model: bool, num_cuda_graphs: int
+    ):
+        """The fast path (add_dummy_requests_for_expert_parallel_step) must leave
+        the same observable state as the slow path
+        (add_dummy_requests_for_cudagraph_capture(min(cuda_graph_dims))).
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=is_hybrid_model,
+            layer_type_list=(
+                [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION]
+                if is_hybrid_model
+                else None
+            ),
+            num_cuda_graphs=num_cuda_graphs,
+        )
+
+        smallest = min(ctx.cuda_graph_batch_dimensions_list)
+        N = smallest.decode_req_count
+        assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
+
+        # --- slow path (reference) ---
+        ctx.add_dummy_requests_for_cudagraph_capture(smallest)
+
+        slow_total_request_count = ctx.total_request_count
+        slow_active_token_count = ctx.active_token_count
+        slow_num_prefill_requests = ctx.num_prefill_requests
+        slow_request_query_lengths = ctx.request_query_lengths[:N].clone()
+        slow_request_kv_length_offsets = ctx.request_kv_length_offsets[:N].clone()
+        slow_request_to_kv_block_ids_col0 = ctx.request_to_kv_block_ids[:N, 0].clone()
+        slow_token_to_block_idx = ctx.token_to_block_idx[:N].clone()
+        slow_token_to_local_pos = ctx.token_to_local_position_within_kv_block[:N].clone()
+        if is_hybrid_model:
+            slow_token_to_request_idx = ctx.token_to_request_idx[:N].clone()
+            slow_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N].clone()
+
+        # --- reset and run fast path ---
+        ctx.reset()
+        ctx.add_dummy_requests_for_expert_parallel_step()
+
+        # 1. Scalar counts
+        assert ctx.total_request_count == slow_total_request_count
+        assert ctx.active_token_count == slow_active_token_count
+        assert ctx.num_prefill_requests == slow_num_prefill_requests
+
+        # 2. Per-request MHA state
+        assert torch.equal(ctx.request_query_lengths[:N], slow_request_query_lengths)
+        assert torch.equal(ctx.request_kv_length_offsets[:N], slow_request_kv_length_offsets)
+        assert torch.equal(ctx.request_to_kv_block_ids[:N, 0], slow_request_to_kv_block_ids_col0)
+
+        # 3. Token-level state
+        dummy_block_idx = ctx.block_allocator.dummy_block_idx
+        assert torch.all(ctx.token_to_block_idx[:N] == dummy_block_idx)
+        assert torch.equal(ctx.token_to_block_idx[:N], slow_token_to_block_idx)
+        assert torch.equal(ctx.token_to_local_position_within_kv_block[:N], slow_token_to_local_pos)
+
+        if is_hybrid_model:
+            # 4. token_to_request_idx
+            assert torch.equal(ctx.token_to_request_idx[:N], slow_token_to_request_idx)
+
+            # 5. Mamba state slots allocated (indices may differ, but must be valid and unique)
+            fast_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N]
+            assert (fast_mamba >= 0).all(), "fast path should allocate valid mamba slots"
+            assert (slow_mamba >= 0).all(), "slow path should allocate valid mamba slots"
+            assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
+
+    @pytest.mark.internal
+    def test_gqa_high_tp_partition_heads(self):
+        """Tests that TP > GQA results in 1 attention head per partition."""
+        tp_size = 8
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=16,
+            num_query_groups=2,  # GQA = 2
+            tensor_model_parallel_size=tp_size,
+        )
+
+        # max_requests must be divisible by TP size (8) and REQUEST_ROUNDER
+        inference_config = InferenceConfig(
+            max_sequence_length=512, buffer_size_gb=0.1, block_size_tokens=128, max_requests=8
+        )
+
+        dynamic_context = DynamicInferenceContext(
+            model_config=model_config, inference_config=inference_config
+        )
+
+        # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
+        assert dynamic_context.num_attention_heads_per_partition == 1
