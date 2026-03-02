@@ -304,7 +304,7 @@ class HybridCPDataLoaderWrapper:
                 tokens = torch.cat([tokens, torch.zeros(pad_len, dtype=tokens.dtype, device=tokens.device)])
                 labels = torch.cat([labels, torch.zeros(pad_len, dtype=labels.dtype, device=labels.device)])
                 loss_mask = torch.cat([loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype, device=loss_mask.device)])
-                position_ids = torch.cat([position_ids, torch.zeros(pad_len, dtype=position_ids.dtype, device=position_ids.device)])
+                position_ids = torch.cat([position_ids, torch.tensor(range(position_ids[-1] + 1, position_ids[-1] + 1 + pad_len), dtype=position_ids.dtype, device=position_ids.device)])
                 sample_padded_lens = torch.cat([sample_padded_lens, torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device)])
                 # padded_length = cu_seqlens_padded[:, -1:] + pad_len
                 # cu_seqlens_padded = torch.cat([cu_seqlens_padded, cu_seqlens_padded[:, -1:] + pad_len], dim=1)
