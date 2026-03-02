@@ -594,10 +594,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             input_layernorm_output, residual = input_layernorm_output
         else:
             residual = hidden_states
-          
+
         if self.config.fp32_residual_connection:
             residual = residual.float()
-        
+
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
@@ -1354,10 +1354,10 @@ class MoETransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
             residual = hidden_states
-        
+
         if self.config.fp32_residual_connection:
             residual = residual.float()
-        
+
         router_outputs = self.mlp(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )

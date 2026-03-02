@@ -52,7 +52,9 @@ class TESpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False) -> LayerNormBuilder:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
+    ) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
