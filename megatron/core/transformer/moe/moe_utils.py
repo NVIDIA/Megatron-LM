@@ -691,11 +691,17 @@ def topk_routing_with_score_function(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             When dense_output=False (default):
-                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts].
-                - routing_map (torch.Tensor): Shape [num_tokens, num_experts].
+                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts]. Sparse tensor
+                  containing the normalized routing probability for each token-expert pair. Non-zero
+                  entries correspond to the top-k selected experts per token.
+                - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
+                  True indicates the token is routed to that expert (i.e. the expert was in the
+                  token's top-k selection).
             When dense_output=True:
-                - probs (torch.Tensor): Shape [num_tokens, topk].
-                - top_indices (torch.Tensor): Shape [num_tokens, topk].
+                - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
+                  probabilities for each token's top-k selected experts.
+                - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
+                  selected for each token.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape

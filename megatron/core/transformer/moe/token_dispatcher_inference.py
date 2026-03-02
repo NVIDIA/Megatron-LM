@@ -8,7 +8,7 @@ AlltoAll with AllGather/ReduceScatter for token exchange, keeping all metadata
 GPU-resident to avoid host synchronizations that would break CUDA graph capture.
 
 Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
-on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
+on Hopper+ GPUs with BF16, with automatic fallback to NCCL.
 """
 
 from typing import List, Optional
@@ -52,7 +52,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
         """
-        Initialize the inference AllGather token dispatcher.
+        Initialize the InferenceCUDAGraphTokenDispatcher.
 
         Args:
             num_local_experts: Number of experts on this rank.
@@ -73,15 +73,31 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
     def _maybe_allocate_ag_buffers(
         self, routing_map: torch.Tensor, probs: torch.Tensor, hidden_states: torch.Tensor
     ) -> dict:
-        """
-        Allocate a single symmetric memory buffer for all-gather outputs of
-        routing_map, probs and hidden_states. Returns sliced views for each.
+        """Allocate a single symmetric memory output buffer for fused all-gather.
 
-        Returns dict with:
-        - "handle": symmetric memory handle (or None if unavailable)
-        - "routing_map" / "routing_map_offset": raw byte view and byte offset
-        - "probs" / "probs_offset": raw byte view and byte offset
-        - "hidden_states" / "hidden_states_offset": raw byte view and byte offset
+        Creates one contiguous symmetric memory buffer sized for the gathered
+        (global) routing_map, probs, and hidden_states, then returns sliced views
+        into it. This allows a single fused NVLS all-gather kernel to write all
+        three outputs in one launch.
+
+        Args:
+            routing_map (torch.Tensor): Local routing map, shape [local_tokens, topk].
+                Boolean or integer tensor mapping each token to its selected experts.
+            probs (torch.Tensor): Local routing probabilities, shape [local_tokens, topk].
+                Normalized weights for each token's selected experts.
+            hidden_states (torch.Tensor): Local hidden states, shape [local_tokens, hidden_dim].
+
+        Returns:
+            dict: A dictionary with the following keys:
+                - "handle": Symmetric memory handle for NVLS ops, or None if
+                  symmetric memory is unavailable.
+                - "routing_map": Raw byte view for the gathered routing map output.
+                - "routing_map_offset": Byte offset of routing_map within the buffer.
+                - "probs": Raw byte view for the gathered probs output.
+                - "probs_offset": Byte offset of probs within the buffer.
+                - "hidden_states": Raw byte view for the gathered hidden states output.
+                - "hidden_states_offset": Byte offset of hidden_states within the buffer.
+                When allocation fails, all tensor views are None and offsets are 0.
         """
         _NONE = {
             "handle": None,
@@ -121,9 +137,18 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         }
 
     def _maybe_allocate_rs_buffer(self, x: torch.Tensor) -> dict:
-        """
-        Allocate symmetric memory buffer for reduce-scatter input.
-        Input shape matches x (the unpermuted hidden states).
+        """Allocate a symmetric memory buffer for reduce-scatter input.
+
+        The buffer has the same shape and dtype as x so that x can be copied
+        into it before the NVLS reduce-scatter kernel.
+
+        Args:
+            x (torch.Tensor): The global hidden states to be reduce-scattered,
+                shape [global_tokens, hidden_dim].
+
+        Returns:
+            dict: A dictionary with keys "handle" (symmetric memory handle, or
+                None if unavailable) and "tensor" (the allocated buffer, or None).
         """
         symm_mem_buffer = get_global_symmetric_memory_buffer_ep().maybe_get_tensor(
             list(x.size()), dtype=x.dtype
@@ -131,11 +156,26 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         return symm_mem_buffer
 
     def token_dispatch(self, hidden_states, probs):
-        """
-        Gathers tokens from all EP ranks using AllGather.
+        """Gathers tokens from all EP ranks using AllGather.
 
-        Uses latency-optimized NVLS multimem_all_gather for routing_map, probs and hidden_states
-        on Hopper+ GPUs with BF16. Falls back to NCCL otherwise.
+        Performs all-gather on routing_map (stored in self.routing_map), probs,
+        and hidden_states so that every rank holds the full global view.
+        Uses latency-optimized fused NVLS multimem_all_gather on Hopper+ GPUs
+        with BF16 when symmetric memory is available. Falls back to NCCL otherwise.
+
+        Args:
+            hidden_states (torch.Tensor): Local hidden states,
+                shape [local_tokens, hidden_dim].
+            probs (torch.Tensor): Local routing probabilities,
+                shape [local_tokens, topk]. Normalized weights for each token's
+                selected experts.
+
+        Returns:
+            tuple: (hidden_states, probs) gathered across all EP ranks.
+                - hidden_states (torch.Tensor): Shape [global_tokens, hidden_dim].
+                - probs (torch.Tensor): Shape [global_tokens, topk].
+                Also updates self.routing_map in-place to the gathered
+                shape [global_tokens, topk].
         """
         if self.ep_size == 1:
             return hidden_states, probs
@@ -202,29 +242,56 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
-        """Pass-through: returns unpermuted inputs directly.
+        """Pass-through: returns inputs directly without permutation.
 
-        tokens_per_expert is not computed by this inference dispatcher. Instead,
-        the FlashInfer fused MoE kernel operates directly on the routing map.
+        Unlike the training dispatcher, this does not permute tokens or compute
+        tokens_per_expert. The downstream InferenceGroupedMLP (FlashInfer /
+        CUTLASS fused MoE kernel) operates directly on the routing map stored
+        in self.routing_map.
+
+        Args:
+            hidden_states (torch.Tensor): Gathered hidden states,
+                shape [global_tokens, hidden_dim].
+            probs (torch.Tensor): Gathered routing probabilities,
+                shape [global_tokens, topk].
+
+        Returns:
+            tuple: (hidden_states, tokens_per_expert, probs) where
+                tokens_per_expert is always None.
         """
         return hidden_states, None, probs
 
     def combine_preprocess(self, expert_output):
-        """Pass-through: InferenceGroupedMLP already produces unpermuted output."""
+        """Pass-through: InferenceGroupedMLP already produces unpermuted output.
+
+        No unpermutation is needed because dispatch_postprocess did not permute
+        the tokens in the first place.
+
+        Args:
+            expert_output (torch.Tensor): Output from InferenceGroupedMLP,
+                shape [global_tokens, hidden_dim].
+
+        Returns:
+            torch.Tensor: The input tensor unchanged.
+        """
         return expert_output
 
     def token_combine(self, hidden_states):
-        """
-        Combines expert outputs using Reduce-Scatter.
+        """Combines expert outputs across EP ranks using Reduce-Scatter.
 
-        Uses latency-optimized NVLS multimem_reduce_scatter on Hopper+ GPUs with BF16
-        when symmetric memory is available. Falls back to NCCL via superclass otherwise.
+        Reduces the global expert output (summing contributions from each rank)
+        and scatters the result so each rank receives its local token slice.
+        Uses latency-optimized NVLS multimem_reduce_scatter on Hopper+ GPUs
+        with BF16 when symmetric memory is available. Falls back to NCCL otherwise.
 
         Args:
-            hidden_states: [global_tokens, hidden_dim] tensor to reduce-scatter
+            hidden_states (torch.Tensor): Combined expert output after routing
+                weights have been applied, shape [global_tokens, hidden_dim].
 
         Returns:
-            [local_tokens, hidden_dim] tensor after reduce-scatter
+            torch.Tensor: Local slice of the reduced output,
+                shape [local_tokens, hidden_dim] where
+                local_tokens = global_tokens // ep_size.
         """
         if self.ep_size == 1:
             return hidden_states

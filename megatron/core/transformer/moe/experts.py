@@ -960,10 +960,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             and not config.inference_disable_torch_grouped_mm
         )
 
-        # FlashInfer's cutlass_fused_moe expects gated weights in [gate, activation]
-        # order, but TE stores them as [activation, gate]. Until FlashInfer supports
-        # TE's weight ordering, the FlashInfer path is only available for non-gated
-        # activations (e.g. squared_relu).
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
@@ -1000,8 +996,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         This allows:
         - load_state_dict to load into weight{i} views -> writes into big tensor
-        - forward() to use big tensor directly with torch._grouped_mm
-        - No post-load hooks needed
+        - forward() to use big tensor directly with torch._grouped_mm or FlashInfer
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device

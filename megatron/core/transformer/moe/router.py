@@ -718,7 +718,7 @@ class InferenceTopKRouter(TopKRouter):
     A stripped-down version of TopKRouter that skips z-loss, auxiliary load
     balancing losses, token dropping, and expert bias updates. The _forward()
     method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
-    instead of sparse [num_tokens, num_experts] for CUDA graph compatibility.
+    instead of sparse [num_tokens, num_experts] for compatibility with FlashInfer.
 
     Falls back to the parent TopKRouter.forward() for training or
     non-CUDA-graphed inference iterations.
