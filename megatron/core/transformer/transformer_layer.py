@@ -1285,6 +1285,8 @@ class MoETransformerLayer(TransformerLayer):
                 and "moe" in self.config.recompute_modules
                 and self.config.cuda_graph_impl == "local"
             )
+            if not hasattr(self, '_router_dtoh_event'):
+                self._router_dtoh_event = torch.cuda.Event()
             if not hasattr(self, 'cudagraph_manager_router'):
                 self.cudagraph_manager_router = CudaGraphManager(
                     self.config, self, function_name="_forward_mlp_router"
@@ -1407,10 +1409,10 @@ class MoETransformerLayer(TransformerLayer):
 
             # After the router graph replays, the captured .copy_() operations that update
             # self.token_dispatcher_attrs via `_maybe_dtoh_and_synchronize` are queued on the
-            # current stream but may not have completed. Synchronize to ensure they complete,
-            # then restore the attrs onto the token dispatcher before the eager expert_compute
-            # phase which does all-to-all using these attrs.
-            torch.cuda.current_stream().synchronize()
+            # current stream but may not have completed. Record an event after the router
+            # graph and wait on it, so we block only until the router's D2H copies complete.
+            self._router_dtoh_event.record()
+            self._router_dtoh_event.synchronize()
             for name, attr in self.token_dispatcher_attrs.items():
                 setattr(self.mlp.token_dispatcher, name, attr)
 
