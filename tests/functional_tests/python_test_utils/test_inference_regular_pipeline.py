@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _NON_REQUEST_TOP_LEVEL_KEYS = {
     # System-level metrics
     "throughput",
+    "lifetime_prefill_token_count",
     # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)
     "mem-max-allocated-bytes",
 }
