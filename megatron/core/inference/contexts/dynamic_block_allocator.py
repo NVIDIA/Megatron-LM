@@ -30,7 +30,9 @@ class BlockAllocator:
         total_count: int,
         paused_count: int,
         enable_prefix_caching: bool = False,
-        prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.REF_ZERO,
+        prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+            PrefixCachingEvictionPolicy.REF_ZERO
+        ),
     ):
 
         self.context = context
@@ -140,7 +142,10 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
-            if not self.enable_prefix_caching or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+            if (
+                not self.enable_prefix_caching
+                or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+            ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
@@ -272,7 +277,10 @@ class BlockAllocator:
         Args:
             block_ids: Tensor of block IDs that were accessed.
         """
-        if self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU or block_ids.numel() == 0:
+        if (
+            self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
+            or block_ids.numel() == 0
+        ):
             return
         self.block_timestamps[block_ids] = self.context.step_count
 
