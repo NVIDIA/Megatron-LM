@@ -64,9 +64,7 @@ class TestPartitionConfig:
         assert cfg.max_seq_len == 512
 
     def test_from_mp_config_kv_format_thd(self):
-        mp = TransformerConfig(
-            num_layers=1, hidden_size=64, num_attention_heads=4
-        )
+        mp = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
         with patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=1):
             cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512, kv_format='thd')
         assert cfg.kv_format == 'thd'
@@ -100,10 +98,13 @@ class TestPartitionConfig:
         mp = TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, context_parallel_size=2
         )
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_context_parallel_group',
-            return_value=mock_group,
-        ), patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2):
+        with (
+            patch(
+                'megatron.core.models.mimo.partition.utils.get_context_parallel_group',
+                return_value=mock_group,
+            ),
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+        ):
             cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512)
         assert cfg.cp_group is mock_group
 
@@ -116,10 +117,13 @@ class TestPartitionConfig:
             tensor_model_parallel_size=2,
             sequence_parallel=True,
         )
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_tensor_model_parallel_group',
-            return_value=mock_group,
-        ), patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=1):
+        with (
+            patch(
+                'megatron.core.models.mimo.partition.utils.get_tensor_model_parallel_group',
+                return_value=mock_group,
+            ),
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=1),
+        ):
             cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512)
         assert cfg.tp_group is mock_group
 
@@ -176,11 +180,12 @@ class TestPartitionAdapterShard:
             'loss_mask': loss_mask[:, :4],
             'attention_mask': attention_mask[:, :4],
         }
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            return_value=sharded,
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            patch(
+                'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
+                return_value=sharded,
+            ),
         ):
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask)
         assert out[0].shape == (2, 4, 16)
@@ -196,11 +201,12 @@ class TestPartitionAdapterShard:
         loss_mask = torch.ones(2, 8)
         attention_mask = torch.ones(2, 8)
         scattered = torch.rand(4, 2, 16)
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.tensor_parallel.scatter_to_sequence_parallel_region',
-            return_value=scattered,
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            patch(
+                'megatron.core.models.mimo.partition.utils.tensor_parallel.scatter_to_sequence_parallel_region',
+                return_value=scattered,
+            ),
         ):
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask)
         assert out[0].shape == (4, 2, 16)
@@ -229,14 +235,16 @@ class TestPartitionAdapterShard:
         }
         scattered = torch.rand(2, 4, 16)
 
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            return_value=cp_sharded,
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.tensor_parallel.scatter_to_sequence_parallel_region',
-            return_value=scattered,
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            patch(
+                'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
+                return_value=cp_sharded,
+            ),
+            patch(
+                'megatron.core.models.mimo.partition.utils.tensor_parallel.scatter_to_sequence_parallel_region',
+                return_value=scattered,
+            ),
         ):
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask)
         assert out[0].shape == (2, 4, 16)
@@ -249,9 +257,10 @@ class TestPartitionAdapterShard:
         labels = torch.randint(0, 100, (2, 7))
         loss_mask = torch.ones(2, 7)
         attention_mask = torch.ones(2, 7)
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), pytest.raises(AssertionError, match="divisible"):
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            pytest.raises(AssertionError, match="divisible"),
+        ):
             adapter.shard(embeddings, labels, loss_mask, attention_mask)
 
     def test_tp_comm_overlap_seq_len_assertion(self):
@@ -265,9 +274,10 @@ class TestPartitionAdapterShard:
         labels = torch.randint(0, 100, (2, 8))
         loss_mask = torch.ones(2, 8)
         attention_mask = torch.ones(2, 8)
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), pytest.raises(AssertionError, match="TP Comm overlap"):
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            pytest.raises(AssertionError, match="TP Comm overlap"),
+        ):
             adapter.shard(embeddings, labels, loss_mask, attention_mask)
 
     def test_thd_format_skips_divisibility_check(self):
@@ -287,13 +297,11 @@ class TestPartitionAdapterShard:
 
         # THD path calls tex.thd_get_partitioned_indices — mock it to return first 4 indices
         fake_index = torch.arange(4, dtype=torch.int32)
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_rank', return_value=0
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.tex'
-        ) as mock_tex:
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            patch('megatron.core.models.mimo.partition.utils.get_pg_rank', return_value=0),
+            patch('megatron.core.models.mimo.partition.utils.tex') as mock_tex,
+        ):
             mock_tex.thd_get_partitioned_indices.return_value = fake_index
             # Should NOT raise AssertionError about divisibility
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask, packed_seq_params)
@@ -312,11 +320,12 @@ class TestPartitionAdapterShard:
             'loss_mask': loss_mask[:, :4],
             'attention_mask': attention_mask[:, :4],
         }
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2
-        ), patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            return_value=cp_sharded,
+        with (
+            patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            patch(
+                'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
+                return_value=cp_sharded,
+            ),
         ):
             out = adapter.shard(None, labels, loss_mask, attention_mask)
         assert out[0] is None
@@ -378,8 +387,7 @@ class TestPartitionAdapterApplyContextParallel:
         cfg = self._make_cfg(use_cp=True, cp_group=mock_cp_group)
         adapter = PartitionAdapter(cfg)
         with patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            return_value={},
+            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank', return_value={}
         ):
             out = adapter._apply_context_parallel(None, None, None, None, None)
         assert all(v is None for v in out[:4])
@@ -419,7 +427,8 @@ class TestPartitionAdapterApplyContextParallel:
         embeddings = torch.rand(2, 5, 16)
         packed_seq_params = MagicMock(spec=PackedSeqParams)
         packed_seq_params.qkv_format = 'thd'
-        with patch(
-            'megatron.core.models.mimo.partition.utils._HAVE_TEX', False
-        ), pytest.raises(AssertionError, match="Transformer Engine"):
+        with (
+            patch('megatron.core.models.mimo.partition.utils._HAVE_TEX', False),
+            pytest.raises(AssertionError, match="Transformer Engine"),
+        ):
             adapter._apply_context_parallel(embeddings, None, None, None, packed_seq_params)

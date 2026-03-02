@@ -529,15 +529,10 @@ class TestMimoModel:
         cu_seqlens = torch.tensor(
             [0, self.seq_len, 2 * self.seq_len], dtype=torch.int64, device=device
         )
-        packing_kwargs = {
-            "cu_seqlens_q": cu_seqlens.clone(),
-            "cu_seqlens_kv": cu_seqlens.clone(),
-        }
+        packing_kwargs = {"cu_seqlens_q": cu_seqlens.clone(), "cu_seqlens_kv": cu_seqlens.clone()}
 
         # Mock get_text_embeddings and align_embeddings_by_token_positions to avoid full forward
-        text_emb = torch.zeros(
-            self.batch_size * self.seq_len, self.hidden_size, device=device
-        )
+        text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=device)
         combined_emb = torch.zeros(self.seq_len, self.batch_size, self.hidden_size, device=device)
 
         # Capture packed_seq_params via a side_effect on language_model.forward.
@@ -549,11 +544,13 @@ class TestMimoModel:
             captured['packed_seq_params'] = kwargs.get('packed_seq_params')
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=device)
 
-        with patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb), \
-             patch.object(
-                 mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
-             ), \
-             patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
+        with (
+            patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb),
+            patch.object(
+                mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
+            ),
+            patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
             mimo_model(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -593,16 +590,12 @@ class TestMimoModel:
 
         # Inject a mock partition adapter that halves the sequence dimension
         sharded_seq_len = self.seq_len // 2
-        sharded_emb = torch.zeros(
-            self.batch_size, sharded_seq_len, self.hidden_size, device=device
-        )
+        sharded_emb = torch.zeros(self.batch_size, sharded_seq_len, self.hidden_size, device=device)
         mock_adapter = MagicMock()
         mock_adapter.shard.return_value = (sharded_emb, None, None, None, None)
         mimo_model.partition_adapter = mock_adapter
 
-        text_emb = torch.zeros(
-            self.batch_size * self.seq_len, self.hidden_size, device=device
-        )
+        text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=device)
         # align_embeddings_by_token_positions returns [S, B, H]
         combined_emb = torch.zeros(self.seq_len, self.batch_size, self.hidden_size, device=device)
 
@@ -610,29 +603,23 @@ class TestMimoModel:
 
         def capture_lm_forward(*args, **kwargs):
             captured['decoder_input'] = kwargs.get('decoder_input')
-            return torch.zeros(
-                self.batch_size, sharded_seq_len, self.vocab_size, device=device
-            )
+            return torch.zeros(self.batch_size, sharded_seq_len, self.vocab_size, device=device)
 
-        with patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb), \
-             patch.object(
-                 mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
-             ), \
-             patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
-            mimo_model(
-                input_ids=input_ids, position_ids=position_ids, modality_inputs=None
-            )
+        with (
+            patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb),
+            patch.object(
+                mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
+            ),
+            patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
 
         # shard() should have been called once
         mock_adapter.shard.assert_called_once()
 
         # The embeddings passed to shard() must be [B, S, H] (transposed from [S, B, H])
         shard_kwargs = mock_adapter.shard.call_args[1]
-        assert shard_kwargs['embeddings'].shape == (
-            self.batch_size,
-            self.seq_len,
-            self.hidden_size,
-        )
+        assert shard_kwargs['embeddings'].shape == (self.batch_size, self.seq_len, self.hidden_size)
 
         # The language model decoder_input must be [S/cp, B, H] (re-transposed after shard)
         assert captured['decoder_input'].shape == (
