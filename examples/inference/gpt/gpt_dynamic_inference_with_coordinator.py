@@ -134,7 +134,7 @@ async def main(
             throughputs = []
 
             for record in results:
-                req = record.merge()
+                req = record
                 result_dict = {
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
@@ -158,7 +158,7 @@ async def main(
             print("Results:")
             unique_prompt_map = defaultdict(list)
             for record in results:
-                req = record.merge()
+                req = record
                 unique_prompt_map[req.prompt].append(req)
             for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
                 print(

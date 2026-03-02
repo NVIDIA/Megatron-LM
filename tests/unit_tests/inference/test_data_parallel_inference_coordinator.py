@@ -139,7 +139,7 @@ class DummyEngine(DynamicInferenceEngine):
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]], use_bin_type=True
                     )
                     self.socket_for_receiving_requests.send(payload)
 
@@ -223,7 +223,7 @@ class TestCoordinator:
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
                 for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                    assert record.status == Status.COMPLETED.name
         finally:
             if torch.distributed.get_rank() == 0:
                 if stop_engines:

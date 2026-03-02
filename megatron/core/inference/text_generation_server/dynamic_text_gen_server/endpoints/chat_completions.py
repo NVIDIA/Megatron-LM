@@ -120,7 +120,7 @@ try:
 
         request_idx = 0
         for record in batch_results:
-            result = record.merge().serialize()
+            result = record if isinstance(record, dict) else record.serialize()
             # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
             result = {
                 k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
