@@ -964,12 +964,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # order, but TE stores them as [activation, gate]. Until FlashInfer supports
         # TE's weight ordering, the FlashInfer path is only available for non-gated
         # activations (e.g. squared_relu).
-        self._flashinfer_available = HAVE_FLASHINFER and not config.gated_linear_unit
-        if self._flashinfer_available:
+        if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
+        assert (
+            HAVE_FLASHINFER
+        ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
         if func == F.silu:
             return ActivationType.Silu
@@ -1091,20 +1093,36 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor],
         permuted_probs: torch.Tensor,
+        routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass with three modes:
-        - Training: delegates to parent TEGroupedMLP
-        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe
-        - Inference + eager: torch._grouped_mm with GPU-resident offsets
+
+        - Training: delegates to parent TEGroupedMLP.
+        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
+          is not used in this path; the FlashInfer kernel operates directly on
+          routing_map.
+        - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets.
+
+        Args:
+            permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
+            tokens_per_expert: [num_experts] number of tokens routed to each expert.
+                None when using the CUDA-graphed FlashInfer path.
+            permuted_probs: [num_tokens, topk] routing probabilities.
+            routing_map: [num_tokens, topk] token-to-expert assignment indices.
+                Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        elif self.is_inference_cuda_graphed_iteration and self._flashinfer_available:
+        elif self.is_inference_cuda_graphed_iteration:
+            assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
+            assert (
+                HAVE_FLASHINFER
+            ), "FlashInfer is not available; cannot use FlashInfer forward pass."
             return self._flashinfer_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                permuted_local_hidden_states, routing_map, permuted_probs
             )
 
         elif self._torch_grouped_mm_available:

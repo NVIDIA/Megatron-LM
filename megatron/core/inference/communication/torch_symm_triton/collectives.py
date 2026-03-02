@@ -25,6 +25,7 @@ from .barrier import symm_mem_sync
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
+
 @triton.jit
 def _ag_phase(
     local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE

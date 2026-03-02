@@ -760,9 +760,19 @@ class InferenceTopKRouter(TopKRouter):
 
     @staticmethod
     @torch.compile
-    def _compiled_topk_routing(logits, topk, use_pre_softmax, num_groups,
-                               group_topk, scaling_factor, score_function,
-                               expert_bias, fused, router_replay, dense_output):
+    def _compiled_topk_routing(
+        logits,
+        topk,
+        use_pre_softmax,
+        num_groups,
+        group_topk,
+        scaling_factor,
+        score_function,
+        expert_bias,
+        fused,
+        router_replay,
+        dense_output,
+    ):
         return topk_routing_with_score_function(
             logits,
             topk,

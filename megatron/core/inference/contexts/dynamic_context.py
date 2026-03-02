@@ -546,8 +546,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        self.smallest_non_decode_cuda_graph_size = (
-            min(inference_config.cuda_graph_mixed_prefill_count, self.max_requests)
+        self.smallest_non_decode_cuda_graph_size = min(
+            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
         )
 
         self._using_cuda_graph_this_step = False

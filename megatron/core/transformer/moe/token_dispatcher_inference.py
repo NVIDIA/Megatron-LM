@@ -202,8 +202,12 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
-        """Pass-through: returns unpermuted inputs and routing_map for InferenceGroupedMLP."""
-        return hidden_states, self.routing_map, probs
+        """Pass-through: returns unpermuted inputs directly.
+
+        tokens_per_expert is not computed by this inference dispatcher. Instead,
+        the FlashInfer fused MoE kernel operates directly on the routing map.
+        """
+        return hidden_states, None, probs
 
     def combine_preprocess(self, expert_output):
         """Pass-through: InferenceGroupedMLP already produces unpermuted output."""
