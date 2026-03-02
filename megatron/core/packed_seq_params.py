@@ -23,9 +23,11 @@ class PackedSeqParams:
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
+    seq_idx: Tensor = None
 
     def __post_init__(self):
-        """
+        """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
+
         If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
         (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
         [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
@@ -36,11 +38,6 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
-
-        # Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
-        # seq_idx is stored as a non-field attribute so dataclasses.fields() won't include it,
-        # preventing it from being forwarded to TransformerEngine's attention forward().
-
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -60,5 +57,3 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
-        else:
-            self.seq_idx = None
