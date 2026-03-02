@@ -48,6 +48,10 @@ pip install --no-build-isolation megatron-core[mlm,dev]
 `--no-build-isolation` requires build dependencies to be pre-installed in the environment. `torch` is needed because several `[dev]` packages (`mamba-ssm`, `nv-grouped-gemm`, `transformer-engine`) import it at build time to compile CUDA kernels. Expect this step to take **20+ minutes** depending on your hardware. If you prefer pre-built binaries, the [NGC Container](#option-c-ngc-container) ships with these pre-compiled.
 ```
 
+```{warning}
+Building from source can consume a large amount of memory. By default the build runs one compiler job per CPU core, which may cause out-of-memory failures on machines with many cores. To limit parallel compilation jobs, set the `MAX_JOBS` environment variable before installing (e.g. `MAX_JOBS=4`).
+```
+
 To clone the repository for examples:
 
 ```bash
@@ -64,6 +68,10 @@ git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
 pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2" pybind11 "torch>=2.6.0"
 pip install --no-build-isolation -e .[mlm,dev]
+```
+
+```{tip}
+If the build runs out of memory, limit parallel compilation jobs with `MAX_JOBS=4 pip install --no-build-isolation -e .[mlm,dev]`.
 ```
 
 
