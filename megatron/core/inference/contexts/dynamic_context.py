@@ -454,20 +454,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
 
-        # Request and token counts.
-        self.total_request_count = 0
-        self.active_token_count = 0
-        self.paused_request_count = 0
-        self.batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_active_token_count = 0
-        self.padded_active_request_count = 0
-        self.paused_tokens = None
-
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
@@ -500,11 +486,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
-        self.num_prefill_requests = 0
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
-        self.active_attn_metadata = None
-        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -547,10 +530,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.cuda_graph_mixed_prefill_count = inference_config.cuda_graph_mixed_prefill_count
-        self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
-        self.chunked_prefill_request_id = -1
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -563,6 +544,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
         self.initialize_all_tensors()
+        self.reset_metadata()
 
         # Print info.
         logging.info(
@@ -720,9 +702,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
 
-        # Reset entire context state.
-        self.reset()
-
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
@@ -740,7 +719,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self._uses_torch_memory_saver:
                 torch_memory_saver.resume("inference_context")
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-                self.reset()
+                self.reset_metadata()
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -750,6 +729,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             self.is_tensor_state_allocated = False
             self.initialize_all_tensors()
+            self.reset_metadata()
 
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
@@ -1455,29 +1435,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-    def reset(self) -> None:
-        """Reset entire context.
+    def reset_tensors(self) -> None:
+        """Fill all GPU tensors with sentinel values.
 
-        This method does:
-        - Reset active/paused request/token counts to zero.
-        - Reset available blocks to entire memory.
-        - Reset other tensors to zeros (unncessary, just or sanity checking).
-
-        This method is useful after cuda graph warmup iterations, where the
-        context's memory buffer is referenced by the cuda graph system and
-        cannot be deallocated.
+        This is unnecessary for correctness (tensors are overwritten before use)
+        but useful for sanity checking and debugging.
         """
-
-        # Reset request/token counts.
-        self.total_request_count = 0
-        self.active_token_count = 0
-        self.paused_request_count = 0
-        self.batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_active_token_count = 0
-        self.padded_active_request_count = 0
-        self.paused_tokens = None
 
         # Reset request indexes.
         self.request_ids.fill_(-1)
@@ -1501,13 +1464,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-        # Reset available block count.
+    def reset_metadata(self) -> None:
+        """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
+
+        This must be called after ``initialize_all_tensors()`` and after any
+        suspend/resume cycle to bring the context back to a clean state.
+        """
+
+        # Reset request/token counts.
+        self.total_request_count = 0
+        self.active_token_count = 0
+        self.paused_request_count = 0
+        self.batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
+        self.padded_active_token_count = 0
+        self.padded_active_request_count = 0
+        self.paused_tokens = None
+
+        # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
         self.block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset chunked prefill state
+        # Reset chunked prefill state.
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
@@ -1515,6 +1496,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+    def reset(self) -> None:
+        """Reset entire context.
+
+        This method does:
+        - Fill all GPU tensors with sentinel values.
+        - Reset active/paused request/token counts to zero.
+        - Reset available blocks to entire memory.
+
+        This method is useful after cuda graph warmup iterations, where the
+        context's memory buffer is referenced by the cuda graph system and
+        cannot be deallocated.
+        """
+        self.reset_tensors()
+        self.reset_metadata()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
