@@ -21,6 +21,7 @@ from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from .execution import ReshardTransform
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
@@ -163,6 +164,7 @@ def swap_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    transform: Optional[ReshardTransform] = None,
 ):
     """
     Orchestrate weight swap/refit.
@@ -173,6 +175,8 @@ def swap_model_weights(
     - src_rank_offset / dst_rank_offset: Offsets applied to local process group
       ranks so that metadata contains globally unique rank IDs across independent
       torch.distributed worlds (e.g., separate training and inference clusters).
+    - transform: Optional ReshardTransform for custom format conversion
+      during reshard.  Passed through to execute_reshard_plan.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -189,6 +193,7 @@ def swap_model_weights(
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        transform=transform,
     )
 
 
@@ -199,6 +204,7 @@ def reshard_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    transform: Optional[ReshardTransform] = None,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -238,7 +244,7 @@ def reshard_model_weights(
             _plan_cache[cache_key] = plan
         else:
             plan = _plan_cache[cache_key]
-        execute_reshard_plan(plan, None, None, service=service, group=group)
+        execute_reshard_plan(plan, None, None, service=service, group=group, transform=transform)
         return
 
     # Handle None models - extract core modules only from non-None models
@@ -287,4 +293,4 @@ def reshard_model_weights(
     else:
         plan = _plan_cache[cache_key]
 
-    execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group)
+    execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group, transform=transform)

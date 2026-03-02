@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from typing import Dict, Optional, Tuple
+
 import torch
 
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -12,7 +14,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8, mxfp8_quantize
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -76,6 +78,161 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
         replace_in_dict(model._parameters)
 
     return model
+
+
+def _should_quantize_param(val: torch.Tensor) -> bool:
+    """Return True if a parameter should be quantized to FlashInfer MXFP8."""
+    if not val.is_cuda:
+        return False
+    if HAVE_TE and isinstance(val, TEMXFP8Tensor):
+        return True
+    if isinstance(val, torch.nn.Parameter) and val.dim() == 2 and val.dtype in (torch.bfloat16, torch.float16):
+        return True
+    return False
+
+
+def _to_bf16(val: torch.Tensor) -> torch.Tensor:
+    """Convert a parameter value to BF16 for quantization."""
+    if HAVE_TE and isinstance(val, TEMXFP8Tensor):
+        return val.dequantize()
+    return val.data.to(torch.bfloat16)
+
+
+def collect_mxfp8_param_metadata(
+    model: torch.nn.Module,
+) -> Dict[str, Tuple[torch.Size, torch.dtype, torch.device]]:
+    """Record shape/dtype/device for each parameter that will be quantized.
+
+    Called once before the first quantization so that
+    ``restore_params_from_mxfp8`` can recreate matching ``nn.Parameter``
+    placeholders later.
+    """
+    metadata: Dict[str, Tuple[torch.Size, torch.dtype, torch.device]] = {}
+    for name, param in model.named_parameters():
+        if _should_quantize_param(param):
+            if HAVE_TE and isinstance(param, TEMXFP8Tensor):
+                bf16 = param.dequantize()
+                metadata[name] = (bf16.shape, bf16.dtype, bf16.device)
+            else:
+                metadata[name] = (param.shape, param.dtype, param.device)
+    return metadata
+
+
+def quantize_params_to_mxfp8(
+    model: torch.nn.Module,
+    persistent_buffers: Optional[Dict[str, MXFP8Tensor]] = None,
+    _prefix: str = "",
+) -> Dict[str, MXFP8Tensor]:
+    """Quantize model parameters to FlashInfer MXFP8Tensor format.
+
+    Handles both TEMXFP8Tensor (fp8_param=True) and BF16/FP16 nn.Parameter
+    inputs.  When *persistent_buffers* is provided, new quantized values are
+    ``copy_()``'d into the existing MXFP8Tensor objects so that CUDA-graph
+    device-pointer captures remain valid.
+
+    Args:
+        model: The model whose parameters should be quantized.
+        persistent_buffers: If not ``None``, a dict mapping fully-qualified
+            parameter names to previously-created ``MXFP8Tensor`` objects.
+            Updated in-place and returned.
+        _prefix: Internal recursion prefix – callers should not set this.
+
+    Returns:
+        The ``persistent_buffers`` dict (created on first call if ``None``).
+    """
+    assert HAVE_FLASHINFER
+
+    if persistent_buffers is None:
+        persistent_buffers = {}
+
+    # Recurse through child modules
+    for child_name, child_module in model.named_children():
+        child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
+        quantize_params_to_mxfp8(child_module, persistent_buffers, _prefix=child_prefix)
+
+    # Process parameters owned directly by this module
+    if hasattr(model, '_parameters') and model._parameters:
+        keys = list(model._parameters.keys())
+        for key in keys:
+            val = model._parameters[key]
+            if val is None:
+                continue
+            if not _should_quantize_param(val):
+                continue
+
+            fqn = f"{_prefix}{key}"
+            bf16_data = _to_bf16(val)
+
+            if fqn in persistent_buffers:
+                # Subsequent call: copy into existing tensors to preserve addresses
+                new_data, new_scale = mxfp8_quantize(bf16_data)
+                persistent_buffers[fqn].data.copy_(new_data)
+                persistent_buffers[fqn].scale.copy_(new_scale)
+                fi_tensor = persistent_buffers[fqn]
+            else:
+                # First call: create new MXFP8Tensor
+                fi_tensor = MXFP8Tensor.from_bf16(bf16_data)
+
+                # Verify correctness for TEMXFP8Tensor inputs
+                if HAVE_TE and isinstance(val, TEMXFP8Tensor):
+                    _verify_te_to_flashinfer_mxfp8_conversion(bf16_data, fi_tensor)
+
+                persistent_buffers[fqn] = fi_tensor
+
+            # Replace nn.Parameter with MXFP8Tensor attribute
+            del model._parameters[key]
+            setattr(model, key, fi_tensor)
+
+    return persistent_buffers
+
+
+def restore_params_from_mxfp8(
+    model: torch.nn.Module,
+    param_metadata: Dict[str, Tuple[torch.Size, torch.dtype, torch.device]],
+    _prefix: str = "",
+) -> None:
+    """Replace MXFP8Tensor attributes with nn.Parameter placeholders.
+
+    This is the inverse of ``quantize_params_to_mxfp8``.  After calling this
+    function, ``swap_model_weights`` can write new training weights into the
+    model's ``nn.Parameter`` objects via ``named_parameters()`` +
+    ``.data.copy_()``.
+
+    The MXFP8Tensor objects are **not** freed here – they remain alive in the
+    worker's ``persistent_buffers`` dict for reuse on the next quantization.
+
+    Args:
+        model: The model to restore.
+        param_metadata: Dict mapping fully-qualified names to
+            ``(shape, dtype, device)`` tuples (from ``collect_mxfp8_param_metadata``).
+        _prefix: Internal recursion prefix – callers should not set this.
+    """
+    # Recurse through child modules
+    for child_name, child_module in model.named_children():
+        child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
+        restore_params_from_mxfp8(child_module, param_metadata, _prefix=child_prefix)
+
+    # Check attributes on this module that are MXFP8Tensor (not in _parameters)
+    for key in list(vars(model).keys()):
+        val = getattr(model, key)
+        if not isinstance(val, MXFP8Tensor):
+            continue
+
+        fqn = f"{_prefix}{key}"
+        if fqn not in param_metadata:
+            continue
+
+        shape, dtype, device = param_metadata[fqn]
+
+        # Remove the MXFP8Tensor attribute
+        delattr(model, key)
+
+        # Register an nn.Parameter placeholder with matching shape/dtype
+        placeholder = torch.nn.Parameter(
+            torch.empty(shape, dtype=dtype, device=device),
+            requires_grad=False,
+        )
+        model.register_parameter(key, placeholder)
 
 
 def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):

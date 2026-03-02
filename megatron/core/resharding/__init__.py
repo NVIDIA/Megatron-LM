@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from .execution import execute_reshard_plan
+from .execution import MXFP8ReshardTransform, ReshardTransform, execute_reshard_plan
 from .planner import build_centralized_reshard_plan
 from .refit import (
     clear_service_cache,
@@ -12,6 +12,8 @@ from .utils import ParameterMetadata, ReshardPlan, ShardingDescriptor, TransferO
 __all__ = [
     "build_centralized_reshard_plan",
     "execute_reshard_plan",
+    "MXFP8ReshardTransform",
+    "ReshardTransform",
     "swap_model_weights",
     "reshard_model_weights",
     "get_or_create_service",
