@@ -26,7 +26,6 @@ from megatron.core.package_info import (
 )
 from megatron.core.timers import Timers
 from megatron.core.utils import is_torch_min_version
-from megatron.training import print_rank_0
 
 # Alias parallel_state as mpu, its legacy name
 mpu = parallel_state
@@ -68,6 +67,7 @@ def graceful_shutdown(signum, frame):
       - Destroys the distributed process group
       - Exits the process cleanly
     """
+    from megatron.training import print_rank_0
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
 
     try:
