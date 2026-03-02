@@ -21,7 +21,7 @@ TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 
 export TRITON_CACHE_DIR="${WORKSPACE}/triton-cache/"
 # The following patch to the Triton cache manager is needed for Triton version <= 3.1
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
+# export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 if [[ -z $LOAD_NAME ]]; then
     echo "Please set LOAD_NAME for input model name."
@@ -53,6 +53,7 @@ OPTIONS=" \
     --apply-layernorm-1p \
     --attention-softmax-in-fp32 \
     --use-checkpoint-args \
+    --no-use-tokenizer-model-from-checkpoint-args \
     --use-distributed-optimizer \
     --transformer-impl transformer_engine \
     --use-te \
