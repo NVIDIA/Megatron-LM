@@ -1366,6 +1366,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1373,15 +1374,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
+            # To pass kwargs unique to specific DDP classes.
+            dp_init_kwargs = {}
+            if args.use_megatron_fsdp:
+                # Also pass the mixed-precision arguments for Megatron-FSDP only.
+                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+
             model = [
                 DP(
                     config=config,
                     ddp_config=ddp_config,
                     module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                    # model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication
+                    # for these model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
