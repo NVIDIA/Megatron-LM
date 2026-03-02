@@ -15,10 +15,10 @@ class Symbols:
     """Symbols for different layer types and pattern separators."""
 
     MAMBA = "M"
+    GDN = 'G'
     ATTENTION = "*"
     MLP = "-"
     MOE = 'E'
-    GDN = 'G'
     PIPE = '|'
     MTP_SEPARATOR = "/"
     VALID_LAYERS = {MAMBA, ATTENTION, MLP, MOE, GDN}
