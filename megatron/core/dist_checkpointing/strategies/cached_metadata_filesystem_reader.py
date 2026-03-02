@@ -21,7 +21,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
 
     _metadata_cache: Dict[str, Metadata] = {}
 
-    def __init__(self, path: Union[str, os.PathLike]) -> None:
+    def __init__(self, path: Union[str, os.PathLike], cache_metadata: bool = True) -> None:
         """
         Initialize with file system path.
 
@@ -29,7 +29,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
             path (Union[str, os.PathLike]): Path to the checkpoint directory or file.
         """
         super().__init__(path=path)
-        self._cache_key = os.path.abspath(os.fspath(path))
+        self._cache_key = os.path.abspath(os.fspath(path)) if cache_metadata else None
 
     def read_metadata(self) -> Metadata:
         """
