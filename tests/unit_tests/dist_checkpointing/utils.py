@@ -18,6 +18,9 @@ from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
@@ -168,9 +171,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     # Clear the metadata cache to avoid contamination between tests
-    from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-        CachedMetadataFileSystemReader,
-    )
 
     CachedMetadataFileSystemReader.clear_metadata_cache()
 
@@ -230,7 +230,7 @@ def setup_model_and_optimizer(
             opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
 
@@ -328,5 +328,5 @@ def setup_moe_model_and_optimizer(
             opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
