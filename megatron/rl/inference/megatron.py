@@ -13,6 +13,12 @@ try:
 except ImportError:
     HAVE_OPENAI = False
 
+try:
+    import h2  # noqa: F401
+    use_http2 = True
+except ImportError:
+    use_http2 = False
+
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
@@ -118,12 +124,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         else:
             client = None
             server_task = None
-            
-        try:
-            import h2  # noqa: F401
-            use_http2 = True
-        except ImportError:
-            use_http2 = False
 
         launched_server = cls(**kwargs)
         launched_server._client = client
