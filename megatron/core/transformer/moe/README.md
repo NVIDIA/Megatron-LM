@@ -1,9 +1,9 @@
 # Megatron Core MoE
 
-Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models, providing the foundational architecture, performance optimizations, and best practices that guide MoE framework development across the industry.
+Megatron Core MoE is a production-ready stack for training large-scale Mixture-of-Experts models, built on the Megatron Core framework. It provides foundational architecture, performance optimizations, and best practices that guide MoE development across the industry.
 
 ## What's New
-For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
+For the latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
 
 ### 🔥 [MCore dev] (2026/01)
 - 🚀 Pipeline-aware fine-grained activation offloading
@@ -92,9 +92,9 @@ For latest features and architectures, please refer to the [MCore dev roadmap](h
 To train a top-2 MoE model with 8 experts and auxiliary loss, add the following arguments to your megatron training script:
 
 ```bash
-## Set MoE Hidden site
+## Set MoE hidden size
 --num-experts 8
---moe-shared-expert-intermediate-size: 2048
+--moe-shared-expert-intermediate-size 2048
 ## Set router config
 --moe-router-load-balancing-type aux_loss
 --moe-router-topk 2
@@ -360,7 +360,7 @@ Memory optimization is critical for large-scale MoE training, as MoE models main
 | Optimization | Description | Config |
 |--------------|-------------|--------|
 | **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
-| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
+| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/user-guide/features/fine_grained_activation_offloading.md` |
 | **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
 | **Optimizer Offloading** | Offloads optimizer states to CPU memory. | `--optimizer-cpu-offload` |
 
@@ -389,7 +389,7 @@ Unlike recomputation (which trades compute for memory), offloading trades **GPU-
 --offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
 ```
 
-For more details, see `docs/source/api-guide/fine_grained_activation_offloading.md`
+For more details, see `docs/user-guide/features/fine_grained_activation_offloading.md`
 
 ### Communication Optimization
 
@@ -515,7 +515,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --num-experts | Number of Experts in MoE | None |
 | --expert-model-parallel-size | Degree of expert model parallelism | 1 |
 | --moe-ffn-hidden-size | MoE FFN hidden size | FFN hidden size of the dense model |
-| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommeded to set to 1 for fine-grained MoE models) |
+| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommended to set to 1 for fine-grained MoE models) |
 | --moe-layer-freq | MoE layer frequency pattern | 1 |
 
 ### Router Arguments
@@ -697,7 +697,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA
 
 ## Citation
 
-If you use Megatron-Core MoE in your research, please cite:
+If you use Megatron Core MoE in your research, please cite:
 
 ```bibtex
 
