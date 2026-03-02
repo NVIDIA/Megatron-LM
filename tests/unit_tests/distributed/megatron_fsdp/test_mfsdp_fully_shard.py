@@ -13,6 +13,10 @@ from packaging import version
 from torch.nn.functional import mse_loss
 from torch.optim import Adam
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+    fully_shard_model,
+    fully_shard_optimizer,
+)
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -782,6 +786,60 @@ class TestMegatronFsdpFullyShard:
                 else nullcontext()
             ):
                 output = mfsdp_model(toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()
+
+    @pytest.mark.parametrize("init_model_with_meta_device", [True, False])
+    def test_model_with_frozen_param(self, init_model_with_meta_device):
+        """
+        Test Megatron-FSDP with frozen parameters.
+        """
+        # Build a toy TRANSFORMER model and identify FSDP unit modules.
+        toy_model, fsdp_unit_modules = build_toy_model(
+            model_type=TRANSFORMER, init_model_with_meta_device=init_model_with_meta_device
+        )
+
+        # Freeze a subset of parameters in the original model.
+        original_params = list(toy_model.parameters())
+        num_frozen = len(original_params) // 2
+        for param in original_params[:num_frozen]:
+            param.requires_grad = False
+
+        # Fully shard the model with Megatron-FSDP.
+        mfsdp_model = fully_shard_model(
+            module=toy_model,
+            fsdp_unit_modules=fsdp_unit_modules,
+            zero_dp_strategy=OPTIM_GRADS,
+            init_model_with_meta_device=init_model_with_meta_device,
+        )
+
+        # Validate that the corresponding parameters remain frozen.
+        sharded_params = list(mfsdp_model.parameters())
+        assert len(sharded_params) == len(
+            original_params
+        ), "Megatron-FSDP changed parameter count unexpectedly."
+        for idx, param in enumerate(sharded_params[:num_frozen]):
+            assert not param.requires_grad, f"Parameter {idx} is not frozen in Megatron-FSDP model."
+
+        # Initialize the distributed optimizer on the Megatron-FSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target.
+        toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+        toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for _ in range(NUM_STEPS):
+            # Forward pass.
+            output = mfsdp_model(toy_input, toy_input)
 
             # Loss.
             loss = mse_loss(output, toy_target)
