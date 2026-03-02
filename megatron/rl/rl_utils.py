@@ -1240,10 +1240,6 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
-            _logprobs_lang_module = (
-                (model.module.module if hasattr(model.module, "module") else model.module)
-                if args.rl_training_cuda_graphs else None
-            )
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
@@ -1804,7 +1800,7 @@ def megatron_rl_inference_mode(
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
         # Restore partial capture cudagraph scope for training if this is MoE
-        if args.num_experts:
+        if args.num_experts is not None:
             model[0].config.cuda_graph_scope = [
                 CudaGraphScope.mamba,
                 CudaGraphScope.attn,

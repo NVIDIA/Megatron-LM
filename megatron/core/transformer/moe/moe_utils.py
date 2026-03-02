@@ -406,8 +406,7 @@ def permute(
         # This is equivalent to masked_select but produces fixed-shape output,
         # making it compatible with CUDA graph capture.
         flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
-        if num_out_tokens is not None:
-            flat_sorted = flat_sorted[:num_out_tokens]
+        flat_sorted = flat_sorted[:num_out_tokens]
         sorted_indices = flat_sorted % num_tokens
 
         if probs is not None:
