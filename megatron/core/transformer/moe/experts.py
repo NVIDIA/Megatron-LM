@@ -762,7 +762,7 @@ class TEGroupedMLP(MegatronModule):
             else:
                 raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
         elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
-            assert bias_parallel is None
+            assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
             intermediate_parallel = weighted_squared_relu_impl(
                 intermediate_parallel, permuted_probs
             )
