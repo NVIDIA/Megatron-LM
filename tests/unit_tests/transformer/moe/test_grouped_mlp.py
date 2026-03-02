@@ -17,6 +17,7 @@ from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
