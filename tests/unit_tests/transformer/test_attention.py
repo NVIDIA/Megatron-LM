@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+from unittest import mock
 
 import pytest
 import torch
@@ -8,16 +9,30 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.common.embeddings.rope_utils import (
+    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import parse_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import set_args
+from megatron.training.training import get_model
+from megatron.training.utils import unwrap_model
+from tests.unit_tests.dist_checkpointing import (
+    TempNamedDir,
+    init_basic_mock_args,
+    init_checkpointing_mock_args,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
