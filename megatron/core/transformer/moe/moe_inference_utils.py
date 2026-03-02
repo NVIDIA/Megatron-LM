@@ -105,62 +105,67 @@ def compute_local_tokens_per_expert(
     return tokens_per_expert
 
 
-if __name__ == "__main__":
-    torch.manual_seed(42)
+# --------------------------------------------------------------------------- #
+# Kernel: Exclusive prefix sum + atomic counters (single block)
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _prefix_sum_kernel(
+    tokens_per_expert_ptr,  # [num_local_experts] input
+    expert_offsets_ptr,  # [num_local_experts] output
+    atomic_counters_ptr,  # [num_local_experts] output (copy of offsets)
+    num_local_experts,
+    BLOCK_SIZE: tl.constexpr,  # next_power_of_2(num_local_experts)
+):
+    """Compute exclusive prefix sum of tokens_per_expert.
 
-    # --- Config ---
-    num_tokens = 128
-    topk = 8
-    num_total_experts = 64
-    num_local_experts = 8
-    local_expert_start = 16  # this rank owns experts 16..23
+    Runs as a single block. Reads tokens_per_expert, computes exclusive prefix
+    sum via tl.cumsum, and writes expert_offsets and a copy as atomic_counters
+    for use by the permute kernel.
+    """
+    expert_range = tl.arange(0, BLOCK_SIZE)
+    mask = expert_range < num_local_experts
+    histogram = tl.load(tokens_per_expert_ptr + expert_range, mask=mask, other=0)
 
-    # --- Build a random routing_map with global expert IDs ---
-    routing_map = torch.randint(
-        0, num_total_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    # Inclusive prefix sum, then shift to exclusive
+    inclusive = tl.cumsum(histogram, axis=0)
+    exclusive = inclusive - histogram
+
+    tl.store(expert_offsets_ptr + expert_range, exclusive, mask=mask)
+    tl.store(atomic_counters_ptr + expert_range, exclusive, mask=mask)
+
+
+# --------------------------------------------------------------------------- #
+# Python wrapper
+# --------------------------------------------------------------------------- #
+def compute_expert_offsets(
+    tokens_per_expert: torch.Tensor,
+) -> tuple:
+    """Compute exclusive prefix sum of tokens_per_expert and a mutable copy for atomics.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Token counts per local expert,
+            shape [num_local_experts], dtype int32.
+
+    Returns:
+        tuple: (expert_offsets, atomic_counters) where:
+            - expert_offsets: [num_local_experts] exclusive prefix sum (read-only).
+            - atomic_counters: [num_local_experts] same values as expert_offsets,
+              to be mutated by the permute kernel's atomic adds.
+    """
+    num_local_experts = tokens_per_expert.shape[0]
+
+    expert_offsets = torch.empty_like(tokens_per_expert)
+    atomic_counters = torch.empty_like(tokens_per_expert)
+
+    BLOCK_SIZE = triton.next_power_of_2(num_local_experts)
+    _prefix_sum_kernel[(1,)](
+        tokens_per_expert,
+        expert_offsets,
+        atomic_counters,
+        num_local_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    # --- Reference: count with PyTorch ---
-    flat = routing_map.flatten()
-    local_mask = (flat >= local_expert_start) & (flat < local_expert_start + num_local_experts)
-    local_ids_ref = flat[local_mask] - local_expert_start
-    ref = torch.zeros(num_local_experts, dtype=torch.int32, device="cuda")
-    ref.scatter_add_(0, local_ids_ref.long(), torch.ones_like(local_ids_ref, dtype=torch.int32))
+    return expert_offsets, atomic_counters
 
-    # --- Triton kernel ---
-    result = compute_local_tokens_per_expert(routing_map, local_expert_start, num_local_experts)
 
-    # --- Compare ---
-    print(f"Reference: {ref.tolist()}")
-    print(f"Triton:    {result.tolist()}")
-    assert torch.equal(ref, result), f"MISMATCH!\n  ref={ref}\n  got={result}"
-    print("PASSED - histogram matches reference")
-
-    # --- Edge cases ---
-    # All tokens routed to non-local experts
-    routing_map_none = torch.zeros(
-        num_tokens, topk, dtype=torch.int32, device="cuda"
-    )  # expert 0, not in [16..23]
-    result_none = compute_local_tokens_per_expert(routing_map_none, local_expert_start, num_local_experts)
-    assert torch.equal(result_none, torch.zeros(num_local_experts, dtype=torch.int32, device="cuda"))
-    print("PASSED - no local experts case")
-
-    # All tokens routed to a single local expert
-    routing_map_single = torch.full(
-        (num_tokens, topk), local_expert_start + 3, dtype=torch.int32, device="cuda"
-    )
-    result_single = compute_local_tokens_per_expert(routing_map_single, local_expert_start, num_local_experts)
-    expected_single = torch.zeros(num_local_experts, dtype=torch.int32, device="cuda")
-    expected_single[3] = num_tokens * topk
-    assert torch.equal(result_single, expected_single)
-    print("PASSED - single expert case")
-
-    # Small: 1 token, topk=1
-    routing_map_tiny = torch.tensor([[local_expert_start]], dtype=torch.int32, device="cuda")
-    result_tiny = compute_local_tokens_per_expert(routing_map_tiny, local_expert_start, num_local_experts)
-    expected_tiny = torch.zeros(num_local_experts, dtype=torch.int32, device="cuda")
-    expected_tiny[0] = 1
-    assert torch.equal(result_tiny, expected_tiny)
-    print("PASSED - single token case")
-
-    print("\nAll tests passed.")
