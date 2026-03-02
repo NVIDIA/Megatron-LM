@@ -13,6 +13,25 @@ from .utils import ReshardPlan
 logger = logging.getLogger(__name__)
 
 
+def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
+    """Return a standard-dtype tensor suitable for wire transmission.
+
+    Quantized parameter types (e.g., Transformer Engine MXFP8Tensor) are
+    dequantized to their original precision (usually BF16).  Standard
+    parameters are returned via ``.data`` (unwrapped from autograd).
+    """
+    try:
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+            MXFP8Tensor as _TEMXFP8,
+        )
+
+        if isinstance(param, _TEMXFP8):
+            return param.dequantize()
+    except ImportError:
+        pass
+    return param.data
+
+
 class ReshardTransform:
     """Hook for custom send/recv/writeback during reshard execution.
 
@@ -120,7 +139,7 @@ def execute_reshard_plan(
         else:
             src_param = src_params.get(op.param_name)
             if src_param is not None:
-                src_view = src_param.data[op.my_slice].contiguous()
+                src_view = _ensure_sendable(src_param)[op.my_slice].contiguous()
                 if submit_send_with_id is not None and op.task_id is not None:
                     submit_send_with_id(op.task_id, src_view, op.peer_rank)
                 else:
@@ -257,15 +276,16 @@ class MXFP8ReshardTransform(ReshardTransform):
     # -- send ----------------------------------------------------------------
 
     def prepare_send(self, param_name, src_slice, src_param):
+        src_data = _ensure_sendable(src_param)
         if self.convert_on_send:
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
-            bf16_data = src_param.data[src_slice].contiguous().to(torch.bfloat16)
+            bf16_data = src_data[src_slice].contiguous().to(torch.bfloat16)
             mxfp8 = MXFP8Tensor.from_bf16(bf16_data)
             return [mxfp8.data.contiguous(), mxfp8.scale.contiguous()]
         else:
             # BF16 on the wire — same as the default reshard path.
-            return [src_param.data[src_slice].contiguous()]
+            return [src_data[src_slice].contiguous()]
 
     # -- recv ----------------------------------------------------------------
 
