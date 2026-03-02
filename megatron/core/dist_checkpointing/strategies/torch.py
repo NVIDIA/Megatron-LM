@@ -659,10 +659,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
 
-        sequential = False
         if self.separation_hint is not None and self.thread_count <= 1:
             self.thread_count = 2
-            sequential = True
 
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
@@ -670,7 +668,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
-            sequential=sequential,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0

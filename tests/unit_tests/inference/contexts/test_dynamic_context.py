@@ -1466,3 +1466,30 @@ class TestDynamicContext:
             assert (fast_mamba >= 0).all(), "fast path should allocate valid mamba slots"
             assert (slow_mamba >= 0).all(), "slow path should allocate valid mamba slots"
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
+
+    @pytest.mark.internal
+    def test_gqa_high_tp_partition_heads(self):
+        """Tests that TP > GQA results in 1 attention head per partition."""
+        tp_size = 8
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=16,
+            num_query_groups=2,  # GQA = 2
+            tensor_model_parallel_size=tp_size,
+        )
+
+        # max_requests must be divisible by TP size (8) and REQUEST_ROUNDER
+        inference_config = InferenceConfig(
+            max_sequence_length=512, buffer_size_gb=0.1, block_size_tokens=128, max_requests=8
+        )
+
+        dynamic_context = DynamicInferenceContext(
+            model_config=model_config, inference_config=inference_config
+        )
+
+        # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
+        assert dynamic_context.num_attention_heads_per_partition == 1

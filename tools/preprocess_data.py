@@ -143,6 +143,8 @@ class Partition(object):
         fin.close()
         fout.close()
 
+        pool.close()
+        pool.join()
 
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
@@ -186,6 +188,8 @@ class Partition(object):
         fin.close()
         builders[key].finalize(output_idx_files[key])
 
+        pool.close()
+        pool.join()
 
 def get_args():
     parser = argparse.ArgumentParser()
