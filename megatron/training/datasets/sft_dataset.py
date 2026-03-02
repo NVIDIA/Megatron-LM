@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
 
@@ -218,11 +219,17 @@ class MockSFTLowLevelDataset:
     """The low-level mock dataset for SFT
 
     Args:
-        mode (str): Either 'file' or 'distribution'.
+        mode (str): One of 'file', 'distribution', or 'verification'.
         **kwargs: Additional arguments depending on mode.
             For mode='file': path (str) - path to a CSV file with sequence lengths.
             For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
                 mean_seq_len (int), and distribution-specific params (e.g. lognormal_sigma).
+            For mode='verification': data_path (str) - prefix path to an IndexedDataset
+                (.bin/.idx files). Optional lognormal distribution params same as
+                'distribution' mode (defaults: min_seq_len=100, max_seq_len=4096,
+                mean_seq_len=2048, lognormal_sigma=1.1).
+        format (str): Output format for MockSFTDataset. Either 'thd' (default, sequence
+            packing with cu_seqlens) or 'sbhd' (padded to seq_length, no cu_seqlens).
     """
 
     seed: int = 0
@@ -233,6 +240,7 @@ class MockSFTLowLevelDataset:
 
     def __init__(self, mode: str, **kwargs) -> None:
         np.random.seed(self.seed)
+        self.format = kwargs.get("format", "thd")
 
         if mode == "file":
             self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
@@ -248,8 +256,20 @@ class MockSFTLowLevelDataset:
                 )
             else:
                 raise ValueError(f"Unsupported distribution type {kwargs['type']}")
+        elif mode == "verification":
+            # Load real tokens from an IndexedDataset for realistic loss curves.
+            # Sequence lengths are drawn from a lognormal distribution (same as
+            # "distribution" mode) to allow controlled comparison of THD vs SBHD.
+            self.indexed_dataset = IndexedDataset(kwargs["data_path"])
+            min_seq_len = kwargs.get("min_seq_len", 100)
+            max_seq_len = kwargs.get("max_seq_len", 4096)
+            mean_seq_len = kwargs.get("mean_seq_len", 2048)
+            lognormal_sigma = kwargs.get("lognormal_sigma", 1.1)
+            self.sequence_lengths = self.generate_lognormal_samples(
+                self.size, mean_seq_len, lognormal_sigma, min_seq_len, max_seq_len
+            )
         else:
-            raise ValueError(f"Unsupported mode '{mode}', must be 'file' or 'distribution'")
+            raise ValueError(f"Unsupported mode '{mode}', must be 'file', 'distribution', or 'verification'")
         
     def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
         mu = np.log(mean) - sigma**2 / 2
@@ -260,13 +280,17 @@ class MockSFTLowLevelDataset:
     def __len__(self) -> int:
         return self.size
 
-    def __getitem__(self, idx: int) -> List[np.ndarray]:
-        # the length of sample is 'length', but only length-1 elements are generated here, 
-        # because an eod token will be appended at the end later in SFTDataset
-
-        length = self.sequence_lengths[idx % self.size]
-        sample = np.arange(1, length, dtype=np.int64)
-        return sample
+    def __getitem__(self, idx: int) -> np.ndarray:
+        # The returned sample has 'length-1' tokens; an EOD token is appended
+        # later in MockSFTDataset.__getitem__, making the total 'length' tokens.
+        length = int(self.sequence_lengths[idx % self.size])
+        if hasattr(self, 'indexed_dataset'):
+            doc_idx = idx % len(self.indexed_dataset)
+            raw = self.indexed_dataset[doc_idx]
+            sample = raw[:length - 1]
+            return sample.astype(np.int64)
+        else:
+            return np.arange(1, length, dtype=np.int64)
 
 
 class MockSFTDataset(SFTDataset):
@@ -310,67 +334,71 @@ class MockSFTDataset(SFTDataset):
 
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
 
-        def extend_with_padding(tokens, targets, positions, pad_len):
+        # Convert tokens to list and always append EOD to ensure length consistency.
+        # The low-level dataset returns length-1 tokens, and we add EOD to make it length tokens.
+        tokens_list = tokens.tolist()
+        tokens_list.append(eod)
+
+        if self.dataset.format == "sbhd":
+            # SBHD format: single padded sequence without cu_seqlens.
+            # Long sequences are truncated to pack_length tokens (including EOD).
+            if len(tokens_list) >= pack_length + 1:
+                tokens_list = tokens_list[:pack_length - 1] + [eod]
+            # Pad to pack_length + 1 (offset by 1 for input/label split).
+            pad_len = pack_length + 1 - len(tokens_list)
+            if pad_len > 0:
+                tokens_list = tokens_list + [pad] * pad_len
+            assert len(tokens_list) == pack_length + 1
+            input_ids    = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+            labels       = torch.tensor(tokens_list[1:],  dtype=torch.int64)
+            # Position IDs are sequential across the entire sequence including padding,
+            # matching GPTDataset behavior for standard (non-packed) training.
+            position_ids = torch.arange(pack_length, dtype=torch.int64)
+            loss_mask = torch.ones(pack_length, dtype=torch.float32)
+            loss_mask[labels == pad] = 0.0
+            return {
+                'tokens':       input_ids,
+                'labels':       labels,
+                'loss_mask':    loss_mask,
+                'position_ids': position_ids,
+            }
+
+        # THD format (sequence packing) below.
+        def extend_with_padding(tokens, positions, pad_len):
             tokens.extend([pad] * pad_len)
-            targets.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
-        # Convert tokens to list and add EOD
-        tokens_list = tokens.tolist()
-        if tokens_list[-1] != eod:
-            tokens_list.append(eod)
-        targets_list = list(tokens_list)
+        pack_tokens = list(tokens_list) + [pad]
+        pack_positions = list(range(len(pack_tokens)))
 
-        pack_tokens = list(tokens_list)
-        pack_targets = list(targets_list)
-        pack_positions = list(range(len(tokens_list)))
-        cu_seqlens = [0]
+        # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
+        if len(pack_tokens) > pack_length + 1:
+            pack_tokens = pack_tokens[:pack_length - 1] + [eod, pad]
+            pack_positions = pack_positions[:pack_length + 1]
 
-        # Pad to padding_divisor alignment
+        # Pad to pad_granularity alignment (tp * cp * 2).
+        # We need final length (after shift) to be divisible by pad_granularity.
         pad_granularity = self._calculate_padding_divisor()
-        mod_token_count = len(pack_tokens) % pad_granularity
+        final_len = len(pack_tokens) - 1
+        mod_token_count = final_len % pad_granularity
         if mod_token_count != 0:
             pad_len = pad_granularity - mod_token_count
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            extend_with_padding(pack_tokens, pack_positions, pad_len)
 
-        # Record padded boundary after padding
-        cu_seqlens.append(len(pack_tokens))
-
-        # Handle any necessary truncation
-        if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
-            max_body = pack_length - 1
-            pack_tokens = pack_tokens[:max_body]
-            pack_targets = pack_targets[:max_body]
-            pack_tokens.extend([eod, pad])
-            pack_targets.extend([eod, pad])
-            pack_positions = pack_positions[:pack_length + 1]
-            cu_seqlens[-1] = len(pack_tokens) - 1
-
-        # Handle any necessary padding
-        if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
-            pad_len = pack_length + 1 - len(pack_tokens)
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
-            cu_seqlens[-1] = len(pack_tokens) - 1
-
-        assert len(pack_tokens) == pack_length + 1
-        assert len(pack_targets) == pack_length + 1
-        assert len(pack_positions) == pack_length + 1
-
-        # Align and convert to tensors
+        # Apply shift for next-token prediction.
         input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
-        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        labels = torch.tensor(pack_tokens[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
 
-        # Loss mask
-        loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
-        loss_mask[labels == IGNORE_INDEX] = 0.0
+        seq_len = len(input_ids)
+        cu_seqlens = [0, seq_len]
 
-        assert len(cu_seqlens) >= 2
+        # Loss mask: mask padding tokens
+        loss_mask = torch.ones(seq_len, dtype=torch.float32)
+        loss_mask[labels == pad] = 0.0
+
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
-        # Calculating max_seqlen here because of possible effects of truncation and padding
-        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
+        max_seqlen = torch.tensor(seq_len, dtype=torch.int32)
 
         return {
             'tokens': input_ids,

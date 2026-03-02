@@ -431,7 +431,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             num_to_move = multiple - remainder
             i = num_packed_sequence - 1
             while num_to_move > 0:
-                assert i > 0, "Not enough samples to move"
+                assert i >= 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
                     packed_id_groups.append([seq_id])
