@@ -1627,6 +1627,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
+        # Hybrid models: disable prefill skipping (no Mamba states per block),
+        # but keep matched blocks for memory sharing.
+        if self.is_hybrid_model:
+            prefix_skip_tokens = 0
+
         effective_chunk_length = chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
             0, overall_required_blocks - already_allocated_blocks - num_matched
