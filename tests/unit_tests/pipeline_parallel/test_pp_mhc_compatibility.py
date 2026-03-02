@@ -25,6 +25,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -48,6 +49,35 @@ def _make_tp_cp_groups(tp_size: int = 1, cp_size: int = 1):
     cp = MagicMock()
     cp.size.return_value = cp_size
     return tp, cp
+
+
+def _get_send_recv_shapes(config, pp_size, seq=32, mbs=2):
+    """Get (send_shape, recv_shape) for each PP rank."""
+    tp, cp = _make_tp_cp_groups()
+    results = []
+    for rank in range(pp_size):
+        send = get_tensor_shapes(
+            seq_length=seq,
+            micro_batch_size=mbs,
+            decoder_seq_length=None,
+            config=config,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(rank, pp_size),
+            is_recv=False,
+        )
+        recv = get_tensor_shapes(
+            seq_length=seq,
+            micro_batch_size=mbs,
+            decoder_seq_length=None,
+            config=config,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(rank, pp_size),
+            is_recv=True,
+        )
+        results.append((send, recv))
+    return results
 
 
 def _make_config(
@@ -342,8 +372,6 @@ class TestTransformerBlockMHCBoundaries:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_input_expand(self):
-        from megatron.core.transformer.hyper_connection import HyperConnectionModule
-
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, C, device='cuda')
@@ -355,8 +383,6 @@ class TestTransformerBlockMHCBoundaries:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_output_contract(self):
-        from megatron.core.transformer.hyper_connection import HyperConnectionModule
-
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, n * C, device='cuda')
@@ -368,8 +394,6 @@ class TestTransformerBlockMHCBoundaries:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_expand_then_contract_preserves_shape(self):
-        from megatron.core.transformer.hyper_connection import HyperConnectionModule
-
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, C, device='cuda')
@@ -505,39 +529,10 @@ class TestPPShapeConsistencyWithMHC:
     This is critical: a mismatch would cause a hang or crash in P2P communication.
     """
 
-    def _get_send_recv_shapes(self, config, pp_size):
-        """Get (send_shape, recv_shape) for consecutive PP stages."""
-        tp, cp = _make_tp_cp_groups()
-        results = []
-        for rank in range(pp_size):
-            send = get_tensor_shapes(
-                seq_length=32,
-                micro_batch_size=2,
-                decoder_seq_length=None,
-                config=config,
-                tp_group=tp,
-                cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size),
-                is_recv=False,
-            )
-            recv = get_tensor_shapes(
-                seq_length=32,
-                micro_batch_size=2,
-                decoder_seq_length=None,
-                config=config,
-                tp_group=tp,
-                cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size),
-                is_recv=True,
-            )
-            results.append((send, recv))
-        return results
-
     def test_pp2_mhc_send_recv_match(self):
         """Rank 0's send shape must match rank 1's recv shape."""
         cfg = _make_config(hidden_size=64, pp_size=2, enable_hyper_connections=True)
-        shapes = self._get_send_recv_shapes(cfg, 2)
-        # rank 0 send == rank 1 recv
+        shapes = _get_send_recv_shapes(cfg, 2)
         assert (
             shapes[0][0] == shapes[1][1]
         ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
@@ -545,7 +540,7 @@ class TestPPShapeConsistencyWithMHC:
     def test_pp4_mhc_all_consecutive_match(self):
         """For all consecutive stages, send[i] == recv[i+1]."""
         cfg = _make_config(hidden_size=64, num_layers=8, pp_size=4, enable_hyper_connections=True)
-        shapes = self._get_send_recv_shapes(cfg, 4)
+        shapes = _get_send_recv_shapes(cfg, 4)
         for i in range(3):
             assert (
                 shapes[i][0] == shapes[i + 1][1]
@@ -554,7 +549,7 @@ class TestPPShapeConsistencyWithMHC:
     def test_pp4_no_mhc_all_consecutive_match(self):
         """Baseline: without mHC, all shapes should be plain hidden_size."""
         cfg = _make_config(hidden_size=64, num_layers=8, pp_size=4)
-        shapes = self._get_send_recv_shapes(cfg, 4)
+        shapes = _get_send_recv_shapes(cfg, 4)
         for i in range(3):
             assert shapes[i][0] == shapes[i + 1][1]
             assert shapes[i][0] == [(32, 2, 64)]
@@ -1040,33 +1035,6 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
     This is critical: a shape mismatch causes hangs or crashes.
     """
 
-    def _get_send_recv_shapes(self, config, pp_size, seq=32, mbs=2):
-        tp, cp = _make_tp_cp_groups()
-        results = []
-        for rank in range(pp_size):
-            send = get_tensor_shapes(
-                seq_length=seq,
-                micro_batch_size=mbs,
-                decoder_seq_length=None,
-                config=config,
-                tp_group=tp,
-                cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size),
-                is_recv=False,
-            )
-            recv = get_tensor_shapes(
-                seq_length=seq,
-                micro_batch_size=mbs,
-                decoder_seq_length=None,
-                config=config,
-                tp_group=tp,
-                cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size),
-                is_recv=True,
-            )
-            results.append((send, recv))
-        return results
-
     def test_pp2_flexible_vpp_mhc_send_recv_match(self):
         """PP=2 with flexible VPP layout + mHC: rank 0 send == rank 1 recv."""
         H, N = 64, 4
@@ -1078,7 +1046,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             enable_hyper_connections=True,
             num_residual_streams=N,
         )
-        shapes = self._get_send_recv_shapes(cfg, pp_size=2)
+        shapes = _get_send_recv_shapes(cfg, pp_size=2)
         assert (
             shapes[0][0] == shapes[1][1]
         ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
@@ -1108,7 +1076,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             enable_hyper_connections=True,
             num_residual_streams=N,
         )
-        shapes = self._get_send_recv_shapes(cfg, pp_size=4)
+        shapes = _get_send_recv_shapes(cfg, pp_size=4)
         for i in range(3):
             assert (
                 shapes[i][0] == shapes[i + 1][1]
@@ -1132,7 +1100,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             layout=[["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]],
             enable_hyper_connections=False,
         )
-        shapes = self._get_send_recv_shapes(cfg, pp_size=2)
+        shapes = _get_send_recv_shapes(cfg, pp_size=2)
         for i in range(1):
             assert shapes[i][0] == shapes[i + 1][1]
             assert shapes[i][0] == [(32, 2, H)]
@@ -1149,7 +1117,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             enable_hyper_connections=True,
             num_residual_streams=N,
         )
-        shapes = self._get_send_recv_shapes(cfg, pp_size=2)
+        shapes = _get_send_recv_shapes(cfg, pp_size=2)
         assert (
             shapes[0][0] == shapes[1][1]
         ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"

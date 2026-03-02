@@ -21,6 +21,28 @@ from megatron.core.transformer.transformer_layer import (
 from tests.unit_tests.test_utilities import Utils
 
 
+def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
+    """Build a TransformerConfig with common MHC defaults.
+
+    Any default can be overridden via **extra
+    (e.g. ``_make_mhc_config(num_layers=8, recompute_hyper_connections=True)``).
+    """
+    base = dict(
+        num_layers=2,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_hyper_connections=True,
+        num_residual_streams=num_streams,
+        mhc_sinkhorn_iterations=5,
+        mhc_init_gating_factor=0.01,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    base.update(extra)
+    return TransformerConfig(**base)
+
+
 class TestParallelTransformerLayer:
 
     def setup_method(self, method):
@@ -327,24 +349,21 @@ class TestTransformerLayerWithHyperConnectionRecompute:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _create_layer_with_hyper_connection(self, hidden_size=64, num_streams=4):
+    def _create_layer_with_hyper_connection(
+        self, hidden_size=64, num_streams=4, layer_number=1, **extra
+    ):
         """Create a HyperConnectionTransformerLayer with hyper connection enabled."""
-        config = TransformerConfig(
-            num_layers=2,
+        config = _make_mhc_config(
             hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            num_streams=num_streams,
             recompute_hyper_connections=True,
             recompute_granularity='selective',
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
+            **extra,
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
-        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer = HyperConnectionTransformerLayer(
+            config, layer_spec.submodules, layer_number=layer_number
+        )
         layer.cuda()
         return layer, config
 
@@ -451,24 +470,10 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         batch_size = 2
         num_layers = 3
 
-        # Create multiple layers
-        config = TransformerConfig(
-            num_layers=num_layers,
-            hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
-            recompute_hyper_connections=True,
-            recompute_granularity='selective',
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-        )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layers = [
-            HyperConnectionTransformerLayer(
-                config, layer_spec.submodules, layer_number=i + 1
-            ).cuda()
+            self._create_layer_with_hyper_connection(
+                hidden_size, num_streams, layer_number=i + 1, num_layers=num_layers
+            )[0]
             for i in range(num_layers)
         ]
 
@@ -532,19 +537,12 @@ class TestMHCRecomputeMemorySaving:
         `recompute_block_size` layers, mirroring TransformerBlock's
         _build_mhc_recompute_layer_plan logic.
         """
-        config = TransformerConfig(
-            num_layers=num_layers,
+        config = _make_mhc_config(
             hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            num_streams=num_streams,
+            num_layers=num_layers,
             recompute_hyper_connections=use_recompute,
             recompute_granularity='selective' if use_recompute else None,
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layers = [
@@ -639,19 +637,7 @@ class TestMHCWithCudaGraph:
         Utils.destroy_model_parallel()
 
     def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            **extra_config,
-        )
+        config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
@@ -988,17 +974,9 @@ class TestMHCWithOffloading:
         if offload_modules is None:
             offload_modules = ["attn_norm", "mlp_norm"]
 
-        config = TransformerConfig(
-            num_layers=2,
+        config = _make_mhc_config(
             hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
+            num_streams=num_streams,
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
         )
@@ -1085,21 +1063,8 @@ class TestMHCWithOffloading:
         input_data = torch.randn(seq_len, batch_size, n_channels, device='cuda')
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        common_config_kwargs = dict(
-            num_layers=2,
-            hidden_size=hidden_size,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
-            mhc_sinkhorn_iterations=5,
-            mhc_init_gating_factor=0.01,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-        )
-
         # Run without offloading
-        config_no_offload = TransformerConfig(**common_config_kwargs)
+        config_no_offload = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams)
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layer_no_offload = HyperConnectionTransformerLayer(
             config_no_offload, layer_spec.submodules
@@ -1113,8 +1078,9 @@ class TestMHCWithOffloading:
         out1_detached = out1.detach().clone()
 
         # Run with offloading using the same weights
-        config_offload = TransformerConfig(
-            **common_config_kwargs,
+        config_offload = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
             fine_grained_activation_offloading=True,
             offload_modules=["attn_norm", "mlp_norm"],
         )

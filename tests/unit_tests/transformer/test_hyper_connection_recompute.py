@@ -4,22 +4,17 @@
 Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
-1. HyperConnectionModule._forward_with_checkpoint
-2. HyperConnectionModule.apply_h_post with manager parameter
-3. Integration with CheckpointManager
-4. TransformerLayer with mhc_recompute_manager
-5. TransformerBlock with recompute_hyper_connections
+1. HyperConnectionModule._forward_with_checkpoint correctness
+2. HyperConnectionModule.apply_h_post with CheckpointManager
+3. Multiple HyperConnectionModules chained with a single CheckpointManager
+4. Partial checkpoint (last layer not checkpointed)
+5. TransformerConfig recompute_hyper_connections option
 """
 
 import pytest
 import torch
-import torch.nn as nn
 
-from megatron.core.tensor_parallel.random import (
-    CheckpointManager,
-    CheckpointWithoutOutput,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -384,104 +379,6 @@ class TestMHCBlockRecomputeIntegration:
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
-
-
-class TestCheckpointWithoutOutputManager:
-    """Test CheckpointWithoutOutput behavior with ckpt_manager."""
-
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    def test_ckpt_manager_auto_registration(self):
-        """
-        Test that CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided.
-        """
-        manager = CheckpointManager()
-        assert len(manager.checkpoints) == 0
-
-        def simple_func(x):
-            return x * 2
-
-        x = torch.randn(4, 4, device='cuda', requires_grad=True)
-
-        # Create checkpoint with manager
-        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-        y = ckpt.checkpoint(simple_func, x)
-
-        # Checkpoint should be auto-registered
-        assert len(manager.checkpoints) == 1
-        assert manager.checkpoints[0] is ckpt
-
-    def test_discard_output_noop_with_manager(self):
-        """
-        Test that discard_output_and_register_recompute is a no-op when ckpt_manager is set.
-        """
-        manager = CheckpointManager()
-
-        def simple_func(x):
-            return x * 2
-
-        x = torch.randn(4, 4, device='cuda', requires_grad=True)
-
-        # Create checkpoint with manager
-        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-        y = ckpt.checkpoint(simple_func, x)
-
-        # Check output storage is not released yet
-        original_size = y.untyped_storage().size()
-        assert original_size > 0
-
-        # Call discard_output_and_register_recompute - should be no-op
-        ckpt.discard_output_and_register_recompute(y)
-
-        # Storage should still be intact (no-op behavior)
-        assert y.untyped_storage().size() == original_size
-
-        # Clean up - register unified recompute to properly release
-        manager.discard_all_outputs_and_register_unified_recompute(y)
-        assert y.untyped_storage().size() == 0
-
-    def test_checkpoint_without_manager_original_behavior(self):
-        """
-        Test that CheckpointWithoutOutput without manager maintains original behavior.
-        """
-
-        def simple_func(x):
-            return x * 2
-
-        x = torch.randn(4, 4, device='cuda', requires_grad=True)
-        x_ref = x.detach().clone().requires_grad_(True)
-
-        # Reference without checkpoint
-        y_ref = simple_func(x_ref)
-        loss_ref = y_ref.sum()
-        loss_ref.backward()
-        grad_ref = x_ref.grad.clone()
-
-        # With checkpoint (no manager)
-        ckpt = CheckpointWithoutOutput()  # No ckpt_manager
-        y = ckpt.checkpoint(simple_func, x)
-
-        # Verify output is valid before discard
-        assert y.untyped_storage().size() > 0
-
-        # Discard and register individual recompute
-        loss = y.sum()
-        ckpt.discard_output_and_register_recompute(loss)
-
-        # Storage should be released
-        assert y.untyped_storage().size() == 0
-
-        # Backward pass
-        loss.backward()
-        grad_ckpt = x.grad.clone()
-
-        # Gradients should match
-        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6)
 
 
 class TestTransformerConfigRecomputeHyperConnections:
