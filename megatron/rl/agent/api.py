@@ -184,16 +184,27 @@ class GroupedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        # When streaming, use buffer_size to create backpressure for balanced generation in a multi-task setting.
+        # When streaming, use buffer_size to create backpressure
+        # for balanced generation in a multi-task setting.
         grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
             maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
 
+        # When batch_results is enabled, gate resubmissions so that workers can only
+        # submit new requests after the previous batch has been consumed.
+        submission_gate = (
+            asyncio.Semaphore(self.parallel_generation_tasks)
+            if request.batch_results
+            else None
+        )
+
         @trace_async_exceptions(verbose=True)
         async def group_task():
             nonlocal submitted_groups
             while request.streaming or submitted_groups < request.num_groups:
+                if submission_gate is not None:
+                    await submission_gate.acquire()
                 group_index = submitted_groups
                 submitted_groups += 1
                 group = await self.group_rollout(request=request)
@@ -223,6 +234,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                         batch.sort(key=lambda g: g[0].submission_index)
                         next_batch_id += 1
                         yield batch
+                        # Release permits so workers can submit the next round of
+                        # requests. This runs after the consumer resumes the generator.
+                        for _ in range(request.num_groups):
+                            submission_gate.release()
             else:
                 while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
                     yield await grouped_rollouts.get()
