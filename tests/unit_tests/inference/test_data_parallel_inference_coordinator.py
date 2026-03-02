@@ -384,6 +384,7 @@ class TestCoordinator:
         # States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
         PAUSED_FAMILY = {
             EngineState.PAUSED,
+            EngineState.UNPAUSING,
             EngineState.SUSPENDING,
             EngineState.SUSPENDED,
             EngineState.RESUMING,

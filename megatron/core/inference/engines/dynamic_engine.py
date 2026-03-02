@@ -112,6 +112,7 @@ class EngineState(Enum):
     RUNNING = auto()  # Processing requests
     PAUSING = auto()  # PAUSE received; waiting for EP consensus + world barrier
     PAUSED = auto()  # Globally confirmed idle
+    UNPAUSING = auto()  # UNPAUSE received; waiting for world barrier
     SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
     SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
     RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
@@ -1665,9 +1666,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.UNPAUSE:
                 assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
-                self.state = EngineState.RUNNING
-                self.paused.clear()
-                self.running.set()
+                self.state = EngineState.UNPAUSING
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
@@ -1799,7 +1798,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
         Used for all state transitions that require global synchronization:
-        PAUSING → PAUSED, SUSPENDING → SUSPENDED, RESUMING → PAUSED, and STOPPING → STOPPED.
+        PAUSING → PAUSED, UNPAUSING → RUNNING, SUSPENDING → SUSPENDED,
+        RESUMING → PAUSED, and STOPPING → STOPPED.
 
         No-op when world_size == 1 (communicator is not created).
         """
@@ -1818,7 +1818,7 @@ class DynamicInferenceEngine(AbstractEngine):
         - RUNNING: EP all-reduce to check for work, then step or idle.
         - PAUSING: EP all-reduce to reach consensus, then world barrier.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
-        - SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
+        - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
@@ -1858,6 +1858,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)
+
+                elif self.state == EngineState.UNPAUSING:
+                    await self._world_barrier()
+                    self.state = EngineState.RUNNING
+                    self.paused.clear()
+                    self.running.set()
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
