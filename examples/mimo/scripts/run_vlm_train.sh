@@ -139,7 +139,7 @@ else
     ${GPT_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
