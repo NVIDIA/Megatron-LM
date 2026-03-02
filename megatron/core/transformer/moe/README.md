@@ -693,6 +693,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA
 
 - GitHub Issues: [Report bugs or request features](https://github.com/NVIDIA/Megatron-LM/issues)
 - Documentation: [Full documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+- Performance: [Latest MoE training performance summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html)
 
 
 ## Citation
