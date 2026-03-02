@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Union
+from typing import List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
