@@ -21,7 +21,7 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, ATTENTION, MLP, MOE, GDN}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, MLP, MOE}
 
 
 @dataclass
