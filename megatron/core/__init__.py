@@ -1,5 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import signal
+import sys
+import torch.distributed as dist
+
 import megatron.core.tensor_parallel
 import megatron.core.utils
 from megatron.core import parallel_state
@@ -21,6 +25,7 @@ from megatron.core.package_info import (
 )
 from megatron.core.timers import Timers
 from megatron.core.utils import is_torch_min_version
+from megatron.training import print_rank_0
 
 # Alias parallel_state as mpu, its legacy name
 mpu = parallel_state
@@ -52,12 +57,16 @@ if is_torch_min_version("2.6a0"):
     register_safe_globals()
 
 
-import signal
-import sys
-import torch.distributed as dist
-from megatron.training import print_rank_0
-
 def graceful_shutdown(signum, frame):
+    """
+    Signal handler for user-initiated termination (SIGINT / SIGTERM).
+
+    This handler attempts a best-effort graceful shutdown:
+      - Logs a single termination message from rank 0
+      - Synchronizes all ranks (barrier)
+      - Destroys the distributed process group
+      - Exits the process cleanly
+    """
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
 
     try:
@@ -70,6 +79,9 @@ def graceful_shutdown(signum, frame):
 
     sys.exit(0)
 
-# Handle BOTH signals
+
+# Register signal handlers for both:
+#  - SIGINT  (Ctrl+C from user)
+#  - SIGTERM (sent by torchrun to worker processes)
 signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
