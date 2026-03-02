@@ -483,14 +483,18 @@ def select_pipeline_segment(
     return layer_type_list, layer_offset
 
 
-def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> list[dict[int, int]]:
+def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
     for each layer type in [Attention, GDN, Mamba, MLP, MoE] given a layer type list.
 
     DSA layers are treated as Attention in this count.
     """
-    layer_types = [Symbols.ATTENTION, Symbols.GDN, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
+    layer_types = [
+        symbol
+        for symbol in Symbols.name_sorted_valid_layer_symbols()
+        if symbol != Symbols.DS_ATTENTION
+    ]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
         # DSA layers are treated as attention for KV cache mapping.
@@ -498,4 +502,4 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> list[dict
         layer_map = layer_maps[effective_type]
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
-    return [layer_maps[layer_type] for layer_type in layer_types]
+    return layer_maps
