@@ -13,6 +13,7 @@ from multiprocessing.connection import Connection
 import torch
 
 from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 
 try:
     import zmq
@@ -75,6 +76,8 @@ class DataParallelInferenceCoordinator:
         tokenizer,
         inference_coordinator_port: int | None = None,
         deterministic_mode: bool = False,
+        block_size_tokens: int | None = None,
+        enable_prefix_caching: bool = False,
     ):
         """
         Initializes the inference coordinator.
@@ -162,6 +165,17 @@ class DataParallelInferenceCoordinator:
         self.next_request_id = 0
         self.tokenizer = tokenizer
 
+        # Prefix caching state for routing.
+        self.block_size_tokens = block_size_tokens
+        self.enable_prefix_caching = enable_prefix_caching
+        self.rank_cached_hashes = {
+            identity: set() for identity in self.identities_of_data_parallel_ranks
+        }
+        self.rank_hash_timestamps = {
+            identity: {} for identity in self.identities_of_data_parallel_ranks
+        }
+        self._assignment_counter = 0
+
     def get_next_data_parallel_rank(self):
         """
         Selects the next data parallel rank using round-robin scheduling.
@@ -170,6 +184,86 @@ class DataParallelInferenceCoordinator:
             bytes: The ZMQ identity of the next data parallel rank to receive a request.
         """
         return next(self.data_parallel_rank_iterator)
+
+    def compute_request_hashes(self, prompt):
+        """Compute block hashes for a prompt on CPU.
+
+        Args:
+            prompt: Either a string (to be tokenized) or a list of token IDs.
+
+        Returns:
+            List of integer block hashes, or empty list if prefix caching is disabled.
+        """
+        if not self.enable_prefix_caching or self.block_size_tokens is None:
+            return []
+        if isinstance(prompt, str):
+            tokens = self.tokenizer.tokenize(prompt)
+        else:
+            tokens = list(prompt)
+        token_tensor = torch.tensor(tokens, dtype=torch.int64)
+        return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
+
+    def get_best_data_parallel_rank(self, request_hashes):
+        """Select the best DP rank based on prefix cache affinity.
+
+        Picks the rank with the longest consecutive prefix match. Ties are broken
+        by recency (higher timestamp = more recently assigned). Falls back to
+        round-robin when prefix caching is disabled or no rank has any match.
+
+        Args:
+            request_hashes: List of block hashes for the request.
+
+        Returns:
+            bytes: The ZMQ identity of the selected data parallel rank.
+        """
+        if not self.enable_prefix_caching or not request_hashes:
+            return self.get_next_data_parallel_rank()
+
+        best_match = 0
+        best_recency = -1
+        best_rank = None
+
+        for rank_identity in self.identities_of_data_parallel_ranks:
+            rank_hashes = self.rank_cached_hashes[rank_identity]
+            # Count consecutive matches from the start.
+            count = 0
+            for h in request_hashes:
+                if h in rank_hashes:
+                    count += 1
+                else:
+                    break
+
+            if count > best_match:
+                best_match = count
+                best_rank = rank_identity
+                # Recency = min timestamp among matched hashes (oldest in the chain).
+                timestamps = self.rank_hash_timestamps[rank_identity]
+                best_recency = min(timestamps.get(h, 0) for h in request_hashes[:count])
+            elif count == best_match and count > 0:
+                timestamps = self.rank_hash_timestamps[rank_identity]
+                recency = min(timestamps.get(h, 0) for h in request_hashes[:count])
+                if recency > best_recency:
+                    best_recency = recency
+                    best_rank = rank_identity
+
+        if best_rank is None:
+            return self.get_next_data_parallel_rank()
+        return best_rank
+
+    def _update_rank_hashes(self, rank_identity, request_hashes):
+        """Record that a rank owns the given hashes.
+
+        Args:
+            rank_identity: ZMQ identity of the target rank.
+            request_hashes: List of block hashes assigned to this rank.
+        """
+        self._assignment_counter += 1
+        cached = self.rank_cached_hashes[rank_identity]
+        timestamps = self.rank_hash_timestamps[rank_identity]
+        ts = self._assignment_counter
+        for h in request_hashes:
+            cached.add(h)
+            timestamps[h] = ts
 
     def start(self):
         """
@@ -230,7 +324,12 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
-                next_data_parallel_rank_identity = self.get_next_data_parallel_rank()
+                request_hashes = self.compute_request_hashes(prompt)
+                next_data_parallel_rank_identity = self.get_best_data_parallel_rank(
+                    request_hashes
+                )
+                if request_hashes:
+                    self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
                 self.router_socket.send_multipart(
                     [
                         next_data_parallel_rank_identity,
@@ -352,6 +451,8 @@ class DataParallelInferenceCoordinator:
         tokenizer,
         inference_coordinator_port: int | None = None,
         deterministic_mode: bool = False,
+        block_size_tokens: int | None = None,
+        enable_prefix_caching: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -366,6 +467,8 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
             deterministic_mode (bool): Whether to enable deterministic scheduling.
+            block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
+            enable_prefix_caching (bool): Whether prefix caching is enabled.
         """
         coordinator = cls(
             pipe_connection,
@@ -373,6 +476,8 @@ class DataParallelInferenceCoordinator:
             tokenizer,
             inference_coordinator_port,
             deterministic_mode=deterministic_mode,
+            block_size_tokens=block_size_tokens,
+            enable_prefix_caching=enable_prefix_caching,
         )
         ready_event.set()
         try:
