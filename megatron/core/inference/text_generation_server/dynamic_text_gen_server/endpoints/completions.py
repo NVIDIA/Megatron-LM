@@ -128,12 +128,16 @@ try:
         choices = []
 
         request_idx = 0
-        for record in batch_results:
-            record_dict = record if isinstance(record, dict) else record.serialize()
+        for completed_request in batch_results:
+            request_dict = (
+                completed_request
+                if isinstance(completed_request, dict)
+                else completed_request.serialize()
+            )
             # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
             result = {
                 k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in record_dict.items()
+                for k, v in request_dict.items()
             }
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
@@ -204,7 +208,9 @@ try:
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
             if result["routing_indices"] is not None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
-                prompt_length = len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
+                prompt_length = (
+                    len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
+                )
                 if prompt_length:
                     choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length

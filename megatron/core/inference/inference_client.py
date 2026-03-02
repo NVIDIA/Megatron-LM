@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Awaitable, List, Optional, Union
 
-from megatron.core.inference.inference_request import DynamicInferenceRequest, DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -53,16 +53,16 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_address: str, deserialize: bool = True):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
         Args:
             inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
-            deserialize (bool): If True (default), deserialize completed requests
-                into DynamicInferenceRequest objects. If False, return the raw
-                serialized dict for lower overhead.
+            deserialize (bool): If True, deserialize completed requests
+                into DynamicInferenceRequest objects. If False (default), return
+                the raw serialized dict for lower overhead.
         """
         assert (
             HAVE_ZMQ
@@ -144,7 +144,9 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
-                    completed_request = DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+                    )
                     completion_future.get_loop().call_soon_threadsafe(
                         completion_future.set_result, completed_request
                     )

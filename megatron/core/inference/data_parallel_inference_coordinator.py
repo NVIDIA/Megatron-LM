@@ -339,8 +339,12 @@ class DataParallelInferenceCoordinator:
                 generated tokens to be detokenized. It is modified in place.
         """
         if finished_request["prompt"] is None:
-            finished_request["prompt"] = self.tokenizer.detokenize(finished_request["prompt_tokens"][1])
-        finished_request["generated_text"] = self.tokenizer.detokenize(finished_request["generated_tokens"])
+            finished_request["prompt"] = self.tokenizer.detokenize(
+                finished_request["prompt_tokens"][1]
+            )
+        finished_request["generated_text"] = self.tokenizer.detokenize(
+            finished_request["generated_tokens"]
+        )
 
     @classmethod
     def entrypoint(
