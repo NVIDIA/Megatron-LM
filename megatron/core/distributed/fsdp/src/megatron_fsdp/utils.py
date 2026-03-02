@@ -22,13 +22,6 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
-    import megatron.core.parallel_state as parallel_state
-
-    HAVE_MEGATRON_CORE = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_MEGATRON_CORE = False
-
-try:
     import einops
 
     HAVE_EINOPS = True
@@ -453,6 +446,8 @@ class FSDPDistributedIndex:
         hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
         expt_device_mesh: Optional[DeviceMesh] = None,
+        fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+        expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -474,6 +469,13 @@ class FSDPDistributedIndex:
                 just sharding across dp_shard ranks and replicating across dp_outer ranks.
             expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
                 to use for the DistributedIndex.
+            fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for overlapping all-gather and reduce-scatter operations.
+                When provided, enables AG/RS overlap optimization for regular (non-expert)
+                parameters.
+            expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for expert parameters in MoE models. When provided, enables AG/RS
+                overlap optimization for expert parameters.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -497,13 +499,10 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # AG group comes from parallel_state, not the mesh
-        # the purpose of this independent group is to overlap all-gather and gradient reduction.
-        self.fsdp_group_ag = None
-        if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
-            self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, independent_all_gather=True
-            )
+        # AG groups passed as explicit arguments
+        # The purpose of independent AG groups is to overlap all-gather and reduce-scatter.
+        self.fsdp_group_ag = fsdp_group_ag
+        self.expt_fsdp_group_ag = expt_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
             self.device_mesh[self.dp_outer_dim].get_group()
@@ -655,6 +654,8 @@ class FSDPDistributedIndex:
     ) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
+            if independent_all_gather:
+                return self.expt_fsdp_group_ag
             return self.expt_fsdp_group
         if independent_all_gather:
             return self.fsdp_group_ag
