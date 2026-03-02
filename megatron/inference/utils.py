@@ -215,7 +215,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Suspend and resume the dynamic engine every "
-        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "`suspend_resume_interval` requests. This is used to test the suspend/resume "
         "system.",
     )
     group.add_argument(

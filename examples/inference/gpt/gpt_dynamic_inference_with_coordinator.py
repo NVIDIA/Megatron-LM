@@ -54,20 +54,8 @@ async def main(
 
     args = get_args()
 
-    # Test suspend/resume intervals.
-    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
-        # Since the client doesn't directly call engine.async_step here, we test
-        # the suspend-resume system ~4 times.
-        suspend_resume_interval = max(1, len(requests) // 4)
-        suspend_idxs = set(
-            range(suspend_resume_interval, len(requests) + 1, suspend_resume_interval)
-        )
-        resume_idxs = set(
-            min(len(requests), i + suspend_resume_interval // 2) for i in suspend_idxs
-        )
-    else:
-        suspend_idxs = set()
-        resume_idxs = set()
+    # All ranks have the same args and requests, so they agree on the cycle count.
+    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
 
     # Create client and run example.
     if dist.get_rank() == 0:
@@ -79,8 +67,9 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")
-        # time.sleep(20)
+        next_suspend_at = args.suspend_resume_interval or 0
+        cycles_done = 0
+
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -96,11 +85,17 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    # Test suspend/resume.
-                    if num_requests_added in suspend_idxs:
+                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                        client.pause_engines()
+                        await engine.wait_until(EngineState.PAUSED)
                         client.suspend_engines()
-                    if num_requests_added in resume_idxs:
+                        await engine.wait_until(EngineState.SUSPENDED)
                         client.resume_engines()
+                        await engine.wait_until(EngineState.PAUSED)
+                        client.unpause_engines()
+                        await engine.wait_until(EngineState.RUNNING)
+                        cycles_done += 1
+                        next_suspend_at += args.suspend_resume_interval
 
             else:
                 # Add deterministic number of requests (generally used for debugging).
@@ -114,11 +109,17 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    # Test suspend/resume.
-                    if num_requests_added in suspend_idxs:
+                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                        client.pause_engines()
+                        await engine.wait_until(EngineState.PAUSED)
                         client.suspend_engines()
-                    if num_requests_added in resume_idxs:
+                        await engine.wait_until(EngineState.SUSPENDED)
                         client.resume_engines()
+                        await engine.wait_until(EngineState.PAUSED)
+                        client.unpause_engines()
+                        await engine.wait_until(EngineState.RUNNING)
+                        cycles_done += 1
+                        next_suspend_at += args.suspend_resume_interval
 
             if num_requests_added == num_requests_total:
                 break
@@ -127,6 +128,13 @@ async def main(
 
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+    else:
+        # Non-rank-0: match the suspend/resume cycles that rank 0 drives.
+        for _ in range(num_suspend_resume_cycles):
+            await engine.wait_until(EngineState.PAUSED)
+            await engine.wait_until(EngineState.SUSPENDED)
+            await engine.wait_until(EngineState.PAUSED)
+            await engine.wait_until(EngineState.RUNNING)
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -215,9 +223,7 @@ if __name__ == "__main__":
 
         model = get_model_for_inference()
 
-        requests = (
-            build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
-        )
+        requests = build_requests(args, tokenizer, sampling_params)
 
         engine = get_dynamic_inference_engine(model=model)
 
