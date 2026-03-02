@@ -453,7 +453,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     streaming = args.rl_partial_rollouts or args.rl_forced_lag > 0
     if not streaming or _ROLLOUT_GENERATOR is None:
         if args.rl_forced_lag > 0:
-            pgt = args.rl_forced_lag * n_prompts
+            pgt = (args.rl_forced_lag + 1) * n_prompts
         else:
             pgt = args.rl_parallel_generation_tasks
         agent = get_agent(args, parallel_generation_tasks=pgt)
