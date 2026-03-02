@@ -1373,9 +1373,9 @@ class MoETransformerLayer(TransformerLayer):
 
         """
 
-        # Restore token dispatcher attributes from heap copies (needed during
-        # cudagraph creation where the router capture may leave these attrs
-        # pointing into graph-pool memory).
+        # Restore token dispatcher attributes. During graph warmup, the router capture leaves these
+        # attrs pointing into cudagraph pool memory; restoring them here ensures the postprocess
+        # graph captures with valid pointers.
         for name, attr in self.token_dispatcher_attrs.items():
             setattr(self.mlp.token_dispatcher, name, attr)
 
@@ -1407,10 +1407,12 @@ class MoETransformerLayer(TransformerLayer):
 
             # After the router graph replays, the captured .copy_() operations that update
             # self.token_dispatcher_attrs via `_maybe_dtoh_and_synchronize` are queued on the
-            # current stream but may not have completed. Synchronize to ensure
-            # self.token_dispatcher_attrs contain the correct values before the eager
-            # expert_compute phase restores them onto the token dispatcher.
+            # current stream but may not have completed. Synchronize to ensure they complete,
+            # then restore the attrs onto the token dispatcher before the eager expert_compute
+            # phase which does all-to-all using these attrs.
             torch.cuda.current_stream().synchronize()
+            for name, attr in self.token_dispatcher_attrs.items():
+                setattr(self.mlp.token_dispatcher, name, attr)
 
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
