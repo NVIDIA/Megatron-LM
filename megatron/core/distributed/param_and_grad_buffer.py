@@ -114,24 +114,28 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (global_start - offset, global_end - offset)
 
         # Layer-wise optimizer attributes for async param gather.
-        self.lw_params_list = None
-        self.lw_param_flat_sizes = None
-        self.lw_gather_list = None
-        self._lw_src_buffer = None
+        self.layerwise_params_list = None
+        self.layerwise_param_flat_sizes = None
+        self.layerwise_gather_list = None
+        self._layerwise_src_buffer = None
 
-    def set_lw_params_list(self, lw_params_list: List[List[torch.nn.Parameter]]):
+    def set_layerwise_params_list(
+        self, layerwise_params_list: List[List[torch.nn.Parameter]]
+    ):
         """Set per-rank parameter lists for layer-wise async all-gather.
 
         Args:
-            lw_params_list: List of param lists, one per rank in the DP group.
+            layerwise_params_list: List of param lists, one per rank in the DP group.
+                Each inner list contains the parameters owned by that rank's
+                layer-wise optimizer that also belong to this bucket.
         """
-        self.lw_params_list = lw_params_list
-        self.lw_param_flat_sizes = [
-            sum([p.numel() for p in param_list]) for param_list in lw_params_list
+        self.layerwise_params_list = layerwise_params_list
+        self.layerwise_param_flat_sizes = [
+            sum([p.numel() for p in param_list]) for param_list in layerwise_params_list
         ]
 
 
-class _LWAllGatherHandle:
+class _LayerwiseAllGatherHandle:
     """Handle wrapping multiple async all-gather work objects.
 
     NCCL guarantees in-order completion on the same communicator, so waiting
@@ -144,6 +148,7 @@ class _LWAllGatherHandle:
     def wait(self):
         if self.handles:
             self.handles[-1].wait()
+        self.handles = None
 
 
 class _ParamAndGradBucketGroup:
@@ -316,77 +321,79 @@ class _ParamAndGradBucketGroup:
             # param gather.
             #
             # Each rank may own a different number of params per bucket, so
-            # lw_param_flat_sizes can vary across ranks.  PyTorch's NCCL
+            # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
             # backend handles uneven tensor sizes in torch.distributed.all_gather
             # (falling back to grouped send/recv internally when sizes differ),
             # so no manual padding is needed.
             dp_size = self.intra_distributed_optimizer_instance_size
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
-            lw_work_handles = []
+            layerwise_work_handles = []
             for bucket in self.buckets:
                 # Use param dtype (e.g., bf16), NOT grad dtype (which may be
                 # fp32 when grad_reduce_in_fp32 is enabled).
                 param_dtype = bucket.params_list[0].dtype
 
-                if max(bucket.lw_param_flat_sizes) == 0:
+                if max(bucket.layerwise_param_flat_sizes) == 0:
                     # All ranks have empty params for this bucket — skip.
-                    bucket.lw_gather_list = None
+                    bucket.layerwise_gather_list = None
                     continue
 
                 # Flatten local params.  Detach from the autograd graph because
                 # start_param_sync can be called during the forward pass (where
                 # autograd is active) and all_gather will write into gather_list
                 # entries in-place.
-                local_size = bucket.lw_param_flat_sizes[local_rank]
+                local_size = bucket.layerwise_param_flat_sizes[local_rank]
                 if local_size > 0:
-                    src = _flatten_dense_tensors(bucket.lw_params_list[local_rank]).detach()
+                    flat_local_params = _flatten_dense_tensors(
+                        bucket.layerwise_params_list[local_rank]
+                    ).detach()
                 else:
-                    src = torch.empty(
+                    flat_local_params = torch.empty(
                         0, device=bucket.grad_data.device, dtype=param_dtype
                     )
-                # Keep src alive until the async operation completes.
-                bucket._lw_src_buffer = src
+                # Keep flat_local_params alive until the async operation completes.
+                bucket._layerwise_src_buffer = flat_local_params
 
                 # Allocate per-rank receive buffers with actual sizes (no padding).
-                # Reuse src for local_rank's slot to avoid an extra allocation.
+                # Reuse flat_local_params for local_rank's slot to avoid an extra allocation.
                 gather_list = []
                 for i in range(dp_size):
                     if i == local_rank:
-                        gather_list.append(src)
+                        gather_list.append(flat_local_params)
                     else:
                         gather_list.append(
                             torch.empty(
-                                bucket.lw_param_flat_sizes[i],
-                                device=src.device,
-                                dtype=src.dtype,
+                                bucket.layerwise_param_flat_sizes[i],
+                                device=flat_local_params.device,
+                                dtype=flat_local_params.dtype,
                             )
                         )
-                bucket.lw_gather_list = gather_list
+                bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
-                    gather_list, src, group=group, async_op=async_op
+                    gather_list, flat_local_params, group=group, async_op=async_op
                 )
                 if async_op and work is not None:
-                    lw_work_handles.append(work)
+                    layerwise_work_handles.append(work)
 
             if async_op:
-                self.param_gather_handle = _LWAllGatherHandle(lw_work_handles)
+                self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
                 # Synchronous: unflatten and copy gathered params immediately.
                 for bucket in self.buckets:
-                    if bucket.lw_gather_list is None:
+                    if bucket.layerwise_gather_list is None:
                         continue
-                    for idx, params in enumerate(bucket.lw_params_list):
+                    for idx, params in enumerate(bucket.layerwise_params_list):
                         if len(params) == 0 or idx == local_rank:
                             continue
                         updated_params = _unflatten_dense_tensors(
-                            bucket.lw_gather_list[idx], params
+                            bucket.layerwise_gather_list[idx], params
                         )
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
-                    bucket.lw_gather_list = None
-                    bucket._lw_src_buffer = None
+                    bucket.layerwise_gather_list = None
+                    bucket._layerwise_src_buffer = None
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -472,10 +479,10 @@ class _ParamAndGradBucketGroup:
                     bucket.param_data.zero_()
             elif not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
-                    if bucket.lw_gather_list is None:
+                    if bucket.layerwise_gather_list is None:
                         continue
                     # Unflatten and copy gathered params for each rank.
-                    for idx, params in enumerate(bucket.lw_params_list):
+                    for idx, params in enumerate(bucket.layerwise_params_list):
                         # Skip local params and empty tensors.
                         if (
                             len(params) == 0
@@ -483,12 +490,12 @@ class _ParamAndGradBucketGroup:
                         ):
                             continue
                         updated_params = _unflatten_dense_tensors(
-                            bucket.lw_gather_list[idx], params
+                            bucket.layerwise_gather_list[idx], params
                         )
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
-                    bucket.lw_gather_list = None
-                    bucket._lw_src_buffer = None
+                    bucket.layerwise_gather_list = None
+                    bucket._layerwise_src_buffer = None
             else:
                 fp8_params = []
                 for bucket in self.buckets:
@@ -685,8 +692,8 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
         for bucket in self.buckets:
-            bucket.lw_gather_list = None
-            bucket._lw_src_buffer = None
+            bucket.layerwise_gather_list = None
+            bucket._layerwise_src_buffer = None
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False

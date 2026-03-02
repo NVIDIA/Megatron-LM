@@ -69,7 +69,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             assert (
                 model_chunks is not None
             ), "model_chunks must be provided if async_allgather is True"
-            self.set_bucket_lw_params_list(model_chunks)
+            self.set_bucket_layerwise_params_list(model_chunks)
 
         if init_state_fn_list:
             assert len(init_state_fn_list) == len(
@@ -156,7 +156,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
-    def set_bucket_lw_params_list(self, model_chunks):
+    def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
@@ -175,7 +175,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         for param in full_params_list:
                             if param in bucket.params:
                                 bucket_list.append(param)
-                    bucket.set_lw_params_list(bucket_params_list)
+                    bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             if self.expt_dp_params_list is not None:
                 for group in model_chunk.expert_parallel_bucket_groups:
@@ -189,7 +189,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                             for param in full_params_list:
                                 if param in bucket.params:
                                     bucket_list.append(param)
-                        bucket.set_lw_params_list(bucket_params_list)
+                        bucket.set_layerwise_params_list(bucket_params_list)
 
     @torch.no_grad()
     def allgather_params(self) -> None:
