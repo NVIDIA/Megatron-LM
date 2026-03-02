@@ -403,7 +403,11 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple, fuse_unpermute_combine=ctx.fused
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            fuse_unpermute_combine=ctx.fused,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
