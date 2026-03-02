@@ -749,7 +749,6 @@ class InferenceTopKRouter(TopKRouter):
         super().__init__(config=config, pg_collection=pg_collection)
 
         self.is_inference_cuda_graphed_iteration = False
-        self.topk_routing_with_score_function = torch.compile(topk_routing_with_score_function)
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA graph-compatible operations for the router."""
@@ -759,14 +758,29 @@ class InferenceTopKRouter(TopKRouter):
         """Disable CUDA graph-compatible operations for the router."""
         self.is_inference_cuda_graphed_iteration = False
 
+    @staticmethod
+    @torch.compile
+    def _compiled_topk_routing(logits, topk, use_pre_softmax, num_groups,
+                               group_topk, scaling_factor, score_function,
+                               expert_bias, fused, router_replay, dense_output):
+        return topk_routing_with_score_function(
+            logits,
+            topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            fused=fused,
+            router_replay=router_replay,
+            dense_output=dense_output,
+        )
+
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
-        logits = self.gating(input).squeeze(1)  # [num_tokens, 1, num_experts]
+        logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        # Share the routing logic with the parent class to avoid code duplication.
-        # However, we pass dense_output=True to return dense [num_tokens, topk] tensors
-        # instead of sparse [num_tokens, num_experts].
-
-        probs, top_indices = self.topk_routing_with_score_function(
+        probs, top_indices = self._compiled_topk_routing(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
