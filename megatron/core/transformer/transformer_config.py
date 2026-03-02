@@ -1362,9 +1362,9 @@ class TransformerConfig(ModelParallelConfig):
                     "which is needed in core_attn.backward()."
                 )
             if self.delay_offload_until_cuda_graph:
-                assert self.external_cuda_graph or self.enable_cuda_graph, (
-                    "delay_offload_until_cuda_graph must be used with cuda graph."
-                )
+                assert (
+                    self.external_cuda_graph or self.enable_cuda_graph
+                ), "delay_offload_until_cuda_graph must be used with cuda graph."
             assert (
                 self.min_offloaded_tensor_size >= 0
             ), "min_offloaded_tensor_size must be non-negative."
