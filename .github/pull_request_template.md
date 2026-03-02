@@ -38,7 +38,7 @@ For PRs outside `megatron/core`, this step is skipped.
 
 Once all required reviewers have approved, the `Approved` label is applied **automatically**.
 
-### Step 4: Merge
+### Merge
 
 Any member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.
 
