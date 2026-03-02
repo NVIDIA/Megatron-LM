@@ -62,7 +62,6 @@ MODEL_ARGS:
 
 METRICS:
   - "lm loss"
-  - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "load_balancing_loss"
