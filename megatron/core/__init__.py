@@ -68,6 +68,7 @@ def graceful_shutdown(signum, frame):
       - Exits the process cleanly
     """
     from megatron.training import print_rank_0
+
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
 
     try:
