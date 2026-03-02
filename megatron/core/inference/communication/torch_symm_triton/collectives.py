@@ -25,9 +25,6 @@ from .barrier import symm_mem_sync
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
-# ── Triton kernels ─────────────────────────────────────────────────────────
-
-
 @triton.jit
 def _ag_phase(
     local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
@@ -39,11 +36,6 @@ def _ag_phase(
     Each thread handles 128-bit (NUMEL_PER_THREAD elements) at a time.
     byte_offset locates the tensor within the multicast buffer.
 
-    NOTE: When numel is not divisible by (NUMEL_PER_THREAD * WORLD_SIZE), the kernel
-    rounds up via cdiv and may read/write up to 15 bytes past the logical tensor end.
-    This is safe because PyTorch's CUDA caching allocator guarantees a minimum block
-    size of 512 bytes (kMinBlockSize in CUDACachingAllocator.cpp), so small tensors
-    always have sufficient backing memory.
     """
     pid = tl.program_id(axis=0)
     tid = get_flat_tid()

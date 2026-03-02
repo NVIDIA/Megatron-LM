@@ -179,7 +179,7 @@ mamba_inference_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # Use inference-optimized MoE layer for better CUDA graph support
+            # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add

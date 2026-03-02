@@ -944,9 +944,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             pg_collection=pg_collection,
         )
 
-        # Concatenate TE's per-expert weights into single tensors for torch._grouped_mm
-        # TE GroupedLinear stores weights as weight0, weight1, ..., weight{n-1}
-        # torch._grouped_mm expects shape [num_experts, out_features, in_features]
+        # TE's GroupedLinear stores per-expert weights as separate parameters
+        # (weight0, weight1, ..., weight{n-1}). We stack them into contiguous tensors
+        # of shape [num_experts, out_features, in_features] for torch._grouped_mm and
+        # FlashInfer's cutlass_fused_moe. Per-expert views are registered so that
+        # load_state_dict still writes into the contiguous buffers.
         self._build_concatenated_weights()
 
         self.is_inference_cuda_graphed_iteration = False
@@ -1050,7 +1052,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
     ):
         permuted_probs = permuted_probs.unsqueeze(-1)
-        # assert tokens_per_expert.is_cuda, "tokens_per_expert must be on GPU"
         if not tokens_per_expert.is_cuda:
             tokens_per_expert = tokens_per_expert.to('cuda')
 
