@@ -302,23 +302,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
-        # import here to avoid circular import
-        from megatron.core.extensions.transformer_engine import TENorm
-
-        def _build_layernorm(builder: LayerNormBuilder, has_residual_connection: bool):
-            norm_kwargs: Dict[str, Any] = {
-                "config": self.config,
-                "hidden_size": self.config.hidden_size,
-                "eps": self.config.layernorm_epsilon,
-            }
-            if has_residual_connection and builder is TENorm:
-                norm_kwargs["has_residual"] = True
-            return builder(**norm_kwargs)
-
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
-        self.input_layernorm = _build_layernorm(
-            submodules.input_layernorm, has_residual_connection=True
+        self.input_layernorm = submodules.input_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
         )
 
         attention_optional_kwargs = {}
@@ -344,8 +333,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
-        self.pre_cross_attn_layernorm = _build_layernorm(
-            submodules.pre_cross_attn_layernorm, has_residual_connection=True
+        self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
         )
 
         # [Module 5: CrossAttention]
@@ -360,8 +351,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
         # [Module 7: Pre MLP] Optional Layernorm before MLP
-        self.pre_mlp_layernorm = _build_layernorm(
-            submodules.pre_mlp_layernorm, has_residual_connection=True
+        self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}

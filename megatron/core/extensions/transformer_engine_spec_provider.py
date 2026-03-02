@@ -52,14 +52,14 @@ class TESpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
             return FusedLayerNorm
-        return TENorm
+        return lambda *args, **kwargs: TENorm(*args, has_residual=has_residual, **kwargs)
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
