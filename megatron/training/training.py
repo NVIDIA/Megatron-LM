@@ -539,7 +539,7 @@ def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squ
                         + args.hidden_size
                         * v_dim
                     )
-                )
+                ) * seqlen_sum_this_global_batch
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "

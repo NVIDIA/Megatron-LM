@@ -5,7 +5,33 @@ from typing import Dict, List
 import numpy as np
 import torch
 
+from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.rerun_state_machine import RerunDataIterator
+
+
+def get_cp_slice_for_thd(batch, cp_group):
+    """Partition sequence data for context parallelism in THD format.
+
+    Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
+    Only keys present in the batch are sliced.
+
+    Args:
+        batch: Dict with packed sequence data.
+        cp_group: Context parallel process group.
+    """
+    cp_size = cp_group.size()
+    if cp_size <= 1:
+        return
+    cp_rank = cp_group.rank()
+    total_tokens = batch['tokens'].size(0)
+    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
+    # cu_seqlens to get the correct result.
+    # TODO: Revert this workaround once TE fixes the issue.
+    cu_seqlens = batch["cu_seqlens_padded"]
+    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+        if key in batch:
+            batch[key] = batch[key].index_select(0, index)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
@@ -208,6 +234,11 @@ def broadcast_to_pp_group(
                 max_seqlens = info_to_broadcast[3 : 3 + num_micro_batches]
                 cu_seqlens_list = []
                 cu_seqlens_padded_list = []
+                # cu_seqlens always starts with 0, and the other metadata values
+                # (num_micro_batches, seqlen_sum, seqlen_squared_sum, max_seqlens)
+                # are always positive, so we can use 0 as the delimiter to locate
+                # the start of each cu_seqlens / cu_seqlens_padded tensor.
+                # This avoids an extra broadcast for the lengths of cu_seqlens.
                 indices = np.where(info_numpy == 0)[0]
                 for i in range(num_micro_batches):
                     cu_seqlens_list.append(info_to_broadcast[indices[i * 2] : indices[i * 2 + 1]])
@@ -266,31 +297,37 @@ def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
     return values
 
 
-def create_data_iterator(new_samples, pp_group, tp_group, config):
-    """Handle virtual pipeline parallelism."""
+def create_data_iterator(new_samples, tp_group, config, vpp_has_data=None):
+    """Handle virtual pipeline parallelism.
+
+    For VPP, each PP rank needs a list of data iterators (one per VPP stage).
+    VPP stages that originally had a data_iterator (indicated by vpp_has_data)
+    get full samples; others get metadata only (cu_seqlens, cu_seqlens_padded,
+    max_seqlen).
+
+    Args:
+        new_samples: The packed samples after scheduling.
+        tp_group: Tensor parallel process group.
+        config: Model parallel config.
+        vpp_has_data: A list of booleans (one per VPP stage) indicating which
+            VPP stages originally had a data_iterator. None if VPP is disabled.
+    """
     if (
         config.virtual_pipeline_model_parallel_size is not None
         and config.virtual_pipeline_model_parallel_size > 1
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
-                metadata = [
-                    {k: sample[k] for k in ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]}
-                    for sample in new_samples
-                ]
-                if pp_group.rank() == 0:
-                    new_data_iterator = [RerunDataIterator(iter(new_samples))] + [
-                        RerunDataIterator(iter(metadata)) for _ in range(vpp_size - 1)
-                    ]
+            metadata = [
+                {k: sample[k] for k in ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]}
+                for sample in new_samples
+            ]
+            new_data_iterator = []
+            for i in range(vpp_size):
+                if vpp_has_data is not None and vpp_has_data[i]:
+                    new_data_iterator.append(RerunDataIterator(iter(new_samples)))
                 else:
-                    new_data_iterator = [
-                        RerunDataIterator(iter(metadata)) for _ in range(vpp_size - 1)
-                    ] + [RerunDataIterator(iter(new_samples))]
-            else:
-                # on middle PP stages, the new_samples are the metadata
-                metadata = new_samples
-                new_data_iterator = [RerunDataIterator(iter(metadata)) for _ in range(vpp_size)]
+                    new_data_iterator.append(RerunDataIterator(iter(metadata)))
         else:
             new_data_iterator = [None for _ in range(vpp_size)]
     else:

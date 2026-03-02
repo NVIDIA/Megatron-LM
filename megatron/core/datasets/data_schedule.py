@@ -12,9 +12,9 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_cp_slice_for_thd,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -491,29 +491,30 @@ class DpBalancedScheduler(BasePackingScheduler):
 
         total_dcp_gpus = dp_cp_group.size()
 
-        # Handle VPP: extract the correct data_iterator for this PP stage
+        # Handle VPP: extract the correct data_iterator for this PP stage.
+        # When VPP is enabled, data_iterator is a list with one entry per VPP stage.
+        # We only need one data_iterator to run the schedule (all VPP stages on the
+        # same PP rank share the same underlying dataset), so pick the first non-None.
+        # Record which VPP stages had data so create_data_iterator knows which ones
+        # need full samples vs metadata only.
+        vpp_has_data = None
         if (
             config.virtual_pipeline_model_parallel_size is not None
             and config.virtual_pipeline_model_parallel_size > 1
         ):
-            # if enable VPP, data_iterator is a list of data_iterators for each VPP stage,
-            # and only the first and last stage rank will have data_iterator,
-            # other stages will have None.
             assert len(data_iterator) == config.virtual_pipeline_model_parallel_size
-            if pp_group.rank() == 0:
-                # the first stage
-                data_iterator = data_iterator[0]
-            elif pp_group.rank() == pp_group.size() - 1:
-                # the last stage
-                data_iterator = data_iterator[-1]
-            else:
-                data_iterator = None
+            vpp_has_data = [di is not None for di in data_iterator]
+            extracted = None
+            for di in data_iterator:
+                if di is not None:
+                    extracted = di
+                    break
+            data_iterator = extracted
 
-        # data_iterator is not None when TP rank 0, with PP stage 0 or -1.
+        # data_iterator is not None on TP rank 0 for PP stages that need data
+        # (first stage, last stage, or any stage with MTP).
         if data_iterator is not None:
-            assert tp_group.rank() == 0 and (
-                pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1
-            ), f"Only TP rank 0 and PP stage 0 or -1 should have data_iterator"
+            assert tp_group.rank() == 0, "Only TP rank 0 should have data_iterator"
 
             # Step 1: Fetch batches and gather global sequence lengths
             batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
@@ -610,7 +611,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         num_micro_batches = int(num_micro_batches)
 
         # Step 9: create data_iterator and handle VPP if enabled
-        new_data_iterator = create_data_iterator(new_samples, pp_group, tp_group, config)
+        new_data_iterator = create_data_iterator(new_samples, tp_group, config, vpp_has_data)
 
         return (
             new_data_iterator,
@@ -729,10 +730,10 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
-    if is_first_stage:
+    if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         batch_keys.append('labels')
         batch_keys.append('loss_mask')
 
@@ -746,21 +747,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         assert data_iterator is None, "Non TP 0 rank should not have data_iterator"
         batch = {}
 
-    # Partition tokens, position_ids, labels, loss_mask for context parallel, currently only
-    # TP rank 0 and the first/last PP stage rank has these data.
-    if is_tp_rank_0 and is_first_or_last_stage:
-        cp_size = cp_group.size()
-        cp_rank = cp_group.rank()
-        # If cp_size == 1, no need to do further processing.
-        if cp_size > 1:
-            total_tokens = batch['tokens'].size(0)
-            # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
-            # cu_seqlens to get the correct result.
-            # TODO: Revert this workaround once TE fixes the issue.
-            cu_seqlens = batch["cu_seqlens_padded"]
-            index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-            for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
-                batch[key] = batch[key].index_select(0, index)
+    # Partition tokens, position_ids, labels, loss_mask for context parallel.
+    # Only TP rank 0 on stages that have data (first/last PP stage or MTP stage) needs this.
+    if is_tp_rank_0 and (is_first_or_last_stage or mtp_on_this_rank):
+        get_cp_slice_for_thd(batch, cp_group)
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
     # cu_seqlens_padded for non TP 0 ranks.
@@ -772,8 +762,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlen_size = cu_seqlen_size.item()
 
     # Broadcast total_tokens because we need it to create placeholder for tokens, position_ids,
-    # labels, loss_mask for non TP 0 ranks. Only first or last stage need this.
-    if is_first_or_last_stage:
+    # labels, loss_mask for non TP 0 ranks. Only first stage, last stage,
+    # and stage with mtp need this.
+
+    if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             total_tokens = torch.tensor(batch['tokens'].size(0), dtype=torch.int32, device=dev)
         else:
@@ -781,7 +773,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
         total_tokens = total_tokens.item()
 
-    # Step1: Prepare "tokens", "position_ids" on all ranks.
+    # Step1: Prepare "tokens", "position_ids" for first stage and stage with mtp on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['tokens'].dtype == torch.int64
@@ -796,8 +788,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['tokens'] = None
         batch['position_ids'] = None
 
-    # Step2: Prepare "labels", "loss_mask" on all ranks.
-    if is_last_stage:
+    # Step2: Prepare "labels", "loss_mask" for last stage and stage with mtp on all TP ranks.
+    if is_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['labels'].dtype == torch.int64
             assert batch['loss_mask'].dtype == torch.float32
