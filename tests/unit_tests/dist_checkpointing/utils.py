@@ -167,6 +167,12 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # Clear the metadata cache to avoid contamination between tests
+    from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader,
+    )
+
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def setup_model_and_optimizer(

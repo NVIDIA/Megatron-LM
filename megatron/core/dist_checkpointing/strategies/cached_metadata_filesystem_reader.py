@@ -44,3 +44,10 @@ class CachedMetadataFileSystemReader(FileSystemReader):
                 super().read_metadata()
             )
         return CachedMetadataFileSystemReader._metadata_cache[self._cache_key]
+
+    @classmethod
+    def clear_metadata_cache(cls):
+        """
+        Clear the metadata cache.
+        """
+        cls._metadata_cache.clear()
