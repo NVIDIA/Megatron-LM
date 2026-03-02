@@ -6,6 +6,9 @@ from unittest import mock
 
 import torch
 
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -18,9 +21,6 @@ from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
