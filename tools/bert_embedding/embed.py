@@ -1,18 +1,20 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 from functools import partial
+from types import SimpleNamespace
+from typing import Callable, Dict, List, Optional, Tuple, TypedDict
 import numpy as np
 import os
 import time
 import torch
+from torch.distributed import ProcessGroup
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler, Subset
 from torch.utils.data._utils.collate import default_collate
-from tqdm import tqdm
 
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron import core
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.datasets.retro.utils import get_blocks_by_rank
+from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.legacy.model import BertModel
@@ -22,6 +24,20 @@ from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 from .dataset import BertEmbeddingDataset
 from .external_libs import h5py
 from .huggingface import HuggingfaceEmbedder
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
 
 
 def collate_batch(samples):
@@ -125,6 +141,211 @@ def embed_data_loader(models, data_loader, tag):
     embeddings = np.concatenate(embeddings, axis=0)
 
     return embeddings
+
+
+class Block(TypedDict):
+    """Specific block arg type to mute mypy."""
+
+    range: Tuple[int, int]
+    path: str
+
+
+def get_blocks(
+    dirname: str, n_samples: int, block_size: int, validate: Optional[Callable] = None
+) -> SimpleNamespace:
+    """Divide range [0, num_samples) to sequence of block ranges.
+
+    This is a core method within the concept of block processing. The idea
+    is to divide a range (size n_samples) into a sequence of blocks. Each
+    block corresponds to a file within 'dirname' with name
+    '{start_idx}-{end_idx}.hdf5'. This method checks for the existence of
+    these files, and returns two lists, one for existing blocks and one for
+    missing blocks.
+
+    Args:
+        dirname (str): Path to directory containing block files.
+        n_samples (int): Ideal number of samples.
+            The total number of saved block data is <=n_samples.
+        block_size (int): Max number of samples per block file (e.g., 100000).
+        validate (Callable): Method for validating each block file during load.
+
+    Returns:
+        A namespace consisting of 2 lists: existing blocks, and missing blocks.
+        The total number of samples between the existing and missing blocks should
+        equal n_samples above.
+    """
+
+    if not HAVE_TQDM:
+        raise ImportError("tqdm is required to use the BertDataset. Please install tqdm.")
+
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the BertDataset. Please install h5py.")
+
+    assert os.path.isdir(dirname), "missing directory '%s.'" % dirname
+
+    # Block ranges.
+    block_start_idxs = list(range(0, n_samples, block_size))
+    block_end_idxs = [min(n_samples, i + block_size) for i in block_start_idxs]
+    block_ranges = list(zip(block_start_idxs, block_end_idxs))
+
+    # All block files (existing + missing).
+    n_digits = int(np.ceil(np.log(n_samples) / np.log(10)) + 1)
+
+    all_blocks: List[Block] = [
+        {
+            "range": r,
+            "path": os.path.join(
+                dirname, "%s-%s.hdf5" % tuple([str(i).zfill(n_digits) for i in r])
+            ),
+        }
+        for r in block_ranges
+    ]
+    all_block_path_set = set(block["path"] for block in all_blocks)
+
+    # Validate function.
+    validate = (lambda f: None) if validate is None else validate
+
+    # Delete corrupt files.
+    if torch.distributed.get_rank() == 0:
+        existing_block_paths = [
+            block["path"] for block in all_blocks if os.path.exists(block["path"])
+        ]
+        for index, path in enumerate(tqdm(existing_block_paths, "validating block.")):
+            assert path in all_block_path_set, "unexpected filename, '%s'." % path
+
+            try:
+                f = h5py.File(path, "r")
+            except Exception:
+                os.remove(path)
+                continue
+
+            try:
+                validate(f)
+            except Exception:
+                os.remove(path)
+            finally:
+                f.close()
+
+    # Wait for files to be deleted.
+    torch.distributed.barrier()
+
+    # Collect blocks.
+    blocks = SimpleNamespace(
+        existing=[b for b in all_blocks if os.path.exists(b["path"])],
+        missing=[b for b in all_blocks if not os.path.exists(b["path"])],
+    )
+
+    return blocks
+
+
+def get_blocks_by_rank(
+    dirname: str,
+    n_samples: int,
+    block_size: int,
+    validate: Optional[Callable] = None,
+    sample: Optional[float] = None,
+    process_group: Optional[ProcessGroup] = None,
+) -> SimpleNamespace:
+    """Divide existing and missing blocks evenly across all ranks.
+
+    See 'get_blocks()' above for description. The returned lists of existing and
+    missing blocks are split evenly across ranks via interleaving. This way,
+    each rank has a roughly equal number of blocks to process for a
+    downstream operation.
+
+    Args:
+        dirname (str): Path to directory containing block files.
+        n_samples (int): Ideal number of samples. The total number of saved block data
+            is <=n_samples.
+        block_size (int): Max number of samples per block file (e.g., 100000).
+        validate (Callable): Method for validating each block file during load.
+        sample (Optional[float]): If provided, sample a random subset of the blocks.
+            Used for validating preprocessing correctness.
+        process_group (Optional[ProcessGroup]): Process group for distributed operations.
+            If None, uses data parallel group.
+
+    Returns:
+        A namespace consisting of 2 lists: existing blocks, and missing blocks.
+        Each of these two lists is potentially a sub-sample of the total set of
+        existing and missing blocks, depending on whether sampling is used.
+        Additionally, the attributes n_existing_world and n_missing_world are the
+        total number of existing and missing blocks, independent of samples.
+        Therefore, (n_existing_world + n_missing_world) * block_size == n_samples.
+    """
+
+    if process_group is None:
+        process_group = parallel_state.get_data_parallel_group()
+
+    # Get world blocks.
+    blocks = get_blocks(dirname, n_samples, block_size, validate)
+
+    # This rank's existing and missing files.
+    rank_existing_blocks = blocks.existing[
+        process_group.rank() : len(blocks.existing) : process_group.size()
+    ]
+    rank_missing_blocks = blocks.missing[
+        process_group.rank() : len(blocks.missing) : process_group.size()
+    ]
+
+    # Extend rank's existing and missing blocks (with None) such that all ranks
+    # have equal length lists. This allows for easier tracking of global progress.
+    def get_world_max(n: int) -> int:
+        """Get max value across ranks.
+
+        Args:
+            n (int): Value on this rank.
+
+        Returns:
+            Max value across all ranks.
+        """
+        n_tensor = torch.cuda.LongTensor([n])
+        torch.distributed.all_reduce(n_tensor, op=torch.distributed.ReduceOp.MAX)
+        return n_tensor.item()
+
+    max_n_existing = get_world_max(len(rank_existing_blocks))
+    max_n_missing = get_world_max(len(rank_missing_blocks))
+
+    rank_existing_blocks += [None] * (max_n_existing - len(rank_existing_blocks))
+    rank_missing_blocks += [None] * (max_n_missing - len(rank_missing_blocks))
+
+    # Collect blocks.
+    blocks = SimpleNamespace(
+        n_existing_world=len(blocks.existing),
+        n_missing_world=len(blocks.missing),
+        existing=rank_existing_blocks,
+        missing=rank_missing_blocks,
+    )
+
+    if sample is not None:
+        # Sample existing and missing blocks evenly across all ranks. The
+        # returned lists of blocks are randomly sampled (without replacement)
+        # to yield `sample * len(blocks)` number of blocks.
+
+        # Randomly sample blocks.
+        def sample_blocks(_blocks: List[Optional[Dict]]) -> List[Optional[Dict]]:
+            """Sample a random subset of all blocks.
+
+            Args:
+                _blocks (List[Optional[Dict]]): List of all blocks.
+
+            Returns:
+                A random subset of the blocks.
+            """
+            n_blocks_sample = int(np.ceil(sample * len(_blocks)))
+            sampled_blocks: List[Optional[Dict]] = [b for b in _blocks if b is not None]
+
+            np.random.seed(None)
+            np.random.shuffle(sampled_blocks)
+
+            sampled_blocks = sampled_blocks[:n_blocks_sample]
+            sampled_blocks += [None] * (n_blocks_sample - len(sampled_blocks))
+
+            return sampled_blocks
+
+        blocks.existing = sample_blocks(blocks.existing)
+        blocks.missing = sample_blocks(blocks.missing)
+
+    return blocks
 
 
 class TextDataset(torch.utils.data.Dataset):

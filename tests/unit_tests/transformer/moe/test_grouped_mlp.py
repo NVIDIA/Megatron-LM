@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import grouped_gemm_util as gg
@@ -69,8 +69,8 @@ class TestParallelGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        submodules = get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False)
+        self.sequential_mlp = MoELayer(tf_config, submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
@@ -83,10 +83,12 @@ class TestParallelGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=True
+        self.grouped_mlp = MoELayer(
+            tf_config,
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp.submodules,
         )
-        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
         print("done intializing for grouped gemm")
 
@@ -259,8 +261,8 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        submodules = get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False)
+        self.sequential_mlp = MoELayer(tf_config, submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
@@ -271,11 +273,13 @@ class TestTEGroupedMLP:
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=True
-        )
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        self.grouped_mlp = MoELayer(
+            tf_config,
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp.submodules,
+        )
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
         self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
 

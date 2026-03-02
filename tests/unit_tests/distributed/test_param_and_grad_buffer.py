@@ -3,6 +3,7 @@
 import contextlib
 import math
 from typing import Optional
+from unittest import mock
 
 import pytest
 import torch
@@ -162,6 +163,59 @@ def test_bucket_sizes(
     Utils.destroy_model_parallel()
 
 
+def test_param_to_index_alignment_with_padding():
+    """Ensure bucket-local param offsets honor padding when DistOpt pads params."""
+    Utils.initialize_model_parallel()
+
+    # With input_dim=4, output_dim=4:
+    #   - weight: 4*4 = 16 elements
+    #   - bias: 4 elements
+    # Since 16 % 64 != 0, the bias must be padded away from the weight,
+    # making padding observable.
+    input_dim = 4
+    output_dim = 4
+    model, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_layers=1,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,  # single bucket
+        use_distributed_optimizer=True,  # enforces 64-element alignment
+        overlap_grad_reduce=True,
+        average_in_collective=False,
+    )
+
+    bucket = param_and_grad_buffer.buckets[0]
+    naive_offset = 0
+    padding_observed = False
+
+    for param in bucket.params_list:
+        global_start, global_end, _ = param_and_grad_buffer.param_index_map[param]
+        expected_local_start = global_start - bucket.offset
+        expected_local_end = global_end - bucket.offset
+        local_start, local_end = bucket.param_to_index[param]
+
+        # param_to_index should match the padded offsets used in the global buffer.
+        assert (local_start, local_end) == (expected_local_start, expected_local_end)
+
+        # At least one param should have been padded relative to naive packing.
+        if local_start != naive_offset:
+            padding_observed = True
+        naive_offset = local_end
+
+        # Verify the slice retrieved via param_to_index matches param.data view.
+        param_slice = bucket.param_data.view(-1)[local_start:local_end]
+        torch.testing.assert_close(param_slice, param.data.view(-1))
+
+    assert padding_observed, (
+        "Expected padding to be applied between params. "
+        "Ensure model dimensions are chosen such that param sizes are not multiples of 64."
+    )
+
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
@@ -263,5 +317,59 @@ def test_grad_sync(
         if not overlap_grad_reduce:
             # Reset grad_data for subsequent collectives.
             param_and_grad_buffer.grad_data.data.fill_(1.0)
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("force_all_reduce", [False, True])
+def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
+    """Test that force_all_reduce=True causes all-reduce to be used instead of reduce-scatter."""
+    Utils.initialize_model_parallel()
+
+    input_dim = 100
+    output_dim = 100
+    num_layers = 2
+    model, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_layers=num_layers,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,
+        use_distributed_optimizer=True,  # This normally uses reduce-scatter.
+        overlap_grad_reduce=False,
+        average_in_collective=False,
+    )
+
+    # Mock the collective operations to track which one is called.
+    with (
+        mock.patch('torch.distributed.all_reduce') as mock_all_reduce,
+        mock.patch(
+            'megatron.core.distributed.param_and_grad_buffer.dist_reduce_scatter_func'
+        ) as mock_reduce_scatter,
+    ):
+        # Set up the mocks to be no-ops.
+        mock_all_reduce.return_value = None
+        mock_reduce_scatter.return_value = None
+
+        # Trigger the grad sync via the DDP model's finish_grad_sync method.
+        model.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+        if force_all_reduce:
+            # When force_all_reduce=True, all_reduce should be called.
+            assert (
+                mock_all_reduce.called
+            ), "Expected all_reduce to be called when force_all_reduce=True"
+            assert (
+                not mock_reduce_scatter.called
+            ), "Expected reduce_scatter NOT to be called when force_all_reduce=True"
+        else:
+            # When force_all_reduce=False with distributed optimizer, reduce_scatter should be called.
+            assert (
+                mock_reduce_scatter.called
+            ), "Expected reduce_scatter to be called when force_all_reduce=False"
+            assert (
+                not mock_all_reduce.called
+            ), "Expected all_reduce NOT to be called when force_all_reduce=False"
 
     Utils.destroy_model_parallel()

@@ -56,6 +56,8 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
@@ -129,6 +131,8 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.SKIP_PYTEST')
 
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
+
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 
 for i in $(seq 1 $N_REPEAT); do
     # Move TB logs into a repeat-specific directory
@@ -325,7 +329,7 @@ for i in $(seq 1 $N_REPEAT); do
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
-                    --test-values-path $TENSORBOARD_PATH \
+                    --test-values-path $INFERENCE_OUTPUT_PATH \
                     --model-config-path ${TRAINING_PARAMS_PATH} \
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
             fi

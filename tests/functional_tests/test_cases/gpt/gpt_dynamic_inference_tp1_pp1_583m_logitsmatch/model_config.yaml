@@ -46,7 +46,7 @@ MODEL_ARGS:
   --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
-  --output-path: ${TENSORBOARD_PATH}
+  --output-path: ${INFERENCE_OUTPUT_PATH}
   --output-every-n-results: 32
   --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
   --prompt-file-num-truncate: 128 # originally 1024
