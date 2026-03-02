@@ -17,7 +17,12 @@ from megatron.core import tensor_parallel
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
-from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_pg_rank,
+    get_pg_size,
+    is_te_min_version,
+)
 
 try:
     import transformer_engine_torch as tex  # type: ignore
@@ -37,8 +42,6 @@ class PartitionConfig:
     are set correctly.
     """
 
-    cp_size: int
-    tp_size: int
     seq_parallel: bool
     use_cp: bool
     tp_comm_overlap: bool
@@ -68,18 +71,15 @@ class PartitionConfig:
         if not isinstance(mp, ModelParallelConfig):
             raise TypeError("mp must be a ModelParallelConfig instance")
 
-        cp_size = mp.context_parallel_size
-        if cp_size > 1 and cp_group is None:
+        if mp.context_parallel_size > 1 and cp_group is None:
             cp_group = get_context_parallel_group()
 
         if mp.sequence_parallel and tp_group is None:
             tp_group = get_tensor_model_parallel_group()
 
         return cls(
-            cp_size=cp_size,
-            tp_size=mp.tensor_model_parallel_size,
             seq_parallel=mp.sequence_parallel,
-            use_cp=cp_size > 1,
+            use_cp=get_pg_size(cp_group) > 1,
             tp_comm_overlap=mp.tp_comm_overlap,
             max_seq_len=max_seq_len,
             kv_format=kv_format,
@@ -146,13 +146,13 @@ class PartitionAdapter:
             seq_dim = None  # which dimension holds the token sequence
 
             if self.cfg.use_cp and self.cfg.seq_parallel:
-                shard_factor = self.cfg.tp_size * self.cfg.cp_size * 2
+                shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(self.cfg.cp_group) * 2
                 seq_dim = 1  # embeddings shape: [B, S, H]
             elif self.cfg.use_cp:
-                shard_factor = self.cfg.cp_size * 2
+                shard_factor = get_pg_size(self.cfg.cp_group) * 2
                 seq_dim = 1
             elif self.cfg.seq_parallel:
-                shard_factor = self.cfg.tp_size
+                shard_factor = get_pg_size(self.cfg.tp_group)
                 seq_dim = 0  # embeddings shape: [S, B, H]
 
             if shard_factor is not None and (
@@ -242,8 +242,8 @@ class PartitionAdapter:
                 "to use Context Parallel with THD format data"
             )
             assert self.cfg.cp_group is not None
-            cp_size = self.cfg.cp_group.size()
-            cp_rank = self.cfg.cp_group.rank()
+            cp_size = get_pg_size(self.cfg.cp_group)
+            cp_rank = get_pg_rank(self.cfg.cp_group)
             for key, data in batch.items():
                 index = tex.thd_get_partitioned_indices(
                     packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank

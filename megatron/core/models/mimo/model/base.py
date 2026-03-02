@@ -103,7 +103,7 @@ class MimoModel(MegatronModule):
             special_token_ids: Dictionary mapping modality names to their special token IDs
 
         Returns:
-            Combined embeddings tensor. Shape: (S, B, H) or (S, H)
+            Combined embeddings tensor. Shape: (S, B, H)
         """
         # Ensure we have at least one modality
         if not modality_embeddings:
