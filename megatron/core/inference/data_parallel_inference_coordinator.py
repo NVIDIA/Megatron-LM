@@ -98,18 +98,6 @@ class DataParallelInferenceCoordinator:
             "please install the messagepack library to use DataParallelInferenceCoordinator\n"
             "pip install msgpack"
         )
-
-        # State flag for graceful termination
-        self.running = True
-
-        def signal_handler(sig, frame):
-            logging.info(f"Coordinator caught signal {sig}. Initiating graceful shutdown...")
-            self.running = False
-
-        # Override signal handlers immediately so torchrun signals trigger shutdown logic
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
         self.pipe_connection = pipe_connection
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
@@ -152,22 +140,9 @@ class DataParallelInferenceCoordinator:
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
-
-        # Condition connection loop on self.running
+        # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
-            while self.running:
-                try:
-                    if self.router_socket.poll(timeout=500):
-                        identity, _ = self.router_socket.recv_multipart()
-                        break
-                except (zmq.error.ZMQError, InterruptedError):
-                    # Signal caught during poll, continue loop so self.running is re-evaluated
-                    continue
-
-            # If shutdown was initiated during startup, break out cleanly
-            if not self.running:
-                return
-
+            identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
@@ -206,20 +181,10 @@ class DataParallelInferenceCoordinator:
         handling new client connections, forwarding requests, broadcasting
         control signals, or processing replies from the engines.
         """
+        # Todo [Siddharth]: Make this more robust to handle invalid messages.
         known_clients = set()
-
-        # 3. Condition main event loop on self.running
-        while self.running:
-            try:
-                if self.router_socket.poll(timeout=500):
-                    sender_identity, serialized_payload = self.router_socket.recv_multipart()
-                else:
-                    continue
-            except (zmq.error.ZMQError, InterruptedError):
-                # If ZMQ throws an EINTR from our explicit signal handling,
-                # restart loop to exit cleanly
-                continue
-
+        while True:
+            sender_identity, serialized_payload = self.router_socket.recv_multipart()
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
 
@@ -230,6 +195,7 @@ class DataParallelInferenceCoordinator:
                     )
                     continue
 
+                # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
                     [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
@@ -239,6 +205,7 @@ class DataParallelInferenceCoordinator:
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
                 # assigned data parallel rank for this process instead
                 # of the coordinator.
+
                 # Message from a known client
                 if sender_identity not in known_clients:
                     logging.info(
@@ -250,7 +217,6 @@ class DataParallelInferenceCoordinator:
                 client_request_id, prompt, sampling_params = deserialized_payload[1:]
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
-
                 request_id = self.next_request_id
                 self.next_request_id += 1
                 self.request_id_to_client_id[request_id] = sender_identity
@@ -408,12 +374,11 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port,
             deterministic_mode=deterministic_mode,
         )
-
-        # Only proceed to 'ready' and 'start' if a signal wasn't caught during startup
-        if coordinator.running:
-            ready_event.set()
+        ready_event.set()
+        try:
             coordinator.start()
-
+        except KeyboardInterrupt:
+            logging.info("Coordinator process interrupted. Exiting...")
         coordinator.stop()
         logging.info("Inference Coordinator: shut down successfully.")
 
@@ -421,11 +386,5 @@ class DataParallelInferenceCoordinator:
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
-        logging.info("Coordinator: Closing socket and terminating ZMQ context...")
-
-        # Set LINGER to 0 to force ZMQ to drop pending messages instead of hanging infinitely
-        self.router_socket.setsockopt(zmq.LINGER, 0)
-
         self.router_socket.close()
         self.context.term()
-        logging.info("Coordinator: ZMQ context terminated.")
