@@ -1,9 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+
+from typing import cast
+
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
 from megatron.core.transformer.moe.router import Router
@@ -41,13 +44,11 @@ class TestTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.sequential_mlp = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
-        self.router = self.sequential_mlp.router
+        self.sequential_mlp = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        self.router = cast(Router, self.sequential_mlp.router)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -124,6 +125,53 @@ class TestTop2Router:
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_with_padding_mask(self):
+        """Test that padding mask correctly excludes padding tokens from routing."""
+        self.router = self.router.cuda()
+        seq_len = 32
+        batch_size = 2
+        hidden_size = self.router.config.hidden_size
+
+        # Create input with shape [seq_len, batch_size, hidden_size]
+        hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
+
+        # Create padding mask: first half valid, second half padding
+        # padding_mask shape: [seq_len, batch_size]
+        # Convention: True = padding (exclude), False = valid (include)
+        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+        padding_mask[seq_len // 2 :, :] = True  # Second half is padding
+
+        # Test forward pass with padding mask
+        with torch.no_grad():
+            probs_with_mask, routing_map_with_mask = self.router(
+                hidden_states, padding_mask=padding_mask
+            )
+
+            # Test forward pass without padding mask (only valid tokens)
+            hidden_states_valid = hidden_states[: seq_len // 2, :, :]
+            probs_without_mask, routing_map_without_mask = self.router(hidden_states_valid)
+
+            # The valid part of routing with mask should match routing without mask
+            probs_valid_part = probs_with_mask.reshape(seq_len, batch_size, -1)[
+                : seq_len // 2, :, :
+            ]
+            probs_valid_part = probs_valid_part.reshape(-1, probs_valid_part.shape[-1])
+
+            # Check that shapes are as expected
+            assert probs_with_mask.shape == (
+                seq_len * batch_size,
+                self.router.config.num_moe_experts,
+            )
+            assert routing_map_with_mask.shape == (
+                seq_len * batch_size,
+                self.router.config.num_moe_experts,
+            )
+
+            # Verify that probs for valid tokens are similar
+            assert torch.equal(probs_valid_part, probs_without_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -265,13 +313,11 @@ class TestGroupLimitedRouter:
         )
 
         # init MoE layer
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
-        self.router = self.moe_layer.router
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules).cuda()
+        self.router = cast(Router, self.moe_layer.router)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -372,13 +418,11 @@ class TestAuxLossFreeTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
-        self.router = self.moe_layer.router
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
 
@@ -420,15 +464,11 @@ class TestAuxLossFreeTop2Router:
     def test_router_forward_fusion_equivalence(self, score_function):
         with torch.no_grad():
             # Build two fresh routers to avoid bias update interference
-            transformer_layer_spec = get_gpt_layer_local_spec(
+            submodules = get_gpt_layer_local_submodules(
                 num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
             )
-            moe_layer_ref = MoELayer(
-                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-            )
-            moe_layer_fused = MoELayer(
-                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-            )
+            moe_layer_ref = MoELayer(self.transformer_config, submodules.mlp.submodules)
+            moe_layer_fused = MoELayer(self.transformer_config, submodules.mlp.submodules)
             router_ref = moe_layer_ref.router.cuda()
             router_fused = moe_layer_fused.router.cuda()
 

@@ -83,6 +83,11 @@ if [[ -v PROMPTS ]]; then
         --prompts ${PROMPTS} \
         --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
     "
+elif [[ -v PROMPT_FILE ]]; then
+    ARGS+=" \
+        --prompt-file ${PROMPT_FILE} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
 else
     ARGS+=" \
         --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT} \

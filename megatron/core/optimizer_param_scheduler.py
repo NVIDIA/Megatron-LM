@@ -3,12 +3,95 @@
 """Learning rate decay and weight decay incr functions."""
 import logging
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
-from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.utils import log_single_rank
 
+if TYPE_CHECKING:
+    # Avoid circular import.
+    from megatron.core.optimizer import MegatronOptimizer
+
 logger = logging.getLogger(__name__)
+
+
+class ParamGroupOverride(TypedDict):
+    """Override values for a parameter group. These values may be optimizer-state/scheduler related.
+
+    These are the values you see later in param_group.get(...) calls in the
+        OptimizerParamScheduler.get_lr and get_wd methods. If you use a custom optimizer
+        or scheduler, you could override those variables instead.
+
+    Example:
+        >>> param_group_override = ParamGroupOverride(min_lr=1e-4, wd_mult=0.1)
+        >>> param_group_override == ParamGroupOverride(newvar=3) # this is ok too
+
+    """
+
+    max_lr: float
+    min_lr: float
+    start_wd: float
+    end_wd: float
+    wd_mult: float
+
+
+def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
+    """Return the lr of the first ``default_config=True`` param group.
+
+    All ``default_config`` groups share the same LR schedule, so the first one
+    is representative.  This includes empty rank-alignment stub groups, which
+    the scheduler still writes a valid lr onto.
+
+    Args:
+        param_groups (list[dict]): parameter groups from the optimizer.
+
+    Returns:
+        float | None: the canonical learning rate, or None if no
+            ``default_config=True`` group is found.
+    """
+    for param_group in param_groups:
+        if param_group.get('default_config', False):
+            return param_group.get('lr')
+    return None
+
+
+def param_group_override_to_tuple(
+    param_group_override: ParamGroupOverride | None,
+) -> tuple[tuple[str, Any], ...] | None:
+    """Convert a param group override to a tuple for use as a key in a dictionary.
+
+    The tuple is sorted by the keys of the param group override to handle different orderings of
+     the keys in different override dictionaries which still mean the same thing.
+    """
+    if param_group_override is None:
+        return None
+    return tuple(sorted(param_group_override.items()))
+
+
+def combine_param_group_overrides(
+    param_group_overrides: list[ParamGroupOverride | None],
+) -> ParamGroupOverride:
+    """Combine a list of param group overrides into a single param group override.
+
+    This function ensures that the overrides are not conflicting as well.
+
+    Args:
+        param_group_overrides (list[ParamGroupOverride]): list of param group overrides to combine
+
+    Returns:
+        ParamGroupOverride: combined param group override
+    """
+    combined_override = ParamGroupOverride()
+    for override in param_group_overrides:
+        if override is None:
+            continue
+        for key, value in override.items():
+            if key in combined_override:
+                if combined_override[key] != value:
+                    raise ValueError(
+                        f"Conflicting overrides for {key}: {combined_override[key]} and {value}"
+                    )
+            combined_override[key] = value
+    return combined_override
 
 
 class OptimizerParamScheduler:
@@ -38,7 +121,7 @@ class OptimizerParamScheduler:
 
     def __init__(
         self,
-        optimizer: MegatronOptimizer,
+        optimizer: "MegatronOptimizer",
         init_lr: float,
         max_lr: float,
         min_lr: float,
@@ -202,6 +285,10 @@ class OptimizerParamScheduler:
             increment (int): number of steps to increment
         """
         self.num_steps += increment
+        # Do not skip empty param groups: get_canonical_lr_for_logging reads lr
+        # from default_config groups regardless of whether they hold parameters.
+        # This is important for logging under model parallelism that may leave
+        # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)

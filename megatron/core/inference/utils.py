@@ -10,6 +10,29 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 
+def device_memory_summary() -> str:
+    """One-line GPU memory summary for torch_memory_saver logging."""
+    dev = torch.cuda.current_device()
+    stats = torch.cuda.memory_stats(dev)
+    try:
+        segs = torch.cuda.memory_snapshot(include_traces=False)
+    except TypeError:  # include_traces was added in PyTorch 2.11
+        segs = torch.cuda.memory_snapshot()
+    M = 1024**2
+    private = sum(
+        s.get("active_size", 0)
+        for s in segs
+        if s.get("device", dev) == dev and tuple(s.get("segment_pool_id", (0, 0))) != (0, 0)
+    )
+    alloc = stats.get("allocated_bytes.all.current", 0)
+    resv = stats.get("reserved_bytes.all.current", 0)
+    dev_mem = torch.cuda.device_memory_used()
+    return (
+        f"alloc={alloc/M:.0f}MiB private={private/M:.0f}MiB "
+        f"resv-alloc={(resv-alloc)/M:.0f}MiB resv={resv/M:.0f}MiB dev_mem={dev_mem/M:.0f}MiB"
+    )
+
+
 class Counter:
     """A simple counter class
 
@@ -132,6 +155,34 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
+def set_inference_cuda_graphed_iteration_for_ep_inference(model):
+    """Enable CUDA graph compatibility for expert parallel inference.
+
+    Sets a flag in all MoELayers indicating the current iteration is being
+    captured/executed in a CUDA graph. This allows the dispatcher to adjust
+    its behavior for CUDA graph compatibility.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    for moe_layer in moe_layer_cache:
+        moe_layer.set_inference_cuda_graphed_iteration()
+
+
+def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
+    """Disable CUDA graph compatibility for expert parallel inference.
+
+    Clears the flag in all MoELayers, restoring standard dispatcher behavior.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    for moe_layer in moe_layer_cache:
+        moe_layer.unset_inference_cuda_graphed_iteration()
+
+
 def tensor_swap(x, src_idxs, dst_idxs):
     """
     Swap x[src_idxs] and x[dst_idxs]
@@ -139,10 +190,8 @@ def tensor_swap(x, src_idxs, dst_idxs):
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
 
-async def await_process_event(
-    event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
-) -> None:
-    """Repeatedly wait for a multiprocessing event to be set, aborting upon process failure.
+async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
+    """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
 
     Note that the timeout in this function is only for checking process liveness.
     Its value should be set to a relatively high number. The only problem a high timeout
@@ -155,8 +204,7 @@ async def await_process_event(
         timeout: The timeout for each wait iteration in seconds.
     """
     while True:
-        signal = await asyncio.to_thread(event.wait, timeout)
-        if signal:
+        if await asyncio.to_thread(call, timeout):
             return
         if not process.is_alive():
             raise RuntimeError(

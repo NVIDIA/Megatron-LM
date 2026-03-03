@@ -21,7 +21,17 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Export a megatron-core transformer-engine checkpoint.",
+        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
+        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
+        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
+        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+    )
+    group.add_argument(
+        "--export-default-te-spec",
+        action="store_true",
+        help="Use the full Transformer-Engine layer spec for model building. "
+        "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
+        "TEGroupedMLP, TEDotProductAttention, etc., matching the canonical TE specs.",
     )
     group.add_argument(
         "--export-force-local-attention",
@@ -51,30 +61,28 @@ def add_modelopt_args(parser):
     )
     # Knowledge Distillation
     group.add_argument(
-        '--export-kd-cfg',
+        '--export-kd-teacher-load',
         type=str,
-        default=None,
-        help='Path to distillation configuration yaml file.',
+        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
     )
-
     group.add_argument(
-        '--teacher-model-config',
+        '--export-kd-teacher-model-config',
         type=str,
         default=None,
         help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
-    )
-
-    group.add_argument(
-        '--export-kd-teacher-load',
-        type=str,
-        help='Path to checkpoint to load as distillation teacher.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
         type=str,
         default=None,
-        choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+        choices=['torch', 'torch_dist', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
+    )
+    group.add_argument(
+        '--export-kd-cfg',
+        type=str,
+        default=None,
+        help='Path to distillation configuration yaml file, in order to use non-default settings.',
     )
 
     # Finetuning

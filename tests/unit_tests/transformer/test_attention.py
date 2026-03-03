@@ -8,7 +8,9 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -25,9 +27,11 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+@pytest.mark.parametrize("output_gate", [False, True])
 class TestParallelAttention:
 
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, output_gate):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(
@@ -37,14 +41,15 @@ class TestParallelAttention:
             use_cpu_initialization=True,
             bf16=True,
             params_dtype=torch.bfloat16,
+            attention_output_gate=output_gate,
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
-    def teardown_method(self, method):
+    def teardown_method(self):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
@@ -52,7 +57,10 @@ class TestParallelAttention:
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
-        assert num_weights == 66304
+        if self.transformer_config.attention_output_gate:
+            assert num_weights == 82816
+        else:
+            assert num_weights == 66304
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -90,6 +98,8 @@ class TestParallelAttention:
         self.parallel_attention.config.apply_rope_fusion = True
         if rotary_interleaved and not is_te_min_version("2.3.0"):
             pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
+        if fused_qkv_rope and self.parallel_attention.config.attention_output_gate:
+            pytest.skip("Fused QKV RoPE does not support gated attention for now.")
         if fused_qkv_rope and not HAVE_FUSED_QKV_ROPE:
             pytest.skip("Fused QKV RoPE not available.")
         self.parallel_attention.config.rotary_interleaved = rotary_interleaved
@@ -128,7 +138,7 @@ class TestParallelAttention:
         transformer_config.recompute_granularity = 'selective'
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         config = checkpointed_parallel_attention.config
@@ -178,7 +188,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
@@ -198,7 +208,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
@@ -218,7 +228,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -252,7 +262,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -287,7 +297,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -321,7 +331,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -343,12 +353,15 @@ class TestClipQK:
         assert attention.core_attention.current_max_attn_logits is None
 
 
+@pytest.mark.parametrize("output_gate", [False, True])
 class TestSelfAttention:
 
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, output_gate):
+        self.output_gate = output_gate
         Utils.destroy_model_parallel()
 
-    def teardown_method(self, method):
+    def teardown_method(self):
         Utils.destroy_model_parallel()
 
     def run_self_attention(self, pg_collection):
@@ -357,12 +370,13 @@ class TestSelfAttention:
             num_layers=2,
             hidden_size=128,
             num_attention_heads=4,
+            attention_output_gate=self.output_gate,
             tensor_model_parallel_size=tensor_model_parallel_size,
             use_cpu_initialization=False,
         )
         self.self_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             pg_collection=pg_collection,

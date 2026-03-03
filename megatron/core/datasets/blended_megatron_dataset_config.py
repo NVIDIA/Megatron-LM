@@ -35,7 +35,7 @@ class BlendedMegatronDatasetConfig:
     """
 
     multiple_validation_sets: Optional[bool] = None
-    """Whether the validation split should be treated as multiple seperate datasets."""
+    """Whether the validation split should be treated as multiple separated datasets."""
 
     full_validation: Optional[bool] = None
     """Whether to run a full epoch of validation each time validation occurs."""
@@ -180,9 +180,6 @@ def convert_split_vector_to_split_matrix(
     Ex. a standard conversion:
 
     [0.99, 0.01, 0.0] -> [(0, 0.99), (0.99, 1.0), None]
-
-    Ex. a conversion for Retro when Retro pretraining uses a [0.99, 0.01, 0.0] split and Retro
-    preprocessing used a [0.98, 0.02, 0.0] split:
 
     [0.99, 0.01, 0.0], [0.98, 0.02, 0.0] -> [(0, 0.98), (0.99, 1.0), None]
 

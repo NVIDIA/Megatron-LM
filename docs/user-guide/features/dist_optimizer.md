@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Distributed Optimizer
 
 The motivation for the distributed optimizer is to save memory by distributing the optimizer state evenly across data parallel ranks (https://arxiv.org/abs/1910.02054), versus the naive method of replicating the optimizer state across data parallel ranks.
@@ -16,11 +25,11 @@ The figures below illustrate the distributed optimizer's sharding scheme, and th
 
 ## Data flow
 
-![Data flow](../images/distrib_optimizer/data_flow.png)
+![Data flow](../../images/distrib_optimizer/data_flow.png)
 
 ## Sharding scheme
 
-![Sharding scheme](../images/distrib_optimizer/sharding_scheme.png)
+![Sharding scheme](../../images/distrib_optimizer/sharding_scheme.png)
 
 ## Key steps
 
