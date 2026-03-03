@@ -94,16 +94,16 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_flask_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
 
-            start_flask_server(
+            start_text_gen_server(
                 coordinator_addr=dp_addr,
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
-                flask_port=kwargs.get('port', 8294),
+                text_gen_port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
             )
@@ -122,8 +122,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def kill(self):
         if dist.get_rank() == 0:
             await self._client.stop_engines()
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_flask_server
-            stop_flask_server()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            stop_text_gen_server()
 
         await self._inference_engine.stopped.wait()
 

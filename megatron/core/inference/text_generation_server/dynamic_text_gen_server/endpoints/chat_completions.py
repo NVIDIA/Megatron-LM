@@ -13,7 +13,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 logger = logging.getLogger(__name__)
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
 
@@ -25,7 +25,7 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Messages ---
         messages = req.get("messages")
@@ -238,4 +238,4 @@ try:
         return jsonify(response)
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")

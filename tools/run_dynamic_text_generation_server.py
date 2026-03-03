@@ -7,8 +7,8 @@ import torch
 
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    start_flask_server,
-    stop_flask_server,
+    start_text_gen_server,
+    stop_text_gen_server,
 )
 from megatron.core.utils import trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
@@ -30,14 +30,16 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, flask_port: int
+    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int
 ):
-    """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks.
+    """
+    Runs the text generation server from rank 0 and initializes the
+    DynamicInferenceEngine on all ranks.
 
     Args:
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
-        flask_port (int): The network for port the frontend Flask server.
+        server_port (int): The network for port the frontend text generation server.
     """
 
     rank = torch.distributed.get_rank()
@@ -48,13 +50,13 @@ async def run_text_generation_server(
 
     try:
         if rank == 0:
-            start_flask_server(
+            start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=args.parsers,
                 rank=rank,
-                flask_port=flask_port,
-                verbose=args.inference_flask_server_logging,
+                server_port=server_port,
+                verbose=args.inference_text_gen_server_logging,
             )
 
         # Await the engine loop directly since the server is running in a separate process
@@ -63,7 +65,7 @@ async def run_text_generation_server(
     finally:
         # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
         if rank == 0:
-            stop_flask_server()
+            stop_text_gen_server()
 
 
 if __name__ == "__main__":
