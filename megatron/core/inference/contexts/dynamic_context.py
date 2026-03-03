@@ -15,7 +15,11 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -242,6 +246,13 @@ class DynamicInferenceContext(BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        # Prefix caching configuration
+        self.enable_prefix_caching = inference_config.enable_prefix_caching
+        self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
+
+        # Step counter (used for LRU timestamps in prefix caching)
+        self.step_count = 0
+
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -261,7 +272,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = model_config.tensor_model_parallel_size
             pp_size = model_config.pipeline_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        if num_attention_heads >= tp_size:
+            self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        else:
+            self.num_attention_heads_per_partition = 1
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -439,6 +453,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_count if self.unified_memory_level == 0 else block_count + paused_block_count
             ),
             paused_count=paused_block_count,
+            enable_prefix_caching=self.enable_prefix_caching,
+            prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
 
         # Track request metadata.
@@ -454,6 +470,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request and token counts.
         self.total_request_count = 0
         self.active_token_count = 0
+        self.lifetime_prefill_token_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -535,7 +552,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
                 cuda_graph_max_tokens=self.max_requests,
-                cuda_graph_mixed_prefill_count=inference_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
@@ -543,7 +560,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        self.cuda_graph_mixed_prefill_count = inference_config.cuda_graph_mixed_prefill_count
+        self.smallest_non_decode_cuda_graph_size = min(
+            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
+        )
+
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1340,13 +1360,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
+            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            cuda_graph_mixed_prefill_count=self.cuda_graph_mixed_prefill_count,
         )
         self._using_cuda_graph_this_step = best_graph is not None
+
+        if construct_graph_dimensions is not None:
+            assert self._using_cuda_graph_this_step
 
         if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
             # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
@@ -1465,6 +1488,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
+        self.lifetime_prefill_token_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -1500,6 +1524,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_mamba_state()
         self.block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
+
+        # Reset step counter
+        self.step_count = 0
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -1559,6 +1586,61 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
+    def _compute_prefix_match(
+        self, req: DynamicInferenceRequest, chunk_length: int
+    ) -> Tuple[list, int, int, int, int, int]:
+        """Compute prefix match results and skip counts for a request chunk.
+
+        Shared by check_availability (budget checks) and add_request (execution).
+
+        Returns:
+            Tuple of (matched_block_ids, num_blocks_from_pool,
+                      already_allocated_blocks, overall_required_blocks,
+                      prefix_skip_tokens, effective_chunk_length).
+        """
+        finished = req.finished_chunk_token_count
+        already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
+        overall_required_blocks = (
+            finished + chunk_length + self.block_size_tokens - 1
+        ) // self.block_size_tokens
+
+        # Fast path: skip all prefix matching when disabled.
+        if not self.enable_prefix_caching:
+            num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
+            return (
+                [],
+                num_blocks_from_pool,
+                already_allocated_blocks,
+                overall_required_blocks,
+                0,
+                chunk_length,
+            )
+
+        matched_block_ids, _ = self._find_matching_prefix_blocks(
+            req, already_allocated_blocks, overall_required_blocks
+        )
+        num_matched = len(matched_block_ids)
+
+        block_aligned = finished % self.block_size_tokens == 0
+        if num_matched > 0 and block_aligned:
+            prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
+        else:
+            prefix_skip_tokens = 0
+
+        effective_chunk_length = chunk_length - prefix_skip_tokens
+        num_blocks_from_pool = max(
+            0, overall_required_blocks - already_allocated_blocks - num_matched
+        )
+
+        return (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_chunk_length,
+        )
+
     def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
@@ -1569,14 +1651,66 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        request_tokens_can_be_added = (
-            self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+        (_, num_blocks_from_pool, _, _, _, effective_chunk_length) = self._compute_prefix_match(
+            req, req.remaining_prompt_length
         )
-        blocks = math.ceil(
-            (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
-        ) - math.ceil(req.finished_chunk_token_count / self.block_size_tokens)
-        kv_cache_available = self.block_allocator.is_memory_available(blocks)
+
+        request_tokens_can_be_added = (
+            self.active_token_count + effective_chunk_length <= self.max_tokens
+        )
+        kv_cache_available = self.block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
+
+    def _find_matching_prefix_blocks(
+        self, req: DynamicInferenceRequest, start_block: int, end_block: int
+    ) -> tuple[list[int], int]:
+        """Find cached blocks matching a range of the prompt using precomputed hashes.
+
+        Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
+        the block allocator's hash-to-block mapping. Stops at the first non-match.
+
+        Args:
+            req: The inference request with precomputed_block_hashes set.
+            start_block: First block index to match (inclusive).
+            end_block: Last block index to match (exclusive); clamped to hash count.
+
+        Returns:
+            Tuple of:
+            - List of matched block IDs (consecutive from start_block)
+            - Parent hash of the last matched block (0 if no matches)
+        """
+        # Early return if prefix caching is disabled
+        if not self.enable_prefix_caching:
+            return [], 0
+
+        # Early return if request has no precomputed hashes
+        if not req.precomputed_block_hashes:
+            return [], 0
+
+        # Clamp end_block to the number of precomputed hashes (the trailing
+        # partial block has no hash).
+        end_block = min(end_block, len(req.precomputed_block_hashes))
+        if start_block >= end_block:
+            return [], 0
+
+        hashes = req.precomputed_block_hashes[start_block:end_block]
+        hash_to_block = self.block_allocator.hash_to_block_id
+
+        # Batch dict lookups via C-level map() — faster than Python for loop
+        block_ids = list(map(hash_to_block.get, hashes))
+
+        # Find prefix length (first None = first miss)
+        try:
+            prefix_len = block_ids.index(None)
+        except ValueError:
+            prefix_len = len(block_ids)
+
+        if prefix_len == 0:
+            return [], 0
+
+        matched_blocks = block_ids[:prefix_len]
+        parent_hash = hashes[prefix_len - 1]
+        return matched_blocks, parent_hash
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
@@ -1604,26 +1738,38 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert (
             chunk_length <= req.remaining_prompt_length
         ), "Chunk length is greater than remaining prompt length"
-        if self.active_token_count + chunk_length > self.max_tokens:
-            raise TokenOverflowError(req.request_id)
 
-        # Use the remaining prompt tokens for this chunk
-        this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
+        # =========================================================================
+        # Block allocation + prefix matching + prefill skipping
+        # =========================================================================
+        (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_chunk_length,
+        ) = self._compute_prefix_match(req, chunk_length)
+        num_matched_blocks = len(matched_block_ids)
+        effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # only allocate new blocks
-        already_allocated_blocks = (
-            req.finished_chunk_token_count + self.block_size_tokens - 1
-        ) // self.block_size_tokens  # ceiling division
-        overall_required_blocks = (
-            req.finished_chunk_token_count + chunk_length + self.block_size_tokens - 1
-        ) // self.block_size_tokens  # ceiling division
+        # Slice tokens to skip matched prefix
+        this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:chunk_length]
 
-        num_blocks_needed = overall_required_blocks - already_allocated_blocks
-
-        if num_blocks_needed > 0:
-            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_needed)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_needed:
+        new_block_ids = None
+        if num_blocks_from_pool > 0:
+            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_from_pool)
+            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
                 raise BlockOverflowError(req.request_id)
+
+        # Increment ref counts and update timestamps for matched (shared) blocks
+        if num_matched_blocks > 0:
+            matched_tensor = torch.tensor(
+                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.block_allocator.block_ref_counts[matched_tensor] += 1
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                self.block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1642,7 +1788,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
 
-        if self.active_token_count + chunk_length > self.max_tokens:
+        if self.active_token_count + effective_chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
@@ -1665,17 +1811,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_metadata[label][current_id] = m
 
         # Handle length and block assignments.
-        self.request_query_lengths[current_id] = chunk_length
+        self.request_query_lengths[current_id] = effective_chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
-        if num_blocks_needed > 0:
+
+        # Assign blocks: matched blocks at [already_allocated, already_allocated + num_matched),
+        # then newly allocated blocks after that.
+        match_start = already_allocated_blocks
+        new_block_start = already_allocated_blocks + num_matched_blocks
+        if num_matched_blocks > 0:
             self.request_to_kv_block_ids[current_id][
-                already_allocated_blocks:overall_required_blocks
+                match_start : match_start + num_matched_blocks
+            ] = matched_tensor
+        if new_block_ids is not None:
+            self.request_to_kv_block_ids[current_id][
+                new_block_start : new_block_start + len(new_block_ids)
             ] = new_block_ids
-        self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
+
+        self.request_kv_length_offsets[current_id] = effective_kv_offset
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
@@ -1685,28 +1841,51 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.block_size_tokens
 
         token_offset_range = torch.arange(
-            req.finished_chunk_token_count,
-            req.finished_chunk_token_count + chunk_length,
+            effective_kv_offset,
+            effective_kv_offset + effective_chunk_length,
             device=self.token_to_pos_ids.device,
         )
-        self.token_to_pos_ids[self.active_token_count : self.active_token_count + chunk_length] = (
-            token_offset_range
-        )
+        self.token_to_pos_ids[
+            self.active_token_count : self.active_token_count + effective_chunk_length
+        ] = token_offset_range
         self.token_to_input_ids[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = this_round_tokens
         self.token_to_request_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = current_id
         self.token_to_position_in_request[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = token_offset_range
         self.token_to_block_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
+
+        # Register hashes for completely filled blocks (skip matched blocks).
+        # Two disjoint ranges may need registration:
+        #   Range 1: [previously_complete, min(already_allocated_blocks, num_complete_blocks))
+        #       — the partial block from a prior chunk that this chunk's tokens completed
+        #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+        #       — newly allocated blocks that are now complete
+        if self.enable_prefix_caching and req.precomputed_block_hashes:
+            total_tokens_after = req.finished_chunk_token_count + chunk_length
+            num_complete_blocks = total_tokens_after // self.block_size_tokens
+            previously_complete = req.finished_chunk_token_count // self.block_size_tokens
+
+            def _register_range(start: int, end: int):
+                if start >= end:
+                    return
+                block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
+                block_hashes_slice = req.precomputed_block_hashes[start:end]
+                self.block_allocator.register_block_hashes(block_ids_to_hash, block_hashes_slice)
+
+            # Range 1: prior-chunk partial block that this chunk just completed
+            _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
+            # Range 2: newly allocated (non-matched) blocks that are now complete
+            _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
@@ -1719,7 +1898,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, mamba_idx] = 0.0
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
-        self.active_token_count += chunk_length
+        self.active_token_count += effective_chunk_length
+        self.lifetime_prefill_token_count += effective_chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
         self.num_prefill_requests += 1
 
