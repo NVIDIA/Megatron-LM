@@ -713,6 +713,11 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank
             )
+
+    # Infer use of MLA from unified pattern
+    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        args.multi_latent_attention = True
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -3083,7 +3088,7 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), * (attention), '
-                       '- (mlp), E (moe). Use | to define pipeline stage boundaries for '
+                       'D (dsa), - (mlp), E (moe). Use | to define pipeline stage boundaries for '
                        'flexible virtual pipeline parallel (fVPP). Use / to separate MTP '
                        'patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
