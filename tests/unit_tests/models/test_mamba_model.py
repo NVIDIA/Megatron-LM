@@ -4,6 +4,7 @@ import os
 from datetime import timedelta
 from itertools import accumulate
 import pytest
+
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
