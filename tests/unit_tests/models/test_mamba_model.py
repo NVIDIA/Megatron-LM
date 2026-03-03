@@ -3,6 +3,7 @@
 import os
 from datetime import timedelta
 from itertools import accumulate
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -69,6 +70,41 @@ class TestMambaModel:
         assert self.model.decoder.input_tensor.shape[0] == sequence_length
         assert self.model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
+
+    def test_compute_output_logits_fp32_casts_inputs_and_weight(self):
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = 2
+        hidden_size = self.model.config.hidden_size
+        partition_vocab_size = self.model.output_layer.output_size_per_partition
+
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, hidden_size, dtype=torch.bfloat16
+        )
+        output_weight = torch.randn_like(self.model.output_layer.weight, dtype=torch.bfloat16)
+
+        def _fake_forward(input_, weight=None, runtime_gather_output=None):
+            assert input_.dtype == torch.float32
+            assert weight is not None
+            assert weight.dtype == torch.float32
+            logits = torch.zeros(
+                sequence_length,
+                micro_batch_size,
+                partition_vocab_size,
+                dtype=torch.bfloat16,
+                device=input_.device,
+            )
+            return logits, None
+
+        with patch.object(self.model.output_layer, 'forward', side_effect=_fake_forward) as mock_forward:
+            logits = self.model._compute_output_logits_fp32(
+                hidden_states=hidden_states,
+                output_weight=output_weight,
+                runtime_gather_output=False,
+            )
+
+        assert mock_forward.call_count == 1
+        assert logits.dtype == torch.float32
+        assert logits.shape == (sequence_length, micro_batch_size, partition_vocab_size)
 
     def test_forward(self):
         sequence_length = self.model.max_sequence_length

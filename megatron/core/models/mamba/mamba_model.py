@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -26,6 +27,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    fp32_matmul_precision,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -296,6 +298,32 @@ class MambaModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def _compute_output_logits_fp32(
+        self,
+        hidden_states: Tensor,
+        output_weight: Optional[Tensor],
+        runtime_gather_output: Optional[bool],
+    ) -> Tensor:
+        """Compute output logits in FP32 for the output projection path."""
+        hidden_states_fp32 = (
+            hidden_states if hidden_states.dtype == torch.float32 else hidden_states.float()
+        )
+
+        weight = output_weight
+        if weight is None and getattr(self.output_layer, "weight", None) is not None:
+            weight = self.output_layer.weight
+        if weight is not None and weight.dtype != torch.float32:
+            weight = weight.float()
+
+        with fp32_matmul_precision("highest"):
+            logits, _ = self.output_layer(
+                hidden_states_fp32,
+                weight=weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+
+        return logits if logits.dtype == torch.float32 else logits.float()
+
     def forward(
         self,
         input_ids: Tensor,
@@ -439,9 +467,18 @@ class MambaModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        # If fp32 residual connection is enabled, run output projection in FP32 and
+        # keep output logits as FP32.
+        if self.config.fp32_residual_connection:
+            logits = self._compute_output_logits_fp32(
+                hidden_states=hidden_states,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
         logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
