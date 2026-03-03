@@ -23,7 +23,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
+from megatron.core.utils import (
+    compute_output_logits_fp32,
+    divide,
+    is_fa_min_version,
+    is_torch_min_version,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -96,8 +101,9 @@ class TestMambaModel:
             return logits, None
 
         with patch.object(self.model.output_layer, 'forward', side_effect=_fake_forward) as mock_forward:
-            logits = self.model._compute_output_logits_fp32(
+            logits = compute_output_logits_fp32(
                 hidden_states=hidden_states,
+                output_layer=self.model.output_layer,
                 output_weight=output_weight,
                 runtime_gather_output=False,
             )

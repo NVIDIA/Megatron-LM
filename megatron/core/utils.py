@@ -137,6 +137,37 @@ def fp32_matmul_precision(precision: FP32MatmulPrecT = "highest") -> Generator[N
         torch.set_float32_matmul_precision(prev_val)
 
 
+def compute_output_logits_fp32(
+    hidden_states: torch.Tensor,
+    output_layer: Callable,
+    output_weight: Optional[torch.Tensor],
+    runtime_gather_output: Optional[bool],
+) -> torch.Tensor:
+    """Compute output projection logits in FP32.
+
+    This utility ensures both operands for the output projection matmul are FP32 and
+    returns FP32 logits.
+    """
+    hidden_states_fp32 = (
+        hidden_states if hidden_states.dtype == torch.float32 else hidden_states.float()
+    )
+
+    weight = output_weight
+    if weight is None and getattr(output_layer, "weight", None) is not None:
+        weight = output_layer.weight
+    if weight is not None and weight.dtype != torch.float32:
+        weight = weight.float()
+
+    with fp32_matmul_precision("highest"):
+        logits, _ = output_layer(
+            hidden_states_fp32,
+            weight=weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+
+    return logits if logits.dtype == torch.float32 else logits.float()
+
+
 class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 
