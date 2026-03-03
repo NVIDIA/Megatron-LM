@@ -1,15 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, cast
 
 import torch
 
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.typed_torch import copy_signature
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +21,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
-    HAVE_TE = False
+    if TYPE_CHECKING:
+        # Unambiguously treat transformer_engine as available during type checking.
+        import transformer_engine as te  # type: ignore[import]
 
-logger = logging.getLogger(__name__)
+        HAVE_TE = True
+    else:
+        HAVE_TE = False
 
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
@@ -53,7 +60,9 @@ class Norm:
     mismatch issue.
     """
 
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
+    ) -> LayerNormInterface:
         if not HAVE_TE:
             raise ImportError(
                 "Transformer-Engine is not installed, please install it with "
@@ -95,7 +104,7 @@ class Norm:
             instance._register_state_dict_hook(_state_dict_hook)
             instance._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
 
-        return instance
+        return cast(LayerNormInterface, instance)
 
 
 class Linear(torch.nn.Linear):
@@ -192,6 +201,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     verbose: bool = False
     real_quant_cfg: str = "None"
 
+    @copy_signature(TransformerLayer.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
