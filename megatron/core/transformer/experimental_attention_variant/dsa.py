@@ -2007,7 +2007,9 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
     to train the indexer to predict attention scores without affecting the forward pass.
     """
 
-    main_loss_backward_scale: torch.Tensor = None
+    # Keep scale as a Python float to avoid holding a long-lived CUDA tensor
+    # across iterations/streams.
+    main_loss_backward_scale: Optional[float] = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, indexer_loss: torch.Tensor):
@@ -2036,24 +2038,25 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
         """
         (indexer_loss,) = ctx.saved_tensors
         if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=indexer_loss.device
-            )
-        indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
-        scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = 1.0
+        indexer_loss_backward_scale = float(DSAIndexerLossAutoScaler.main_loss_backward_scale)
+        scaled_indexer_loss_grad = torch.full_like(
+            indexer_loss, fill_value=indexer_loss_backward_scale
+        )
         return grad_output, scaled_indexer_loss_grad
 
     @staticmethod
-    def set_loss_scale(scale: torch.Tensor):
+    def set_loss_scale(scale: Union[torch.Tensor, float]):
         """Set the scale of the indexer loss.
 
         Args:
             scale: The scale value to set.
         """
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
+        if isinstance(scale, torch.Tensor):
+            scale_value = float(scale.detach().item())
         else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            scale_value = float(scale)
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = scale_value
 
 
 @dataclass

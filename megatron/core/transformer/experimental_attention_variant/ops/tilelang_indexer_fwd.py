@@ -2,15 +2,29 @@
 # Adapted from:
 # https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/
 # examples/deepseek_v32/fp8_lighting_indexer.py
+import os
+import threading
 from collections import OrderedDict
 
 import tilelang
 import torch
 from tilelang import language as T
 
-_TILELANG_KERNEL_CACHE_MAX = 64
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+_TILELANG_KERNEL_CACHE_MAX = _env_int("MCORE_DSA_TILELANG_KERNEL_CACHE_MAX", 512)
 _tilelang_indexer_fwd_kernel_cache = OrderedDict()
 _tilelang_indexer_clean_logits_kernel_cache = OrderedDict()
+_tilelang_indexer_fwd_cache_lock = threading.Lock()
 
 
 def _cache_put_lru(cache: OrderedDict, key, value):
@@ -22,28 +36,30 @@ def _cache_put_lru(cache: OrderedDict, key, value):
 
 def _get_clean_logits_kernel(threads: int = 512, block_K: int = 4096):
     key = (threads, block_K)
-    kernel = _tilelang_indexer_clean_logits_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = clean_logits_(threads=threads, block_K=block_K)
-    _cache_put_lru(_tilelang_indexer_clean_logits_kernel_cache, key, kernel)
-    return kernel
+    with _tilelang_indexer_fwd_cache_lock:
+        kernel = _tilelang_indexer_clean_logits_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = clean_logits_(threads=threads, block_K=block_K)
+        _cache_put_lru(_tilelang_indexer_clean_logits_kernel_cache, key, kernel)
+        return kernel
 
 
 def _get_indexer_fwd_kernel(
     heads: int, index_dim: int, block_N: int = 256, num_stages: int = 3, threads: int = 512
 ):
     key = (heads, index_dim, block_N, num_stages, threads)
-    kernel = _tilelang_indexer_fwd_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = tl_indexer_fwd_impl(
-            heads=heads,
-            index_dim=index_dim,
-            block_N=block_N,
-            num_stages=num_stages,
-            threads=threads,
-        )
-    _cache_put_lru(_tilelang_indexer_fwd_kernel_cache, key, kernel)
-    return kernel
+    with _tilelang_indexer_fwd_cache_lock:
+        kernel = _tilelang_indexer_fwd_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = tl_indexer_fwd_impl(
+                heads=heads,
+                index_dim=index_dim,
+                block_N=block_N,
+                num_stages=num_stages,
+                threads=threads,
+            )
+        _cache_put_lru(_tilelang_indexer_fwd_kernel_cache, key, kernel)
+        return kernel
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
