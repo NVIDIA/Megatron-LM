@@ -2,8 +2,74 @@
 # Adapted from:
 # https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/
 # examples/deepseek_v32/sparse_mla_fwd.py
+import os
+from collections import OrderedDict
+
 import tilelang
+import torch
 from tilelang import language as T
+
+_TILELANG_KERNEL_CACHE_MAX = 64
+_tilelang_sparse_mla_fwd_kernel_cache = OrderedDict()
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def _round_up(x: int, multiple: int) -> int:
+    if multiple <= 1:
+        return x
+    return _ceil_div(x, multiple) * multiple
+
+
+def _cache_put_lru(cache: OrderedDict, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _TILELANG_KERNEL_CACHE_MAX:
+        cache.popitem(last=False)
+
+
+def _get_sparse_mla_fwd_kernel(
+    heads: int,
+    dim: int,
+    tail_dim: int,
+    topk: int,
+    kv_group: int,
+    sm_scale,
+    is_causal: bool,
+    block_I: int,
+    num_stages: int,
+    threads: int,
+):
+    key = (heads, dim, tail_dim, topk, kv_group, sm_scale, is_causal, block_I, num_stages, threads)
+    kernel = _tilelang_sparse_mla_fwd_kernel_cache.pop(key, None)
+    if kernel is None:
+        kernel = sparse_mla_fwd(
+            heads,
+            dim,
+            tail_dim,
+            topk,
+            kv_group,
+            sm_scale,
+            is_causal,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+        )
+    _cache_put_lru(_tilelang_sparse_mla_fwd_kernel_cache, key, kernel)
+    return kernel
 
 
 @tilelang.jit(
@@ -185,6 +251,9 @@ def sparse_mla_fwd_interface(
     threads=256,
 ):
     """Run sparse-MLA forward kernel and return (out, lse)."""
+    seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
+    topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", block_I)
+
     q = q.unsqueeze(0)
     kv = kv.unsqueeze(0)
     indices = indices.unsqueeze(0)
@@ -193,10 +262,15 @@ def sparse_mla_fwd_interface(
     assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
-    _, seq_len_kv, kv_group, _ = kv.shape
-
-    assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
+    _, seq_len_kv, kv_group, kv_dim = kv.shape
+    assert (
+        kv_dim == dim_plus_tail_dim
+    ), "q and kv must have the same embedding dimension on the last axis"
+    assert (
+        dim_plus_tail_dim == 576
+    ), "TileLang sparse MLA fwd is currently specialized for dim_plus_tail_dim=576"
     dim = d_v
+    assert 0 < dim <= dim_plus_tail_dim, f"d_v must be in (0, {dim_plus_tail_dim}], but got {dim}"
 
     assert kv.shape[-1] == dim_plus_tail_dim
     tail_dim = dim_plus_tail_dim - dim
@@ -204,19 +278,49 @@ def sparse_mla_fwd_interface(
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
-    kernel = sparse_mla_fwd(
-        heads,
-        dim,
-        tail_dim,
-        topk,
-        kv_group,
-        sm_scale,
-        is_casual,
+    seq_len_bucketed = _round_up(seq_len, seq_bucket)
+    seq_len_kv_bucketed = _round_up(seq_len_kv, seq_bucket)
+    topk_bucketed = _round_up(_round_up(topk, topk_bucket), block_I)
+
+    if seq_len_bucketed != seq_len:
+        q_padded = torch.zeros(
+            (batch, seq_len_bucketed, heads, dim_plus_tail_dim), dtype=q.dtype, device=q.device
+        )
+        q_padded[:, :seq_len].copy_(q)
+        q = q_padded
+
+    if seq_len_kv_bucketed != seq_len_kv:
+        kv_padded = torch.zeros(
+            (batch, seq_len_kv_bucketed, kv_group, dim_plus_tail_dim),
+            dtype=kv.dtype,
+            device=kv.device,
+        )
+        kv_padded[:, :seq_len_kv].copy_(kv)
+        kv = kv_padded
+
+    if seq_len_bucketed != seq_len or topk_bucketed != topk:
+        indices_padded = torch.full(
+            (batch, seq_len_bucketed, kv_group, topk_bucketed),
+            -1,
+            dtype=indices.dtype,
+            device=indices.device,
+        )
+        indices_padded[:, :seq_len, :, :topk].copy_(indices)
+        indices = indices_padded
+
+    kernel = _get_sparse_mla_fwd_kernel(
+        heads=heads,
+        dim=dim,
+        tail_dim=tail_dim,
+        topk=topk_bucketed,
+        kv_group=kv_group,
+        sm_scale=sm_scale,
+        is_causal=is_casual,
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
     )
     out, lse = kernel(q, kv, indices)
-    out = out.squeeze(0)
-    lse = lse.squeeze(0)
+    out = out[:, :seq_len].contiguous().squeeze(0)
+    lse = lse[:, :seq_len].contiguous().squeeze(0)
     return out, lse

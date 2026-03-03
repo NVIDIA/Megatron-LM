@@ -51,7 +51,7 @@ class IndexerFunction(torch.autograd.Function):
         grad_q, grad_w, grad_k = indexer_bwd_interface(
             index_q, weights, index_k, topk_indices, grad_scores
         )
-        return grad_q, grad_k, grad_w, None, None, None, None, None, None, None
+        return grad_q, grad_k, grad_w, None, None, None, None
 
 
 def lighting_indexer(
