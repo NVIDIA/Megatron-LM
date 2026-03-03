@@ -239,13 +239,6 @@ class DataParallelInferenceCoordinator:
         ):
             return self.get_next_data_parallel_rank()
 
-        # FIRST_PREFIX_BLOCK: check only the first block as a cheap heuristic.
-        if (
-            self.prefix_caching_coordinator_policy
-            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-        ):
-            request_hashes = request_hashes[:1]
-
         # Reverse scan: first match is the longest prefix (parent-chained hashes).
         for h in reversed(request_hashes):
             rank_info = self.hash_to_rank_info.get(h)
@@ -328,6 +321,11 @@ class DataParallelInferenceCoordinator:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
                 request_hashes = self.compute_request_hashes(prompt)
+                if (
+                    self.prefix_caching_coordinator_policy
+                    == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+                ):
+                    request_hashes = request_hashes[:1]
                 next_data_parallel_rank_identity = self.get_best_data_parallel_rank(
                     request_hashes
                 )

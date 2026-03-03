@@ -508,7 +508,7 @@ class TestFirstPrefixBlockRouting:
         # Only rank_1 has the first block.
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
-        selected = coordinator.get_best_data_parallel_rank(hashes)
+        selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
 
     def test_first_block_ignores_longer_match(self):
@@ -529,7 +529,8 @@ class TestFirstPrefixBlockRouting:
             coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
 
         # rank_0 wins because it has higher recency on the first block.
-        selected = coordinator.get_best_data_parallel_rank(hashes)
+        # Caller truncates to [:1] before calling get_best_data_parallel_rank.
+        selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_0
 
     def test_first_block_recency_tiebreaker(self):
@@ -545,7 +546,7 @@ class TestFirstPrefixBlockRouting:
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 3
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 7
 
-        selected = coordinator.get_best_data_parallel_rank(hashes)
+        selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
 
     def test_no_first_block_match_uses_round_robin(self):
@@ -560,8 +561,8 @@ class TestFirstPrefixBlockRouting:
         coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_0] = 1
 
         # No rank has the first block, so round-robin.
-        r1 = coordinator.get_best_data_parallel_rank(hashes)
-        r2 = coordinator.get_best_data_parallel_rank(hashes)
+        r1 = coordinator.get_best_data_parallel_rank(hashes[:1])
+        r2 = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert r1 != r2
 
     def test_first_block_policy_with_single_block_prompt(self):
@@ -575,5 +576,5 @@ class TestFirstPrefixBlockRouting:
 
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
-        selected = coordinator.get_best_data_parallel_rank(hashes)
+        selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
