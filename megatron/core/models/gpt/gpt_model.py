@@ -242,7 +242,11 @@ class GPTModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
@@ -444,7 +448,7 @@ class GPTModel(LanguageModule):
             # return this extra tensor
             # this is for backwards compatibility with
             # legacy unit tests, which break if you
-            # return a 6 tuple instead of 5.
+            # return a 7 tuple instead of 6.
             preproc_output += (rotary_pos_cos_sin,)
 
         return preproc_output
@@ -621,6 +625,7 @@ class GPTModel(LanguageModule):
                 config=self.config,
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
+                scale_logits_fn=self._scale_logits if self.config.use_mup else None,
             )
         sequence_parallel_override = False
 
@@ -648,6 +653,9 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Apply MuP output scaling to logits
+        logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

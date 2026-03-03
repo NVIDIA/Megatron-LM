@@ -9,13 +9,12 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   codeowners-approval:
     needs: [pre-flight]
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'

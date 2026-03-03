@@ -17,7 +17,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+    FusedDSAIndexerLoss,
+    _compute_index_scores,
     compute_dsa_indexer_loss,
+    fused_qk_topk_naive,
     rotate_activation,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -263,6 +266,320 @@ class TestDSAIndexerLossAutoScaler:
             rtol=0,
             atol=0,
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
+
+
+@pytest.mark.parametrize("seqlen_and_topk", [[16, 8], [32, 16], [64, 32]])
+@pytest.mark.parametrize("sparse_loss", [False, True])
+class TestFusedDSAIndexerLossGradient:
+    """Test that FusedDSAIndexerLoss manual backward matches autograd backward."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fused_indexer_loss_gradient_matches_autograd(self, seqlen_and_topk, sparse_loss):
+        """
+        Test that the manually written backward in FusedDSAIndexerLoss produces
+        the same gradients as PyTorch autograd on the unfused implementation.
+        """
+        seqlen = seqlen_and_topk[0]
+        index_topk = seqlen_and_topk[1]
+        batch_size = 2
+        num_heads = 4
+        head_dim = 64
+        index_n_heads = 8
+        index_head_dim = 64
+        softmax_scale = head_dim**-0.5
+        loss_coeff = 1.0
+
+        torch.manual_seed(42)
+
+        # Create inputs for indexer
+        # q: [seqlen, batch, index_n_heads, index_head_dim]
+        q_ref = (
+            torch.randn(seqlen, batch_size, index_n_heads, index_head_dim, dtype=torch.float32)
+            .cuda()
+            .requires_grad_(True)
+        )
+        # weights: [seqlen, batch, index_n_heads]
+        weights_ref = (
+            torch.randn(seqlen, batch_size, index_n_heads, dtype=torch.float32)
+            .cuda()
+            .requires_grad_(True)
+        )
+        # k: [seqlen, batch, index_head_dim]
+        k_ref = (
+            torch.randn(seqlen, batch_size, index_head_dim, dtype=torch.float32)
+            .cuda()
+            .requires_grad_(True)
+        )
+        # query: [seqlen, batch, num_heads, head_dim] - detached, not trained
+        query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        # key: [seqlen, batch, num_heads, head_dim] - detached, not trained
+        key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+
+        # Create causal mask
+        mask = torch.triu(
+            torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(), diagonal=1
+        )
+
+        # =============================================
+        # Method 1: Autograd (reference)
+        # =============================================
+        # Compute index scores and apply mask (matches fused_qk_topk_naive behavior)
+        index_scores_ref = _compute_index_scores(q_ref, weights_ref, k_ref)
+        # Apply mask
+        index_scores_masked = index_scores_ref + mask.unsqueeze(0)
+        # Get topk indices from masked scores
+        topk_k = min(index_topk, seqlen)
+        topk_indices = index_scores_masked.topk(topk_k, dim=-1)[1]
+
+        # Compute loss using autograd
+        loss_ref = compute_dsa_indexer_loss(
+            index_scores=index_scores_masked,
+            topk_indices=topk_indices,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
+            loss_coeff=loss_coeff,
+            sparse_loss=sparse_loss,
+            pg_collection=self.pg_collection,
+        )
+
+        # Backward with autograd
+        loss_ref.backward()
+
+        # Save reference gradients
+        grad_q_ref = q_ref.grad.clone()
+        grad_weights_ref = weights_ref.grad.clone()
+        grad_k_ref = k_ref.grad.clone()
+
+        # =============================================
+        # Method 2: FusedDSAIndexerLoss (manual backward)
+        # =============================================
+        # Clone tensors from ref (detach and require grad again)
+        q_fused = q_ref.detach().clone().requires_grad_(True)
+        weights_fused = weights_ref.detach().clone().requires_grad_(True)
+        k_fused = k_ref.detach().clone().requires_grad_(True)
+
+        # Use FusedDSAIndexerLoss
+        topk_indices_fused, loss_fused = FusedDSAIndexerLoss.apply(
+            q_fused,
+            weights_fused,
+            k_fused,
+            query.detach(),
+            key.detach(),
+            softmax_scale,
+            index_topk,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            self.pg_collection,
+        )
+
+        # Backward with manual implementation
+        loss_fused.backward()
+
+        # Get fused gradients
+        grad_q_fused = q_fused.grad
+        grad_weights_fused = weights_fused.grad
+        grad_k_fused = k_fused.grad
+
+        # =============================================
+        # Compare gradients
+        # =============================================
+        # Check loss values match
+        assert torch.allclose(
+            loss_fused, loss_ref, rtol=1e-5, atol=1e-5
+        ), f"Loss mismatch: fused={loss_fused.item()}, ref={loss_ref.item()}"
+
+        # Check topk indices match
+        assert torch.equal(
+            topk_indices_fused, topk_indices
+        ), "Top-k indices mismatch between fused and reference"
+
+        # Check gradients match
+        assert torch.allclose(
+            grad_q_fused, grad_q_ref, rtol=1e-5, atol=1e-5
+        ), f"grad_q mismatch: max diff = {(grad_q_fused - grad_q_ref).abs().max().item()}"
+
+        assert torch.allclose(
+            grad_weights_fused, grad_weights_ref, rtol=1e-5, atol=1e-5
+        ), f"grad_weights mismatch: max diff = {(grad_weights_fused - grad_weights_ref).abs().max().item()}"
+
+        assert torch.allclose(
+            grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5
+        ), f"grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
+
+
+@pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
+@pytest.mark.parametrize("sparse_loss", [False, True])
+class TestFusedDSAIndexerLossGradientTP:
+    """Test FusedDSAIndexerLoss gradient consistency across different TP sizes."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fused_indexer_loss_gradient_tp_consistency(
+        self, tensor_model_parallel_size, sparse_loss
+    ):
+        """
+        Test that FusedDSAIndexerLoss produces consistent gradients across TP ranks
+        and matches TP=1 baseline.
+        """
+        seqlen = 64
+        index_topk = 32
+        batch_size = 2
+        num_heads = 8
+        head_dim = 64
+        index_n_heads = 8
+        index_head_dim = 64
+        softmax_scale = head_dim**-0.5
+        loss_coeff = 1.0
+
+        # =============================================
+        # First run with TP=1 to get baseline
+        # =============================================
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(42)
+        model_parallel_cuda_manual_seed(42)
+
+        pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+
+        # Create inputs
+        q_input = torch.randn(
+            seqlen, batch_size, index_n_heads, index_head_dim, dtype=torch.float32
+        ).cuda()
+        weights_input = torch.randn(seqlen, batch_size, index_n_heads, dtype=torch.float32).cuda()
+        k_input = torch.randn(seqlen, batch_size, index_head_dim, dtype=torch.float32).cuda()
+        query_input = torch.randn(
+            seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda()
+        key_input = torch.randn(
+            seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda()
+        mask = torch.triu(
+            torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(), diagonal=1
+        )
+
+        # Clone for TP=1
+        q_tp1 = q_input.clone().requires_grad_(True)
+        weights_tp1 = weights_input.clone().requires_grad_(True)
+        k_tp1 = k_input.clone().requires_grad_(True)
+
+        # Forward and backward with TP=1
+        topk_indices_tp1, loss_tp1 = FusedDSAIndexerLoss.apply(
+            q_tp1,
+            weights_tp1,
+            k_tp1,
+            query_input.detach(),
+            key_input.detach(),
+            softmax_scale,
+            index_topk,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            pg_collection_tp1,
+        )
+        loss_tp1.backward()
+
+        # Save TP=1 results
+        grad_q_tp1 = q_tp1.grad.clone()
+        grad_weights_tp1 = weights_tp1.grad.clone()
+        grad_k_tp1 = k_tp1.grad.clone()
+        loss_tp1_value = loss_tp1.detach().clone()
+
+        Utils.destroy_model_parallel()
+
+        # =============================================
+        # Run with target TP size
+        # =============================================
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(42)
+        model_parallel_cuda_manual_seed(42)
+
+        pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+        # Clone inputs for TP=N (same values as TP=1)
+        q_tpn = q_input.clone().requires_grad_(True)
+        weights_tpn = weights_input.clone().requires_grad_(True)
+        k_tpn = k_input.clone().requires_grad_(True)
+
+        # query and key need to be split along heads for TP
+        head_per_rank = num_heads // tensor_model_parallel_size
+        start_head = tp_rank * head_per_rank
+        end_head = (tp_rank + 1) * head_per_rank
+        query_tpn = query_input[:, :, start_head:end_head, :].clone()
+        key_tpn = key_input[:, :, start_head:end_head, :].clone()
+
+        # Forward and backward with TP=N
+        topk_indices_tpn, loss_tpn = FusedDSAIndexerLoss.apply(
+            q_tpn,
+            weights_tpn,
+            k_tpn,
+            query_tpn.detach(),
+            key_tpn.detach(),
+            softmax_scale,
+            index_topk,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            pg_collection_tpn,
+        )
+        loss_tpn.backward()
+
+        # =============================================
+        # Compare results
+        # =============================================
+        # Loss should be the same
+        assert torch.allclose(
+            loss_tpn, loss_tp1_value, rtol=1e-5, atol=1e-5
+        ), f"Loss mismatch: TP={tensor_model_parallel_size} got {loss_tpn.item()}, TP=1 got {loss_tp1_value.item()}"
+
+        # Top-k indices should be the same
+        assert torch.equal(
+            topk_indices_tpn, topk_indices_tp1
+        ), "Top-k indices mismatch between TP=1 and TP=N"
+
+        # Gradients should match exactly (indexer params are duplicated across TP)
+        assert torch.allclose(
+            q_tpn.grad, grad_q_tp1, rtol=1e-5, atol=1e-5
+        ), f"grad_q mismatch: max diff = {(q_tpn.grad - grad_q_tp1).abs().max().item()}"
+
+        assert torch.allclose(
+            weights_tpn.grad, grad_weights_tp1, rtol=1e-5, atol=1e-5
+        ), f"grad_weights mismatch: max diff = {(weights_tpn.grad - grad_weights_tp1).abs().max().item()}"
+
+        assert torch.allclose(
+            k_tpn.grad, grad_k_tp1, rtol=1e-5, atol=1e-5
+        ), f"grad_k mismatch: max diff = {(k_tpn.grad - grad_k_tp1).abs().max().item()}"
+
+        # Check gradients are identical across all TP ranks
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            for grad_tensor, name in [
+                (q_tpn.grad, "grad_q"),
+                (weights_tpn.grad, "grad_weights"),
+                (k_tpn.grad, "grad_k"),
+            ]:
+                grad_list = [torch.zeros_like(grad_tensor) for _ in range(tp_size)]
+                torch.distributed.all_gather(grad_list, grad_tensor, group=pg_collection_tpn.tp)
+
+                for i in range(1, tp_size):
+                    assert torch.allclose(
+                        grad_list[0], grad_list[i], rtol=0, atol=0
+                    ), f"{name} differs between TP rank 0 and rank {i}"
+
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("seqlen", [16, 64])
