@@ -1173,7 +1173,8 @@ class ChainedOptimizer(MegatronOptimizer):
                         d = {}
                         for chunk_idx, model_chunk in enumerate(optimizer.model_chunks):
                             assert model_chunk in chunk_to_global_idx, (
-                                "Sub-optimizer model chunk was not found in chained optimizer model chunks"
+                                "Sub-optimizer model chunk was not found in "
+                                "chained optimizer model chunks"
                             )
                             global_idx = chunk_to_global_idx[model_chunk]
                             assert (
