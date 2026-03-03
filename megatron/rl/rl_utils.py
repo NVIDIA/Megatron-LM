@@ -36,8 +36,7 @@ from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
     toggle_cuda_graphs,
-    transition_moe_to_full_cudagraphs,
-    transition_moe_to_partial_cudagraphs,
+    transition_moe_cudagraphs,
 )
 from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
@@ -1728,7 +1727,7 @@ def megatron_rl_inference_mode(
 
     # Switch MoE layers to full CUDA graph capture for inference
     if args.rl_training_cuda_graphs and args.num_experts is not None:
-        transition_moe_to_full_cudagraphs(lang_module)
+        transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1826,7 +1825,7 @@ def megatron_rl_inference_mode(
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:
-            transition_moe_to_partial_cudagraphs(lang_module)
+            transition_moe_cudagraphs(lang_module, 'partial')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
         # GPU memory during training.
