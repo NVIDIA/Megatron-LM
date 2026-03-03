@@ -27,7 +27,7 @@ import sys
 project = "Megatron Core"
 copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "nightly"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -63,6 +63,12 @@ myst_enable_extensions = [
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
 
+# Suppress "more than one target found for cross-reference" warnings for Python symbols
+# that have the same name across multiple modules (e.g. DistributedDataParallelConfig,
+# ModelType). These are structural ambiguities in the codebase – the cross-reference
+# still resolves; Sphinx just cannot pick the unique target automatically.
+suppress_warnings = ["ref.python"]
+
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -80,6 +86,11 @@ if not skip_autodoc:
     # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
     autodoc2_docstring_parser_regexes = [
         (r".*", "docs.autodoc2_docstrings_parser"),
+    ]
+    # Regex patterns whose values contain raw regex syntax (e.g. \p{L}) that docutils
+    # mis-parses as footnote/reference markup. Exclude them from the generated docs.
+    autodoc2_hidden_regexes = [
+        r".*\._PATTERN_TIKTOKEN.*",
     ]
 
 # -- Options for HTML output -------------------------------------------------

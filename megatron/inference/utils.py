@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
@@ -11,18 +12,20 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
@@ -63,6 +66,9 @@ def get_model_for_inference() -> MegatronModule:
 
     # Eval mode.
     model.eval()
+
+    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
+        quantize_model_to_mxfp8(unwrap_model(model))
 
     return model
 
@@ -169,6 +175,13 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "results of every `n` requests.",
     )
     group.add_argument(
+        "--output-request-events",
+        action='store_true',
+        default=False,
+        help="Include request events (lifecycle + per-token block allocator metrics) "
+        "in the JSON output.",
+    )
+    group.add_argument(
         "--prompt-file",
         help='Jsonl file containing input prompts, where each item (i.e., line) '
         'contains the field \'text\' where the value is the prompt. All other '
@@ -224,6 +237,19 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action='store_true',
         default=False,
         help="If true, only run throughput check without verifying outputs.",
+    )
+    group.add_argument(
+        "--drain-between-batches",
+        action='store_true',
+        default=False,
+        help="Process requests in batches, draining all active requests between batches.",
+    )
+    group.add_argument(
+        "--batch-boundaries",
+        type=str,
+        default=None,
+        help="Comma-separated list of request indices where each batch starts. "
+        "Used with --drain-between-batches.",
     )
 
     return parser
@@ -300,8 +326,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         materialize_only_last_token_logits=not args.return_log_probs,
+        track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )
