@@ -5,8 +5,8 @@ Megatron-LM and Megatron Core
 
 <h4>GPU-optimized library for training transformer models at scale</h4>
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/Megatron-Core/developer-guide/latest/index.html)
-[![version](https://img.shields.io/badge/release-0.12.0-green)](./CHANGELOG.md)
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+[![version](https://img.shields.io/badge/release-0.15.0-green)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
 
 <div align="left">
@@ -133,7 +133,7 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 
 ## Getting Help
 
-- 📖 **[Documentation](https://docs.nvidia.com/Megatron-Core/)** - Official documentation
+- 📖 **[Documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** - Official documentation
 - 🐛 **[Issues](https://github.com/NVIDIA/Megatron-LM/issues)** - Bug reports and feature requests
 
 ## Contributing
@@ -145,7 +145,7 @@ We ❤️ contributions! Ways to contribute:
 - 📝 **Improve docs** - Make Megatron Core more accessible
 - 🔧 **Submit PRs** - Contribute code improvements
 
-**→ [Contributing Guide](./CONTRIBUTING.md)**
+**→ [Contributing Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)**
 
 ## Citation
 

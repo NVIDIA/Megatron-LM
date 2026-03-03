@@ -7,6 +7,9 @@ the async checkpoint save calls.
 import logging
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
@@ -76,3 +79,4 @@ def reset_persistent_async_worker():
         del _results_queue
     _results_queue = None
     _async_calls_queue = None
+    CachedMetadataFileSystemReader.clear_metadata_cache()

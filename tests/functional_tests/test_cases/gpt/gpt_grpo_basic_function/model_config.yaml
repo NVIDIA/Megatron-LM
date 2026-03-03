@@ -43,8 +43,6 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --tokenizer-type: HuggingFaceTokenizer
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
-  --langrl-inference-server-type: inplace_megatron_chat
-  --langrl-inference-server-conversation-template: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
   --vocab-size: 151936
   --make-vocab-size-divisible-by: 128
   --optimizer: adam

@@ -245,6 +245,7 @@ class DataParallelInferenceCoordinator:
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
+                Headers.INCREMENT_STALENESS,
                 Headers.STOP,
             ]:
                 # control signals for the engine

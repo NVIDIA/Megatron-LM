@@ -8,7 +8,6 @@ import time
 import types
 import typing as T
 from collections import namedtuple
-from copy import deepcopy
 from functools import partial
 
 import numpy as np
@@ -19,14 +18,10 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args, get_tokenizer
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint

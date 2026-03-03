@@ -92,7 +92,6 @@ model_parallel:
 
   # Optimizations
   gradient_accumulation_fusion: True
-  async_tensor_model_parallel_allreduce: True
   tp_comm_overlap: False
 
   # Debug Options
