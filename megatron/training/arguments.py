@@ -1382,8 +1382,12 @@ def validate_args(args, defaults={}):
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Expert parallelism check
-    if args.expert_model_parallel_size  > 1:
-        assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
+    # NOTE: These validations are also enforced in TransformerConfig.__post_init__
+    # for configs that go through dataclass construction. Retained here for legacy
+    # model paths that bypass TransformerConfig entirely.
+    if args.expert_model_parallel_size > 1:
+        assert args.num_experts is not None, \
+            "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
 
