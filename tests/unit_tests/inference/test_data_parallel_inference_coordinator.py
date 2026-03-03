@@ -12,6 +12,7 @@ from typing import Dict, Optional
 import msgpack
 import pytest
 import torch
+
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -342,8 +343,7 @@ class TestCoordinator:
 
         # Ensure all engines are registered before submitting requests.
         await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-            timeout=30.0,
+            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
         )
 
         client = None
