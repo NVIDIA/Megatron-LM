@@ -17,6 +17,7 @@ import msgpack
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -200,6 +201,7 @@ def make_coordinator_direct(
     coordinator.data_parallel_size = data_parallel_size
     coordinator.block_size_tokens = block_size_tokens
     coordinator.enable_prefix_caching = enable_prefix_caching
+    coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
 
     # Create fake rank identities.
     coordinator.identities_of_data_parallel_ranks = deque(

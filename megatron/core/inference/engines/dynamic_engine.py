@@ -454,8 +454,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.tokenizer,
                     inference_coordinator_port,
                     deterministic_mode,
-                    getattr(self.context, 'block_size_tokens', None),
-                    getattr(self.context, 'enable_prefix_caching', False),
+                    self.context.block_size_tokens,
+                    self.context.enable_prefix_caching,
+                    self.context.prefix_caching_coordinator_policy,
                 ),
             )
             self.inference_coordinator_process.start()

@@ -12,6 +12,7 @@ from multiprocessing.connection import Connection
 
 import torch
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 
@@ -78,6 +79,9 @@ class DataParallelInferenceCoordinator:
         deterministic_mode: bool = False,
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
+        prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        ),
     ):
         """
         Initializes the inference coordinator.
@@ -168,6 +172,7 @@ class DataParallelInferenceCoordinator:
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
         self.enable_prefix_caching = enable_prefix_caching
+        self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.rank_cached_hashes = {
             identity: set() for identity in self.identities_of_data_parallel_ranks
         }
@@ -216,7 +221,12 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if not self.enable_prefix_caching or not request_hashes:
+        if (
+            not self.enable_prefix_caching
+            or not request_hashes
+            or self.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
+        ):
             return self.get_next_data_parallel_rank()
 
         best_match = 0
@@ -453,6 +463,9 @@ class DataParallelInferenceCoordinator:
         deterministic_mode: bool = False,
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
+        prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        ),
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -469,6 +482,7 @@ class DataParallelInferenceCoordinator:
             deterministic_mode (bool): Whether to enable deterministic scheduling.
             block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
             enable_prefix_caching (bool): Whether prefix caching is enabled.
+            prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
         """
         coordinator = cls(
             pipe_connection,
@@ -478,6 +492,7 @@ class DataParallelInferenceCoordinator:
             deterministic_mode=deterministic_mode,
             block_size_tokens=block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
+            prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
         )
         ready_event.set()
         try:
