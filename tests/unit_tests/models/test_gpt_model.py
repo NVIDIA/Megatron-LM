@@ -3,6 +3,7 @@
 import inspect
 import os
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -448,3 +449,41 @@ class TestGPTWithDynamicInference:
 
         # Assert that all padding logits are zero.
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+def test_get_transformer_layer_spec_forwards_use_te_activation_func():
+    """Test that _get_transformer_layer_spec forwards use_te_activation_func.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/2770
+    The --use-te-activation-func flag was silently ignored for non-MoE GPT
+    models because _get_transformer_layer_spec did not forward the parameter
+    to get_gpt_layer_with_transformer_engine_spec.
+    """
+    mock_config = MagicMock()
+    mock_config.use_te_activation_func = True
+    mock_config.use_kitchen = False
+    mock_config.use_kitchen_attention = False
+    mock_config.kitchen_attention_backend = "sdpa"
+
+    mock_args = MagicMock()
+    mock_args.num_experts = None
+    mock_args.moe_grouped_gemm = False
+    mock_args.qk_layernorm = False
+    mock_args.multi_latent_attention = False
+    mock_args.experimental_attention_variant = None
+    mock_args.moe_use_legacy_grouped_gemm = False
+    mock_args.qk_l2_norm = False
+
+    with (
+        patch('gpt_builders.get_args', return_value=mock_args),
+        patch('gpt_builders.get_gpt_layer_with_transformer_engine_spec') as mock_spec_fn,
+    ):
+        from gpt_builders import _get_transformer_layer_spec
+
+        _get_transformer_layer_spec(use_te=True, config=mock_config)
+
+        mock_spec_fn.assert_called_once()
+        _, call_kwargs = mock_spec_fn.call_args
+        assert (
+            call_kwargs.get('use_te_activation_func') is True
+        ), "use_te_activation_func must be forwarded from config"

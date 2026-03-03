@@ -39,5 +39,5 @@ else
 fi
 
 if [ ${ENABLE_CUDA_GRAPH:-true} == true ]; then
-    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local"
+    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local --rl-persist-cuda-graphs"
 fi
