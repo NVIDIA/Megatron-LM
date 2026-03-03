@@ -33,18 +33,18 @@ class MambaInferenceStateConfig:
     ssm_states_shape: Tuple[int]
     """Mamba SSM states shape per request."""
 
-    conv_states_dtype: torch.dtype = None
+    conv_states_dtype: torch.dtype
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
 
-    ssm_states_dtype: torch.dtype = None
+    ssm_states_dtype: torch.dtype
     """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
 
     @classmethod
     def from_model(
         cls,
         model: MegatronModule,
-        conv_states_dtype: Optional[torch.dtype],
-        ssm_states_dtype: Optional[torch.dtype],
+        conv_states_dtype: Optional[torch.dtype] = None,
+        ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
         from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
