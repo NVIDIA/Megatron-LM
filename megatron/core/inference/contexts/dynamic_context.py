@@ -733,7 +733,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             self.reset_metadata()
 
-
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
 
