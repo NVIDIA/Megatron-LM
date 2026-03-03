@@ -2761,7 +2761,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/cspades/TransformerEngine.git?rev=60b68f7305da496fd048adc7e3caee8460ebde1c" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=39d249baab612b3c8b5d32d616603505d2e00282" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -6732,8 +6732,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.14.0.dev0+60b68f73"
-source = { git = "https://github.com/cspades/TransformerEngine.git?rev=60b68f7305da496fd048adc7e3caee8460ebde1c#60b68f7305da496fd048adc7e3caee8460ebde1c" }
+version = "2.14.0.dev0+39d249ba"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=39d249baab612b3c8b5d32d616603505d2e00282#39d249baab612b3c8b5d32d616603505d2e00282" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
