@@ -40,6 +40,7 @@ from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
+from megatron.core.inference.utils import device_memory_summary
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
@@ -117,16 +118,19 @@ def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
             "(see https://github.com/fzyzcjy/torch_memory_saver)"
         )
 
+    tag = "rl_inference_model"
     if to_cpu:
         if not _INFERENCE_MODEL_IS_PAUSED:
-            torch_memory_saver.pause("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: pausing {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.pause(tag)
             _INFERENCE_MODEL_IS_PAUSED = True
-            print_rank_0("[Rank 0] offloaded RL inference model weights to CPU using torch_memory_saver")
+            print_rank_0(f"torch_memory_saver: paused  {tag}, after:  {device_memory_summary()}")
     else:
         if _INFERENCE_MODEL_IS_PAUSED:
-            torch_memory_saver.resume("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: resuming {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.resume(tag)
             _INFERENCE_MODEL_IS_PAUSED = False
-            print_rank_0("[Rank 0] restored RL inference model weights to GPU using torch_memory_saver")
+            print_rank_0(f"torch_memory_saver: resumed  {tag}, after:  {device_memory_summary()}")
 
 
 def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
