@@ -101,10 +101,13 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
+    Provides a consistent interface for gradient management, parameter 
+    access, and state-dict handling across different optimization types.
+
     Args:
-        optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-        config (OptimizerConfig): configuration object for optimizer.
-        init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        optimizer (torch.optim.Optimizer): The base PyTorch optimizer.
+        config (OptimizerConfig): The optimizer configuration.
+        init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
     def __init__(
@@ -135,13 +138,15 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """
-        Get main_grads that should be taken into account to compute the grad norm.
-        Filter parameters based on:
-          - grad should not be None.
-          - parameter should not be shared (i.e., grads shouldn't be double counted while
-            computing norms).
-          - should not be a replica due to tensor model parallelism.
+        
+        """Collects gradients for norm calculation, filtering duplicates.
+
+        This method filters parameters based on whether the gradient is not None, 
+        the parameter is not shared (to avoid double-counting gradients), and 
+        the parameter is not a replica due to tensor model parallelism.
+
+        Returns:
+            List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
         """
         params = self.get_parameters()
         grads_for_norm = []
