@@ -289,14 +289,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
-            mamba_conv_states_shape = mamba_inference_state_config.mamba_conv_states_shape
-            mamba_ssm_states_shape = mamba_inference_state_config.mamba_ssm_states_shape
-            assert (
-                mamba_conv_states_shape is not None
-            ), "`mamba_conv_states_shape` must be specified for hybrid models"
-            assert (
-                mamba_ssm_states_shape is not None
-            ), "`mamba_ssm_states_shape` must be specified for hybrid models"
+            self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
+            self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
+            self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
+            self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -306,8 +302,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.mamba_conv_states_shape = mamba_conv_states_shape
-            self.mamba_ssm_states_shape = mamba_ssm_states_shape
             self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
@@ -322,20 +316,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Block size tokens, bytes.
-        dtype_size_bytes = model_config.params_dtype.itemsize
+        kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
             self.block_size_bytes = (
-                dtype_size_bytes
+                kv_dtype_size_bytes
                 * self.num_attention_layers
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
         else:
             self.block_size_bytes = (
-                dtype_size_bytes
+                kv_dtype_size_bytes
                 * 2  # key, value
                 * self.num_attention_layers
                 * self.block_size_tokens
@@ -346,10 +340,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)
-            mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
+            mamba_states_memory_per_request += (
+                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+            )
+            mamba_states_memory_per_request += (
+                math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+            )
             mamba_states_memory_per_request *= self.num_mamba_layers
-            mamba_states_memory_per_request *= dtype_size_bytes
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -617,12 +614,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.params_dtype,
+                dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.params_dtype,
+                dtype=self.mamba_ssm_states_dtype,
                 device=torch.cuda.current_device(),
             )
             if (

@@ -882,6 +882,8 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+    args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
+    args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1821,6 +1823,12 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--mamba-inference-conv-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference conv states tensor')
+    group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference SSM states tensor')
     return parser
 
 
