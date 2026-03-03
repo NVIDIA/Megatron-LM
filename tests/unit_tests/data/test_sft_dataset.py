@@ -152,10 +152,7 @@ def test_sft_dataset(
             SFTDataset, [100, 10, 10], lambda: True, config
         ).build()
 
-        # print(f"train_ds: {train_ds[0]['cu_seqlens']}, {train_ds[0]['tokens'].shape}, {train_ds[0]['labels'].shape}")
 
-        for i in range(5):
-            print(f"train_ds[{i}]: {train_ds[i]['cu_seqlens']} ({train_ds[i]['cu_seqlens'].shape}), {train_ds[i]['tokens'].shape}, {train_ds[i]['labels'].shape[0]}, {train_ds[i]['tokens'].numel()}, {train_ds[i]['labels'].numel()}")
-            
-            assert train_ds[i]['tokens'].shape[0] > sequence_length
-            assert train_ds[i]['tokens'].shape[0] + 1 == train_ds[i]['cu_seqlens'][-1]
+        for sample_idx in [0, 1, -1]:            
+            assert train_ds[sample_idx]['tokens'].shape[0] <= sequence_length
+            assert train_ds[sample_idx]['tokens'].shape[0] + 1 == train_ds[sample_idx]['cu_seqlens'][-1]

@@ -29,11 +29,11 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
     train_on_thinking_traces: bool = True
     """If False, mask thinking traces from the completitions"""
-
-    completitions_start_tokens: List[int]
+    
+    #completitions_start_tokens: List[int]
     """The tokens that indicate the start of a completition"""
 
-    completitions_end_tokens: List[int]
+    #completitions_end_tokens: List[int]
     """The tokens that indicate the end of a completition"""
 
     truncate_conversations: bool = True # TODO(asolergi-nv): 
@@ -106,7 +106,7 @@ class SFTDataset(MegatronDataset):
             int: The length of the dataset
         """
 
-        return self.shuffle_index.shape[0] - 1 # TODO(asolergi-nv): Check this -1 
+        return self.shuffle_index.shape[0]
     
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
@@ -146,11 +146,8 @@ class SFTDataset(MegatronDataset):
         idx = self.shuffle_index[idx]
 
         # Get the beginning and end documents and offsets
-        doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
-        doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
-
-        assert doc_index_beg_offset == 0 # TODO(asolergi-nv): Remove
-        assert doc_index_end_offset == 0 # TODO(asolergi-nv): Remove
+        doc_index_beg = self.sample_index[idx]
+        doc_index_end = self.sample_index[idx + 1]
 
         document_ids = []
         sample_parts = []
@@ -158,42 +155,12 @@ class SFTDataset(MegatronDataset):
         # TODO(asolergi-nv): For PP add flag to JUST read cu_seqlens
         # TODO(asolergi-nv): sequence_pointer, sequence_length, sequence_mode = self.dataset.index[document_index[i or doc_index_beg]]
         
-        # Sample spans a single document
-        if doc_index_beg == doc_index_end:
-            # Add the document id
-            document_ids.append(self.document_index[doc_index_beg])
-
-            # Add the entire sample
-            sample_parts.append(
-                self.dataset.get(
-                    self.document_index[doc_index_beg],
-                    offset=int(doc_index_beg_offset),
-                    length=doc_index_end_offset
-                    - doc_index_beg_offset
-                    + self.config.add_extra_token_to_sequence,
-                )
-            )
-
-        # Sample spans multiple documents
-        else:
-            for i in range(doc_index_beg, doc_index_end + 1):
-                # Add the sample part
-                offset = 0 if i > doc_index_beg else doc_index_beg_offset
-                length = (
-                    None
-                    if i < doc_index_end
-                    else doc_index_end_offset + self.config.add_extra_token_to_sequence
-                )
-                # TODO(asolergi-nv): Improve this logic, we will always be in this else statement & always get a full sample
-                if length is not None and length < 2:
-                    break
-                
-                # Add the document id
-                document_ids.append(self.document_index[i])
-                
-                sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
-                )
+        for i in range(doc_index_beg, doc_index_end):
+            # Add the document id # TODO(asolergi-nv): Remove
+            document_ids.append(self.document_index[i])
+            
+            # Add the sample part
+            sample_parts.append(self.dataset.get(self.document_index[i]))
         assert len(document_ids) == len(
             sample_parts
         ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
@@ -268,7 +235,7 @@ class SFTDataset(MegatronDataset):
 
             sequence_length = self.config.sequence_length
             sample_lengths = self.dataset.sequence_lengths[self.indices]
-            num_samples = self.num_samples
+            num_samples = 1 if self.num_samples is None else self.num_samples
 
             packed_samples = pack_samples(sample_lengths, sequence_length)
             document_index = [j for pack in packed_samples for j in pack]
@@ -279,6 +246,12 @@ class SFTDataset(MegatronDataset):
             shuffle_index = []
             for epoch in range(num_epochs):
                 shuffle_index.extend(torch.randperm(num_packed).tolist())
+
+            # TODO(asolergi-nv): Refactor
+            # Convert to numpy arrays
+            document_index = numpy.array(document_index, dtype=numpy.int32)
+            sample_index = numpy.array(sample_index, dtype=numpy.int32)
+            shuffle_index = numpy.array(shuffle_index, dtype=numpy.int32)
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
