@@ -1165,17 +1165,17 @@ class ChainedOptimizer(MegatronOptimizer):
                 # (e.g., dense and MoE parts) use the same model state dict.
                 state_dicts = [state_dict] * len(self.chained_optimizers)
             else:
-                # Split state_dict by chunk identity
+                # Split state_dict by model chunk object.
                 prefix = "model" if "model0" in state_dict.keys() else "model_"
-                chunk_id_to_global_idx = {id(chunk): idx for idx, chunk in enumerate(self.model_chunks)}
+                chunk_to_global_idx = {chunk: idx for idx, chunk in enumerate(self.model_chunks)}
                 for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
                     if hasattr(optimizer, "model_chunks"):
                         d = {}
                         for chunk_idx, model_chunk in enumerate(optimizer.model_chunks):
-                            assert id(model_chunk) in chunk_id_to_global_idx, (
+                            assert model_chunk in chunk_to_global_idx, (
                                 "Sub-optimizer model chunk was not found in chained optimizer model chunks"
                             )
-                            global_idx = chunk_id_to_global_idx[id(model_chunk)]
+                            global_idx = chunk_to_global_idx[model_chunk]
                             assert (
                                 f"{prefix}{global_idx}" in state_dict
                             ), f"Wrong state_dict format, cannot find '{prefix}{global_idx}'"
