@@ -17,6 +17,8 @@ from megatron.core.datasets.utils import Split
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.utils import log_single_rank
 
+from bisect import bisect
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,7 +106,7 @@ class SFTDataset(MegatronDataset):
             int: The length of the dataset
         """
 
-        return self.sample_index.shape[0] - 1
+        return self.shuffle_index.shape[0] - 1 # TODO(asolergi-nv): Check this -1 
     
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
@@ -265,95 +267,18 @@ class SFTDataset(MegatronDataset):
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length
-            num_tokens_per_epoch = self._get_num_tokens_per_epoch()
-            num_epochs = self._get_num_epochs(num_tokens_per_epoch)
+            sample_lengths = self.dataset.sequence_lengths[self.indices]
+            num_samples = self.num_samples
 
-            if num_epochs == 1:
-                separate_final_epoch = False
-            else:
-                # Get the number of samples for the last epoch
-                num_samples_sans_final_epoch = (
-                    (num_epochs - 1) * num_tokens_per_epoch
-                    - self.config.add_extra_token_to_sequence
-                ) // sequence_length
-                num_samples_from_final_epoch = self.num_samples - num_samples_sans_final_epoch
-                num_samples_per_epoch = (
-                    num_tokens_per_epoch - self.config.add_extra_token_to_sequence
-                ) // sequence_length
+            packed_samples = pack_samples(sample_lengths, sequence_length)
+            document_index = [j for pack in packed_samples for j in pack]
+            sample_index = torch.cumsum(torch.tensor([0] + [len(sample) for sample in packed_samples]), dim=0)
 
-                # num_samples_from_final_epoch should be non-negative
-                assert num_samples_from_final_epoch >= 0
-
-                # num_samples_from_final_epoch should not exceed max value
-                assert num_samples_from_final_epoch <= num_samples_per_epoch + 1
-
-                # Separate the final epoch if it falls below the threshold
-                threshold = 0.80
-                separate_final_epoch = num_samples_from_final_epoch < int(
-                    threshold * num_samples_per_epoch
-                )
-
-                log_single_rank(
-                    logger,
-                    logging.DEBUG,
-                    f"> num_samples_from_final_epoch: {num_samples_from_final_epoch}",
-                )
-                log_single_rank(logger, logging.DEBUG, f"> threshold: {threshold}")
-                log_single_rank(
-                    logger, logging.DEBUG, f"> num_samples_per_epoch: {num_samples_per_epoch}"
-                )
-
-            log_single_rank(
-                logger, logging.DEBUG, f"> separate_final_epoch: {separate_final_epoch}"
-            )
-
-            numpy_random_state = numpy.random.RandomState(self.config.random_seed)
-
-            # Build the document index
-            document_index = _build_document_index(
-                self.indices, num_epochs, numpy_random_state, separate_final_epoch
-            )
-
-            # Build the sample index
-            from megatron.core.datasets import helpers
-
-            if self.index_split == Split.valid:
-                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
-            else:
-                drop_last_partial_sequence = True
-
-            assert document_index.dtype == numpy.int32
-            assert self.dataset.sequence_lengths.dtype == numpy.int32
-            if len(document_index) * 2 > len(self.dataset.sequence_lengths):
-                # If "access density" of sequence_lengths is high, force load the mmap-ed array
-                # into memory by making a copy.
-                #
-                # System performance benefits come from two aspects:
-                #   1. We sequentially pre-load the whole file, most of which we expect to read
-                #   2. The GIL is held when entering the c++ program, improving the speed of which
-                #      improves parallelism
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
-            else:
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths
-            sample_index = helpers.build_sft_sample_idx(
-                sequence_lengths_for_cpp,
-                document_index,
-                sequence_length,
-                num_epochs,
-                num_tokens_per_epoch,
-                drop_last_partial_sequence,
-                self.config.add_extra_token_to_sequence,
-            )
-
-            # Build the shuffle index
-            if separate_final_epoch:
-                shuffle_index = _build_shuffle_index(
-                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
-                )
-            else:
-                shuffle_index = _build_shuffle_index(
-                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
-                )
+            num_packed = len(packed_samples)
+            num_epochs = (num_samples // num_packed) + 1 if num_samples % num_packed else num_samples // num_packed
+            shuffle_index = []
+            for epoch in range(num_epochs):
+                shuffle_index.extend(torch.randperm(num_packed).tolist())
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
@@ -420,31 +345,155 @@ class SFTDataset(MegatronDataset):
 
         return document_index, sample_index, shuffle_index
 
-    def _get_num_tokens_per_epoch(self) -> int:
-        """Calculate the number of tokens in a single epoch
+def _classify_items(
+    items: List[Tuple[int, int]], bin_capacity: int
+) -> Tuple[
+    List[Tuple[int, int]],
+    List[Tuple[int, int]],
+    List[Tuple[int, int]],
+    List[Tuple[int, int]],
+]:
+    """Split items into large / medium / small / tiny classes.
 
-        Returns:
-            int: The number of tokens in a single epoch
-        """
-        # TODO(asolergi-nv): For the truncated conversations it'll be less than this 
-        return int(numpy.sum(self.dataset.sequence_lengths[self.indices]))
+    Follows the classification used by Johnson & Garey:
+        large   : (C/2, C]
+        medium  : (C/3, C/2]
+        small   : (C/6, C/3]
+        tiny    : (0  , C/6]
 
-    def _get_num_epochs(self, num_tokens_per_epoch: int) -> int:
-        """Calculate the number of epochs
+    Args:
+        items: List of (index, size) tuples
 
-        Args:
-            num_tokens_per_epoch (int): The number of tokens in a single epoch
+    Returns:
+        Tuple of four lists (large, medium, small, tiny) without additional sorting.
+    """
+    large, medium, small, tiny = [], [], [], []
+    for idx, size in items:
+        if size > bin_capacity / 2:
+            large.append((idx, size))
+        elif size > bin_capacity / 3:
+            medium.append((idx, size))
+        elif size > bin_capacity / 6:
+            small.append((idx, size))
+        else:
+            tiny.append((idx, size))
+    return large, medium, small, tiny
 
-        Returns:
-            int: The number of epochs
-        """
-        num_epochs = 1
-        num_tokens = num_tokens_per_epoch
-        if self.num_samples is not None:
-            num_tokens_requested = (
-                self.num_samples * self.config.sequence_length
-            ) + self.config.add_extra_token_to_sequence
-            while num_tokens < num_tokens_requested:
-                num_epochs += 1
-                num_tokens += num_tokens_per_epoch
-        return num_epochs
+def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[int]]:
+    """Pack sequences using the Modified First-Fit Decreasing algorithm.
+
+    Args:
+        sequence_lengths: A list of sequence lengths to pack.
+
+    Returns:
+        A list of bins, where each bin is a list of indices into the original
+        sequence_lengths list.
+    """
+    # Validate inputs
+    if bin_capacity <= 0:
+        raise ValueError("bin_capacity must be positive")
+    if any(l <= 0 for l in sequence_lengths):
+        raise ValueError("sequence lengths must be positive")
+
+    # Drop documents that exceed capacity and warn
+    long_mask = [l > bin_capacity for l in sequence_lengths]
+    if any(long_mask):
+        n_dropped = sum(long_mask)
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Dropping {n_dropped} document(s) with sequence length > bin_capacity "
+            f"(bin_capacity={bin_capacity}).",
+        )
+    items: List[Tuple[int, int]] = [
+        (i, l) for i, l in enumerate(sequence_lengths) if l <= bin_capacity
+    ]
+
+    # Phase-0: classify
+    large, medium, small, tiny = _classify_items(items, bin_capacity)
+
+    # Sort according to the rules of MFFD
+    large.sort(key=lambda x: x[1], reverse=True)  # descending size
+    medium.sort(key=lambda x: x[1], reverse=True)
+    small.sort(key=lambda x: x[1])  # ascending size
+    tiny.sort(key=lambda x: x[1])
+
+    # Phase-1: start one bin per large item
+    bins: List[List[Tuple[int, int]]] = [[item] for item in large]
+
+    # Phase-2: try to add one medium item to each large bin (forward pass)
+    for b in bins:
+        remaining = bin_capacity - sum(size for _, size in b)
+        for i, (idx, size) in enumerate(medium):
+            if size <= remaining:
+                b.append(medium.pop(i))
+                break
+
+    # Phase-3: backward pass – fill with two small items where possible
+    for b in reversed(bins):
+        has_medium = any(
+            bin_capacity / 3 < size <= bin_capacity / 2 for _, size in b
+        )
+        if has_medium or len(small) < 2:
+            continue
+        remaining = bin_capacity - sum(size for _, size in b)
+        if small[0][1] + small[1][1] > remaining:
+            continue
+        first_small = small.pop(0)
+        # pick the *largest* small that fits with first_small (so iterate from end)
+        second_idx = None
+        for j in range(len(small) - 1, -1, -1):
+            if small[j][1] <= remaining - first_small[1]:
+                second_idx = j
+                break
+        if second_idx is not None:
+            second_small = small.pop(second_idx)
+            b.extend([first_small, second_small])
+
+    # Phase-4: forward greedy fit of remaining items
+    remaining_items = sorted(
+        medium + small + tiny, key=lambda x: x[1], reverse=True
+    )
+    for b in bins:
+        while remaining_items:
+            rem = bin_capacity - sum(size for _, size in b)
+            # if even the smallest remaining doesn't fit we break
+            if rem < remaining_items[-1][1]:
+                break
+
+            # pick the first (largest) that fits
+            chosen_idx = None
+            for i, (_, size) in enumerate(remaining_items):
+                if size <= rem:
+                    chosen_idx = i
+                    break
+            if chosen_idx is None:
+                break
+            b.append(remaining_items.pop(chosen_idx))
+
+    # Phase-5: FFD on leftovers
+    leftovers = remaining_items  # renamed for clarity
+
+    # New O(n * logn) implementation
+    ffd_bins: List[List[Tuple[int, int]]] = [[]]
+    ffd_bin_sizes: List[int] = [0]
+    for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+        # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
+        if size <= (bin_capacity - ffd_bin_sizes[0]):
+            new_bin = ffd_bins.pop(0)
+            new_bin_size = ffd_bin_sizes.pop(0)
+        else:
+            new_bin = []
+            new_bin_size = 0
+
+        new_bin.append((idx, size))
+        new_bin_size += size
+
+        new_idx = bisect(ffd_bin_sizes, new_bin_size)
+        ffd_bins.insert(new_idx, new_bin)
+        ffd_bin_sizes.insert(new_idx, new_bin_size)
+
+    bins.extend(ffd_bins)
+
+    # Convert to list of index lists (discard sizes)
+    return [[idx for idx, _ in b] for b in bins if b]
