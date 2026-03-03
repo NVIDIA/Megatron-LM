@@ -1540,8 +1540,8 @@ def validate_args(args, defaults={}):
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
         
-    if args.mla_fusion:
-        assert args.multi_latent_attention, "--mla-fusion requires --multi-latent-attention"
+    if args.mla_down_proj_fusion:
+        assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
     # MoE latent projections
     if args.moe_latent_size is not None:
@@ -3011,10 +3011,11 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
-        '--mla-fusion',
+        '--mla-down-proj-fusion',
         action='store_true',
         default=False,
-        help='Enable best-effort MLA fusion (fused q/kv down projection and fused input layernorm when supported).',
+        help="Enable fused q/kv down-projection and fused input layernorm when backend supports. "
+             "Otherwise fall back to the unfused MLA.",
     )
 
     return parser
