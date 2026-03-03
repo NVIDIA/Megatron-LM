@@ -921,7 +921,7 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
-    needs_dp_avg: bool = True,
+    reduce_group_has_dp: bool = False,
 ) -> None:
     """Save the auxiliary loss for logging.
     Args:
@@ -933,8 +933,8 @@ def save_to_aux_losses_tracker(
             Defaults to None.
         avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
             Defaults to None.
-        needs_dp_avg (bool, optional): Whether to average the metric across data parallel ranks.
-            Defaults to True.
+        reduce_group_has_dp (bool, optional): Whether the reduce group already includes DP ranks.
+            If True, DP averaging is skipped. Defaults to False.
     """
     get_moe_metrics_tracker().record(
         name=name,
@@ -943,7 +943,7 @@ def save_to_aux_losses_tracker(
         num_layers=num_layers,
         reduce_group=reduce_group,
         avg_group=avg_group,
-        needs_dp_avg=needs_dp_avg,
+        needs_dp_avg=not reduce_group_has_dp,
     )
 
 

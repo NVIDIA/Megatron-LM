@@ -950,11 +950,6 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
-        # Ensure the global MoE metrics tracker exists (lazy init).
-        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
-
-        get_moe_metrics_tracker()
-
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
