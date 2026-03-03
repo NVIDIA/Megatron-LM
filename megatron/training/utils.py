@@ -755,25 +755,19 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 def get_nvtx_range():
     """Create an NVTX range context manager."""
-    try:
-        from torch.cuda import nvtx
+    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-        @contextmanager
-        def nvtx_range(msg, time=False):
-            if time:
-                timers = get_timers()
-                timers(msg, log_level=0).start()
-            try:
-                nvtx.range_push(msg)
-                yield
-            finally:
-                nvtx.range_pop()
-                if time:
-                    timers(msg, log_level=0).stop()
-
-        return nvtx_range
-    except:
-        @contextmanager
-        def dummy_range(msg):
+    @contextmanager
+    def nvtx_range(msg, time=False):
+        if time:
+            timers = get_timers()
+            timers(msg, log_level=0).start()
+        try:
+            nvtx_range_push(msg)
             yield
-        return dummy_range
+        finally:
+            nvtx_range_pop(msg)
+            if time:
+                timers(msg, log_level=0).stop()
+
+    return nvtx_range

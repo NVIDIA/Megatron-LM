@@ -17,7 +17,7 @@ except ImportError:
     HAVE_CUPY = False
 
 import torch
-import torch.cuda.nvtx as nvtx
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 class KernelLauncher:
@@ -78,9 +78,9 @@ class KernelLauncher:
             torch_pack_stream: PyTorch external stream wrapper
             pack_event: CUDA event to record after kernel launch
         """
-        nvtx.range_push("Launch Pack Kernel")
+        nvtx_range_push("Launch Pack Kernel")
         if not gpu_plan:
-            nvtx.range_pop()
+            nvtx_range_pop("Launch Pack Kernel")
             return
 
         # Unpack cached CuPy arrays from gpu_plan
@@ -99,7 +99,7 @@ class KernelLauncher:
             (cp_src, cp_dst, cp_sizes, num_chunks),
             stream=self.cp_pack_stream,
         )
-        nvtx.range_pop()
+        nvtx_range_pop("Launch Pack Kernel")
         # Record event on PyTorch stream
         pack_event.record(stream=torch_pack_stream)
 
@@ -121,9 +121,9 @@ class KernelLauncher:
             torch_unpack_stream: PyTorch external stream wrapper
             unpack_event: CUDA event to record after kernel launch
         """
-        nvtx.range_push("Launch Unpack Kernel")
+        nvtx_range_push("Launch Unpack Kernel")
         if not gpu_plan:
-            nvtx.range_pop()
+            nvtx_range_pop("Launch Unpack Kernel")
             return
 
         # Unpack cached CuPy arrays from gpu_plan
@@ -142,6 +142,6 @@ class KernelLauncher:
             (cp_src, cp_dst, cp_sizes, num_chunks),
             stream=self.cp_unpack_stream,
         )
-        nvtx.range_pop()
+        nvtx_range_pop("Launch Unpack Kernel")
         # Record event on PyTorch stream
         unpack_event.record(stream=torch_unpack_stream)
