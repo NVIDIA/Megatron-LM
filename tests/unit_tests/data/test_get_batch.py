@@ -22,7 +22,7 @@ from sft_mamba import get_batch
 import torch
 
 def initialize_test_environment(
-    tp_size: int, cp_size: int, seq_length: int, micro_batch_size: int, sft: bool = False
+    tp_size: int, cp_size: int, seq_length: int, micro_batch_size: int, sft: bool = False, create_attention_mask: bool = False
 ):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -36,7 +36,7 @@ def initialize_test_environment(
     args.context_parallel_size = cp_size
     args.sft = sft
     args.micro_batch_size = micro_batch_size
-
+    args.create_attention_mask_in_dataloader = create_attention_mask
     #
     args.vocab_size = 1024
     args.tokenizer_type = "NullTokenizer"
@@ -53,6 +53,7 @@ def initialize_test_environment(
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
     return args
 
+# TODO(asolergi-nv): Add micro_batch_size parameter
 def create_data_iterator(seq_length, sft: bool = False, create_attention_mask: bool = False):
     text = torch.randint(0, 10000, (1, seq_length + 1), dtype=torch.int64)
     tokens = text[:, :-1].contiguous()
@@ -77,7 +78,7 @@ def create_data_iterator(seq_length, sft: bool = False, create_attention_mask: b
         batch["cu_seqlens"] = torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32)))  # NOTE(asolergi-nv): torch.cumsum promotes int32 to int64
 
     else:
-        batch["loss_mask"] = torch.ones(seq_length, dtype=torch.float)
+        batch["loss_mask"] = torch.ones((1, seq_length), dtype=torch.float)
         if create_attention_mask:
             batch["attention_mask"] = torch.tril(
                 torch.ones((seq_length, seq_length))
@@ -120,6 +121,9 @@ def test_sft_batch(tp_size, cp_size, seq_length):
         assert cu_seqlens_padded is not None
     else:
         assert cu_seqlens_padded is None
+    
+    if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -129,7 +133,7 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if cp_size * tp_size > torch.cuda.device_count():
         pytest.skip(f"Skipping test because cp_size * tp_size > torch.cuda.device_count() ({cp_size * tp_size} > {torch.cuda.device_count()})")
 
-    initialize_test_environment(tp_size, cp_size, seq_length, 1)
+    initialize_test_environment(tp_size, cp_size, seq_length, 1, sft=False, create_attention_mask=create_attention_mask)
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
@@ -158,4 +162,7 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert cu_seqlens is None
     assert cu_seqlens_padded is None
     assert max_seqlen is None
+    
+    if torch.distributed.is_initialized():
+            torch.distributed.barrier()
     

@@ -85,13 +85,13 @@ def get_batch(data_iterator, vp_stage=None):
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank: # TODO(asolergi-nv): Add HybridCP condition
         return [None for _ in BATCH_KEYS]
-
+    
+    batch = {}
     # NOTE(asolergi-nv): We should do this in the dataloader collator, leaving it here to be more explicit.
     if tp_rank == 0: # NOTE(asolergi-nv): Unpack batch on TP rank 0 before sharing with other ranks
         batch = next(data_iterator)
         if is_sft:
             batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len) 
-        
         for key in BATCH_KEYS:
             batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 

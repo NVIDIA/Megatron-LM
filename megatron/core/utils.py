@@ -2181,7 +2181,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
 ### tensor parallel ####
 ########################
 
-def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False, create_attention_mask_in_dataloader: bool = True):
+def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, create_attention_mask_in_dataloader: bool, broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
     # TODO(asolergi-nv): Enable PP wit sft
 
     def _broadcast(item):
@@ -2416,7 +2416,7 @@ def get_batch_on_this_cp_rank(
             the current context-parallel settings from parallel_state.
     """
 
-    if "cu_seqlens" in batch:
+    if batch["cu_seqlens"] is not None:
         batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:
         batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
