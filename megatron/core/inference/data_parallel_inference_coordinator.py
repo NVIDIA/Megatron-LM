@@ -175,12 +175,7 @@ class DataParallelInferenceCoordinator:
         self.block_size_tokens = block_size_tokens
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
-        self.rank_cached_hashes = {
-            identity: set() for identity in self.identities_of_data_parallel_ranks
-        }
-        self.rank_hash_timestamps = {
-            identity: {} for identity in self.identities_of_data_parallel_ranks
-        }
+        self.hash_to_rank_info = {}  # Dict[int, Dict[bytes, int]]: hash → {rank → timestamp}
         self._assignment_counter = 0
 
         # Schedule recording.
@@ -223,12 +218,12 @@ class DataParallelInferenceCoordinator:
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity.
 
-        All policies share a single consecutive-match loop. The policy controls
-        how many hashes are considered: ROUND_ROBIN skips matching entirely,
-        FIRST_PREFIX_BLOCK truncates to the first hash as a cheap heuristic,
-        and LONGEST_PREFIX uses the full list. Ties are broken by recency
-        (higher timestamp = more recently assigned). Falls back to round-robin
-        when prefix caching is disabled or no rank has any match.
+        Iterates request hashes in reverse order and picks the rank that cached
+        the longest matching prefix (the furthest hash found). Since hashes are
+        parent-chained, finding hash[i] in a rank guarantees hash[0..i-1] are
+        also present. Among ranks that share the longest match, the most recently
+        assigned rank (highest timestamp) is preferred. Falls back to round-robin
+        when no rank matches.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -251,36 +246,15 @@ class DataParallelInferenceCoordinator:
         ):
             request_hashes = request_hashes[:1]
 
-        best_match = 0
-        best_recency = -1
-        best_rank = None
+        # Reverse scan: first match is the longest prefix (parent-chained hashes).
+        for h in reversed(request_hashes):
+            rank_info = self.hash_to_rank_info.get(h)
+            if rank_info:
+                # Pick the most recently assigned rank.
+                best_rank = max(rank_info, key=rank_info.get)
+                return best_rank
 
-        for rank_identity in self.identities_of_data_parallel_ranks:
-            rank_hashes = self.rank_cached_hashes[rank_identity]
-            # Count consecutive matches from the start.
-            count = 0
-            for h in request_hashes:
-                if h in rank_hashes:
-                    count += 1
-                else:
-                    break
-
-            if count > best_match:
-                best_match = count
-                best_rank = rank_identity
-                # Recency = min timestamp among matched hashes (oldest in the chain).
-                timestamps = self.rank_hash_timestamps[rank_identity]
-                best_recency = min(timestamps.get(h, 0) for h in request_hashes[:count])
-            elif count == best_match and count > 0:
-                timestamps = self.rank_hash_timestamps[rank_identity]
-                recency = min(timestamps.get(h, 0) for h in request_hashes[:count])
-                if recency > best_recency:
-                    best_recency = recency
-                    best_rank = rank_identity
-
-        if best_rank is None:
-            return self.get_next_data_parallel_rank()
-        return best_rank
+        return self.get_next_data_parallel_rank()
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
@@ -290,12 +264,9 @@ class DataParallelInferenceCoordinator:
             request_hashes: List of block hashes assigned to this rank.
         """
         self._assignment_counter += 1
-        cached = self.rank_cached_hashes[rank_identity]
-        timestamps = self.rank_hash_timestamps[rank_identity]
         ts = self._assignment_counter
         for h in request_hashes:
-            cached.add(h)
-            timestamps[h] = ts
+            self.hash_to_rank_info.setdefault(h, {})[rank_identity] = ts
 
     def start(self):
         """

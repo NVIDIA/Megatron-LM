@@ -215,12 +215,7 @@ def make_coordinator_direct(
         coordinator.identities_of_data_parallel_ranks
     )
 
-    coordinator.rank_cached_hashes = {
-        identity: set() for identity in coordinator.identities_of_data_parallel_ranks
-    }
-    coordinator.rank_hash_timestamps = {
-        identity: {} for identity in coordinator.identities_of_data_parallel_ranks
-    }
+    coordinator.hash_to_rank_info = {}
     coordinator._assignment_counter = 0
 
     return coordinator
@@ -319,13 +314,11 @@ class TestCoordinatorPrefixRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has first block only.
-        coordinator.rank_cached_hashes[rank_0].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
 
         # rank_1 has first two blocks.
-        coordinator.rank_cached_hashes[rank_1].update(hashes[:2])
-        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 1
-        coordinator.rank_hash_timestamps[rank_1][hashes[1]] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_1] = 1
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -341,10 +334,8 @@ class TestCoordinatorPrefixRouting:
 
         # Both ranks have both blocks, but rank_1 has higher timestamps.
         for h in hashes:
-            coordinator.rank_cached_hashes[rank_0].add(h)
-            coordinator.rank_hash_timestamps[rank_0][h] = 1
-            coordinator.rank_cached_hashes[rank_1].add(h)
-            coordinator.rank_hash_timestamps[rank_1][h] = 5
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 5
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -363,28 +354,6 @@ class TestCoordinatorPrefixRouting:
         rank2 = coordinator.get_best_data_parallel_rank([1, 2, 3])
         assert rank1 != rank2
 
-    def test_non_consecutive_match_stops_at_gap(self):
-        """Only consecutive matches from the start count."""
-        coordinator = make_coordinator_direct()
-        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
-        hashes = coordinator.compute_request_hashes(tokens)
-
-        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
-        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # rank_0 has blocks 0 and 2 (gap at block 1).
-        coordinator.rank_cached_hashes[rank_0].update([hashes[0], hashes[2]])
-        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 1
-        coordinator.rank_hash_timestamps[rank_0][hashes[2]] = 1
-
-        # rank_1 has block 0 only.
-        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 2
-
-        # Both match 1 block consecutively, rank_1 wins on recency.
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_1
-
 
 class TestCoordinatorShadowState:
     """Test that shadow state (rank_cached_hashes, timestamps) is updated correctly."""
@@ -395,7 +364,9 @@ class TestCoordinatorShadowState:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
-        assert coordinator.rank_cached_hashes[rank_0] == {100, 200, 300}
+        assert all(
+            rank_0 in coordinator.hash_to_rank_info[h] for h in [100, 200, 300]
+        )
 
     def test_update_rank_hashes_increments_counter(self):
         """Each call to _update_rank_hashes increments the assignment counter."""
@@ -414,10 +385,10 @@ class TestCoordinatorShadowState:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts1 = coordinator.rank_hash_timestamps[rank_0][100]
+        ts1 = coordinator.hash_to_rank_info[100][rank_0]
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts2 = coordinator.rank_hash_timestamps[rank_0][100]
+        ts2 = coordinator.hash_to_rank_info[100][rank_0]
 
         assert ts2 > ts1
 
@@ -428,7 +399,9 @@ class TestCoordinatorShadowState:
 
         coordinator._update_rank_hashes(rank_0, [10, 20])
         coordinator._update_rank_hashes(rank_0, [30, 40])
-        assert coordinator.rank_cached_hashes[rank_0] == {10, 20, 30, 40}
+        assert all(
+            rank_0 in coordinator.hash_to_rank_info[h] for h in [10, 20, 30, 40]
+        )
 
     def test_hash_can_appear_in_multiple_ranks(self):
         """The same hash can be owned by multiple ranks."""
@@ -439,8 +412,8 @@ class TestCoordinatorShadowState:
         coordinator._update_rank_hashes(rank_0, [100])
         coordinator._update_rank_hashes(rank_1, [100])
 
-        assert 100 in coordinator.rank_cached_hashes[rank_0]
-        assert 100 in coordinator.rank_cached_hashes[rank_1]
+        assert rank_0 in coordinator.hash_to_rank_info[100]
+        assert rank_1 in coordinator.hash_to_rank_info[100]
 
     def test_routing_then_state_update_flow(self):
         """Full flow: compute hashes, route, update state, then re-route to same rank."""
@@ -533,8 +506,7 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Only rank_1 has the first block.
-        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -550,13 +522,11 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has first block only, with higher timestamp.
-        coordinator.rank_cached_hashes[rank_0].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 10
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
 
         # rank_1 has all three blocks, but lower timestamp on first block.
-        coordinator.rank_cached_hashes[rank_1].update(hashes)
         for h in hashes:
-            coordinator.rank_hash_timestamps[rank_1][h] = 1
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
 
         # rank_0 wins because it has higher recency on the first block.
         selected = coordinator.get_best_data_parallel_rank(hashes)
@@ -572,11 +542,8 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Both ranks have the first block.
-        coordinator.rank_cached_hashes[rank_0].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 3
-
-        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 7
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 3
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 7
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -590,8 +557,7 @@ class TestFirstPrefixBlockRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         # rank_0 has block 1 (second block), but not block 0.
-        coordinator.rank_cached_hashes[rank_0].add(hashes[1])
-        coordinator.rank_hash_timestamps[rank_0][hashes[1]] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_0] = 1
 
         # No rank has the first block, so round-robin.
         r1 = coordinator.get_best_data_parallel_rank(hashes)
@@ -607,8 +573,7 @@ class TestFirstPrefixBlockRouting:
 
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
-        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
-        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
