@@ -544,7 +544,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
         self.initialize_all_tensors()
-        self.reset_metadata()
 
         # Print info.
         logging.info(
@@ -702,6 +701,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
 
+        # Reset tensor-related metadata.
+        self.reset_metadata()
+
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
@@ -714,24 +716,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        if self._uses_torch_memory_saver:
+        if self.unified_memory_level != 0 and self._uses_torch_memory_saver:
             # Need to bring back the memory block before we reset it.
-            torch_memory_saver.resume("inference_context")
-        elif self.unified_memory_level != 0:
-            # Include this for code readability.
-            pass
-        else:
-            if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
-                for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
-                    tensor.storage().resize_(self._offloadable_storage_sizes[name])
-                    tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
-            elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-                self.is_tensor_state_allocated = False
-                self.initialize_all_tensors()
+            if self._uses_torch_memory_saver:
+                torch_memory_saver.resume("inference_context")
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset_metadata()
+            return
 
-        # No matter which memory mode, in RECOMPUTE we need to reset the metadata.
-        if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self.reset_metadata()
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
+            self.initialize_all_tensors()
 
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
@@ -1502,10 +1501,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         - Fill all GPU tensors with sentinel values.
         - Reset active/paused request/token counts to zero.
         - Reset available blocks to entire memory.
-
-        This method is useful after cuda graph warmup iterations, where the
-        context's memory buffer is referenced by the cuda graph system and
-        cannot be deallocated.
         """
         self.reset_tensors()
         self.reset_metadata()
