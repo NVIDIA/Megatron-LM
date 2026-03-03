@@ -2,6 +2,7 @@
 
 import errno
 import faulthandler
+import json
 import logging
 import signal
 import socket
@@ -82,6 +83,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
+        schedule_output_path: str | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -180,6 +182,16 @@ class DataParallelInferenceCoordinator:
             identity: {} for identity in self.identities_of_data_parallel_ranks
         }
         self._assignment_counter = 0
+
+        # Schedule recording.
+        self.schedule_output_path = schedule_output_path
+        self.schedule_records = [] if schedule_output_path else None
+
+        # Deterministic rank index mapping (sorted identity -> 0-based index).
+        sorted_identities = sorted(self.identities_of_data_parallel_ranks)
+        self.identity_to_rank_index = {
+            identity: idx for idx, identity in enumerate(sorted_identities)
+        }
 
     def get_next_data_parallel_rank(self):
         """
@@ -340,6 +352,12 @@ class DataParallelInferenceCoordinator:
                 )
                 if request_hashes:
                     self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
+                if self.schedule_records is not None:
+                    self.schedule_records.append({
+                        "request_id": request_id,
+                        "rank_index": self.identity_to_rank_index[next_data_parallel_rank_identity],
+                        "num_hashes": len(request_hashes),
+                    })
                 self.router_socket.send_multipart(
                     [
                         next_data_parallel_rank_identity,
@@ -466,6 +484,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
+        schedule_output_path: str | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -483,6 +502,7 @@ class DataParallelInferenceCoordinator:
             block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
             enable_prefix_caching (bool): Whether prefix caching is enabled.
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
+            schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
         """
         coordinator = cls(
             pipe_connection,
@@ -493,6 +513,7 @@ class DataParallelInferenceCoordinator:
             block_size_tokens=block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
+            schedule_output_path=schedule_output_path,
         )
         ready_event.set()
         try:
@@ -506,5 +527,14 @@ class DataParallelInferenceCoordinator:
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
+        if self.schedule_output_path and self.schedule_records:
+            schedule_data = {
+                "policy": self.prefix_caching_coordinator_policy.value,
+                "data_parallel_size": self.data_parallel_size,
+                "num_requests": len(self.schedule_records),
+                "records": self.schedule_records,
+            }
+            with open(self.schedule_output_path, "w") as f:
+                json.dump(schedule_data, f, indent=2)
         self.router_socket.close()
         self.context.term()

@@ -369,6 +369,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
@@ -457,6 +458,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.block_size_tokens,
                     self.context.enable_prefix_caching,
                     self.context.prefix_caching_coordinator_policy,
+                    coordinator_schedule_output_path,
                 ),
             )
             self.inference_coordinator_process.start()

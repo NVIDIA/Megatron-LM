@@ -252,6 +252,12 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Comma-separated list of request indices where each batch starts. "
         "Used with --drain-between-batches.",
     )
+    group.add_argument(
+        "--coordinator-schedule-output-path",
+        type=str,
+        default=None,
+        help="Path to write coordinator request scheduling decisions as JSON",
+    )
 
     return parser
 
