@@ -615,8 +615,8 @@ def num_floating_point_operations(args, batch_size):
         from operator import itemgetter
 
         from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
-        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers, num_gdn_layers = (
-            itemgetter(Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE, Symbols.GDN)(
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
+            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )

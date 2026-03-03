@@ -39,10 +39,10 @@ class MambaStackSubmodules:
     """
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
+    gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
-    gdn_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
 
 

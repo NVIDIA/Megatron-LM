@@ -155,23 +155,23 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
         pattern: Full hybrid layer pattern string.
 
     Returns:
-        Dictionary mapping layer symbol to count. Keys are Symbols.ATTENTION,
-        Symbols.MAMBA, Symbols.MLP, Symbols.MOE, and Symbols.GDN.
+        Dictionary mapping layer symbol to count. Keys are Symbols.MAMBA,
+        Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, and Symbols.MOE.
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'M': 2, '-': 0, 'E': 0, 'G': 0}
+        {'M': 2, 'G': 0, '*': 2, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'M': 8, '-': 4, 'E': 0, 'G': 0}
+        {'M': 8, 'G': 0, '*': 1, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {
-        Symbols.ATTENTION: 0,
         Symbols.MAMBA: 0,
+        Symbols.GDN: 0,
+        Symbols.ATTENTION: 0,
         Symbols.MLP: 0,
         Symbols.MOE: 0,
-        Symbols.GDN: 0,
     }
 
     # Count main decoder layers (skip '|' pipe separators)
@@ -473,9 +473,9 @@ def get_layer_maps_from_layer_type_list(
 ) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Attention, Mamba, MLP, MoE, GDN] given a layer type list.
+    for each layer type in [Mamba, GDN, Attention, MLP, MoE] given a layer type list.
     """
-    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE, Symbols.GDN]
+    layer_types = [Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
         layer_map = layer_maps[layer_type]
