@@ -634,7 +634,7 @@ class TestLayerWiseOptimizer:
             )
 
     def test_overlap_param_gather_bucket_lw_params(self):
-        """Verify bucket.lw_params_list is populated when async_allgather is enabled."""
+        """Verify bucket.layerwise_params_list is populated when async_allgather is enabled."""
         model, optimizer, pg_collection = (
             self.create_model_and_optimizer_with_overlap_param_gather()
         )
@@ -643,33 +643,33 @@ class TestLayerWiseOptimizer:
 
         for bucket_group in model.bucket_groups:
             for bucket in bucket_group.buckets:
-                # lw_params_list should be populated by set_bucket_lw_params_list
+                # layerwise_params_list should be populated by set_bucket_layerwise_params_list
                 assert (
-                    bucket.lw_params_list is not None
-                ), "bucket.lw_params_list should be populated"
+                    bucket.layerwise_params_list is not None
+                ), "bucket.layerwise_params_list should be populated"
                 assert (
-                    len(bucket.lw_params_list) == dp_size
-                ), f"Expected {dp_size} per-rank lists, got {len(bucket.lw_params_list)}"
+                    len(bucket.layerwise_params_list) == dp_size
+                ), f"Expected {dp_size} per-rank lists, got {len(bucket.layerwise_params_list)}"
 
                 # The union of all per-rank param lists should cover all bucket params
                 all_lw_params = set()
-                for rank_params in bucket.lw_params_list:
+                for rank_params in bucket.layerwise_params_list:
                     for p in rank_params:
                         all_lw_params.add(p)
                 assert (
                     all_lw_params == bucket.params
-                ), "Union of per-rank lw_params should equal bucket params"
+                ), "Union of per-rank layerwise_params should equal bucket params"
 
-                # lw_param_flat_sizes should be populated and have correct length
-                assert bucket.lw_param_flat_sizes is not None
-                assert len(bucket.lw_param_flat_sizes) == dp_size
+                # layerwise_param_flat_sizes should be populated and have correct length
+                assert bucket.layerwise_param_flat_sizes is not None
+                assert len(bucket.layerwise_param_flat_sizes) == dp_size
 
                 # Each flat size should equal the sum of param numels for that rank
                 for rank_idx in range(dp_size):
-                    expected_size = sum(p.numel() for p in bucket.lw_params_list[rank_idx])
-                    assert bucket.lw_param_flat_sizes[rank_idx] == expected_size, (
+                    expected_size = sum(p.numel() for p in bucket.layerwise_params_list[rank_idx])
+                    assert bucket.layerwise_param_flat_sizes[rank_idx] == expected_size, (
                         f"Rank {rank_idx}: expected flat_size {expected_size}, "
-                        f"got {bucket.lw_param_flat_sizes[rank_idx]}"
+                        f"got {bucket.layerwise_param_flat_sizes[rank_idx]}"
                     )
 
     def test_overlap_param_gather_vs_standard_ddp(self):
