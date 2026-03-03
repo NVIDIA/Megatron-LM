@@ -837,9 +837,9 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
     softmax_scale: float,
     loss_coeff: float,
     pg_collection: ProcessGroupCollection,
-    seq_chunk_size: int = 32,
-    head_chunk_size: int = 4,
-    topk_chunk_size: int = 64,
+    seq_chunk_size: int = 512,
+    head_chunk_size: int = 16,
+    topk_chunk_size: int = 1024,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Run fused tilelang indexer and stream top-k logits directly into sparse KL accumulation."""
     if lighting_indexer is None:
@@ -1515,9 +1515,9 @@ def compute_dsa_indexer_loss_topk_sparse(
 
     # Compute KL in streaming chunks to avoid materializing full [b, sq, topk]
     # and avoid full-size valid/safe top-k tensors.
-    seq_chunk_size = 32
-    head_chunk_size = 4
-    topk_chunk_size = 64
+    seq_chunk_size = 512
+    head_chunk_size = 16
+    topk_chunk_size = 1024
     kl_sum = torch.zeros((), dtype=torch.float32, device=query.device)
     tp_size = pg_collection.tp.size()
     pending_handle = None
@@ -2417,9 +2417,9 @@ def unfused_dsa_fn(
         device=query.device,
     )
 
-    seq_chunk_size = 64
-    head_chunk_size = 4
-    topk_chunk_size = 256
+    seq_chunk_size = 512
+    head_chunk_size = 16
+    topk_chunk_size = 1024
     safe_k_max = max(0, skv - 1)
     output = torch.empty((sq, b, np * hnv), dtype=value.dtype, device=query.device)
 
