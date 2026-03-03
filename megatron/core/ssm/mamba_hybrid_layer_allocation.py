@@ -17,11 +17,12 @@ class Symbols:
     MAMBA = "M"
     GDN = 'G'
     ATTENTION = "*"
+    DS_ATTENTION = "D"
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
 
 @dataclass
@@ -285,6 +286,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
+    # Disallow Attention + MLA/DSA hybridity.
+    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
 
 def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
@@ -308,6 +313,10 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"In hybrid layer pattern segment, '{layer_char}' is not "
                 f"one of {Symbols.VALID_LAYERS}"
             )
+
+    # Disallow Attention + MLA/DSA hybridity.
+    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
     return layer_type_list
 
 
@@ -471,12 +480,16 @@ def select_pipeline_segment(
 def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> list[dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Mamba, GDN, Attention, MLP, MoE] given a layer type list.
+    for each layer type in [Attention, GDN, Mamba, MLP, MoE] given a layer type list.
+
+    DSA layers are treated as Attention in this count.
     """
-    layer_types = [Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE]
+    layer_types = [Symbols.ATTENTION, Symbols.GDN, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
-        layer_map = layer_maps[layer_type]
+        # DSA layers are treated as attention for KV cache mapping.
+        effective_type = Symbols.ATTENTION if layer_type == Symbols.DS_ATTENTION else layer_type
+        layer_map = layer_maps[effective_type]
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
     return [layer_maps[layer_type] for layer_type in layer_types]

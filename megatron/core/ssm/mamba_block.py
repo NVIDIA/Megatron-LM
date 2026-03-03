@@ -41,6 +41,7 @@ class MambaStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
+    dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -128,6 +129,16 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
                         submodules.attention_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.DS_ATTENTION:
+                    layer = build_module(
+                        submodules.dsa_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
