@@ -99,6 +99,40 @@ def test_make_viewless_tensor():
     assert torch.equal(inp, util.make_viewless_tensor(inp, True, False))
 
 
+def test_compute_output_logits_fp32_casts_inputs_and_explicit_weight():
+    class DummyOutputLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(8, 4, dtype=torch.bfloat16))
+            self.last_input_dtype = None
+            self.last_weight_dtype = None
+            self.last_runtime_gather_output = None
+
+        def forward(self, input_, weight=None, runtime_gather_output=None):
+            self.last_input_dtype = input_.dtype
+            self.last_weight_dtype = None if weight is None else weight.dtype
+            self.last_runtime_gather_output = runtime_gather_output
+            logits = torch.zeros(input_.shape[0], input_.shape[1], 8, dtype=torch.bfloat16)
+            return logits, None
+
+    layer = DummyOutputLayer()
+    hidden_states = torch.randn(3, 2, 4, dtype=torch.bfloat16)
+    output_weight = torch.randn(8, 4, dtype=torch.bfloat16)
+
+    logits = util.compute_output_logits_fp32(
+        hidden_states=hidden_states,
+        output_layer=layer,
+        output_weight=output_weight,
+        runtime_gather_output=False,
+    )
+
+    assert layer.last_input_dtype == torch.float32
+    assert layer.last_weight_dtype == torch.float32
+    assert layer.last_runtime_gather_output is False
+    assert logits.dtype == torch.float32
+    assert logits.shape == (3, 2, 8)
+
+
 def test_safely_set_viewless_tensor_data():
     tensor = torch.zeros((3, 4))
     new_data_tensor = torch.tensor(np.random.rand(3, 4))
