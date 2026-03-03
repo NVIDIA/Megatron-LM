@@ -161,7 +161,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         add_layer_offset=False,
                     )
                 else:
-                    assert False, "unexpected layer_type"
+                    raise ValueError("unexpected layer_type")
             self.layers.append(layer)
 
         # Required for activation recomputation
