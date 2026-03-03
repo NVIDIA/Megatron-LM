@@ -296,6 +296,11 @@ class HybridCPDataLoaderWrapper:
         loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
         position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
 
+        # Create the cu_seqlens_padded tensor
+        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
+        cu_seqlens_padded[0, 0] = 0
+        cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
+
         # HACK:
         mxfp8_enabled = True
         if mxfp8_enabled:
@@ -307,13 +312,13 @@ class HybridCPDataLoaderWrapper:
                 position_ids = torch.cat([position_ids, torch.tensor(range(position_ids[-1] + 1, position_ids[-1] + 1 + pad_len), dtype=position_ids.dtype, device=position_ids.device)])
                 sample_padded_lens = torch.cat([sample_padded_lens, torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device)])
                 # padded_length = cu_seqlens_padded[:, -1:] + pad_len
-                # cu_seqlens_padded = torch.cat([cu_seqlens_padded, cu_seqlens_padded[:, -1:] + pad_len], dim=1)
+                cu_seqlens_padded[:, -1:] = cu_seqlens_padded[:, -1:] + pad_len
+                if torch.distributed.get_rank() == 254:
+                    print(f"pad_len: {pad_len} sample_padded_lens: {sample_padded_lens} cu_seqlens_padded: {cu_seqlens_padded} tokens.shape: {tokens.shape} local_cp_size: {local_cp_size}")
+            else:
+                if torch.distributed.get_rank() == 254:
+                    print(f"no padding needed sample_padded_lens: {sample_padded_lens} cu_seqlens_padded: {cu_seqlens_padded} tokens.shape: {tokens.shape} local_cp_size: {local_cp_size}")
         
-        # Create the cu_seqlens_padded tensor
-        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
-        cu_seqlens_padded[0, 0] = 0
-        cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
-
         new_sample = {}
         new_sample["tokens"] = tokens
         new_sample["labels"] = labels
