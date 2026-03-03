@@ -428,7 +428,7 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
-        assert args.rl_forced_lag > 0 or not args.rl_partial_rollouts, (
+        assert args.rl_forced_lag == 0 or not args.rl_partial_rollouts, (
             "--rl-forced-lag and --rl-partial-rollouts are incompatible."
         )
 
