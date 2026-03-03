@@ -156,17 +156,23 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Returns:
         Dictionary mapping layer symbol to count. Keys are Symbols.ATTENTION,
-        Symbols.MAMBA, Symbols.MLP, and Symbols.MOE.
+        Symbols.MAMBA, Symbols.MLP, Symbols.MOE, and Symbols.GDN.
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'M': 2, '-': 0, 'E': 0}
+        {'*': 2, 'M': 2, '-': 0, 'E': 0, 'G': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'M': 8, '-': 4, 'E': 0}
+        {'*': 1, 'M': 8, '-': 4, 'E': 0, 'G': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
-    counts = {Symbols.ATTENTION: 0, Symbols.MAMBA: 0, Symbols.MLP: 0, Symbols.MOE: 0}
+    counts = {
+        Symbols.ATTENTION: 0,
+        Symbols.MAMBA: 0,
+        Symbols.MLP: 0,
+        Symbols.MOE: 0,
+        Symbols.GDN: 0,
+    }
 
     # Count main decoder layers (skip '|' pipe separators)
     if parsed.main_pattern:
