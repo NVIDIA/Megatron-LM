@@ -2,9 +2,84 @@
 # Adapted from:
 # https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/
 # examples/deepseek_v32/sparse_mla_bwd.py
+import os
+from collections import OrderedDict
+
 import tilelang
 import torch
 from tilelang import language as T
+
+_TILELANG_KERNEL_CACHE_MAX = 64
+_SPARSE_MLA_BWD_BLOCK_SIZE = 32
+_tilelang_sparse_mla_preprocess_kernel_cache = OrderedDict()
+_tilelang_sparse_mla_bwd_kernel_cache = OrderedDict()
+_tilelang_sparse_mla_postprocess_kernel_cache = OrderedDict()
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def _round_up(x: int, multiple: int) -> int:
+    if multiple <= 1:
+        return x
+    return _ceil_div(x, multiple) * multiple
+
+
+def _cache_put_lru(cache: OrderedDict, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _TILELANG_KERNEL_CACHE_MAX:
+        cache.popitem(last=False)
+
+
+def _get_preprocess_kernel(B: int, S: int, H: int, D: int):
+    key = (B, S, H, D)
+    kernel = _tilelang_sparse_mla_preprocess_kernel_cache.pop(key, None)
+    if kernel is None:
+        kernel = preprocess(B, S, H, D)
+    _cache_put_lru(_tilelang_sparse_mla_preprocess_kernel_cache, key, kernel)
+    return kernel
+
+
+def _get_bwd_kernel(
+    B: int,
+    S: int,
+    S_kv: int,
+    H: int,
+    D: int,
+    D_tail: int,
+    topk: int,
+    kv_group: int,
+    sm_scale,
+    is_causal: bool,
+):
+    key = (B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
+    kernel = _tilelang_sparse_mla_bwd_kernel_cache.pop(key, None)
+    if kernel is None:
+        kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
+    _cache_put_lru(_tilelang_sparse_mla_bwd_kernel_cache, key, kernel)
+    return kernel
+
+
+def _get_postprocess_kernel(B: int, S_kv: int, D: int, D_tail: int, kv_group: int):
+    key = (B, S_kv, D, D_tail, kv_group)
+    kernel = _tilelang_sparse_mla_postprocess_kernel_cache.pop(key, None)
+    if kernel is None:
+        kernel = postprocess(B, S_kv, D, D_tail, kv_group)
+    _cache_put_lru(_tilelang_sparse_mla_postprocess_kernel_cache, key, kernel)
+    return kernel
 
 
 @tilelang.jit(out_idx=[-1])
@@ -315,6 +390,9 @@ def sparse_mla_bwd(
     q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None
 ):
     """Run sparse-MLA backward kernels and return (dq, dkv)."""
+    seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
+    topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", _SPARSE_MLA_BWD_BLOCK_SIZE)
+
     q = q.unsqueeze(0)
     kv = kv.unsqueeze(0)
     o = o.unsqueeze(0)
@@ -330,24 +408,80 @@ def sparse_mla_bwd(
     _, S_kv, kv_group, _ = kv.shape
     assert kv.shape[-1] == dim_plus_tail_dim
     assert kv.shape[0] == B
-    # dim should be assigned
+    # This copied kernel currently assumes a fixed base value-channel dimension.
     D = 512
+    assert (
+        dim_plus_tail_dim >= D
+    ), f"Invalid dimensions: dim_plus_tail_dim={dim_plus_tail_dim} is smaller than base D={D}"
 
     D_tail = dim_plus_tail_dim - D
     topk = indices.shape[-1]
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
+    seq_bucketed = _round_up(S, seq_bucket)
+    seq_kv_bucketed = _round_up(S_kv, seq_bucket)
+    topk_bucketed = _round_up(_round_up(topk, topk_bucket), _SPARSE_MLA_BWD_BLOCK_SIZE)
+
+    if seq_bucketed != S:
+        q_padded = torch.zeros(
+            (B, seq_bucketed, H, dim_plus_tail_dim), dtype=q.dtype, device=q.device
+        )
+        q_padded[:, :S].copy_(q)
+        q = q_padded
+
+        o_padded = torch.zeros((B, seq_bucketed, H, D), dtype=o.dtype, device=o.device)
+        o_padded[:, :S].copy_(o)
+        o = o_padded
+
+        do_padded = torch.zeros((B, seq_bucketed, H, D), dtype=do.dtype, device=do.device)
+        do_padded[:, :S].copy_(do)
+        do = do_padded
+
+        lse_padded = torch.zeros((B, seq_bucketed, H), dtype=lse.dtype, device=lse.device)
+        lse_padded[:, :S].copy_(lse)
+        lse = lse_padded
+
+    if seq_kv_bucketed != S_kv:
+        kv_padded = torch.zeros(
+            (B, seq_kv_bucketed, kv_group, dim_plus_tail_dim), dtype=kv.dtype, device=kv.device
+        )
+        kv_padded[:, :S_kv].copy_(kv)
+        kv = kv_padded
+
+    if seq_bucketed != S or topk_bucketed != topk:
+        indices_padded = torch.full(
+            (B, seq_bucketed, kv_group, topk_bucketed),
+            -1,
+            dtype=indices.dtype,
+            device=indices.device,
+        )
+        indices_padded[:, :S, :, :topk].copy_(indices)
+        indices = indices_padded
+
+    if delta is not None:
+        if delta.ndim == 2:
+            delta = delta.unsqueeze(0)
+        if seq_bucketed != S:
+            delta_padded = torch.zeros((B, seq_bucketed, H), dtype=delta.dtype, device=delta.device)
+            delta_padded[:, :S].copy_(delta)
+            delta = delta_padded
+
     # Get kernels
-    preprocess_kernel = preprocess(B, S, H, D)
-    bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_casual)
-    postprocess_kernel = postprocess(B, S_kv, D, D_tail, kv_group)
+    preprocess_kernel = _get_preprocess_kernel(B, seq_bucketed, H, D)
+    bwd_kernel = _get_bwd_kernel(
+        B, seq_bucketed, seq_kv_bucketed, H, D, D_tail, topk_bucketed, kv_group, sm_scale, is_casual
+    )
+    postprocess_kernel = _get_postprocess_kernel(B, seq_kv_bucketed, D, D_tail, kv_group)
 
     if delta is None:
         delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
     dkv = postprocess_kernel(dkv)
+
+    dq = dq[:, :S].contiguous()
+    dkv = dkv[:, :S_kv].contiguous()
 
     dq = dq.squeeze(0)
     dkv = dkv.squeeze(0)
