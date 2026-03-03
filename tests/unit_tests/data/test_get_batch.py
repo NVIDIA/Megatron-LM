@@ -46,13 +46,6 @@ def initialize_test_environment(
     args.hidden_size = 512
     args.num_attention_heads = 8
     args.max_position_embeddings = seq_length
-    #args.vocab_size = 1024
-    
-    #args.create_attention_mask_in_dataloader = True
-    #args.train_iters = 10
-    #args.lr = 3e-5
-    #args.bf16 = True
-    #args.add_bias_linear = False
 
     validate_args(args)
     set_global_variables(args, True)
@@ -127,21 +120,6 @@ def test_sft_batch(tp_size, cp_size, seq_length):
         assert cu_seqlens_padded is not None
     else:
         assert cu_seqlens_padded is None
-
-    """
-    expected_shape = (1, seq_length // cp_size)
-    assert tokens.shape == expected_shape
-    assert labels.shape == expected_shape
-    assert loss_mask.shape == expected_shape
-    assert position_ids.shape == expected_shape
-    assert attention_mask.shape == expected_shape
-    assert cu_seqlens.shape == (1, 2)
-    assert cu_seqlens_padded.shape == (1, 2)
-    assert max_seqlen.shape == (1,)
-    """
-
-    #print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.shape}, max_seqlen: {max_seqlen.shape}") # cu_seqlens_padded: {cu_seqlens_padded.shape}
-
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
