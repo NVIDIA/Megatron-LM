@@ -81,7 +81,7 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
     ):
@@ -463,7 +463,7 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
     ):

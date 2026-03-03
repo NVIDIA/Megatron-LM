@@ -223,7 +223,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
