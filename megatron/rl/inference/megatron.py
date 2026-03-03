@@ -3,7 +3,9 @@
 import asyncio
 import logging
 
+import httpx
 import torch.distributed as dist
+from openai import AsyncOpenAI, DefaultAioHttpClient
 from pydantic import PrivateAttr
 
 from megatron.core.inference.config import KVCacheManagementMode
@@ -24,6 +26,7 @@ from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
 
+MAX_CONCURRENT_REQUESTS = 4000
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -33,16 +36,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None) 
+    _openai_client: AsyncOpenAI = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
+        # Use the shared, optimized client instead of spinning up a new one
+        client = self._openai_client
 
-        # Things that may be problematic when doign this switch
+        # Things that may be problematic when doing this switch
         # - Add BOS token
         # - Skip prompt logprobs
         response = await client.chat.completions.create(
@@ -117,9 +121,28 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
+        # Connection pool limits configured here to support massive concurrency
+        # TODO(ksanthanam): Make this configurable?
+        concurrency_limit = MAX_CONCURRENT_REQUESTS
+        custom_limits = httpx.Limits(
+            max_connections=concurrency_limit,
+            max_keepalive_connections=concurrency_limit
+        )
+        http_client = DefaultAioHttpClient(limits=custom_limits)
+
+        launched_server._openai_client = AsyncOpenAI(
+            base_url=f"http://{launched_server.host}:{launched_server.port}",
+            api_key="NONE",
+            http_client=http_client
+        )
+
         return launched_server
 
     async def kill(self):
+        # Gracefully close the shared OpenAI client connections
+        if self._openai_client is not None:
+            await self._openai_client.close()
+
         if dist.get_rank() == 0:
             await self._client.stop_engines()
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
