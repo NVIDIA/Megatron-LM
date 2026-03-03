@@ -19,6 +19,7 @@ moe
 context_parallel
 custom_fsdp
 dist_optimizer
+layerwise_dist_optimizer
 optimizer_cpu_offload
 pipeline_parallel_layout
 tokenizers
