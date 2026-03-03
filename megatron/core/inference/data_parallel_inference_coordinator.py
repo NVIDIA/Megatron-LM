@@ -234,8 +234,7 @@ class DataParallelInferenceCoordinator:
         if (
             not self.enable_prefix_caching
             or not request_hashes
-            or self.prefix_caching_coordinator_policy
-            == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
+            or self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
         ):
             return self.get_next_data_parallel_rank()
 
@@ -326,17 +325,19 @@ class DataParallelInferenceCoordinator:
                     == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
                 ):
                     request_hashes = request_hashes[:1]
-                next_data_parallel_rank_identity = self.get_best_data_parallel_rank(
-                    request_hashes
-                )
+                next_data_parallel_rank_identity = self.get_best_data_parallel_rank(request_hashes)
                 if request_hashes:
                     self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
                 if self.schedule_records is not None:
-                    self.schedule_records.append({
-                        "request_id": request_id,
-                        "rank_index": self.identity_to_rank_index[next_data_parallel_rank_identity],
-                        "num_hashes": len(request_hashes),
-                    })
+                    self.schedule_records.append(
+                        {
+                            "request_id": request_id,
+                            "rank_index": self.identity_to_rank_index[
+                                next_data_parallel_rank_identity
+                            ],
+                            "num_hashes": len(request_hashes),
+                        }
+                    )
                 self.router_socket.send_multipart(
                     [
                         next_data_parallel_rank_identity,

@@ -235,9 +235,7 @@ class TestCoordinatorHashComputation:
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]
         hashes = coordinator.compute_request_hashes(tokens)
 
-        expected = compute_block_hashes_batched(
-            torch.tensor(tokens, dtype=torch.int64), BLOCK_SIZE
-        )
+        expected = compute_block_hashes_batched(torch.tensor(tokens, dtype=torch.int64), BLOCK_SIZE)
         assert hashes == expected
         assert len(hashes) == 2  # 8 tokens / block_size 4 = 2 blocks
 
@@ -364,9 +362,7 @@ class TestCoordinatorShadowState:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
-        assert all(
-            rank_0 in coordinator.hash_to_rank_info[h] for h in [100, 200, 300]
-        )
+        assert all(rank_0 in coordinator.hash_to_rank_info[h] for h in [100, 200, 300])
 
     def test_update_rank_hashes_increments_counter(self):
         """Each call to _update_rank_hashes increments the assignment counter."""
@@ -399,9 +395,7 @@ class TestCoordinatorShadowState:
 
         coordinator._update_rank_hashes(rank_0, [10, 20])
         coordinator._update_rank_hashes(rank_0, [30, 40])
-        assert all(
-            rank_0 in coordinator.hash_to_rank_info[h] for h in [10, 20, 30, 40]
-        )
+        assert all(rank_0 in coordinator.hash_to_rank_info[h] for h in [10, 20, 30, 40])
 
     def test_hash_can_appear_in_multiple_ranks(self):
         """The same hash can be owned by multiple ranks."""
@@ -436,17 +430,13 @@ class TestCoordinatorEndToEnd:
     """End-to-end test with real ZMQ sockets and DummyEngines."""
 
     async def run_coordinator_test(
-        self,
-        requests,
-        block_size_tokens=BLOCK_SIZE,
-        enable_prefix_caching=True,
+        self, requests, block_size_tokens=BLOCK_SIZE, enable_prefix_caching=True
     ):
         """Submit requests through a real coordinator and return results."""
         engine = DummyEngine()
 
         dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT,
-            launch_inference_coordinator=True,
+            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
         )
 
         try:
