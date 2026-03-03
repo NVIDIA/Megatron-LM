@@ -34,12 +34,18 @@ try:
     from megatron.core.transformer.experimental_attention_variant.ops.indexer import (
         lighting_indexer,
     )
-except Exception:
+except (ImportError, OSError):
+    logger.debug(
+        "Failed to import fused TileLang indexer; lighting_indexer path disabled.", exc_info=True
+    )
     lighting_indexer = None
 
 try:
     from megatron.core.transformer.experimental_attention_variant.ops.sparse_mla import SparseMLA
-except Exception:
+except (ImportError, OSError):
+    logger.debug(
+        "Failed to import fused TileLang SparseMLA; SparseMLA path disabled.", exc_info=True
+    )
     SparseMLA = None
 
 # Reusable no-grad scratch buffers keyed by (name, shape, dtype, device).
