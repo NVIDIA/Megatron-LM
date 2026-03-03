@@ -18,7 +18,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -912,7 +912,7 @@ def apply_router_token_dropping(
 
 
 @deprecated(
-    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().record()"
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().record()"
 )
 def save_to_aux_losses_tracker(
     name: str,
@@ -936,7 +936,7 @@ def save_to_aux_losses_tracker(
         needs_dp_avg (bool, optional): Whether to average the metric across data parallel ranks.
             Defaults to True.
     """
-    MoEMetricsTracker.get_instance().record(
+    get_moe_metrics_tracker().record(
         name=name,
         value=loss,
         layer_number=layer_number,
@@ -947,18 +947,14 @@ def save_to_aux_losses_tracker(
     )
 
 
-@deprecated(
-    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().clear()"
-)
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().clear()")
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
-    MoEMetricsTracker.get_instance().clear()
+    get_moe_metrics_tracker().clear()
 
 
 @deprecated(
-    version="0.16",
-    removal_version="0.18",
-    alternative="MoEMetricsTracker.get_instance()._sync_metrics()",
+    version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker()._sync_metrics()"
 )
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
@@ -971,14 +967,12 @@ def reduce_aux_losses_tracker_across_ranks(
         pg_collection (Optional[ProcessGroupCollection], optional):
             The process group collection. Defaults to None.
     """
-    tracker = MoEMetricsTracker.get_instance()
+    tracker = get_moe_metrics_tracker()
     names_list = track_names if track_names is not None else list(tracker.metrics.keys())
     tracker._sync_metrics(names_list, pg_collection)
 
 
-@deprecated(
-    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().metrics"
-)
+@deprecated(version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker().metrics")
 def get_moe_layer_wise_logging_tracker():
     """Return the moe layer wise tracker in legacy dict format."""
     return {
@@ -988,12 +982,12 @@ def get_moe_layer_wise_logging_tracker():
             "avg_group": entry.avg_group,
             "needs_dp_avg": entry.needs_dp_avg,
         }
-        for name, entry in MoEMetricsTracker.get_instance().metrics.items()
+        for name, entry in get_moe_metrics_tracker().metrics.items()
     }
 
 
 @deprecated(
-    version="0.15", removal_version="0.17", alternative="MoEMetricsTracker.get_instance().report()"
+    version="0.15", removal_version="0.17", alternative="get_moe_metrics_tracker().report()"
 )
 def track_moe_metrics(
     loss_scale: float,
@@ -1011,9 +1005,9 @@ def track_moe_metrics(
 ) -> str:
     """Track the MoE metrics for logging.
 
-    Deprecated: Use MoEMetricsTracker.get_instance().report() directly.
+    Deprecated: Use get_moe_metrics_tracker().report() directly.
     """
-    return MoEMetricsTracker.get_instance().report(
+    return get_moe_metrics_tracker().report(
         loss_scale=loss_scale,
         iteration=iteration,
         writer=writer,

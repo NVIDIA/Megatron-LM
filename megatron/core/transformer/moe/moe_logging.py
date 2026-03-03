@@ -6,7 +6,7 @@ Collects per-layer MoE metrics during forward passes, synchronizes them across
 distributed ranks, and writes scalar summaries to TensorBoard / W&B.
 
 Usage:
-    tracker = MoEMetricsTracker.get_instance()
+    tracker = get_moe_metrics_tracker()
 
     # In router forward pass:
     tracker.record("load_balancing_loss", loss, layer_number=1, num_layers=32,
@@ -22,7 +22,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -40,30 +40,47 @@ class MetricEntry:
     needs_dp_avg: bool = True
 
 
+# ---------------------------------------------------------------------------
+# Module-level global tracker (follows parallel_state / global_vars pattern)
+# ---------------------------------------------------------------------------
+_MOE_METRICS_TRACKER: Optional['MoEMetricsTracker'] = None
+
+
+def get_moe_metrics_tracker() -> 'MoEMetricsTracker':
+    """Return the global MoE metrics tracker, creating it lazily if needed."""
+    global _MOE_METRICS_TRACKER
+    if _MOE_METRICS_TRACKER is None:
+        _MOE_METRICS_TRACKER = MoEMetricsTracker()
+    return _MOE_METRICS_TRACKER
+
+
+def set_moe_metrics_tracker(tracker: 'MoEMetricsTracker') -> None:
+    """Set the global MoE metrics tracker."""
+    global _MOE_METRICS_TRACKER
+    _MOE_METRICS_TRACKER = tracker
+
+
+def destroy_moe_metrics_tracker() -> None:
+    """Reset the global MoE metrics tracker to ``None``."""
+    global _MOE_METRICS_TRACKER
+    _MOE_METRICS_TRACKER = None
+
+
 class MoEMetricsTracker:
-    """Singleton tracker for MoE layer-wise metrics.
+    """Tracker for MoE layer-wise metrics.
 
     Lifecycle: ``record()`` per-layer values during forward → ``report()`` at
     step end (sync, aggregate, log, clear) → repeat.
 
     Example:
-        tracker = MoEMetricsTracker.get_instance()
+        tracker = get_moe_metrics_tracker()
         tracker.record("load_balancing_loss", loss, layer_number=1, num_layers=32)
         log_str = tracker.report(loss_scale=1/8, iteration=100, writer=tb_writer,
                                  num_layers=32)
     """
 
-    _instance: ClassVar[Optional['MoEMetricsTracker']] = None
-
     def __init__(self):
         self._metrics: Dict[str, MetricEntry] = {}
-
-    @classmethod
-    def get_instance(cls) -> 'MoEMetricsTracker':
-        """Get or create the singleton instance."""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
 
     # =========================================================================
     # Public API

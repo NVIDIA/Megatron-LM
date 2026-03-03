@@ -819,7 +819,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
         is_moe = isinstance(self.base_module, MoETransformerLayer)
         if is_moe:
-            moe_metrics_tracker = self.base_module.config.moe_metrics_tracker
+            from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+
+            moe_metrics_tracker = get_moe_metrics_tracker()
             cached_aux_losses = {}
             for name, entry in moe_metrics_tracker.metrics.items():
                 cached_aux_losses[name] = entry.values.clone()
@@ -2214,7 +2216,9 @@ class TECudaGraphHelper:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
-        self.config.moe_metrics_tracker.clear()
+        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+
+        get_moe_metrics_tracker().clear()
         reset_model_temporary_tensors(self.config, self.model)
 
         if FREEZE_GC:
