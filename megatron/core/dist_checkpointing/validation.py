@@ -203,6 +203,7 @@ def verify_checkpoint_and_load_strategy(
     checkpoint_dir: str,
     sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
+    cache_metadata: bool = False,
 ) -> Tuple[LoadShardedStrategy, LoadCommonStrategy]:
     """Verifies if checkpoint metadata exists and matches given strategies.
 
@@ -216,6 +217,8 @@ def verify_checkpoint_and_load_strategy(
         common_strategy (LoadCommonStrategy, Tuple[str, int], optional): common load strategy to be verified
             if compatible with the checkpoint content. If None, the default common load strategy
             for the checkpoint backend will be returned.
+        cache_metadata (bool): if True and checkpoint backend is torch_dist, use a load strategy that caches
+            metadata (e.g. when ckpt_assume_constant_structure is enabled). Ignored if sharded_strategy is set.
     """
     isdir = True
     if MultiStorageClientFeature.is_enabled():
@@ -231,11 +234,18 @@ def verify_checkpoint_and_load_strategy(
         raise CheckpointingException(f"{checkpoint_dir} is not a distributed checkpoint")
 
     if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(
-            StrategyAction.LOAD_SHARDED,
-            saved_config.sharded_backend,
-            saved_config.sharded_backend_version,
-        )
+        if cache_metadata and saved_config.sharded_backend == 'torch_dist':
+            from megatron.core.dist_checkpointing.strategies.torch import (
+                TorchDistLoadShardedStrategy,
+            )
+
+            sharded_strategy = TorchDistLoadShardedStrategy(cache_metadata=True)
+        else:
+            sharded_strategy = get_default_strategy(
+                StrategyAction.LOAD_SHARDED,
+                saved_config.sharded_backend,
+                saved_config.sharded_backend_version,
+            )
     elif isinstance(sharded_strategy, tuple):
         sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, *sharded_strategy)
 
