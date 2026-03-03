@@ -777,7 +777,7 @@ class MambaMixer(MegatronModule):
         else:
             assert self.activation in ["silu", "swish"]
             # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
-            # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
+            # tensors to the conv state dtype for causal_conv1d_fn and then cast xBC
             # back to the original dtype
             xBC_dtype = xBC.dtype
             weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
