@@ -8,7 +8,10 @@ from megatron.core.models.backends import (
     InferenceSpecProvider,
     LocalSpecProvider,
 )
-from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.models.gpt.moe_module_specs import (
+    get_inference_optimized_moe_spec,
+    get_moe_module_spec_for_backend,
+)
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -89,14 +92,17 @@ def get_gpt_layer_with_inference_submodules(
     assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
 
-    mlp = get_mlp_module_spec_for_backend(
-        backend=backend,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
-        use_te_op_fuser=False,
-        use_te_activation_func=False,
-    )
+    if num_experts is not None:
+        mlp = get_inference_optimized_moe_spec()
+    else:
+        mlp = get_mlp_module_spec_for_backend(
+            backend=backend,
+            num_experts=None,
+            moe_grouped_gemm=moe_grouped_gemm,
+            moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+            use_te_op_fuser=False,
+            use_te_activation_func=False,
+        )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."

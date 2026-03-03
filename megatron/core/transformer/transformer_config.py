@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope, MoEGroupedGemmBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from .._rank_utils import log_single_rank
@@ -917,9 +917,18 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_disable_torch_grouped_mm: bool = False
-    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
-    falling back to TE GroupedGEMM. """
+    moe_ggemm_training: str = "te"
+    """Backend for training grouped GEMM. Only 'te' is supported."""
+
+    moe_ggemm_inference_cg: str = "flashinfer"
+    """Backend for CUDA-graphed inference grouped GEMM.
+    'flashinfer': FlashInfer's fused cutlass_fused_moe kernel (default).
+    'torch': triton permute/unpermute kernels + torch._grouped_mm."""
+
+    moe_ggemm_inference_no_cg: str = "torch"
+    """Backend for non-CUDA-graphed inference grouped GEMM.
+    'torch': torch._grouped_mm with GPU-resident cumsum offsets (default).
+    'te': TE GroupedGEMM fallback."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1159,17 +1168,23 @@ class TransformerConfig(ModelParallelConfig):
                     "Inference-optimized MoE layers do not support padded "
                     "routing map for quantization."
                 )
-            if self.moe_router_dtype != "fp32":
+            if self.moe_router_dtype != "fp32" and self.moe_ggemm_inference_cg == "flashinfer":
                 raise ValueError(
-                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
-                    "to avoid costly dtype conversions during decode."
+                    "The FlashInfer CUDA-graphed MoE backend requires "
+                    "--moe-router-dtype=fp32. Either set --moe-router-dtype=fp32 "
+                    "or switch to --moe-ggemm-inference-cg=torch."
                 )
-            if self.gated_linear_unit and self.cuda_graph_impl != "none":
+            if (
+                self.gated_linear_unit
+                and self.cuda_graph_impl != "none"
+                and self.moe_ggemm_inference_cg == "flashinfer"
+            ):
                 raise ValueError(
-                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
+                    "The FlashInfer CUDA-graphed MoE backend does not support gated "
                     "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
-                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
-                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                    "between the FlashInfer kernel and mcore. Either switch to the torch "
+                    "backend (--moe-ggemm-inference-cg=torch), disable CUDA graphs "
+                    "(--cuda-graph-impl=none), or use a non-gated activation (e.g. squared_relu)."
                 )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
@@ -2185,11 +2200,20 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
-        if self.inference_disable_torch_grouped_mm:
-            assert self.transformer_impl == "inference_optimized", (
-                "inference_disable_torch_grouped_mm is only supported "
-                "for inference_optimized transformer implementation."
-            )
+        # Convert moe_ggemm_* strings to enums
+        _ggemm_valid = {b.name for b in MoEGroupedGemmBackend}
+        for field_name, allowed in [
+            ("moe_ggemm_training", {"te"}),
+            ("moe_ggemm_inference_cg", {"flashinfer", "torch"}),
+            ("moe_ggemm_inference_no_cg", {"torch", "te"}),
+        ]:
+            val = getattr(self, field_name)
+            if isinstance(val, str):
+                if val not in allowed:
+                    raise ValueError(
+                        f"{field_name} must be one of {sorted(allowed)}, got '{val}'"
+                    )
+                object.__setattr__(self, field_name, MoEGroupedGemmBackend[val])
 
         if self.batch_invariant_mode:
             assert (

@@ -42,6 +42,7 @@ from megatron.core.transformer.mlp import (
     TEActivationFunctionBuilder,
     apply_swiglu_sharded_factory,
 )
+from megatron.core.transformer.enums import MoEGroupedGemmBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
@@ -741,7 +742,7 @@ class TEGroupedMLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * permuted_probs
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
+        elif self.config.bias_activation_fusion and permuted_probs is not None:
             if self.activation_func == F.silu and self.config.gated_linear_unit:
                 # dtype is handled inside the fused kernel
                 intermediate_parallel = weighted_bias_swiglu_impl(
@@ -761,7 +762,7 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
-        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
+        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu and permuted_probs is not None:
             assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
             intermediate_parallel = weighted_squared_relu_impl(
                 intermediate_parallel, permuted_probs
@@ -782,7 +783,8 @@ class TEGroupedMLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
             original_dtype = intermediate_parallel.dtype
-            intermediate_parallel = intermediate_parallel * permuted_probs
+            if permuted_probs is not None:
+                intermediate_parallel = intermediate_parallel * permuted_probs
             intermediate_parallel = intermediate_parallel.to(original_dtype)
         return intermediate_parallel
 
@@ -957,7 +959,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._torch_grouped_mm_available = (
             is_torch_min_version("2.10")
             and hasattr(torch, '_grouped_mm')
-            and not config.inference_disable_torch_grouped_mm
         )
 
         if HAVE_FLASHINFER:
@@ -1046,13 +1047,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _torch_grouped_mm_forward(
-        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+        inclusive_expert_offsets=None,
     ):
-        permuted_probs = permuted_probs.unsqueeze(-1)
+        if permuted_probs is not None:
+            permuted_probs = permuted_probs.unsqueeze(-1)
         if not tokens_per_expert.is_cuda:
             tokens_per_expert = tokens_per_expert.to('cuda')
 
-        if self.config.moe_apply_probs_on_input:
+        if self.config.moe_apply_probs_on_input and permuted_probs is not None:
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
@@ -1062,12 +1065,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if permuted_local_hidden_states.nelement() != 0:
-            # Use pre-concatenated weights (built during init/load)
-            # _fc1_weight shape: [num_experts, ffn_hidden * (2 if gated else 1), hidden_size]
-            # _fc2_weight shape: [num_experts, hidden_size, ffn_hidden]
-            # Compute cumulative offsets on GPU (no host sync!)
-            # offs[i] = end index of expert i's tokens
-            offs = tokens_per_expert.cumsum(0).to(torch.int32)
+            # Reuse precomputed inclusive offsets from the dispatcher if available,
+            # otherwise compute cumsum on the fly (non-CG eager path).
+            if inclusive_expert_offsets is not None:
+                offs = inclusive_expert_offsets
+            else:
+                offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
             fc1_output = torch._grouped_mm(
                 permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
@@ -1091,6 +1094,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: Optional[torch.Tensor],
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
+        inclusive_expert_offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass with three modes:
 
@@ -1107,20 +1111,38 @@ class InferenceGroupedMLP(TEGroupedMLP):
             permuted_probs: [num_tokens, topk] routing probabilities.
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
+            inclusive_expert_offsets: [num_experts] precomputed inclusive cumsum of
+                tokens_per_expert (i.e. offs[i] = end index of expert i). When
+                provided, torch._grouped_mm reuses these directly instead of
+                recomputing cumsum. None for FlashInfer and non-CG paths.
         """
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         elif self.is_inference_cuda_graphed_iteration:
-            assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                HAVE_FLASHINFER
-            ), "FlashInfer is not available; cannot use FlashInfer forward pass."
-            return self._flashinfer_forward(
-                permuted_local_hidden_states, routing_map, permuted_probs
-            )
+            if self.config.moe_ggemm_inference_cg == MoEGroupedGemmBackend.flashinfer:
+                assert routing_map is not None, (
+                    "routing_map is required for FlashInfer forward pass."
+                )
+                assert HAVE_FLASHINFER, (
+                    "FlashInfer is not available; cannot use FlashInfer forward pass."
+                )
+                return self._flashinfer_forward(
+                    permuted_local_hidden_states, routing_map, permuted_probs
+                )
+            else:
+                assert tokens_per_expert is not None, (
+                    "tokens_per_expert is required for torch grouped_mm forward pass."
+                )
+                return self._torch_grouped_mm_forward(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+                    inclusive_expert_offsets=inclusive_expert_offsets,
+                )
 
-        elif self._torch_grouped_mm_available:
+        elif (
+            self.config.moe_ggemm_inference_no_cg == MoEGroupedGemmBackend.torch
+            and self._torch_grouped_mm_available
+        ):
             return self._torch_grouped_mm_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )

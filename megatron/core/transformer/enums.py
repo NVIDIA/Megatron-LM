@@ -67,6 +67,14 @@ class AttnBackend(enum.Enum):
     auto = 5
 
 
+class MoEGroupedGemmBackend(enum.Enum):
+    """Backend for MoE grouped GEMM operations."""
+
+    te = 1  # Transformer Engine GroupedGEMM
+    torch = 2  # torch._grouped_mm
+    flashinfer = 3  # FlashInfer fused cutlass_fused_moe kernel
+
+
 class CudaGraphScope(enum.Enum):
     """Cuda Graph Scope - defines which parts of the model to capture."""
 

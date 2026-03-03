@@ -26,6 +26,13 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import MoEGroupedGemmBackend
+from megatron.core.transformer.moe.moe_inference_utils import (
+    compute_expert_offsets,
+    compute_local_tokens_per_expert,
+    permute_tokens,
+    unpermute_tokens,
+)
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -69,6 +76,20 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         self.topk = config.moe_router_topk
 
         self.triton_nvls_kernels_allowed = not self.config.inference_disable_triton_nvls_kernels
+
+        # Backend selection for CUDA-graphed grouped GEMM
+        self._moe_backend = config.moe_ggemm_inference_cg
+        self._local_expert_start = local_expert_indices[0]
+
+        # Intermediate state for torch backend (set in dispatch_postprocess, used in combine_preprocess)
+        self._source_token_indices = None
+        self._num_routed_slots = None
+        self._permuted_probs = None
+        self._num_tokens_after_dispatch = None
+        # Inclusive end offsets per expert after permutation. Reused as the
+        # `offs` arg to torch._grouped_mm to avoid recomputing cumsum.
+        # None for the flashinfer backend (not needed).
+        self.inclusive_expert_offsets = None
 
     def _maybe_allocate_ag_buffers(
         self, routing_map: torch.Tensor, probs: torch.Tensor, hidden_states: torch.Tensor
@@ -242,12 +263,11 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
-        """Pass-through: returns inputs directly without permutation.
+        """Post-process dispatched tokens for expert computation.
 
-        Unlike the training dispatcher, this does not permute tokens or compute
-        tokens_per_expert. The downstream InferenceGroupedMLP (FlashInfer /
-        CUTLASS fused MoE kernel) operates directly on the routing map stored
-        in self.routing_map.
+        For the flashinfer backend, this is a pass-through: the FlashInfer fused
+        kernel operates directly on self.routing_map. For the torch backend,
+        uses triton kernels to permute tokens into expert-grouped order.
 
         Args:
             hidden_states (torch.Tensor): Gathered hidden states,
@@ -256,25 +276,79 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 shape [global_tokens, topk].
 
         Returns:
-            tuple: (hidden_states, tokens_per_expert, probs) where
-                tokens_per_expert is always None.
+            tuple: (hidden_states, tokens_per_expert, probs) where:
+                - flashinfer: tokens_per_expert=None, probs=original probs
+                - torch: tokens_per_expert=GPU histogram, probs=None
+                  (probs deferred to combine_preprocess unpermute)
         """
-        return hidden_states, None, probs
+        if self._moe_backend == MoEGroupedGemmBackend.flashinfer:
+            return hidden_states, None, probs
+
+        # torch backend: permute tokens into expert-grouped order
+        self._num_tokens_after_dispatch = hidden_states.size(0)
+        tokens_per_expert = compute_local_tokens_per_expert(
+            self.routing_map, self._local_expert_start, self.num_local_experts
+        )
+        exclusive_expert_offsets = compute_expert_offsets(tokens_per_expert)
+        # permute_tokens mutates the offsets tensor in-place via atomic adds,
+        # converting exclusive start offsets into inclusive end offsets.
+        # Example with 3 experts and tokens_per_expert = [2, 3, 1]:
+        #   exclusive_expert_offsets = [0, 2, 5]  (start of each expert's region)
+        #   inclusive_expert_offsets = [2, 5, 6]  (end of each expert's region)
+        # The last entry (6) equals the total number of routed tokens.
+        permuted_hidden, permuted_probs, source_token_indices = permute_tokens(
+            hidden_states, probs, self.routing_map, exclusive_expert_offsets,
+            self._local_expert_start, self.num_local_experts,
+        )
+        inclusive_expert_offsets = exclusive_expert_offsets  # mutated in-place by permute_tokens
+
+        # Cache state for combine_preprocess.
+        self._source_token_indices = source_token_indices
+        # Number of (token, expert) slots actually routed to local experts on
+        # this rank. With topk > 1, a single token may occupy multiple slots.
+        # Only permuted_hidden[:num_routed_slots] contains real data; the
+        # remaining rows are uninitialized padding for static CUDA graph shapes.
+        # Used later in combine_preprocess/unpermute_tokens to read only the
+        # valid grouped GEMM outputs and skip garbage-padded rows.
+        # Stored as a 1-element GPU tensor view ([-1:], not [-1]) to avoid a
+        # device-to-host sync that would break CUDA graphability.
+        self._num_routed_slots = inclusive_expert_offsets[-1:]
+        self._permuted_probs = permuted_probs
+        # Cache the full inclusive offsets so torch._grouped_mm can reuse them
+        # directly as `offs` without recomputing cumsum on tokens_per_expert.
+        self.inclusive_expert_offsets = inclusive_expert_offsets
+
+        # probs=None: expert skips prob-weighting, unpermute applies probs instead
+        return permuted_hidden, tokens_per_expert, None
 
     def combine_preprocess(self, expert_output):
-        """Pass-through: InferenceGroupedMLP already produces unpermuted output.
+        """Unpermute expert outputs back to original token order.
 
-        No unpermutation is needed because dispatch_postprocess did not permute
-        the tokens in the first place.
+        For flashinfer, this is a pass-through (FlashInfer already produces
+        output in token order). For the torch backend, uses the triton unpermute
+        kernel to scatter-add expert outputs weighted by routing probs.
 
         Args:
             expert_output (torch.Tensor): Output from InferenceGroupedMLP,
-                shape [global_tokens, hidden_dim].
+                shape [output_size, hidden_dim] (torch) or
+                [global_tokens, hidden_dim] (flashinfer).
 
         Returns:
-            torch.Tensor: The input tensor unchanged.
+            torch.Tensor: Output in original token order,
+                shape [global_tokens, hidden_dim].
         """
-        return expert_output
+        if self._moe_backend == MoEGroupedGemmBackend.flashinfer:
+            return expert_output
+
+        # torch backend: unpermute with routing probs
+        output = unpermute_tokens(
+            expert_output,
+            self._permuted_probs,
+            self._source_token_indices,
+            self._num_tokens_after_dispatch,
+            self._num_routed_slots,
+        )
+        return output
 
     def token_combine(self, hidden_states):
         """Combines expert outputs across EP ranks using Reduce-Scatter.
@@ -324,3 +398,4 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 hidden_states, group=self.tp_ep_group
             )
             return hidden_states
+

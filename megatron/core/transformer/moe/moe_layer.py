@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
+from megatron.core.transformer.enums import MoEGroupedGemmBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
@@ -268,15 +269,16 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            assert (
-                HAVE_FLASHINFER
-            ), "flashinfer-python is required for inference-optimized MoE implementation."
-            if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
-                warnings.warn(
-                    "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                    "The FlashInfer cutlass kernel will be JIT compiled,"
-                    "which may take a long time."
-                )
+            if config.moe_ggemm_inference_cg == MoEGroupedGemmBackend.flashinfer:
+                assert (
+                    HAVE_FLASHINFER
+                ), "flashinfer-python is required when moe_ggemm_inference_cg='flashinfer'."
+                if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
+                    warnings.warn(
+                        "flashinfer-cubin and/or flashinfer-jit-cache not found. "
+                        "The FlashInfer cutlass kernel will be JIT compiled,"
+                        "which may take a long time."
+                    )
             self._setup_inference_mode(pg_collection)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
@@ -418,10 +420,18 @@ class MoELayer(BaseMoELayer):
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
         ):
-            routing_map = self.token_dispatcher.routing_map
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
-            )
+            if self.config.moe_ggemm_inference_cg == MoEGroupedGemmBackend.flashinfer:
+                routing_map = self.token_dispatcher.routing_map
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+                )
+            else:
+                # torch backend: dispatcher already permuted tokens; tokens_per_expert is set.
+                # Pass precomputed inclusive offsets to avoid recomputing cumsum.
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs,
+                    inclusive_expert_offsets=self.token_dispatcher.inclusive_expert_offsets,
+                )
         else:
             expert_output, mlp_bias = self.experts(
                 dispatched_input, tokens_per_expert, permuted_probs
