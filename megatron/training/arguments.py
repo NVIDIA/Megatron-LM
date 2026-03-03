@@ -1827,7 +1827,7 @@ def _add_inference_args(parser):
                        'cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
                        type=str, default='longest_prefix',
-                       choices=['longest_prefix', 'round_robin'],
+                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
                        help='Coordinator routing policy for prefix caching. '
                        '"longest_prefix" (default) routes to the rank with the '

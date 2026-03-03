@@ -509,3 +509,106 @@ class TestCoordinatorEndToEnd:
             ("1 2 3 4 5 6 7 8", SamplingParams(num_tokens_to_generate=2)),
         ]
         await self.run_coordinator_test(requests)
+
+
+def make_first_prefix_block_coordinator(**kwargs):
+    """Create a coordinator configured with FIRST_PREFIX_BLOCK policy."""
+    coordinator = make_coordinator_direct(**kwargs)
+    coordinator.prefix_caching_coordinator_policy = (
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    )
+    return coordinator
+
+
+class TestFirstPrefixBlockRouting:
+    """Test routing decisions using the FIRST_PREFIX_BLOCK policy."""
+
+    def test_first_block_match_routes_to_rank(self):
+        """Request is routed to the rank that has the first block cached."""
+        coordinator = make_first_prefix_block_coordinator()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Only rank_1 has the first block.
+        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
+        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 1
+
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_1
+
+    def test_first_block_ignores_longer_match(self):
+        """Rank with more blocks cached is not preferred; only first block matters."""
+        coordinator = make_first_prefix_block_coordinator()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
+        hashes = coordinator.compute_request_hashes(tokens)
+        assert len(hashes) == 3
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # rank_0 has first block only, with higher timestamp.
+        coordinator.rank_cached_hashes[rank_0].add(hashes[0])
+        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 10
+
+        # rank_1 has all three blocks, but lower timestamp on first block.
+        coordinator.rank_cached_hashes[rank_1].update(hashes)
+        for h in hashes:
+            coordinator.rank_hash_timestamps[rank_1][h] = 1
+
+        # rank_0 wins because it has higher recency on the first block.
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_0
+
+    def test_first_block_recency_tiebreaker(self):
+        """When multiple ranks have the first block, higher timestamp wins."""
+        coordinator = make_first_prefix_block_coordinator()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Both ranks have the first block.
+        coordinator.rank_cached_hashes[rank_0].add(hashes[0])
+        coordinator.rank_hash_timestamps[rank_0][hashes[0]] = 3
+
+        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
+        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 7
+
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_1
+
+    def test_no_first_block_match_uses_round_robin(self):
+        """Falls back to round-robin when no rank has the first block."""
+        coordinator = make_first_prefix_block_coordinator()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+
+        # rank_0 has block 1 (second block), but not block 0.
+        coordinator.rank_cached_hashes[rank_0].add(hashes[1])
+        coordinator.rank_hash_timestamps[rank_0][hashes[1]] = 1
+
+        # No rank has the first block, so round-robin.
+        r1 = coordinator.get_best_data_parallel_rank(hashes)
+        r2 = coordinator.get_best_data_parallel_rank(hashes)
+        assert r1 != r2
+
+    def test_first_block_policy_with_single_block_prompt(self):
+        """Works correctly with a prompt that has only one block."""
+        coordinator = make_first_prefix_block_coordinator()
+        tokens = [1, 2, 3, 4]
+        hashes = coordinator.compute_request_hashes(tokens)
+        assert len(hashes) == 1
+
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        coordinator.rank_cached_hashes[rank_1].add(hashes[0])
+        coordinator.rank_hash_timestamps[rank_1][hashes[0]] = 1
+
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_1

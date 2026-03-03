@@ -71,6 +71,9 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     LONGEST_PREFIX = "longest_prefix"
     """Route to the rank with the longest consecutive prefix match."""
 
+    FIRST_PREFIX_BLOCK = "first_prefix_block"
+    """Route to the rank that has the first block hash cached. O(ranks) check."""
+
     ROUND_ROBIN = "round_robin"
     """Route requests to ranks in round-robin order, ignoring prefix affinity."""
 

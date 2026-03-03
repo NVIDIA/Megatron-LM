@@ -223,9 +223,12 @@ class DataParallelInferenceCoordinator:
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity.
 
-        Picks the rank with the longest consecutive prefix match. Ties are broken
-        by recency (higher timestamp = more recently assigned). Falls back to
-        round-robin when prefix caching is disabled or no rank has any match.
+        All policies share a single consecutive-match loop. The policy controls
+        how many hashes are considered: ROUND_ROBIN skips matching entirely,
+        FIRST_PREFIX_BLOCK truncates to the first hash as a cheap heuristic,
+        and LONGEST_PREFIX uses the full list. Ties are broken by recency
+        (higher timestamp = more recently assigned). Falls back to round-robin
+        when prefix caching is disabled or no rank has any match.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -240,6 +243,13 @@ class DataParallelInferenceCoordinator:
             == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
         ):
             return self.get_next_data_parallel_rank()
+
+        # FIRST_PREFIX_BLOCK: check only the first block as a cheap heuristic.
+        if (
+            self.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        ):
+            request_hashes = request_hashes[:1]
 
         best_match = 0
         best_recency = -1
