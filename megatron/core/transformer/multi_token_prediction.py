@@ -29,6 +29,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    fp32_matmul_precision,
     get_pg_rank,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -664,12 +665,45 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
-    for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
+    def _compute_output_logits_fp32(
+        hidden_states: Tensor,
+        output_layer: Callable,
+        output_weight: Optional[Tensor],
+        runtime_gather_output: Optional[bool],
+    ) -> Tensor:
+        """Compute output logits in FP32 for MTP output projection."""
+        hidden_states_fp32 = (
+            hidden_states if hidden_states.dtype == torch.float32 else hidden_states.float()
         )
+
+        weight = output_weight
+        if weight is None and getattr(output_layer, "weight", None) is not None:
+            weight = output_layer.weight
+        if weight is not None and weight.dtype != torch.float32:
+            weight = weight.float()
+
+        with fp32_matmul_precision("highest"):
+            logits, _ = output_layer(
+                hidden_states_fp32,
+                weight=weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        return logits if logits.dtype == torch.float32 else logits.float()
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        if config.fp32_residual_connection:
+            mtp_logits = _compute_output_logits_fp32(
+                hidden_states=hidden_states_list[mtp_layer_number + 1],
+                output_layer=output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
