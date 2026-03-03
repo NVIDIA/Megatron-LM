@@ -255,7 +255,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
             )
             input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
             down_proj_linear = (
-                backend.column_parallel_layer_norm_linear() if fuse_input_layernorm else backend.linear()
+                backend.column_parallel_layer_norm_linear()
+                if fuse_input_layernorm
+                else backend.linear()
             )
             return TransformerLayerSubmodules(
                 input_layernorm=input_layernorm,

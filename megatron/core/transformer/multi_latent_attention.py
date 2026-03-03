@@ -1163,9 +1163,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         self.linear_qkv_down_proj = build_module(
             submodules.linear_qkv_down_proj,
             self.config.hidden_size,
-            self.config.q_lora_rank
-            + self.config.kv_lora_rank
-            + self.config.qk_pos_emb_head_dim,
+            self.config.q_lora_rank + self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
@@ -1174,7 +1172,9 @@ class FusedMLASelfAttention(MLASelfAttention):
             tp_comm_buffer_name='qkv_down_proj',
             skip_weight_param_allocation=False,
             tp_group=(
-                pg_collection.tp if qkv_down_proj_kwargs.get('parallel_mode') != 'duplicated' else None
+                pg_collection.tp
+                if qkv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                else None
             ),
             **qkv_down_proj_kwargs,
         )
@@ -1223,10 +1223,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         qkv, _ = self.linear_qkv_down_proj(hidden_states)
         q_compressed, kv_combined = torch.split(
             qkv,
-            [
-                self.config.q_lora_rank,
-                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
-            ],
+            [self.config.q_lora_rank, self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim],
             dim=-1,
         )
         return q_compressed, kv_combined
