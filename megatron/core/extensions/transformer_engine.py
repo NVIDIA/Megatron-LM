@@ -603,8 +603,6 @@ class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
 
-    Residual Fusion Design:
-    ----------------------
     Residual fusion is a two-level opt-in mechanism:
 
     1. Global capability: config.fused_residual_rmsnorm must be True (enables the feature)
