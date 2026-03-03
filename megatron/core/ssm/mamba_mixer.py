@@ -38,6 +38,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
+    is_using_quantization_scales,
     log_single_rank,
 )
 
@@ -486,6 +487,11 @@ class MambaMixer(MegatronModule):
             y = y_prefill
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
+
+        # Clear the outputs for padding tokens when using quantization scales
+        # to avoid corrupting amax calculations
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
 
         # Output projection
         out, out_bias = self.out_proj(y)

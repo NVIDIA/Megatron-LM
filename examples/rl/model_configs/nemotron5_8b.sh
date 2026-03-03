@@ -60,7 +60,7 @@ MODEL_OPTIONS="\
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
-  --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
+  --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
     --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
     --tiktoken-pattern v2 \
     --distributed-timeout-minutes 60 \
@@ -73,7 +73,6 @@ MODEL_OPTIONS="\
    --init-method-std 0.014 \
     --position-embedding-type none \
     --squared-relu \
-    --num-layers 52 \
     --hidden-size 4096 \
     --num-attention-heads 32 \
     --group-query-attention \
