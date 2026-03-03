@@ -250,6 +250,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
+        self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
