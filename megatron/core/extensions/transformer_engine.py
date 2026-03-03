@@ -502,6 +502,7 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -624,6 +625,8 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -639,6 +642,7 @@ class TELinear(te.pytorch.Linear):
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode=te_parallel_mode,
+            etp_group=ps_group,
             **extra_kwargs,
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -733,6 +737,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
     ):
         if not HAVE_TE:
@@ -848,6 +853,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_layernorm_output=False,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+            etp_group=ps_group,
             **extra_kwargs,
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -960,6 +966,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
     ):
         if not HAVE_TE:
@@ -993,6 +1000,7 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            ps_group=ps_group,
         )
 
         # Set proper partition_stride
@@ -1069,6 +1077,7 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1101,6 +1110,7 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            ps_group=ps_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1536,6 +1546,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
+            ps_group = pg_collection.expt_ps
+
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1563,6 +1575,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=parallel_mode,
+                etp_group=ps_group,
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None

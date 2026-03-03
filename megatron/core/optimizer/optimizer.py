@@ -39,6 +39,11 @@ except ImportError:
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+
+try:
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
+except ImportError:
+    ETPShardedParam = None
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -142,9 +147,12 @@ class MegatronOptimizer(ABC):
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+          - should not be a PS duplicate (non-ETP params are identical across PS peers;
+            only PS rank 0 should contribute to avoid over-counting).
         """
         params = self.get_parameters()
         grads_for_norm = []
+        ps_rank = parallel_state.get_parameter_sharding_rank()
         for param in params:
             if getattr(param, "__fsdp_param__", False):
                 grad = param.grad._local_tensor if param.grad is not None else None
@@ -157,7 +165,19 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
                 param, getattr(self, 'tp_group', None)
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            # PS-duplicate filter: only needed for non-distributed optimizer.
+            # Distributed optimizer: PS peers are in the same DP group, reduce-scatter
+            # gives unique shards per rank — no duplicates possible.
+            # Non-distributed optimizer: PS peers have identical grads after allreduce.
+            # ETP params have unique shards, non-ETP are duplicated across PS peers.
+            if hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer:
+                is_not_ps_duplicate = True
+            else:
+                is_etp_param = getattr(param, 'is_etp', False) or (
+                    ETPShardedParam is not None and isinstance(param, ETPShardedParam)
+                )
+                is_not_ps_duplicate = is_etp_param or ps_rank == 0
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
                 grads_for_norm.append(grad)
 
         return grads_for_norm
@@ -224,11 +244,13 @@ class MegatronOptimizer(ABC):
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
+        use_dist_opt = hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=getattr(self, 'tp_group', None),
+            use_distributed_optimizer=use_dist_opt,
         )
 
     @abstractmethod
@@ -672,7 +694,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
                             # Create a copy
+                            from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
+
+                                
                             main_param = param.detach().clone().float()
+                            if isinstance(param, ETPShardedParam):
+                                main_param.is_etp = True
+                            else:
+                                main_param.is_etp = False
+
+
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):

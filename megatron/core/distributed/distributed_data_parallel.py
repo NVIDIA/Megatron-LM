@@ -9,6 +9,11 @@ import torch
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
+
+try:
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
+except ImportError:
+    ETPShardedParam = None
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
@@ -83,6 +88,11 @@ class DistributedDataParallel(_BaseDataParallel):
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
+        self.intra_dp_cp_with_ps_group = process_group_dict.get('intra_dp_cp_with_ps_group',
+                                                                 self.intra_dp_cp_group)
+        self.intra_expt_dp_with_eps_group = process_group_dict.get(
+            'intra_expt_dp_with_eps_group', self.intra_expt_dp_group
+        )
 
         # Set inter_dist_opt_group if multiple optimizer instances
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -106,6 +116,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Group parameters by their gradient type.
         param_to_name = {}
         dense_params = []
+        etp_params = []
         expert_parallel_params = []
         self.params_with_grad = []
         for name, param in self.module.named_parameters():
@@ -119,10 +130,12 @@ class DistributedDataParallel(_BaseDataParallel):
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
 
-            if getattr(param, 'allreduce', True):
-                dense_params.append(param)
-            else:
+            if not getattr(param, 'allreduce', True):
                 expert_parallel_params.append(param)
+            elif ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+                etp_params.append(param)
+            else:
+                dense_params.append(param)
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -182,10 +195,14 @@ class DistributedDataParallel(_BaseDataParallel):
                         )
                     else:
                         # For non-expert parameters, gradient_scaling_factor is 1.
-                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
+                        # For expert parameters, gradient_scaling_factor is
+                        # expt_dp_with_eps_size/dp_size.
                         assert (gradient_scaling_factor == 1) or (
                             gradient_scaling_factor
-                            == (self.expt_dp_group.size() / self.dp_cp_group.size())
+                            == (
+                                self.intra_expt_dp_with_eps_group.size()
+                                / self.dp_cp_group.size()
+                            )
                         )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
@@ -256,6 +273,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 not self.ddp_config.average_in_collective
             ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
+            etp_gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
             # The goal is to scale reduced gradients by 1/dp_size.
@@ -273,6 +291,11 @@ class DistributedDataParallel(_BaseDataParallel):
             #   3. Resulted scaling: (edp_size/dp_size) * (1/edp_size) = 1/dp_size as desired
             #   (edp_size = expert data parallel world size)
             #
+            # - ETP parameters:
+            #   ETP reduce-scatter already sums grads within the PS group. DDP only
+            #   reduces across the with_ps=True group (true weight replicas).
+            #   Total effective reduction covers all dp_cp ranks, so target is 1/dp_cp_size.
+            #
             # Case 2: average_in_collective=False
             # - Both expert and non-expert parameters:
             #   1. Scale gradients by 1/dp_size before reduction
@@ -280,11 +303,18 @@ class DistributedDataParallel(_BaseDataParallel):
             #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
-                expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
+                # ETP: the collective averages over with_ps group (size = dp_cp_size / ps_size).
+                # ETP RS already summed over ps_size ranks. To get 1/dp_cp_size total scaling:
+                # pre_scale * (1/with_ps_size) = 1/dp_cp_size
+                # => pre_scale = with_ps_size / dp_cp_size = 1 / ps_size
+                etp_with_ps_size = self.intra_dp_cp_with_ps_group.size()
+                etp_gradient_scaling_factor = etp_with_ps_size / self.dp_cp_group.size()
+                expert_gradient_scaling_factor = self.intra_expt_dp_with_eps_group.size() / self.dp_cp_group.size()
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
+                etp_gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
@@ -292,11 +322,20 @@ class DistributedDataParallel(_BaseDataParallel):
             dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
         )
 
+        # Allocate separate param+grad buffers for ETP params' grads.
+        # ETP params use the with_ps=True group since the PS dimension is already
+        # reduced by ETP's reduce-scatter in the backward pass.
+        self.etp_buffers, self.etp_bucket_groups = _allocate_buffers_for_parameters(
+            etp_params,
+            self.intra_dp_cp_with_ps_group,
+            gradient_scaling_factor=etp_gradient_scaling_factor,
+        )
+
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                self.intra_expt_dp_group,
+                self.intra_expt_dp_with_eps_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -341,7 +380,11 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
+
+                    if ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+                        param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
         self.use_forward_hook = (
@@ -452,12 +495,12 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         Context manager that turns off gradient synchronization.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.is_last_microbatch = False
         try:
             yield
         finally:
-            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
@@ -479,7 +522,7 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
 
             if not self.ddp_config.overlap_param_gather:
@@ -519,7 +562,7 @@ class DistributedDataParallel(_BaseDataParallel):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -531,12 +574,12 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.buffers + self.etp_buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -550,9 +593,9 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.buffers + self.etp_buffers + self.expert_parallel_buffers:
             buffer.reset()
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.bucket_groups + self.etp_bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()
 
     def broadcast_params(self):
@@ -587,7 +630,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.buffers + self.etp_buffers + self.expert_parallel_buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
 
         if empty_cache:
@@ -604,7 +647,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.buffers + self.etp_buffers + self.expert_parallel_buffers:
             buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:

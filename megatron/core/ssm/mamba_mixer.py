@@ -246,6 +246,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            ps_group=self.pg_collection.ps,
         )
 
         if not self.use_mem_eff_path:
@@ -345,6 +346,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            ps_group=self.pg_collection.ps,
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the

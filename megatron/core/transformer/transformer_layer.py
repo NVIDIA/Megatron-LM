@@ -371,6 +371,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     pg_collection, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
+                additional_mlp_kwargs["ps_group"] = pg_collection.ps if hasattr(pg_collection, 'ps') else None
             elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
                 assert hasattr(
                     pg_collection, 'tp'

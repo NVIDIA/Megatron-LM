@@ -20,6 +20,11 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    parameter_sharding_size: int = 1
+    """Parameter sharding parallelism. Shards model weights (but not activations) across GPU ranks.
+       Placed right after tensor parallelism in the parallelism ordering.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
@@ -71,6 +76,11 @@ class ModelParallelConfig:
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
+
+    expert_parameter_sharding_size: int = 1
+    """Parameter sharding parallelism for expert layers. Shards expert weights (but not activations)
+       across GPU ranks. Independent from the decoder's parameter_sharding_size.
+    """
 
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
