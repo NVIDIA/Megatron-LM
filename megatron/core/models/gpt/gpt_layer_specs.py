@@ -76,6 +76,9 @@ def get_gpt_layer_with_inference_submodules(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -88,9 +91,9 @@ def get_gpt_layer_with_inference_submodules(
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
-        num_experts=None,
-        moe_grouped_gemm=False,
-        moe_use_legacy_grouped_gemm=False,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=False,
         use_te_activation_func=False,
     )
@@ -148,7 +151,7 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
@@ -557,6 +560,21 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
+    elif config.transformer_impl == "inference_optimized":
+        layer_norm_impl = TENorm
+        dense_layer_spec = get_gpt_layer_with_inference_spec(
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+        )
+        moe_layer_spec = get_gpt_layer_with_inference_spec(
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+        )
     else:
         layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
@@ -647,6 +665,8 @@ def get_gpt_decoder_block_spec(
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     if use_transformer_engine:
+        layer_norm_impl = TENorm
+    elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
     else:
         layer_norm_impl = LNImpl
