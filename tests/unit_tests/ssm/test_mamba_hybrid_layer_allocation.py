@@ -312,7 +312,13 @@ class TestGetHybridLayerCounts:
     def test_with_pipes_and_mtp(self):
         # Main: M-M-|M-M*- -> 1 attn, 4 mamba, 4 mlp
         # MTP: MM x 2 depths -> +4 mamba
-        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {'M': 8, 'G': 0, '*': 1, '-': 4, 'E': 0}
+        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
+            'M': 8,
+            'G': 0,
+            '*': 1,
+            '-': 4,
+            'E': 0,
+        }
 
     def test_moe_pattern(self):
         assert get_hybrid_layer_counts("MEME") == {'M': 2, 'G': 0, '*': 0, '-': 0, 'E': 2}
