@@ -186,6 +186,7 @@ class Partition(object):
                 builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
+        # Save performance data (preprocessed docs/s)
         if self.args.find_optimal_num_workers:
             perf_file_path = os.path.join(self.args.performance_dir, f"{self.workers}_workers.json")
             with open(perf_file_path, "w") as perf_file:
@@ -405,7 +406,6 @@ def main():
                 for idx in range(args.partitions):
                     partitioned_input_files[idx].close()
 
-        assert num_workers % args.partitions == 0
         partition = Partition(args, num_workers//args.partitions)
 
         # check to see if paritions with split sentences already created
@@ -469,6 +469,7 @@ def main():
                 builders[key].add_index(full_partition_output_prefix)
             builders[key].finalize(output_idx_files[key])
 
+    # Find the most optimal number of workers
     find_optimal_num_workers(args)
 
 if __name__ == '__main__':
