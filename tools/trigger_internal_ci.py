@@ -25,12 +25,13 @@ import logging
 import os
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 import requests
 import gitlab  # python-gitlab
 
 GITHUB_REPO = "NVIDIA/Megatron-LM"
-GITLAB_PROJECT = "ADLR/Megatron-LM"
+GITLAB_PROJECT_ID = 19378
 GITLAB_BRANCH_PREFIX = "pull-request"
 GITHUB_API_URL = "https://api.github.com"
 
@@ -39,16 +40,28 @@ logger = logging.getLogger(__name__)
 PIPELINE_VARIABLES_FIXED = {
     "UNIT_TEST": "no",
     "INTEGRATION_TEST": "no",
+    "FUNCTIONAL_TEST_SCOPE": "mr",
 }
 
 
-def get_github_token():
-    """Return a GitHub token from GH_TOKEN or GITHUB_TOKEN env vars, or exit."""
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token:
-        logger.error("GH_TOKEN or GITHUB_TOKEN not set")
-        sys.exit(1)
-    return token
+def get_remote_url(origin):
+    """Return the fetch URL configured for the given git remote name."""
+    result = subprocess.run(
+        ["git", "remote", "get-url", origin],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def get_gitlab_hostname(remote_url):
+    """Extract the hostname (without port) from an SSH or HTTPS remote URL."""
+    if remote_url.startswith("git@"):
+        hostname = remote_url.split("@", 1)[1].split(":")[0]
+    else:
+        hostname = urlparse(remote_url).hostname
+    return hostname.split(":")[0]
 
 
 def get_current_branch():
@@ -61,29 +74,13 @@ def get_current_branch():
     )
     return result.stdout.strip()
 
-
-def get_pr_number(branch, token):
-    """Return the PR number for an open GitHub PR matching the given branch, or exit."""
-    url = f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/pulls"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    params = {"head": f"NVIDIA:{branch}", "state": "open"}
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    pulls = response.json()
-    if not pulls:
-        logger.error("no open PR found for branch '%s'", branch)
-        sys.exit(1)
-    return pulls[0]["number"]
-
-
-def git_push(gitlab_url, target_branch, dry_run=False):
-    """Force-push HEAD to the given branch on the GitLab remote."""
-    remote_url = f"git@{gitlab_url}:{GITLAB_PROJECT}.git"
+def git_push(origin, target_branch, dry_run=False):
+    """Force-push HEAD to the given branch on the named git remote."""
     if dry_run:
-        logger.info("[DRY RUN] Would push HEAD to %s as %s", remote_url, target_branch)
+        logger.info("[DRY RUN] Would push HEAD to remote '%s' as %s", origin, target_branch)
         return
     subprocess.run(
-        ["git", "push", remote_url, f"HEAD:{target_branch}", "--force"],
+        ["git", "push", origin, f"HEAD:{target_branch}", "--force"],
         check=True,
     )
 
@@ -94,12 +91,13 @@ def trigger_pipeline(gitlab_url, trigger_token, ref, pipeline_vars, dry_run=Fals
         logger.info(
             "[DRY RUN] Would trigger pipeline on https://%s project %s @ %s",
             gitlab_url,
-            GITLAB_PROJECT,
+            GITLAB_PROJECT_ID,
             ref,
         )
         return
+    logger.info("Triggering pipeline on https://%s project %s @ %s", gitlab_url, GITLAB_PROJECT_ID, ref)
     gl = gitlab.Gitlab(f"https://{gitlab_url}")
-    project = gl.projects.get(GITLAB_PROJECT)
+    project = gl.projects.get(GITLAB_PROJECT_ID, lazy=True)
     pipeline = project.trigger_pipeline(ref=ref, token=trigger_token, variables=pipeline_vars)
     logger.info("Pipeline triggered: %s", pipeline.web_url)
 
@@ -110,9 +108,9 @@ def main():
         description="Trigger the internal GitLab CI pipeline for a GitHub PR."
     )
     parser.add_argument(
-        "--gitlab-url",
+        "--gitlab-origin",
         required=True,
-        help="Hostname of the internal GitLab (e.g. gitlab.example.com)",
+        help="Name of the git remote pointing to the internal GitLab (e.g. gitlab)",
     )
     parser.add_argument(
         "--trigger-token",
@@ -147,16 +145,15 @@ def main():
         logger.error("--trigger-token or GITLAB_TRIGGER_TOKEN not set")
         sys.exit(1)
 
-    github_token = get_github_token()
     branch = get_current_branch()
     logger.info("Current branch: %s", branch)
 
-    pr_number = get_pr_number(branch, github_token)
-    logger.info("Found PR #%s for branch '%s'", pr_number, branch)
+    remote_url = get_remote_url(args.gitlab_origin)
+    gitlab_hostname = get_gitlab_hostname(remote_url)
 
-    target_branch = f"{GITLAB_BRANCH_PREFIX}/{pr_number}"
+    target_branch = f"{GITLAB_BRANCH_PREFIX}/{branch}"
 
-    git_push(args.gitlab_url, target_branch, dry_run=args.dry_run)
+    git_push(args.gitlab_origin, target_branch, dry_run=args.dry_run)
 
     pipeline_vars = {
         **PIPELINE_VARIABLES_FIXED,
@@ -166,7 +163,7 @@ def main():
     }
 
     trigger_pipeline(
-        args.gitlab_url, args.trigger_token, target_branch, pipeline_vars, dry_run=args.dry_run
+        gitlab_hostname, args.trigger_token, target_branch, pipeline_vars, dry_run=args.dry_run
     )
 
 
