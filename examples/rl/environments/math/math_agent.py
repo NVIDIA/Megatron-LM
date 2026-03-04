@@ -117,6 +117,24 @@ class MathAgent(RewardOnlyAgent):
                 # Did not format the answer correctly
                 return self.negative_reward
 
+    # def make_prefix(self, problem_key: str = "problem", **kwargs) -> str:
+    #     """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""
+    #     if self.answer_format == "boxed":
+    #         answer_format = "Please reason step by step and provide your answer between \\boxed{} tags, for example \\boxed{20\\sqrt{3}}."
+    #     elif self.answer_format == "tagged":
+    #         answer_format = "Please reason step by step and provide your answer between <answer> </answer> tags, for example <answer> 20\\sqrt{3} </answer>. Do not include an = sign."
+    #     else:
+    #         raise ValueError(f"Invalid answer format: {self.answer_format}")
+
+    #     if self.chat_mode:
+    #         prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+    #     else:
+    #         prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+    # The question will be a word math problem. Show your work in <think> </think> tags.
+    # {answer_format}
+    # User: {kwargs[problem_key]}
+    # {self.assistant_suffix}"""
+    #     return prefix
     def make_prefix(self, problem_key: str = "problem", **kwargs) -> str:
         """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""
         if self.answer_format == "boxed":
@@ -126,6 +144,11 @@ class MathAgent(RewardOnlyAgent):
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 
-        prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+        # prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+        prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+    The question will be a word math problem. Show your work in <think> </think> tags.
+    {answer_format}
+    User: {kwargs[problem_key]}
+    Assistant:"""
 
         return prefix
