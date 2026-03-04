@@ -121,7 +121,9 @@ class PRReviewTracker:
 
         # 5. Compute pending expert reviewers
         expert_non_approvers = non_approvers - all_excluded_members
-        pending_expert = (pending_individuals | expert_team_members | expert_non_approvers) - approvers
+        pending_expert = (
+            pending_individuals | expert_team_members | expert_non_approvers
+        ) - approvers
         logger.info(f"Pending expert reviewers: {pending_expert}")
 
         # 6. Compute pending final reviewers
@@ -137,9 +139,7 @@ class PRReviewTracker:
         # 8. Guard: if no reviewers exist at all, the review process hasn't started yet.
         #    This prevents a race condition where the swap script runs before the oncall
         #    reviewer is assigned (both trigger on ready_for_review concurrently).
-        has_any_reviewers = (
-            pending_individuals or pending_team_slugs or approvers or non_approvers
-        )
+        has_any_reviewers = pending_individuals or pending_team_slugs or approvers or non_approvers
         if not has_any_reviewers and self.stage == self.EXPERT_REVIEW:
             logger.info(f"PR #{pr.number} has no reviewers assigned yet. Skipping.")
             return
@@ -168,9 +168,7 @@ class PRReviewTracker:
                     pr.remove_from_labels(self.FINAL_REVIEW)
                 except Exception:
                     pass
-                logger.info(
-                    f'Reverted PR #{pr.number} to expert review — pending: {pending_expert}'
-                )
+                logger.info(f'Reverted PR #{pr.number} to expert review — pending: {pending_expert}')
             else:
                 # Expert review done but final review needed again
                 try:
@@ -194,18 +192,14 @@ class PRReviewTracker:
                     f'new expert reviewers pending: {pending_expert}'
                 )
             except Exception as e:
-                logger.warning(
-                    f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}'
-                )
+                logger.warning(f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}')
         elif len(pending_final) == 0:
             # All final reviewers approved — move to Approved, remove Final Review
             try:
                 pr.remove_from_labels(self.FINAL_REVIEW)
                 logger.info(f'Removed "{self.FINAL_REVIEW}" from PR #{pr.number}')
             except Exception as e:
-                logger.warning(
-                    f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}'
-                )
+                logger.warning(f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}')
             try:
                 pr.add_to_labels(self.APPROVED)
                 logger.info(f'Added "{self.APPROVED}" to PR #{pr.number}')

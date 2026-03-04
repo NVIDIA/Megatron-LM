@@ -130,11 +130,7 @@ class PRReviewTracker:
 
     def get_ready_for_review_date(self, pr):
         """Get the date a PR was marked as ready for review."""
-        dates = [
-            e.created_at
-            for e in pr.as_issue().get_events()
-            if e.event == "ready_for_review"
-        ]
+        dates = [e.created_at for e in pr.as_issue().get_events() if e.event == "ready_for_review"]
         return max(dates) if dates else None
 
     def days_since(self, date):
@@ -231,7 +227,10 @@ class PRReviewTracker:
                 # No reviewer activity yet — assignment hasn't completed (e.g. PR just became
                 # ready-for-review). Don't fire a spurious "all approved" message.
                 has_reviewer_activity = bool(
-                    approvers or non_approving_reviewers or pending_individuals or pending_teams_slugs
+                    approvers
+                    or non_approving_reviewers
+                    or pending_individuals
+                    or pending_teams_slugs
                 )
                 if not has_reviewer_activity:
                     return [], "Waiting for reviewers to be assigned."
