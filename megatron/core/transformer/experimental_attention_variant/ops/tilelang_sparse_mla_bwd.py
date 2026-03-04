@@ -59,61 +59,54 @@ def _normalize_sm_scale(sm_scale):
     return round(sm_scale, 12)
 
 
-def _get_preprocess_kernel(B: int, S: int, H: int, D: int):
-    key = (B, S, H, D)
+def _get_preprocess_kernel(H: int, D: int):
+    key = (H, D)
     with _tilelang_sparse_mla_bwd_cache_lock:
         kernel = _tilelang_sparse_mla_preprocess_kernel_cache.pop(key, None)
         if kernel is None:
-            kernel = preprocess(B, S, H, D)
+            kernel = preprocess(H, D)
         _cache_put_lru(_tilelang_sparse_mla_preprocess_kernel_cache, key, kernel)
         return kernel
 
 
 def _get_bwd_kernel(
-    B: int,
-    S: int,
-    S_kv: int,
-    H: int,
-    D: int,
-    D_tail: int,
-    topk: int,
-    kv_group: int,
-    sm_scale,
-    is_causal: bool,
+    H: int, D: int, D_tail: int, topk: int, kv_group: int, sm_scale, is_causal: bool
 ):
-    key = (B, S, S_kv, H, D, D_tail, topk, kv_group, _normalize_sm_scale(sm_scale), is_causal)
+    key = (H, D, D_tail, topk, kv_group, _normalize_sm_scale(sm_scale), is_causal)
     with _tilelang_sparse_mla_bwd_cache_lock:
         kernel = _tilelang_sparse_mla_bwd_kernel_cache.pop(key, None)
         if kernel is None:
-            kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
+            kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, is_causal)
         _cache_put_lru(_tilelang_sparse_mla_bwd_kernel_cache, key, kernel)
         return kernel
 
 
-def _get_postprocess_kernel(B: int, S_kv: int, D: int, D_tail: int, kv_group: int):
-    key = (B, S_kv, D, D_tail, kv_group)
+def _get_postprocess_kernel(D: int, D_tail: int, kv_group: int):
+    key = (D, D_tail, kv_group)
     with _tilelang_sparse_mla_bwd_cache_lock:
         kernel = _tilelang_sparse_mla_postprocess_kernel_cache.pop(key, None)
         if kernel is None:
-            kernel = postprocess(B, S_kv, D, D_tail, kv_group)
+            kernel = postprocess(D, D_tail, kv_group)
         _cache_put_lru(_tilelang_sparse_mla_postprocess_kernel_cache, key, kernel)
         return kernel
 
 
 @tilelang.jit(out_idx=[-1])
-def preprocess(B, S, H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dtype=T.float32):
+def preprocess(H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dtype=T.float32):
     """Build preprocessing kernel that computes Delta = sum(O * dO) per row/head."""
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
-    shape = [B, S, H, D]
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    shape = [batch, seq_len, H, D]
 
     @T.prim_func
     def preprocess_kernel(
         O: T.Tensor(shape, dtype),
         dO: T.Tensor(shape, dtype),
-        Delta: T.Tensor([B, S, H], accum_dtype),
+        Delta: T.Tensor([batch, seq_len, H], accum_dtype),
     ):
-        with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
+        with T.Kernel(H, T.ceildiv(seq_len, block_ND), batch) as (bx, by, bz):
             o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
             do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
             delta = T.alloc_fragment([block_ND], accum_dtype)
@@ -148,18 +141,24 @@ def preprocess(B, S, H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dt
 
 @tilelang.jit(out_idx=[-1])
 def postprocess(
-    B, S_kv, D, D_tail, kv_group=1, block_N=64, threads=128, dtype=T.bfloat16, accum_dtype=T.float32
+    D, D_tail, kv_group=1, block_N=64, threads=128, dtype=T.bfloat16, accum_dtype=T.float32
 ):
     """Build postprocess kernel that casts/exports accumulated dKV."""
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
-    dkv_shape = [B, S_kv, kv_group, D + D_tail]
+    batch = T.dynamic("batch")
+    seq_len_kv = T.dynamic("seq_len_kv")
+    dkv_shape = [batch, seq_len_kv, kv_group, D + D_tail]
 
     @T.prim_func
     def postprocess_kernel(
         dKV: T.Tensor(dkv_shape, accum_dtype), dKV_out: T.Tensor(dkv_shape, dtype)
     ):
-        with T.Kernel(T.ceildiv(S_kv, block_N), kv_group, B, threads=threads) as (bx, by, bz):
+        with T.Kernel(T.ceildiv(seq_len_kv, block_N), kv_group, batch, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
             T.copy(
                 dKV[bz, bx * block_N : (bx + 1) * block_N, by, :],
                 dKV_out[bz, bx * block_N : (bx + 1) * block_N, by, :],
@@ -177,9 +176,6 @@ def postprocess(
     },
 )
 def bwd(
-    B,
-    S,
-    S_kv,
     H,
     D,
     D_tail,
@@ -207,13 +203,17 @@ def bwd(
         sm_scale = (D + D_tail) ** (-0.5)
     sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
 
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
     H_kv = H // kv_group
-    q_shape = [B, S, H, D + D_tail]
-    k_shape = [B, S_kv, kv_group, D + D_tail]
-    o_shape = [B, S, H, D]
-    indices_shape = [B, S, kv_group, topk]
-    delta_shape = [B, S, H]
-    lse_shape = [B, S, H]
+    q_shape = [batch, seq_len, H, D + D_tail]
+    k_shape = [batch, seq_len_kv, kv_group, D + D_tail]
+    o_shape = [batch, seq_len, H, D]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    delta_shape = [batch, seq_len, H]
+    lse_shape = [batch, seq_len, H]
     assert indices_dtype == T.int32
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
@@ -239,7 +239,7 @@ def bwd(
         dQ: T.Tensor(q_shape, dtype),
         dKV: T.Tensor(k_shape, accum_dtype),
     ):
-        with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
+        with T.Kernel(seq_len, batch, kv_group * NH, threads=threads) as (s_i, by, bz):
             Q_shared = T.alloc_shared([block_H, D], dtype)
             Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
@@ -486,11 +486,9 @@ def sparse_mla_bwd(
             delta = delta_padded
 
     # Get kernels
-    preprocess_kernel = _get_preprocess_kernel(B, seq_bucketed, H, D)
-    bwd_kernel = _get_bwd_kernel(
-        B, seq_bucketed, seq_kv_bucketed, H, D, D_tail, topk_bucketed, kv_group, sm_scale, is_casual
-    )
-    postprocess_kernel = _get_postprocess_kernel(B, seq_kv_bucketed, D, D_tail, kv_group)
+    preprocess_kernel = _get_preprocess_kernel(H, D)
+    bwd_kernel = _get_bwd_kernel(H, D, D_tail, topk_bucketed, kv_group, sm_scale, is_casual)
+    postprocess_kernel = _get_postprocess_kernel(D, D_tail, kv_group)
 
     if delta is None:
         delta = preprocess_kernel(o, do)
