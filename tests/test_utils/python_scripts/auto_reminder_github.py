@@ -255,6 +255,8 @@ class PRReviewTracker:
             stage_days = self.days_since(ready_date)
         elif stage in (self.FINAL_REVIEW, self.APPROVED):
             stage_days = self.days_since(self.get_label_date(pr, stage))
+        else:
+            stage_days = 0
         total_review_days = self.days_since(ready_date)
         author_email = self.get_user_email(pr.user.login)
         reviewer_emails, action_message = self.get_reviewers(pr)
