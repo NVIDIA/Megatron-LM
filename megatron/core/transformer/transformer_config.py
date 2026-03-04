@@ -721,10 +721,6 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
-    moe_use_legacy_grouped_gemm: bool = False
-    """Use legacy GroupedMLP rather than TEGroupedMLP.
-    Note: The legacy one will be deprecated soon."""
-
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -913,6 +909,13 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_fuse_tp_communication: bool = False
     """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
+
+    inference_disable_triton_nvls_kernels: bool = False
+    """ If true, disables the use of Triton NVLS kernels during inference. """
+
+    inference_disable_torch_grouped_mm: bool = False
+    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
+    falling back to TE GroupedGEMM. """
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1139,6 +1142,31 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+
+        if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                )
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
+            if self.moe_router_padding_for_quantization:
+                raise ValueError(
+                    "Inference-optimized MoE layers do not support padded "
+                    "routing map for quantization."
+                )
+            if self.moe_router_dtype != "fp32":
+                raise ValueError(
+                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
+                    "to avoid costly dtype conversions during decode."
+                )
+            if self.gated_linear_unit and self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
+                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
+                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
+                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -2058,9 +2086,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.overlap_moe_expert_parallel_comm
             ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
-            assert (
-                not self.moe_use_legacy_grouped_gemm
-            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
@@ -2141,6 +2166,21 @@ class TransformerConfig(ModelParallelConfig):
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
+                "for inference_optimized transformer implementation."
+            )
+            assert (
+                self.num_moe_experts is None
+            ), "--inference-fuse-tp-communication is not supported for MoE models."
+
+        if self.inference_disable_triton_nvls_kernels:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_triton_nvls_kernels is only supported "
+                "for inference_optimized transformer implementation."
+            )
+
+        if self.inference_disable_torch_grouped_mm:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_torch_grouped_mm is only supported "
                 "for inference_optimized transformer implementation."
             )
 
