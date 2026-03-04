@@ -144,6 +144,7 @@ class _LayerwiseAllGatherHandle:
         self.handles = handles
 
     def wait(self):
+        """Wait on the last handle and clear all handles."""
         if self.handles:
             self.handles[-1].wait()
         self.handles = None
