@@ -284,6 +284,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_torch_grouped_mm": False,
     "inference_disable_triton_nvls_kernels": False,
+    "moe_router_force_biased": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
