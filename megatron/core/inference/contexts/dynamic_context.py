@@ -250,6 +250,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
+        self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
@@ -1644,6 +1645,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_matched > 0 and block_aligned:
             prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
         else:
+            prefix_skip_tokens = 0
+
+        # Hybrid models: disable prefill skipping (no Mamba states per block),
+        # but keep matched blocks for memory sharing.
+        if self.is_hybrid_model:
             prefix_skip_tokens = 0
 
         effective_chunk_length = chunk_length - prefix_skip_tokens
