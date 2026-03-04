@@ -753,7 +753,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
 class CheckpointManager:
     """
-    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock 
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock
     cross layer recomputations, enabling unified recomputation during backward pass.
     This is particularly useful for scenarios where multiple checkpoint operations have
     sequential dependencies (i.e., the output of one checkpoint is the input of the next).

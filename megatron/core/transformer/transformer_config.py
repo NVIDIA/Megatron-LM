@@ -1390,8 +1390,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
         ):
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
