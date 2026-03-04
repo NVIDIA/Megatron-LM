@@ -50,6 +50,12 @@ jobs:
             Focus ONLY on:
             - Critical bugs or logic errors
             - Typos in code, comments, or strings
+            - Missing or insufficient test coverage for changed code
+            - Outdated or inaccurate documentation affected by the changes
+
+            Do NOT comment on:
+            - Style preferences or formatting
+            - Minor naming suggestions
             - Architectural opinions or refactoring ideas
             - Performance unless there is a clear, measurable issue
 
