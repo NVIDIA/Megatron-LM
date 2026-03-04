@@ -73,6 +73,21 @@ python tools/preprocess_data.py \
 | `--performance-dir` | Directory where to save performance results |
 | `--max-documents` | Number of documents to be preprocessed during each run |
 
+**Output example**
+
+```bash
+-----------------------------------
+Performance results (fastest → slowest):
+1. 16 workers → avg. docs/s: 9606.6476
+2. 32 workers → avg. docs/s: 9275.3284
+3. 8 workers → avg. docs/s: 9151.9280
+4. 4 workers → avg. docs/s: 6391.3819
+
+-----------------------------------
+The most optimal num of workers is 16 with avg. preprocessed docs/s: 9606.6476.
+-----------------------------------
+```
+
 ## Output Files
 
 The preprocessing tool generates two files:
