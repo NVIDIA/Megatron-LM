@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Entrypoints for saving and loading the distributed checkpoints.
+"""Entrypoints for saving and loading the distributed checkpoints.
 
 Functions `load` and `save` are equivalents of `torch.load` and `torch.save`
 but expect torch.Tensors to be wrapped with classes from the `mapping module`.
@@ -15,6 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -38,7 +39,7 @@ from .strategies.base import (
     StrategyAction,
     get_default_strategy,
 )
-from .utils import extract_sharded_base
+from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
     StrictHandling,
     determine_global_metadata,
@@ -106,6 +107,17 @@ def load(
         checkpoint_dir, sharded_strategy, common_strategy
     )
 
+    # Dequantize all FP8 tensors in the state dict into their corresponding high-precision tensors.
+    # Retaining FP8 tensors in the state dict can cause issues in the following two cases:
+    #   1. Sometimes, when the precision of the checkpoint is higher than that of the model params,
+    #      we want to directly use the state dict to initialize the main params. If the FP8 tensors
+    #      in this sharded state dict are not converted to high-precision tensors, the loaded
+    #      tensors will already be quantized, which defeats the purpose of initializing the main
+    #      params with a high-precision state dict;
+    #   2. When using delayed scaling, this loading process writes an extra value into the global
+    #      amax_history buffer of Transformer Engine, which is undesirable.
+    force_all_tensors_to_non_fp8(sharded_state_dict)
+
     common_state_dict = common_strategy.load_common(checkpoint_dir)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
@@ -170,9 +182,12 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     """
     if isinstance(checkpoint_dir, Path):
         checkpoint_dir = str(checkpoint_dir)
-        logger.warning(
-            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in load_common_state_dict will "
-            "no longer be supported in a future release. Please pass it as a string instead."
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in "
+            "load_common_state_dict will no longer be supported in a future release. "
+            "Please pass it as a string instead.",
         )
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
     return common_strategy.load_common(checkpoint_dir)
@@ -438,6 +453,14 @@ def get_default_save_common_strategy(
     return get_default_strategy(StrategyAction.SAVE_COMMON, backend, version)
 
 
-def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
-    """Get default load sharded strategy."""
-    return verify_checkpoint_and_load_strategy(checkpoint_dir)[0]
+def get_default_load_sharded_strategy(
+    checkpoint_dir: str, cache_metadata: bool = False
+) -> LoadShardedStrategy:
+    """Get default load sharded strategy.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory.
+        cache_metadata: If True and checkpoint format is torch_dist, use a strategy that caches
+            metadata (e.g. when ckpt_assume_constant_structure is enabled).
+    """
+    return verify_checkpoint_and_load_strategy(checkpoint_dir, cache_metadata=cache_metadata)[0]

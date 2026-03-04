@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ class DummyNode:
     to transformer layers in a real model.
     """
 
-    common_state = DummyState()
+    layer_state = DummyState()
     chunk_state = DummyState()
 
     def detach(self, x):

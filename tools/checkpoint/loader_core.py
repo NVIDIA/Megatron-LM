@@ -5,6 +5,7 @@ import os
 import sys
 import torch
 import types
+from functools import partial
 
 from schema_core import get_model_schema
 from loader_base import MegatronCheckpointLoaderBase
@@ -54,7 +55,9 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
     def import_model_provider(self):
         """Return the correct model_provider function depending on GPT vs. BERT."""
         if self.args.model_type == 'GPT':
-            from pretrain_gpt import model_provider
+            from model_provider import model_provider
+            from gpt_builders import gpt_builder
+            self.model_provider = partial(model_provider, gpt_builder)
             return model_provider
         elif self.args.model_type == 'BERT':
             from pretrain_bert import model_provider

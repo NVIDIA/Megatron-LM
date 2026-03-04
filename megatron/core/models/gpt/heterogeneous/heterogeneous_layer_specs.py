@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
+from typing import Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -26,9 +27,12 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -41,6 +45,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinearGathered,
+    ) = (None, None, None, None, None)
     HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -57,8 +68,9 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def _get_layer_norm(config: AttentionConfig | MLPConfig, use_te: bool, normalization: str):
@@ -106,8 +118,10 @@ def _get_heterogenous_attention_spec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                core_attention=TEDotProductAttention if use_te else DotProductAttention,
+                linear_qkv=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
+                core_attention=not_none(TEDotProductAttention) if use_te else DotProductAttention,
                 linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
                 q_layernorm=ln,
                 k_layernorm=ln,
@@ -130,8 +144,10 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
         mlp = ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                linear_fc1=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
+                linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
             ),
         )
     return mlp
@@ -151,23 +167,30 @@ def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_t
     mapping = {}
     if not use_te:
         if block_config.attention.num_query_groups is not None:
-            mapping.update({'input_layernorm.': 'self_attention.linear_qkv.layer_norm_'})
+            mapping.update({"input_layernorm.": "self_attention.linear_qkv.layer_norm_"})
         if block_config.attention.replace_with_linear:
-            mapping.update({'input_layernorm.': 'self_attention.layer_norm_'})
+            mapping.update({"input_layernorm.": "self_attention.layer_norm_"})
         if block_config.mlp.ffn_hidden_size is not None:
-            mapping.update({'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_'})
+            mapping.update({"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"})
         if block_config.mlp.replace_with_linear:
-            mapping.update({'pre_mlp_layernorm.': 'mlp.layer_norm_'})
+            mapping.update({"pre_mlp_layernorm.": "mlp.layer_norm_"})
     return mapping
 
 
-def get_gpt_heterogeneous_layer_spec(config: HeterogeneousTransformerConfig, use_te: bool = False):
+def get_gpt_heterogeneous_layer_spec(
+    config: HeterogeneousTransformerConfig,
+    use_te: bool = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+):
     """
     Returns a list of ModuleSpec objects for the transformer layers in the heterogeneous model.
 
     Args:
         config (HeterogeneousTransformerConfig): Heterogeneous Transformer configuration.
         use_te (bool, optional): To use Transformer-Engine. Defaults to False.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         ModuleSpec: Module specification for the transformer layers
@@ -197,8 +220,8 @@ def get_gpt_heterogeneous_layer_spec(config: HeterogeneousTransformerConfig, use
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Submodules layer_norm determines the type of layernorm used in the last layernorm

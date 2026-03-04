@@ -57,7 +57,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                            'sequence_parallel', 'async_tensor_model_parallel_allreduce',
+                            'sequence_parallel',
                             'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
                             'vocab_file',
                             'save_interval', 'save',
@@ -99,7 +99,6 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     '--no-masked-softmax-fusion',
                     '--no-bias-gelu-fusion',
                     '--no-bias-dropout-fusion',
-                    '--no-async-tensor-model-parallel-allreduce',
                     '--use-cpu-initialization',
                     '--micro-batch-size', '1',
                     '--no-load-optim',
@@ -153,7 +152,6 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         margs.allow_missing_vision_projection_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_vision_projection_checkpoint", False)
         margs.freeze_LM = getattr(self.md.checkpoint_args, "freeze_LM", False)
         margs.freeze_ViT = getattr(self.md.checkpoint_args, "freeze_ViT", False)
-        margs.encoder_tensor_model_parallel_size = getattr(self.md.checkpoint_args, "encoder_tensor_model_parallel_size", 0)
         margs.force_system_message = getattr(self.md.checkpoint_args, "force_system_message", False)
         margs.image_tag_type = getattr(self.md.checkpoint_args, "image_tag_type", "")
         margs.num_frames = getattr(self.md.checkpoint_args, "num_frames", 8)

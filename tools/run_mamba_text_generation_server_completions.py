@@ -8,4 +8,4 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.
 from run_text_generation_server import main
 
 if __name__ == "__main__":
-    main(model_provider="mamba")
+    main(model_type="mamba")

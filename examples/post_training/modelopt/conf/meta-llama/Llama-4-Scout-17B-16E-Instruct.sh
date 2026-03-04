@@ -50,4 +50,5 @@ MODEL_ARGS=" \
     --no-bias-swiglu-fusion \
     --export-qk-l2-norm \
     --export-moe-apply-probs-on-input \
+    --padded-vocab-size 202048 \
 "

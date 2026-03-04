@@ -42,6 +42,7 @@ The user-passed configuration is split into 2 distinct pieces:
 The idea here is to provide an ability to define arbitrarily-complicated recipes in as
 friendly a way as possible.
 """
+
 import fnmatch
 import logging
 from abc import ABC, abstractmethod
@@ -49,9 +50,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import yaml
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 
 @dataclass
@@ -78,8 +86,8 @@ class QuantizationConfig:
 
     def __repr__(self) -> str:
         return (
-            f'{type(self).__name__}(config={self.config}, '
-            f'match_input={self.match_input}, config_key={self.config_key})'
+            f"{type(self).__name__}(config={self.config}, "
+            f"match_input={self.match_input}, config_key={self.config_key})"
         )
 
 
@@ -117,7 +125,7 @@ class GlobMatcher(Matcher):
         return None
 
     def __repr__(self) -> str:
-        return f'{type(self).__name__}(pattern={self.pattern}, config_key={self.config_key})'
+        return f"{type(self).__name__}(pattern={self.pattern}, config_key={self.config_key})"
 
 
 class RecipeConfig:
@@ -128,11 +136,13 @@ class RecipeConfig:
         self.matchers = matchers
 
     @staticmethod
-    def _build_matchers(matchers_dict: Dict) -> List[Matcher]:
+    def _build_matchers(matchers_dict: Dict | None) -> List[Matcher]:
         # NOTE(slayton): We rely on order for matchers because it allows us to specify an
         # override ordering from the yaml structure. Process matchers in order of
         # definition, so we can have fallthrus.
         matchers: List[Matcher] = []
+        if matchers_dict is None:
+            return matchers
 
         for name, matcher in matchers_dict.items():
             enabled = matcher.get("enabled", False)
@@ -141,14 +151,14 @@ class RecipeConfig:
                 continue
 
             match_type = matcher.get("type", None)
-            assert match_type is not None, f"Matcher must specify a \"type\" field"
+            assert match_type is not None, f'Matcher must specify a "type" field'
 
             if match_type == "glob":
                 pattern = matcher.get("pattern", None)
                 config = matcher.get("config", None)
 
-                assert pattern is not None, f"GlobMatcher must specify \"pattern\" field"
-                assert config is not None, f"GlobMatcher must specify \"config\" field"
+                assert pattern is not None, f'GlobMatcher must specify "pattern" field'
+                assert config is not None, f'GlobMatcher must specify "config" field'
 
                 m = GlobMatcher(pattern, config)
             else:
@@ -162,8 +172,17 @@ class RecipeConfig:
     def from_yaml_file(recipe_yaml_path: str) -> "RecipeConfig":
         """Loads recipe from yaml configuration."""
 
+        if not HAVE_YAML:
+            raise ImportError("yaml is not installed. Please install it with `pip install pyyaml`.")
+
         with open(recipe_yaml_path, "r") as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.load(f, Loader=yaml.SafeLoader)
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Loaded quantization recipe from path '{recipe_yaml_path}'. " f"Contents: '{config}'",
+        )
 
         return RecipeConfig.from_config_dict(config)
 
@@ -173,7 +192,7 @@ class RecipeConfig:
 
         matchers_config = config.get("matchers", None)
         matchers = RecipeConfig._build_matchers(matchers_config)
-        config_dict = config.get("configs", None)
+        config_dict = config.get("configs", {})
 
         return RecipeConfig(matchers, config_dict)
 
@@ -185,11 +204,15 @@ class RecipeConfig:
         for matcher in self.matchers:
             config_key = matcher.match(operator_context)
             if config_key is not None:
-                logger.info(
-                    f'Context ({operator_context}) matched to quant config \"{config_key}\"'
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f'Context ({operator_context}) matched to quant config "{config_key}"',
                 )
                 return config_key
-        logger.info(f'No config key match found for Context ({operator_context})')
+        log_single_rank(
+            logger, logging.INFO, f"No config key match found for Context ({operator_context})"
+        )
         return None
 
     def match(self, operator_context: MatchContext) -> QuantizationConfig | None:
@@ -205,8 +228,8 @@ class RecipeConfig:
         return None
 
     def __repr__(self) -> str:
-        s = f'{type(self).__name__}(\n'
+        s = f"{type(self).__name__}(\n"
         for matcher in self.matchers:
-            s += f'  matcher({repr(matcher)}\n'
-        s += ')'
+            s += f"  matcher({repr(matcher)}\n"
+        s += ")"
         return s

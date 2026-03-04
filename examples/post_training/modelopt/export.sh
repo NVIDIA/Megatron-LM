@@ -26,8 +26,6 @@ if [ "${TP}" != "1" ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} is forced to be 1 during export!!\n"
 fi
 
-# Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
 
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/export.py \
     ${MODEL_ARGS} \

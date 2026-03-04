@@ -4,7 +4,6 @@ import re
 from typing import Optional
 
 import torch
-from tqdm import tqdm
 
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
@@ -12,6 +11,13 @@ from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAM
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
 from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
 
 
 # pylint: disable=line-too-long
@@ -98,10 +104,10 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         """
         storage = self.storage_type
 
-        scale_key = '.'.join(layer_name.split('.')[:-1]) + '.weights_scaling_factor'
+        scale_key = ".".join(layer_name.split(".")[:-1]) + ".weights_scaling_factor"
         if scale_key in self.scales and layer_name.endswith("weight"):
             storage = torch.float8_e4m3fn
-            val = val * self.scales[scale_key]['weight_multiplier'].to(val.device)
+            val = val * self.scales[scale_key]["weight_multiplier"].to(val.device)
 
         return val.to(storage)
 
@@ -125,17 +131,17 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 layer_name (str): The TRTLLMlayername as a string
                 split_type (str, optional): The split type. Defaults to None.
             """
-            if split_type == 'expert_split':
+            if split_type == "expert_split":
                 for split_num, split_val in enumerate(val):
-                    self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
+                    self.trtllm_model_weights[f"{layer_name}.{split_num}.bin"] = (
                         self._cast_value(split_val, layer_name).detach().contiguous()
                     )
-            elif split_type == 'tensor_split':
+            elif split_type == "tensor_split":
                 for split_num, split_val in enumerate(val):
                     if split_val.ndim >= 2:
                         split_val = torch.transpose(split_val.reshape(split_val.shape[0], -1), 1, 0)
 
-                    self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
+                    self.trtllm_model_weights[f"{layer_name}.{split_num}.bin"] = (
                         self._cast_value(split_val, layer_name).detach().contiguous()
                     )
             else:
@@ -145,6 +151,16 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 self.trtllm_model_weights[layer_name] = (
                     self._cast_value(val, layer_name).detach().contiguous()
                 )
+
+        def _duplicate_kv_head(val: torch.Tensor, rep: int, dim: int):
+            """Duplicates a kv tensor along specified dimension.
+            [hidden_dim, num_kv_heads, 1, size_per_head] -> [hidden_dim, num_kv_heads, rep, size_per_head]
+            or [num_kv_heads, 1, size_per_head] -> [num_kv_heads, rep, size_per_head]
+            """
+            shapes = list(val.shape)
+            shapes[dim] = rep
+
+            return val.expand(*shapes)
 
         if val.ndim == 2:
             val = val.T
@@ -163,7 +179,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             if (
                 self.transformer_config.layernorm_zero_centered_gamma
                 and self.transformer_config.normalization == "LayerNorm"
-                and 'layernorm.weight' in layer_name
+                and "layernorm.weight" in layer_name
             ):
                 val = val + 1.0
 
@@ -176,7 +192,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=0)
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                val=split_vals, layer_name=layer_name, split_type="tensor_split"
             )
 
         elif (
@@ -190,12 +206,12 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 gate_layer_name = layer_name.replace("fc", "gate")
                 split_vals = torch.chunk(gate, self.export_config.inference_tp_size, axis=-1)
                 _add_to_trtllm_model_weights(
-                    val=split_vals, layer_name=gate_layer_name, split_type='tensor_split'
+                    val=split_vals, layer_name=gate_layer_name, split_type="tensor_split"
                 )
 
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                val=split_vals, layer_name=layer_name, split_type="tensor_split"
             )
 
         elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
@@ -203,7 +219,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                val=split_vals, layer_name=layer_name, split_type="tensor_split"
             )
 
         elif layer_name.endswith(suffix(TRTLLMLayers.attention_qkv_bias)):
@@ -216,20 +232,25 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             # We first concat all sub weights per tp rank together.
             val = val.reshape(self.num_kv_heads, q_num + 2, size_per_head)
 
-            qkv = torch.split(val, [q_num, 1, 1], dim=1)
-            q_split = torch.chunk(qkv[0], self.export_config.inference_tp_size, axis=0)
-            k_split = torch.chunk(qkv[1], self.export_config.inference_tp_size, axis=0)
-            v_split = torch.chunk(qkv[2], self.export_config.inference_tp_size, axis=0)
+            q_bias, k_bias, v_bias = torch.split(val, [q_num, 1, 1], dim=1)
+
+            if self.num_kv_heads < self.export_config.inference_tp_size:
+                rep = self.export_config.inference_tp_size // self.num_kv_heads
+                k_bias = _duplicate_kv_head(k_bias, rep, dim=1)
+                v_bias = _duplicate_kv_head(v_bias, rep, dim=1)
+
+            # Reshape before splitting for num_kv_heads < tp_size
+            q_split = torch.chunk(q_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
+            k_split = torch.chunk(k_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
+            v_split = torch.chunk(v_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
 
             # Concatenate Q, K, and V together
             split_vals = [
-                torch.concatenate(
-                    [q_split[i].reshape(-1), k_split[i].reshape(-1), v_split[i].reshape(-1)], dim=0
-                )
+                torch.concatenate([q_split[i], k_split[i], v_split[i]], dim=0)
                 for i in range(self.export_config.inference_tp_size)
             ]
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                val=split_vals, layer_name=layer_name, split_type="tensor_split"
             )
 
         # TODO : Should add a atten layer dimension "qkvqkv, qqkkvv etc to see how to reshape here"
@@ -246,35 +267,43 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             val = val.reshape(hidden_dim, self.num_kv_heads, q_num + 2, size_per_head)
 
             # Split the QKV to separate variables.
-            qkv = torch.split(val, [q_num, 1, 1], dim=2)
+            q_weight, k_weight, v_weight = torch.split(val, [q_num, 1, 1], dim=2)
 
-            query_groups_shape = qkv[0].shape
-            if len(query_groups_shape) > 1:
-                if (query_groups_shape[1] % self.export_config.inference_tp_size) != 0:
+            if self.num_kv_heads < self.export_config.inference_tp_size:
+                if self.export_config.inference_tp_size % self.num_kv_heads != 0:
                     raise Exception(
                         "Number of query groups of the models is {0}. Please select tensor parallelism size "
-                        "that can split the number of query groups to equal number of query matrices in the "
-                        "each GPU.".format(query_groups_shape[1])
+                        "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                        "each GPU.".format(self.num_kv_heads)
                     )
+                rep = self.export_config.inference_tp_size // self.num_kv_heads
+                k_weight = _duplicate_kv_head(k_weight, rep, dim=2)
+                v_weight = _duplicate_kv_head(v_weight, rep, dim=2)
+            elif (self.num_kv_heads % self.export_config.inference_tp_size) != 0:
+                raise Exception(
+                    "Number of query groups of the models is {0}. Please select tensor parallelism size "
+                    "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                    "each GPU.".format(self.num_kv_heads)
+                )
 
-            q_split = torch.chunk(qkv[0], self.export_config.inference_tp_size, axis=1)
-            k_split = torch.chunk(qkv[1], self.export_config.inference_tp_size, axis=1)
-            v_split = torch.chunk(qkv[2], self.export_config.inference_tp_size, axis=1)
+            # Reshape before splitting for num_kv_heads < tp_size
+            q_split = torch.chunk(
+                q_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
+            k_split = torch.chunk(
+                k_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
+            v_split = torch.chunk(
+                v_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
 
             # Concatenate Q, K, and V together
             split_vals = [
-                torch.concatenate(
-                    [
-                        q_split[i].reshape(hidden_dim, -1),
-                        k_split[i].reshape(hidden_dim, -1),
-                        v_split[i].reshape(hidden_dim, -1),
-                    ],
-                    dim=1,
-                )
+                torch.concatenate([q_split[i], k_split[i], v_split[i]], dim=1)
                 for i in range(self.export_config.inference_tp_size)
             ]
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                val=split_vals, layer_name=layer_name, split_type="tensor_split"
             )
 
         elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight_mixture_of_experts)):
@@ -287,14 +316,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             split_vals = [torch.concatenate(item, dim=1) for item in zip(split_w3s, split_w1s)]
             layer_name = layer_name.replace(".expert", "")  # Remove suffix .expert from key
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='expert_split'
+                val=split_vals, layer_name=layer_name, split_type="expert_split"
             )
 
         elif layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight_mixture_of_experts)):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
             layer_name = layer_name.replace(".expert", "")  # Remove suffix .expert from key
             _add_to_trtllm_model_weights(
-                val=split_vals, layer_name=layer_name, split_type='expert_split'
+                val=split_vals, layer_name=layer_name, split_type="expert_split"
             )
         else:
             raise ValueError(f"{layer_name} cannot be handled by converter")
@@ -360,9 +389,13 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 for layer_number in range(self.transformer_config.num_layers):
                     # e.g transformer.layers.mlp.fc.bias => transformer.layers.2.mlp.fc.bias
                     layer_name_with_layer_number = re.sub(
-                        r'(?<=layers\.)', f'{layer_number}.', layer_name
+                        r"(?<=layers\.)", f"{layer_number}.", layer_name
                     )
                     transformer_layers_dict[layer_name_with_layer_number] = value[layer_number]
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required for SingleDeviceTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"
+            )
 
         for layer_name, value in tqdm(
             transformer_layers_dict.items(), desc="Converting to TRTLLM Weights"
@@ -427,7 +460,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             else:
                 continue
             if (
-                hasattr(trtllm_model_config, 'new_decoder_architecture')
+                hasattr(trtllm_model_config, "new_decoder_architecture")
                 and trtllm_model_config.new_decoder_architecture
                 and "post_layernorm" in layer_name
             ):

@@ -36,5 +36,5 @@ RUN pip install fairscale fire blobfile
 # Use --no-deps for the following to avoid outdated and unnecessary dependencies.
 RUN pip install mmf --no-deps
 RUN pip install open_clip_torch open-flamingo[eval] --no-deps
-RUN pip install zarr "tensorstore==0.1.45"
+RUN pip install "tensorstore==0.1.45"
 RUN pip install git+https://github.com/NVIDIA/Megatron-Energon.git#egg=megatron-energon[av_decode]
