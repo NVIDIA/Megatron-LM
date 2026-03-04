@@ -41,4 +41,4 @@ jobs:
             - Architectural opinions or refactoring ideas
             - Performance unless there is a clear, measurable issue
 
-            If everything looks good, say so briefly. Do not leave unnecessary comments.
+            Always post a comment summarizing your findings. If everything looks good, post a brief LGTM.
