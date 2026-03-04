@@ -49,7 +49,7 @@ def _mamba_chunk_scan_combined_fwd(
     seqlen, nheads, headdim = x.shape
     _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
-    assert B.shape == (seqlen, ngroups, dstate)
+    assert B.shape == (seqlen, ngroups, dstate), f"B.shape={B.shape} != ({seqlen}, {ngroups}, {dstate})"
     assert dt.shape == (seqlen, nheads)
     assert A.shape == (nheads,)
     assert C.shape == B.shape

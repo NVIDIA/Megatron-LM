@@ -540,7 +540,13 @@ class MambaMixer(MegatronModule):
             else None
         )
 
-        return self._ssm_prefill(
+        # Also strip padded tokens from the data tensor itself. zxBCdt has
+        # shape (padded_total_tokens, 1, d); trim to real tokens so that all
+        # downstream tensors (z, xBC, dt) have consistent shapes.
+        padded_token_count = zxBCdt.shape[0]
+        zxBCdt = zxBCdt[:real_token_count]
+
+        y_prefill = self._ssm_prefill(
             zxBCdt,
             conv_state=conv_state,
             ssm_state=ssm_state,
@@ -549,6 +555,15 @@ class MambaMixer(MegatronModule):
             batch_indices=batch_indices,
             use_triton_conv1d=context.use_triton_conv1d,
         )
+
+        # Pad output back to padded token count. The caller (residual add,
+        # tensor_merge) expects the output to match the padded input shape.
+        if y_prefill.shape[0] < padded_token_count:
+            y_prefill = F.pad(
+                y_prefill, (0, 0, 0, 0, 0, padded_token_count - y_prefill.shape[0])
+            )
+
+        return y_prefill
 
     def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
