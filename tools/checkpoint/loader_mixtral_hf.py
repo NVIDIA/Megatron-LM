@@ -62,7 +62,7 @@ def load_args_from_checkpoint(args):
 
 def verify_transformers_version():
     major, minor, patch = map(int, transformers.__version__.split('.'))
-    assert major >= 4 and minor >= 36
+    assert major >= 5 or (major >= 4 and minor >= 36)
 
 def set_preprocess_state(args, model, hf_model):
     '''Set embedding params.'''
