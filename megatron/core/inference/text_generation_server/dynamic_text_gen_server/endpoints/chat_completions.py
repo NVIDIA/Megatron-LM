@@ -36,7 +36,11 @@ try:
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=req.get("tools", None),
+                **req.get("chat_template_kwargs", {}),
             )
         except (AttributeError, AssertionError):
             warnings.warn(
@@ -184,7 +188,7 @@ try:
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
-            message["generation_log_probs"] = result.get("generated_log_probs", None)
+            message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             choice_data = {
@@ -192,7 +196,7 @@ try:
                 "message": message,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result["generated_log_probs"],
+                "generation_log_probs": result.get("generated_log_probs", []),
                 "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
                 # "logprobs": {"content": logprobs_content} if logprobs_content else None,
@@ -201,15 +205,11 @@ try:
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
             }
-            if result.get("policy_staleness") is not None:
-                choice_data["policy_staleness"] = result["policy_staleness"]
-            if result.get("kv_cache_staleness") is not None:
-                choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
-            events = result.get("events")
-            if events is not None:
-                num_evictions = sum(1 for e in events if e.get("type") == "EVICT")
-                if num_evictions > 0:
-                    choice_data["num_evictions"] = num_evictions
+            choice_data["policy_staleness"] = result["policy_staleness"]
+            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["num_evictions"] = sum(
+                1 for e in result["events"] if e.get("type") == "EVICT"
+            )
             if current_app.config['verbose']:
                 logging.info(result)
             if result["routing_indices"] is not None:
