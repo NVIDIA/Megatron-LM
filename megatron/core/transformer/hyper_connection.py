@@ -178,8 +178,7 @@ class HyperConnectionModule(MegatronModule):
         Args:
             x: [s, b, n*C] - n-stream hidden states
         """
-        s, b, nC = x.shape
-        n = self.n
+        nC = x.shape[-1]
         r = x.norm(dim=-1, keepdim=True) / math.sqrt(nC)  # shape: [s, b, 1]
         r = 1.0 / (r + self.norm_eps)  # shape: [s, b, 1]
         proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
@@ -199,7 +198,6 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
         """
-        s, b, _ = proj.shape
         alpha_ = torch.cat(
             [
                 self.alpha_pre.expand(self.n),

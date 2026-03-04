@@ -428,7 +428,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+             "shared_experts", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -437,7 +438,10 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -835,24 +839,6 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
-
-    recompute_hyper_connections: bool = False
-    """Enable recomputation for HyperConnection intermediate activations.
-    
-    When enabled, HyperConnection intermediate activations are managed by
-    CheckpointWithoutOutput + CheckpointManager to reduce activation memory.
-    Note that compute_mappings is kept as a normal forward op because its outputs
-    (h_pre/h_post/h_res) are consumed by downstream computations in the same layer.
-    The checkpointed path focuses on activations that can be safely discarded and
-    recomputed during backward pass.
-    
-    Requirements:
-    - Only effective when enable_hyper_connections=True and training=True
-    - Must use recompute_granularity='selective'
-    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
-    
-    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
-    serves as the hook_tensor for registering the unified recompute hook."""
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
@@ -1312,6 +1298,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1374,21 +1361,16 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
-        # Validation for recompute_hyper_connections
-        if self.recompute_hyper_connections:
+        # Validation for "mhc" in recompute_modules
+        if "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
                 raise ValueError(
-                    "recompute_hyper_connections requires enable_hyper_connections=True."
-                )
-            if self.recompute_granularity != "selective":
-                raise ValueError(
-                    "recompute_hyper_connections requires recompute_granularity='selective'. "
-                    f"Got recompute_granularity={self.recompute_granularity}."
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
                 )
             if "mlp" in self.recompute_modules:
                 raise ValueError(
-                    "recompute_hyper_connections cannot be used together with 'mlp' in "
-                    "recompute_modules. They use different checkpoint mechanisms that may conflict."
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
                 )
             if self.mhc_recompute_layer_num is not None and (
                 isinstance(self.mhc_recompute_layer_num, bool)
@@ -1397,15 +1379,26 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "mhc_recompute_layer_num must be a positive integer when "
-                    "recompute_hyper_connections=True."
+                    "'mhc' is in recompute_modules."
                 )
             if self.fine_grained_activation_offloading:
                 raise ValueError(
-                    "recompute_hyper_connections is incompatible with "
+                    "'mhc' in recompute_modules is incompatible with "
                     "fine_grained_activation_offloading. The mHC recompute hook fires "
                     "before the offloading backward chunk is initialized, causing "
                     "tensor_pop on a None chunk. Disable one of them."
                 )
+
+        if (
+            self.enable_hyper_connections
+            and self.recompute_granularity == "selective"
+            and "mhc" not in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled with selective recompute but 'mhc' is not in "
+                "recompute_modules. Consider adding 'mhc' to recompute_modules to reduce "
+                "activation memory."
+            )
 
         # Validation for hyper_connections with MTP
         if self.enable_hyper_connections and self.mtp_num_layers is not None:

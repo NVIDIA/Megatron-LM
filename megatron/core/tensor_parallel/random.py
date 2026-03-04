@@ -753,24 +753,17 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
 class CheckpointManager:
     """
-    MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
-
-    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock for
-    HyperConnection computations, enabling unified recomputation during backward pass.
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock 
+    cross layer recomputations, enabling unified recomputation during backward pass.
     This is particularly useful for scenarios where multiple checkpoint operations have
     sequential dependencies (i.e., the output of one checkpoint is the input of the next).
 
     Usage:
-        # In TransformerBlock:
-        manager = CheckpointManager()
-
-        # Pass manager to each layer's HyperConnection
-        for layer in self.layers:
-            hidden_states = layer.forward(..., mhc_recompute_manager=manager)
-
-        # After all layers, register unified recompute on final output
-        final_output = hidden_states.sum()  # or loss
-        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+        ckptManager = CheckpointManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckptManager)
+        ckpt_function.checkpoint(run_function, *args)
+        # other checkpointed operations
+        ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
     """
 
     def __init__(self):
@@ -848,12 +841,9 @@ class CheckpointWithoutOutput(object):
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
-        # Also skip during CUDA graph capture: saving/restoring RNG states via the
-        # non-graph-safe path would call CUDAGeneratorImpl::current_seed which is
-        # not allowed while a stream is being captured.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup() or torch.cuda.is_current_stream_capturing():
+        if is_graph_warmup():
             return run_function(*args)
 
         self.run_function = run_function
@@ -877,10 +867,8 @@ class CheckpointWithoutOutput(object):
         from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
         # The recomputation has been triggered already. Just return.
-        # Handle cudagraphs: skip during graph warmup and native CUDA graph capture,
-        # as _fork_rng / _set_all_rng_states use RNG APIs that are incompatible with
-        # stream capture.
-        if self.ctx is None or is_graph_warmup() or torch.cuda.is_current_stream_capturing():
+        # Handle cudagraphs: do nothing if currently in graph warmup
+        if self.ctx is None or is_graph_warmup():
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():

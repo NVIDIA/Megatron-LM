@@ -836,11 +836,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             outer_quantization_context = nullcontext()
 
         # Determine if MHC recompute should be used
-        # Only enable when: training mode AND hyper connections AND recompute_hyper_connections
+        # Only enable when: training mode AND hyper connections AND 'mhc' in recompute_modules
         use_mhc_recompute = (
             self.training
             and self.config.enable_hyper_connections
-            and self.config.recompute_hyper_connections
+            and self.config.recompute_granularity == 'selective'
+            and "mhc" in self.config.recompute_modules
         )
         mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
             use_mhc_recompute

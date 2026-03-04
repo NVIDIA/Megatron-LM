@@ -25,7 +25,7 @@ def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
     """Build a TransformerConfig with common MHC defaults.
 
     Any default can be overridden via **extra
-    (e.g. ``_make_mhc_config(num_layers=8, recompute_hyper_connections=True)``).
+    (e.g. ``_make_mhc_config(num_layers=8, recompute_modules=["core_attn", "mhc"])``).
     """
     base = dict(
         num_layers=2,
@@ -356,7 +356,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         config = _make_mhc_config(
             hidden_size=hidden_size,
             num_streams=num_streams,
-            recompute_hyper_connections=True,
+            recompute_modules=["core_attn", "mhc"],
             recompute_granularity='selective',
             **extra,
         )
@@ -512,7 +512,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
 
 
 class TestMHCRecomputeMemorySaving:
-    """Verify that recompute_hyper_connections actually reduces peak GPU memory."""
+    """Verify that 'mhc' in recompute_modules actually reduces peak GPU memory."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -541,7 +541,7 @@ class TestMHCRecomputeMemorySaving:
             hidden_size=hidden_size,
             num_streams=num_streams,
             num_layers=num_layers,
-            recompute_hyper_connections=use_recompute,
+            recompute_modules=["core_attn", "mhc"] if use_recompute else None,
             recompute_granularity='selective' if use_recompute else None,
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
@@ -984,19 +984,6 @@ class TestMHCWithOffloading:
         layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
-
-    def test_offloading_flags_set_correctly(self):
-        """Verify offload_attn_norm and offload_mlp_norm are properly set for mHC."""
-        layer, config = self._create_mhc_layer_with_offloading()
-
-        assert layer.offload_attn_norm, (
-            "offload_attn_norm should be True when fine_grained_activation_offloading=True "
-            "and 'attn_norm' in offload_modules"
-        )
-        assert layer.offload_mlp_norm, (
-            "offload_mlp_norm should be True when fine_grained_activation_offloading=True "
-            "and 'mlp_norm' in offload_modules"
-        )
 
     def test_forward_backward_with_offloading(self):
         """Forward+backward should work with activation offloading enabled.

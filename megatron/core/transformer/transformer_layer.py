@@ -1327,18 +1327,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
-        # In mHC the layernorm may be fused into TE linear layers, making
-        # input_layernorm / pre_mlp_layernorm an IdentityOp.  The base-class
-        # __init__ skips offloading when the norm is IdentityOp, but mHC still
-        # needs to offload the aggregated hidden_states around the norm call.
-        self.offload_attn_norm = (
-            self.config.fine_grained_activation_offloading
-            and "attn_norm" in self.config.offload_modules
-        )
-        self.offload_mlp_norm = (
-            self.config.fine_grained_activation_offloading
-            and "mlp_norm" in self.config.offload_modules
-        )
+        # When mHC recompute is active, skip checkpointing if the layernorm
+        # is IdentityOp (fused into TE linear) — there is nothing to recompute.
+        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
@@ -1432,7 +1424,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
         # Optional Input Layer norm
-        if mhc_recompute_manager is not None or self.recompute_input_layernorm:
+        checkpoint_input_layernorm = (
+            self.recompute_input_layernorm
+            or (mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm)
+        )
+        if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
@@ -1460,7 +1456,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
-        if self.recompute_input_layernorm or mhc_recompute_manager is not None:
+        if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
@@ -1530,7 +1526,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
         # Optional Layer norm post the cross-attention.
-        if mhc_recompute_manager is not None or self.recompute_pre_mlp_layernorm:
+        checkpoint_pre_mlp_layernorm = (
+            self.recompute_pre_mlp_layernorm
+            or (mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm)
+        )
+        if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
@@ -1609,7 +1609,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        if self.recompute_pre_mlp_layernorm or mhc_mlp_bda_recompute_manager is not None:
+        if self.recompute_pre_mlp_layernorm or (
+            mhc_mlp_bda_recompute_manager is not None
+            and self.mhc_checkpoint_pre_mlp_layernorm
+        ):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
             )

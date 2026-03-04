@@ -235,7 +235,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "qk_layernorm": False,
     "quant_recipe": None,
     "recompute_granularity": None,
-    "recompute_hyper_connections": False,
     "recompute_method": None,
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,

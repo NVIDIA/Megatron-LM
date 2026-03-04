@@ -8,7 +8,7 @@ Tests the following functionality:
 2. HyperConnectionModule.apply_h_post with CheckpointManager
 3. Multiple HyperConnectionModules chained with a single CheckpointManager
 4. Partial checkpoint (last layer not checkpointed)
-5. TransformerConfig recompute_hyper_connections option
+5. TransformerConfig 'mhc' in recompute_modules option
 """
 
 import pytest
@@ -381,26 +381,26 @@ class TestMHCBlockRecomputeIntegration:
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
 
 
-class TestTransformerConfigRecomputeHyperConnections:
-    """Test recompute_hyper_connections configuration option."""
+class TestTransformerConfigRecomputeMhc:
+    """Test 'mhc' in recompute_modules configuration."""
 
     def test_config_default_value(self):
-        """Test that recompute_hyper_connections defaults to False."""
+        """Test that 'mhc' is not in recompute_modules by default."""
         config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
-        assert config.recompute_hyper_connections is False
+        assert "mhc" not in config.recompute_modules
 
-    def test_config_enable_recompute_hyper_connections(self):
-        """Test enabling recompute_hyper_connections."""
+    def test_config_enable_mhc_recompute(self):
+        """Test enabling 'mhc' in recompute_modules."""
         config = TransformerConfig(
             num_layers=2,
             hidden_size=64,
             num_attention_heads=4,
             enable_hyper_connections=True,
             num_residual_streams=4,
-            recompute_hyper_connections=True,
+            recompute_modules=["core_attn", "mhc"],
             recompute_granularity='selective',
         )
-        assert config.recompute_hyper_connections is True
+        assert "mhc" in config.recompute_modules
         assert config.enable_hyper_connections is True
 
 

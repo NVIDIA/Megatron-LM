@@ -55,8 +55,8 @@ MODEL_ARGS:
   --num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
   --mhc-init-gating-factor: 0.01
-  --recompute-hyper-connections: true
   --recompute-granularity: selective
+  --recompute-modules: "[mhc]"
   --mhc-recompute-layer-num: 2
   --exit-interval: 50
 TEST_TYPE: ckpt-resume
