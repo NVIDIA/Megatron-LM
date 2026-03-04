@@ -1389,15 +1389,14 @@ class TransformerConfig(ModelParallelConfig):
                     "tensor_pop on a None chunk. Disable one of them."
                 )
 
-        if (
-            self.enable_hyper_connections
-            and self.recompute_granularity == "selective"
-            and "mhc" not in self.recompute_modules
+        if self.enable_hyper_connections and not (
+            self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
         ):
             warnings.warn(
-                "HyperConnections are enabled with selective recompute but 'mhc' is not in "
-                "recompute_modules. Consider adding 'mhc' to recompute_modules to reduce "
-                "activation memory."
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
             )
 
         # Validation for hyper_connections with MTP
