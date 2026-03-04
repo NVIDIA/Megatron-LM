@@ -185,19 +185,18 @@ class WeightedMultiTask(
         agent_groups = self._distribute_counts(request.num_groups)
 
         if request.batch_results:
-            # Each sub-agent batches independently. Merge their batches.
+            # Each sub-agent batches independently and yields individual groups.
+            # Collect each agent's share of groups per batch, then yield them.
+            agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
             generators = []
-            for agent, num_groups in zip(self.agents, agent_groups):
+            sub_group_counts = []
+            for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts):
                 if num_groups > 0:
                     if not isinstance(agent, GroupedRolloutGenerator):
                         raise TypeError(
                             f"Agent of type {type(agent)} does not support grouped rollouts"
                         )
-                    # TODO: Verify whether this makes sense outside of forced lag.
-                    # Scale parallel_generation_tasks proportionally to `num_groups`.
-                    agent.parallel_generation_tasks = int(
-                        agent.parallel_generation_tasks * num_groups / request.num_groups
-                    )
+                    agent.parallel_generation_tasks = pgt
                     sub_request = GroupedRolloutRequest(
                         num_groups=num_groups,
                         streaming=request.streaming,
@@ -209,18 +208,15 @@ class WeightedMultiTask(
                         filter_groups_with_same_reward=request.filter_groups_with_same_reward,
                     )
                     generators.append(agent.get_grouped_rollouts(sub_request))
+                    sub_group_counts.append(num_groups)
 
             while generators:
-                merged = []
-                for gen in generators:
-                    try:
-                        batch = await anext(gen)
-                        merged.extend(batch)
-                    except StopAsyncIteration:
-                        generators = []
-                        break
-                if merged:
-                    yield merged
+                try:
+                    for gen, count in zip(generators, sub_group_counts):
+                        for _ in range(count):
+                            yield await anext(gen)
+                except StopAsyncIteration:
+                    break
         else:
             # Balanced interleaving path (streaming and non-streaming).
             slots_total = 10 if request.streaming else request.num_groups
