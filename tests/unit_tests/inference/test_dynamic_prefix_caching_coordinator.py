@@ -443,7 +443,7 @@ class TestCoordinatorEndToEnd:
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)

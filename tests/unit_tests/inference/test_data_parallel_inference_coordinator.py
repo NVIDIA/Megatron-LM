@@ -72,6 +72,7 @@ class DummyContext:
 
     def __init__(self):
         self.active_cnt = 0
+        self.step_count = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -113,7 +114,6 @@ class DummyEngine(DynamicInferenceEngine):
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
-        self.step_count = 0
 
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
