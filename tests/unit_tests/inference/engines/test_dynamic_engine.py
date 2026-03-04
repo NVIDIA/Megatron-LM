@@ -51,7 +51,7 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -143,6 +143,8 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+
+    use_mla: bool = False
 
     def __post_init__(self):
 
@@ -299,9 +301,11 @@ class TestDynamicInferenceEngine:
         # Requests.
         requests = cls._build_requests(test_config)
 
+        transformer_config_cls = MLATransformerConfig if test_config.use_mla else TransformerConfig
+
         if test_config.model_provider == "gpt":
             # Transformer config.
-            transformer_config = TransformerConfig(
+            transformer_config = transformer_config_cls(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
@@ -340,11 +344,15 @@ class TestDynamicInferenceEngine:
                 # inference optimized currently only supports RMS Norm
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    multi_latent_attention=test_config.use_mla
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(multi_latent_attention=test_config.use_mla)
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec()
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    multi_latent_attention=test_config.use_mla
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
@@ -368,7 +376,7 @@ class TestDynamicInferenceEngine:
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
-            transformer_config = TransformerConfig(
+            transformer_config = transformer_config_cls(
                 params_dtype=torch.bfloat16,
                 num_layers=(
                     3 if pp_size == 1 else 6
@@ -1056,6 +1064,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
+    @pytest.mark.parametrize("use_mla", [False, True])
     @torch.inference_mode()
     def test_parallel_inference(
         self,
@@ -1066,6 +1075,7 @@ class TestDynamicInferenceEngine:
         sequence_parallel,
         materialize_only_last_token_logits,
         transformer_impl,
+        use_mla,
     ):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -1097,6 +1107,8 @@ class TestDynamicInferenceEngine:
                 pytest.skip(
                     reason="Mamba model is not supported with the inference optimized transformer."
                 )
+        if use_mla and transformer_impl == "local":
+            pytest.skip(reason="MLA does not work with the local implementation.")
 
         env = self._run_test(
             model_provider=model_provider,
@@ -1106,6 +1118,7 @@ class TestDynamicInferenceEngine:
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             transformer_impl=transformer_impl,
+            use_mla=use_mla,
         )
 
     @pytest.mark.internal
