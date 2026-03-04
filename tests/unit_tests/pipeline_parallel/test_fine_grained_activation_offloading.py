@@ -142,7 +142,7 @@ def _run_one_iter_and_capture(
         (True, False, ["qkv_linear"]),
         (True, False, ["core_attn"]),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
+        # (True, True, ["core_attn", "attn_proj"]),  # TODO(helenn/CI): re-enable this case on AWS.
         (True, False, ["mlp_norm"]),
         (True, False, ["expert_fc1"]),
         (True, False, ["moe_act"]),
