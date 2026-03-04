@@ -279,15 +279,15 @@ def check_files_exist(in_ss_out_names, key, num_partitions):
     return True
 
 
-def find_optimal_num_workers(directory: str):
+def find_optimal_num_workers(args):
     """Parses saved .json files with perf. numbers and prints optimal number of workers"""
     results = []
 
-    for filename in os.listdir(directory):
+    for filename in os.listdir(args.performance_dir):
         if not filename.endswith(".json"):
             continue
 
-        filepath = os.path.join(directory, filename)
+        filepath = os.path.join(args.performance_dir, filename)
 
         with open(filepath, "r") as f:
             data = json.load(f)
@@ -304,14 +304,14 @@ def find_optimal_num_workers(directory: str):
     print("\n-----------------------------------")
     print("Performance results (fastest → slowest):")
     for workers, avg_perf in results:
-        print(f"{workers} workers → avg docs/s: {avg_perf:.4f}")
+        print(f"{workers * args.partitions} workers → avg. docs/s: {avg_perf:.4f}")
     
     best_workers, best_perf = results[0]
 
     print("\n-----------------------------------")
     print(
-        f"The most optimal num of workers is {best_workers} "
-        f"with avg. preprocessed docs/s {best_perf:.4f}."
+        f"The most optimal num of workers is {best_workers * args.partitions} "
+        f"with avg. preprocessed docs/s: {best_perf:.4f}."
     )
     print("-----------------------------------")
 
@@ -469,7 +469,7 @@ def main():
                 builders[key].add_index(full_partition_output_prefix)
             builders[key].finalize(output_idx_files[key])
 
-    find_optimal_num_workers(args.performance_dir)
+    find_optimal_num_workers(args)
 
 if __name__ == '__main__':
 
