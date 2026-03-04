@@ -1,15 +1,16 @@
 #!/bin/bash
 
-#SBATCH -p gb200
+#SBATCH -p batch
 #SBATCH -q normal
 #SBATCH --account=coreai_dlalgo_llm
-#SBATCH -J coreai_dlalgo_llm-dcp.perf
 #SBATCH --ntasks-per-node=4
 #SBATCH --nodes=64
-#SBATCH --time=2:00:00
+#SBATCH --time=1:00:00
 #SBATCH --exclusive
+#SBATCH --gpus-per-node=4
 #SBATCH --mem=0
 #SBATCH --dependency=singleton
+#SBATCH --job-name=ultra_sft
 #SBATCH --output=dcp_ultra_sft_%j.out
 
 
@@ -20,13 +21,13 @@ export QUANTIZATION_TYPE_DEBUG=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=16
 
-export HF_HOME="/lustre/fsw/coreai_dlalgo_llm/users/pmannan/hf_home"
+export HF_HOME="/lustre/fsw/portfolios/coreai/users/pmannan/hf_home"
 
 NAME=${SLURM_JOB_NAME}
 
 # OUTPUT_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/nemotron_ultra/sft-runs"
-MEGATRON_LM_DIR=/lustre/fsw/coreai_dlalgo_llm/users/pmannan/megatron-lm
-IMAGE="/lustre/fsw/coreai_dlalgo_llm/users/guyueh/rl_projects/mxfp8_train/pt_ultra_mamba_ssmv230_23jan28.sqsh"
+MEGATRON_LM_DIR=/lustre/fsw/portfolios/coreai/users/pmannan/megatron-lm
+IMAGE="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/containers/pt_ultra_mamba_ssmv230_23jan28.sqsh"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 RUN_DIR="${MEGATRON_LM_DIR}/${DATETIME}"
@@ -52,20 +53,14 @@ GBS=64
 LR=1e-5
 MIN_LR=2e-6
 
-TOKENIZER_MODEL_PATH="/lustre/fsw/coreai_dlalgo_llm/users/guyueh/rl_projects/mxfp8_train/tokenizer"
+TOKENIZER_MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/nemotron_super/tokenizer"
 # BASE_MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/nemotron_ultra/reinit-embeddings-ckpts/phase1_fp32rs_continued_iter_0600000/checkpoints"
-BLEND_PATH="/lustre/fsw/coreai_dlalgo_llm/users/guyueh/rl_projects/mxfp8_train/blend_jan21.json"
+BLEND_PATH="/lustre/fsw/portfolios/llmservice/users/adithyare/nemotron_ultra/blend_jan21.json"
 
-WANDB_PROJECT="nemo-rl-sft-dev-guyueh"
-WANDB_EXP_NAME="ultra-v3-sft-hsg-mainfeb5merge-mxfp8-fp8_param-8node"
+# WANDB_PROJECT="nemo-rl-sft-dev-guyueh"
+# WANDB_EXP_NAME="ultra-v3-sft-hsg-mainfeb5merge-mxfp8-fp8_param-8node"
 
-
-srun --ntasks-per-node=4 \
---container-image=${IMAGE} \
---container-mounts="/lustre:/lustre" \
---output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
-sh -c "python -u \
-${MEGATRON_LM_DIR}/pretrain_mamba.py \
+OPTIONS=" \
     --sft \
     --sft-tokenizer-prompt-format identity \
     --distributed-timeout-minutes 5 \
@@ -106,7 +101,6 @@ ${MEGATRON_LM_DIR}/pretrain_mamba.py \
     --calculate-per-token-loss \
     --mtp-loss-scaling-factor 0.3 \
     \
-	--cuda-graph-scope mamba attn moe_router \
     --te-rng-tracker \
     --high-priority-stream-groups ep \
     --manual-gc-interval 10 \
@@ -126,7 +120,6 @@ ${MEGATRON_LM_DIR}/pretrain_mamba.py \
 	--moe-router-topk 22 \
     --moe-aux-loss-coeff 1e-4 \
     --moe-router-topk-scaling-factor 5.0 \
-    --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
     --moe-shared-expert-intermediate-size 10240 \
@@ -193,13 +186,24 @@ ${MEGATRON_LM_DIR}/pretrain_mamba.py \
     --use-mcore-models \
     --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
     \
-    --hybrid-context-parallel \
-    --max-seqlen-per-dp-cp-rank 4096 \
     --rerun-mode disabled \
     \
     --dist-ckpt-strictness log_unexpected \
     --tensorboard-dir ${TENSORBOARD_DIR} \
-	--fp8-format e4m3 \
+    --fp8-format e4m3 \
 	--fp8-recipe mxfp8 \
     --moe-router-fusion \
+    --moe-router-enable-expert-bias \
+    --cuda-graph-scope mamba attn moe_router \
+    --hybrid-context-parallel \
+    --max-seqlen-per-dp-cp-rank 10240 \
     "
+
+RUN_CMD="python -u ${MEGATRON_LM_DIR}/pretrain_mamba.py ${OPTIONS}"
+
+srun -l \
+     --no-container-mount-home \
+     --container-image=${IMAGE} \
+     --container-mounts="/lustre:/lustre" \
+     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
+     sh -c "${RUN_CMD}"
