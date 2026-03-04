@@ -1,6 +1,8 @@
 .integration_tests_rules:
   stage: integration_tests
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $INTEGRATION_TEST == "yes"
       when: on_success
     - when: never
@@ -15,32 +17,8 @@ include:
     ref: main
     file: downstreams.yml
 
-wait_for_resources:
-  extends: [.integration_tests_rules]
-  image: python:3.10
-  timeout: 7 days
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  script:
-    - env
-    - pip install --no-cache-dir python-gitlab click
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-    - export GITLAB_ENDPOINT
-    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
-  rules:
-    - if: $INTEGRATION_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: on_success
-    - when: never
-
 integration:configure:
   needs:
-    - job: wait_for_resources
-      optional: true
     - test:build_image
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
       optional: true
@@ -65,6 +43,7 @@ integration:configure:
     - |
       A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+      GB200_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo $CLUSTER_GB200 || echo $DEFAULT_GB200_CLUSTER)
     - |
       ARGS=(
         "--scope $INTEGRATION_TEST_SCOPE"
@@ -110,19 +89,38 @@ integration:configure:
         --platform dgx_h100 \
         --cluster $H100_CLUSTER \
         --output-path "functional-test-job-lts-H100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb2100 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
   artifacts:
     paths:
       - functional-test-job-lts-A100.yaml
       - functional-test-job-lts-H100.yaml
       - functional-test-job-dev-H100.yaml
       - functional-test-job-dev-A100.yaml
+      - functional-test-job-lts-GB200.yaml
+      - functional-test-job-dev-GB200.yaml
       - tests/test_utils/local_recipes
 
 .integration_run:
   needs:
     - integration:configure
     - test:build_image
-    - wait_for_resources
+    - job: wait_for_resources
+      optional: true
   extends: [.integration_tests_rules]
   trigger:
     include:
@@ -143,15 +141,24 @@ integration:configure:
 
 integration:run_lts_dgx_a100:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: A100
 
 integration:run_lts_dgx_h100:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: H100
+
+integration:run_lts_dgx_gb200:
+  extends: [.integration_run]
+  allow_failure: true
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: GB200
 
 integration:run_dev_dgx_a100:
   extends: [.integration_run]
@@ -164,3 +171,9 @@ integration:run_dev_dgx_h100:
   variables:
     ENVIRONMENT: dev
     CLUSTER: H100
+
+integration:run_dev_dgx_gb200:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB200

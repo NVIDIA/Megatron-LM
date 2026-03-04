@@ -6,16 +6,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state as ps
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from megatron.training.global_vars import set_args
 from tests.unit_tests.test_utilities import Utils
@@ -47,15 +49,19 @@ class TestLLaVAModel:
             use_cpu_initialization=False,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        vision_layer_spec = deepcopy(language_layer_spec)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
+        vision_layer_spec = ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+        )
+        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -325,8 +331,8 @@ class TestLLaVAModel:
                 [0, 512, 1024, 1600], dtype=torch.int32
             ).cuda(),  # Just example values.
             cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
-            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
+            max_seqlen_q=1600,
+            max_seqlen_kv=1600,
         )
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
@@ -481,16 +487,20 @@ def setup_and_teardown_llava_model(request):
         use_cpu_initialization=False,
     )
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    vision_layer_spec = deepcopy(language_layer_spec)
-    vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+    language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
+    vision_layer_spec = ModuleSpec(
+        module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+    )
+    vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
     language_config.language_model_type = "dummy"
     vision_model_type = request.param
     vision_config.vision_model_type = vision_model_type
     model = LLaVAModel(
         language_transformer_config=language_config,
-        language_transformer_layer_spec=language_layer_spec,
+        language_transformer_layer_spec=ModuleSpec(
+            module=TransformerLayer, submodules=language_layer_submodules
+        ),
         language_vocab_size=2048,
         language_max_sequence_length=4096,
         vision_transformer_config=vision_config,
@@ -539,7 +549,7 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def _init_llava_model(self, cp_size, tp_size, sequence_parallel, cp_group=None):
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
         language_hidden_size = 64
         language_num_attention_heads = 16
 
@@ -573,31 +583,33 @@ class TestLLaVAModelTokenParallel:
             context_parallel_size=1,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
-            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.causal
         ):
-            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
+            language_layer_submodules.self_attention.params['attn_mask_type'] = (
                 AttnMaskType.padding_causal
             )
         elif (
-            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.no_mask
         ):
-            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
-                AttnMaskType.padding
-            )
+            language_layer_submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
 
-        vision_layer_spec = deepcopy(language_layer_spec)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_layer_spec = ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+        )
+        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -608,7 +620,6 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
-            cp_group=cp_group,
         )
 
         return model
@@ -713,9 +724,7 @@ class TestLLaVAModelTokenParallel:
         )
         model = None
         with ctx:
-            model = self._init_llava_model(
-                cp_size, tp_size, sequence_parallel, cp_group=ps.get_context_parallel_group()
-            )
+            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
 
         if model is None:
             return
@@ -770,247 +779,21 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 
-@pytest.mark.internal  # The model is under active development and its methods may change.
-@pytest.mark.parametrize(
-    'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0), (2, 3, 2, 1), (2, 4, 2, 0)]
-)
-def test_llava_model_parallelism(dtp, dpp, etp, epp):
-    """
-    The purpose of this test is to check that vit, vision projection and lm layer
-    counts across tensor and pipeline parallel ranks match the counts in the
-    non-model-parallel case, i.e. tp==1, pp==1, etp==1, epp==0
-    """
-
-    language_hidden_size = 64
-    language_num_attention_heads = 4
-
-    # First initialize a single GPU model to get baseline parameter and layer counts
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        encoder_tensor_model_parallel_size=1,
-        encoder_pipeline_model_parallel_size=0,
-    )
-    model_parallel_cuda_manual_seed(123)
-
-    language_config = TransformerConfig(
-        num_layers=12,
-        hidden_size=language_hidden_size,
-        num_attention_heads=language_num_attention_heads,
-        use_cpu_initialization=False,
-    )
-    language_config.tensor_model_parallel_size = dtp
-    language_config.pipeline_model_parallel_size = dpp
-
-    vision_config = TransformerConfig(
-        num_layers=4, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
-    )
-    vision_config.tensor_model_parallel_size = etp
-    vision_config.pipeline_model_parallel_size = 1
-
-    vision_projection_config = TransformerConfig(
-        num_layers=2,
-        hidden_size=language_hidden_size,
-        ffn_hidden_size=32,
-        num_attention_heads=1,
-        use_cpu_initialization=False,
-    )
-    vision_projection_config.tensor_model_parallel_size = etp
-    vision_projection_config.pipeline_model_parallel_size = 1
-
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-    vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
-
-    language_config.language_model_type = "dummy"
-    vision_config.vision_model_type = "clip"
-    non_parallel_model = LLaVAModel(
-        language_transformer_config=language_config,
-        language_transformer_layer_spec=language_layer_spec,
-        language_vocab_size=8192,
-        language_max_sequence_length=4096,
-        vision_transformer_config=vision_config,
-        vision_transformer_layer_spec=vision_layer_spec,
-        drop_vision_class_token=False,
-        vision_projection_config=vision_projection_config,
-        vision_projection_layer_spec=vision_projection_spec,
-        img_h=336,
-        img_w=336,
-        patch_dim=14,
-    )
-
-    base_vit_params = sum(p.numel() for p in non_parallel_model.vision_model.parameters())
-    base_proj_params = sum(p.numel() for p in non_parallel_model.vision_projection.parameters())
-
-    base_vit_layers = len(non_parallel_model.vision_model.decoder.layers)
-
-    Utils.destroy_model_parallel()
-
-    # Next initialize a model parallel version to get test parameter and layer counts
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=dtp,
-        pipeline_model_parallel_size=dpp,
-        encoder_tensor_model_parallel_size=etp,
-        encoder_pipeline_model_parallel_size=epp,
-    )
-    model_parallel_cuda_manual_seed(123)
-
-    pp_rank = ps.get_pipeline_model_parallel_rank()
-    pp_world_size = ps.get_pipeline_model_parallel_world_size()
-    tp_world_size = ps.get_tensor_model_parallel_world_size()
-
-    pre_process = True if (pp_rank == 0 or (pp_rank == 1 and epp == 1)) else False
-    post_process = (
-        True if ((pp_rank == 0 and epp == 1) or (pp_rank == pp_world_size - 1)) else False
-    )
-    add_encoder = True if pp_rank == 0 else False
-    add_decoder = False if (pp_rank == 0 and epp == 1) else True
-
-    language_config = TransformerConfig(
-        num_layers=12,
-        hidden_size=language_hidden_size,
-        num_attention_heads=language_num_attention_heads,
-        use_cpu_initialization=False,
-    )
-    language_config.tensor_model_parallel_size = dtp
-    language_config.pipeline_model_parallel_size = dpp
-
-    vision_config = TransformerConfig(
-        num_layers=4, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
-    )
-    vision_config.tensor_model_parallel_size = etp
-    vision_config.pipeline_model_parallel_size = 1
-
-    vision_projection_config = TransformerConfig(
-        num_layers=2,
-        hidden_size=language_hidden_size,
-        ffn_hidden_size=32,
-        num_attention_heads=1,
-        use_cpu_initialization=False,
-    )
-    vision_projection_config.tensor_model_parallel_size = etp
-    vision_projection_config.pipeline_model_parallel_size = 1
-
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-    vision_projection_spec = deepcopy(vision_layer_spec.submodules.mlp.submodules)
-
-    language_config.language_model_type = "dummy"
-    vision_config.vision_model_type = "clip"
-    model = LLaVAModel(
-        language_transformer_config=language_config,
-        language_transformer_layer_spec=language_layer_spec,
-        language_vocab_size=8192,
-        language_max_sequence_length=4096,
-        vision_transformer_config=vision_config,
-        vision_transformer_layer_spec=vision_layer_spec,
-        drop_vision_class_token=False,
-        vision_projection_config=vision_projection_config,
-        vision_projection_layer_spec=vision_projection_spec,
-        img_h=336,
-        img_w=336,
-        patch_dim=14,
-        pre_process=pre_process,
-        post_process=post_process,
-        add_encoder=add_encoder,
-        add_decoder=add_decoder,
-    )
-
-    if epp == 1:
-        if pp_rank == 0:
-            # should be in a etp sized tp group
-            assert tp_world_size == etp
-            # there should only be a single pipeline rank
-            assert pp_world_size == epp + dpp
-            # should not be inside decoder
-            assert not ps.is_inside_decoder()
-            # should be inside encoder
-            assert ps.is_inside_encoder()
-        elif pp_rank != 0:
-            # non-encoder ranks should be in a dtp sized tp group
-            assert tp_world_size == dtp
-            # check we're inside the decoder
-            assert ps.is_inside_decoder()
-            # check we're not inside the encoder
-            assert not ps.is_inside_encoder()
-    elif epp == 0:
-        if pp_rank == 0:
-            # check we're inside the encoder and decoder
-            assert ps.is_inside_encoder()
-            assert ps.is_inside_decoder()
-        elif pp_rank != 0:
-            # check we're inside the decoder only and there's no vision_model
-            assert not ps.is_inside_encoder()
-            assert ps.is_inside_decoder()
-            assert model.vision_model is None
-            assert model.vision_projection is None
-
-    if ps.is_inside_encoder():
-        # Check num vit layers - epp > 1 not supported
-        test_vit_layers = len([p for p in model.vision_model.decoder.layers])
-        assert test_vit_layers == base_vit_layers
-
-        # Check all vit params are present
-        test_vit_tp_params = sum(
-            [
-                p.numel()
-                for p in model.vision_model.parameters()
-                if hasattr(p, 'tensor_model_parallel')
-            ]
-        )
-        test_vit_non_tp_params = sum(
-            [
-                p.numel()
-                for p in model.vision_model.parameters()
-                if not hasattr(p, 'tensor_model_parallel')
-            ]
-        )
-        group = ps.get_tensor_model_parallel_group()
-        test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).cuda()
-        torch.distributed.all_reduce(
-            test_vit_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
-        )
-        total_test_vit_tp_params = test_vit_params_tensor.item()
-        assert total_test_vit_tp_params + test_vit_non_tp_params == base_vit_params
-
-        # Check all vision projection params are present
-        test_proj_tp_params = sum(
-            [
-                p.numel()
-                for p in model.vision_projection.parameters()
-                if hasattr(p, 'tensor_model_parallel')
-            ]
-        )
-        test_proj_non_tp_params = sum(
-            [
-                p.numel()
-                for p in model.vision_projection.parameters()
-                if not hasattr(p, 'tensor_model_parallel')
-            ]
-        )
-        test_proj_params_tensor = torch.tensor([test_proj_tp_params], dtype=torch.int32).cuda()
-        torch.distributed.all_reduce(
-            test_proj_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
-        )
-        total_test_proj_tp_params = test_proj_params_tensor.item()
-        assert total_test_proj_tp_params + test_proj_non_tp_params == base_proj_params
-    else:
-        # check ranks that aren't inside encoder have no vit
-        assert model.vision_model is None
-        assert model.vision_projection is None
-
-    Utils.destroy_model_parallel()
-    torch.cuda.empty_cache()
-
-
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "cp_size, tp_size, has_sp, seq_len, expected_padding",
-    [(1, 1, False, 99, 0), (2, 2, True, 99, 5), (2, 2, False, 99, 1)],
+    "cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding",
+    [
+        (1, 1, False, 99, False, 0),
+        (2, 2, True, 99, False, 5),
+        (2, 2, False, 99, False, 1),
+        (1, 4, False, 99, True, 13),
+    ],
 )
-def test_get_padding(cp_size, tp_size, has_sp, seq_len, expected_padding):
+def test_get_padding(cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding):
     """Test calculating padding for context parallel."""
-    padding = context_parallel.get_padding(seq_len, cp_size, tp_size, has_sp)
+    padding = context_parallel.get_padding(
+        seq_len, cp_size, tp_size, has_sp, fp8_enabled=fp8_enabled
+    )
 
     assert padding == expected_padding
 

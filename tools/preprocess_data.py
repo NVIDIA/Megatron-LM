@@ -22,7 +22,7 @@ except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
-from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
 
@@ -143,6 +143,8 @@ class Partition(object):
         fin.close()
         fout.close()
 
+        pool.close()
+        pool.join()
 
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
@@ -186,6 +188,8 @@ class Partition(object):
         fin.close()
         builders[key].finalize(output_idx_files[key])
 
+        pool.close()
+        pool.join()
 
 def get_args():
     parser = argparse.ArgumentParser()
