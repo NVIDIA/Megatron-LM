@@ -89,7 +89,7 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     backend = InferenceSpecProvider()
     activation_func = backend.activation_func()
 
-    expert_module, expert_submodule = backend.grouped_mlp_modules(True, False)
+    expert_module, expert_submodule = backend.grouped_mlp_modules(True)
     if expert_submodule is not None:
         expert_submodule.activation_func = activation_func
 
