@@ -431,7 +431,7 @@ def validate_args(args, defaults={}):
         assert args.rl_forced_lag == 0 or not args.rl_partial_rollouts, (
             "--rl-forced-lag and --rl-partial-rollouts are incompatible."
         )
-        if args.rl_forced_lag > 0 and args.rl_parallel_generation_tasks is not None:
+        if args.rl_forced_lag > 0 and args.rl_parallel_generation_tasks != 512:
             print_rank_0('WARNING: --rl-parallel-generation-tasks is ignored when '
                          '--rl-forced-lag is set. Parallel generation tasks will be '
                          'computed as (rl_forced_lag + 1) * grpo_prompts_per_step.')
@@ -2229,7 +2229,7 @@ def _add_rl_args(parser):
     group.add_argument('--rl-forced-lag', type=int, default=0,
                        help='Forced rollout lag of L steps. After an initial warm-up of L steps, '
                             'All steps N+L use only rollouts that were started on step N. '
-                            '0 (default) disabled this behavior.'
+                            '0 (default) disables this behavior.'
                        )
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
@@ -2303,7 +2303,7 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
