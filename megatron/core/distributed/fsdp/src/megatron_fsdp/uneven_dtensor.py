@@ -25,6 +25,8 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+from .utils import get_mesh_names
+
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
@@ -56,6 +58,7 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         # TODO: add documentation for the offset calculation
         # Add on the offset of the current mesh dimension
         offsets[shard_dim] += offset
+        # Calculate the global shape using the sum of the sharding dim sizes.
         cumulative_shape[shard_dim] = sum(s[shard_dim] for s in global_shapes)
 
     # Get the shard placements order.
@@ -238,7 +241,9 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
-    for key_chain in visit_dtensor:
+    # Sort the keys, since some state dictionaries are mocked
+    # and extended to include empty global keys.
+    for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
         update_uneven_dtensor_chunk_metadata(dtensor)
@@ -272,7 +277,25 @@ def gather_uneven_dtensor_to_full_tensor(
     if not device_mesh.mesh_dim_names:
         process_group = device_mesh.get_group()
     else:
-        process_group = device_mesh._flatten().get_group()
+        # Check if the fully-flattened mesh exists first.
+        full_flattened_mesh_dim_name = "_".join(device_mesh.mesh_dim_names)
+        if full_flattened_mesh_dim_name in get_mesh_names(device_mesh):
+            # Retrieve the existing flattened DeviceMesh ProcessGroup.
+            try:
+                # Two Cases: Name is a root dimension, or using the old DeviceMesh
+                # API which allows us to get flattened dimensions.
+                process_group = device_mesh[full_flattened_mesh_dim_name].get_group()
+            except:
+                # Name is a flattened dimension that cannot be retrieved from the
+                # DeviceMesh.__getitem__, so fall-back to new DeviceMesh API.
+                process_group = (
+                    device_mesh._get_root_mesh()
+                    ._flatten_mapping[full_flattened_mesh_dim_name]
+                    .get_group()
+                )
+        else:
+            # Create the _-separated flattened DeviceMesh ProcessGroup.
+            process_group = device_mesh._flatten().get_group()
 
     # Collect chunk metadata for uneven shards (update if missing)
     if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
@@ -365,7 +388,9 @@ def _assemble_full_tensor_from_uneven_chunks(
 
     # Wrap into a replicated DTensor and return
     return DTensor.from_local(
-        full_tensor, placements=[Replicate()], device_mesh=dtensor.device_mesh
+        full_tensor,
+        placements=[Replicate()] * len(dtensor.placements),
+        device_mesh=dtensor.device_mesh,
     )
 
 

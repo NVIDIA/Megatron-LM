@@ -54,6 +54,7 @@ class AttnMaskType(enum.Enum):
     no_mask = 3  # only used for TE
     padding_causal = 4  # only used for thd attention
     arbitrary = 5
+    causal_bottom_right = 6  # only used for TE
 
 
 class AttnBackend(enum.Enum):
@@ -64,3 +65,16 @@ class AttnBackend(enum.Enum):
     unfused = 3
     local = 4
     auto = 5
+
+
+class CudaGraphScope(enum.Enum):
+    """Cuda Graph Scope - defines which parts of the model to capture."""
+
+    full_iteration = 1  # Captures the entire training iteration
+    attn = 2  # Captures attention layers
+    mlp = 3  # Captures MLP layers (dense layers only)
+    moe = 4  # Captures MoE layers (drop-and-pad MoE layers only)
+    moe_router = 5  # Captures MoE router part
+    moe_preprocess = 6  # Captures MoE preprocessing part (requires moe_router)
+    mamba = 7  # Captures Mamba layers
+    full_iteration_inference = 8  # Captures the entire inference iteration

@@ -1,26 +1,58 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
+import modelopt.torch.opt as mto
 import torch.nn as nn
+from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 
 from megatron.core import dist_checkpointing
+from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
+from .utils import print_distributed_quant_summary
 
-try:
-    import modelopt.torch.opt as mto
-    from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
-except ImportError as e:
-    raise ImportError("Required `\"nvidia-modelopt[torch]\"` is not installed!") from e
-
+logger = logging.getLogger(__name__)
 
 NEMO_WEIGHT_DIR_NAMES = {"model_weights": "model.", "weights": "module."}
 
 
-def get_sharded_load_dir(load_dir: str) -> Tuple[Union[str, None], str]:
+def has_modelopt_state(checkpoint_path: str) -> bool:
+    """Check if modelopt_state folder exists inside the checkpoint.
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+
+    Returns:
+        True if modelopt_state exists, False otherwise
+    """
+    args = get_args()
+
+    try:
+        if args.ckpt_format == "torch":
+            # Non-sharded
+            state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
+            if state_dict is None:
+                return False
+            if "modelopt_state" not in state_dict:
+                return False
+            return True
+        else:
+            # Sharded
+            load_dir, _ = get_sharded_load_dir(checkpoint_path)
+            if load_dir is None:
+                return False
+            if not (load_dir / "modelopt_state").is_dir():
+                return False
+            return True
+    except Exception as e:
+        print_rank_0(f"Failed to inspect checkpoint in {checkpoint_path}: {e}")
+        return False
+
+
+def get_sharded_load_dir(load_dir: str) -> Tuple[Union[Path, None], str]:
     """Helper to retrieve the sharded load directory and its prefix, if any."""
     load_dir = Path(load_dir)
 
@@ -57,41 +89,41 @@ def get_sharded_load_dir(load_dir: str) -> Tuple[Union[str, None], str]:
     return sharded_load_dir, sharded_prefix
 
 
-def load_modelopt_state(load_dir: Optional[str] = None, model: Optional[nn.Module] = None) -> Dict:
+def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> None:
     """Loading modelopt_state without loading the model.
 
-    If --use-dist-ckpt, we try to load from the sharded modelopt_state. This will not load the model
-    state_dict. Otherwise, if the checkpoint is not sharded, we load the base checkpoint (that
-    contains the model state as well) and extract the modelopt_state.
+    If distributed checkpointing in use, we try to load from the sharded modelopt_state. This will not
+    load the model state_dict. Otherwise, if the checkpoint is not sharded, we load the base checkpoint
+    (which contains the model state as well) and extract the modelopt_state.
 
     Args:
+        model: the model to load the modelopt_state into
         load_dir: optionally provide a different loading path
-        model: required when loading a sharded checkpoint
     """
     args = get_args()
+    load_dir = load_dir or args.load
 
-    if load_dir is None:
-        load_dir = args.load
-
-    if args.use_dist_ckpt:
-        assert model is not None, "`model` argument required when `args.use_dist_ckpt is True`"
-        sharded_load_dir, _ = get_sharded_load_dir(load_dir)
-        if sharded_load_dir is None:
-            print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
-            return {}
-        restore_sharded_modelopt_state([model], sharded_load_dir)
-    else:
+    if args.ckpt_format == "torch":
+        # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
             state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
+            return
         if state_dict is None:
             print_rank_0("No checkpoint state_dict found. Skipping loading ModelOpt state.")
-        else:
-            modelopt_state = state_dict.get("modelopt_state", None)
+            return
+        modelopt_state = state_dict.get("modelopt_state", None)
         if modelopt_state is not None:
             mto.restore_from_modelopt_state(model, modelopt_state)
+    else:
+        # Sharded
+        sharded_load_dir, _ = get_sharded_load_dir(load_dir)
+        if sharded_load_dir is None:
+            print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
+            return
+        restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
 def load_modelopt_checkpoint(
@@ -145,8 +177,13 @@ def load_modelopt_checkpoint(
         )
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
+        print_distributed_quant_summary(unwrapped_model[0])
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
-        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix)
+        sharded_state_dict_metadata = dist_checkpointing.load_content_metadata(sharded_load_dir)
+        sharded_state_dict = unwrapped_model[0].sharded_state_dict(
+            prefix=additional_sharded_prefix, metadata=sharded_state_dict_metadata
+        )
+
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(
                 _remove_prefix_state_dict_pre_hook
@@ -155,5 +192,6 @@ def load_modelopt_checkpoint(
             sharded_state_dict, sharded_load_dir, strict=args.dist_ckpt_strictness
         )
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
+        print_distributed_quant_summary(unwrapped_model[0])
     else:
         _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=strict, load_arg=load_arg)

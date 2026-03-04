@@ -9,9 +9,10 @@ import torch
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
+from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
-from megatron.training import dist_signal_handler
-from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 _GLOBAL_ARGS = None
 _GLOBAL_TOKENIZER = None
@@ -73,10 +74,11 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
-def _set_signal_handler():
+def _set_signal_handler(exit_signal):
+
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
-    _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
+    _GLOBAL_SIGNAL_HANDLER = DistributedSignalHandler(exit_signal).__enter__()
 
 
 
@@ -109,7 +111,10 @@ def set_global_variables(args, build_tokenizer=True):
         set_experimental_flag(True)
 
     if args.exit_signal_handler:
-        _set_signal_handler()
+        _set_signal_handler(args.exit_signal)
+
+    if args.disable_jit_fuser:
+        disable_jit_fuser()
 
 
 def unset_global_variables():
@@ -266,13 +271,13 @@ def _set_adlr_autoresume(args):
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
     if args.adlr_autoresume:
-        if args.rank == 0:
-            print('enabling autoresume ...', flush=True)
+        from megatron.training.utils import print_rank_0
+        print_rank_0('enabling autoresume ...')
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
         except ImportError:
-            print('ADLR autoresume is not available, exiting ...')
+            print_rank_0('ADLR autoresume is not available, exiting ...')
             sys.exit()
 
         _GLOBAL_ADLR_AUTORESUME = AutoResume

@@ -15,7 +15,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    attention_mask_func,
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import divide
 
 
@@ -41,10 +45,10 @@ class DotProductAttention(MegatronModule):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -53,10 +57,6 @@ class DotProductAttention(MegatronModule):
         assert (
             self.config.context_parallel_size == 1
         ), "Context parallelism is only supported by TEDotProductAttention!"
-
-        assert (
-            self.config.window_size is None
-        ), "Sliding Window Attention is only supported by TEDotProductAttention!"
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -71,6 +71,8 @@ class DotProductAttention(MegatronModule):
             assert hasattr(
                 pg_collection, 'tp'
             ), "DotProductAttention pg_collection must have tp process group"
+        self.pg_collection = pg_collection
+        self.tp_group = self.pg_collection.tp
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
@@ -88,6 +90,13 @@ class DotProductAttention(MegatronModule):
             coeff = self.layer_number
             self.softmax_scale /= coeff
 
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = None
+
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
             input_in_bf16=self.config.bf16,
@@ -96,6 +105,7 @@ class DotProductAttention(MegatronModule):
             mask_func=attention_mask_func,
             softmax_in_fp32=self.config.attention_softmax_in_fp32,
             scale=coeff,
+            window_size=window_size,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
@@ -108,16 +118,24 @@ class DotProductAttention(MegatronModule):
         if self.config.softmax_type == "vanilla":
             self.softmax_offset = None
         elif self.config.softmax_type == "off-by-one":
-            self.softmax_offset = torch.zeros(self.num_attention_heads_per_partition)
+            self.softmax_offset = torch.zeros(
+                self.num_attention_heads_per_partition,
+                device=torch.cuda.current_device(),
+                dtype=self.config.params_dtype,
+            )
         elif self.config.softmax_type == "learnable":
             self.register_parameter(
                 "softmax_offset",
                 torch.nn.Parameter(
                     torch.empty(
-                        self.num_attention_heads_per_partition, dtype=self.config.params_dtype
+                        self.num_attention_heads_per_partition,
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
                     )
                 ),
             )
+            if config.perform_initialization:
+                self.softmax_offset = config.init_method(self.softmax_offset)
         else:
             raise ValueError("Softmax type not supported")
 
@@ -126,9 +144,9 @@ class DotProductAttention(MegatronModule):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
-        attn_mask_type: AttnMaskType = None,
-        attention_bias: Tensor = None,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
@@ -235,7 +253,7 @@ class DotProductAttention(MegatronModule):
     def sharded_state_dict(
         self,
         prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""
@@ -244,5 +262,10 @@ class DotProductAttention(MegatronModule):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )

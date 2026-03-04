@@ -38,9 +38,9 @@ MODEL_ARGS:
   # Data args
   --seq-length: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
   # Add network size args
   --num-layers: 16

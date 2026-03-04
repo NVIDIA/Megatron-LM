@@ -10,7 +10,7 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -25,9 +25,8 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
-from megatron.training import get_args, get_tokenizer, get_timers, pretrain, print_rank_0
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.tokenizers import MegatronTokenizer
 from pretrain_gpt import loss_func
 
 """
@@ -66,7 +65,12 @@ to accumulate the encoder_hidden_state gradient across skip connections
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True
+    pre_process=True,
+    post_process=True,
+    add_encoder=True,
+    add_decoder=True,
+    config=None,
+    pg_collection=None,
 ) -> Union[megatron.legacy.model.T5Model, T5Model]:
     """Builds the model.
 
@@ -83,7 +87,8 @@ def model_provider(
 
     args = get_args()
     
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
     if args.use_legacy_models:
         model = megatron.legacy.model.T5Model(
             config=config,
@@ -207,10 +212,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """
     args = get_args()
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=args.seed,
@@ -233,6 +235,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
         masking_use_longer_ngrams=False,
         masking_use_geometric_distribution=True,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     print_rank_0('> building train, validation, and test datasets for T5 ...')

@@ -76,9 +76,12 @@ class StaticBufferLoader:
 
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                        inputs[k]
-                    ).cuda()
+                    if isinstance(inputs[k], torch.Tensor):
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
+                            inputs[k], device="cuda"
+                        )
+                    else:
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
@@ -176,7 +179,7 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            logger.info(f'CUDA graph capture done!!!')
+            logger.info(f'CUDA graph capture done for {training_str}!!!')
 
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)

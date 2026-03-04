@@ -54,4 +54,4 @@ uv pip install --no-cache-dir \
     $MAMBA_WHEEL \
     $CAUSALCONV1D_WHEEL \
     $GROUPEDGEMM_WHEEL \
-    "setuptools<80.0.0"
+    "setuptools<80.0.0,>=77.0.0"

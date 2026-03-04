@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
 from .megatron_fsdp import MegatronFSDP
+from .mixed_precision import MixedPrecisionPolicy
 from .package_info import (
     __contact_emails__,
     __contact_names__,
@@ -29,16 +31,14 @@ from .package_info import (
 )
 from .utils import FSDPDistributedIndex
 
-try:
-    from .fully_shard import fully_shard
-except ImportError as e:
-    print(f"Failed to import fully_shard: {e}")
-
 __all__ = [
     "DistributedDataParallelConfig",
     "MegatronFSDP",
     "FSDPDistributedIndex",
+    "MixedPrecisionPolicy",
     "fully_shard",
+    "fully_shard_model",
+    "fully_shard_optimizer",
     "__contact_emails__",
     "__contact_names__",
     "__description__",

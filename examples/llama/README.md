@@ -118,7 +118,7 @@ Legend:
 - EP: Expert Parallel size
 - GA: Gradient Accumulation steps
 
-As NeMo uses Megatron-Core, for the latest performance benchmarks, please refer to the official [NeMo documentation](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance_summary.html).
+As NeMo uses Megatron-Core, for the latest performance benchmarks, please refer to the official [NeMo documentation](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-summary.html).
 
 ## 5. Test Datasets
 <a id="test-datasets" name="test-datasets"></a>

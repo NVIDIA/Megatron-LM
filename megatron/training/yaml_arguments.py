@@ -6,12 +6,12 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import torch
 import types
+import yaml
 
 from itertools import chain, starmap
-from types import SimpleNamespace
-import yaml, re, os
 from types import SimpleNamespace
 
 import torch.nn.functional as F
@@ -75,9 +75,9 @@ def validate_yaml(args, defaults={}):
     args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
@@ -304,37 +304,11 @@ def validate_yaml(args, defaults={}):
     if args.model_parallel.tensor_model_parallel_size == 1:
         args.model_parallel.sequence_parallel = False
 
-    # disable async_tensor_model_parallel_allreduce when
-    # model parallel memory optimization is enabled
-    if args.model_parallel.sequence_parallel:
-        args.model_parallel.async_tensor_model_parallel_allreduce = False
-
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.model_parallel.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.model_parallel.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
-
-    # Retro checks.
-    if getattr(args, 'retro_add_retriever', False):
-        raise Exception("Retro untested for yaml args. See arguments.py.")
-
-        # Sequence parallelism unsupported.
-        assert not args.sequence_parallel, \
-            "retro currently does not support sequence parallelism."
-
-        # Pipeline parallelism unsupported.
-        assert args.pipeline_model_parallel_size == 1, \
-            "retro currently does not support pipeline parallelism."
-
-    #TODO: Retro args loading not tested
-    # Load retro args (used by both Retro & GPT).
-    if getattr(args, 'retro_project_dir', None) is not None:
-        raise Exception("Retro untested for yaml args. See arguments.py.")
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:

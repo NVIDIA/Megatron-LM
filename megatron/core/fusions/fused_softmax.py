@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.utils import get_default_causal_mask
+from megatron.core.transformer.utils import get_default_causal_mask, get_sliding_window_causal_mask
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
@@ -18,7 +18,16 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
-        """forward pass"""
+        """Forward pass for scaled upper-triangular masked softmax.
+
+        Args:
+            ctx: Autograd context used to stash tensors for backward.
+            inputs (torch.Tensor): Input tensor of shape [attn_batches, sq, sk].
+            scale (float): Scaling factor applied prior to softmax.
+
+        Returns:
+            torch.Tensor: Softmax results after applying scale and causal upper-triangular mask.
+        """
         import scaled_upper_triang_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -29,7 +38,15 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        """backward pass"""
+        """Backward pass for scaled upper-triangular masked softmax.
+
+        Args:
+            ctx: Autograd context containing saved tensors from forward.
+            output_grads (torch.Tensor): Upstream gradients matching forward output shape.
+
+        Returns:
+            Tuple[torch.Tensor, None]: Gradient with respect to inputs and None for scale.
+        """
         import scaled_upper_triang_masked_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
@@ -50,7 +67,17 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, mask, scale):
-        """forward pass"""
+        """Forward pass for scaled masked softmax.
+
+        Args:
+            ctx: Autograd context used to stash tensors for backward.
+            inputs (torch.Tensor): Input tensor of shape [b, np, sq, sk].
+            mask (torch.Tensor): Additive mask broadcastable to inputs.
+            scale (float): Scaling factor applied prior to softmax.
+
+        Returns:
+            torch.Tensor: Softmax results after applying scale and mask.
+        """
         import scaled_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -61,7 +88,15 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        """backward pass"""
+        """Backward pass for scaled masked softmax.
+
+        Args:
+            ctx: Autograd context containing saved tensors from forward.
+            output_grads (torch.Tensor): Upstream gradients matching forward output shape.
+
+        Returns:
+            Tuple[torch.Tensor, None, None]: Gradient w.r.t inputs; None for mask and scale.
+        """
         import scaled_masked_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
@@ -79,7 +114,16 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
-        """forward pass"""
+        """Forward pass for scaled softmax (no mask).
+
+        Args:
+            ctx: Autograd context used to stash tensors for backward.
+            inputs (torch.Tensor): Input tensor of shape [b, np, sq, sk] or [attn_batches, sq, sk].
+            scale (float): Scaling factor applied prior to softmax.
+
+        Returns:
+            torch.Tensor: Softmax results after applying scale.
+        """
         import scaled_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -90,7 +134,15 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        """backward pass"""
+        """Backward pass for scaled softmax (no mask).
+
+        Args:
+            ctx: Autograd context containing saved tensors from forward.
+            output_grads (torch.Tensor): Upstream gradients matching forward output shape.
+
+        Returns:
+            Tuple[torch.Tensor, None, None]: Gradient w.r.t inputs; None for unused args.
+        """
         import scaled_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
@@ -147,11 +199,11 @@ class FusedScaleMaskSoftmax(nn.Module):
         mask_func,
         softmax_in_fp32,
         scale,
+        window_size=None,
     ):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
-
         assert not (
             self.input_in_fp16 and self.input_in_bf16
         ), "both fp16 and bf16 flags cannot be active at the same time."
@@ -161,7 +213,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
-
+        self.window_size = window_size
         assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
     def forward(
@@ -184,7 +236,18 @@ class FusedScaleMaskSoftmax(nn.Module):
             return self.forward_torch_softmax(input, mask, softmax_offset)
 
     def is_kernel_available(self, mask, b, np, sq, sk):
-        """Detect whether fused softmax kernel is available"""
+        """Check whether the fused CUDA kernel can be used for the given shapes and settings.
+
+        Args:
+            mask (Optional[torch.Tensor]): Attention mask or None.
+            b (int): Batch size.
+            np (int): Number of attention heads per tensor-parallel partition.
+            sq (int): Query sequence length.
+            sk (int): Key sequence length.
+
+        Returns:
+            bool: True if the fused kernel constraints are satisfied; otherwise False.
+        """
         attn_batches = b * np
 
         if (
@@ -207,7 +270,15 @@ class FusedScaleMaskSoftmax(nn.Module):
         return False
 
     def forward_fused_softmax(self, input, mask):
-        """forward pass for fused softmax"""
+        """Compute softmax using fused CUDA kernels when available.
+
+        Args:
+            input (torch.Tensor): Attention scores of shape [b, np, sq, sk].
+            mask (Optional[torch.Tensor]): Optional mask for non-causal attention.
+
+        Returns:
+            torch.Tensor: Attention probabilities of shape [b, np, sq, sk].
+        """
         b, np, sq, sk = input.size()
         scale = self.scale if self.scale is not None else 1.0
 
@@ -226,7 +297,19 @@ class FusedScaleMaskSoftmax(nn.Module):
                 return ScaledSoftmax.apply(input, scale)
 
     def forward_torch_softmax(self, input, mask, softmax_offset=None):
-        """forward pass for unfused torch softmax"""
+        """Fallback PyTorch implementation for masked softmax.
+
+        Applies optional scaling, constructs a causal or sliding-window mask if needed,
+        applies the mask, and computes softmax in PyTorch. Optionally casts back to
+        float16/bfloat16 when requested.
+
+        Args:
+            input (torch.Tensor): Attention scores of shape [b, np, sq, sk].
+            mask (Optional[torch.Tensor]): Optional additive mask.
+
+        Returns:
+            torch.Tensor: Attention probabilities of shape [b, np, sq, sk].
+        """
         if self.input_in_float16 and self.softmax_in_fp32:
             input = input.float()
 
@@ -235,7 +318,9 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         # Generate causal mask if not given
         sq, sk = input.size(2), input.size(3)
-        if self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
+        if self.window_size is not None:
+            mask = get_sliding_window_causal_mask(sq, sk, self.window_size)
+        elif self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
             # If sq == 1 then either KV cache is used or one-element context is passed
             # so keeping mask=None in this case; subsequent code should handle it
             assert sq == sk, "causal mask is only for self attention"
@@ -258,7 +343,17 @@ class FusedScaleMaskSoftmax(nn.Module):
 
     @staticmethod
     def get_batch_per_block(sq, sk, b, np):
-        """get fused softmax batch per block"""
+        """Return CUDA kernel's batch-per-block parameter for masked softmax.
+
+        Args:
+            sq (int): Query sequence length.
+            sk (int): Key sequence length.
+            b (int): Batch size.
+            np (int): Number of attention heads per tensor-parallel partition.
+
+        Returns:
+            int: Batch-per-block value as computed by the CUDA extension.
+        """
         import scaled_masked_softmax_cuda
 
         return scaled_masked_softmax_cuda.get_batch_per_block(sq, sk, b, np)
