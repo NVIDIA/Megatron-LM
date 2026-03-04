@@ -461,7 +461,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         if args.rl_forced_lag > 0:
             pgt = (args.rl_forced_lag + 1) * n_prompts
         else:
-            pgt = args.rl_parallel_generation_tasks
+            pgt = args.rl_parallel_generation_tasks or 512
         agent = get_agent(args, parallel_generation_tasks=pgt)
         request = GroupedRolloutRequest(
             num_groups=n_prompts,

@@ -431,6 +431,10 @@ def validate_args(args, defaults={}):
         assert args.rl_forced_lag == 0 or not args.rl_partial_rollouts, (
             "--rl-forced-lag and --rl-partial-rollouts are incompatible."
         )
+        if args.rl_forced_lag > 0 and args.rl_parallel_generation_tasks is not None:
+            print_rank_0('WARNING: --rl-parallel-generation-tasks is ignored when '
+                         '--rl-forced-lag is set. Parallel generation tasks will be '
+                         'computed as (rl_forced_lag + 1) * grpo_prompts_per_step.')
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2306,7 +2310,7 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
