@@ -911,18 +911,6 @@ class ParallelTransformerLayer(MegatronModule):
         # Normalize the attention output
         self.post_attention_norm = get_norm(config)
 
-        # Cross attention.
-        if self.layer_type in (LayerType.decoder,
-                               LayerType.retro_decoder,
-                               LayerType.retro_decoder_with_retriever,
-                               LayerType.retro_encoder):
-            self.inter_attention = ParallelAttention(
-                config,
-                layer_number,
-                attention_type=AttnType.cross_attn)
-            # Normalize the attention output.
-            self.post_inter_attention_norm = get_norm(config)
-
         # MLP
         if args.num_experts is not None:
             self.mlp = SwitchMLP(config)
@@ -935,25 +923,6 @@ class ParallelTransformerLayer(MegatronModule):
         use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         self.bias_dropout_add_exec_handler = \
                 nullcontext if use_nvfuser else torch.enable_grad
-
-        if args.retro_add_retriever:
-            self.retro_num_neighbors = args.retro_num_neighbors
-            self.retro_chunk_length = args.retro_chunk_length
-            self.retro_retrieved_length = \
-                args.retro_num_retrieved_chunks * args.retro_chunk_length
-
-        # Retriever (bi-directional transformer with cross attention)
-        if layer_type == LayerType.retro_decoder_with_retriever:
-            self.retriever = ParallelTransformer(
-                config=config,
-                model_type=ModelType.retro_encoder,
-                self_attn_mask_type=AttnMaskType.padding,
-                pre_process=True,
-                post_process=False,
-            )
-            self._retriever_key = 'retriever'
-        else:
-            self.retriever = None
 
     def default_decoder_cross_attention(self,
                                         encoder_output,
@@ -991,200 +960,14 @@ class ParallelTransformerLayer(MegatronModule):
 
         return norm_input, norm_output
 
-    def retro_encoder_cross_attention(self,
-                                      retriever_output,
-                                      norm_input,
-                                      norm_output,
-                                      bias_dropout_add_func):
-        """Cross attention for Retro encoder.
-
-        Notation:
-            ns : Sequence length.
-            bs : Batch size.
-            d  : Hidden size.
-            l  : Number of chunks per sample (i.e., seq_length/chunk_length).
-            k  : Number of neighbors.
-            r  : Number of retrieved tokens (neighbors + continuation).
-        """
-
-        ns, bs, d = norm_output.shape # [r, bs * l * k, d]
-
-        # Divide sequence dimension into chunks.
-        chunked_outputs = norm_output.reshape(self.retro_retrieved_length,
-                                              -1,
-                                              self.retro_num_neighbors,
-                                              d)
-        chunked_outputs_before_norm = \
-            norm_input.reshape(self.retro_retrieved_length, -1,
-                               self.retro_num_neighbors, d) # [r, bs*l, k, d]
-
-        # Per-chunk attention.
-        norm_inputs = []
-        norm_outputs = []
-        for k in range(self.retro_num_neighbors):
-
-            # Attention.
-            chunked_output = chunked_outputs[:,:,k].contiguous()
-            attention_output, attention_bias = \
-                self.inter_attention(
-                    chunked_output, # Q (neighbor embedding)
-                    None,
-                    encoder_output=retriever_output) # K, V (hidden act)
-
-            # Residual connection.
-            if self.apply_residual_connection_post_norm:
-                residual = chunked_output
-            else:
-                residual = chunked_outputs_before_norm[:,:,k]
-
-            # Re-enable torch grad to enable fused optimization.
-            with torch.enable_grad():
-                norm_input = bias_dropout_add_func(
-                    attention_output,
-                    None if attention_bias is None else attention_bias.expand_as(residual),
-                    residual,
-                    self.hidden_dropout)
-                norm_inputs.append(norm_input)
-
-            # Layer norm.
-            norm_output = self.post_inter_attention_norm(norm_input)
-            norm_outputs.append(norm_output)
-
-        # Concatenate layer norms.
-        # norm_input : [r, k * bs * l, d]
-        # norm_output : [r, k * bs * l, d]
-        norm_input = torch.stack(norm_inputs, dim=1).reshape(ns, bs, d)
-        norm_output = torch.stack(norm_outputs, dim=1).reshape(ns, bs, d)
-
-        return norm_input, norm_output
-
-    def retro_decoder_cross_attention(self,
-                                      retriever_input,
-                                      retriever_output,
-                                      retriever_attn_mask,
-                                      norm_input,
-                                      norm_output,
-                                      inference_context,
-                                      bias_dropout_add_func,
-                                      *,
-                                      inference_params=None):
-        """Cross attention for Retro decoder.
-
-        Notation:
-            ns : Sequence length.
-            bs : Batch size.
-            d  : Hidden size.
-            l  : Number of chunks per sample (i.e., seq_length/chunk_length).
-            m  : Number of tokens per chunk.
-            k  : Number of neighbors.
-            r  : Number of retrieved tokens (neighbors + continuation).
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        ns, bs, d = norm_output.shape
-        l = int(np.ceil(ns / self.retro_chunk_length))
-
-        # Retrieve neighbors.
-        if self.layer_type == LayerType.retro_decoder_with_retriever:
-            first_ns = ns % self.retro_chunk_length
-            if first_ns > 0:
-                first_chunk, rest_chunk = \
-                    norm_output[:first_ns], norm_output[first_ns:]
-                first_chunk = torch.nn.functional.pad(
-                    first_chunk,
-                    (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
-                    'constant',
-                    0)
-                chunked_output = \
-                    torch.cat((first_chunk, rest_chunk), dim=0) # [l * m, bs, d]
-            else:
-                chunked_output = norm_output # [l * m, bs, d]
-            chunked_output = chunked_output \
-                .reshape(l, self.retro_chunk_length, bs, d) \
-                .permute(1, 2, 0, 3) \
-                .reshape(self.retro_chunk_length, bs * l, d) \
-                .contiguous()
-
-            # Get Encoder Output
-            retriever_output = self.retriever(
-                hidden_states=retriever_input,
-                attention_mask=retriever_attn_mask,
-                retriever_output=chunked_output,
-                retriever_attn_mask=retriever_attn_mask,
-                inference_context=inference_context) # [r, k * bs * l , d]
-            retriever_output = retriever_output.reshape(
-                self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
-
-        # Chunks.
-        pad = (ns - 1) % self.retro_chunk_length
-        attending_chunks = norm_output[pad:]
-        padded_chunks = torch.nn.functional.pad(
-            attending_chunks,
-            (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
-            'constant', 0)
-        padded_chunked_output = padded_chunks \
-            .reshape(l, self.retro_chunk_length, bs, d) \
-            .permute(1, 2, 0, 3)
-        padded_chunked_output = padded_chunked_output.reshape(
-            self.retro_chunk_length, bs * l, d).contiguous()
-
-        # Encoder output.
-        attention_output, attention_bias = \
-            self.inter_attention(padded_chunked_output,
-                                 None,
-                                 encoder_output=retriever_output)
-
-        # Residual connection.
-        if self.apply_residual_connection_post_norm:
-            residual = norm_output
-        else:
-            residual = norm_input
-
-        # Re-enable torch grad to enable fused optimization.
-        with torch.enable_grad():
-            norm_input = bias_dropout_add_func(
-                attention_output,
-                None if attention_bias is None else attention_bias.expand_as(attention_output),
-                torch.zeros_like(attention_output),
-                self.hidden_dropout)
-            norm_input = norm_input \
-                .reshape(self.retro_chunk_length, bs, l, d) \
-                .permute(2, 0, 1, 3) # [l, m, bs, d]
-            norm_input = norm_input.reshape(self.retro_chunk_length * l, bs, d)
-            norm_input = torch.nn.functional.pad(
-                norm_input,
-                (0, 0, 0, 0, pad, 0),
-                'constant', 0)[:ns] # [ns, b, d]
-            # TODO: better redesign with inference param
-            args = get_args()
-            norm_input = args.retro_attention_gate * norm_input + residual
-
-        # Layer norm post the decoder attention
-        norm_output = self.post_inter_attention_norm(norm_input)
-
-        return retriever_output, norm_input, norm_output
-
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                retriever_input=None,
-                retriever_output=None,
-                retriever_attn_mask=None,
                 inference_context=None,
                 rotary_pos_emb=None,
                 *,
                 inference_params=None):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        # Update the params in case the retro param changes during inference
-        # TODO: better redesign with inference param
-        args = get_args()
-        if args.retro_add_retriever:
-            self.retro_num_neighbors = args.retro_num_neighbors
-            self.retro_chunk_length = args.retro_chunk_length
-            self.retro_retrieved_length = \
-                args.retro_num_retrieved_chunks * args.retro_chunk_length
 
         # hidden_states: [s, b, h]
 
@@ -1246,24 +1029,6 @@ class ParallelTransformerLayer(MegatronModule):
                     norm_input,
                     norm_output,
                     bias_dropout_add_func)
-        elif self.layer_type == LayerType.retro_encoder:
-            norm_input, norm_output = \
-                self.retro_encoder_cross_attention(
-                    retriever_output,
-                    norm_input,
-                    norm_output,
-                    bias_dropout_add_func)
-        elif self.layer_type in (LayerType.retro_decoder,
-                                 LayerType.retro_decoder_with_retriever):
-            retriever_output, norm_input, norm_output = \
-                self.retro_decoder_cross_attention(
-                    retriever_input,
-                    retriever_output,
-                    retriever_attn_mask,
-                    norm_input,
-                    norm_output,
-                    inference_context,
-                    bias_dropout_add_func)
         else:
             raise Exception("Unsupported layer type, '%s'." %
                             self.layer_type.name)
@@ -1305,10 +1070,7 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
-        if self.layer_type == LayerType.retro_decoder_with_retriever:
-            return output, retriever_output
-        else:
-            return output
+        return output
 
 
 class NoopTransformerLayer(MegatronModule):
@@ -1339,9 +1101,7 @@ class NoopTransformerLayer(MegatronModule):
 
 def _get_num_layers(args, model_type, is_decoder=False):
     """Compute the number of transformer layers resident on the current rank."""
-    if model_type == ModelType.retro_encoder:
-        num_layers = args.retro_encoder_layers
-    elif mpu.get_pipeline_model_parallel_world_size() > 1:
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
         assert args.num_layers == args.encoder_num_layers
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
             'num_layers must be divisible by transformer_pipeline_model_parallel_size'
@@ -1362,22 +1122,6 @@ def _get_num_layers(args, model_type, is_decoder=False):
         else:
             num_layers = args.decoder_num_layers
     return num_layers
-
-
-def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
-                    layer_number):
-    args = get_args()
-    if args.retro_add_retriever and layer_number in retro_layer_numbers:
-        if model_type == ModelType.retro_decoder:
-            return LayerType.retro_decoder_with_retriever \
-                if layer_number == retro_layer_numbers[0] \
-                   else LayerType.retro_decoder
-        elif model_type == ModelType.retro_encoder:
-            return LayerType.retro_encoder
-        else:
-            raise Exception("Unsupported model type, '%s'." % model_type)
-    else:
-        return default_layer_type
 
 
 class ParallelTransformer(MegatronModule):
@@ -1403,7 +1147,6 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
         self.transformer_impl = args.transformer_impl
-        self.retro_add_retriever = args.retro_add_retriever
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = config.recompute_granularity
@@ -1469,29 +1212,12 @@ class ParallelTransformer(MegatronModule):
             rate.item() for rate in
             torch.linspace(0, self.drop_path_rate, config.num_layers)]
 
-        self.retro_layer_numbers = None
-        if model_type == ModelType.retro_decoder:
-            retro_layer_start = 6 if config.num_layers <= 15 else 9
-            self.retro_layer_numbers = \
-                np.arange(retro_layer_start, args.num_layers + 1, 3).tolist()
-        if model_type == ModelType.retro_encoder:
-            self.retro_layer_numbers = [1]
-
-        # Transformer layers.
-        if args.retro_add_retriever:
-            assert self.recompute_granularity != 'full', \
-                "Full recompute not supported for Retro."
-            assert args.transformer_impl == 'local', \
-                "Transformer engine does not support Retro layers."
         def build_layer(layer_number):
             if args.transformer_impl == 'local':
-                current_layer_type = _get_layer_type(
-                    model_type, layer_type, self.retro_layer_numbers,
-                    layer_number)
                 return ParallelTransformerLayer(
                     config,
                     layer_number,
-                    layer_type=current_layer_type,
+                    layer_type=layer_type,
                     self_attn_mask_type=self_attn_mask_type,
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
@@ -1574,17 +1300,6 @@ class ParallelTransformer(MegatronModule):
         else:
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
-
-            # Update dropout rate for Retro encoder.
-            if model_type == ModelType.retro_encoder:
-                for layer in self.layers:
-                    if layer.self_attention.use_flash_attn:
-                        layer.self_attention.core_attention_flash.dropout_p = \
-                            torch.nn.Dropout(args.retro_encoder_attention_dropout)
-                    else:
-                        layer.self_attention.core_attention.attention_dropout.p =\
-                            args.retro_encoder_attention_dropout
-                    layer.hidden_dropout = args.retro_encoder_hidden_dropout
 
         if self.post_process and self.post_norm:
             # Final layer norm before output.
@@ -1684,9 +1399,6 @@ class ParallelTransformer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                retriever_input=None,
-                retriever_output=None,
-                retriever_attn_mask=None,
                 inference_context=None,
                 rotary_pos_emb=None,
                 *,
@@ -1771,9 +1483,6 @@ class ParallelTransformer(MegatronModule):
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
-                        forward_kwargs['retriever_input'] = retriever_input
-                        forward_kwargs['retriever_output'] = retriever_output
-                        forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
@@ -1782,14 +1491,6 @@ class ParallelTransformer(MegatronModule):
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
-
-                        # First Retro decoder layer returns both hidden_states
-                        # and retriever_output. Make retriever_output available
-                        # to subsequence Retro layers.
-                        if isinstance(hidden_states, tuple):
-                            assert len(hidden_states) == 2
-                            hidden_states, retriever_output = hidden_states
-                            forward_kwargs["retriever_output"] = retriever_output
 
                 # Skip counter update for eval and activation checkpointing
                 if torch.is_grad_enabled() and self.training:

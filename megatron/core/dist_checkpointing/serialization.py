@@ -15,6 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -181,9 +182,12 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     """
     if isinstance(checkpoint_dir, Path):
         checkpoint_dir = str(checkpoint_dir)
-        logger.warning(
-            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in load_common_state_dict will "
-            "no longer be supported in a future release. Please pass it as a string instead."
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in "
+            "load_common_state_dict will no longer be supported in a future release. "
+            "Please pass it as a string instead.",
         )
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
     return common_strategy.load_common(checkpoint_dir)
@@ -449,6 +453,14 @@ def get_default_save_common_strategy(
     return get_default_strategy(StrategyAction.SAVE_COMMON, backend, version)
 
 
-def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
-    """Get default load sharded strategy."""
-    return verify_checkpoint_and_load_strategy(checkpoint_dir)[0]
+def get_default_load_sharded_strategy(
+    checkpoint_dir: str, cache_metadata: bool = False
+) -> LoadShardedStrategy:
+    """Get default load sharded strategy.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory.
+        cache_metadata: If True and checkpoint format is torch_dist, use a strategy that caches
+            metadata (e.g. when ckpt_assume_constant_structure is enabled).
+    """
+    return verify_checkpoint_and_load_strategy(checkpoint_dir, cache_metadata=cache_metadata)[0]

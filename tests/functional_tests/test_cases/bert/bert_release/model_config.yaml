@@ -45,6 +45,7 @@ MODEL_ARGS:
   --log-params-norm: true
   --log-validation-ppl-to-tensorboard: true
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
   --exit-interval: 20000

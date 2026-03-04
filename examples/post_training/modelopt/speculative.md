@@ -43,7 +43,7 @@ and acceptance rate (AR).
 For simplicity and efficiency, we use `vllm serve --quantization modelopt` to host an quantized
 endpoint and we feed multi-turn conversation data to synthesize the assistant output.
 See ModelOpt's example (https://github.com/NVIDIA/Model-Optimizer/tree/main/speculative_decoding)
-for more details. The final output is stored as jsonlines in an OpenAI chat completion format.
+for more details. The final output is stored as `jsonlines` in an OpenAI chat completion format.
 
 
 ### Quantization-Aware Training (QAT)
