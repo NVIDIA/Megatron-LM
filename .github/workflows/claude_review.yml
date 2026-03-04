@@ -25,10 +25,6 @@ jobs:
     steps:
       - name: Get PR head commit
         id: get-pr-head-commit
-        env:
-          GH_TOKEN: ${{ env.GH_TOKEN }}
-          PR_NUMBER: ${{ env.PR_NUMBER }}
-          REPO: ${{ env.REPO }}
         run: |
           echo "sha=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid -q .headRefOid)" | tee -a $GITHUB_OUTPUT
 
