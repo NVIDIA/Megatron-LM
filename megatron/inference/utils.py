@@ -224,8 +224,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Suspend and resume the dynamic engine every "
-        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "`suspend_resume_interval` requests. This is used to test the suspend/resume "
         "system.",
+    )
+    group.add_argument(
+        "--suspend-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep while the engine is suspended (simulates a training step).",
     )
     group.add_argument(
         "--inference-repeat-n",
@@ -258,7 +264,6 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Path to write coordinator request scheduling decisions as JSON",
     )
-
     return parser
 
 

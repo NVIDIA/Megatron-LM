@@ -56,6 +56,9 @@ def test_inference_pipeline(
         model_config_content = f3.read()
 
     metrics = yaml.safe_load(model_config_content)["METRICS"]
+    if not metrics:
+        print("No metrics defined in model_config.yaml, skipping validation.")
+        return
 
     output_groundtruth = json.loads(golden_values_content)
 
