@@ -55,20 +55,8 @@ async def main(
         coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
 
-    # Test suspend/resume intervals.
-    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
-        # Since the client doesn't directly call engine.async_step here, we test
-        # the suspend-resume system ~4 times.
-        suspend_resume_interval = max(1, len(requests) // 4)
-        suspend_idxs = set(
-            range(suspend_resume_interval, len(requests) + 1, suspend_resume_interval)
-        )
-        resume_idxs = set(
-            min(len(requests), i + suspend_resume_interval // 2) for i in suspend_idxs
-        )
-    else:
-        suspend_idxs = set()
-        resume_idxs = set()
+    # All ranks agree on the number of suspend/resume cycles from args.
+    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
 
     # Create client and run example.
     if dist.get_rank() == 0:

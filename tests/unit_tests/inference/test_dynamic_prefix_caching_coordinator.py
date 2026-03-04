@@ -216,6 +216,7 @@ def make_coordinator_direct(
     )
 
     coordinator.hash_to_rank_info = {}
+    coordinator._round_robin_idx = 0
     coordinator._assignment_counter = 0
 
     return coordinator
