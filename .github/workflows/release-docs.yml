@@ -30,14 +30,52 @@ on:
         required: false
         type: string
         default: ""
+      update-version-picker:
+        description: Update version picker.
+        required: false
+        type: boolean
+        default: true
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: false
         type: string
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Whether to run the workflow in dry-run mode
+        required: true
+        type: boolean
+        default: true
+      publish-as-latest:
+        description: Publish as Latest stable version.
+        required: false
+        type: boolean
+        default: true
+      docs-version-override:
+        description: Docs version if commit is not tagged
+        required: false
+        type: string
+        default: ""
+      update-version-picker:
+        description: Update version picker.
+        required: false
+        type: boolean
+        default: true
+      notify-emails:
+        description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
+        required: false
+        type: string
+      build-docs-ref:
+        description: Reference to build the docs from
+        required: false
+        type: string
+        default: ${{ github.sha }}
 
 jobs:
   build-docs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
+    with:
+      ref: ${{ inputs.build-docs-ref }}
 
   publish-docs:
     runs-on: ubuntu-latest
@@ -46,7 +84,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.72.0
+          ref: v0.74.0
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
@@ -62,6 +100,7 @@ jobs:
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
           overwrite-latest-on-tag: ${{ inputs.publish-as-latest }}
           docs-version-override: ${{ inputs.docs-version-override }}
+          update-version-picker: ${{ inputs.update-version-picker }}
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: megatron-core-publish-docs-${{ github.run_id }}
           aws-region: ${{ vars.DOCS_AWS_REGION }}

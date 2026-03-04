@@ -6,6 +6,7 @@ import logging
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -33,6 +34,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
 
@@ -68,6 +70,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
             prompt_length=len(choice.prompt_token_ids),
+            policy_staleness=choice.policy_staleness,
+            kv_cache_staleness=choice.kv_cache_staleness,
+            completed_at_step=args.curr_iteration,
+            num_evictions=getattr(choice, 'num_evictions', 0),
         )
 
     @classmethod
@@ -110,6 +116,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server._client = client
         launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
+        launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
+            args.rl_kv_cache_management_mode
+        )
 
         return launched_server
 
@@ -118,12 +127,18 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             await self._client.stop_engines()
         await self._inference_engine.stopped.wait()
 
+    def increment_staleness(self):
+        if dist.get_rank() == 0:
+            self._client.increment_staleness()
+
     async def suspend(self):
         if dist.get_rank() == 0:
-            await self._client.pause_engines()
+            self._client.suspend_engines()
         await self._inference_engine.paused.wait()
+        self._inference_engine.suspend()
 
     async def resume(self):
         if dist.get_rank() == 0:
-            self._client.unpause_engines()
+            self._client.resume_engines()
         await self._inference_engine.running.wait()
+        self._inference_engine.resume()

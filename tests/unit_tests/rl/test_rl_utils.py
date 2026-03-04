@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -314,6 +316,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=[[1, 2, 3, 4]],
@@ -322,6 +328,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
 
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -340,6 +350,10 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
@@ -348,9 +362,13 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0]],
+            kv_cache_staleness=[[0, 0, 0, 0]],
+            completed_at_step=[1],
+            num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
-        data_iter = rl_utils.prepare_data_for_update(
+        data_iter, _, _ = rl_utils.prepare_data_for_update(
             [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
 
@@ -381,6 +399,10 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
+            policy_staleness=[[0, 0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
             trajectory=[[4, 5, 6, 7, tokenizer.eod]] * num_turns,
@@ -389,6 +411,10 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
+            policy_staleness=[[0, 0, 0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
             trajectory=[[8, 9, tokenizer.eod]] * num_turns,
@@ -397,6 +423,10 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
+            policy_staleness=[[0, 0, 0]] * num_turns,
+            kv_cache_staleness=[[0, 0, 0]] * num_turns,
+            completed_at_step=[0] * num_turns,
+            num_evictions=[0] * num_turns,
         )
 
         rollouts = [r1, r2, r3]
@@ -865,3 +895,87 @@ class TestRLUtils:
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
+
+    def test_compute_true_staleness(self):
+        # Single group, 2 turns: turn 1 has 1 token, turn 2 has 2 tokens
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[1, 2, 3]],
+            completed_at_steps=[[8, 7]],
+            turn_lens=[[1, 2]],
+            current_iteration=10,
+        )
+        # token 0: 1 + (10-8) = 3
+        # token 1: 2 + (10-7) = 5
+        # token 2: 3 + (10-7) = 6
+        assert result == [3, 5, 6]
+
+        # Multiple groups
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[0, 0], [1]],
+            completed_at_steps=[[5], [5]],
+            turn_lens=[[2], [1]],
+            current_iteration=6,
+        )
+        # group 1: [0+1, 0+1] = [1, 1]
+        # group 2: [1+1] = [2]
+        assert result == [1, 1, 2]
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prep_wandb_metrics(self, initialize_model_parallel):
+        # This tests the computation and makes us fail noisily if
+        # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
+        traj_lens = [[3, 3], [1, 2]]
+        turn_lens = [[1, 2, 1, 1, 1], [1, 2]]
+        rewards = [[1, 1], [-1, 2]]
+        num_turns = [[42, 2], [10, 8]]
+        advantages = [0, 1]
+        # Per-token staleness (6 tokens in group 1, 3 in group 2; matching turn_lens)
+        policy_staleness = [[1, 2, 2, 0, 0, 3], [0, 3, 3]]
+        kv_cache_staleness = [[1, 1, 1, 0, 0, 2], [0, 2, 2]]
+        num_evictions = [[0, 1], [0, 0]]
+        # Per-turn completed_at_steps (5 turns in group 1, 2 in group 2; matching turn_lens)
+        completed_at_steps = [[5, 4, 5, 5, 3], [5, 3]]
+        current_iteration = 6
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_staleness=policy_staleness,
+            kv_cache_staleness=kv_cache_staleness,
+            num_evictions=num_evictions,
+            completed_at_steps=completed_at_steps,
+            current_iteration=current_iteration,
+        )
+        assert metrics["mean_reward"] == 0.75
+        assert metrics["mean_advantage"] == 0.5
+        assert metrics["nonzero_groups_ratio"] == 0.5
+        assert metrics["max_traj_length"] == 3
+        assert metrics["min_traj_length"] == 1
+        assert metrics["mean_traj_length"] == 2.25
+        assert metrics["mean_traj_length_std"] == 0.25
+        assert metrics["max_turn_length"] == 2
+        assert metrics["min_turn_length"] == 1
+        assert metrics["mean_turn_length"] == 1.35
+        assert np.isclose(metrics["mean_turn_length_std"], 0.45)
+        assert metrics["mean_num_turns"] == 15.5
+        assert metrics["max_num_turns"] == 42
+        assert metrics["min_num_turns"] == 2
+        # true_policy_staleness = [2, 4, 4, 1, 1, 6, 1, 6, 6]
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 4, 1, 1, 6, 1, 6, 6])
+        assert metrics["max_policy_staleness"] == 6
+        assert metrics["min_policy_staleness"] == 1
+        # true_kv_staleness = [2, 3, 3, 1, 1, 5, 1, 5, 5]
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 3, 1, 1, 5, 1, 5, 5])
+        assert metrics["max_kv_cache_staleness"] == 5
+        assert metrics["min_kv_cache_staleness"] == 1
+        assert metrics["total_eviction_count"] == 1
+        assert metrics["max_num_evictions"] == 1
+        # completion_gaps per-turn = [1, 2, 1, 1, 3, 1, 3]
+        assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 1, 3, 1, 3])

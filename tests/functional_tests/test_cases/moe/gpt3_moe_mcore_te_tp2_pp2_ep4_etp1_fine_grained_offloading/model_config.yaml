@@ -51,7 +51,7 @@ MODEL_ARGS:
   # Add network size args
   --num-layers: 15
   --moe-layer-freq: ([0]*3+[1]*12)
-  --pipeline-model-parallel-layout: Et*3\\|\\(tt\\|\\)*6mL # Et*3|(tt|)*6mL
+  --pipeline-model-parallel-layout: Et*3|(tt|)*6mL
   --hidden-size: 1024
   --ffn-hidden-size: 4096
   --num-attention-heads: 32
