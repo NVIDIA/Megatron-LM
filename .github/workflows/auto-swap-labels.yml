@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event.pull_request.base.ref == 'main' &&
       (
         (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
         (github.event_name == 'pull_request_target' && !github.event.pull_request.draft)
