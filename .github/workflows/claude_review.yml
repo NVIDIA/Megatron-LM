@@ -7,7 +7,7 @@ on:
 jobs:
   review-on-comment:
     name: Claude Review (comment trigger)
-    if: github.event.issue.pull_request
+    # if: github.event.issue.pull_request
     runs-on: ubuntu-latest
     permissions:
       contents: read
