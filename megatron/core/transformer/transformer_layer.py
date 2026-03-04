@@ -1310,7 +1310,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.config.cuda_graph_warmup_steps > 0
             ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
 
-
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
