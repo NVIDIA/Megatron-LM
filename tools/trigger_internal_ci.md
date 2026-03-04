@@ -21,6 +21,8 @@ To check existing remotes: `git remote -v`
 4. Copy the generated token (starts with `glptt-`).
 5. Store it in your environment to avoid passing it on every invocation:
 
+Reach out to @mcore-ci in case you don't have access to the settings page.
+
 ```bash
 export GITLAB_TRIGGER_TOKEN=glptt-<your-token>
 ```
