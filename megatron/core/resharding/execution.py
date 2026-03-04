@@ -150,6 +150,7 @@ def execute_reshard_plan(
     #   ('default', recv_buffer, dst_param, dst_slice)  or
     #   ('transform', param_name, dst_slice, [recv_buffers])
     recv_writebacks: list = []
+
     for op in plan.recv_ops:
         if transform is not None and transform.should_transform(op.param_name):
             recv_bufs = transform.prepare_recv(op.param_name, op.my_slice)
@@ -295,10 +296,15 @@ class MXFP8ReshardTransform(ReshardTransform):
 
         if self.convert_on_send:
             # Receive MXFP8 data + scale (2 buffers).
-            scale_slice = _scale_slice_from_data_slice(dst_slice)
+            if buf.scale.ndim == 1:
+                # Flat 1D scale (swizzled FlashInfer format): allocate the full scale buffer.
+                scale_recv_buf = torch.empty_like(buf.scale.contiguous())
+            else:
+                scale_slice = _scale_slice_from_data_slice(dst_slice)
+                scale_recv_buf = torch.empty_like(buf.scale[scale_slice].contiguous())
             return [
                 torch.empty_like(buf.data[dst_slice].contiguous()),
-                torch.empty_like(buf.scale[scale_slice].contiguous()),
+                scale_recv_buf,
             ]
         else:
             # Receive BF16 (1 buffer, same shape as the MXFP8 data slice).
@@ -308,16 +314,25 @@ class MXFP8ReshardTransform(ReshardTransform):
     def finalize_recv(self, param_name, dst_slice, recv_buffers):
         buf_key = param_name.removeprefix(self.buffer_key_prefix)
         buf = self.persistent_buffers[buf_key]
-        scale_slice = _scale_slice_from_data_slice(dst_slice)
 
         if self.convert_on_send:
             # Already MXFP8 — direct copy.
             buf.data[dst_slice].copy_(recv_buffers[0])
-            buf.scale[scale_slice].copy_(recv_buffers[1])
+            if buf.scale.ndim == 1:
+                # Flat 1D scale (swizzled FlashInfer format): copy the full scale.
+                buf.scale.copy_(recv_buffers[1])
+            else:
+                scale_slice = _scale_slice_from_data_slice(dst_slice)
+                buf.scale[scale_slice].copy_(recv_buffers[1])
         else:
             # Convert received BF16 → MXFP8, then copy into persistent buffers.
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
             mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0])
             buf.data[dst_slice].copy_(mxfp8.data)
-            buf.scale[scale_slice].copy_(mxfp8.scale)
+            if buf.scale.ndim == 1:
+                # Flat 1D scale (swizzled FlashInfer format): copy the full scale.
+                buf.scale.copy_(mxfp8.scale)
+            else:
+                scale_slice = _scale_slice_from_data_slice(dst_slice)
+                buf.scale[scale_slice].copy_(mxfp8.scale)

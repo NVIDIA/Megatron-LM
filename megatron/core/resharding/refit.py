@@ -279,7 +279,10 @@ def reshard_model_weights(
     # Build or retrieve cached plan
     cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
 
+    import sys
+    my_rank = group.rank() if group is not None else torch.distributed.get_rank()
     if cache_key not in _plan_cache:
+        print(f"[DEBUG REFIT] rank={my_rank} BUILDING plan (cache miss, cache size={len(_plan_cache)})", flush=True, file=sys.stderr)
         # All ranks must participate in planning (collective operations)
         plan = build_centralized_reshard_plan(
             src_core,
@@ -291,6 +294,10 @@ def reshard_model_weights(
         )
         _plan_cache[cache_key] = plan
     else:
+        print(f"[DEBUG REFIT] rank={my_rank} USING cached plan (cache size={len(_plan_cache)})", flush=True, file=sys.stderr)
         plan = _plan_cache[cache_key]
 
+    send_peers = sorted(set(op.peer_rank for op in plan.send_ops))
+    recv_peers = sorted(set(op.peer_rank for op in plan.recv_ops))
+    print(f"[DEBUG REFIT] rank={my_rank} executing: {len(plan.send_ops)} sends→{send_peers} {len(plan.recv_ops)} recvs←{recv_peers}", flush=True, file=sys.stderr)
     execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group, transform=transform)

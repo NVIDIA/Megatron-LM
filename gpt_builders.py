@@ -116,17 +116,26 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-    
+
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-        
+
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
     args = get_args()
-    if use_te:
+    # Check inference_optimized first: it takes precedence over use_te since
+    # args.transformer_impl may still be "transformer_engine" when
+    # config.transformer_impl is "inference_optimized" (set via TransformerConfig).
+    if config.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            qk_l2_norm=args.qk_l2_norm,
+        )
+    elif use_te:
         return get_gpt_layer_with_transformer_engine_spec(
             args.num_experts,
             args.moe_grouped_gemm,
@@ -139,12 +148,6 @@ def _get_transformer_layer_spec(use_te, config):
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-    elif config.transformer_impl == "inference_optimized":
-        return get_gpt_layer_with_inference_spec(
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            qk_l2_norm=args.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
