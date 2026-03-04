@@ -121,6 +121,11 @@ class ModelParallelConfig:
        None, no function is called on the loss.
     """
 
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scale tensor for MTP loss. If None, falls back to grad_scale_func with torch.ones(1).
+    """
+
     no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use

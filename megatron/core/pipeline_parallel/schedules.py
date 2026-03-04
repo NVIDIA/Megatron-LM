@@ -296,12 +296,15 @@ def forward_step_calc_loss(
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
+        # Calculate the loss scale based on mtp_grad_scale_func if available,
+        # else fall back to grad_scale_func, else default to 1.
+        mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
+        if mtp_grad_scale_func is not None:
+            loss_scale = mtp_grad_scale_func()
+        elif config.grad_scale_func is not None:
+            loss_scale = config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+        else:
+            loss_scale = torch.ones(1, device=output_tensor.device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
