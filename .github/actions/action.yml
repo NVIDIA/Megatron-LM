@@ -98,7 +98,8 @@ runs:
           --environment dev \
           --platform dgx_h100 \
           --tag ${{ inputs.tag }} \
-          --container-image ${{ inputs.container-image }}
+          --container-image ${{ inputs.container-image }} \
+          --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
         RUN_TEST_EOF
         )
