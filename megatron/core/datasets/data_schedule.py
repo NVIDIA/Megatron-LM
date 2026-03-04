@@ -289,7 +289,6 @@ class HybridCPDataLoaderWrapper:
 
         # Get the padded lengths of all sub-samples being packed
         sample_padded_lens = torch.tensor([s["tokens"].shape[0] for s in samples], dtype=torch.int32)
-        max_seqlen = torch.max(sample_padded_lens).to(dtype=torch.int32)
 
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
         labels = _pack_tensors([sample["labels"] for sample in samples])
@@ -313,11 +312,6 @@ class HybridCPDataLoaderWrapper:
                 sample_padded_lens = torch.cat([sample_padded_lens, torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device)])
                 # padded_length = cu_seqlens_padded[:, -1:] + pad_len
                 cu_seqlens_padded[:, -1:] = cu_seqlens_padded[:, -1:] + pad_len
-                if torch.distributed.get_rank() == 254:
-                    print(f"pad_len: {pad_len} sample_padded_lens: {sample_padded_lens} cu_seqlens_padded: {cu_seqlens_padded} tokens.shape: {tokens.shape} local_cp_size: {local_cp_size}")
-            else:
-                if torch.distributed.get_rank() == 254:
-                    print(f"no padding needed sample_padded_lens: {sample_padded_lens} cu_seqlens_padded: {cu_seqlens_padded} tokens.shape: {tokens.shape} local_cp_size: {local_cp_size}")
         
         new_sample = {}
         new_sample["tokens"] = tokens
@@ -336,6 +330,7 @@ class HybridCPDataLoaderWrapper:
         # TODO(pmannan): We need to be able to differentiate if the original data_iterator is providing
         # padded samples or valid lengths.
         new_sample["cu_seqlens"] = cu_seqlens_padded
+        max_seqlen = torch.max(torch.diff(cu_seqlens_padded[0])).to(dtype=torch.int32)
         new_sample["max_seqlen"] = max_seqlen
 
         return new_sample
