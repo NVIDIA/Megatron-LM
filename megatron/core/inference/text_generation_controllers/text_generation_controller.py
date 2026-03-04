@@ -530,6 +530,12 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
+        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
+        if is_inference_optimized:
+            assert not moe_pad_experts_for_cuda_graph_inference, (
+                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
+                "transformer_impl is 'inference_optimized'"
+            )
         if moe_pad_experts_for_cuda_graph_inference:
             if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
@@ -842,6 +848,11 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
+            # initialize symmetric memory if needed
+            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            model_config = get_model_config(unwrapped_model)
+            if model_config.transformer_impl == "inference_optimized":
+                context.maybe_initialize_symmetric_memory()
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
