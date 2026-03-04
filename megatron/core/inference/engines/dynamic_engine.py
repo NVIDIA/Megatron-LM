@@ -121,6 +121,7 @@ class EngineState(Enum):
     SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
     SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
     RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
+    RESUMED = auto()  # GPU onloaded, all ranks confirmed; cleared on next SUSPEND
     STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
     STOPPED = auto()  # All ranks confirmed; teardown complete
 
@@ -173,6 +174,7 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.RUNNING: 'running',
         EngineState.PAUSED: 'paused',
         EngineState.SUSPENDED: 'suspended',
+        EngineState.RESUMED: 'resumed',
         EngineState.STOPPED: 'stopped',
     }
 
@@ -291,9 +293,9 @@ class DynamicInferenceEngine(AbstractEngine):
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
 
-        Only stable states (RUNNING, PAUSED, SUSPENDED, STOPPED) are
-        supported.  Transient states (PAUSING, SUSPENDING, RESUMING,
-        STOPPING) are not directly waitable.
+        Only stable states (RUNNING, PAUSED, SUSPENDED, RESUMED,
+        STOPPED) are supported.  Transient states (PAUSING, SUSPENDING,
+        RESUMING, STOPPING) are not directly waitable.
         """
         attr = self._STATE_EVENTS.get(state)
         if attr is None:
@@ -1795,6 +1797,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
+                self.resumed.clear()
                 self.suspend()
                 self.state = EngineState.SUSPENDING
 
@@ -2004,7 +2007,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 elif self.state == EngineState.RESUMING:
                     await self._world_barrier()
                     self.state = EngineState.PAUSED
-                    self.paused.set()
+                    self.resumed.set()
 
                 elif self.state == EngineState.STOPPING:
                     await self._world_barrier()

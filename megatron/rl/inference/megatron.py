@@ -154,6 +154,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         if dist.get_rank() == 0:
             self._client.resume_engines()
-            self._client.unpause_engines()
+        await self._inference_engine.wait_until(EngineState.RESUMED)
 
+        if dist.get_rank() == 0:
+            self._client.unpause_engines()
         await self._inference_engine.wait_until(EngineState.RUNNING)

@@ -91,7 +91,7 @@ async def main(
                         client.suspend_engines()
                         await engine.wait_until(EngineState.SUSPENDED)
                         client.resume_engines()
-                        await engine.wait_until(EngineState.PAUSED)
+                        await engine.wait_until(EngineState.RESUMED)
                         client.unpause_engines()
                         await engine.wait_until(EngineState.RUNNING)
                         cycles_done += 1
@@ -115,7 +115,7 @@ async def main(
                         client.suspend_engines()
                         await engine.wait_until(EngineState.SUSPENDED)
                         client.resume_engines()
-                        await engine.wait_until(EngineState.PAUSED)
+                        await engine.wait_until(EngineState.RESUMED)
                         client.unpause_engines()
                         await engine.wait_until(EngineState.RUNNING)
                         cycles_done += 1
@@ -133,7 +133,7 @@ async def main(
         for _ in range(num_suspend_resume_cycles):
             await engine.wait_until(EngineState.PAUSED)
             await engine.wait_until(EngineState.SUSPENDED)
-            await engine.wait_until(EngineState.PAUSED)
+            await engine.wait_until(EngineState.RESUMED)
             await engine.wait_until(EngineState.RUNNING)
 
     if dist.get_rank() == 0:

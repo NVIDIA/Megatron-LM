@@ -516,9 +516,8 @@ class TestCoordinator:
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # Resume.
-                engine.paused.clear()
                 client.resume_engines()
-                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.RESUMED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
                 assert not engine.suspended.is_set()
 
