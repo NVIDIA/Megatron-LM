@@ -168,16 +168,16 @@ class PRReviewTracker:
                     pr.remove_from_labels(self.FINAL_REVIEW)
                 except Exception:
                     pass
-                logger.info(f'Reverted PR #{pr.number} to expert review — pending: {pending_expert}')
+                logger.info(
+                    f'Reverted PR #{pr.number} to expert review — pending: {pending_expert}'
+                )
             else:
                 # Expert review done but final review needed again
                 try:
                     pr.add_to_labels(self.FINAL_REVIEW)
                 except Exception:
                     pass
-                logger.info(
-                    f'Reverted PR #{pr.number} to final review — pending: {pending_final}'
-                )
+                logger.info(f'Reverted PR #{pr.number} to final review — pending: {pending_final}')
         else:
             logger.info(f"PR #{pr.number} is approved. No changes needed.")
 
