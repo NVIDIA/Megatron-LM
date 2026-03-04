@@ -32,19 +32,8 @@ class MambaMetadata:
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
-        # (varlen kernel requests only — batch-kernel requests use separate buffer)
         self._batch_indices_prefill_buffer = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=self.device
-        )
-
-        # Per-batch-kernel-request: mamba slot index
-        self._batch_kernel_indices_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=self.device
-        )
-
-        # Per-batch-kernel-request: cumulative token offsets
-        self._batch_kernel_cu_seqlens_buffer = torch.zeros(
-            (self.max_requests + 1,), dtype=torch.int32, device=self.device
         )
 
         # Map from token id to request id for active prefill requests
@@ -59,14 +48,6 @@ class MambaMetadata:
 
         # Tuple of (active decode request count, active prefill request count)
         self._device_decode_prefill_buffer = torch.zeros(
-            (2,), dtype=torch.int32, device=self.device
-        )
-
-        # Tuple of (
-        #   total batch-kernel prefill token count,
-        #   total varlen prefill token count
-        # )
-        self._device_chunked_prefill_buffer = torch.zeros(
             (2,), dtype=torch.int32, device=self.device
         )
 
@@ -99,10 +80,6 @@ class MambaMetadata:
         self.cu_seqlens = None
         self.seq_idx = None
         self.device_decode_prefill = None
-        self.device_chunked_prefill = None
-        self.num_batch_kernel_prefills = 0
-        self.batch_kernel_batch_indices = None
-        self.batch_kernel_cu_seqlens = None
 
     def update(
         self,
@@ -111,8 +88,6 @@ class MambaMetadata:
         cu_seqlens: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
-        enable_chunked_prefill: bool,
-        prefill_has_initial_states: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Updates the dedicated CUDA graph mapping tensor with the indices
@@ -125,10 +100,6 @@ class MambaMetadata:
             cu_seqlens (Tensor): Cumulative sequence lengths.
             batch_dimensions (InferenceBatchDimensions): Dimensions of the current batch.
             padded_batch_dimensions (InferenceBatchDimensions): Dimensions of the padded batch.
-            enable_chunked_prefill (bool): Whether chunked prefill is enabled.
-            prefill_has_initial_states (Optional[Tensor]): Boolean tensor indicating which
-                active requests have initial Mamba states (from restored prefix cache or
-                continuing chunked prefill). Shape: (num_active_requests,).
         """
         real_decode_count = batch_dimensions.decode_req_count
         real_prefill_count = batch_dimensions.prefill_req_count
@@ -136,23 +107,6 @@ class MambaMetadata:
         padded_decode_count = padded_batch_dimensions.decode_req_count
         padded_prefill_count = padded_batch_dimensions.prefill_req_count
         padded_token_count = padded_batch_dimensions.token_count
-
-        # Determine how many prefill requests should use the batch kernel
-        # (those with initial Mamba states: restored from cache or continuing chunked prefill).
-        # The scheduler guarantees these come first among prefill requests.
-        num_batch_kernel = 0
-        if enable_chunked_prefill and real_prefill_count > 0:
-            if prefill_has_initial_states is not None:
-                prefill_flags = prefill_has_initial_states[
-                    real_decode_count : real_decode_count + real_prefill_count
-                ]
-                num_batch_kernel = prefill_flags.sum().item()
-            else:
-                # Legacy fallback: treat first prefill as batch-kernel (old behavior)
-                num_batch_kernel = 1
-
-        self.num_batch_kernel_prefills = num_batch_kernel
-        varlen_prefill_count = real_prefill_count - num_batch_kernel
 
         if padded_decode_count > 0:
             # Update decode indices
@@ -163,75 +117,52 @@ class MambaMetadata:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
 
-        # Populate batch-kernel metadata
-        if num_batch_kernel > 0:
-            batch_start = real_decode_count
-            self._batch_kernel_indices_buffer[:num_batch_kernel].copy_(
-                active_mamba_indices[batch_start : batch_start + num_batch_kernel]
-            )
-            self.batch_kernel_batch_indices = self._batch_kernel_indices_buffer[:num_batch_kernel]
-
-            # Cu seqlens for batch kernel requests (relative to first batch kernel token)
-            batch_start_token = cu_seqlens[real_decode_count]
-            self._batch_kernel_cu_seqlens_buffer[0] = 0
-            self._batch_kernel_cu_seqlens_buffer[1 : num_batch_kernel + 1].copy_(
-                cu_seqlens[real_decode_count + 1 : real_decode_count + num_batch_kernel + 1]
-                - batch_start_token
-            )
-            self.batch_kernel_cu_seqlens = self._batch_kernel_cu_seqlens_buffer[
-                : num_batch_kernel + 1
-            ]
-        else:
-            self.batch_kernel_batch_indices = None
-            self.batch_kernel_cu_seqlens = None
-
         if padded_prefill_count > 0:
-            # Update varlen prefill indices
-            if varlen_prefill_count > 0:
-                varlen_start_idx = real_decode_count + num_batch_kernel
-                self._batch_indices_prefill_buffer[:varlen_prefill_count].copy_(
-                    active_mamba_indices[varlen_start_idx : varlen_start_idx + varlen_prefill_count]
+            # Update prefill indices (all prefill requests go through varlen)
+            if real_prefill_count > 0:
+                prefill_start_idx = real_decode_count
+                self._batch_indices_prefill_buffer[:real_prefill_count].copy_(
+                    active_mamba_indices[prefill_start_idx : prefill_start_idx + real_prefill_count]
                 )
 
-            if padded_prefill_count > varlen_prefill_count:
+            if padded_prefill_count > real_prefill_count:
                 self._batch_indices_prefill_buffer[
-                    varlen_prefill_count:padded_prefill_count
+                    real_prefill_count:padded_prefill_count
                 ] = -1
 
             self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
 
-            # Update seq_idx for varlen prefills
-            # Varlen requests start after batch-kernel requests in the prefill token stream
-            varlen_start_req_idx = real_decode_count + num_batch_kernel
-            end_varlen_req_idx = real_decode_count + real_prefill_count
+            # Update seq_idx for all prefill requests
+            prefill_start_req_idx = real_decode_count
+            end_prefill_req_idx = real_decode_count + real_prefill_count
 
-            start_varlen_token_idx = cu_seqlens[varlen_start_req_idx]
-            end_varlen_token_idx = cu_seqlens[end_varlen_req_idx]
+            start_prefill_token_idx = cu_seqlens[prefill_start_req_idx]
+            end_prefill_token_idx = cu_seqlens[end_prefill_req_idx]
 
-            seq_len = end_varlen_token_idx - start_varlen_token_idx
+            seq_len = end_prefill_token_idx - start_prefill_token_idx
 
             if seq_len > 0:
-                # Normalize request IDs to 0-based relative to varlen requests
+                # Normalize request IDs to 0-based relative to prefill requests
                 self._seq_idx_buffer[:, :seq_len].copy_(
-                    token_to_request_idx[start_varlen_token_idx:end_varlen_token_idx]
-                    - varlen_start_req_idx
+                    token_to_request_idx[start_prefill_token_idx:end_prefill_token_idx]
+                    - prefill_start_req_idx
                 )
 
             if padded_token_count > seq_len:
                 self._seq_idx_buffer[:, seq_len:padded_token_count] = -1
             self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
-            # Update cu_seqlens for varlen prefill requests
+            # Update cu_seqlens for all prefill requests
             self._cu_seqlens_buffer[0] = 0
-            if varlen_prefill_count > 0:
-                self._cu_seqlens_buffer[1 : varlen_prefill_count + 1].copy_(
-                    cu_seqlens[varlen_start_req_idx + 1 : end_varlen_req_idx + 1]
-                    - cu_seqlens[varlen_start_req_idx]
+            if real_prefill_count > 0:
+                self._cu_seqlens_buffer[1 : real_prefill_count + 1].copy_(
+                    cu_seqlens[prefill_start_req_idx + 1 : end_prefill_req_idx + 1]
+                    - cu_seqlens[prefill_start_req_idx]
                 )
 
             # Pad the rest with the last value (effectively length 0 segments)
-            last_val = self._cu_seqlens_buffer[varlen_prefill_count]
-            self._cu_seqlens_buffer[varlen_prefill_count + 1 : padded_prefill_count + 1].fill_(
+            last_val = self._cu_seqlens_buffer[real_prefill_count]
+            self._cu_seqlens_buffer[real_prefill_count + 1 : padded_prefill_count + 1].fill_(
                 last_val
             )
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
@@ -240,22 +171,6 @@ class MambaMetadata:
             self._device_decode_prefill_buffer[0] = real_decode_count
             self._device_decode_prefill_buffer[1] = real_prefill_count
             self.device_decode_prefill = self._device_decode_prefill_buffer
-
-        # Store the batch-kernel vs varlen token split
-        if num_batch_kernel > 0:
-            batch_kernel_total_tokens = (
-                cu_seqlens[real_decode_count + num_batch_kernel] - cu_seqlens[real_decode_count]
-            )
-            varlen_total_tokens = 0
-            if varlen_prefill_count > 0:
-                varlen_total_tokens = (
-                    cu_seqlens[real_decode_count + real_prefill_count]
-                    - cu_seqlens[real_decode_count + num_batch_kernel]
-                )
-
-            self._device_chunked_prefill_buffer[0] = batch_kernel_total_tokens
-            self._device_chunked_prefill_buffer[1] = varlen_total_tokens
-            self.device_chunked_prefill = self._device_chunked_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:
         """

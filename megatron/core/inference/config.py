@@ -213,6 +213,10 @@ class InferenceConfig:
     """Memory budget (GB) for cached Mamba states in prefix caching.
     Required for Mamba prefix caching in hybrid models. If None, Mamba prefix caching is disabled."""
 
+    use_triton_conv1d: bool = False
+    """Whether to use a Triton varlen conv1d kernel for Mamba prefill instead of
+    per-request causal_conv1d_fn calls. Only applies to hybrid models with Mamba layers."""
+
     # =================================
     # Logging config
     # =================================

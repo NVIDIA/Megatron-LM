@@ -252,6 +252,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
 
+        # Mamba conv1d kernel selection
+        self.use_triton_conv1d = inference_config.use_triton_conv1d
+
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
 
@@ -633,9 +636,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
-            )
-            self.request_has_initial_mamba_state = torch.zeros(
-                self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
             )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -1145,7 +1145,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
             self.mamba_metadata.reset()
-            self.request_has_initial_mamba_state.fill_(False)
 
     # =========================================================================
     # Mamba prefix caching methods
@@ -1661,15 +1660,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
-            active_has_initial_states = self.request_has_initial_mamba_state[active_slice]
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
-                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
-                prefill_has_initial_states=active_has_initial_states,
             )
 
         if self.moe_enable_routing_replay:
@@ -2021,8 +2017,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 self.request_ids[current_id] == req.request_id
             ), "Continuation current_id mismatch"
-            if self.is_hybrid_model:
-                self.request_has_initial_mamba_state[current_id] = True
         else:
             current_id = self.total_request_count
 
@@ -2146,9 +2140,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.total_request_count, last_mamba_block_id
                 )
 
-            if restored:
-                self.request_has_initial_mamba_state[self.total_request_count] = True
-            else:
+            if not restored:
                 # No cached state - initialize to zero
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
@@ -2180,9 +2172,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
                 self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
             )
-            self.request_has_initial_mamba_state[dst_idxs] = (
-                self.request_has_initial_mamba_state[src_idxs]
-            )
 
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
@@ -2203,7 +2192,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
-            tensor_swap(self.request_has_initial_mamba_state, src_idxs, dst_idxs)
 
     def get_index_of_chunked_prefill_request(self) -> int:
         """Get the index of the chunked prefill request in the context.
@@ -2240,7 +2228,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Free Mamba slots and clear initial-state flags.
         if self.is_hybrid_model:
             self.mamba_metadata.free_slots(request_indexes)
-            self.request_has_initial_mamba_state[request_indexes] = False
 
     def resume_paused_requests(
         self,

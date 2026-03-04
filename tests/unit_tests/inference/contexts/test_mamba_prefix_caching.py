@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -60,6 +60,7 @@ def _build_hybrid_context(
     layer_type_list=None,
     params_dtype=torch.float32,
     pp_size=1,
+    eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
 ) -> DynamicInferenceContext:
     """Build a DynamicInferenceContext configured for a hybrid Mamba model."""
     _set_rounder(rounder)
@@ -93,8 +94,8 @@ def _build_hybrid_context(
         use_flashinfer_fused_rope=None,
         unified_memory_level=0,
         enable_prefix_caching=enable_prefix_caching,
-        block_evict_lru=enable_prefix_caching,
         prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+        prefix_caching_eviction_policy=eviction_policy,
     )
     return DynamicInferenceContext(
         model_config=transformer_config, inference_config=inference_config
@@ -213,7 +214,7 @@ class TestMambaCacheEviction:
     @pytest.mark.internal
     def test_lru_eviction_when_pool_full(self):
         """When the Mamba cache is full, the LRU slot (oldest timestamp, ref_count=0) is evicted."""
-        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001, eviction_policy=PrefixCachingEvictionPolicy.LRU)
         max_slots = ctx.max_mamba_cache_slots
         assert max_slots > 0
 
@@ -362,6 +363,7 @@ class TestMambaPrefixMatching:
             enable_prefix_caching=True,
             prefix_caching_mamba_gb=0.01,
             max_tokens=None,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
         assert ctx.max_mamba_cache_slots > 0
@@ -412,6 +414,7 @@ class TestMambaPrefixMatching:
             enable_prefix_caching=True,
             prefix_caching_mamba_gb=0.001,  # Very small -- few slots
             max_tokens=None,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
 
@@ -461,6 +464,7 @@ class TestMambaPrefixMatching:
             enable_prefix_caching=True,
             prefix_caching_mamba_gb=0.01,
             max_tokens=None,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
 
@@ -505,6 +509,7 @@ def _build_engine(
     max_sequence_length,
     buffer_size_gb,
     seed,
+    eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
 ):
     """Build a full MambaModel engine stack for end-to-end testing.
 
@@ -568,8 +573,8 @@ def _build_engine(
             mamba_inference_state_config=mamba_inference_state_config,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=enable_prefix_caching,
-            block_evict_lru=enable_prefix_caching,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+            prefix_caching_eviction_policy=eviction_policy,
             materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
@@ -707,6 +712,7 @@ class TestCrossConfigEndToEnd:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.01,
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "chunked_only",
@@ -743,6 +749,7 @@ class TestCrossConfigEndToEnd:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -836,7 +843,6 @@ class TestBudgetZero:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=True,
-            block_evict_lru=True,
             prefix_caching_mamba_gb=None,
         )
         ctx = DynamicInferenceContext(
@@ -902,7 +908,7 @@ class TestMultiplePrefillWithInitialStates:
            - Also restores Mamba state from block 1
 
         4. Schedule B and C simultaneously -> both have initial states
-           -> Both go through batch kernel (via loop)
+           -> Both go through unified varlen path
 
         5. Compare: run B alone and C alone in separate engine instances
            -> outputs must match the simultaneous run
@@ -952,6 +958,7 @@ class TestMultiplePrefillWithInitialStates:
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
             seed=seed,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
 
         def make_req(req_id, prompt):
@@ -1072,7 +1079,7 @@ class TestMambaHashMap:
     @pytest.mark.internal
     def test_mamba_hash_removed_on_mamba_eviction(self):
         """Mamba eviction removes hash from mamba_hash_to_block_id but keeps kv_hash_to_block_id."""
-        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001, eviction_policy=PrefixCachingEvictionPolicy.LRU)
         block_size = ctx.block_size_tokens
         alloc = ctx.block_allocator
         max_slots = ctx.max_mamba_cache_slots
@@ -1113,7 +1120,7 @@ class TestMambaHashMap:
     @pytest.mark.internal
     def test_mamba_hash_removed_on_kv_eviction(self):
         """KV block eviction removes hash from both kv and mamba hash maps."""
-        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01, buffer_size_gb=0.01, rounder=1)
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01, buffer_size_gb=0.01, rounder=1, eviction_policy=PrefixCachingEvictionPolicy.LRU)
         block_size = ctx.block_size_tokens
         alloc = ctx.block_allocator
 
@@ -1272,6 +1279,7 @@ class TestChunkedPrefillMambaState:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.01,
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "chunked_only",
@@ -1300,6 +1308,7 @@ class TestChunkedPrefillMambaState:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -1316,7 +1325,7 @@ class TestChunkedPrefillMambaState:
             #   (_find_mamba_divergence_block scans backward: block 1 has state → return 2).
             # num_mamba_matched == num_kv_matched → no divergence, _kv_divergence_token = 0.
             # last_aligned = 128. prefix_skip = 64, effective = 64 tokens.
-            # Mamba restored from block 1. request_has_initial_mamba_state = True.
+            # Mamba restored from block 1 (initial states passed to varlen kernel).
             # After B's prefill (total_prefilled=128 == last_aligned=128):
             #   stores Mamba state for block 3 (last complete block).
             # After B: Mamba at {1, 3}. KV blocks {0,1,2,3} all cached.
@@ -1357,7 +1366,7 @@ class TestChunkedPrefillMambaState:
             # _kv_divergence_token = 3*32 = 96, _mamba_last_aligned_token = 96.
             # In add_request: KV match truncated to 2 blocks.
             #   prefix_skip = min(2*32, 96-1) = 64, effective = 32 tokens.
-            #   Mamba restored from block 1. request_has_initial_mamba_state = True.
+            #   Mamba restored from block 1 (initial states passed to varlen kernel).
             # After C's prefill (total_prefilled=96 == _kv_divergence_token=96):
             #   stores Mamba state for block 2 (divergence boundary).
             req_c = make_req(2, prompt_c, config["enable_prefix_caching"])
@@ -1396,7 +1405,7 @@ class TestChunkedPrefillMambaState:
         Sequence:
             X (80 tokens, no prefix) →
                 Chunk 1: 64 tokens → stores Mamba for block 1
-                Chunk 2: 16 tokens (request_has_initial_mamba_state=True)
+                Chunk 2: 16 tokens (initial Mamba state restored, unified varlen path)
 
         Verified by comparing X's output between chunked+prefix and chunked_only configs.
         """
@@ -1433,6 +1442,7 @@ class TestChunkedPrefillMambaState:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.01,
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "chunked_only",
@@ -1461,6 +1471,7 @@ class TestChunkedPrefillMambaState:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -1473,7 +1484,7 @@ class TestChunkedPrefillMambaState:
             #   chunk_length = min(80, min(256, 64)) = 64.
             #   Chunk 1: 64 tokens → Mamba zero-init, processed from scratch.
             #   _store_mamba_states: total_prefilled=64 == last_aligned=64 → stores block 1.
-            #   Chunk 2: 16 tokens, request_has_initial_mamba_state=True (batch kernel).
+            #   Chunk 2: 16 tokens, initial Mamba state restored (unified varlen path).
             #
             # In chunked_only config:
             #   No Mamba budget → max_mamba_cache_slots=0 → no mamba_limit → no forced chunk.
@@ -1492,28 +1503,28 @@ class TestChunkedPrefillMambaState:
 
 
 class TestMixedKernelRouting:
-    """Engine-level test for mixed batch-kernel and varlen-kernel routing.
+    """Engine-level test for mixed restored-state and fresh prefill routing.
 
     In a single forward step, a continuing chunked prefill request with
-    request_has_initial_mamba_state=True (batch kernel) runs alongside two
-    fresh prefill requests with zero-initialized Mamba state (varlen kernel).
+    restored Mamba state runs alongside two fresh prefill requests with
+    zero-initialized Mamba state, all through the unified varlen path.
 
     Scenario:
         block_size=32, max_tokens=112, num_tokens_to_generate=4
 
-        1. Request A (64 tokens) → run to completion, Mamba state at block 1
-        2. Request B (160 tokens, first 64 shared with A) → chunk 1 = 112 tokens
+        1. Request A (64 tokens) -> run to completion, Mamba state at block 1
+        2. Request B (160 tokens, first 64 shared with A) -> chunk 1 = 112 tokens
            (64 prefix-skipped + 48 effective). B has 48 remaining, is continuing.
         3. Add C (32 tokens, fresh) and D (32 tokens, fresh)
-        4. Schedule → B continues (batch kernel, 48 tokens) + C (varlen, 32) + D (varlen, 32)
-        5. Step → forward pass with mixed kernel routing
+        4. Schedule -> B continues (restored state, 48 tokens) + C (fresh, 32) + D (fresh, 32)
+        5. Step -> forward pass with unified varlen kernel
         6. Continue until all complete
 
     Verified by comparing B, C, D outputs against individual baseline runs.
 
     NOTE: this test covers a strictly more complex scenario than
-    TestMultiplePrefillWithInitialStates (mixed batch-kernel + varlen vs
-    all-batch-kernel).
+    TestMultiplePrefillWithInitialStates (mixed restored + fresh initial
+    states vs all-restored).
     """
 
     def teardown_method(self, method):
@@ -1524,7 +1535,7 @@ class TestMixedKernelRouting:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.no_grad()
-    def test_batch_kernel_continuation_with_varlen_fresh_prefills(self):
+    def test_restored_state_continuation_with_fresh_prefills(self):
         _skip_if_mamba_sequence_packing_not_available()
 
         # --- Parameters ---
@@ -1565,6 +1576,7 @@ class TestMixedKernelRouting:
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
             seed=seed,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
 
         def make_req(req_id, prompt, enable_pc=True):
@@ -1606,7 +1618,7 @@ class TestMixedKernelRouting:
         # In add_request:
         #   finished_chunk_token_count=0 → is_chunked_prefill=False → allocates Mamba.
         #   prefix_skip = min(64, 111) = 64, effective = 48 tokens.
-        #   Mamba restored from block 1, request_has_initial_mamba_state=True.
+        #   Mamba restored from block 1 (initial states passed to varlen kernel).
         # After step: B has 48 remaining tokens, is continuing chunked prefill.
         engine_sim._add_request(make_req(1, prompt_b))
         step_result = engine_sim.step_modern()
@@ -1620,12 +1632,11 @@ class TestMixedKernelRouting:
 
         # Steps 4-6: Schedule and step until all complete.
         # Next schedule_chunked_prefill processes:
-        #   B continues (batch kernel): 48 tokens, request_has_initial_mamba_state=True
-        #     (set at line 1984 for continuing chunks).
-        #   C fresh (varlen): 32 tokens, request_has_initial_mamba_state=False.
-        #   D fresh (varlen): 32 tokens, request_has_initial_mamba_state=False.
+        #   B continues (restored state): 48 tokens.
+        #   C fresh: 32 tokens (zero-initialized Mamba state).
+        #   D fresh: 32 tokens (zero-initialized Mamba state).
         #   Total tokens: 48 + 32 + 32 = 112 = max_tokens.
-        #   MambaMetadata.update routes: num_batch_kernel_prefills=1, varlen_count=2.
+        #   All three go through unified varlen path.
         # Subsequent steps: decode until all requests generate num_tokens_to_generate.
         results_sim = {}
         while engine_sim.has_unfinished_requests():
@@ -1728,7 +1739,7 @@ class TestMambaEvictionEdgeCases:
     @pytest.mark.internal
     def test_all_active_slots_raises_error(self):
         """When all Mamba slots hold blocks with ref_count > 0, eviction raises RuntimeError."""
-        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001, eviction_policy=PrefixCachingEvictionPolicy.LRU)
         max_slots = ctx.max_mamba_cache_slots
         assert max_slots > 0
 
@@ -1748,7 +1759,7 @@ class TestMambaEvictionEdgeCases:
     @pytest.mark.internal
     def test_mixed_ref_counts_evicts_only_inactive(self):
         """With mixed ref_count=0 and ref_count=1, only the oldest ref_count=0 block is evicted."""
-        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001, eviction_policy=PrefixCachingEvictionPolicy.LRU)
         max_slots = ctx.max_mamba_cache_slots
         assert max_slots >= 3, f"Need at least 3 Mamba slots, got {max_slots}"
 
@@ -1860,6 +1871,7 @@ class TestKvMambaEvictionInteraction:
             prefix_caching_mamba_gb=0.01,
             buffer_size_gb=0.01,
             rounder=1,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -1912,6 +1924,7 @@ class TestKvMambaEvictionInteraction:
             prefix_caching_mamba_gb=0.00005,
             buffer_size_gb=0.01,
             rounder=1,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -1975,6 +1988,7 @@ class TestKvMambaEvictionInteraction:
             prefix_caching_mamba_gb=0.00005,  # ~1 Mamba slot
             buffer_size_gb=0.01,
             rounder=1,
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         block_size = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -2076,6 +2090,7 @@ class TestEvictionEndToEnd:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.0001,  # Very small: 1-2 Mamba slots
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "baseline",
@@ -2104,6 +2119,7 @@ class TestEvictionEndToEnd:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -2177,6 +2193,7 @@ class TestEvictionEndToEnd:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.0005,  # 1 Mamba slot
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "baseline",
@@ -2205,6 +2222,7 @@ class TestEvictionEndToEnd:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -2269,6 +2287,7 @@ class TestEvictionEndToEnd:
                 "enable_prefix_caching": True,
                 "prefix_caching_mamba_gb": 0.0001,  # Very small: 1-2 Mamba slots
                 "max_tokens": max_tokens,
+                "eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
                 "name": "baseline",
@@ -2297,6 +2316,7 @@ class TestEvictionEndToEnd:
                 max_sequence_length=max_sequence_length,
                 buffer_size_gb=buffer_size_gb,
                 seed=seed,
+                eviction_policy=config.get("eviction_policy", PrefixCachingEvictionPolicy.REF_ZERO),
             )
             _install_deterministic_mock_forward(engine, vocab_size)
 
@@ -2384,6 +2404,7 @@ class TestMambaStressAndBudget:
             prefix_caching_mamba_gb=0.001,  # Few Mamba slots
             buffer_size_gb=0.01,            # Many KV blocks
             max_tokens=None,                # No token limit
+            eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         max_slots = ctx.max_mamba_cache_slots
         assert max_slots >= 1

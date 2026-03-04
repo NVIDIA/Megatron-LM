@@ -10,8 +10,6 @@ import math
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
-from yaml.error import YAMLError
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -522,85 +520,21 @@ class MambaMixer(MegatronModule):
     ) -> torch.Tensor:
         """Helper to run dynamic inference prefill.
 
-        Processes batch-kernel requests (those with initial Mamba states) one at a
-        time via the batch kernel, then processes remaining requests together via the
-        varlen kernel.
+        All prefill requests (with or without initial Mamba states) are processed
+        together through the unified varlen path.
         """
         metadata = context.mamba_metadata
-
-        # Use the regular prefill request count to determine if regular
-        # prefill path needs to be run when chunked prefill is enabled
-        prefill_req_count = context.batch_dimensions.prefill_req_count
-
-        # Padded prefill token count
-        prefill_token_count = zxBCdt.shape[0]
-
-        y_batch_parts = []
-        y_varlen = None
-
-        # Process each request with initial states via batch kernel (one at a time)
-        if metadata.num_batch_kernel_prefills > 0:
-            for i in range(metadata.num_batch_kernel_prefills):
-                start = metadata.batch_kernel_cu_seqlens[i].item()
-                end = metadata.batch_kernel_cu_seqlens[i + 1].item()
-                batch_idx = metadata.batch_kernel_batch_indices[i : i + 1]
-
-                y_part = self._ssm_prefill(
-                    zxBCdt[start:end],
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    batch_indices=batch_idx,
-                    is_chunked_prefill=True,
-                )
-                y_batch_parts.append(y_part)
-
-            # Update zxBCdt to contain the remaining slice for varlen prefill
-            zxBCdt_remainder = torch.empty_like(zxBCdt)
-            tensor_get_slice_after(
-                zxBCdt, zxBCdt_remainder, metadata.device_chunked_prefill, check_bounds=False
-            )
-            zxBCdt = zxBCdt_remainder
-
-        # Process remaining requests via varlen kernel
-        num_varlen = prefill_req_count - metadata.num_batch_kernel_prefills
-        if num_varlen > 0:
-            y_varlen = self._ssm_prefill(
-                zxBCdt,
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                seq_idx=metadata.seq_idx,
-                cu_seqlens=metadata.cu_seqlens,
-                return_varlen_states=True,
-                batch_indices=metadata.batch_indices_prefill,
-            )
-
-        # Merge batch-kernel and varlen results
-        if y_batch_parts and y_varlen is not None:
-            y_batch = (
-                torch.cat(y_batch_parts, dim=0)
-                if len(y_batch_parts) > 1
-                else y_batch_parts[0]
-            )
-            y_combined = torch.empty_like(y_varlen)
-            tensor_merge(
-                y_batch, y_varlen, metadata.device_chunked_prefill, output_tensor=y_combined
-            )
-            return y_combined
-        elif y_batch_parts:
-            y_batch = (
-                torch.cat(y_batch_parts, dim=0)
-                if len(y_batch_parts) > 1
-                else y_batch_parts[0]
-            )
-            y_prefill = torch.empty(
-                (prefill_token_count, 1, y_batch.shape[-1]),
-                dtype=y_batch.dtype,
-                device=y_batch.device,
-            )
-            y_prefill[: y_batch.shape[0]] = y_batch
-            return y_prefill
-        else:
-            return y_varlen
+        if context.batch_dimensions.prefill_req_count <= 0:
+            return None
+        return self._ssm_prefill(
+            zxBCdt,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            seq_idx=metadata.seq_idx,
+            cu_seqlens=metadata.cu_seqlens,
+            batch_indices=metadata.batch_indices_prefill,
+            use_triton_conv1d=context.use_triton_conv1d,
+        )
 
     def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
@@ -729,9 +663,8 @@ class MambaMixer(MegatronModule):
         ssm_state: Optional[torch.Tensor],
         seq_idx: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
-        return_varlen_states: bool = False,
         batch_indices: Optional[torch.Tensor] = None,
-        is_chunked_prefill: bool = False,
+        use_triton_conv1d: bool = False,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference prefill step.
@@ -743,18 +676,15 @@ class MambaMixer(MegatronModule):
             ssm_state: The selective scan state tensor for inference.
             seq_idx: A map from token index to request index for variable-length sequences.
             cu_seqlens: Cumulative sequence lengths for variable-length sequences.
-            return_varlen_states: Whether to return variable-length states from the SSM kernel.
             batch_indices: A map from batch id to position in the Mamba state tensors for
                 dynamic inference.
-            is_chunked_prefill: Whether the request is a chunked prefill request.
+            use_triton_conv1d: Whether to use the Triton varlen conv1d kernel instead
+                of per-request causal_conv1d_fn calls.
 
         Returns:
             The output tensor of shape (l, b, d).
         """
         is_dynamic_batching = seq_idx is not None
-        assert not (
-            is_dynamic_batching and is_chunked_prefill
-        ), "Cannot use chunked prefill with dynamic batching"
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -773,55 +703,77 @@ class MambaMixer(MegatronModule):
         )
 
         # Compute short convolution
-        initial_conv_state = None
         if conv_state is not None and is_dynamic_batching:
-            # xBC should have shape (b l d) for causal_conv1d_varlen_states
             assert batch_indices is not None
+
+            # Save final conv states from the input sequence
             conv_varlen_states = causal_conv1d_varlen_states(
                 xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
             tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
-            # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
-            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
-            xBC = xBC.transpose(1, 2)
-        elif is_chunked_prefill:
-            # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
-            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
-            assert batch_indices is not None
-            initial_conv_state = (
-                conv_state[batch_indices, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
-            )
-            xBC = xBC.transpose(1, 2)
-            tensor_masked_update(
-                conv_state, batch_indices, F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-            )
+            # Extract initial conv states (zeros for fresh requests, cached for restored)
+            initial_conv_states = conv_state[batch_indices, :, 1:]  # (num_reqs, conv_dim, d_conv-1)
+
+            conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+            conv_bias = self.cp.get_conv1d_bias()
+
+            if use_triton_conv1d:
+                from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+
+                xBC_out = causal_conv1d_varlen_fn(
+                    x=xBC.squeeze(0),  # (total_tokens, conv_dim)
+                    weight=conv_weight,
+                    bias=conv_bias,
+                    cu_seqlens=cu_seqlens,
+                    initial_states=initial_conv_states,
+                    activation=self.activation,
+                )
+                xBC = xBC_out.unsqueeze(0)  # (1, total_tokens, conv_dim)
+            else:
+                # Per-request loop calling causal_conv1d_fn with initial_states.
+                # causal_conv1d_fn requires channels-last memory layout when using
+                # initial_states: create x as (1, seq_len, conv_dim) then transpose
+                # to get stride pattern (seq_len*conv_dim, 1, conv_dim).
+                num_requests = cu_seqlens.shape[0] - 1
+                xBC_parts = []
+                for r in range(num_requests):
+                    start = cu_seqlens[r].item()
+                    end = cu_seqlens[r + 1].item()
+                    if end <= start:
+                        continue
+                    # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
+                    xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
+                    init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)
+                    init_r = init_r.permute(0, 2, 1).contiguous().transpose(1, 2)  # channels-last
+                    xBC_r = causal_conv1d_fn(
+                        x=xBC_r,
+                        weight=conv_weight,
+                        bias=conv_bias,
+                        activation=self.activation,
+                        initial_states=init_r,
+                    )
+                    xBC_parts.append(xBC_r.transpose(1, 2).contiguous())  # (1, L, C)
+                xBC = torch.cat(xBC_parts, dim=1)  # (1, total_tokens, conv_dim)
         else:
-            # transpose: b l pd --> b pd l
+            # Non-dynamic-batching path (static batching / training fallback)
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
             if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(
-                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-                )  # Update state (B D W)
+                conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))
 
-        seqlen = xBC.size(2)
-        if causal_conv1d_fn is None:
-            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
-        else:
-            assert self.activation in ["silu", "swish"]
-            xBC = causal_conv1d_fn(
-                x=xBC,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
-                activation=self.activation,
-                seq_idx=seq_idx,
-                initial_states=initial_conv_state,
-            )
-
-        # transpose b pd l --> b l pd
-        xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+            seqlen = xBC.size(2)
+            if causal_conv1d_fn is None:
+                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
+            else:
+                assert self.activation in ["silu", "swish"]
+                xBC = causal_conv1d_fn(
+                    x=xBC,
+                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    bias=self.cp.get_conv1d_bias(),
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
+            xBC = rearrange(xBC, "b d l -> b l d").contiguous()
 
         x, B, C = torch.split(
             xBC,
@@ -833,28 +785,20 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
-        # TODO Vijay: fuse most of the transposes with the GEMMS
         x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
         dt = dt.contiguous()
         B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
         C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
         z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
 
-        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
-        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
-        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
-        # mathematically incorrect, and potentially arithmetically unstable.
         assert (
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-        initial_ssm_state = ssm_state[batch_indices]
+        if is_dynamic_batching:
+            # Unified varlen SSM path: all prefill requests through single kernel call
+            initial_ssm_state = ssm_state[batch_indices]
 
-        if (
-            cu_seqlens is not None             
-        ):
-            # Variable-length path: sequences are concatenated in one row (x.shape[0] == 1).
-            # Batch size = number of sequences from cu_seqlens; max_seqlen = max sequence length.                            
             x = x.squeeze(0)
             dt = dt.squeeze(0)
             A = A.squeeze(0)
@@ -863,32 +807,17 @@ class MambaMixer(MegatronModule):
             z = z.squeeze(0)
             y = torch.empty_like(x)
 
-            # Calculate cu_chunk_seqlens using seq_idx and cu_seqlens
-            cu_chunk_seqlens = None
-            if seq_idx is not None and cu_seqlens is not None:
-                # seq_idx: shape (1, total_tokens), where seq_idx[0, i] maps token position i to the packed sequence index
-                # cu_seqlens: shape (num_sequences + 1), e.g. [0, 5, 7, 11, 16], where cu_seqlens[-1] == total_tokens
-                
-                # The number of sequences = cu_seqlens.numel() - 1 = N
-                # The output cu_chunk_seqlens should be a cumulative sum of the number of tokens in each sequence,
-                # i.e. same as cu_seqlens
-                cu_chunk_seqlens = cu_seqlens
-
-                # However, double check if seq_idx indicates any extra grouping, or if an extra entry is required:
-                # If seq_idx.max() + 1 > cu_seqlens.numel() - 1, then extra sequences
+            cu_chunk_seqlens = cu_seqlens
+            if seq_idx is not None:
                 n_seq_from_seq_idx = int(seq_idx.max().item() + 1)
                 n_seq_from_cu = cu_seqlens.numel() - 1
                 if n_seq_from_seq_idx > n_seq_from_cu:
-                    # Need to extend cu_seqlens to include the rest of tokens counted in seq_idx
-                    # This can happen if the last part is treated as an extra seq
                     cu_chunk_seqlens = torch.cat(
                         [cu_seqlens, cu_seqlens.new_tensor([seq_idx.shape[1]])]
                     )
 
-            # Kernel expects seq_idx of shape (nchunks,) — one sequence index per chunk.
-            # We have seq_idx of shape (1, total_tokens); take seq index at start of each chunk.
             seq_idx_for_varlen = None
-            if seq_idx is not None and cu_chunk_seqlens is not None:
+            if seq_idx is not None:
                 chunk_starts = cu_chunk_seqlens[:-1]
                 seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
@@ -922,8 +851,9 @@ class MambaMixer(MegatronModule):
             z = z.unsqueeze(0)
 
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
-                
         else:
+            # Non-dynamic-batching path (static batching)
+            initial_ssm_state = None
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -940,29 +870,12 @@ class MambaMixer(MegatronModule):
                 dt_bias=self.cp.get_dt_bias().float(),
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
-                seq_idx=seq_idx,
-                cu_seqlens=cu_seqlens,
-                return_varlen_states=return_varlen_states,
                 initial_states=initial_ssm_state,
             )
 
             if ssm_state is not None:
-                if return_varlen_states:
-                    assert batch_indices is not None
-
-                    y, _, ssm_varlen_states = y
-
-                    # This has to be varlen_states, NOT last_state
-                    # See reference implementation:
-                    # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
-                    tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
-                elif is_chunked_prefill:
-                    assert batch_indices is not None
-                    y, last_state = y
-                    tensor_masked_update(ssm_state, batch_indices, last_state)
-                else:
-                    y, last_state = y
-                    ssm_state.copy_(last_state)
+                y, last_state = y
+                ssm_state.copy_(last_state)
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)
