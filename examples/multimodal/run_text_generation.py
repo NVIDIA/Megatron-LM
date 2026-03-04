@@ -89,6 +89,7 @@ def add_text_generation_args(parser):
             "MotionBench",
             "PhysGameBench",
             "MVBench",
+            "inference",
         ],
         help="Generation task to run",
     )
@@ -201,7 +202,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed
+            controller, max_batch_size=1, random_seed=args.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -278,6 +279,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -316,6 +318,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -361,7 +364,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
 
 def get_evaluation_configs(config_path=None) -> Dict[str, EvaluationConfig]:
     """Get evaluation config(s) from a config file or command-line arguments.
-    
+
     Args:
         config_path: Optional path to config file. If not provided, will check args.config_path
                     or fall back to command-line arguments.
@@ -473,15 +476,8 @@ class VLMForwardStep(ForwardStep):
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
 
-        self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
-        # In this case, the current stage should only receive vision embeddings.
-        if pp_rank > 0:
-            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
-
-        # Checks if the current stage only has a vision encoder
-        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -637,8 +633,14 @@ def get_conversation(task, question, metadata=None):
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
+    elif task == "inference":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{question}"},
+        ]
     else:
         raise NotImplementedError(f"No prompting support for task {task}")
+
 
     return conversation
 
@@ -789,8 +791,11 @@ def run_eval(config, iteration=None):
         score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
         with open(config.output_path + "-scores.txt", "a") as f:
             f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+    elif config.task == "inference":
+        score = {"Inference accuracy:": None}
+        pass
     else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+        raise NotImplementedError(f"Evaluation of {config.task} not implemented yet")
 
     print(score)
     return score
@@ -799,39 +804,39 @@ def run_eval(config, iteration=None):
 def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
     """
     Common evaluation loop used by both online evaluation during training and standalone evaluation.
-    
+
     Args:
         model: The model to evaluate
         configs: Dict[str, EvaluationConfig] - dictionary of evaluation configs
         output_dir_override: Optional directory to override the output path in configs
         iteration: Optional iteration number for logging
         print_output: Whether to print generation output
-        
+
     Returns:
         Dict[str, float]: Dictionary of evaluation scores
     """
     args = get_args()
     scores = {}
-    
+
     for key, config in configs.items():
         # Handle output path override for online evaluation
         if output_dir_override:
             config.output_path = os.path.join(output_dir_override, args.language_model_type)
-        
+
         # Generate samples and write to file
         generate_and_write_samples(model, config, print_output=print_output)
-        
+
         # Synchronize before evaluation
         torch.distributed.barrier()
-        
+
         # Run evaluation on the last rank
         if is_last_rank():
             task_scores = run_eval(config, iteration=iteration)
             scores.update(task_scores)
-        
+
         # Synchronize after evaluation
         torch.distributed.barrier()
-    
+
     return scores
 
 
@@ -846,7 +851,7 @@ def eval_tasks():
                               parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
@@ -855,7 +860,7 @@ def eval_tasks():
     model.eval()
 
     configs = get_evaluation_configs()
-    
+
     # Use the common evaluation loop
     run_evaluation_loop(model, configs, iteration=args.ckpt_step)
 

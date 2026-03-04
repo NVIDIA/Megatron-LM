@@ -1339,6 +1339,71 @@ class MVBenchDataset(torch.utils.data.Dataset):
         )
 
 
+class ExampleInferenceDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        img_h,
+        img_w,
+        use_tiling,
+        max_num_tiles,
+        use_thumbnail,
+        vision_model_type,
+    ):
+        # Define your own inference samples here. The following is an example.
+        samples = [
+            # Use <image> token to indicate the image position.
+            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png"], "question": "<image>\nWhat is the curve?"},
+            # Optional: if you have an answer for the question.
+            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png"], "question": "What is the curve?<image>", "answer": "It's a loss function curve."},
+            # If you have multiple images for the question, then use <image> token to indicate the image positions.
+            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png", "examples/multimodal/assets/pretrain_curves.png"], "question": "<image>What is the curve?<image>"},
+            # Text only sample.
+            {"question": "Who is Jensen Huang?"},
+        ]
+
+        self._samples = samples
+        self._img_h = img_h
+        self._img_w = img_w
+        self._use_tiling = use_tiling
+        self._max_num_tiles = max_num_tiles
+        self._use_thumbnail = use_thumbnail
+        self._transform_img = ImageTransform(img_h, vision_model_type)
+
+    def __len__(self):
+        return len(self._samples)
+
+    def __getitem__(self, idx):
+        sample = self._samples[idx]
+
+        sample_imgs = []
+        sample_tile_count = []
+        for image_path in sample.get("image_paths", []):
+            img = Image.open(image_path)
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+
+            sample_imgs.extend(imgs)
+            sample_tile_count.append(len(imgs))
+
+        sample_id = idx
+        metadata = ""  # Not used.
+
+        return (
+            torch.stack(sample_imgs) if len(sample_imgs) > 0 else torch.tensor([]),
+            torch.tensor(sample_tile_count, dtype=torch.int),
+            sample_id,
+            sample["question"],
+            sample.get("answer", ""),
+            metadata,
+        )
+
 
 def get_evaluation_dataset(
     task,
@@ -1617,6 +1682,15 @@ def get_evaluation_dataset(
             num_frames,
             vision_model_type,
             split=split
+        )
+    elif task == "inference":
+        dataset = ExampleInferenceDataset(
+            img_h,
+            img_w,
+            use_tiling,
+            max_num_tiles,
+            use_thumbnail,
+            vision_model_type,
         )
     else:
         raise NotImplementedError(f"unsupported task {task}")

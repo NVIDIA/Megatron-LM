@@ -3,13 +3,13 @@ repos:
   rev: 'refs/tags/24.4.2:refs/tags/24.4.2'
   hooks:
   - id: black
-    files: ^megatron/core/.*
-    args: ["--skip-magic-trailing-comma"]
+    files: ^megatron/core/.*|^tests/unit_tests/.*
+    args: ["--skip-magic-trailing-comma", "--skip-string-normalization"]
 - repo: https://github.com/pycqa/pylint
   rev: v3.2.6
   hooks:
   - id: pylint
-    files: ^megatron/core/.* 
+    files: ^megatron/core/.*
 - repo: https://github.com/pycqa/isort
   rev: 5.13.2
   hooks:

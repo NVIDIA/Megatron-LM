@@ -6,7 +6,7 @@ import pytest
 import torch
 from packaging.version import Version
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -92,8 +92,11 @@ class TestModelOptGPTModel:
     def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
         """Save with the default TE spec and restore using the ModelOpt spec."""
         _dist_checkpoint_name = "default_model"
-        te_fused_sharded_state_dict = self.default_model.sharded_state_dict()
-        modelopt_sharded_state_dict = self.modelopt_model.sharded_state_dict()
+        metadata = {
+            "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+        }
+        te_fused_sharded_state_dict = self.default_model.sharded_state_dict(metadata=metadata)
+        modelopt_sharded_state_dict = self.modelopt_model.sharded_state_dict(metadata=metadata)
 
         with TempNamedDir(tmp_path_dist_ckpt / _dist_checkpoint_name, sync=True) as tmpdirname:
             dist_checkpointing.save(te_fused_sharded_state_dict, tmpdirname)
@@ -170,6 +173,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             moe_ffn_hidden_size=128,
             moe_shared_expert_intermediate_size=128,
             qk_layernorm=True,
+            qk_l2_norm=True,
             use_cpu_initialization=True,
         )
         default_spec = get_gpt_decoder_block_spec(
@@ -208,7 +212,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
         # A Hybrid MambaModel using ModelOpt spec (local + TENorm).
@@ -217,7 +221,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
 
@@ -268,9 +272,14 @@ def test_get_mamba_stack_modelopt_spec_interface():
     expected_params = {
         "local_core_attention": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "use_default_te_spec": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
-    expected_defaults = {"local_core_attention": False, "remap_te_layernorm": False}
+    expected_defaults = {
+        "local_core_attention": False,
+        "remap_te_layernorm": False,
+        "use_default_te_spec": False,
+    }
 
     # Check expected parameters are in function signature
     for param_name, param_kind in expected_params.items():
@@ -287,3 +296,9 @@ def test_get_mamba_stack_modelopt_spec_interface():
         assert (
             k in sig_defaults and v == sig_defaults[k]
         ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
+
+
+def test_get_mamba_stack_modelopt_spec_use_default_te_spec():
+    """Test that use_default_te_spec=True returns the standard mamba_stack_spec."""
+    spec = get_mamba_stack_modelopt_spec(use_default_te_spec=True)
+    assert spec is mamba_stack_spec

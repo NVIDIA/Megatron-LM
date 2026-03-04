@@ -130,7 +130,8 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from pretrain_gpt import model_provider
+    from model_provider import model_provider
+    from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
 
     # Load Huggingface model.
@@ -138,7 +139,7 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)

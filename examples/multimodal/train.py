@@ -48,7 +48,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
+    if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
@@ -302,16 +302,12 @@ def llava_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
+    if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [pp_ranks[0], last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
@@ -319,16 +315,12 @@ def llava_position_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
     if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp]]
+        return [pp_ranks[0]]
 
 
 def run_online_eval(model):
@@ -392,7 +384,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_dataloaders_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,

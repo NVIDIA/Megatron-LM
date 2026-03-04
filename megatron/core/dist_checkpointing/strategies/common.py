@@ -84,9 +84,9 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         try:
             if MultiStorageClientFeature.is_enabled():
                 msc = MultiStorageClientFeature.import_package()
-                return msc.torch.load(load_path, map_location='cpu', weights_only=False)
+                return msc.torch.load(load_path, map_location='cpu')
             else:
-                return torch.load(load_path, map_location='cpu', weights_only=False)
+                return torch.load(load_path, map_location='cpu')
         except FileNotFoundError as e:
             err_msg = f'Common file {load_path} does not exist'
             if MultiStorageClientFeature.is_enabled():
@@ -118,9 +118,9 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
             try:
                 if MultiStorageClientFeature.is_enabled():
                     msc = MultiStorageClientFeature.import_package()
-                    loaded_obj = msc.torch.load(load_path, weights_only=False)
+                    loaded_obj = msc.torch.load(load_path)
                 else:
-                    loaded_obj = torch.load(load_path, weights_only=False)
+                    loaded_obj = torch.load(load_path)
             except FileNotFoundError as e:
                 # Backward compatible logic: previously the save format was incorrect
                 base, _ = os.path.splitext(sh_obj.unique_key)
@@ -128,9 +128,9 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
                 try:
                     if MultiStorageClientFeature.is_enabled():
                         msc = MultiStorageClientFeature.import_package()
-                        loaded_obj = msc.torch.load(old_load_path, weights_only=False)
+                        loaded_obj = msc.torch.load(old_load_path)
                     else:
-                        loaded_obj = torch.load(old_load_path, weights_only=False)
+                        loaded_obj = torch.load(old_load_path)
                 except FileNotFoundError:
                     err_msg = f'Object shard {load_path} not found'
                     obj_subdir = os.path.join(checkpoint_dir, sh_obj.key)

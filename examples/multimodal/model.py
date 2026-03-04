@@ -16,7 +16,8 @@ from megatron.core.utils import log_single_rank
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
+    vp_stage=None, config=None, pg_collection=None
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -28,13 +29,14 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable parallel model output.
+        vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
+        config: Optional transformer config. If None, will be created from args.
+        pg_collection: Optional process group collection. If None, will use default.
 
     Returns:
         model: A multimodal model.
     """
     args = get_args()
-    assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
-
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -112,12 +114,10 @@ def model_provider(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
     )
     if vision_model_type.startswith("hf://"):
-        assert args.encoder_tensor_model_parallel_size < 2, "Huggingface vision encoders do not support --encoder-tensor-model-parallel-size > 1"
-        assert args.encoder_pipeline_model_parallel_size == 0, "Huggingface vision encoders do not support --encoder-pipeline-model-parallel-size > 0"
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
-    if vision_model_type in ["clip", "siglip", "radio"]:
+    if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True
@@ -152,21 +152,8 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
-    # --encoder-pipeline-model-parallel-size 1 will enable a separate pipeline stage for the vision model.
-    if args.encoder_pipeline_model_parallel_size > 0:
-        assert (
-            args.encoder_pipeline_model_parallel_size == 1
-        ), "vision model and projection can only live on 1 pipeline stage."
-
-        if args.encoder_tensor_model_parallel_size > 0:
-            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
-            vision_projection_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
-
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
-    # 0 is not a valid for the config value, hence max(1, ).
-    vision_config.pipeline_model_parallel_size = max(1, args.encoder_pipeline_model_parallel_size)
+    vision_config.pipeline_model_parallel_size = 1
     vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
@@ -230,9 +217,7 @@ def model_provider(
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
-        hybrid_attention_ratio=args.hybrid_attention_ratio,
-        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-        hybrid_override_pattern=args.hybrid_override_pattern,
+        hybrid_layer_pattern=args.hybrid_layer_pattern,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,

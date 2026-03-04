@@ -63,6 +63,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
+        disable_bucketing: bool = False,
         process_group: Optional[ProcessGroup] = None,
     ):
 
@@ -108,6 +109,13 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # See https://github.com/pytorch/pytorch/issues/136929.
         attrs = save_custom_attrs(self.module)
 
+        # Local transformer implementation does not support ColumnParallelLinear.
+        if config.transformer_impl == "local":
+            sub_modules_to_wrap = [
+                sub_module
+                for sub_module in sub_modules_to_wrap
+                if sub_module != tensor_parallel.ColumnParallelLinear
+            ]
         sub_modules_to_wrap = set(sub_modules_to_wrap)
         for sub_module in self.module.modules():
             fsdp_modules = getattr(sub_module, "_fsdp_modules", [])

@@ -5,13 +5,13 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -37,12 +37,10 @@ class TestParallelSequentialMLP:
             moe_router_topk=1,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.sequential_mlp = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
+        self.sequential_mlp = MoELayer(transformer_config, submodules.mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -75,7 +73,7 @@ class TestTEParallelSequentialMLP:
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
         num_moe_experts = 4
-        model_comm_pgs = get_default_model_comm_pgs()
+        pg_collection = get_default_pg_collection()
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -108,7 +106,7 @@ class TestTEParallelSequentialMLP:
             self.num_local_experts,
             self.transformer_config,
             self.local_mlp_spec,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         model_parallel_cuda_manual_seed(123)
@@ -116,7 +114,7 @@ class TestTEParallelSequentialMLP:
             self.num_local_experts,
             self.transformer_config,
             self.te_mlp_spec,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
     @pytest.mark.internal
@@ -168,13 +166,13 @@ class TestTEParallelSequentialMLP:
     @pytest.mark.internal
     def test_gpu_forward_with_one_local_expert(self):
         model_parallel_cuda_manual_seed(123)
-        model_comm_pgs = get_default_model_comm_pgs()
+        pg_collection = get_default_pg_collection()
         local_sequential_mlp = SequentialMLP(
-            1, self.transformer_config, self.local_mlp_spec, model_comm_pgs=model_comm_pgs
+            1, self.transformer_config, self.local_mlp_spec, pg_collection=pg_collection
         )
         model_parallel_cuda_manual_seed(123)
         te_sequential_mlp = SequentialMLP(
-            1, self.transformer_config, self.te_mlp_spec, model_comm_pgs=model_comm_pgs
+            1, self.transformer_config, self.te_mlp_spec, pg_collection=pg_collection
         )
         seq_len = 4
         batch_size = 2

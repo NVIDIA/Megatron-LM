@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from time import time
 from typing import Dict, Optional, Tuple
 
-from .dict_utils import dict_list_map_inplace, extract_matching_values
+from .dict_utils import dict_list_map_inplace, extract_matching_values, nested_values
 from .mapping import (
     LocalNonpersistentObject,
     ShardedBase,
@@ -233,6 +233,19 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
     dict_list_map_inplace(_replace_prefixes, sharded_state_dict)
 
 
+def force_all_tensors_to_non_fp8(sharded_state_dict: ShardedStateDict):
+    """Force all tensors in state dict to be non-fp8.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): sharded state dict.
+    """
+    from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor  # Avoid circular import
+
+    for v in nested_values(sharded_state_dict):
+        if hasattr(v, "data") and is_float8tensor(v.data):
+            v.data = dequantize_fp8_tensor(v.data)
+
+
 fallback_logger = logging.getLogger(__name__)
 __LOGGER_NAME_STACK = []
 __LOGGER_STACK = []
@@ -317,3 +330,20 @@ def debug_msg(msg: str):
     """
     with logger_stack(None, None) as (stacked_name, last_logger):
         last_logger.debug(f"{stacked_name} {msg}")
+
+
+def _clean_metadata_for_serialization(metadata: dict) -> dict:
+    """Create a clean copy of metadata for serialization by removing non-serializable objects.
+
+    Args:
+        metadata: Original metadata dict
+
+    Returns:
+        Clean metadata dict suitable for serialization
+    """
+    if metadata is None:
+        return None
+    clean_metadata = metadata.copy()
+    # Remove dp_cp_group as it's not serializable
+    clean_metadata.pop('dp_cp_group', None)
+    return clean_metadata
