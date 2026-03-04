@@ -76,7 +76,6 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         margs.allow_missing_vision_projection_checkpoint = getattr(checkpoint_args, "allow_missing_vision_projection_checkpoint", False)
         margs.freeze_LM = getattr(checkpoint_args, "freeze_LM", False)
         margs.freeze_ViT = getattr(checkpoint_args, "freeze_ViT", False)
-        margs.encoder_tensor_model_parallel_size = getattr(checkpoint_args, "encoder_tensor_model_parallel_size", 0)
         margs.force_system_message = getattr(checkpoint_args, "force_system_message", False)
         margs.image_tag_type = getattr(checkpoint_args, "image_tag_type", "")
         margs.num_frames = getattr(checkpoint_args, "num_frames", 8)
@@ -136,7 +135,8 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         # Swiglu is used to chunk linear layer weight in a specific way, and this is guarded by the
         # gated_linear_unit config in the MLP code.
         md.swiglu = self.margs.swiglu and language_config.gated_linear_unit
-        md.previous_encoder_tensor_parallel_size = self.margs.tensor_model_parallel_size if self.margs.encoder_tensor_model_parallel_size == 0 else self.margs.encoder_tensor_model_parallel_size
+        # With deprecated encoder_tensor_model_parallel_size removed, always use tensor_model_parallel_size
+        md.previous_encoder_tensor_parallel_size = self.margs.tensor_model_parallel_size
         md.vision_model_type = self.margs.vision_model_type
         md.language_model_type = self.margs.language_model_type
         md.vision_projection_linear_bias = vision_projection_config.add_bias_linear
@@ -167,11 +167,11 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         vp_size = self.margs.virtual_pipeline_model_parallel_size or 1
         encoder_tp_size = self.md.previous_encoder_tensor_parallel_size
 
-        if self.md.vision_model_type not in ("internvit", "clip", "siglip", "radio", "radio-g"):
+        if self.md.vision_model_type not in ("internvit", "siglip", "radio", "radio-g"):
             raise Exception(f'unrecognized vision model type: {md.vision_model_type}')
 
         message = {}
-        if self.md.vision_model_type in ("internvit", "clip", "siglip"):
+        if self.md.vision_model_type in ("internvit", "siglip"):
             message["conv1 weight"] = self.all_models[0][0][0].vision_model.conv1.weight.data
             if self.md.vision_model_type in ("internvit", "siglip"):
                 message["conv1 bias"] = self.all_models[0][0][0].vision_model.conv1.bias.data
@@ -186,15 +186,11 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
                 message["embedder bias"] = torch.cat([self.all_models[0][0][tp_rank].vision_model.embedder.bias.data for tp_rank in range(encoder_tp_size)], dim=0)
             message["position embeddings"] = self.all_models[0][0][0].vision_model.position_embeddings.data
 
-        if self.md.vision_model_type in ("clip"):
-            message["ln pre weight"] = self.all_models[0][0][0].vision_model.ln_pre.weight.data
-            message["ln pre bias"] = self.all_models[0][0][0].vision_model.ln_pre.bias.data
-
         if self.md.vision_model_type in ("siglip", "radio-g"):
             message["ln post weight"] = self.all_models[0][0][0].vision_model.ln_post.weight.data
             message["ln post bias"] = self.all_models[0][0][0].vision_model.ln_post.bias.data
 
-        if self.md.vision_model_type in ("internvit", "clip", "radio", "radio-g"):
+        if self.md.vision_model_type in ("internvit", "radio", "radio-g"):
             message["class token"] = self.all_models[0][0][0].vision_model.class_token.data
 
         self.queue_put("vit embeddings", message)

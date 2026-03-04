@@ -27,16 +27,16 @@ class Scheduler:
 
     def __init__(self, max_batch_size):
         self.max_batch_size = max_batch_size
-        self.requests: Dict[str, InferenceRequest] = OrderedDict()
-        self.streams: Dict[str, AsyncStream] = OrderedDict()
-        self.active_request_pool: Dict[str, InferenceRequest] = OrderedDict()
-        self.waiting_request_pool: Dict[str, InferenceRequest] = OrderedDict()
-        self.completed_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.requests: Dict[int, InferenceRequest] = OrderedDict()
+        self.streams: Dict[int, AsyncStream] = OrderedDict()
+        self.active_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.waiting_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.completed_request_pool: Dict[int, InferenceRequest] = OrderedDict()
         self.request_counter = Counter()
 
-    def get_new_request_id(self) -> str:
+    def get_new_request_id(self) -> int:
         """Gets a new request id"""
-        request_id = str(next(self.request_counter))
+        request_id = int(next(self.request_counter))
         return request_id
 
     def add_request(
@@ -50,7 +50,7 @@ class Scheduler:
         inference_request: Optional[InferenceRequest] = None,
         *,
         inference_parameters: Optional[SamplingParams] = None,
-    ) -> str:
+    ) -> int:
         """Add an incoming request
 
         This method will add the request to either the active pool or the waiting pool
@@ -152,7 +152,7 @@ class Scheduler:
             self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
 
     def update_requests_pools(
-        self, result_dict: Optional[typing.OrderedDict[str, InferenceRequest]] = None
+        self, result_dict: Optional[typing.OrderedDict[int, InferenceRequest]] = None
     ):
         """Update request pool status
 
@@ -162,9 +162,9 @@ class Scheduler:
         request pool and add waiting request into active pool.
 
         Args:
-            result (typing.OrderedDict[str, InferenceRequest], optional): The result returned
+            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned
                 by the engine. A dictionary with keys as the request ids, and values as the
-                requests. Defaults to None
+                requests. Defaults to None.
         """
         for result_request_id in list(result_dict.keys()):
             active_request = self.active_request_pool[result_request_id]
@@ -183,7 +183,7 @@ class Scheduler:
 
     def abort_request(
         self,
-        request_id: str,
+        request_id: int,
         *,
         exception: Optional[Union[BaseException, Type[BaseException]]] = None,
     ):

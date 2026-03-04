@@ -5,7 +5,6 @@ import json
 import logging
 
 import click
-import yaml
 
 from tests.functional_tests.python_test_utils import common
 
@@ -20,14 +19,33 @@ logger = logging.getLogger(__name__)
 @click.option(
     "--is-convergence-test/--is-normal-test",
     type=bool,
-    help="Tensorboard index to extract",
+    help="Use first or all tensorboard logs",
     default=False,
 )
+@click.option(
+    "--is-second-run/--is-not-second-run",
+    type=bool,
+    help="Use second run of tensorboard logs",
+    default=False,
+)
+@click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
 def collect_train_test_metrics(
-    logs_dir: str, train_iters: str, output_path: str, is_convergence_test: bool
+    logs_dir: str,
+    train_iters: str,
+    output_path: str,
+    is_convergence_test: bool,
+    is_second_run: bool,
+    step_size: int,
 ):
+    if is_convergence_test and is_second_run:
+        raise ValueError("Convergence test cannot be run on second run of tensorboard logs")
+
     summaries = common.read_tb_logs_as_list(
-        logs_dir, index=(0 if not is_convergence_test else -1), train_iters=train_iters, start_idx=1
+        logs_dir,
+        index=(-1 if is_convergence_test else (1 if is_second_run else 0)),
+        train_iters=train_iters,
+        start_idx=1,
+        step_size=step_size,
     )
 
     if summaries is None:
@@ -44,6 +62,7 @@ def collect_train_test_metrics(
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
+            "mtp_1 loss",
         ]
     }
 
@@ -55,6 +74,7 @@ def collect_train_test_metrics(
                     for golden_value_key, golden_values in summaries.items()
                 },
                 fh,
+                indent=4,
             )
 
 

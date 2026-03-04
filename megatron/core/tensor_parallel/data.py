@@ -81,7 +81,7 @@ def broadcast_data(keys, data, datatype, tp_group=None):
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+        flatten_data = torch.cat([data[key].cuda().contiguous().view(-1) for key in keys], dim=0)
     else:
         flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
 

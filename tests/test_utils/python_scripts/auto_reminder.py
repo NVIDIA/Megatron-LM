@@ -27,6 +27,7 @@ REQUIRED_REVIEWERS = {
     "final_reviewers": [
         "jcasper@nvidia.com",
         "dnarayanan@nvidia.com",
+        "vkorthikanti@nvidia.com",
         "eharper@nvidia.com",
         "shanmugamr@nvidia.com",
         "yuya@nvidia.com",
@@ -111,11 +112,11 @@ def get_mcore_reviewers():
 
     def get_group_members(group):
         # Get direct members of the group
-        for member in group.members.list(all=True):
+        for member in group.members.list(get_all=True):
             reviewers.add(f"{member.username}@nvidia.com")
 
         # Recursively get members of subgroups
-        for subgroup in group.subgroups.list(all=True):
+        for subgroup in group.subgroups.list(get_all=True):
             subgroup_obj = get_gitlab_handle().groups.get(subgroup.id)
             get_group_members(subgroup_obj)
 
@@ -128,7 +129,11 @@ def get_days_in_stage(mr, stage):
     for event in sorted(
         mr.resourcelabelevents.list(get_all=True), key=lambda x: x.created_at, reverse=True
     ):
-        if event.label.get('name') == stage and event.action == 'add':
+        if (
+            event.label.get('name') == stage
+            and event.action == 'add'
+            and '_bot_' not in event.user.get('username')
+        ):
             return get_days_since(event.created_at)
 
 
@@ -183,9 +188,14 @@ def get_required_reviewers(mr):
     ]
 
     if review_group is None or len(review_group) == 0:
-        review_group = ["okoenig@nvidia.com"]
+        review_group = ["S06GU680R3N"]
 
-    return ", ".join(get_slack_user_id(reviewer) for reviewer in review_group)
+    print(f"Reviewer: {review_group}")
+
+    return ", ".join(
+        get_slack_user_id(reviewer) if "@" in reviewer else f"<!subteam^{reviewer}>"
+        for reviewer in review_group
+    )
 
 
 def get_priority(days_in_current_stage):

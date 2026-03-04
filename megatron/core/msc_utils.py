@@ -20,13 +20,17 @@ class _FeatureFlag:
     def __init__(self, default: bool = False):
         self._enabled = default
 
+    def enable(self) -> None:
+        """Enable the feature flag."""
+        self._enabled = True
+
     def disable(self) -> None:
         """Disable the feature flag."""
         self._enabled = False
 
     def is_enabled(self) -> bool:
         """Check if the feature flag is enabled."""
-        return self._enabled
+        return self._enabled and msc is not None
 
     def import_package(self) -> Any:
         """Import the package."""
@@ -53,4 +57,13 @@ class _FeatureFlag:
 MultiStorageClientFeature = _FeatureFlag(_msc_available)
 
 
-__all__ = ['MultiStorageClientFeature']
+def open_file(*args, **kwargs):
+    """Open a file with the appropriate method based on whether MSC is enabled."""
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.open(*args, **kwargs)
+    else:
+        return open(*args, **kwargs)
+
+
+__all__ = ['MultiStorageClientFeature', 'open_file']

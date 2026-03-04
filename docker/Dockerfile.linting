@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:experimental
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
+ENV DEBIAN_FRONTEND=noninteractive
+ARG UV_VERSION=0.7.2
+ARG YQ_VERSION=4.44.1
+ENV PATH="/root/.local/bin:$PATH"
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+WORKDIR /opt/megatron-lm
+COPY pyproject.toml uv.lock /opt/megatron-lm/
+COPY megatron/core/package_info.py megatron/core/__init__.py /opt/megatron-lm/megatron/core/
+RUN uv sync --locked --only-group linting --only-group test --only-group ci
+
+##### For NVIDIANS only #####
+FROM main as jet
+ARG JET_API_VERSION
+RUN --mount=type=secret,id=JET_INDEX_URLS \
+      JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \ 
+      uv pip install --no-cache-dir "jet-client~=2.0" --upgrade $JET_INDEX_URLS

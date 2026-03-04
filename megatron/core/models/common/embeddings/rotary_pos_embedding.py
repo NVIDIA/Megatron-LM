@@ -25,7 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
 
@@ -147,14 +147,12 @@ class RotaryEmbedding(nn.Module):
         sin = torch.sin(freqs)
         return cos, sin
 
-    @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
-        """Forward pass of RoPE embedding.
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
+        """Forward pass of RoPE embedding before CP sharding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -174,10 +172,37 @@ class RotaryEmbedding(nn.Module):
             )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension and select the parition of the current
-            # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
+        return emb
+
+    @lru_cache(maxsize=32)
+    @internal_api
+    def forward(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
+        """Forward pass of RoPE embedding.
+
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
+
+        Returns:
+            Tensor: Embeddings after applying RoPE.
+        """
+        emb = self.get_emb(max_seq_len, offset)
+        if cp_group is None:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+            # slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+
         return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -190,10 +215,10 @@ class RotaryEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        packed_seq_params: PackedSeqParams,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> float:
+    ) -> int:
         """Function to get the rotary sequence length.
 
         Args:
@@ -205,7 +230,7 @@ class RotaryEmbedding(nn.Module):
             packed_seq_params (PackedSeqParams): Packed sequence params
 
         Returns:
-            float: The rotary sequence length
+            int: The rotary sequence length
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -256,6 +281,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         rotary_interleaved: bool = False,
         seq_len_interpolation_factor: Optional[float] = None,
         rotary_base: int = 10000,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
@@ -272,14 +298,26 @@ class MultimodalRotaryEmbedding(nn.Module):
                 / dim
             )
         )
+        self.cp_group = (
+            cp_group
+            if cp_group is not None
+            else parallel_state.get_context_parallel_group(check_initialized=False)
+        )
 
-    def forward(self, position_ids: torch.Tensor, mrope_section: List[int]) -> Tensor:
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        mrope_section: List[int],
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
         Args:
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -312,8 +350,10 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if cp_group is None:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 1)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb

@@ -2,7 +2,7 @@
 
 import logging
 import warnings
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -209,24 +209,35 @@ class MimoModel(MegatronModule):
         ).squeeze(
             1
         )  # Shape: [num_text_tokens, hidden_dim]
-
         return text_embeddings
 
-    def forward(self, data_batch: dict):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         """Forward pass through the multimodal model.
 
         Args:
-            data_batch (dict):
-                Dictionary containing inputs for different modalities
-                - input_ids: Input IDs for text tokens and special tokens
-                  [batch_size, seq_length]
-                - position_ids: Optional position IDs for all tokens [batch_size, seq_length]
-                - attention_mask: Optional attention mask [batch_size, seq_length]
-                - loss_mask: Optional loss mask [batch_size, seq_length]
-                - images: Optional image inputs [num_tiles_in_batch, 3, height, width]
-                - audio: Optional audio inputs
-                - video: Optional video inputs
-                - labels: Optional labels for training
+            input_ids: Input token IDs [batch_size, seq_length]
+            position_ids: Position IDs [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
+            loss_mask: Loss mask [batch_size, seq_length]
+            labels: Labels for training
+            modality_inputs: Dictionary mapping modality names to encoder inputs. For example:
+                {
+                    "images": {
+                        "clip_encoder": {"pixel_values": clip_images},
+                        "vit_encoder": {"images": vit_images}
+                    },
+                    "audio": {
+                        "whisper_encoder": {"input_features": whisper_features}
+                    }
+                }
 
         Returns:
             tuple: Tuple containing model outputs and loss mask
@@ -236,19 +247,20 @@ class MimoModel(MegatronModule):
 
         for modality_name, submodule in self.modality_submodules.items():
             # Process the modality through its submodule
-            if modality_name in data_batch and data_batch[modality_name] is not None:
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
+                and modality_inputs[modality_name] is not None
+            ):
                 logger.debug(f"Processing {modality_name} modality")
                 # Get embeddings for this modality
-                embeddings = submodule.forward(data_batch)
+                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
                     # All embeddings are now in the format [num_tokens, hidden_dim]
                     modality_embeddings[modality_name] = embeddings
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
-
-        input_ids = data_batch.get("input_ids")
-        position_ids = data_batch.get("position_ids")
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
@@ -265,15 +277,12 @@ class MimoModel(MegatronModule):
         )  # [s, b, h]
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        attention_mask = data_batch.get("attention_mask", None)
-        loss_mask = data_batch.get("loss_mask", None)
-
         # 3. Forward pass through language model
         lm_output = self.language_model(
             input_ids=None,
             position_ids=None,
             decoder_input=combined_embeddings,
-            labels=data_batch.get("labels"),
+            labels=labels,
             attention_mask=attention_mask,
         )
         logger.debug(f"Language model output shape: {lm_output.shape}")

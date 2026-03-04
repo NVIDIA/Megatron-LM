@@ -1,0 +1,74 @@
+{
+  "deepseek_a2a_tp1ep8_bf16": {
+    "backward_ms": 10.482670497894286,
+    "forward_ms": 7.119169592857361,
+    "max_allocated_bytes": 3442750464,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_a2a_tp1ep8_fp8": {
+    "backward_ms": 10.126460886001587,
+    "forward_ms": 7.609272027015686,
+    "max_allocated_bytes": 4412930560,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_deepep_tp1ep8_bf16": {
+    "backward_ms": 9.055137538909912,
+    "forward_ms": 5.681718397140503,
+    "max_allocated_bytes": 2445288448,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_deepep_tp1ep8_fp8": {
+    "backward_ms": 8.60211353302002,
+    "forward_ms": 6.034772801399231,
+    "max_allocated_bytes": 3707410944,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_hybridep_tp1ep8_bf16": {
+    "backward_ms": 8.795001602172851,
+    "forward_ms": 5.390828824043274,
+    "max_allocated_bytes": 2424369664,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_hybridep_tp1ep8_fp8": {
+    "backward_ms": 7.6874864339828495,
+    "forward_ms": 5.142886424064637,
+    "max_allocated_bytes": 2652078464,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_a2a_tp1ep8_bf16": {
+    "backward_ms": 7.684332823753357,
+    "forward_ms": 4.32688798904419,
+    "max_allocated_bytes": 2890180198.4,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_a2a_tp1ep8_fp8": {
+    "backward_ms": 6.618246412277221,
+    "forward_ms": 3.7876319885253906,
+    "max_allocated_bytes": 3095914086.4,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_deepep_tp1ep8_bf16": {
+    "backward_ms": 7.854356813430786,
+    "forward_ms": 4.635550403594971,
+    "max_allocated_bytes": 2890295808,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_deepep_tp1ep8_fp8": {
+    "backward_ms": 6.82720000743866,
+    "forward_ms": 4.101150441169739,
+    "max_allocated_bytes": 3095448064,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_hybridep_tp1ep8_bf16": {
+    "backward_ms": 7.740782427787781,
+    "forward_ms": 4.342604804039001,
+    "max_allocated_bytes": 2889559552,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_hybridep_tp1ep8_fp8": {
+    "backward_ms": 6.57167682647705,
+    "forward_ms": 3.7007392168045046,
+    "max_allocated_bytes": 3095269376,
+    "max_regression_ratio": 1.02
+  }
+}

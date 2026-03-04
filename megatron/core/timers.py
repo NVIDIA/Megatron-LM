@@ -2,18 +2,34 @@
 
 """Megatron timers."""
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import List
 
 import torch
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 from megatron.core.utils import is_torch_min_version
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
+
+logger = logging.getLogger(__name__)
 
 
 class TimerBase(ABC):
@@ -158,6 +174,17 @@ class Timer(TimerBase):
         self._elapsed = 0.0
         self._started = False
 
+    def set_elapsed(self, value):
+        """Directly set the elapsed time.
+
+        This is useful for injecting pre-computed timing values (e.g., startup
+        timestamps) into the timer so they can be reported via timers.log().
+
+        Args:
+            value (float): The elapsed time value in seconds.
+        """
+        self._elapsed = value
+
     def elapsed(self, reset=True, barrier=False):
         """Calculates the elapsed time and restarts timer.
 
@@ -257,6 +284,9 @@ class Timers:
             torch.tensor: Tensor of size [world_size, len(names)] with times in float.
         """
 
+        if len(names) == 0:
+            return None
+
         # First make sure all the callers are in sync.
         if barrier:
             torch.distributed.barrier()
@@ -289,16 +319,19 @@ class Timers:
         """Report only min and max times across all ranks."""
 
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
+        # Using Python built-in methods to avoid the overhead of PyTorch operations.
+        rank_name_to_time = (
+            rank_name_to_time.permute(1, 0).tolist() if rank_name_to_time is not None else None
+        )
         name_to_min_max_time = {}
         for i, name in enumerate(names):
-            rank_to_time = rank_name_to_time[:, i]
             # filter out the ones we did not have any timings for
-            rank_to_time = rank_to_time[rank_to_time > 0.0]
+            rank_to_time = list(filter(lambda x: x > 0.0, rank_name_to_time[i]))
             # If the timer exists:
-            if rank_to_time.numel() > 0:
+            if len(rank_to_time) > 0:
                 name_to_min_max_time[name] = (
-                    rank_to_time.min().item() / normalizer,
-                    rank_to_time.max().item() / normalizer,
+                    min(rank_to_time) / normalizer,
+                    max(rank_to_time) / normalizer,
                 )
         return name_to_min_max_time
 
@@ -414,7 +447,7 @@ class Timers:
         if rank is None:
             rank = torch.distributed.get_world_size() - 1
         if rank == torch.distributed.get_rank() and output_string is not None:
-            print(output_string, flush=True)
+            logger.info(output_string)
 
     def write(
         self,
@@ -446,4 +479,7 @@ class Timers:
         if writer is not None:
             for name in name_to_min_max_time:
                 _, max_time = name_to_min_max_time[name]
-                writer.add_scalar(name + '-time', max_time, iteration)
+                if isinstance(writer, SummaryWriter) and SummaryWriter is not None:
+                    writer.add_scalar(name + '-time', max_time, iteration)
+                elif writer == wandb and wandb is not None:
+                    writer.log({name + '-time': max_time}, iteration)

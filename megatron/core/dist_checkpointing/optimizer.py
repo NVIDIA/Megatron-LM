@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 import torch
 
-from megatron.core.utils import to_local_if_dtensor
+from megatron.core.utils import log_single_rank, to_local_if_dtensor
 
 from .dict_utils import nested_values
 from .mapping import (
@@ -24,6 +24,12 @@ from .mapping import (
     StateDict,
 )
 from .utils import extract_sharded_tensors_and_factories
+
+KEEP_VARS_HINT = (
+    " Make sure state dict contains original torch.nn.Parameters (not pure torch.Tensors)"
+    " by passing `keep_vars=True` to `.state_dict()`. If any transformation of the original"
+    " parameter is needed, use a ShardedTensorFactory."
+)
 
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
@@ -64,10 +70,12 @@ def get_param_id_to_sharded_param_map(
             logger.debug(f'{ten} is not tracked by the optimizer')
 
     if not id_to_sharded_param_map:
-        logger.warning(
+        log_single_rank(
+            logger,
+            logging.WARNING,
             "Sharded parameters mapping is empty. It means tensors in model state dict"
             " do not correspond to tensors in optimizer parameters map."
-            " Make sure to call state_dict with `keep_vars=True`."
+            " Make sure to call state_dict with `keep_vars=True`.",
         )
     return id_to_sharded_param_map
 

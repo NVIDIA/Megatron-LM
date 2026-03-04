@@ -1,9 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn as nn
 
 from megatron.core.models.mimo.submodules.base import ModalitySubmodules
 
@@ -19,17 +20,17 @@ class VisionModalitySubmodules(ModalitySubmodules):
 
     def __init__(
         self,
-        encoders=None,
-        decoders=None,
-        input_projections=None,
-        output_projections=None,
+        encoders: Optional[Dict[str, nn.Module]] = None,
+        decoders: Optional[Dict[str, nn.Module]] = None,
+        input_projections: Optional[List[nn.Module]] = None,
+        output_projections: Optional[List[nn.Module]] = None,
         **kwargs,
     ):
         """Initialize vision modality submodules.
 
         Args:
-            encoders: List of encoder modules
-            decoders: List of decoder modules
+            encoders: Dictionary of encoder modules
+            decoders: Dictionary of decoder modules
             input_projections: List of input projection modules
             output_projections: List of output projection modules
             **kwargs: Additional keyword arguments
@@ -51,33 +52,47 @@ class VisionModalitySubmodules(ModalitySubmodules):
                 len(self.output_projections) <= 1
             ), "VisionModalitySubmodules currently supports only one output projection"
 
-    def encode(self, data_batch: Dict) -> List[torch.Tensor]:
+    def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode image data batch into a list of tensors.
 
         Args:
-            data_batch: Dictionary containing input data.
-                Expected to have an 'images' key with tensor data of shape [num_images, 3, h, w].
-                Each image in the list is treated as an independent input, not grouped by batch.
+            encoders_data_batch: Dictionary containing encoder-specific inputs.
+                Keys should match encoder names in self.encoders.
+                Each encoder receives its own specific inputs.
 
         Returns:
             List of encoded image embeddings, one from each encoder.
-        """
-        if "images" not in data_batch:
-            return []
+            Each embedding is a flattened tensor of shape [total_tokens, hidden_dim]
 
-        images = data_batch["images"]  # [num_images, 3, h, w]
-        logger.debug(f"Input images shape: {images.shape}")
+        Raises:
+            ValueError: If no data is provided for any encoder or if there's a parameter mismatch.
+        """
+        if not encoders_data_batch:
+            return []
 
         embeddings = []
 
-        for i, encoder in enumerate(self.encoders):
-            # Process all images as independent inputs (not grouped by batch)
-            encoder_outputs = encoder(images)  # [num_images, seq_len, hidden_dim]
-            logger.debug(
-                f"Encoder {i+1}/{len(self.encoders)} "
-                f"({type(encoder).__name__}) output shape: {encoder_outputs.shape}"
-            )
-            embeddings.append(encoder_outputs)
+        for name, encoder in self.encoders.items():
+            if name not in encoders_data_batch:
+                raise ValueError(f"No inputs found for encoder '{name}'")
+
+            encoder_inputs = encoders_data_batch[name]
+
+            # Process inputs through the encoder
+            encoder_outputs = encoder(**encoder_inputs)
+            logger.debug(f"Encoder '{name}' output shape: {encoder_outputs.shape}")
+            if encoder_outputs.ndim == 3:
+                # its b,s,h -> we need to flatten it to b*s,h
+                encoder_outputs = encoder_outputs.reshape(-1, encoder_outputs.size(-1))
+                embeddings.append(encoder_outputs)
+            elif encoder_outputs.ndim == 2:
+                # its b*s,h -> encoder already returned the flattened output
+                embeddings.append(encoder_outputs)
+            else:
+                raise ValueError(
+                    f"Encoder '{name}' output shape {encoder_outputs.shape} is not supported"
+                    "Expected 3D (b,s,h) or 2D (b*s,h) tensor, got {encoder_outputs.ndim}D"
+                )
 
         return embeddings
 
@@ -111,15 +126,15 @@ class VisionModalitySubmodules(ModalitySubmodules):
         if len(embeddings) == 1:
             return embeddings[0]
 
-        # concatenate along dimension 1 (seq) for now
+        # each embedding is [total_tokens, hidden_dim]
         #  Make this configurable in the future
-        combined = torch.cat(embeddings, dim=1)
+        combined = torch.cat(embeddings, dim=0)
         logger.debug(f"Combined embeddings shape after concatenation: {combined.shape}")
         return combined
 
     def project_embeddings(
         self, embeddings: List[torch.Tensor], is_input: bool = True
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         """Project image embeddings using input or output projections.
 
         Args:
@@ -129,9 +144,6 @@ class VisionModalitySubmodules(ModalitySubmodules):
         Returns:
             Projected image embeddings or None if no embeddings
         """
-        if not embeddings:
-            return None
-
         if is_input:
             embeddings = self.combine_embeddings(embeddings)
 
@@ -148,32 +160,25 @@ class VisionModalitySubmodules(ModalitySubmodules):
 
         return embeddings
 
-    def forward(self, data_batch: Dict) -> Optional[torch.Tensor]:
+    def forward(self, encoder_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Process image data through encoding and projection.
 
         Args:
-            data_batch: Dictionary containing input data with 'images' key.
-                Shape [num_tiles, 3, h, w]
+            encoder_inputs: Dictionary where keys match encoder names in self.encoders
+                and values are dictionaries of encoder-specific parameters.
+                Example: {"clip": {"pixel_values": images}, "vit": {"images": vit_images}}
 
         Returns:
-            Projected image embeddings or None if no images in batch.
-            Output shape is [total_embeddings, hidden_dim], where total_embeddings is the total
-            number of embeddings across all images (num_tiles * tile_seq_len).
+            Flattened image embeddings with shape [total_embeddings, hidden_dim],
+            or None if no valid inputs were provided.
         """
         # Encode the images
-        embeddings = self.encode(data_batch)
+        embeddings = self.encode(encoder_inputs)
 
         # If no embeddings were produced, return None
         if not embeddings:
             return None
 
         projected = self.project_embeddings(embeddings, is_input=True)
-
-        num_images, seq_len, hidden_dim = projected.shape
-        flattened = projected.reshape(-1, hidden_dim)
-        logger.debug(
-            f"flattened embeddings shape: {flattened.shape}, "
-            f"from {num_images} images with {seq_len} tokens each"
-        )
-
-        return flattened  # [total_embeddings, hidden_dim]
+        logging.debug(f"Projected audio embeddings shape: {projected.shape}")
+        return projected  # [total_embeddings, hidden_dim]

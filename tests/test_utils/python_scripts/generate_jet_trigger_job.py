@@ -4,7 +4,7 @@ from typing import Optional
 import click
 import yaml
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
@@ -17,14 +17,9 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 @click.option(
     "--test-cases", required=True, type=str, help="Comma-separated list of test_cases, or 'all'"
 )
-@click.option("--a100-cluster", required=True, type=str, help="A100 Cluster to run on")
-@click.option("--h100-cluster", required=True, type=str, help="H100 Cluster to run on")
-@click.option(
-    "--a100-partition", required=False, type=str, help="Slurm partition to use", default=None
-)
-@click.option(
-    "--h100-partition", required=False, type=str, help="Slurm partition to use", default=None
-)
+@click.option("--platform", required=True, type=str, help="Platform to select")
+@click.option("--cluster", required=True, type=str, help="Cluster to run on")
+@click.option("--partition", required=False, type=str, help="Slurm partition to use", default=None)
 @click.option("--output-path", required=True, type=str, help="Path to write GitLab job to")
 @click.option("--container-image", required=True, type=str, help="LTS Container image to use")
 @click.option("--container-tag", required=True, type=str, help="Container tag to use")
@@ -69,10 +64,9 @@ def main(
     n_repeat: int,
     time_limit: int,
     test_cases: str,
-    a100_cluster: str,
-    h100_cluster: str,
-    a100_partition: Optional[str],
-    h100_partition: Optional[str],
+    platform: Optional[str],
+    cluster: Optional[str],
+    partition: Optional[str],
     output_path: str,
     container_image: str,
     container_tag: str,
@@ -87,11 +81,12 @@ def main(
 ):
     list_of_test_cases = [
         test_case
-        for test_case in common.load_workloads(
+        for test_case in recipe_parser.load_workloads(
             scope=scope,
             container_tag=container_tag,
             environment=environment,
             test_cases=test_cases,
+            platform=platform,
             tag=tag,
         )
         if test_case.type != "build"
@@ -124,19 +119,29 @@ def main(
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
+                "retry": {
+                    "max": 2,
+                    "when": [
+                        "unknown_failure",
+                        "stuck_or_timeout_failure",
+                        "runner_system_failure",
+                    ],
+                },
             },
         }
 
     else:
-        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x.spec.model)
+        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x["spec"]["model"])
 
         gitlab_pipeline = {
-            "stages": sorted(list(set([test_case.spec.model for test_case in list_of_test_cases]))),
+            "stages": sorted(
+                list(set([test_case["spec"]["model"] for test_case in list_of_test_cases]))
+            ),
             "workflow": {
                 "rules": [
                     {
                         "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
-                        "auto_cancel": {"on_new_commit": "none"},
+                        "auto_cancel": {"on_new_commit": "interruptible"},
                     },
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
                     {"when": "never"},
@@ -152,29 +157,21 @@ def main(
         warmup_job = ""
 
         for test_idx, test_case in enumerate(list_of_test_cases):
-            if test_case.spec.platforms == "dgx_a100":
-                cluster = a100_cluster
-                partition = a100_partition
-            elif test_case.spec.platforms == "dgx_h100":
-                cluster = h100_cluster
-                partition = h100_partition
-            else:
-                raise ValueError(f"Platform {test_case.spec.platforms} unknown")
-
             job_tags = list(tags)
-            job_tags.append(f"cluster/{common.resolve_cluster_config(cluster)}")
+            job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
                 "python tests/test_utils/python_scripts/launch_jet_workload.py",
-                f"--model {test_case.spec.model}",
-                f"--environment {test_case.spec.environment}",
+                f"--model {test_case['spec']['model']}",
+                f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
                 f"--time-limit {time_limit}",
                 f"--scope {scope}",
-                f"--test-case '{test_case.spec.test_case}'",
+                f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
+                f"--platform {platform}",
                 f"--record-checkpoints {record_checkpoints}",
                 f"--account {slurm_account}",
             ]
@@ -190,27 +187,35 @@ def main(
 
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
-                test_case.spec.model
                 script.append(
-                    f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
+                    f"--wandb-experiment {wandb_experiment}-{test_case['spec']['model']}-{test_case['spec']['test_case']}"
                 )
 
             needs = [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}]
 
             if enable_warmup:
                 if test_idx == 0:
-                    warmup_job = test_case.spec.test_case
+                    warmup_job = test_case['spec']['test_case']
                 elif warmup_job != "":
                     needs.append({"job": warmup_job})
 
-            gitlab_pipeline[test_case.spec.test_case] = {
-                "stage": f"{test_case.spec.model}",
+            gitlab_pipeline[test_case['spec']['test_case']] = {
+                "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
                 "timeout": "7 days",
                 "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
+                "allow_failure": test_case["spec"]["model"] == "gpt-nemo",
+                "retry": {
+                    "max": 2,
+                    "when": [
+                        "unknown_failure",
+                        "stuck_or_timeout_failure",
+                        "runner_system_failure",
+                    ],
+                },
             }
 
     with open(output_path, 'w') as outfile:

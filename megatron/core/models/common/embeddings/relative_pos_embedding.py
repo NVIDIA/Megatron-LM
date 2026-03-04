@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, nvtx_decorator
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,7 @@ class RelativePositionEmbedding(nn.Module):
 
         return relative_seq_len
 
+    @nvtx_decorator()
     def forward(self, query_seq_length, key_seq_length):
         """
         Args:
