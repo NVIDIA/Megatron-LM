@@ -1,9 +1,8 @@
-name: Claude Code Review test
+name: Claude Code Review
 
 on:
-  # issue_comment:
-  #   types: [created]
-  push:
+  issue_comment:
+    types: [created]
 
 jobs:
   review-on-comment:
@@ -18,7 +17,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: 3704 # ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ github.event.issue.number }}
     steps:
       - name: Get PR head commit
         id: get-pr-head-commit
