@@ -3288,8 +3288,6 @@ def evaluate(
 
     rerun_state_machine.set_mode(rerun_mode)
 
-    rerun_state_machine.set_mode(rerun_mode)
-
     return total_loss_dict, collected_non_loss_data, False
 
 
