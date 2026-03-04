@@ -1,0 +1,9 @@
+# Fusions module (fused_bias_dropout, fused_bias_gelu, etc.).
+#
+# Test imports traced:
+#   transformer*  → fusions.fused_bias_dropout, fusions.fused_indices_converter
+#   fusions       → fusions.* (test suite)
+test_buckets:
+  - transformer
+  - transformer_moe
+  - fusions
