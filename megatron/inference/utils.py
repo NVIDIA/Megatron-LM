@@ -12,6 +12,7 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
@@ -251,6 +252,12 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Comma-separated list of request indices where each batch starts. "
         "Used with --drain-between-batches.",
     )
+    group.add_argument(
+        "--coordinator-schedule-output-path",
+        type=str,
+        default=None,
+        help="Path to write coordinator request scheduling decisions as JSON",
+    )
 
     return parser
 
@@ -331,6 +338,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )

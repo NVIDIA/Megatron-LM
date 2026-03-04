@@ -1,0 +1,38 @@
+name: Claude Code Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review-on-comment:
+    name: Claude Review (comment trigger)
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/claude review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are doing a light code review. Keep it concise and actionable.
+            Focus ONLY on:
+            - Critical bugs or logic errors
+            - Typos in code, comments, or strings
+            - Missing or insufficient test coverage for changed code
+            - Outdated or inaccurate documentation affected by the changes
+
+            Do NOT comment on:
+            - Style preferences or formatting
+            - Minor naming suggestions
+            - Architectural opinions or refactoring ideas
+            - Performance unless there is a clear, measurable issue
+
+            If everything looks good, say so briefly. Do not leave unnecessary comments.
