@@ -1109,9 +1109,26 @@ class MegatronFSDP(torch.nn.Module):
         bookkeeping: populating the set of parameters that require gradient handling
         and resetting the grad-accumulation flag on each parameter.
 
+        For optim_grads_params, also replicates the FSDP-unit state transitions and
+        forward-bucket release marking that _root_pre_backward normally performs.
+
         Must be called before each microbatch's backward pass in the overlap schedule.
         """
         self._root_pre_backward_hook_issued = True
+
+        if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            fsdp_unit_modules = self.fsdp_unit_modules
+            for module in self.module.modules():
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    module._training_state = TrainingState.PRE_BACKWARD
+            ag_pipeline = self.all_gather_pipeline
+            for bucket_id in range(ag_pipeline.num_buckets):
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                if group.fsdp_unit_id is not None:
+                    ag_pipeline.bucket_can_be_released[
+                        ag_pipeline.get_bucket_key(bucket_id, bwd=False)
+                    ] = True
+
         self._params_require_handle_grad = set()
         for param_group in self.param_and_grad_buffer.parameter_groups:
             if not param_group.requires_grad:
@@ -1126,6 +1143,10 @@ class MegatronFSDP(torch.nn.Module):
         Counterpart to overlap_pre_backward(). Handles any parameters whose gradients
         were not processed by per-parameter hooks (e.g. shared parameters), waits for
         pending async reduce-scatter operations, and updates microbatch bookkeeping.
+
+        For optim_grads_params, also releases backward parameter buckets and transitions
+        FSDP units back to IDLE, replicating what _post_backward_release_module normally
+        does per-unit during the backward pass.
 
         Must be called after each microbatch's backward pass in the overlap schedule.
         """
@@ -1155,6 +1176,18 @@ class MegatronFSDP(torch.nn.Module):
             )
 
             self.grad_reduce_pipeline.reset()
+
+        if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            fsdp_unit_modules = self.fsdp_unit_modules
+            released_buckets = set()
+            for module in self.module.modules():
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    for param in module.parameters():
+                        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                        if bucket_id not in released_buckets:
+                            self.all_gather_pipeline.release_bucket(bucket_id, bwd=True)
+                            released_buckets.add(bucket_id)
+                    module._training_state = TrainingState.IDLE
 
         self._root_pre_backward_hook_issued = False
         self.microbatch_count += 1

@@ -124,7 +124,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
                 enable_fine_grained_param_gather_hook=(
-                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or (
+                        config.overlap_moe_expert_parallel_comm
+                        and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    )
                 ),
             ),
         )
