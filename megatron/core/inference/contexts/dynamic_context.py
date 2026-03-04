@@ -359,10 +359,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)
-            mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
-            mamba_states_memory_per_request *= self.num_mamba_layers
-            mamba_states_memory_per_request *= dtype_size_bytes
+            mamba_states_memory_per_request += (
+                math.prod(self.mamba_conv_states_shape) * dtype_size_bytes
+                + math.prod(self.mamba_ssm_states_shape) * 4  # fp32
+            ) * self.num_mamba_layers
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -641,7 +641,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.mamba_ssm_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.params_dtype,
+                dtype=torch.float32,
                 device=torch.cuda.current_device(),
             )
             if (
