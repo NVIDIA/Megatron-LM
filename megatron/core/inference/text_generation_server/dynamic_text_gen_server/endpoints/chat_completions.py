@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import json
 import logging
 import time
 import traceback
@@ -11,6 +12,38 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
+
+
+def _get_field(obj, key, default=None):
+    """Read a field from dict-like or object-like values."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalize_tool_calls(tool_calls):
+    """Normalize tool calls to OpenAI-compatible JSON primitives."""
+    normalized = []
+    for call in tool_calls or []:
+        fn = _get_field(call, "function", {}) or {}
+        fn_name = _get_field(fn, "name")
+        fn_args = _get_field(fn, "arguments", "")
+        if fn_name is None:
+            continue
+        if not isinstance(fn_args, str):
+            try:
+                fn_args = json.dumps(fn_args, ensure_ascii=False)
+            except TypeError:
+                fn_args = str(fn_args)
+        normalized.append(
+            {
+                "id": str(_get_field(call, "id", f"call_{uuid.uuid4().hex[:24]}")),
+                "type": "function",
+                "function": {"name": str(fn_name), "arguments": fn_args},
+            }
+        )
+    return normalized
+
 
 try:
     import orjson
@@ -47,6 +80,8 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        tools = req.get("tools", None)
+        tools_requested = bool(tools)
 
         # --- 1. Parse Messages ---
         messages = req.get("messages")
@@ -60,7 +95,7 @@ try:
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
-                tools=req.get("tools", None),
+                tools=tools,
                 **req.get("chat_template_kwargs", {}),
             )
         except (AttributeError, AssertionError):
@@ -195,12 +230,24 @@ try:
             message_text = text_output
 
             if parsers:
-                message_text, metadata = apply_parsers(
-                    message_text, req.get("tools", None), parsers
+                parsed_text, new_info = apply_parsers(
+                    message_text, tools=tools, parsers=parsers
                 )
+                prev_text = message_text
+                if "tool_calls" in new_info:
+                    new_info["tool_calls"] = _normalize_tool_calls(new_info.get("tool_calls", []))
+                    if not tools_requested:
+                        # Ignore incidental tool-call syntax in plain chat mode.
+                        parsed_text = prev_text
+                        new_info.pop("tool_calls", None)
+                message_text = parsed_text
+                assert not (
+                    metadata.keys() & new_info.keys()
+                ), "Multiple parsers found the same information."
+                metadata.update(new_info)
 
             message = {"role": "assistant", "content": message_text}
-            if "tool_calls" in metadata:
+            if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
                 message["reasoning"] = metadata["reasoning"]
