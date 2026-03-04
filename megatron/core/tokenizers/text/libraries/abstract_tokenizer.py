@@ -88,6 +88,19 @@ class MegatronTokenizerTextAbstract(ABC):
         pass
 
     @abstractmethod
+    def batch_ids_to_text(self, ids: List[List[int]]) -> List[str]:
+        """
+        Converts batch of ids to text.
+
+        Args:
+            ids (List[List[int]]): ids to be detokenized.
+
+        Returns:
+            List[str]: detokenized text.
+        """
+        return list(map(self.ids_to_text, ids))
+
+    @abstractmethod
     def add_special_tokens(self):
         """Adds special tokens to the tokenizer."""
         pass

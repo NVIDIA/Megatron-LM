@@ -88,6 +88,18 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         return self._tokenizer.ids_to_text(ids)
 
+    def batch_detokenize(self, ids: List[List[int]]) -> List[str]:
+        """
+        Batch text detokenization.
+
+        Args:
+            ids (list[list[int]]): text to be tokenized.
+
+        Returns:
+            list[str]: detokenized_text.
+        """
+        return self._tokenizer.batch_ids_to_text(ids)
+
     def apply_chat_template(
         self, conversation: List[Dict[str, str]], chat_template: Optional[str] = None, **kwargs
     ) -> Union[str, list]:

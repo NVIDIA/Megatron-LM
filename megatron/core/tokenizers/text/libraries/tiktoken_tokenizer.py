@@ -229,6 +229,26 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         else:
             return ""  # Return an empty string if all tokens were filtered out
 
+    def batch_ids_to_text(
+        self, batch_ids: List[List[int]], remove_special_tokens: bool = False
+    ) -> List[str]:
+        """Converts a batch of sequences of ids to a list of strings."""
+        if remove_special_tokens:
+            # Filter out special tokens (like bos, eos, and anything < num_special_tokens)
+            adjusted_batch = [
+                [
+                    t
+                    for t in tokens
+                    if t not in {self.bos_id, self.eos_id} and t >= self.num_special_tokens
+                ]
+                for tokens in batch_ids
+            ]
+        else:
+            adjusted_batch = batch_ids
+
+        # Leverage tiktoken's native Rust implementation for fast batch decoding.
+        return self.tokenizer.decode_batch(adjusted_batch)
+
     def add_special_tokens(self, special_tokens_dict: dict):
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for TikToken tokenizers.")

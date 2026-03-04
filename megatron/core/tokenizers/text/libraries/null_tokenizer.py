@@ -25,6 +25,10 @@ class NullTokenizer:
         text = [str(x) for x in ids]
         return ' '.join(text)
 
+    def batch_ids_to_text(self, ids):
+        """Converts batch ids to text."""
+        return list(map(self.ids_to_text, ids))
+
     def tokens_to_ids(self, tokens):
         """Converts tokens to ids."""
         return [int(x) for x in tokens]

@@ -203,6 +203,10 @@ class SFTTokenizer:
         """Detokenize tokens."""
         return self._tokenizer.decode(tokens)
 
+    def batch_ids_to_text(self, tokens: List[int]):
+        """Batch detokenize tokens."""
+        return self._tokenizer.batch_decode(tokens)
+
     def ids_to_tokens(self):
         """Converts ids to tokens."""
         raise NotImplementedError("This method is not supported for SFTTokenizer.")

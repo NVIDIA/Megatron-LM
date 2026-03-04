@@ -27,8 +27,6 @@ from ..server.api import InferenceServer
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-MAX_CONCURRENT_REQUESTS = 4000
-
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
 
@@ -122,19 +120,21 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        # Connection pool limits configured here to support massive concurrency
-        # TODO(ksanthanam): Make this configurable?
-        concurrency_limit = MAX_CONCURRENT_REQUESTS
-        custom_limits = httpx.Limits(
-            max_connections=concurrency_limit,
-            max_keepalive_connections=concurrency_limit
-        )
-        http_client = DefaultAioHttpClient(limits=custom_limits)
-
+        max_connections = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{launched_server.host}:{launched_server.port}",
             api_key="NONE",
-            http_client=http_client
+            timeout=timeout,
+            max_retries=0,
+            http_client=httpx.AsyncClient(
+                timeout=timeout,
+                http2=use_http2,
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_connections,
+                    keepalive_expiry=10,
+                ),
+            ),
         )
 
         return launched_server

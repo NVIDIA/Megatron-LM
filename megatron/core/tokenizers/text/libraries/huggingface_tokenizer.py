@@ -268,6 +268,21 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         text = self.tokens_to_text(tokens_clean)
         return text
 
+    def batch_ids_to_text(
+        self, batch_ids: List[List[int]], remove_special_tokens: Optional[bool] = None
+    ) -> List[str]:
+        """Converts a batch of sequences of ids to a list of strings.
+
+        When remove_special_tokens is None, uses not self.include_special_tokens so that
+        --tokenizer-hf-include-special-tokens keeps EOS (and other special tokens) in
+        detokenized output (e.g. for RL trajectory consistency).
+        """
+        if remove_special_tokens is None:
+            remove_special_tokens = not self.include_special_tokens
+
+        # Leverage Hugging Face's native batch_decode for optimized performance
+        return self.tokenizer.batch_decode(batch_ids, skip_special_tokens=remove_special_tokens)
+
     def apply_chat_template(self, conversation, chat_template, **kwargs):
         """Applies chat template and tokenizes results"""
         return self.tokenizer.apply_chat_template(
