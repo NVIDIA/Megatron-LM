@@ -182,7 +182,7 @@ class InferenceSpecProvider(BackendSpecProvider):
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool,
+        self, moe_use_grouped_gemm: bool
     ) -> Tuple[type, Optional[MLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
         return InferenceGroupedMLP, MLPSubmodules(
