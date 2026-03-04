@@ -191,34 +191,49 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # When batch_results is enabled, gate resubmissions so that workers can only
-        # submit new requests after the previous batch has been consumed.
-        submission_gate = (
-            asyncio.Semaphore(self.parallel_generation_tasks)
-            if request.batch_results
-            else None
-        )
+        if request.batch_results:
+            # Each worker gets a permit for a batch of num_groups groups.
+            # The semaphore ensures that each batch only starts after the previous is consumed.
+            groups_per_worker = request.num_groups
+            num_workers = self.parallel_generation_tasks // groups_per_worker
+            submission_gate = asyncio.Semaphore(num_workers)
+        else:
+            groups_per_worker = 1
+            num_workers = self.parallel_generation_tasks
+            submission_gate = None
+
+        async def generate_and_enqueue(batch_id, index_in_batch):
+            group = await self.group_rollout(request=request)
+            if (
+                not request.filter_groups_with_same_reward
+                or np.std([r.reward for r in group]) > 1e-6
+            ):
+                for rollout in group:
+                    rollout.submission_index = batch_id * groups_per_worker + index_in_batch
+                    rollout.batch_id = batch_id
+                await grouped_rollouts.put(group)
+                return True
+            return False
 
         @trace_async_exceptions(verbose=True)
-        async def group_task():
+        async def generate_task():
             nonlocal submitted_groups
-            while request.streaming or submitted_groups < request.num_groups:
+            while request.streaming or submitted_groups < self.parallel_generation_tasks:
                 if submission_gate is not None:
                     await submission_gate.acquire()
-                group_index = submitted_groups
-                submitted_groups += 1
-                group = await self.group_rollout(request=request)
-                if (
-                    not request.filter_groups_with_same_reward
-                    or np.std([r.reward for r in group]) > 1e-6
-                ):
-                    for rollout in group:
-                        rollout.submission_index = group_index
-                    await grouped_rollouts.put(group)
+                batch_id = submitted_groups // groups_per_worker
+                submitted_groups += groups_per_worker
+                if groups_per_worker > 1:
+                    results = await asyncio.gather(*[
+                        generate_and_enqueue(batch_id, i)
+                        for i in range(groups_per_worker)
+                    ])
+                    assert all(results), "Filtering is not supported with batch_results"
                 else:
-                    submitted_groups -= 1
+                    if not await generate_and_enqueue(batch_id, 0):
+                        submitted_groups -= 1
 
-        tasks = [asyncio.create_task(group_task()) for _ in range(self.parallel_generation_tasks)]
+        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
         try:
             if request.batch_results:
@@ -227,17 +242,14 @@ class GroupedRolloutGenerator(Agent, ABC):
                 pending: dict[int, list[list[Rollout]]] = {}
                 while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
                     group = await grouped_rollouts.get()
-                    batch_id = group[0].submission_index // request.num_groups
-                    pending.setdefault(batch_id, []).append(group)
+                    pending.setdefault(group[0].batch_id, []).append(group)
                     if len(pending.get(next_batch_id, [])) >= request.num_groups:
                         batch = pending.pop(next_batch_id)
                         batch.sort(key=lambda g: g[0].submission_index)
                         next_batch_id += 1
-                        yield batch
-                        # Release permits so workers can submit the next round of
-                        # requests. This runs after the consumer resumes the generator.
-                        for _ in range(request.num_groups):
-                            submission_gate.release()
+                        for g in batch:
+                            yield g
+                        submission_gate.release()
             else:
                 while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
                     yield await grouped_rollouts.get()
