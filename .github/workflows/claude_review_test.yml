@@ -3,7 +3,7 @@ name: Claude Code Review test
 on:
   # issue_comment:
   #   types: [created]
-  pull_request:
+  push:
 
 jobs:
   review-on-comment:
