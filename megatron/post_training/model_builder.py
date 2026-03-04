@@ -2,6 +2,7 @@
 
 """ModelOpt GPT model provider."""
 
+import logging
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -24,6 +25,8 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
+from megatron.post_training.utils import print_distributed_quant_summary
+
 
 def count_parameters_in_layer(model, layer_name):
     num_params = 0
@@ -45,9 +48,9 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
 def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
-    The config provided via --teacher-model-config should specify
-    (in NEMO format) any model architecture settings which differ from the main student model's.
-    This function will translate NEMO field names to MCore as needed.
+    The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
+    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
+    This function will translate NeMo field names to MCore as needed.
     """
     required_teacher_fields = (
         "num_layers",
@@ -57,18 +60,22 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     )
 
     args = get_args()
-    config_path = os.path.join(checkpoint_path, "model_config.yaml") if args.teacher_model_config is None else args.teacher_model_config
+    if args.export_kd_teacher_model_config is not None:
+        config_path = args.export_kd_teacher_model_config
+    else:
+        config_path = os.path.join(checkpoint_path, "model_config.yaml")
     if not os.path.exists(config_path):
         raise FileNotFoundError(
-            "Teacher checkpoint dir must contain a NEMO-format yaml config named 'model_config.yaml'"
+            f"Teacher model-config file {config_path} not found.\n"
+            "Teacher checkpoint dir must contain a NeMo-format config named 'model_config.yaml'"
+            " or provide it via --export-kd-teacher-model-config."
         )
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    missing_keys = [k for k in required_teacher_fields if k not in config]
-    if missing_keys:
+    if missing_keys := [k for k in required_teacher_fields if k not in config]:
         raise ValueError(
-            f"Teacher `model_config.yaml` file missing the following fields: {missing_keys}"
+            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
         )
 
     if "encoder_seq_length" in config:
@@ -99,23 +106,44 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     del args_dict["kv_channels"]  # not recalculated if present
     args_dict.update(config)
 
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (args_dict.get('hybrid_override_pattern') is not None
+            and args_dict.get('hybrid_layer_pattern') is None):
+        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
+
     return Namespace(**args_dict)
 
 
-def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
-    """Teacher model factory (must be a non-local function to pickle)."""
+def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+    """Teacher model creator."""
     args = get_args()
 
-    # Convert to `TransformerConfig` here to avoid ModelOpt pickling issues (contains local functions)
-    config = core_transformer_config_from_args(config)
-
     if config.is_hybrid_model:
+        # This parameter is not part of the TransformerConfig and needs to be passed separately.
+        # Note: hybrid_override_pattern is remapped to hybrid_layer_pattern in
+        # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
+        model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
+
         teacher = MCoreMambaModel(config=config, **model_kwargs)
     else:
+        # GPT layer spec needs re-creation since it depends on number of model layers.
+        if config.heterogeneous_block_specs:
+            model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=(args.transformer_impl == "transformer_engine"),
+            )
+        else:
+            model_kwargs["transformer_layer_spec"] = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+                use_arbitrary_attention_mask=False,
+            )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
 
-    print_rank_0("Loading teacher {} checkpoint...".format("MCoreMambaModel" if config.is_hybrid_model else "MCoreGPTModel"))
+    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
     # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
     # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
     # True while loading the teacher checkpoint.
@@ -125,7 +153,7 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
         args.ckpt_format = args.export_kd_teacher_ckpt_format
     load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
     args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("successfully loaded teacher...")
+    print_rank_0("...teacher loaded successfully.")
 
     return teacher
 
@@ -201,21 +229,18 @@ def modelopt_gpt_mamba_builder(
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
-            local_core_attention=args.export_force_local_attention
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
-                use_arbitrary_attention_mask = False
             else:
-                use_arbitrary_attention_mask = True
+                local_core_attention=args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                use_arbitrary_attention_mask=False,
             )
 
         model_kwargs = {
@@ -234,20 +259,26 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
+    elif args.export_model_type == "MambaModel" or getattr(args, 'hybrid_layer_pattern', None) is not None:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
+        if args.export_default_te_spec and args.export_te_mcore_model:
+            logging.getLogger(__name__).warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            args.export_te_mcore_model = False
+
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
             "mamba_stack_spec": mamba_stack_spec,
             "vocab_size": args.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
+            "hybrid_layer_pattern": args.hybrid_layer_pattern,
             "pre_process": pre_process,
-            "hybrid_attention_ratio": args.hybrid_attention_ratio,
-            "hybrid_mlp_ratio": args.hybrid_mlp_ratio,
-            "hybrid_override_pattern": args.hybrid_override_pattern,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
@@ -292,24 +323,22 @@ def modelopt_gpt_mamba_builder(
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
         if args.pipeline_model_parallel_size > 1:
             assert (
                 args.virtual_pipeline_model_parallel_size is None
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
-        teacher_config = _load_teacher_model_config(args.export_kd_teacher_load)
-        distill_cfg = mtd_mcore.setup_distillation_config(
-            args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
-        )
-        if "hybrid_override_pattern" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_override_pattern"] = teacher_config.hybrid_override_pattern
-        if "hybrid_attention_ratio" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_attention_ratio"] = teacher_config.hybrid_attention_ratio
-        if "hybrid_mlp_ratio" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_mlp_ratio"] = teacher_config.hybrid_mlp_ratio
+        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
 
+        distill_cfg = mtd_mcore.setup_distillation_config(
+            args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
+        )
         kd_config = {
-            "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
+            "teacher_model": _load_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
@@ -320,5 +349,6 @@ def modelopt_gpt_mamba_builder(
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-
+    
+    print_distributed_quant_summary(model)
     return model

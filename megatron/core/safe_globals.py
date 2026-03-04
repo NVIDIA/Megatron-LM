@@ -14,7 +14,7 @@ from numpy.dtypes import UInt32DType
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode, RerunState
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 
 SAFE_GLOBALS = [
     SimpleNamespace,
@@ -25,6 +25,7 @@ SAFE_GLOBALS = [
     UInt32DType,
     Namespace,
     AttnBackend,
+    CudaGraphScope,
     ModelType,
     OptimizerConfig,
     RerunDiagnostic,

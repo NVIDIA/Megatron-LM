@@ -1,3 +1,16 @@
+---
+orphan: true
+---
+
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # API Backward Compatibility Checking
 
 ## Overview
@@ -182,7 +195,7 @@ def _internal_compute(x, y, z):  # Added parameter
 ### Example 4: Deprecation Workflow
 
 ```python
-from megatron.core.backwards_compatibility_decorators import deprecated
+from megatron.core.utils import deprecated
 
 # Version 1.0 - Add deprecation
 @deprecated(
