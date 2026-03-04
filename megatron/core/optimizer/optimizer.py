@@ -149,10 +149,26 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to tensor model parallelism.
           - should not be a PS duplicate (non-ETP params are identical across PS peers;
             only PS rank 0 should contribute to avoid over-counting).
+
+        Returns all filtered grads as a single list (for backward compatibility).
+        Use get_main_grads_for_grad_norm_split() to get ETP and non-ETP grads separately.
+        """
+        non_etp_grads, etp_grads = self.get_main_grads_for_grad_norm_split()
+        return non_etp_grads + etp_grads
+
+    def get_main_grads_for_grad_norm_split(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Get main_grads split into (non_etp_grads, etp_grads).
+
+        ETP grads may need an extra PS/EPS reduction that differs from the
+        optimizer's grad_stats_parallel_group, so callers that compute norms
+        need them separated.
         """
         params = self.get_parameters()
-        grads_for_norm = []
+        non_etp_grads = []
+        etp_grads = []
         ps_rank = parallel_state.get_parameter_sharding_rank()
+        eps_rank = parallel_state.get_expert_parameter_sharding_rank()
         for param in params:
             if getattr(param, "__fsdp_param__", False):
                 grad = param.grad._local_tensor if param.grad is not None else None
@@ -162,25 +178,36 @@ class MegatronOptimizer(ABC):
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+
+            is_etp_param = getattr(param, 'is_etp', False) or (
+                ETPShardedParam is not None and isinstance(param, ETPShardedParam)
             )
+
+            # ETP params are always unique across TP ranks (tensor_model_parallel
+            # attribute is lost during wrap_etp_sharded_tensor), so skip TP filter.
+            is_not_tp_duplicate = is_etp_param or (
+                tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                    param, getattr(self, 'tp_group', None)
+                )
+            )
+
             # PS-duplicate filter: only needed for non-distributed optimizer.
-            # Distributed optimizer: PS peers are in the same DP group, reduce-scatter
-            # gives unique shards per rank — no duplicates possible.
-            # Non-distributed optimizer: PS peers have identical grads after allreduce.
-            # ETP params have unique shards, non-ETP are duplicated across PS peers.
+            is_expert = not getattr(param, 'allreduce', True)
             if hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer:
                 is_not_ps_duplicate = True
             else:
-                is_etp_param = getattr(param, 'is_etp', False) or (
-                    ETPShardedParam is not None and isinstance(param, ETPShardedParam)
-                )
-                is_not_ps_duplicate = is_etp_param or ps_rank == 0
-            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
-                grads_for_norm.append(grad)
+                if is_expert:
+                    is_not_ps_duplicate = is_etp_param or eps_rank == 0
+                else:
+                    is_not_ps_duplicate = is_etp_param or ps_rank == 0
 
-        return grads_for_norm
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
+                if is_etp_param:
+                    etp_grads.append(grad)
+                else:
+                    non_etp_grads.append(grad)
+
+        return non_etp_grads, etp_grads
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -212,25 +239,67 @@ class MegatronOptimizer(ABC):
         """Step the optimizer with ready gradients, return successful."""
         return True
 
+    def _compute_grad_norm_with_etp(self, non_etp_grads, etp_grads):
+        """Compute grad norm handling ETP grads that may need extra PS/EPS reduction.
+
+        For MoE optimizers, grad_stats_parallel_group = TP×EP×PP which does NOT
+        include EPS. MoE-ETP grads need an extra EPS reduction.
+        For dense-ETP optimizers, grad_stats_parallel_group = TP×PP×PS which
+        already includes PS, so no extra reduction is needed.
+        """
+        grad_stats_group = self.get_grad_stats_parallel_group()
+
+        if not etp_grads:
+            return get_grad_norm_fp32(
+                non_etp_grads, grad_stats_parallel_group=grad_stats_group
+            )
+
+        # Check if this optimizer handles expert params that need EPS reduction.
+        # The model_parallel group for dense/ETP optimizers = TP×PP×PS (includes PS),
+        # but for MoE optimizers = TP×EP×PP (does NOT include EPS).
+        eps_world_size = parallel_state.get_expert_parameter_sharding_world_size()
+        is_expert_optimizer = any(
+            not getattr(p, 'allreduce', True) for p in self.get_parameters()
+        )
+        needs_eps_reduce = is_expert_optimizer and eps_world_size > 1
+
+        if not needs_eps_reduce:
+            # Dense/ETP optimizer: grad_stats_group already covers PS.
+            return get_grad_norm_fp32(
+                non_etp_grads + etp_grads, grad_stats_parallel_group=grad_stats_group
+            )
+
+        # MoE optimizer with EPS: compute ETP norm separately, add EPS reduction.
+        non_etp_norm = get_grad_norm_fp32(
+            non_etp_grads, grad_stats_parallel_group=grad_stats_group
+        )
+        etp_norm = get_grad_norm_fp32(
+            etp_grads, grad_stats_parallel_group=grad_stats_group
+        )
+        # get_grad_norm_fp32 returns a float. We need to do the EPS reduction on GPU.
+        etp_norm_2 = torch.tensor([etp_norm ** 2], dtype=torch.float, device='cuda')
+        torch.distributed.all_reduce(
+            etp_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.get_expert_parameter_sharding_group(),
+        )
+        total_norm_2 = non_etp_norm ** 2 + etp_norm_2.item()
+        return total_norm_2 ** 0.5
+
     @torch.no_grad()
     def get_grad_norm(self):
         """Compute and return grad norm."""
-        grads_for_norm = self.get_main_grads_for_grad_norm()
-        total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
-        return total_norm
+        non_etp_grads, etp_grads = self.get_main_grads_for_grad_norm_split()
+        return self._compute_grad_norm_with_etp(non_etp_grads, etp_grads)
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            non_etp_grads, etp_grads = self.get_main_grads_for_grad_norm_split()
         else:
-            grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+            non_etp_grads, etp_grads = [], []
+        grad_norm = self._compute_grad_norm_with_etp(non_etp_grads, etp_grads)
 
         if params:
             clip_grad_by_total_norm_fp32(
