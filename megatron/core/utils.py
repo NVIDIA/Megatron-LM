@@ -333,8 +333,11 @@ def get_te_version():
             return version("transformer-engine")
 
     global _te_version
-    if _te_version is None and HAVE_TE:
-        _te_version = PkgVersion(get_te_version_str())
+    if _te_version is None:
+        if HAVE_TE:
+            _te_version = PkgVersion(get_te_version_str())
+        else:
+            _te_version = PkgVersion("0.0.0")
     return _te_version
 
 
@@ -706,6 +709,44 @@ class GlobalSymmetricMemoryBuffer:
         required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
         return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
 
+    def maybe_get_tensors(self, tensor_specs, alignment=16):
+        """
+        Pack multiple tensors contiguously in the symmetric buffer with alignment.
+
+        Each tensor's starting offset is aligned to `alignment` bytes (default 16
+        for 128-bit multimem access).
+
+        Args:
+            tensor_specs: list of (numel, dtype) tuples.
+            alignment: byte alignment for each tensor's start offset (default 16).
+
+        Returns:
+            {"handle": None, "tensors": None} if unavailable or insufficient space.
+            {"handle": symm_mem_hdl, "tensors": [(raw_byte_view, byte_offset), ...]}
+            on success, where raw_byte_view is a uint8 slice of the buffer.
+        """
+        _NONE_RESULT = {"handle": None, "tensors": None}
+        if self.symm_mem_hdl is None:
+            return _NONE_RESULT
+
+        # Compute aligned byte sizes and running offsets
+        slices = []
+        current_offset = 0
+        for numel, dtype in tensor_specs:
+            nbytes = numel * torch.tensor([], dtype=dtype).element_size()
+            aligned_nbytes = ((nbytes + alignment - 1) // alignment) * alignment
+            slices.append((current_offset, nbytes))
+            current_offset += aligned_nbytes
+
+        if not self._can_allocate(current_offset, torch.uint8):
+            return _NONE_RESULT
+
+        tensors = []
+        for offset, nbytes in slices:
+            tensors.append((self.symm_buffer[offset : offset + nbytes], offset))
+
+        return {"handle": self.symm_mem_hdl, "tensors": tensors}
+
     def maybe_get_tensor(self, tensor_shape, dtype):
         """
         Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
@@ -837,6 +878,26 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
     std = sigma / math.sqrt(multiplier * num_layers)
 
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
+def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0):
+    """MuP scaled init method for output layers: N(0, sigma / (sqrt(2*L) * sqrt(m))).
+
+    Combines the standard scaled initialization (for output projection layers)
+    with MuP width scaling. This ensures that both depth and width scaling
+    are accounted for in the initialization.
+
+    Args:
+        sigma (float): Base standard deviation for initialization.
+        num_layers (int): Number of transformer layers.
+        width_mult (float): Width multiplier (hidden_size / base_hidden_size).
+        multiplier (float): Multiplier for depth scaling (default: 2.0).
+
+    Returns:
+        Callable: Initialization function for torch.nn.init.
+    """
+    std = sigma / (math.sqrt(multiplier * num_layers) * math.sqrt(width_mult))
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
