@@ -170,6 +170,7 @@ class TestLayerWiseOptimizer:
         ddp_config = DistributedDataParallelConfig(
             use_distributed_optimizer=False,
             overlap_param_gather=True,
+            overlap_grad_reduce=True,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
             bucket_size=bucket_size,
         )
