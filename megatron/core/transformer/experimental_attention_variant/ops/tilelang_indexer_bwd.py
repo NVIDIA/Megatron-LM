@@ -2,6 +2,8 @@
 # Adapted from:
 # https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/
 # examples/dsa_sparse_finetune/indexer_bwd.py
+import os
+import threading
 from collections import OrderedDict
 
 import tilelang as tl
@@ -11,13 +13,27 @@ import torch
 BF16 = T.bfloat16
 FP32 = T.float32
 INT32 = T.int32
-_TILELANG_KERNEL_CACHE_MAX = 64
 _tilelang_indexer_bwd_kernel_cache = OrderedDict()
+_tilelang_indexer_bwd_cache_lock = threading.Lock()
 
 pass_configs = {
     tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+_TILELANG_KERNEL_CACHE_MAX = _env_int("MCORE_DSA_TILELANG_KERNEL_CACHE_MAX", 512)
 
 
 def _cache_put_lru(cache: OrderedDict, key, value):
@@ -43,11 +59,12 @@ def _canonical_topk(topk: int, block_i: int = 32) -> int:
 
 def _get_indexer_bwd_kernel(heads: int, dim: int, topk: int):
     key = (heads, dim, topk)
-    kernel = _tilelang_indexer_bwd_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = tl_indexer_bwd_impl(heads, dim, topk)
-    _cache_put_lru(_tilelang_indexer_bwd_kernel_cache, key, kernel)
-    return kernel
+    with _tilelang_indexer_bwd_cache_lock:
+        kernel = _tilelang_indexer_bwd_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = tl_indexer_bwd_impl(heads, dim, topk)
+        _cache_put_lru(_tilelang_indexer_bwd_kernel_cache, key, kernel)
+        return kernel
 
 
 @tl.jit(pass_configs=pass_configs)

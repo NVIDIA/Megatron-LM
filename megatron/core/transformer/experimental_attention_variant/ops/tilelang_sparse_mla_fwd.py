@@ -3,14 +3,15 @@
 # https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/
 # examples/deepseek_v32/sparse_mla_fwd.py
 import os
+import threading
 from collections import OrderedDict
 
 import tilelang
 import torch
 from tilelang import language as T
 
-_TILELANG_KERNEL_CACHE_MAX = 64
 _tilelang_sparse_mla_fwd_kernel_cache = OrderedDict()
+_tilelang_sparse_mla_fwd_cache_lock = threading.Lock()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -22,6 +23,9 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+_TILELANG_KERNEL_CACHE_MAX = _env_int("MCORE_DSA_TILELANG_KERNEL_CACHE_MAX", 512)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -41,6 +45,17 @@ def _cache_put_lru(cache: OrderedDict, key, value):
         cache.popitem(last=False)
 
 
+def _normalize_sm_scale(sm_scale):
+    if sm_scale is None:
+        return None
+    if isinstance(sm_scale, torch.Tensor):
+        sm_scale = float(sm_scale.detach().item())
+    else:
+        sm_scale = float(sm_scale)
+    # Avoid tiny floating-point jitter creating cache-key churn.
+    return round(sm_scale, 12)
+
+
 def _get_sparse_mla_fwd_kernel(
     heads: int,
     dim: int,
@@ -53,23 +68,35 @@ def _get_sparse_mla_fwd_kernel(
     num_stages: int,
     threads: int,
 ):
-    key = (heads, dim, tail_dim, topk, kv_group, sm_scale, is_causal, block_I, num_stages, threads)
-    kernel = _tilelang_sparse_mla_fwd_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = sparse_mla_fwd(
-            heads,
-            dim,
-            tail_dim,
-            topk,
-            kv_group,
-            sm_scale,
-            is_causal,
-            block_I=block_I,
-            num_stages=num_stages,
-            threads=threads,
-        )
-    _cache_put_lru(_tilelang_sparse_mla_fwd_kernel_cache, key, kernel)
-    return kernel
+    key = (
+        heads,
+        dim,
+        tail_dim,
+        topk,
+        kv_group,
+        _normalize_sm_scale(sm_scale),
+        is_causal,
+        block_I,
+        num_stages,
+        threads,
+    )
+    with _tilelang_sparse_mla_fwd_cache_lock:
+        kernel = _tilelang_sparse_mla_fwd_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = sparse_mla_fwd(
+                heads,
+                dim,
+                tail_dim,
+                topk,
+                kv_group,
+                sm_scale,
+                is_causal,
+                block_I=block_I,
+                num_stages=num_stages,
+                threads=threads,
+            )
+        _cache_put_lru(_tilelang_sparse_mla_fwd_kernel_cache, key, kernel)
+        return kernel
 
 
 @tilelang.jit(
