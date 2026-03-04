@@ -298,22 +298,6 @@ def build_centralized_reshard_plan(
     dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata, group=group)
     dist.all_gather_object(all_dst_metadata_by_rank, my_dst_metadata, group=group)
 
-    # DEBUG: log what each PE contributed so we can detect wrong owner_rank/tp_ranks
-    if my_global_rank == 0:
-        import sys
-        for r, mlist in enumerate(all_src_metadata_by_rank):
-            if mlist:
-                m0 = mlist[0]
-                print(f"[DEBUG PLAN] src rank={r}: owner={m0.owner_rank} tp={m0.tensor_parallel_group_ranks} dp={m0.data_parallel_group_ranks} n_params={len(mlist)}", flush=True, file=sys.stderr)
-            else:
-                print(f"[DEBUG PLAN] src rank={r}: (no src params)", flush=True, file=sys.stderr)
-        for r, mlist in enumerate(all_dst_metadata_by_rank):
-            if mlist:
-                m0 = mlist[0]
-                print(f"[DEBUG PLAN] dst rank={r}: owner={m0.owner_rank} tp={m0.tensor_parallel_group_ranks} dp={m0.data_parallel_group_ranks} n_params={len(mlist)}", flush=True, file=sys.stderr)
-            else:
-                print(f"[DEBUG PLAN] dst rank={r}: (no dst params)", flush=True, file=sys.stderr)
-
     # Parameter to metadata maps keyed by resolved_name
     src_param_metadata_by_rank = {}
     dst_param_metadata_by_rank = {}
@@ -385,23 +369,12 @@ def build_centralized_reshard_plan(
                         )
                     )
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
-        # DEBUG: log the resulting plan
-        import sys
-        for r, plan in enumerate(plans_list):
-            send_peers = sorted(set(op.peer_rank for op in plan.send_ops))
-            recv_peers = sorted(set(op.peer_rank for op in plan.recv_ops))
-            print(f"[DEBUG PLAN] plan[{r}]: {len(plan.send_ops)} sends→{send_peers} {len(plan.recv_ops)} recvs←{recv_peers}", flush=True, file=sys.stderr)
     else:
         plans_list = [None] * world_size
     # Use group_src= (group rank) instead of src= (default PG global rank) to support
     # cross-cluster ProcessGroups where members share the same default PG rank.
     torch.distributed.broadcast_object_list(plans_list, group_src=0, group=group)
     my_plan = plans_list[my_global_rank]
-
-    import sys
-    send_peers = sorted(set(op.peer_rank for op in my_plan.send_ops))
-    recv_peers = sorted(set(op.peer_rank for op in my_plan.recv_ops))
-    print(f"[DEBUG PLAN] rank={my_global_rank} got plan: {len(my_plan.send_ops)} sends→{send_peers} {len(my_plan.recv_ops)} recvs←{recv_peers}", flush=True, file=sys.stderr)
 
     logger.info(
         f"Rank {my_global_rank}: Received plan - {len(my_plan.recv_ops)} recvs, "
