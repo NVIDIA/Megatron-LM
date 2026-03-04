@@ -256,6 +256,9 @@ from .activation_logging import (
     enable_activation_logging,
     disable_activation_logging,
     save_activations,
+    enable_tokens_per_expert_logging,
+    disable_tokens_per_expert_logging,
+    save_tokens_per_expert,
 )
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
 
@@ -1791,6 +1794,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_params_interval == 0)
     save_activations_in_this_iteration = (args.save_activations_interval is not None and
                                           (iteration + 1) % args.save_activations_interval == 0)
+    save_tpe_in_this_iteration = (args.save_tokens_per_expert_interval is not None and
+                                  (iteration + 1) % args.save_tokens_per_expert_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
@@ -1834,6 +1839,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
+        if save_tpe_in_this_iteration:
+            enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
@@ -1851,6 +1858,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
+        if save_tpe_in_this_iteration:
+            save_tokens_per_expert(iteration + 1)
+            disable_tokens_per_expert_logging()
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
@@ -1860,7 +1870,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             model_chunk.force_all_reduce = False
 
     def _save_state_dict(attr_name, label):
-        # Collect state_dict of wgrads (each param's .main_grad field).
+        # Collect state_dict of the given attribute for each parameter.
         state_dict = defaultdict(dict)
         for model_chunk_id, model_chunk in enumerate(model):
             model_chunk_name = f"model_chunk{model_chunk_id}"

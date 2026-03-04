@@ -3,8 +3,16 @@
 """Forward activation logging using forward hooks."""
 
 from collections import defaultdict
+import json
+import logging
+import os
+import re
+from typing import Callable, List, Tuple
+
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
@@ -13,11 +21,15 @@ from .checkpointing import save_grads
 from .utils import unwrap_model
 
 
-def _get_linear_types():
-    """Build tuple of linear layer types to capture activations from."""
-    types = [nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear, Router]
+def _discover_te_types():
+    """Discover available Transformer Engine layer types.
 
-    # Add Transformer Engine layers if available.
+    Returns (all_types, grouped_types) where grouped_types is the subset of
+    TEGroupedLinear variants used for tokens-per-expert capture.
+    """
+    all_types = []
+    grouped_types = []
+
     try:
         from megatron.core.extensions.transformer_engine import (
             TELinear,
@@ -26,8 +38,8 @@ def _get_linear_types():
             TERowParallelLinear,
             TELayerNormColumnParallelLinear,
         )
-        types.extend([TELinear, TENorm, TEColumnParallelLinear, TERowParallelLinear,
-                      TELayerNormColumnParallelLinear])
+        all_types.extend([TELinear, TENorm, TEColumnParallelLinear, TERowParallelLinear,
+                          TELayerNormColumnParallelLinear])
     except ImportError:
         pass
 
@@ -38,98 +50,211 @@ def _get_linear_types():
             TERowParallelGroupedLinear,
         )
         if TEGroupedLinear is not None:
-            types.extend([TEGroupedLinear, TEColumnParallelGroupedLinear,
-                          TERowParallelGroupedLinear])
+            grouped = [TEGroupedLinear, TEColumnParallelGroupedLinear,
+                       TERowParallelGroupedLinear]
+            all_types.extend(grouped)
+            grouped_types.extend(grouped)
     except ImportError:
         pass
 
-    return tuple(types)
+    return tuple(all_types), tuple(grouped_types)
 
 
-LINEAR_TYPES = _get_linear_types()
+_TE_TYPES, _GROUPED_LINEAR_TYPES = _discover_te_types()
 
+LINEAR_TYPES = (nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear,
+                Router, *_TE_TYPES)
+
+
+def _register_hooks(model, module_types, hook_factory, *, name_filter=None):
+    """Walk *model* and register a forward hook on every module matching *module_types*.
+
+    Args:
+        model: Iterable of model chunks (possibly wrapped).
+        module_types: Tuple of types to match via ``isinstance``.
+        hook_factory: ``(model_chunk_name, module_name) -> hook_fn``.
+        name_filter: Optional ``str -> bool`` predicate on the module name.
+
+    Returns:
+        List of hook handles.
+    """
+    handles = []
+    for model_chunk_id, model_chunk in enumerate(model):
+        model_chunk_name = f"model_chunk{model_chunk_id}"
+        unwrapped = unwrap_model(model_chunk)
+        for module_name, module in unwrapped.named_modules():
+            if isinstance(module, module_types) and (name_filter is None or name_filter(module_name)):
+                hook_fn = hook_factory(model_chunk_name, module_name)
+                if hook_fn is None:
+                    continue
+                handle = module.register_forward_hook(hook_fn, with_kwargs=True)
+                handles.append(handle)
+    return handles
 
 class ActivationLogger:
-    """Captures and saves forward activations from all linear layers using forward hooks."""
+    """Captures and saves forward activations using forward hooks.
+
+    Manages two independent hook sets:
+
+    - **Full activation hooks** capture all inputs / outputs / kwargs for every
+      ``LINEAR_TYPES`` module.
+    - **Tokens-per-expert (TPE) hooks** are lightweight hooks that only capture
+      the tokens-per-expert routing metadata from MoE.
+    """
 
     def __init__(self, save_dir: str):
         self._save_dir = save_dir
-        self._activations_state_dict = defaultdict(dict)
-        self._hooks = []
 
-    def _make_hook(self, model_chunk_name: str, module_name: str):
-        """Create a forward hook for a named module (with_kwargs=True: args, kwargs, output)."""
+        # Full activation state.
+        self._activations_state_dict: defaultdict = defaultdict(dict)
+        self._activation_hooks: List[torch.utils.hooks.RemovableHook] = []
+
+        # Tokens-per-expert state: layer -> list of per-microbatch token counts.
+        self._tpe_records: dict[str, list] = defaultdict(list)
+        self._tpe_hooks: List[torch.utils.hooks.RemovableHook] = []
+
+    # ------------------------------------------------------------------
+    # Full activation hooks
+    # ------------------------------------------------------------------
+
+    def _make_activation_hook(self, model_chunk_name: str, module_name: str) -> Callable:
+        """Forward hook that captures all inputs, outputs and kwargs."""
+        sd = self._activations_state_dict
+
         def hook(_, args, kwargs, output):
             input_tuple = args if isinstance(args, tuple) else (args,)
             for idx, inp in enumerate(input_tuple):
                 if inp is None:
                     continue
                 key = f"{module_name}/input{idx}"
-                if isinstance(inp, torch.Tensor):
-                    self._activations_state_dict[model_chunk_name][key] = inp.detach().cpu()
-                else:
-                    self._activations_state_dict[model_chunk_name][key] = inp
-            output_tuple = output if isinstance(output, tuple) else (output,)
-            for idx, out in enumerate(output_tuple):
+                sd[model_chunk_name][key] = inp.detach().cpu() if isinstance(inp, torch.Tensor) else inp
+            for idx, out in enumerate(output if isinstance(output, tuple) else (output,)):
                 if out is not None and isinstance(out, torch.Tensor):
-                    key = f"{module_name}/output{idx}"
-                    self._activations_state_dict[model_chunk_name][key] = out.detach().cpu()
+                    sd[model_chunk_name][f"{module_name}/output{idx}"] = out.detach().cpu()
             for kwarg_key, kwarg_value in kwargs.items():
                 key = f"{module_name}/{kwarg_key}"
-                if isinstance(kwarg_value, torch.Tensor):
-                    self._activations_state_dict[model_chunk_name][key] = kwarg_value.detach().cpu()
-                else:
-                    self._activations_state_dict[model_chunk_name][key] = kwarg_value
+                sd[model_chunk_name][key] = (
+                    kwarg_value.detach().cpu() if isinstance(kwarg_value, torch.Tensor) else kwarg_value
+                )
+
         return hook
 
-    def save(self, iteration: int):
-        """Save captured activations to disk and clear the buffer."""
+    def register_activation_hooks(self, model):
+        assert not self._activation_hooks
+        self._activation_hooks = _register_hooks(model, LINEAR_TYPES, self._make_activation_hook)
+
+    def remove_activation_hooks(self):
+        for hook in self._activation_hooks:
+            hook.remove()
+        self._activation_hooks.clear()
+
+    def save_activations(self, iteration: int):
         if not self._activations_state_dict:
             return
         save_grads(self._save_dir, self._activations_state_dict, iteration, "activations")
         self._activations_state_dict.clear()
 
-    def register_hooks(self, model: torch.nn.Module):
-        """Find and register forward hooks on all linear layers."""
-        assert len(self._hooks) == 0
-        for model_chunk_id, model_chunk in enumerate(model):
-            unwrapped_model_chunk = unwrap_model(model_chunk)
-            for module_name, module in unwrapped_model_chunk.named_modules():
-                if isinstance(module, LINEAR_TYPES):
-                    model_chunk_name = f"model_chunk{model_chunk_id}"
-                    handle = module.register_forward_hook(
-                        self._make_hook(model_chunk_name, module_name),
-                        with_kwargs=True,
-                    )
-                    self._hooks.append(handle)
+    # ------------------------------------------------------------------
+    # Tokens-per-expert hooks
+    # ------------------------------------------------------------------
 
-    def remove_hooks(self):
-        """Remove all registered hooks."""
-        for handle in self._hooks:
-            handle.remove()
-        self._hooks.clear()
+    def _make_tpe_hook(self, _model_chunk_name: str, module_name: str) -> Callable:
+        """Forward hook that captures only the non-Tensor ``input1`` (tokens_per_expert).
+
+        The layer number is extracted from *module_name*
+        (e.g. ``decoder.layers.3.mlp.experts.linear_fc1`` → ``3``).
+        """
+        m = re.search(r'\.layers\.(\d+)\.', module_name)
+        if not m:
+            logger.warning(
+                "Cannot extract layer number from module name: %r — "
+                "skipping tokens-per-expert hook for this module", module_name
+            )
+            return None
+        layer = m.group(1)
+
+        def hook(_, args, kwargs, output):
+            input_tuple = args if isinstance(args, tuple) else (args,)
+            if len(input_tuple) > 1 and input_tuple[1] is not None:
+                inp = input_tuple[1]
+                if not isinstance(inp, torch.Tensor):
+                    self._tpe_records[layer].append(list(inp))
+
+        return hook
+
+    def register_tpe_hooks(self, model):
+        assert not self._tpe_hooks
+        self._tpe_hooks = _register_hooks(
+            model, _GROUPED_LINEAR_TYPES, self._make_tpe_hook,
+            name_filter=lambda name: name.endswith("linear_fc1"),
+        )
+
+    def remove_tpe_hooks(self):
+        for hook in self._tpe_hooks:
+            hook.remove()
+        self._tpe_hooks.clear()
+
+    def save_tpe(self, iteration: int):
+        """Append captured tokens-per-expert records as JSON Lines.
+
+        Each rank writes to its own file under ``{save_dir}/tokens_per_expert/``,
+        e.g. ``rank0.jsonl``, ``rank1.jsonl``.  Each line is a JSON object::
+
+            {"iter": 100, "layer": 3, "tpe": [[128, 64], [96, 80]]}
+        """
+        if not self._tpe_records:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        tpe_dir = os.path.join(self._save_dir, "tokens_per_expert")
+        os.makedirs(tpe_dir, exist_ok=True)
+        filepath = os.path.join(tpe_dir, f"rank{rank}.jsonl")
+        lines = "".join(
+            json.dumps({"iter": iteration, "layer": int(layer),
+                        "tpe": microbatches}) + "\n"
+            for layer, microbatches in sorted(self._tpe_records.items())
+        )
+        with open(filepath, "a") as f:
+            f.write(lines)
+        self._tpe_records.clear()
+
+_LOGGER: ActivationLogger | None = None
 
 
-_LOGGER = None
-
-
-def enable_activation_logging(model: torch.nn.Module, save_dir: str):
-    """Enable activation logging on a model."""
+def _get_logger(save_dir: str) -> ActivationLogger:
     global _LOGGER
     if _LOGGER is None:
         _LOGGER = ActivationLogger(save_dir)
-    _LOGGER.register_hooks(model)
+    return _LOGGER
+
+
+def _require_logger() -> ActivationLogger:
+    assert _LOGGER is not None, "No ActivationLogger has been initialised"
+    return _LOGGER
+
+
+# -- Full activation logging -------------------------------------------
+
+def enable_activation_logging(model: torch.nn.Module, save_dir: str):
+    _get_logger(save_dir).register_activation_hooks(model)
 
 
 def disable_activation_logging():
-    """Disable activation logging on a model."""
-    global _LOGGER
-    assert _LOGGER is not None
-    _LOGGER.remove_hooks()
+    _require_logger().remove_activation_hooks()
 
 
 def save_activations(iteration: int):
-    """Save activations to disk."""
-    global _LOGGER
-    assert _LOGGER is not None
-    _LOGGER.save(iteration)
+    _require_logger().save_activations(iteration)
+
+
+# -- Tokens-per-expert logging ----------------------------------------
+
+def enable_tokens_per_expert_logging(model: torch.nn.Module, save_dir: str):
+    _get_logger(save_dir).register_tpe_hooks(model)
+
+
+def disable_tokens_per_expert_logging():
+    _require_logger().remove_tpe_hooks()
+
+
+def save_tokens_per_expert(iteration: int):
+    _require_logger().save_tpe(iteration)
