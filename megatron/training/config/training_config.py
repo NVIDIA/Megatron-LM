@@ -338,6 +338,9 @@ class CheckpointConfig:
     save_activations_interval: int | None = None
     """Number of iterations between act.name->act.data mapping saves."""
 
+    save_tokens_per_experts_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
