@@ -53,7 +53,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                     )
                 )
             elif args.num_experts:
-                assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
