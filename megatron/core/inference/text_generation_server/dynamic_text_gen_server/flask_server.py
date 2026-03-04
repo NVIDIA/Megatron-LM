@@ -42,14 +42,8 @@ async def run_flask_server_on_client(
     flask_port: int,
     parsers: list[str] = None,
     verbose: bool = False,
-    shutdown_event: asyncio.Event = None,
 ):
-    """Initializes and runs the async Flask server using the provided InferenceClient.
-
-    Args:
-        shutdown_event: If provided, setting this event triggers graceful shutdown.
-            If None, Hypercorn uses its default signal-based shutdown (for standalone servers).
-    """
+    """Initializes and runs the async Flask server using the provided InferenceClient."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
 
@@ -76,8 +70,6 @@ async def run_flask_server_on_client(
         return "Megatron Dynamic Inference Server is running."
 
     loop = asyncio.get_event_loop()
-    executor = ThreadPoolExecutor(max_workers=8192)
-    loop.set_default_executor(executor)
 
     config = Config()
     config.wsgi_max_body_size = 2**30  # 1 GB; needed for large prompts.
@@ -92,14 +84,8 @@ async def run_flask_server_on_client(
         logger.info(f"Using tokenizer: {type(tokenizer)}")
         logger.info(f"Using parsers: {parsers}")
 
-    try:
-        await serve(
-            AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size),
-            config,
-            shutdown_trigger=shutdown_event.wait if shutdown_event else None,
-        )
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
+    await serve(AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size), config)
 
 
 @trace_async_exceptions

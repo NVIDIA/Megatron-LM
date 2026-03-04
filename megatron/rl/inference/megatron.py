@@ -149,7 +149,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
     async def resume(self):
-        if self._inference_engine.running.is_set():
+        if self._inference_engine._state_events[EngineState.RUNNING].is_set():
             return
 
         if dist.get_rank() == 0:
