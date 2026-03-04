@@ -15,6 +15,8 @@ flowchart LR
     C2 --> D[Merge]
 ```
 
+> **Note:** All PRs start as drafts. Click **"Ready for Review"** when your PR is ready to begin the review process.
+
 ### Pre-checks
 
 - [ ] I want this PR in a versioned release and have added the appropriate Milestone (e.g., `Core 0.8`)
@@ -33,20 +35,16 @@ The following process is enforced via the CODEOWNERS file for changes into `mega
 
 Feel free to message or comment the @mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
-#### (Step 1): Add PR label `Expert Review`
+#### (Step 1): Mark PR as "Ready for Review"
 
-#### (Step 2): Collect the expert reviewers reviews
+When your PR is ready, click **"Ready for Review"**. GitHub will auto-assign expert reviewers based on your changes. They will get notified and pick up your PR soon.
 
-1. Attach the `Expert Review` label when your PR is ready for review.
-2. GitHub auto-assigns expert reviewers based on your changes. They will get notified and pick up your PR soon.
-
-:warning: Only proceed to the next step once all reviewers have approved, merge-conflict are resolved and the CI is passing.  
+:warning: Only proceed to the next step once all reviewers have approved, merge conflicts are resolved, and CI is passing.
 Final Review might get declined if these requirements are not fulfilled.
 
-#### (Step 3): Final Review
+#### (Step 2): Final Review (automatic)
 
-1. Add `Final Review` label
-2. GitHub auto-assigns final reviewers based on your changes. They will get notified and pick up your PR soon.
+Once all expert reviewers approve, the `Final Review` label is added automatically. GitHub auto-assigns final reviewers based on your changes. They will get notified and pick up your PR soon.
 
 #### (Optional Step 4): Cherry-pick into release branch
 

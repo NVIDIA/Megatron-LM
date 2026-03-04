@@ -1,0 +1,48 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Force Draft PR
+
+on:
+  pull_request_target:
+    types: [opened]
+    branches:
+      - main
+
+permissions:
+  pull-requests: write
+
+jobs:
+  force-draft:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft && github.repository == 'NVIDIA/Megatron-LM' }}
+    steps:
+      - name: Convert PR to draft
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh pr ready --undo ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+
+      - name: Add comment explaining draft policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body \
+            "This PR has been automatically converted to **draft**.
+
+          All PRs must start as drafts to allow time for self-review and preparation before requesting reviewers. When your PR is ready for review, click **\"Ready for Review\"** to begin the review process.
+
+          The review stages are:
+          1. **Expert Review** — triggered automatically when you mark the PR ready for review
+          2. **Final Review** — triggered automatically once all expert reviewers approve"

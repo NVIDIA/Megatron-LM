@@ -127,6 +127,15 @@ class PRReviewTracker:
         ]
         return max(dates) if dates else None
 
+    def get_ready_for_review_date(self, pr):
+        """Get the most recent date the PR was marked ready for review."""
+        dates = [
+            e.created_at
+            for e in pr.as_issue().get_events()
+            if e.event == "ready_for_review"
+        ]
+        return max(dates) if dates else pr.created_at
+
     def days_since(self, date):
         """Calculate days since given date."""
         if not date:
@@ -209,7 +218,7 @@ class PRReviewTracker:
             if stage == self.EXPERT_REVIEW:
                 # Assign to PR author
                 reviewer_emails = [self.get_user_email(pr.user.login)]
-                action_message = "All Expert Reviewers approved the PR. Please attach the Final Review label to proceed with the review."
+                action_message = "All Expert Reviewers approved the PR. The Final Review label will be added automatically."
             elif stage == self.FINAL_REVIEW:
                 # Assign to mcore-reviewers who approved
                 try:
@@ -229,7 +238,11 @@ class PRReviewTracker:
     def create_reminder(self, pr):
         """Create reminder for PR."""
         stage = self.get_stage(pr)
-        stage_days = self.days_since(self.get_label_date(pr, stage))
+        ready_for_review_date = self.get_ready_for_review_date(pr)
+        if stage == self.FINAL_REVIEW:
+            stage_days = self.days_since(self.get_label_date(pr, self.FINAL_REVIEW))
+        else:
+            stage_days = self.days_since(ready_for_review_date)
         author_email = self.get_user_email(pr.user.login)
         reviewer_emails, action_message = self.get_reviewers(pr)
         escaped_title = html.escape(pr.title, quote=False)
@@ -241,7 +254,7 @@ class PRReviewTracker:
             author=self.get_slack_user_id(author_email),
             priority="P0" if stage_days > 3 else "P1" if stage_days >= 1 else "P2",
             review_stage=stage,
-            total_review_time=self.days_since(self.get_label_date(pr, self.EXPERT_REVIEW)),
+            total_review_time=self.days_since(ready_for_review_date),
             current_stage_time=stage_days,
             reviewers=[self.get_slack_user_id(email) for email in reviewer_emails],
             action_message=action_message,
@@ -256,12 +269,11 @@ class PRReviewTracker:
 
         reminders = []
         for milestone in milestones:
-            # Find issues with the 'Expert Review' or 'Final Review' label
+            # Find all open non-draft PRs with milestones
             query = (
                 f'repo:"{self.repo.full_name}" '
                 f'milestone:"{milestone.title}" '
-                f'is:open is:pr -is:draft '
-                f'label:"{self.EXPERT_REVIEW}","{self.FINAL_REVIEW}"'
+                f'is:open is:pr -is:draft'
             )
             try:
                 # Use search_issues for a more direct query instead of get_issues + filtering

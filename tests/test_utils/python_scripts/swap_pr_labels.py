@@ -52,6 +52,10 @@ class PRReviewTracker:
     def swap_labels(self):
         """Get filtered reviewer emails who haven't approved yet."""
         pr = self.pr
+        if pr.draft:
+            logger.info(f"PR #{pr.number} is a draft. Skipping.")
+            return
+
         if self.stage == self.FINAL_REVIEW:
             logger.info(f"PR #{self.pr.number} is in the {self.stage} stage. No reviewers needed.")
             return
@@ -114,14 +118,6 @@ class PRReviewTracker:
         pending_reviewers = all_required_reviewers - approvers
         logger.info(f"Pending reviewers: {pending_reviewers}")
         if len(pending_reviewers) == 0:
-            try:
-                pr.remove_from_labels(self.EXPERT_REVIEW)
-                logger.info(f'Removed "{self.EXPERT_REVIEW}" label from PR #{pr.number}')
-            except Exception as e:
-                logger.warning(
-                    f'Failed to remove "{self.EXPERT_REVIEW}" label from PR #{pr.number}: {e}'
-                )
-
             try:
                 pr.add_to_labels(self.FINAL_REVIEW)
                 logger.info(f'Added "{self.FINAL_REVIEW}" label to PR #{pr.number}')
