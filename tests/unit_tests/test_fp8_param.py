@@ -253,16 +253,13 @@ class TestFP8Param:
                 if buffer.param_data is None:
                     continue
                 buf_start = buffer.param_data.data_ptr()
-                buf_end = (
-                    buf_start
-                    + buffer.param_data.numel() * buffer.param_data.element_size()
-                )
+                buf_end = buf_start + buffer.param_data.numel() * buffer.param_data.element_size()
                 for param in buffer.param_to_bucket:
                     if is_mxfp8tensor(param):
                         # MXFP8 params keep their own quantized storage.
-                        assert not (buf_start <= param.data.data_ptr() < buf_end), (
-                            "MXFP8 param should not be mapped to the param buffer"
-                        )
+                        assert not (
+                            buf_start <= param.data.data_ptr() < buf_end
+                        ), "MXFP8 param should not be mapped to the param buffer"
                     else:
                         # BF16 params should be views into the param buffer
                         # (no double allocation).
