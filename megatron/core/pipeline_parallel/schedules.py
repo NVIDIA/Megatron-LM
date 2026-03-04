@@ -217,6 +217,24 @@ def set_current_microbatch(model, microbatch_id):
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
                 layer.mtp_model_layer.current_microbatch = microbatch_id
 
+    # Also set current_microbatch on vision encoder layers so that
+    # _te_cuda_graph_replay selects the correct graph index. Without this,
+    # vision layers always use graph 0 (since current_microbatch defaults to 0),
+    # causing all microbatch forwards to overwrite the same static buffers.
+    # When backward runs for earlier microbatches, the buffers contain stale
+    # data from later forwards, producing NaN gradients.
+    try:
+        model_with_vision = get_attr_wrapped_model(
+            model, "vision_model", allow_none=True, return_model_obj=True
+        )
+    except RuntimeError:
+        model_with_vision = None
+    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
+        vision_model = model_with_vision.vision_model
+        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
+            for layer in vision_model.decoder.layers:
+                layer.current_microbatch = microbatch_id
+
 
 def forward_step_calc_loss(
     model,
