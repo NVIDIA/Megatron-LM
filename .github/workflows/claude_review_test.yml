@@ -1,4 +1,4 @@
-name: Claude Code Review
+name: Claude Code Review test
 
 on:
   issue_comment:
