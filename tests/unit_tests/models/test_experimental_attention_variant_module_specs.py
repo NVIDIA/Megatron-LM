@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -349,28 +349,44 @@ class TestGetDsaModuleSpec:
         assert subs.k_norm == _FakeQKNorm
         assert subs.linear_weights_proj == _FakeLinear
 
-    def test_qk_layernorm_enabled(self):
-        """Verify q/kv layernorm submodules are enabled when qk_layernorm=True."""
+    @pytest.mark.parametrize("normalization", ["RMSNorm", "LayerNorm"])
+    def test_qk_layernorm_enabled(self, normalization):
+        """Verify q/kv layernorm uses backend.layer_norm(rms_norm=..., for_qk=True)."""
+        backend = _make_backend()
         cfg = _make_config(
             multi_latent_attention=True,
             qk_l2_norm=False,
             qk_layernorm=True,
-            normalization="RMSNorm",
+            normalization=normalization,
         )
-        spec = self._call(cfg=cfg)
+        spec = self._call(cfg=cfg, backend=backend)
+        expected_rms = normalization == "RMSNorm"
         assert spec.submodules.q_layernorm == _FakeQKNorm
         assert spec.submodules.kv_layernorm == _FakeQKNorm
+        # Both point to the same qk_norm object
+        assert spec.submodules.q_layernorm is spec.submodules.kv_layernorm
+        backend.layer_norm.assert_any_call(rms_norm=expected_rms, for_qk=True)
 
     def test_qk_layernorm_disabled(self):
-        """Verify q/kv layernorm submodules become IdentityOp when qk_layernorm=False."""
+        """Verify q/kv layernorm becomes IdentityOp, skipping backend.layer_norm for qk."""
+        backend = _make_backend()
         cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=False)
-        spec = self._call(cfg=cfg)
+        spec = self._call(cfg=cfg, backend=backend)
         assert spec.submodules.q_layernorm is IdentityOp
         assert spec.submodules.kv_layernorm is IdentityOp
+        # backend.layer_norm is still called for the indexer k_norm (for_qk=True at line 94),
+        # but NOT for the outer qk_norm (line 105-107 takes the else branch).
+        # Exactly one for_qk=True call should exist (from the indexer, not from qk_norm).
+        qk_calls = [c for c in backend.layer_norm.call_args_list if c.kwargs.get("for_qk")]
+        assert (
+            len(qk_calls) == 1
+        ), f"Expected 1 for_qk=True call (indexer only), got {len(qk_calls)}"
 
     def test_linear_projections(self):
-        """Verify all major Q/KV projection slots map to the expected backend modules."""
-        spec = self._call()
+        """Verify Q/KV projection slots and backend.column_parallel_linear call count."""
+        backend = _make_backend()
+        cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True)
+        spec = self._call(cfg=cfg, backend=backend)
         subs = spec.submodules
         assert subs.linear_q_proj == _FakeColumnParallelLinear
         assert subs.linear_q_down_proj == _FakeLinear
@@ -378,6 +394,9 @@ class TestGetDsaModuleSpec:
         assert subs.linear_kv_down_proj == _FakeLinear
         assert subs.linear_kv_up_proj == _FakeColumnParallelLinear
         assert subs.linear_proj == _FakeRowParallelLinear
+        # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
+        assert backend.column_parallel_linear.call_count == 3
+        assert backend.row_parallel_linear.call_count == 1
 
 
 # ===================================================================
@@ -555,20 +574,21 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
     MODULE = "megatron.core.models.gpt.experimental_attention_variant_module_specs"
 
     @pytest.mark.parametrize(
-        "pp_size,vp_stage,pp_rank,use_layout,offset,num_layers_to_build,layout_ids,expected_ids",
+        "num_layers,pp_size,vp_stage,pp_rank,use_layout,offset,num_layers_to_build,layout_ids,expected_ids",
         [
             # no pipeline split
-            (1, None, None, False, 0, 4, None, [0, 1, 2, 3]),
+            (4, 1, None, None, False, 0, 4, None, [0, 1, 2, 3]),
             # pp split (rank 1 gets [4,5,6,7])
-            (2, None, 1, False, 4, 4, None, [4, 5, 6, 7]),
+            (8, 2, None, 1, False, 4, 4, None, [4, 5, 6, 7]),
             # vpp + pp split (example stage)
-            (2, 1, 0, False, 2, 2, None, [2, 3]),
+            (8, 2, 1, 0, False, 2, 2, None, [2, 3]),
             # explicit pipeline layout wins over offset/num_layers
-            (2, 0, 0, True, None, None, [0, 3, 5], [0, 3, 5]),
+            (8, 2, 0, 0, True, None, None, [0, 3, 5], [0, 3, 5]),
         ],
     )
     def test_get_transformer_block_with_experimental_attention_variant_spec(
         self,
+        num_layers,
         pp_size,
         vp_stage,
         pp_rank,
@@ -578,13 +598,11 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
         layout_ids,
         expected_ids,
     ):
+        """Verify transformer block layer slicing and vp/pp argument forwarding."""
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_transformer_block_with_experimental_attention_variant_spec,
         )
 
-        """Verify transformer block layer slicing across pp/vpp/layout combinations."""
-        # Keep layer pool just large enough for expected ids in each parameterized case.
-        num_layers = 8 if expected_ids and max(expected_ids) >= 4 else 4
         mock_layout = MagicMock() if use_layout else None
         if mock_layout is not None:
             # When layout is provided, it should fully control local layer selection.
@@ -612,17 +630,24 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
                 result = get_transformer_block_with_experimental_attention_variant_spec(
                     cfg, vp_stage=vp_stage, pp_rank=pp_rank
                 )
+                mock_layout.get_layer_id_list.assert_called_once_with(
+                    layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+                )
             else:
                 # Without explicit layout, slicing comes from offset + num_layers_to_build.
                 with (
-                    patch(f"{self.MODULE}.get_transformer_layer_offset", return_value=offset),
+                    patch(
+                        f"{self.MODULE}.get_transformer_layer_offset", return_value=offset
+                    ) as mock_offset,
                     patch(
                         f"{self.MODULE}.get_num_layers_to_build", return_value=num_layers_to_build
-                    ),
+                    ) as mock_num_layers,
                 ):
                     result = get_transformer_block_with_experimental_attention_variant_spec(
                         cfg, vp_stage=vp_stage, pp_rank=pp_rank
                     )
+                mock_offset.assert_called_once_with(cfg, vp_stage=vp_stage, pp_rank=pp_rank)
+                mock_num_layers.assert_called_once_with(cfg, vp_stage=vp_stage, pp_rank=pp_rank)
 
         assert isinstance(result, TransformerBlockSubmodules)
         assert result.layer_specs == [fake_layer_specs[i] for i in expected_ids]
