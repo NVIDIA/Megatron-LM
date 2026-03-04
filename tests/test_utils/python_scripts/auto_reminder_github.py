@@ -228,6 +228,13 @@ class PRReviewTracker:
         # 8. Handle the original edge cases
         if len(reviewer_emails) == 0:
             if stage == self.EXPERT_REVIEW:
+                # No reviewer activity yet — assignment hasn't completed (e.g. PR just became
+                # ready-for-review). Don't fire a spurious "all approved" message.
+                has_reviewer_activity = bool(
+                    approvers or non_approving_reviewers or pending_individuals or pending_teams_slugs
+                )
+                if not has_reviewer_activity:
+                    return [], "Waiting for reviewers to be assigned."
                 # Assign to PR author
                 reviewer_emails = [self.get_user_email(pr.user.login)]
                 action_message = "All Expert Reviewers have approved the PR."
@@ -238,7 +245,7 @@ class PRReviewTracker:
                     mcore_members = {m.login for m in mcore_team.get_members()}
                     valid_approvers = approvers & mcore_members
                     reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
-                    action_message = "All Final Reviewers approved the PR. Please ping an Expert or Final Reviewer to merge the PR."
+                    action_message = "All Final Reviewers approved the PR. Please ping the @mcore-oncall to merge the PR."
 
                 except Exception as e:
                     logger.warning(
