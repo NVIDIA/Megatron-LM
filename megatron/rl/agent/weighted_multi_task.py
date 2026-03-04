@@ -193,6 +193,11 @@ class WeightedMultiTask(
                         raise TypeError(
                             f"Agent of type {type(agent)} does not support grouped rollouts"
                         )
+                    # TODO: Verify whether this makes sense outside of forced lag.
+                    # Scale parallel_generation_tasks proportionally to `num_groups`.
+                    agent.parallel_generation_tasks = int(
+                        agent.parallel_generation_tasks * num_groups / request.num_groups
+                    )
                     sub_request = GroupedRolloutRequest(
                         num_groups=num_groups,
                         streaming=request.streaming,
