@@ -734,7 +734,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        if self.unified_memory_level != 0 and self._uses_torch_memory_saver:
+        if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
             # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
                 tag = self.TMS_TAG
