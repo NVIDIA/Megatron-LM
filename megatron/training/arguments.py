@@ -1091,6 +1091,12 @@ def validate_args(args, defaults={}):
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
+    if args.overlap_moe_expert_parallel_comm and args.use_megatron_fsdp:
+        assert args.data_parallel_sharding_strategy != 'optim_grads_params', (
+            'overlap_moe_expert_parallel_comm with Megatron FSDP does not yet support '
+            'optim_grads_params (full parameter sharding). Use optim_grads or no_shard instead.'
+        )
+
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.

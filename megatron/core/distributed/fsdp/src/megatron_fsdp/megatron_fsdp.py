@@ -595,6 +595,7 @@ class MegatronFSDP(torch.nn.Module):
             param.grad_added_to_main_grad = False
 
         self._params_require_handle_grad = set()
+        self._overlap_grad_acc_fn = _grad_acc
 
         def _post_backward_release_module(module, *unused):
             """
@@ -1098,6 +1099,68 @@ class MegatronFSDP(torch.nn.Module):
                 Defaults to True. MegatronFSDP.model_auto_sync defaults to False.
         """
         self.model_auto_sync = sync_model
+
+    def overlap_pre_backward(self):
+        """Initialize backward state for overlap_moe_expert_parallel_comm schedule.
+
+        When the fine-grained overlap schedule bypasses normal module hooks (because it
+        calls layer sub-modules directly instead of going through module.forward()),
+        FSDP's root pre-backward hook never fires. This method replicates the essential
+        bookkeeping: populating the set of parameters that require gradient handling
+        and resetting the grad-accumulation flag on each parameter.
+
+        Must be called before each microbatch's backward pass in the overlap schedule.
+        """
+        self._root_pre_backward_hook_issued = True
+        self._params_require_handle_grad = set()
+        for param_group in self.param_and_grad_buffer.parameter_groups:
+            if not param_group.requires_grad:
+                continue
+            self._params_require_handle_grad |= set(param_group.params)
+            for param in param_group.params:
+                param.grad_added_to_main_grad = False
+
+    def overlap_post_backward(self):
+        """Finalize backward state for overlap_moe_expert_parallel_comm schedule.
+
+        Counterpart to overlap_pre_backward(). Handles any parameters whose gradients
+        were not processed by per-parameter hooks (e.g. shared parameters), waits for
+        pending async reduce-scatter operations, and updates microbatch bookkeeping.
+
+        Must be called after each microbatch's backward pass in the overlap schedule.
+        """
+        ordered_params = sorted(
+            list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]
+        )
+
+        for param in ordered_params:
+            self._overlap_grad_acc_fn(param)
+
+        grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
+            "optim_grads",
+            "optim_grads_params",
+        ]
+        is_last_microbatch = getattr(self, "is_last_microbatch", False)
+
+        outer_fsdp_group_grad_reduce = (
+            self.dist_index.use_hybrid_fsdp
+            and (is_last_microbatch or self.model_auto_sync)
+        )
+
+        if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+            self.grad_reduce_pipeline.reduce_gradients(
+                ordered_params,
+                suggested_queue_capacity=self.suggested_RS_queue_capacity,
+                outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
+            )
+
+            self.grad_reduce_pipeline.reset()
+
+        self._root_pre_backward_hook_issued = False
+        self.microbatch_count += 1
+
+        if self.model_auto_sync:
+            self.finish_grad_sync()
 
     def get_distributed_index(self) -> FSDPDistributedIndex:
         """
