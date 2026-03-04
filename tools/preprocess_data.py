@@ -181,10 +181,13 @@ class Partition(object):
         total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+            if self.args.find_optimal_num_workers and i > self.args.max_documents:
+                break
+            else:
+                total_bytes_processed += bytes_processed
+                for key in doc.keys():
+                    builders[key].add_document(doc[key], sentence_lens[key])
+                self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         # Save performance data (preprocessed docs/s)
         if self.args.find_optimal_num_workers:
@@ -470,7 +473,8 @@ def main():
             builders[key].finalize(output_idx_files[key])
 
     # Find the most optimal number of workers
-    find_optimal_num_workers(args)
+    if args.find_optimal_num_workers:
+        find_optimal_num_workers(args)
 
 if __name__ == '__main__':
 
