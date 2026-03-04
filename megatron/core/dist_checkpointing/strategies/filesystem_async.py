@@ -6,7 +6,6 @@ import dataclasses
 import inspect
 import logging
 import os
-import pickle
 import queue
 import threading
 from functools import partial
@@ -502,7 +501,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             path = os.path.join(self.checkpoint_dir, ".metadata")
 
             with msc.open(path, "wb") as metadata_file:
-                pickle.dump(metadata, metadata_file)
+                torch.save(metadata, metadata_file)
         else:
             super().finish(metadata, results)
 
