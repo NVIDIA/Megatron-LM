@@ -7,7 +7,6 @@
 
 import logging
 import math
-import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -39,6 +38,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
+    is_using_quantization_scales,
     log_single_rank,
 )
 
@@ -163,10 +163,6 @@ class MambaMixer(MegatronModule):
         # Fused kernel and sharding options
         chunk_size=128,
         layer_number=None,
-        use_mem_eff_path=None,
-        d_state=None,
-        headdim=None,
-        ngroups=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
     ):
@@ -194,33 +190,6 @@ class MambaMixer(MegatronModule):
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
-
-        # Check for deprecated arguments and raise warnings
-        if use_mem_eff_path is not None:
-            warnings.warn(
-                "The 'use_mem_eff_path' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if d_state is not None:
-            warnings.warn(
-                "The 'd_state' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if headdim is not None:
-            warnings.warn(
-                "The 'headdim' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if ngroups is not None:
-            warnings.warn(
-                "The 'ngroups' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -518,6 +487,11 @@ class MambaMixer(MegatronModule):
             y = y_prefill
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
+
+        # Clear the outputs for padding tokens when using quantization scales
+        # to avoid corrupting amax calculations
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
 
         # Output projection
         out, out_bias = self.out_proj(y)
