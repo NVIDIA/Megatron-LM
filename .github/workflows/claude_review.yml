@@ -10,7 +10,6 @@ jobs:
     if: |
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
-      (github.event.issue.user.login == 'ko3n1g' || github.event.issue.user.login == 'Phlip79') &&
       contains(github.event.comment.body, '/claude review')
     runs-on: ubuntu-latest
     permissions:
@@ -43,20 +42,19 @@ jobs:
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*)"
           prompt: |
-            REPO: ${{ env.REPO }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
             You are doing a light code review. Keep it concise and actionable.
+
             Focus ONLY on:
             - Critical bugs or logic errors
             - Typos in code, comments, or strings
-            - Missing or insufficient test coverage for changed code
-            - Outdated or inaccurate documentation affected by the changes
-
-            Do NOT comment on:
-            - Style preferences or formatting
-            - Minor naming suggestions
             - Architectural opinions or refactoring ideas
             - Performance unless there is a clear, measurable issue
 
-            Always post a comment summarizing your findings. If everything looks good, post a brief LGTM.
+            Provide feedback using inline comments for specific code suggestions.
+            Use top-level comments for general observations.
+
+            It's perfectly acceptable to not have anything to comment on.
+            If you do not have anything to comment on, post "LGTM".
