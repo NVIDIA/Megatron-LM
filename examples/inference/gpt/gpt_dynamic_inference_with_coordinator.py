@@ -47,15 +47,28 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
     # leaving inference_coordinator_port as None will find a free port automatically.
+    args = get_args()
+
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
+        coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
 
-    args = get_args()
-
-    # All ranks have the same args and requests, so they agree on the cycle count.
-    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    # Test suspend/resume intervals.
+    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
+        # Since the client doesn't directly call engine.async_step here, we test
+        # the suspend-resume system ~4 times.
+        suspend_resume_interval = max(1, len(requests) // 4)
+        suspend_idxs = set(
+            range(suspend_resume_interval, len(requests) + 1, suspend_resume_interval)
+        )
+        resume_idxs = set(
+            min(len(requests), i + suspend_resume_interval // 2) for i in suspend_idxs
+        )
+    else:
+        suspend_idxs = set()
+        resume_idxs = set()
 
     # Create client and run example.
     if dist.get_rank() == 0:
