@@ -25,6 +25,7 @@ from ..inference.inference_interface import (
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MAX_CONCURRENT_REQUESTS = 4000
 
