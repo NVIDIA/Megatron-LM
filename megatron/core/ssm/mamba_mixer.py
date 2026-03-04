@@ -524,15 +524,29 @@ class MambaMixer(MegatronModule):
         together through the unified varlen path.
         """
         metadata = context.mamba_metadata
-        if context.batch_dimensions.prefill_req_count <= 0:
+        real_prefill_count = context.batch_dimensions.prefill_req_count
+        if real_prefill_count <= 0:
             return None
+
+        # Strip CUDA-graph padding from metadata tensors. The padded entries
+        # have -1 batch_indices and zero-length segments in cu_seqlens, which
+        # would cause out-of-bounds indexing in the varlen SSM kernel.
+        cu_seqlens = metadata.cu_seqlens[: real_prefill_count + 1]
+        batch_indices = metadata.batch_indices_prefill[:real_prefill_count]
+        real_token_count = cu_seqlens[-1].item()
+        seq_idx = (
+            metadata.seq_idx[:, :real_token_count]
+            if metadata.seq_idx is not None
+            else None
+        )
+
         return self._ssm_prefill(
             zxBCdt,
             conv_state=conv_state,
             ssm_state=ssm_state,
-            seq_idx=metadata.seq_idx,
-            cu_seqlens=metadata.cu_seqlens,
-            batch_indices=metadata.batch_indices_prefill,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            batch_indices=batch_indices,
             use_triton_conv1d=context.use_triton_conv1d,
         )
 
@@ -807,14 +821,22 @@ class MambaMixer(MegatronModule):
             z = z.squeeze(0)
             y = torch.empty_like(x)
 
-            cu_chunk_seqlens = cu_seqlens
-            if seq_idx is not None:
-                n_seq_from_seq_idx = int(seq_idx.max().item() + 1)
-                n_seq_from_cu = cu_seqlens.numel() - 1
-                if n_seq_from_seq_idx > n_seq_from_cu:
-                    cu_chunk_seqlens = torch.cat(
-                        [cu_seqlens, cu_seqlens.new_tensor([seq_idx.shape[1]])]
-                    )
+            # Build cu_chunk_seqlens: subdivide each sequence into chunks of
+            # at most self.chunk_size tokens. The SSM kernels allocate per-chunk
+            # output arrays of size chunk_size, so passing cu_seqlens directly
+            # would cause out-of-bounds access when sequences are longer than
+            # chunk_size.
+            chunk_boundaries = [0]
+            num_seqs = cu_seqlens.numel() - 1
+            for i in range(num_seqs):
+                start = cu_seqlens[i].item()
+                end = cu_seqlens[i + 1].item()
+                pos = start + self.chunk_size
+                while pos < end:
+                    chunk_boundaries.append(pos)
+                    pos += self.chunk_size
+                chunk_boundaries.append(end)
+            cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
 
             seq_idx_for_varlen = None
             if seq_idx is not None:
