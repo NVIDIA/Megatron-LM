@@ -106,6 +106,7 @@ dev = [
     "emerging_optimizers",
     "quart",
     "openai[aiohttp]",
+    "orjson",
 ]
 
 lts = [

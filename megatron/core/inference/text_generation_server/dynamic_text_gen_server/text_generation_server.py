@@ -4,13 +4,13 @@ import asyncio
 import logging
 import multiprocessing as mp
 import socket
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from typing import List, Optional
 
 try:
-    from quart import Quart
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
+    from quart import Quart
 
     HAS_BACKEND = True
 except ImportError as e:
@@ -22,8 +22,9 @@ from megatron.core.utils import trace_async_exceptions
 
 logger = logging.getLogger(__name__)
 
-# Global reference to manage the background server process
-_SERVER_PROCESS = None
+# Global reference to manage the background server processes
+_SERVER_PROCESSES: List[mp.Process] = []
+_SHARED_SOCKET = None
 
 
 @contextmanager
@@ -44,8 +45,9 @@ async def _run_text_gen_server(
     tokenizer,
     rank: int,
     server_port: int,
-    parsers: list[str] = None,
+    parsers: Optional[List[str]] = None,
     verbose: bool = False,
+    fd: Optional[int] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -68,8 +70,8 @@ async def _run_text_gen_server(
 
         app = Quart(__name__)
 
-        # Quart/Flask native way to handle max body size (1 GB; needed for large prompts)
-        app.config['MAX_CONTENT_LENGTH'] = 2**30 
+        # Quart native way to handle max body size (1 GB; needed for large prompts)
+        app.config['MAX_CONTENT_LENGTH'] = 2**30
 
         # Store client and tokenizer in app config for Blueprints to use
         app.config['client'] = inference_client
@@ -81,21 +83,23 @@ async def _run_text_gen_server(
         for endpoint in endpoints.__all__:
             app.register_blueprint(endpoint)
 
-        loop = asyncio.get_event_loop()
-
         config = Config()
         config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
         config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
         config.h2_max_concurrent_streams = (
             2**14
         )  # Allow many concurrent streams for HTTP/2 clients.
-        config.bind = [f"0.0.0.0:{server_port}"]
+
+        if fd is not None:
+            config.bind = [f"fd://{fd}"]
+        else:
+            config.bind = [f"0.0.0.0:{server_port}"]
 
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
             logger.info(f"Using tokenizer: {type(tokenizer)}")
             logger.info(f"Using parsers: {parsers}")
-        
+
         # Quart is natively ASGI, so we can serve the app directly
         await serve(app, config)
 
@@ -110,18 +114,21 @@ def _server_process_worker(
     tokenizer,
     rank: int,
     server_port: int,
-    parsers: list[str] = None,
+    parsers: Optional[List[str]] = None,
     verbose: bool = False,
+    fd: Optional[int] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
-            _run_text_gen_server(coordinator_addr, tokenizer, rank, server_port, parsers, verbose)
+            _run_text_gen_server(
+                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd
+            )
         )
     except KeyboardInterrupt:
-        logger.info(f"Rank {rank}: Text Gen server process interrupted.")
+        logger.info(f"Rank {rank}: text gen server process interrupted.")
     finally:
         pending = asyncio.all_tasks(loop)
         for task in pending:
@@ -136,43 +143,68 @@ def start_text_gen_server(
     tokenizer,
     rank: int,
     server_port: int,
-    parsers: list[str] = None,
+    parsers: Optional[List[str]] = None,
     verbose: bool = False,
+    num_replicas: int = 4,
 ):
-    """Spawns and starts a separate process to run the web frontend transparently."""
-    global _SERVER_PROCESS
+    """Start the text generation server."""
+    global _SERVER_PROCESSES
+    global _SHARED_SOCKET
 
-    if _SERVER_PROCESS is not None and _SERVER_PROCESS.is_alive():
-        logger.warning("Text Gen server process is already running.")
+    if _SERVER_PROCESSES:
+        logger.warning("Text gen server processes are already running.")
         return
 
-    _SERVER_PROCESS = mp.Process(
-        target=_server_process_worker,
-        args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose),
-        daemon=True,
-    )
-    _SERVER_PROCESS.start()
-    logger.info(f"Started Text Gen frontend in separate process (PID: {_SERVER_PROCESS.pid})")
+    _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    if hasattr(socket, 'SO_REUSEPORT'):
+        try:
+            _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+
+    _SHARED_SOCKET.bind(("0.0.0.0", server_port))
+    _SHARED_SOCKET.setblocking(False)
+
+    _SHARED_SOCKET.set_inheritable(True)
+    fd = _SHARED_SOCKET.fileno()
+
+    for i in range(num_replicas):
+        p = mp.Process(
+            target=_server_process_worker,
+            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd),
+            daemon=True,
+        )
+        p.start()
+        _SERVER_PROCESSES.append(p)
+        logger.info(f"Started text gen frontend replica {i+1}/{num_replicas} (PID: {p.pid})")
 
 
 def stop_text_gen_server():
-    """Terminates the background Text Gen server process with a timeout."""
-    global _SERVER_PROCESS
+    """Stop the text generation server."""
+    global _SERVER_PROCESSES
+    global _SHARED_SOCKET
 
-    if _SERVER_PROCESS is not None and _SERVER_PROCESS.is_alive():
-        logger.info(f"Terminating Text Gen frontend process (PID: {_SERVER_PROCESS.pid})")
-        _SERVER_PROCESS.terminate()
+    if not _SERVER_PROCESSES:
+        return
 
-        # Wait up to 3 seconds for it to shut down gracefully
-        _SERVER_PROCESS.join(timeout=3)
+    logger.info(f"Terminating {len(_SERVER_PROCESSES)} Text Gen frontend processes...")
 
-        # If it's still alive, it's ignoring SIGTERM. Force kill it.
-        if _SERVER_PROCESS.is_alive():
-            logger.warning(
-                f"Text Gen process (PID: {_SERVER_PROCESS.pid}) refused to terminate. Force killing."
-            )
-            _SERVER_PROCESS.kill()
-            _SERVER_PROCESS.join()
+    for p in _SERVER_PROCESSES:
+        if p.is_alive():
+            p.terminate()
 
-        _SERVER_PROCESS = None
-        logger.info("Text Gen frontend process terminated.")
+    for p in _SERVER_PROCESSES:
+        p.join(timeout=3)
+        if p.is_alive():
+            p.kill()
+            p.join()
+
+    # Clean up the master socket
+    if _SHARED_SOCKET is not None:
+        _SHARED_SOCKET.close()
+        _SHARED_SOCKET = None
+
+    _SERVER_PROCESSES = []
+    logger.info("All text gen frontend processes terminated.")
