@@ -119,9 +119,7 @@ class _ParamAndGradBucket:
         self.layerwise_gather_list = None
         self._layerwise_src_buffer = None
 
-    def set_layerwise_params_list(
-        self, layerwise_params_list: List[List[torch.nn.Parameter]]
-    ):
+    def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
 
         Args:

@@ -323,9 +323,7 @@ class TestLayerWiseOptimizer:
             isinstance(k, int) for k in sharded_state_dict.keys()
         ):
             for idx, sub_dict in sharded_state_dict.items():
-                assert (
-                    'optimizer' in sub_dict
-                ), f"Sub-dict {idx} should contain 'optimizer' key"
+                assert 'optimizer' in sub_dict, f"Sub-dict {idx} should contain 'optimizer' key"
         else:
             assert (
                 'optimizer' in sharded_state_dict
