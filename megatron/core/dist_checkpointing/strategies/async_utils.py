@@ -40,11 +40,30 @@ def _set_process_qos(cpu_priority: int, io_priority: Optional[int]) -> None:
     """
     pid = os.getpid()
 
-    # Set CPU priority (nice value)
+    # Set CPU priority (nice value). os.nice(increment) adds to current;
+    # get current with os.nice(0). Only increase nice (deprioritize);
+    # decreasing requires superuser.
     if cpu_priority is not None and cpu_priority >= 0 and cpu_priority <= 19:
         try:
-            os.nice(cpu_priority)
-            logger.debug(f"PID {pid}: Set CPU nice value to +{cpu_priority}")
+            current_nice = os.nice(0)  # 0 = no change, returns current nice value
+            increment = cpu_priority - current_nice
+            if increment <= 0:
+                logger.warning(
+                    "PID %s: Skipping CPU nice (current %s already <= target %s; "
+                    "lowering requires superuser",
+                    pid,
+                    current_nice,
+                    cpu_priority,
+                )
+            else:
+                new_nice = os.nice(increment)
+                logger.debug(
+                    "PID %s: Set CPU nice from %s to %s (target %s)",
+                    pid,
+                    current_nice,
+                    new_nice,
+                    cpu_priority,
+                )
         except (OSError, PermissionError) as e:
             logger.warning(f"PID {pid}: Failed to set CPU priority: {e}")
 
@@ -490,10 +509,10 @@ class PersistentAsyncCaller(AsyncCaller):
                 self._persistent_queue.join()
                 self._persistent_process.join()
             self.process = None
-            self._persistent_process = None
-            self._persistent_queue = None
-            self._persistent_preload_q = None
-            self._persistent_comp_q = None
+            PersistentAsyncCaller._persistent_process = None
+            PersistentAsyncCaller._persistent_queue = None
+            PersistentAsyncCaller._persistent_preload_q = None
+            PersistentAsyncCaller._persistent_comp_q = None
 
     def __del__(self):
         self.close()
@@ -699,3 +718,4 @@ class AsyncCallsQueue:
             self.maybe_finalize_async_calls(blocking=True)
         if self.persistent and AsyncCallsQueue._persistent_caller:
             AsyncCallsQueue._persistent_caller.close(abort=abort)
+            AsyncCallsQueue._persistent_caller = None
