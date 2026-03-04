@@ -1362,7 +1362,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_modules.append("moe")
 
         # Validation for "mhc" in recompute_modules
-        if "mhc" in self.recompute_modules:
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
                 raise ValueError(
                     "'mhc' in recompute_modules requires enable_hyper_connections=True."
