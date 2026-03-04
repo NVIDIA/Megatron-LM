@@ -46,6 +46,33 @@ python tools/preprocess_data.py \
 | `--workers` | Number of parallel workers for processing |
 | `--append-eod` | Add end-of-document token |
 
+## Finding Optimal Number of Workers
+
+Use the `--find-optimal-num-workers` flag to find number of workers which gives the best performance in terms of preprocessed documents per second.
+Script will lauch a few short data preprocessing runs with a different number of workers to define the fastest run in respect to collected performance data.
+
+```bash
+python tools/preprocess_data.py \
+    --input data.jsonl \
+    --output-prefix processed_data \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --workers 8 \
+    --find-optimal-num-workers \
+    --workers-to-check 4 8 16 32 \
+    --performance-dir /path/to/save/perf/results \
+    --max-documents 50000
+```
+
+**Required arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `--find-optimal-num-workers` | Activates search of optimal number of workers |
+| `--workers-to-check` | List of possible number of workers to run |
+| `--performance-dir` | Directory where to save performance results |
+| `--max-documents` | Number of documents to be preprocessed during each run |
+
 ## Output Files
 
 The preprocessing tool generates two files:

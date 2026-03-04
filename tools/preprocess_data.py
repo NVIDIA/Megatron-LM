@@ -231,7 +231,7 @@ def get_args():
                              'Script will run few small jobs with '
                              'different number of workers to define '
                              'optimal number of workers in terms of performance.'))
-    group.add_argument('--workers-to-check', nargs='+', default=[16, 32, 64],
+    group.add_argument('--workers-to-check', nargs='+', type=int, default=[16, 32, 64],
                        help=('list of workers to run data processing with '
                              'to find optimal number of workers. '
                              'Works only when --find-optimal-num-workers is enabled. '))
@@ -307,8 +307,8 @@ def find_optimal_num_workers(args):
     
     print("\n-----------------------------------")
     print("Performance results (fastest → slowest):")
-    for workers, avg_perf in results:
-        print(f"{workers * args.partitions} workers → avg. docs/s: {avg_perf:.4f}")
+    for i, (workers, avg_perf) in enumerate(results):
+        print(f"{i+1}. {workers * args.partitions} workers → avg. docs/s: {avg_perf:.4f}")
     
     best_workers, best_perf = results[0]
 
