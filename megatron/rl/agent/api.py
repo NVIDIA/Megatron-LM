@@ -192,6 +192,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         submitted_groups = 0
 
         if request.batch_results:
+            assert not request.filter_groups_with_same_reward, \
+                "Filtering is not supported with batch_results"
             # Each worker gets a permit for a batch of num_groups groups.
             # The semaphore ensures that each batch only starts after the previous is consumed.
             groups_per_worker = request.num_groups
@@ -224,11 +226,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
                 if groups_per_worker > 1:
-                    results = await asyncio.gather(*[
+                    await asyncio.gather(*[
                         generate_and_enqueue(batch_id, i)
                         for i in range(groups_per_worker)
                     ])
-                    assert all(results), "Filtering is not supported with batch_results"
                 else:
                     if not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= 1
