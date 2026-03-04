@@ -104,6 +104,7 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+    "hypercorn",
     "quart",
     "openai[aiohttp]",
     "orjson",
