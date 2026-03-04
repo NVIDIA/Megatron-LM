@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLI tool to trigger the internal GitLab CI pipeline for a GitHub PR.
+"""CLI tool to trigger the internal GitLab CI pipeline from a local branch.
 
-Infers the PR number from the current branch, pushes the branch to the
-internal GitLab remote under the pull-request/<number> naming convention,
-and triggers a pipeline with the specified test configuration.
+Pushes the current branch to the internal GitLab remote under the
+pull-request/<branch> naming convention and triggers a pipeline with
+the specified test configuration.
 """
 
 import argparse
@@ -27,21 +27,17 @@ import subprocess
 import sys
 from urllib.parse import urlparse
 
-import requests
 import gitlab  # python-gitlab
 
-GITHUB_REPO = "NVIDIA/Megatron-LM"
 GITLAB_PROJECT_ID = 19378
 GITLAB_BRANCH_PREFIX = "pull-request"
-GITHUB_API_URL = "https://api.github.com"
-
-logger = logging.getLogger(__name__)
 
 PIPELINE_VARIABLES_FIXED = {
     "UNIT_TEST": "no",
     "INTEGRATION_TEST": "no",
-    "FUNCTIONAL_TEST_SCOPE": "mr",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def get_remote_url(origin):
@@ -74,6 +70,7 @@ def get_current_branch():
     )
     return result.stdout.strip()
 
+
 def git_push(origin, target_branch, dry_run=False):
     """Force-push HEAD to the given branch on the named git remote."""
     if dry_run:
@@ -95,7 +92,9 @@ def trigger_pipeline(gitlab_url, trigger_token, ref, pipeline_vars, dry_run=Fals
             ref,
         )
         return
-    logger.info("Triggering pipeline on https://%s project %s @ %s", gitlab_url, GITLAB_PROJECT_ID, ref)
+    logger.info(
+        "Triggering pipeline on https://%s project %s @ %s", gitlab_url, GITLAB_PROJECT_ID, ref
+    )
     gl = gitlab.Gitlab(f"https://{gitlab_url}")
     project = gl.projects.get(GITLAB_PROJECT_ID, lazy=True)
     pipeline = project.trigger_pipeline(ref=ref, token=trigger_token, variables=pipeline_vars)
@@ -105,7 +104,7 @@ def trigger_pipeline(gitlab_url, trigger_token, ref, pipeline_vars, dry_run=Fals
 def main():
     """Parse arguments and orchestrate the push and pipeline trigger flow."""
     parser = argparse.ArgumentParser(
-        description="Trigger the internal GitLab CI pipeline for a GitHub PR."
+        description="Trigger the internal GitLab CI pipeline for the current branch."
     )
     parser.add_argument(
         "--gitlab-origin",
