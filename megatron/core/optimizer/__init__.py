@@ -770,8 +770,8 @@ def get_megatron_optimizer(
             )
             model_chunk_offset += 1
 
-        if len(optimizers) == 1:
-            return optimizers[0]
+        # if len(optimizers) == 1:
+        #     return optimizers[0]
 
         return ChainedOptimizer(optimizers)
 
