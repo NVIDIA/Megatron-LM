@@ -1269,6 +1269,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
+    def _set_offload_modules(self):
+        """Set the offload modules for the transformer layer."""
+        if self.config.fine_grained_activation_offloading:
+            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
+                self.input_layernorm, IdentityOp
+            )
+            self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
+            self.offload_core_attn = "core_attn" in self.config.offload_modules
+            self.offload_attn_proj = "attn_proj" in self.config.offload_modules
+            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
+                self.pre_mlp_layernorm, IdentityOp
+            )
+            self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
+            self.offload_moe_act = "moe_act" in self.config.offload_modules
+        else:
+            self.offload_attn_norm = False
+            self.offload_qkv_linear = False
+            self.offload_core_attn = False
+            self.offload_attn_proj = False
+            self.offload_mlp_norm = False
+            self.offload_expert_fc1 = False
+            self.offload_moe_act = False
+        # Set the offload module in cuda graph flag.
+        self.offload_module_in_cuda_graph = False
+        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
+                self.offload_module_in_cuda_graph = True
+        if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
+            if self.offload_mlp_norm:
+                self.offload_module_in_cuda_graph = True
+        if self.offload_module_in_cuda_graph:
+            assert is_torch_min_version(
+                "2.9.0a0"
+            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
+            assert is_te_min_version(
+                "2.13.0"
+            ), "Offloading modules captured in cuda graph requires TE>=2.13.0."
+            assert (
+                self.config.cuda_graph_warmup_steps > 0
+            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
+
+
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
@@ -1437,44 +1479,3 @@ class MoETransformerLayer(TransformerLayer):
                 return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
             return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
-
-    def _set_offload_modules(self):
-        """Set the offload modules for the transformer layer."""
-        if self.config.fine_grained_activation_offloading:
-            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
-                self.input_layernorm, IdentityOp
-            )
-            self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
-            self.offload_core_attn = "core_attn" in self.config.offload_modules
-            self.offload_attn_proj = "attn_proj" in self.config.offload_modules
-            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
-                self.pre_mlp_layernorm, IdentityOp
-            )
-            self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
-            self.offload_moe_act = "moe_act" in self.config.offload_modules
-        else:
-            self.offload_attn_norm = False
-            self.offload_qkv_linear = False
-            self.offload_core_attn = False
-            self.offload_attn_proj = False
-            self.offload_mlp_norm = False
-            self.offload_expert_fc1 = False
-            self.offload_moe_act = False
-        # Set the offload module in cuda graph flag.
-        self.offload_module_in_cuda_graph = False
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
-                self.offload_module_in_cuda_graph = True
-        if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
-            if self.offload_mlp_norm:
-                self.offload_module_in_cuda_graph = True
-        if self.offload_module_in_cuda_graph:
-            assert is_torch_min_version(
-                "2.9.0a0"
-            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
-            assert is_te_min_version(
-                "2.13.0"
-            ), "Offloading modules captured in cuda graph requires TE>=2.13.0."
-            assert (
-                self.config.cuda_graph_warmup_steps > 0
-            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
