@@ -228,6 +228,12 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "system.",
     )
     group.add_argument(
+        "--suspend-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep while the engine is suspended (simulates a training step).",
+    )
+    group.add_argument(
         "--inference-repeat-n",
         type=int,
         default=1,
@@ -258,7 +264,6 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Path to write coordinator request scheduling decisions as JSON",
     )
-
     return parser
 
 
