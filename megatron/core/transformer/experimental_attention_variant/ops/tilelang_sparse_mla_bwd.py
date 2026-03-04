@@ -3,17 +3,18 @@
 # https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/
 # examples/deepseek_v32/sparse_mla_bwd.py
 import os
+import threading
 from collections import OrderedDict
 
 import tilelang
 import torch
 from tilelang import language as T
 
-_TILELANG_KERNEL_CACHE_MAX = 64
 _SPARSE_MLA_BWD_BLOCK_SIZE = 32
 _tilelang_sparse_mla_preprocess_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_bwd_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_postprocess_kernel_cache = OrderedDict()
+_tilelang_sparse_mla_bwd_cache_lock = threading.Lock()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -25,6 +26,9 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+_TILELANG_KERNEL_CACHE_MAX = _env_int("MCORE_DSA_TILELANG_KERNEL_CACHE_MAX", 512)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -44,13 +48,25 @@ def _cache_put_lru(cache: OrderedDict, key, value):
         cache.popitem(last=False)
 
 
+def _normalize_sm_scale(sm_scale):
+    if sm_scale is None:
+        return None
+    if isinstance(sm_scale, torch.Tensor):
+        sm_scale = float(sm_scale.detach().item())
+    else:
+        sm_scale = float(sm_scale)
+    # Avoid tiny floating-point jitter creating cache-key churn.
+    return round(sm_scale, 12)
+
+
 def _get_preprocess_kernel(B: int, S: int, H: int, D: int):
     key = (B, S, H, D)
-    kernel = _tilelang_sparse_mla_preprocess_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = preprocess(B, S, H, D)
-    _cache_put_lru(_tilelang_sparse_mla_preprocess_kernel_cache, key, kernel)
-    return kernel
+    with _tilelang_sparse_mla_bwd_cache_lock:
+        kernel = _tilelang_sparse_mla_preprocess_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = preprocess(B, S, H, D)
+        _cache_put_lru(_tilelang_sparse_mla_preprocess_kernel_cache, key, kernel)
+        return kernel
 
 
 def _get_bwd_kernel(
@@ -65,21 +81,23 @@ def _get_bwd_kernel(
     sm_scale,
     is_causal: bool,
 ):
-    key = (B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
-    kernel = _tilelang_sparse_mla_bwd_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
-    _cache_put_lru(_tilelang_sparse_mla_bwd_kernel_cache, key, kernel)
-    return kernel
+    key = (B, S, S_kv, H, D, D_tail, topk, kv_group, _normalize_sm_scale(sm_scale), is_causal)
+    with _tilelang_sparse_mla_bwd_cache_lock:
+        kernel = _tilelang_sparse_mla_bwd_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal)
+        _cache_put_lru(_tilelang_sparse_mla_bwd_kernel_cache, key, kernel)
+        return kernel
 
 
 def _get_postprocess_kernel(B: int, S_kv: int, D: int, D_tail: int, kv_group: int):
     key = (B, S_kv, D, D_tail, kv_group)
-    kernel = _tilelang_sparse_mla_postprocess_kernel_cache.pop(key, None)
-    if kernel is None:
-        kernel = postprocess(B, S_kv, D, D_tail, kv_group)
-    _cache_put_lru(_tilelang_sparse_mla_postprocess_kernel_cache, key, kernel)
-    return kernel
+    with _tilelang_sparse_mla_bwd_cache_lock:
+        kernel = _tilelang_sparse_mla_postprocess_kernel_cache.pop(key, None)
+        if kernel is None:
+            kernel = postprocess(B, S_kv, D, D_tail, kv_group)
+        _cache_put_lru(_tilelang_sparse_mla_postprocess_kernel_cache, key, kernel)
+        return kernel
 
 
 @tilelang.jit(out_idx=[-1])
