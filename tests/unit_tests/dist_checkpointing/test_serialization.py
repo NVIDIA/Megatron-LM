@@ -77,16 +77,6 @@ class TestSerialization:
             save(sharded_state_dict, ckpt_dir)
             torch.distributed.barrier()
 
-            saved_config = maybe_load_config(ckpt_dir)
-            if saved_config.sharded_backend == 'zarr':
-                assert (ckpt_dir / 'keyA').is_dir()
-                assert (ckpt_dir / 'keyB').is_dir()
-                assert not (ckpt_dir / 'keyC').exists()
-                assert not (ckpt_dir / 'sd_keyA').is_dir()
-
-                if HAVE_DTENSOR:
-                    assert (ckpt_dir / 'keyD').is_dir()
-
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
                     'keyA', torch.ones(2, 4), replica_id=Utils.rank
@@ -126,13 +116,6 @@ class TestSerialization:
                 validate_access_integrity=True,
                 preprocess_common_before_consistancy_check=preprocess_fn,
             )
-
-            saved_config = maybe_load_config(ckpt_dir)
-            if saved_config.sharded_backend == 'zarr':
-                assert (ckpt_dir / 'keyA').is_dir()
-                assert (ckpt_dir / 'keyB').is_dir()
-                assert not (ckpt_dir / 'keyC').exists()
-                assert not (ckpt_dir / 'sd_keyA').is_dir()
 
         Utils.destroy_model_parallel()
 
@@ -426,7 +409,6 @@ class TestSerialization:
                 load(state_dict, ckpt_dir)
             assert f'is not a distributed checkpoint' in str(exc_info.value)
 
-            # Missing Zarr arrays
             torch.distributed.barrier()
             save(state_dict, ckpt_dir)
             sh_ten.key = 'different_key'

@@ -14,7 +14,10 @@ from functools import partial
 
 import torch
 
-from megatron.core.utils import divide
+from examples.multimodal.layer_scaling import (
+    LayerScalingTransformerLayer,
+    get_bias_dropout_add_layer_scaling,
+)
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -31,13 +34,12 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-
-from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
-
+from megatron.core.typed_torch import copy_signature, not_none
+from megatron.core.utils import divide
 
 try:
     import apex
@@ -60,7 +62,7 @@ class InternViTRMSNorm(MegatronModule):
 
     def __init__(
         self,
-        config,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-6,
         sequence_parallel: bool = False,
@@ -92,7 +94,7 @@ class InternViTRMSNorm(MegatronModule):
 
         return x * torch.rsqrt(var + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run RMSNorm with an option to compute custom statistic."""
         var = None
         if self._compute_var:
@@ -128,10 +130,14 @@ class InternViTRMSNorm(MegatronModule):
 
         if rank < valid_ranks:  # Ranks without any dummy attention heads.
             var = input_.sum(-1, keepdim=True)
-        elif rank == valid_ranks:  # The only rank which may contain 'residual_heads' dummy attention heads.
+        elif (
+            rank == valid_ranks
+        ):  # The only rank which may contain 'residual_heads' dummy attention heads.
             var = input_[..., :max_dim].sum(-1, keepdim=True)
         else:
-            var = input_.sum(-1, keepdim=True) * 0.0  # All heads in these ranks are dummy heads: Zero-out.
+            var = (
+                input_.sum(-1, keepdim=True) * 0.0
+            )  # All heads in these ranks are dummy heads: Zero-out.
 
         tensor_list = [torch.empty_like(var) for _ in range(world_size)]
         tensor_list[rank] = var
@@ -167,6 +173,7 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
 
 # Override a few things that are special in InternViT and not supported by the SelfAttention class.
 class InternViTSelfAttention(SelfAttention):
+    @copy_signature(SelfAttention.__init__)
     def __init__(
         self, config: TransformerConfig, submodules: SelfAttentionSubmodules, *args, **kwargs
     ):
@@ -175,12 +182,11 @@ class InternViTSelfAttention(SelfAttention):
         # Need to override linear_qkv, q_layernorm and k_layernorm.
         qkv_bias = False
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=qkv_bias,
             skip_bias_add=False,
@@ -192,26 +198,23 @@ class InternViTSelfAttention(SelfAttention):
             self.hidden_size_per_attention_head * self.num_attention_heads_per_partition
         )  # 512 for internvit
 
-        self.q_layernorm = build_module(
-            submodules.q_layernorm,
+        self.q_layernorm = not_none(submodules.q_layernorm)(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
-        self.k_layernorm = build_module(
-            submodules.k_layernorm,
+        self.k_layernorm = not_none(submodules.k_layernorm)(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
 
 class InternViTTEDotProductAttention(TEDotProductAttention):
     """Adjusted Attention for InternViT"""
 
+    @copy_signature(TEDotProductAttention.forward)
     def forward(self, *args, **kwargs):
         """Regular TEDotProductAttention + zero-out dummy attention heads."""
         out = super().forward(*args, **kwargs)
@@ -245,8 +248,8 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
                     linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                     core_attention=TEDotProductAttention if use_te else DotProductAttention,
                     linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
-                    q_layernorm=InternViTRMSNorm,
-                    k_layernorm=InternViTRMSNorm,
+                    q_layernorm=partial(InternViTRMSNorm, compute_var=True),
+                    k_layernorm=partial(InternViTRMSNorm, compute_var=True),
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
@@ -255,6 +258,7 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
     )
+
 
 def get_internvit300M_layer_spec(use_te) -> ModuleSpec:
     mlp = get_mlp_module_spec(use_te)  # no norm

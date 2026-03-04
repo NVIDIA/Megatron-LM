@@ -5,12 +5,6 @@ EP=${EP:-32}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
 LLM="nemotron6_3b_moe"
 
-ROOT_DIR="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6"
-
-CHECKPOINT="${ROOT_DIR}/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/"
-
-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
-
 echo "Using Nemotron6 3B MOE model checkpoint"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 source $(dirname $SCRIPT_PATH)/common.sh
@@ -91,7 +85,7 @@ MODEL_OPTIONS="\
   --rl-importance-sampling-truncation-coef 10.0 \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --distributed-timeout-minutes 60 \
   --use-mcore-models \
@@ -110,7 +104,7 @@ MODEL_OPTIONS="\
   --tiktoken-pattern v2 \
   --tokenizer-type TikTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
-  --dist-ckpt-strictness log_unexpected
+  --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \
   --ckpt-fully-parallel-load \
@@ -124,5 +118,4 @@ MODEL_OPTIONS="\
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
-  --no-load-rng \
-  "
+  --no-load-rng "

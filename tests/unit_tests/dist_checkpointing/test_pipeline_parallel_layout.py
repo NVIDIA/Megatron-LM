@@ -131,7 +131,6 @@ def create_args():
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
     args.use_dist_ckpt = True
@@ -152,6 +151,7 @@ def create_args():
     args.use_megatron_fsdp = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
 
     yield args
 

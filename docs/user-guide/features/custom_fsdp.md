@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Megatron FSDP
 
 **NOTE: In M-Core 0.14, the custom FSDP refactored its checkpoint implementation to use DTensor-based torch distributed checkpointing. The custom FSDP was also renamed Megatron FSDP. The relevant sections of this document are no longer applicable.**
@@ -12,6 +21,8 @@ Add these flag to enable MCore custom FSDP.
 --no-gradient-accumulation-fusion
 --use-distributed-optimizer
 ```
+
+For a practical guide covering required configurations, checkpoint conversion, and example scripts, see the [Megatron-FSDP User Guide](../../discussions/megatron-fsdp-user-guide/megatron-fsdp-user-guide.md).
 
 ## Key Features
 
