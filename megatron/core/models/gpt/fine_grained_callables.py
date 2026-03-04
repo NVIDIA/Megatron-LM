@@ -454,7 +454,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         ):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
+            node.chunk_state.flush_delayed_groups = False
         else:
+            node.chunk_state.flush_delayed_groups = True
+
             # wrapper function that keeps consistent api with cuda graph replay
             def forward_func(
                 hidden_states: Tensor,
@@ -476,18 +479,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
+                node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
                             hidden_states
                         )
@@ -589,13 +590,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if layer.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
             )
+            node.layer_state.mlp_norm_manager = None
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        # Flush the delayed groups.
+        # This process happens only during the warmup steps of cuda graph.
+        if node.chunk_state.flush_delayed_groups:
+            off_interface.flush_delayed_groups()
 
         # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
