@@ -522,11 +522,28 @@ class MambaMixer(MegatronModule):
 
         All prefill requests (with or without initial Mamba states) are processed
         together through the unified varlen path.
+
+        During CUDA graph capture, GPU-to-CPU sync (.item()) is forbidden, so we
+        pass padded tensors directly to the old mamba_chunk_scan_combined kernel
+        which handles padding natively via seq_idx. No requests have initial
+        states during graph capture, so this produces correct results.
         """
         metadata = context.mamba_metadata
         real_prefill_count = context.batch_dimensions.prefill_req_count
         if real_prefill_count <= 0:
             return None
+
+        if context.is_creating_cuda_graphs:
+            # CUDA graph capture: pass padded tensors directly (no .item() calls).
+            return self._ssm_prefill(
+                zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=metadata.seq_idx,
+                cu_seqlens=metadata.cu_seqlens,
+                batch_indices=metadata.batch_indices_prefill,
+                cuda_graph_compatible=True,
+            )
 
         # Strip CUDA-graph padding from metadata tensors. The padded entries
         # have -1 batch_indices and zero-length segments in cu_seqlens, which
@@ -694,6 +711,7 @@ class MambaMixer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
         batch_indices: Optional[torch.Tensor] = None,
         use_triton_conv1d: bool = False,
+        cuda_graph_compatible: bool = False,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference prefill step.
@@ -709,6 +727,10 @@ class MambaMixer(MegatronModule):
                 dynamic inference.
             use_triton_conv1d: Whether to use the Triton varlen conv1d kernel instead
                 of per-request causal_conv1d_fn calls.
+            cuda_graph_compatible: When True, avoids GPU-to-CPU sync (.item()) by
+                using causal_conv1d_fn with seq_idx and mamba_chunk_scan_combined
+                instead of the varlen kernel. Used during CUDA graph capture when
+                no requests have initial states.
 
         Returns:
             The output tensor of shape (l, b, d).
@@ -735,23 +757,38 @@ class MambaMixer(MegatronModule):
         if conv_state is not None and is_dynamic_batching:
             assert batch_indices is not None
 
+            # Extract initial conv states BEFORE saving new ones. The conv_state
+            # buffer holds the previous state (zeros for fresh requests, cached
+            # values for restored requests). We must read it before overwriting.
+            initial_conv_states = conv_state[batch_indices, :, 1:]  # (num_reqs, conv_dim, d_conv-1)
+
             # Save final conv states from the input sequence
             conv_varlen_states = causal_conv1d_varlen_states(
                 xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
             tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
-            # Extract initial conv states (zeros for fresh requests, cached for restored)
-            initial_conv_states = conv_state[batch_indices, :, 1:]  # (num_reqs, conv_dim, d_conv-1)
-
             conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
             conv_bias = self.cp.get_conv1d_bias()
 
-            if use_triton_conv1d:
+            if cuda_graph_compatible:
+                # CUDA graph capture: use causal_conv1d_fn with seq_idx (no .item()
+                # calls, handles padding via seq_idx). No initial states during
+                # graph capture, so zeroing at sequence boundaries is correct.
+                xBC = xBC.transpose(1, 2)  # (1, L, D) -> (1, D, L)
+                xBC = causal_conv1d_fn(
+                    x=xBC,
+                    weight=conv_weight,
+                    bias=conv_bias,
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
+                xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+            elif use_triton_conv1d:
                 from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
                 xBC_out = causal_conv1d_varlen_fn(
-                    x=xBC.squeeze(0),  # (total_tokens, conv_dim)
+                    x=xBC.squeeze(0).contiguous(),  # (total_tokens, conv_dim)
                     weight=conv_weight,
                     bias=conv_bias,
                     cu_seqlens=cu_seqlens,
@@ -824,7 +861,34 @@ class MambaMixer(MegatronModule):
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-        if is_dynamic_batching:
+        if is_dynamic_batching and cuda_graph_compatible:
+            # CUDA graph capture: use mamba_chunk_scan_combined with seq_idx
+            # (no .item() calls, handles padding natively). Tensors keep their
+            # batch dimension (b=1), matching the non-dynamic-batching path.
+            y = mamba_chunk_scan_combined(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.chunk_size,
+                D=(
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.cp.get_D()
+                ),
+                z=z if not self.rmsnorm else None,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                return_final_states=True,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                return_varlen_states=True,
+                initial_states=None,
+            )
+            y, _, ssm_varlen_states = y
+            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+        elif is_dynamic_batching:
             # Unified varlen SSM path: all prefill requests through single kernel call
             initial_ssm_state = ssm_state[batch_indices]
 
