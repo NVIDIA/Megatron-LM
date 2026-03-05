@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Literal
+from typing import Literal, Optional
 
 @dataclass(kw_only=True)
 class TrainingConfig:
