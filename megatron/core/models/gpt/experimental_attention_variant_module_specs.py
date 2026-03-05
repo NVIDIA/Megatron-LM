@@ -392,7 +392,6 @@ def _get_self_attention_module_spec(
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
-        moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         qk_l2_norm=config.qk_l2_norm,
         use_kitchen=config.use_kitchen,
         use_te_activation_func=config.use_te_activation_func,
@@ -444,7 +443,6 @@ def _get_moe_module_spec(
         backend=backend,
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         use_te_activation_func=config.use_te_activation_func,
     )
     moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False

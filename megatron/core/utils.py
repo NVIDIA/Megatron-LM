@@ -335,8 +335,11 @@ def get_te_version():
             return version("transformer-engine")
 
     global _te_version
-    if _te_version is None and HAVE_TE:
-        _te_version = PkgVersion(get_te_version_str())
+    if _te_version is None:
+        if HAVE_TE:
+            _te_version = PkgVersion(get_te_version_str())
+        else:
+            _te_version = PkgVersion("0.0.0")
     return _te_version
 
 
