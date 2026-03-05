@@ -827,6 +827,10 @@ class TestDynamicContext:
             dynamic_context.request_to_kv_block_ids[i, 0] = initial_blocks[i]
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
+            dynamic_context.request_last_kv_block_id[i] = initial_blocks[i]
+            dynamic_context.request_last_kv_block_offset[i] = 0
+            dynamic_context.request_kv_block_counts[i] = 1
+            dynamic_context.request_in_prefill_status_tensor[i] = 0
             if is_hybrid_model:
                 dynamic_context.mamba_conv_states[:, i, :, :].fill_(
                     float(i + 1)
