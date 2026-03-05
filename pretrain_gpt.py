@@ -39,6 +39,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.anomaly_utils import set_last_batch_info
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -68,7 +69,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -80,6 +81,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
     local_cp_size = batch.pop('local_cp_size', None)
+    sample_type = batch.pop('sample_type', None)
+    sample_indices = batch.pop('sample_indices', None)
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
@@ -92,8 +95,19 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
-    return (*batch.values(), packed_seq_params)
+
+    set_last_batch_info(
+        {
+            "sample_indices": sample_indices.detach().cpu().tolist()
+            if isinstance(sample_indices, torch.Tensor)
+            else None,
+            "sample_type": sample_type.detach().cpu().tolist()
+            if isinstance(sample_type, torch.Tensor)
+            else None,
+        }
+    )
+
+    return (*batch.values(), sample_type, packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -101,7 +115,7 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None, sample_type: Optional[torch.Tensor] = None
 ):
     """Loss function.
 
@@ -159,6 +173,28 @@ def loss_func(
             fatal=False,
         )
 
+    if getattr(args, "enable_channel_loss", False):
+        sample_type = sample_type if isinstance(sample_type, torch.Tensor) else None
+        if sample_type is None or (has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False)):
+            report["channel/unknown loss"] = report["lm loss"].clone().detach()
+        else:
+            flat_losses = losses.reshape(loss_mask.shape)
+            sample_count = sample_type.shape[0]
+            tokens_per_sample = flat_losses.numel() // sample_count
+            sample_loss = (
+                flat_losses.reshape(sample_count, tokens_per_sample)
+                * loss_mask.reshape(sample_count, tokens_per_sample)
+            ).sum(dim=1)
+            sample_tokens = loss_mask.reshape(sample_count, tokens_per_sample).sum(dim=1).to(torch.int)
+            for channel in sample_type.unique():
+                channel_mask = sample_type == channel
+                channel_loss = sample_loss[channel_mask].sum()
+                channel_tokens = sample_tokens[channel_mask].sum()
+                channel_name = f"channel/type_{int(channel.item())} loss"
+                report[channel_name] = torch.cat(
+                    [channel_loss.clone().detach().view(1), channel_tokens.view(1)]
+                )
+
     return loss, num_tokens, report
 
 
@@ -178,7 +214,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, sample_type, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -191,14 +227,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
-                return schedule_plan, partial(loss_func, loss_mask, model=model)
+                return schedule_plan, partial(loss_func, loss_mask, model=model, sample_type=sample_type)
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, sample_type=sample_type)
 
 
 def is_dataset_built_on_rank(vp_stage=None):

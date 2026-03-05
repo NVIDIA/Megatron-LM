@@ -321,6 +321,33 @@ class LoggerConfig:
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
+    capture_anomaly_data: bool = False
+    """Enable anomaly data capture based on step loss / grad-norm thresholds."""
+
+    anomaly_window_size: int = 100
+    """Window size used to compute dynamic anomaly thresholds."""
+
+    anomaly_dynamic_multiplier: float = 3.0
+    """Dynamic threshold multiplier for anomaly detection."""
+
+    anomaly_loss_abs_max: float = 1.0e10
+    """Absolute max loss threshold for anomaly detection."""
+
+    anomaly_grad_norm_abs_max: float = 1.0e10
+    """Absolute max grad-norm threshold for anomaly detection."""
+
+    anomaly_flush_interval: int = 10
+    """Flush anomaly cache to disk every N iterations."""
+
+    anomaly_buffer_size: int = 64
+    """Flush anomaly cache to disk when buffered events exceed this size."""
+
+    anomaly_output_file: str = "anomaly_events.jsonl"
+    """Path to the anomaly output JSONL file."""
+
+    enable_channel_loss: bool = False
+    """Enable per-type/channel loss logging when `sample_type` is available in data."""
+
 
 @dataclass(kw_only=True)
 class CheckpointConfig:

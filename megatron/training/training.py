@@ -106,6 +106,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
+from megatron.training.anomaly_utils import TrainingAnomalyMonitor, get_last_batch_info
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -2593,6 +2594,7 @@ def train(
 
     # Tracking loss.
     total_loss_dict = {}
+    anomaly_monitor = TrainingAnomalyMonitor(args)
 
     # Iterations.
     iteration = args.iteration
@@ -2997,6 +2999,12 @@ def train(
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )
+        anomaly_monitor.observe(
+            iteration=iteration,
+            loss_value=loss_dict.get('lm loss') if isinstance(loss_dict, dict) else None,
+            grad_norm=grad_norm,
+            batch_info=get_last_batch_info(),
+        )
         is_first_iteration = False
 
         # Evaluation.
@@ -3109,6 +3117,8 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    anomaly_monitor.flush()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
