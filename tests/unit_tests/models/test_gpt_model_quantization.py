@@ -16,10 +16,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]
-
-    HAVE_KITCHEN = True
     from megatron.core.extensions.kitchen import (
+        HAVE_KITCHEN,
         KitchenColumnParallelGroupedLinear,
         KitchenColumnParallelLinear,
         KitchenDotProductAttention,
@@ -269,7 +267,6 @@ class TestGPTModelKitchenQuantizationConfig:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             num_layers=2,
             hidden_size=12,
             num_attention_heads=4,

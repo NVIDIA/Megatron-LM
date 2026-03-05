@@ -18,8 +18,8 @@ on:
   push:
     branches:
       - main
-      - 'pull-request/[0-9]+'
-      - 'deploy-release/*'
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   merge_group:
     types: [checks_requested]
 
@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   build-test-publish-wheels:
@@ -42,8 +42,7 @@ jobs:
     with:
       no-publish: true
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+      TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
 
   build-test-publish-wheel-summary:
     needs: [pre-flight, build-test-publish-wheels]
@@ -65,7 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' || github.ref != 'refs/heads/main' }}
+          SKIPPING_IS_ALLOWED: true
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 

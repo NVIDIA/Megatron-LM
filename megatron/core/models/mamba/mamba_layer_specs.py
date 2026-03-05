@@ -1,13 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.models.gpt.moe_module_specs import (
+    get_inference_optimized_moe_spec,
+    get_moe_module_spec,
+)
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -19,15 +23,50 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 
+# This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
-    moe_use_legacy_grouped_gemm=False,
 )
+
+# Inference-optimized MoE spec
+moe_inference = get_inference_optimized_moe_spec()
+
+
+# MTP block spec for Mamba - provides norms and projection only.
+# Inner layers are built by MultiTokenPredictionLayer using nested MambaStack
+_mamba_mtp_block_spec = ModuleSpec(
+    module=MultiTokenPredictionBlock,
+    submodules=MultiTokenPredictionBlockSubmodules(
+        layer_specs=[
+            ModuleSpec(
+                module=MultiTokenPredictionLayer,
+                submodules=MultiTokenPredictionLayerSubmodules(
+                    enorm=TENorm,
+                    hnorm=TENorm,
+                    eh_proj=TEColumnParallelLinear,
+                    mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                    layer_norm=TENorm,
+                ),
+            )
+        ]
+    ),
+)
+
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -78,14 +117,15 @@ mamba_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
-            module=TransformerLayer,
+            module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )
+
 
 mamba_inference_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -138,11 +178,12 @@ mamba_inference_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )

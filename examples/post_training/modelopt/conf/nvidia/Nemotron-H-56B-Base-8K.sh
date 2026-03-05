@@ -8,11 +8,11 @@ else
 fi
 
 MODEL_ARGS=" \
+    --trust-remote-code \
     --save-interval 100000 \
     --micro-batch-size 1 \
     --attention-backend flash \
-    --is-hybrid-model \
-    --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
+    --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
     --mamba-state-dim 256 \
     --tiktoken-pattern v2 \
     --use-mcore-models \
@@ -21,7 +21,6 @@ MODEL_ARGS=" \
     --init-method-std 0.0099 \
     --position-embedding-type none \
     --squared-relu \
-    --num-layers 118 \
     --hidden-size 8192 \
     --num-attention-heads 64 \
     --group-query-attention \

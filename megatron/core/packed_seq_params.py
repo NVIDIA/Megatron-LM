@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
 
+import torch.distributed as dist
 from torch import Tensor
 
 
@@ -18,3 +19,5 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    local_cp_size: int = None
+    cp_group: dist.ProcessGroup = None
