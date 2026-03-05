@@ -1,9 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -18,7 +19,7 @@ class TestParallelMLP:
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
-        self.mlp = MLP(transformer_config, get_gpt_layer_local_spec().submodules.mlp.submodules)
+        self.mlp = MLP(transformer_config, get_gpt_layer_local_submodules().mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

@@ -25,7 +25,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.typed_torch import apply_module
+from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -275,6 +275,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
@@ -288,7 +290,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # so they should NOT add the decoder layer offset. The router.py handles MTP layer
         # numbering separately by adding config.num_layers to distinguish MTP layers from decoder
         # layers in the aux loss tracker.
-        if is_mtp_layer:
+        #
+        # When add_layer_offset is False, the caller has already included the correct offset
+        # in layer_number (e.g. when using --hybrid-layer-pattern with fVPP).
+        if is_mtp_layer or not add_layer_offset:
             self.layer_number = layer_number
         else:
             self.layer_number = layer_number + get_transformer_layer_offset(
@@ -308,11 +313,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
-                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
+                # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
+                    self.layer_number - 1
+                ]
             else:
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
 
         attention_optional_kwargs["pg_collection"] = pg_collection
+        if pp_layer_offset is not None:
+            attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
@@ -353,7 +363,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         additional_mlp_kwargs = {}
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
-        from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+        from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
@@ -361,7 +371,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The conditional below is to make the logic explicit
         # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
         if isinstance(submodules.mlp, ModuleSpec):
-            if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
+            if submodules.mlp.module in (MoELayer, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
                 # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
                 if submodules.mlp.module == MoELayer:
@@ -515,21 +525,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    def forward(self, *args, **kwargs):
-        """
-        Perform a forward pass through the transformer layer.
-
-        This method calls the core computation of a transformer layer, including
-        self-attention, cross-attention (if applicable), and feed-forward operations.
-        """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-        )
-        return output, context
-
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -583,6 +578,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -651,6 +648,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
@@ -674,6 +673,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         return hidden_states, context
+
+    @copy_signature(_forward_attention)
+    def forward(self, *args, **kwargs):
+        """
+        Perform a forward pass through the transformer layer.
+
+        This method calls the core computation of a transformer layer, including
+        self-attention, cross-attention (if applicable), and feed-forward operations.
+        """
+        hidden_states, context = self._forward_attention(*args, **kwargs)
+        output = self._forward_mlp(
+            hidden_states,
+            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+        )
+        return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -715,6 +730,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -1292,6 +1309,8 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         router_outputs = self.mlp(

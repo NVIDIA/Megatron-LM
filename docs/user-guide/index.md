@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 <!---
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -14,7 +18,6 @@ Comprehensive guides for using Megatron Core and Megatron-LM.
 ```{toctree}
 :maxdepth: 2
 
-quickstart
 msc_integration
 data-preparation
 training-examples
