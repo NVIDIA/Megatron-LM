@@ -60,11 +60,6 @@ class MambaMetadata:
             (self.max_requests,), -1, dtype=torch.int32, device=self.device
         )
 
-        # Map from the active chunked prefill request to its slot in the static Mamba state buffer
-        self._batch_indices_chunked_prefill_buffer = torch.full(
-            (1,), -1, dtype=torch.int32, device=self.device
-        )
-
         # Map from token id to request id for active prefill requests
         self._seq_idx_buffer = torch.full(
             (1, self.max_tokens), -1, dtype=torch.int32, device=self.device
@@ -80,19 +75,13 @@ class MambaMetadata:
             (2,), dtype=torch.int32, device=self.device
         )
 
-        # Tuple of (
-        #   total prefill sequence length excluding chunked prefill,
-        #   chunked prefill sequence length
-        # )
-        self._device_chunked_prefill_buffer = torch.zeros(
-            (2,), dtype=torch.int32, device=self.device
-        )
-
         # Allocator for Mamba state slots
         self.mamba_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
         )
         self.mamba_state_free_slot_count = self.max_requests
+
+        self.reset_varlen_metadata()
 
     def reset(self) -> None:
         """
@@ -112,11 +101,9 @@ class MambaMetadata:
         """Resets varlen metadata."""
         self.batch_indices_decode = None
         self.batch_indices_prefill = None
-        self.batch_indices_chunked_prefill = None
         self.cu_seqlens = None
         self.seq_idx = None
         self.device_decode_prefill = None
-        self.device_chunked_prefill = None
 
     def update(
         self,
@@ -133,20 +120,17 @@ class MambaMetadata:
         Args:
             active_mamba_indices (Tensor): Tensor containing the Mamba slot indices
                                            for active requests.
-            num_active_requests (int): The number of active requests.
+            token_to_request_idx (Tensor): Map from token index to request index.
+            cu_seqlens (Tensor): Cumulative sequence lengths.
+            batch_dimensions (InferenceBatchDimensions): Dimensions of the current batch.
+            padded_batch_dimensions (InferenceBatchDimensions): Dimensions of the padded batch.
         """
         real_decode_count = batch_dimensions.decode_req_count
         real_prefill_count = batch_dimensions.prefill_req_count
-        real_token_count = batch_dimensions.token_count
-        has_explicit_chunked_prefill_req = batch_dimensions.has_explicit_chunked_prefill_req
 
         padded_decode_count = padded_batch_dimensions.decode_req_count
         padded_prefill_count = padded_batch_dimensions.prefill_req_count
         padded_token_count = padded_batch_dimensions.token_count
-        assert (
-            has_explicit_chunked_prefill_req
-            == padded_batch_dimensions.has_explicit_chunked_prefill_req
-        )
 
         if padded_decode_count > 0:
             # Update decode indices
@@ -157,82 +141,60 @@ class MambaMetadata:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
 
-        # Determine if we have a chunked prefill request and adjust counts for regular prefill
-        regular_prefill_count = real_prefill_count
-        if has_explicit_chunked_prefill_req:
-            # The last prefill request is the chunked one
-            regular_prefill_count -= 1
-            chunked_req_idx = real_decode_count + regular_prefill_count
-
-            # Update chunked prefill indices
-            self._batch_indices_chunked_prefill_buffer[0] = active_mamba_indices[chunked_req_idx]
-            self.batch_indices_chunked_prefill = self._batch_indices_chunked_prefill_buffer
-        else:
-            self.batch_indices_chunked_prefill = None
-
         if padded_prefill_count > 0:
-            # Update prefill indices (excluding chunked prefill from regular prefill buffer)
-            if regular_prefill_count > 0:
-                self._batch_indices_prefill_buffer[:regular_prefill_count].copy_(
-                    active_mamba_indices[
-                        real_decode_count : real_decode_count + regular_prefill_count
-                    ]
+            # Update prefill indices (all prefill requests go through varlen)
+            if real_prefill_count > 0:
+                prefill_start_idx = real_decode_count
+                self._batch_indices_prefill_buffer[:real_prefill_count].copy_(
+                    active_mamba_indices[prefill_start_idx : prefill_start_idx + real_prefill_count]
                 )
 
-            if padded_prefill_count > regular_prefill_count:
-                self._batch_indices_prefill_buffer[regular_prefill_count:padded_prefill_count] = -1
+            if padded_prefill_count > real_prefill_count:
+                self._batch_indices_prefill_buffer[
+                    real_prefill_count:padded_prefill_count
+                ] = -1
 
             self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
 
-            # Update seq_idx
-            end_regular_prefill_token_idx = cu_seqlens[real_decode_count + regular_prefill_count]
+            # Update seq_idx for all prefill requests
+            prefill_start_req_idx = real_decode_count
+            end_prefill_req_idx = real_decode_count + real_prefill_count
 
-            # The length of tokens belonging to regular prefill requests (excluding decode tokens)
-            seq_len = end_regular_prefill_token_idx - real_decode_count
+            start_prefill_token_idx = cu_seqlens[prefill_start_req_idx]
+            end_prefill_token_idx = cu_seqlens[end_prefill_req_idx]
+
+            seq_len = end_prefill_token_idx - start_prefill_token_idx
 
             if seq_len > 0:
+                # Normalize request IDs to 0-based relative to prefill requests
                 self._seq_idx_buffer[:, :seq_len].copy_(
-                    token_to_request_idx[real_decode_count:end_regular_prefill_token_idx]
-                    - real_decode_count
+                    token_to_request_idx[start_prefill_token_idx:end_prefill_token_idx]
+                    - prefill_start_req_idx
                 )
 
             if padded_token_count > seq_len:
                 self._seq_idx_buffer[:, seq_len:padded_token_count] = -1
             self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
-            # Update cu_seqlens
+            # Update cu_seqlens for all prefill requests
             self._cu_seqlens_buffer[0] = 0
-            if regular_prefill_count > 0:
-                self._cu_seqlens_buffer[1 : regular_prefill_count + 1].copy_(
-                    cu_seqlens[
-                        real_decode_count + 1 : real_decode_count + regular_prefill_count + 1
-                    ]
-                    - real_decode_count
+            if real_prefill_count > 0:
+                self._cu_seqlens_buffer[1 : real_prefill_count + 1].copy_(
+                    cu_seqlens[prefill_start_req_idx + 1 : end_prefill_req_idx + 1]
+                    - cu_seqlens[prefill_start_req_idx]
                 )
 
             # Pad the rest with the last value (effectively length 0 segments)
-            last_val = self._cu_seqlens_buffer[regular_prefill_count]
-            self._cu_seqlens_buffer[regular_prefill_count + 1 : padded_prefill_count + 1].fill_(
+            last_val = self._cu_seqlens_buffer[real_prefill_count]
+            self._cu_seqlens_buffer[real_prefill_count + 1 : padded_prefill_count + 1].fill_(
                 last_val
             )
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = real_decode_count
-            self._device_decode_prefill_buffer[1] = regular_prefill_count
+            self._device_decode_prefill_buffer[1] = real_prefill_count
             self.device_decode_prefill = self._device_decode_prefill_buffer
-
-        # If using chunked prefill for this batch, store the number of regular prefill tokens
-        # and the number of tokens in the chunked prefill request
-        if has_explicit_chunked_prefill_req:
-            chunked_prefill_token_count = (
-                cu_seqlens[real_decode_count + real_prefill_count]
-                - cu_seqlens[real_decode_count + real_prefill_count - 1]
-            )
-            assert self.cu_seqlens is not None
-            self._device_chunked_prefill_buffer[0] = self.cu_seqlens[regular_prefill_count]
-            self._device_chunked_prefill_buffer[1] = chunked_prefill_token_count
-            self.device_chunked_prefill = self._device_chunked_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:
         """
@@ -248,6 +210,25 @@ class MambaMetadata:
         # Get a free slot
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+
+        return mamba_idx
+
+    def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
+        """
+        Allocates new slots for the given number of requests in the Mamba state buffers.
+
+        Returns:
+            torch.Tensor: The indices of the allocated slots.
+            Returns None if not enough slots are available.
+        """
+        if self.mamba_state_free_slot_count < num_slots:
+            return None
+
+        # Get free slots
+        self.mamba_state_free_slot_count -= num_slots
+        mamba_idx = self.mamba_state_free_slots[
+            self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
+        ]
 
         return mamba_idx
 
