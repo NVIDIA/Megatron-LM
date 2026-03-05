@@ -1440,18 +1440,20 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.cuda_graph_scope is not None
                 ), "cuda_graph_scope must be set when enabling offloading."
-                assert (
-                    "attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope
-                ) or (
-                    CudaGraphScope.attn in self.cuda_graph_scope
-                    and CudaGraphScope.moe_router in self.cuda_graph_scope
-                ), "attn and moe_router must be in cuda_graph_scope when enabling offloading."
-                assert (
-                    "attn_norm" not in self.offload_modules
-                ), "input of attn_norm is the start point of cuda graph, which can't be offloaded."
-                assert (
-                    "mlp_norm" not in self.offload_modules
-                ), "mlp_norm goes through the boundary of cuda graph, which can't be offloaded."
+                if (
+                    "attn" in self.cuda_graph_scope
+                    or "moe_router" in self.cuda_graph_scope
+                    or "moe_preprocess" in self.cuda_graph_scope
+                    or CudaGraphScope.attn in self.cuda_graph_scope
+                    or CudaGraphScope.moe_router in self.cuda_graph_scope
+                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
+                ):
+                    assert (
+                        "attn_norm" not in self.offload_modules
+                    ), "attn_norm is the start point of cuda graph, so can't be offloaded."
+                    assert (
+                        "mlp_norm" not in self.offload_modules
+                    ), "mlp_norm goes through the boundary of cuda graph, so can't be offloaded."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
