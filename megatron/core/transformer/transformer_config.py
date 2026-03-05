@@ -246,8 +246,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to run real-time tests."""
 
     calculate_per_token_loss: bool = False
-    """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
-    global batch, versus the default behavior of assuming all tokens are non-padded."""
+    """Whether cross entropy loss is calculated over the actual number of non-padded and non-masked
+    tokens in the global batch, versus the default behavior of assuming all tokens are non-padded 
+    and non-masked."""
 
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
