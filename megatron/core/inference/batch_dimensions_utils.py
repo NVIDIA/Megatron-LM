@@ -382,7 +382,7 @@ class CUDAGraphBatchDimensionBuilder:
             ):
                 cuda_graph_max_tokens = max_tokens
 
-            assert cuda_graph_max_tokens == max_requests, (
+            assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
                 f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests "
                 f"({max_requests}). This is required for correctly syncing EP ranks: "
                 f"prefill and decode graph pools must have the same token count granularity."
@@ -427,15 +427,16 @@ class CUDAGraphBatchDimensionBuilder:
             # Use decode-specific token counts for decode-only graphs
             for size in cuda_graph_decode_token_counts:
                 decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
+                token_count = decode_req_count * (num_speculative_tokens + 1)
+                token_count = token_count // tp_size * tp_size
                 add_if_valid(
-                    token_count=decode_req_count * (num_speculative_tokens + 1),
-                    prefill_req_count=0,
-                    decode_req_count=decode_req_count,
+                    token_count=token_count, prefill_req_count=0, decode_req_count=decode_req_count
                 )
         else:
             # Mixed prefill and decode mode
             # Create prefill and mixed dimensions with full token counts
             for size in cuda_graph_prefill_token_counts:
+                assert size % tp_size == 0
                 prefill_req_count = min(cuda_graph_mixed_prefill_request_count, max_requests)
                 decode_req_count = max(
                     0,
@@ -465,10 +466,10 @@ class CUDAGraphBatchDimensionBuilder:
             # Create decode-only dimensions with optimized token counts
             for size in cuda_graph_decode_token_counts:
                 decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
+                token_count = decode_req_count * (num_speculative_tokens + 1)
+                token_count = token_count // tp_size * tp_size
                 add_if_valid(
-                    token_count=decode_req_count * (num_speculative_tokens + 1),
-                    prefill_req_count=0,
-                    decode_req_count=decode_req_count,
+                    token_count=token_count, prefill_req_count=0, decode_req_count=decode_req_count
                 )
 
         # Remove duplicates and sort by prefill token count

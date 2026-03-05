@@ -1332,7 +1332,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         pass can run without error.
 
         """
-        smallest_cuda_graph_dimensions = min(self.cuda_graph_batch_dimensions_list)
+        smallest_cuda_graph_dimensions = min(
+            [x for x in self.cuda_graph_batch_dimensions_list if x.prefill_req_count == 0]
+        )
         # the smallest cuda graph is decode only.
         assert smallest_cuda_graph_dimensions.prefill_req_count == 0
 
@@ -1608,7 +1610,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) Flattened active input and position IDs.
         """
         num_tokens = num_warmup_tokens or self.padded_active_token_count
-        assert num_tokens >= self.batch_dimensions.decode_req_count * (
+        assert num_tokens >= self.padded_batch_dimensions.decode_req_count * (
             self.num_speculative_tokens + 1
         )
         return (
