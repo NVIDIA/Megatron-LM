@@ -376,6 +376,16 @@ def combined_forward_backward_step(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
+        # Wire per-layer FSDP parameter release callbacks.  The EP overlap
+        # schedule bypasses normal FSDP forward/backward hooks, so we release
+        # each layer's all-gathered parameters explicitly after its compute.
+        _fsdp = _find_megatron_fsdp(f_model)
+        if _fsdp is not None:
+            for i in range(f_schedule_plan.num_layers()):
+                layer_plan = f_schedule_plan.get_layer(i)
+                layer_plan.on_forward_done = _fsdp.overlap_release_fsdp_unit_forward_params
+                layer_plan.on_backward_done = _fsdp.overlap_release_fsdp_unit_backward_params
+
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
     b_schedule_plan = None
