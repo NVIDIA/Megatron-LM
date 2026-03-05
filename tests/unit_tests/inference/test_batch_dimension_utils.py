@@ -446,7 +446,7 @@ class TestSpeculativeDecodingBatchDimensions:
         graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
             tp_size=TP_SIZE,
             num_cuda_graphs=num_cuda_graphs,
-            cuda_graph_max_tokens=MAX_REQUESTS,
+            cuda_graph_max_tokens=MAX_REQUESTS * (num_speculative_tokens + 1),
             cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
             max_requests=MAX_REQUESTS,
             max_tokens=MAX_TOKENS,

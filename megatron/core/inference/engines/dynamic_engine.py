@@ -215,11 +215,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
 
-            # assert (
-            #    not self.enable_chunked_prefill
-            # ), "Chunked prefill is not supported with speculative tokens"
-
-        # Initialize MTP sampling tensor now that num_speculative_tokens is set
         self.controller._init_mtp_sampling_tensor()
 
         self.track_paused_request_events = inference_config.track_paused_request_events
