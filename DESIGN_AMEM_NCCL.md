@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PR integrates optional AMem (Asynchronous Memory) NCCL-based offloading support for Megatron RL training workflows. The feature enables offloading GPU memory to CPU/host memory during RL rollout phases to reduce GPU memory pressure.
+This PR integrates optional AMem (Asynchronous Memory) NCCL-based offloading support for Megatron RL training workflows. The feature enables releasing NCCL-allocated communicator buffers during RL rollout phases to reduce GPU memory pressure.
 
 ## When AMem Hooks Are Enabled
 
@@ -23,24 +23,28 @@ During rollout:
 - Large batches of sequences are generated
 - Activation tensors accumulate rapidly
 - GPU memory becomes a bottleneck before compute saturation
-- Model parameters can be temporarily offloaded without performance penalty
+- NCCL buffer memory (communicator allocations) is idle during rollout generation
 
 AMem enables:
-- Offloading idle model parameters during rollout
-- Fetching them back asynchronously before training phase
-- Overlapping CPU-GPU transfers with rollout computation
+- Releasing GPU memory allocated by NCCL (communication buffers)
+- Restoring NCCL memory before training collective operations resume
+- Reducing peak GPU memory during rollout phases where NCCL buffers are otherwise idle
 
 ## What Memory Is Offloaded
 
-When enabled, AMem NCCL offloads:
-- **Model parameters** during rollout generation
-- **Optimizer states** (optional, based on configuration)
-- **Gradient buffers** when not actively being computed
+AMem enables:
+- Offloading GPU memory allocated by NCCL (communication buffers)
+- Restoring NCCL memory before training collective operations resume
+- Reducing peak GPU memory during rollout phases where NCCL buffers are otherwise idle
 
-Explicitly **not offloaded**:
-- Active computation tensors
-- Attention KV caches during generation
-- Critical activations needed for current forward pass
+AMem does NOT offload:
+- Model parameters
+- Optimizer states
+- Gradient buffers
+- Activations
+
+Parameter and optimizer offloading are handled separately via
+`--rl-offload-optimizer-during-inference` and related flags.
 
 ## Implementation Details
 

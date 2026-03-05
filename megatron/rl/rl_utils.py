@@ -1829,16 +1829,21 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
-    amem_offload_during_rollout = getattr(args, 'rl_amem_offload_during_rollout', True)
+    amem_offload_during_rollout = getattr(args, 'rl_amem_offload_during_rollout', False)
+
+    # Resolve use_amem here, not lazily
+    use_amem = False
+    amem_nccl = None
     if amem_offload_during_rollout:
         try:
             from megatron.core import amem_nccl
-            if amem_nccl.is_amem_available():
+            use_amem = amem_nccl.is_amem_available()
+            if use_amem:
                 logger.info(f"[{dist.get_rank()}:DP] AMem NCCL plugin enabled for memory offloading")
             else:
-                logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL plugin requested but not available")
+                logger.warning(f"[{dist.get_rank()}:DP] AMem requested but not available")
         except ImportError:
-            logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL module not found, disabling AMem")
+            logger.warning(f"[{dist.get_rank()}:DP] AMem module not found, disabling")
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
@@ -1875,7 +1880,13 @@ def megatron_rl_inference_mode(
                 optimizer.offload_to_cpu()
 
         # Offload NCCL memory before inference if AMem is enabled
+        # NOTE: This is only safe if inference runs without collective comms.
+        # In Megatron's inplace inference mode, comms still occur — use with caution.
         if use_amem and amem_offload_during_rollout:
+            logger.warning(
+                "AMem NCCL pause before inference is experimental. "
+                "If inference uses collective communication, this may cause errors."
+            )
             with nvtx_range("amem-nccl-pause-before-inference"):
                 if amem_nccl.nccl_pause():
                     logger.info(f"[{dist.get_rank()}:DP] Successfully offloaded NCCL memory")
