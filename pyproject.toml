@@ -93,7 +93,7 @@ dev = [
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
+    "emerging_optimizers; python_version >= '3.12'",
     "flask[async]",
     "hypercorn",
     "openai",
@@ -116,7 +116,7 @@ lts = [
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
+    "emerging_optimizers; python_version >= '3.12'",
 ]
 
 [dependency-groups]
@@ -160,7 +160,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -190,7 +190,7 @@ flash_mla = [
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "70562671f9d417ab88ddce8579a478ee4cac1459" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
