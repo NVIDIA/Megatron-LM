@@ -52,6 +52,8 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
     update_microbatch_calculator,
+    get_packing_avg_seq_length,
+    get_packing_efficiency,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -294,16 +296,31 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.actual_tokens_this_iteration = 0
+        self.compute_tokens_this_iteration = 0
+        self.packing_efficiency = 0.0
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.actual_tokens_this_iteration = 0
+        self.compute_tokens_this_iteration = 0
+        self.packing_efficiency = 0.0
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
         self.sequences_this_iteration_on_rank += count
         self.latest_batch_num_sequences = count
+
+    def update_token_counts(self, actual_tokens: int, compute_tokens: int):
+        """Update token counts for the current iteration."""
+        self.actual_tokens_this_iteration = actual_tokens
+        self.compute_tokens_this_iteration = compute_tokens
+        if compute_tokens > 0:
+            self.packing_efficiency = actual_tokens / compute_tokens
+        else:
+            self.packing_efficiency = 0.0
 
 
 # Global runtime state instance
@@ -1356,7 +1373,9 @@ def prepare_data_for_update(
                 for indices in packing_context.packing_info.bin_seq_indices
                 for idx in indices
             )
-            global_real_tokens = my_real_tokens * mpu.get_data_parallel_world_size()
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
                 get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
@@ -1387,7 +1406,9 @@ def prepare_data_for_update(
             # counts padding tokens and inflates TPS metrics.  Report only the real
             # (non-padding) tokens so the metric is comparable to the SP path.
             my_real_tokens = int((trajs != tokenizer.pad).sum().item())
-            global_real_tokens = my_real_tokens * mpu.get_data_parallel_world_size()
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
                 get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)

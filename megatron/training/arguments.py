@@ -2304,6 +2304,10 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+    group.add_argument('--rl-profile', action='store_true', default=False,
+                        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
+    group.add_argument('--rl-profile-dir', type=str, default=None,
+                        help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     return parser
 
 def _add_training_args(parser):
