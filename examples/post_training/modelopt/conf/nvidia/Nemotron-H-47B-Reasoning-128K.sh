@@ -18,15 +18,13 @@ MODEL_ARGS=" \
     --position-embedding-type none \
     --normalization RMSNorm \
     --squared-relu \
-    --num-layers 98 \
     --hidden-size 8192 \
     --ffn-hidden-size 30720 \
     --num-attention-heads 64 \
     --kv-channels 128 \
     --group-query-attention \
     --num-query-groups 8 \
-    --hybrid-override-pattern M-M-M-M-M-M-M-M-M*-M-M-M-M-M-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-M-M---MM---M-M*-M-M-M-M-M- \
-    --is-hybrid-model \
+    --hybrid-layer-pattern M-M-M-M-M-M-M-M-M*-M-M-M-M-M-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-M-M---MM---M-M*-M-M-M-M-M- \
     --mamba-head-dim 64 \
     --mamba-num-heads 256 \
     --mamba-num-groups 8 \
