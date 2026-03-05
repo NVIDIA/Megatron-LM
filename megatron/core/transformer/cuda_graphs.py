@@ -2222,7 +2222,8 @@ class TECudaGraphHelper:
         )
         from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 
-        off_interface.reset()
+        if self.config.fine_grained_activation_offloading:
+            off_interface.reset()
 
         torch.distributed.barrier()
         for model_chunk in self.model:
