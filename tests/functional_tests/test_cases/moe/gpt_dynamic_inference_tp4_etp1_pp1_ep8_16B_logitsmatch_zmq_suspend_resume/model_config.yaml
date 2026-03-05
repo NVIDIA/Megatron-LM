@@ -73,14 +73,17 @@ MODEL_ARGS:
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
   --output-path: ${INFERENCE_OUTPUT_PATH}
-  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-repeat-n: 8
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-max-requests: 16
   --inference-logging-step-interval: 1
   --moe-enable-routing-replay: true
+  --prompt-file: "./tests/functional_tests/test_cases/moe/gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq_suspend_resume/prompts.json"
+  --suspend-resume-interval: 16
+  --suspend-timeout: 4.0
+  --rl-kv-cache-management-mode: recompute
+  --inference-dynamic-batching-unified-memory-level: 0
+  --no-rl-persist-cuda-graphs: true
+
 METRICS:
-  - "generated_tokens"
-  - "logprobs"
-  - "routing_indices"
