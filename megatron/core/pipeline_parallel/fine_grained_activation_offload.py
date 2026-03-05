@@ -419,6 +419,8 @@ class PipelineOffloadManager:
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
+        # Whether the manager is in CUDA graph replay phase.
+        self._in_replay = False
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -1133,7 +1135,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        if delay_offload:
+        if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
             PipelineOffloadManager.get_instance().push_offload_groups(
                 cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
             )
@@ -1244,11 +1246,13 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor) -> torch.Tensor:
         """Forward pass for cuda graph capture."""
+        debug_rank("FineGrainedOffloadingBackwardRecordFunction forward")
         return tensor
 
     @staticmethod
     def backward(ctx, grad_output):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
+        debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
         mgr = PipelineOffloadManager.get_instance()
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
         torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
@@ -1358,3 +1362,13 @@ class FineGrainedActivationOffloadingInterface:
     def enable_offload():
         """Enable the offload."""
         PipelineOffloadManager.get_instance().enable_offload()
+
+    @staticmethod
+    def enter_replay():
+        """Enter CUDA graph replay mode to enable delayed offloading."""
+        PipelineOffloadManager.get_instance()._in_replay = True
+
+    @staticmethod
+    def exit_replay():
+        """Exit CUDA graph replay mode."""
+        PipelineOffloadManager.get_instance()._in_replay = False

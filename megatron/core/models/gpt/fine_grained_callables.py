@@ -454,10 +454,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         ):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
-            node.chunk_state.flush_delayed_groups = False
         else:
-            node.chunk_state.flush_delayed_groups = True
-
             # wrapper function that keeps consistent api with cuda graph replay
             def forward_func(
                 hidden_states: Tensor,
@@ -599,11 +596,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
-
-        # Flush the delayed groups.
-        # This process happens only during the warmup steps of cuda graph.
-        if layer.config.delay_offload_until_cuda_graph and node.chunk_state.flush_delayed_groups:
-            off_interface.flush_delayed_groups()
 
         # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())

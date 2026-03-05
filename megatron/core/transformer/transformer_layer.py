@@ -564,12 +564,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        # Record the backward event on cuda graph stream in backward pass.
-        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
-        # and overlaps with the H2D transfer on reload stream.
-        if self.offload_module_in_cuda_graph:
-            hidden_states = off_interface.backward_record(hidden_states)
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
@@ -709,7 +703,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
-        flush_delayed_groups: bool = True,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -805,13 +798,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            return self._forward_post_mlp(mlp_output_with_bias, residual, flush_delayed_groups)
+            return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(
         self,
         mlp_output_with_bias: tuple[Tensor, Tensor | None],
         residual: Tensor,
-        flush_delayed_groups: bool = True,
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
@@ -819,7 +811,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
-            flush_delayed_groups (bool): Whether to flush the delayed groups.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -868,14 +859,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Flush the delayed groups.
-        # This process happens only during the warmup steps of cuda graph.
-        if self.config.delay_offload_until_cuda_graph and flush_delayed_groups:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
-
-            off_interface.flush_delayed_groups()
         return output
 
     def sharded_state_dict(
@@ -1019,6 +1002,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        # Record the backward event on cuda graph stream in backward pass.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the H2D transfer on reload stream.
+        if self.offload_module_in_cuda_graph:
+            if len(args) > 0:
+                hidden_states = args[0]
+                hidden_states = off_interface.backward_record(hidden_states)
+                args = (hidden_states,) + args[1:]
+            else:
+                hidden_states = kwargs.pop("hidden_states")
+                hidden_states = off_interface.backward_record(hidden_states)
+                kwargs["hidden_states"] = hidden_states
         context = None
         if not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
@@ -1078,12 +1077,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
+        if self.config.delay_offload_until_cuda_graph:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            off_interface.enter_replay()
+
+        try:
+            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+        finally:
+            if self.config.delay_offload_until_cuda_graph:
+                off_interface.exit_replay()
+
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+        """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
-        # Flush the delayed groups after the cuda graph replay.
-        # This is to reduce or eliminate the cpu overhead of offloading because
-        # there exists a synchronization between the cuda graph replay and the a2a comm
-        # in moe layer, at that point the host thread is blocked and idle.
+        # Flush delayed offload groups from previous layers after graph replay.
+        # The CPU is idle during the sync between graph replay and a2a comm,
+        # so we use that time to execute the delayed offload operations.
         if self.config.delay_offload_until_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
@@ -1165,9 +1178,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # of the cudagraph, so disable the recompute hooks inside _forward_post_mlp
             recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
             self.recompute_pre_mlp_layernorm = False
-            output = self._forward_post_mlp(
-                mlp_output_with_bias, residual, flush_delayed_groups=False
-            )
+            output = self._forward_post_mlp(mlp_output_with_bias, residual)
             self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
@@ -1183,7 +1194,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output, flush_delayed_groups=False)
+            output = self._forward_mlp(*cuda_graph_output)
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
