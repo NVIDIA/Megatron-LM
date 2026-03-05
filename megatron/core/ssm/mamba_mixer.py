@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
+from yaml.error import YAMLError
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,6 +67,19 @@ try:
 
     HAVE_MAMBA_SSM = True
 except ImportError:
+    mamba_chunk_scan_combined = None
+    mamba_split_conv1d_scan_combined = None
+    HAVE_MAMBA_SSM = False
+
+try:
+    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
+
+    HAVE_SSM_OPS_VARLEN = True
+except ImportError:
+    mamba_chunk_scan_combined_varlen = None
+    HAVE_SSM_OPS_VARLEN = False
+
+if not HAVE_MAMBA_SSM:
     from unittest.mock import MagicMock
 
     RMSNormGated = MagicMock()
@@ -813,53 +828,121 @@ class MambaMixer(MegatronModule):
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-        if is_chunked_prefill:
-            initial_ssm_state = ssm_state[batch_indices]
+        initial_ssm_state = ssm_state[batch_indices]
+
+        if (
+            cu_seqlens is not None             
+        ):
+            # Variable-length path: sequences are concatenated in one row (x.shape[0] == 1).
+            # Batch size = number of sequences from cu_seqlens; max_seqlen = max sequence length.                            
+            x = x.squeeze(0)
+            dt = dt.squeeze(0)
+            A = A.squeeze(0)
+            B = B.squeeze(0)
+            C = C.squeeze(0)
+            z = z.squeeze(0)
+            y = torch.empty_like(x)
+
+            # Calculate cu_chunk_seqlens using seq_idx and cu_seqlens
+            cu_chunk_seqlens = None
+            if seq_idx is not None and cu_seqlens is not None:
+                # seq_idx: shape (1, total_tokens), where seq_idx[0, i] maps token position i to the packed sequence index
+                # cu_seqlens: shape (num_sequences + 1), e.g. [0, 5, 7, 11, 16], where cu_seqlens[-1] == total_tokens
+                
+                # The number of sequences = cu_seqlens.numel() - 1 = N
+                # The output cu_chunk_seqlens should be a cumulative sum of the number of tokens in each sequence,
+                # i.e. same as cu_seqlens
+                cu_chunk_seqlens = cu_seqlens
+
+                # However, double check if seq_idx indicates any extra grouping, or if an extra entry is required:
+                # If seq_idx.max() + 1 > cu_seqlens.numel() - 1, then extra sequences
+                n_seq_from_seq_idx = int(seq_idx.max().item() + 1)
+                n_seq_from_cu = cu_seqlens.numel() - 1
+                if n_seq_from_seq_idx > n_seq_from_cu:
+                    # Need to extend cu_seqlens to include the rest of tokens counted in seq_idx
+                    # This can happen if the last part is treated as an extra seq
+                    cu_chunk_seqlens = torch.cat(
+                        [cu_seqlens, cu_seqlens.new_tensor([seq_idx.shape[1]])]
+                    )
+
+            # Kernel expects seq_idx of shape (nchunks,) — one sequence index per chunk.
+            # We have seq_idx of shape (1, total_tokens); take seq index at start of each chunk.
+            seq_idx_for_varlen = None
+            if seq_idx is not None and cu_chunk_seqlens is not None:
+                chunk_starts = cu_chunk_seqlens[:-1]
+                seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
+
+            ssm_varlen_states = mamba_chunk_scan_combined_varlen(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=self.chunk_size,
+                cu_seqlens=cu_seqlens,
+                cu_chunk_seqlens=cu_chunk_seqlens,
+                last_chunk_indices=None,
+                seq_idx=seq_idx_for_varlen,
+                out=y,
+                D=(
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.cp.get_D()
+                ),
+                z=z if not self.rmsnorm else None,
+                dt_bias=self.cp.get_dt_bias().float(),
+                initial_states=initial_ssm_state,
+                return_intermediate_states=False,
+                dt_softplus=True,
+                dt_limit=(0.0, float("inf")),
+                state_dtype=ssm_state.dtype,
+            )
+
+            y = y.unsqueeze(0)
+            z = z.unsqueeze(0)
+
+            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+                
         else:
-            initial_ssm_state = None
+            y = mamba_chunk_scan_combined(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.chunk_size,
+                D=(
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.cp.get_D()
+                ),
+                z=z if not self.rmsnorm else None,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                return_final_states=ssm_state is not None,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                return_varlen_states=return_varlen_states,
+                initial_states=initial_ssm_state,
+            )
 
-        # Note that both `seq_idx` and `cu_seqlens` must be passed in
-        # for variable length generation.
-        # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
-        y = mamba_chunk_scan_combined(
-            x,
-            dt,
-            A,
-            B,
-            C,
-            self.chunk_size,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
-            z=z if not self.rmsnorm else None,
-            dt_bias=self.cp.get_dt_bias().float(),
-            dt_softplus=True,
-            return_final_states=ssm_state is not None,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
-            return_varlen_states=return_varlen_states,
-            initial_states=initial_ssm_state,
-        )
+            if ssm_state is not None:
+                if return_varlen_states:
+                    assert batch_indices is not None
 
-        if ssm_state is not None:
-            if return_varlen_states:
-                assert batch_indices is not None
+                    y, _, ssm_varlen_states = y
 
-                y, _, ssm_varlen_states = y
-
-                # This has to be varlen_states, NOT last_state
-                # See reference implementation:
-                # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
-                tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
-            elif is_chunked_prefill:
-                assert batch_indices is not None
-                y, last_state = y
-                tensor_masked_update(ssm_state, batch_indices, last_state)
-            else:
-                y, last_state = y
-                ssm_state.copy_(last_state)
+                    # This has to be varlen_states, NOT last_state
+                    # See reference implementation:
+                    # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
+                    tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+                elif is_chunked_prefill:
+                    assert batch_indices is not None
+                    y, last_state = y
+                    tensor_masked_update(ssm_state, batch_indices, last_state)
+                else:
+                    y, last_state = y
+                    ssm_state.copy_(last_state)
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)
