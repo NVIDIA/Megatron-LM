@@ -320,11 +320,11 @@ class GatedDeltaNet(MegatronModule):
         # Convolution on qkv
         qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
-        if (causal_conv1d_fn is None) or self.config.deterministic_mode:
+        if (causal_conv1d is None) or self.config.deterministic_mode:
             qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
         else:
             assert self.activation in ["silu", "swish"]
-            qkv = causal_conv1d_fn(
+            qkv = causal_conv1d(
                 x=qkv,
                 weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
                 bias=self.conv1d.bias,
