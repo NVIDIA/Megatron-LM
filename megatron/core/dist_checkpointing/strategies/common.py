@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 def save_common(common_state_dict: StateDict, checkpoint_dir: Path):
     """Save common part of the state dict."""
     if torch.distributed.get_rank() == 0:
-        torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
+        torch.save(common_state_dict, Path(checkpoint_dir) / COMMON_STATE_FNAME)
 
 
 def load_common(checkpoint_dir: Path):
