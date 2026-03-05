@@ -46,12 +46,13 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
     # leaving inference_coordinator_port as None will find a free port automatically.
+    args = get_args()
+
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
+        coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
-
-    args = get_args()
 
     # Test suspend/resume intervals.
     if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
