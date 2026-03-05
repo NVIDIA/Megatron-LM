@@ -121,16 +121,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_world_range: Range,
         bucket_offset: int,
     ):
-        """
-        Build mapping from param reference to grad buffer shard ranges.
+        """Build mapping from param reference to grad buffer shard ranges.
 
-        Each grad buffer is conceptually divided into DP-world-size contiguous 
-        regions, where each DP rank 'owns' a region. This method creates 
-        mappings for four specific ranges:
-            - The param's range within the entire grad buffer (world index).
-            - The param's range within the relevant grad bucket's buffer.
-            - The param's range within the DP rank's local view of the grad buffer.
-            - The param's range within itself (its shard).
+        This method builds a mapping from parameter references to grad
+        buffer shard ranges, specific to each data-parallel (DP) rank's
+        set of 'owned' parameters. Each grad buffer (padded to be an even
+        multiple of DP-world-size) is conceptually divided into DP-world-size
+        contiguous regions, where each DP rank 'owns' a contiguous region.
+        Ownership in this sense means DP rank is responsible for reducing
+        the relevant subset of grads, and updating the relevant subset of
+        params.
+
+        This conceptual partitioning of the grad buffer does NOT respect
+        parameter boundaries, and as such it is assumed that each created
+        range references a shard (or subset) of the full parameter. It is
+        easiest to think of each DP rank as operating (i.e., reducing,
+        gathering) purely on views into the grad buffer, for all model-to-
+        main & main-to-model operations.
+
+        This method creates four ranges:
+          - gbuf_world: The param's range within the entire grad buffer (world index).
+          - gbuf_world_in_bucket: The param's range within the relevant grad bucket's buffer.
+          - gbuf_local: The param's range within the DP rank's local view of the grad buffer.
+          - param: The param's range within itself (i.e., its shard).
+
+        Args:
+            param_world_index_map (Dict): Mapping from parameter to its world indexes.
+            gbuf_world_range (Range): The range of the grad buffer owned by this rank.
+            bucket_offset (int): The offset of the current bucket within the grad buffer.
         """
 
         # Param range map.
@@ -213,9 +231,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        Iterate through all buckets of grad buffer to construct param ranges
-        that this rank "owns" (the dp_rank'th shard of each bucket, where each
-        shard is 1/dp_world_size of the bucket).
+        These mappings are partitioned according to data type. This method 
+        iterates through all buckets of a grad buffer to construct param 
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        where each shard is 1/dp_world_size of the bucket).
 
         Args:
             param_and_grad_buffer (_ParamAndGradBuffer): The buffer to map.
