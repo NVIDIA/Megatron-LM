@@ -345,6 +345,11 @@ def get_megatron_muon_optimizer(
         if reset_config_bf16:
             config.bf16 = True
         return LayerWiseDistributedOptimizer(
-            optimizers, config, pg_collection, init_state_fn_list=init_fns
+            optimizers,
+            config,
+            pg_collection,
+            init_state_fn_list=init_fns,
+            model_chunks=model_chunks,
+            async_allgather=config.overlap_param_gather,
         )
     return ChainedOptimizer(optimizers)
