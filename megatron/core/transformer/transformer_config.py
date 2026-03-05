@@ -721,10 +721,6 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
-    moe_use_legacy_grouped_gemm: bool = False
-    """Use legacy GroupedMLP rather than TEGroupedMLP.
-    Note: The legacy one will be deprecated soon."""
-
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -2103,9 +2099,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.overlap_moe_expert_parallel_comm
             ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
-            assert (
-                not self.moe_use_legacy_grouped_gemm
-            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
