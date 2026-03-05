@@ -267,7 +267,6 @@ class TestGPTModelKitchenQuantizationConfig:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             num_layers=2,
             hidden_size=12,
             num_attention_heads=4,
