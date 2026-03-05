@@ -100,7 +100,7 @@ async def run_flask_server(
     """Initializes and runs the async Flask server
     starting an InferenceClient with the provided coordinator address."""
     inference_client = InferenceClient(coordinator_addr)
-    await inference_client.start()
+    inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
         await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers, verbose)
