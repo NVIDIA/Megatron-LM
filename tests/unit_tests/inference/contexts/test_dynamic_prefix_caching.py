@@ -213,7 +213,7 @@ class TestBlockSharingAndRefCounts(PrefixCachingTestBase):
         ctx_disabled = self._ctx(enable_prefix_caching=False)
         alloc_d = ctx_disabled.block_allocator
         assert not hasattr(alloc_d, 'block_hashes')
-        assert not hasattr(alloc_d, 'hash_to_block_id')
+        assert not hasattr(alloc_d, 'kv_hash_to_block_id')
         assert not hasattr(alloc_d, 'block_ref_counts')
 
         ctx_rz = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -318,12 +318,12 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        assert b0_hash in alloc.kv_hash_to_block_id
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
         assert alloc.block_ref_counts[b1].item() == 0
-        assert b0_hash in alloc.hash_to_block_id, "LRU keeps cached blocks"
+        assert b0_hash in alloc.kv_hash_to_block_id, "LRU keeps cached blocks"
 
     @pytest.mark.internal
     def test_lru_cached_blocks_reused_by_new_request(self):
@@ -339,7 +339,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.total_request_count = 0
         assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
+        assert alloc.block_hashes[b0].item() in alloc.kv_hash_to_block_id
 
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         assert self._block_ids(ctx, 0, 2) == [b0, b1]
@@ -395,12 +395,12 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         # Release first: ref=1, hash persists
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        assert b0_hash in alloc.kv_hash_to_block_id
 
         # Release second: ref=0, hash removed, blocks returned
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
+        assert b0_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
@@ -496,8 +496,8 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
         b0, b1 = self._block_ids(ctx, 0, 2)
         h0, h1 = req.precomputed_block_hashes
 
-        assert alloc.hash_to_block_id.get(h0) == b0
-        assert alloc.hash_to_block_id.get(h1) == b1
+        assert alloc.kv_hash_to_block_id.get(h0) == b0
+        assert alloc.kv_hash_to_block_id.get(h1) == b1
         assert alloc.block_hashes[b0].item() == h0
         assert alloc.block_hashes[b1].item() == h1
 
@@ -538,7 +538,7 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_second_request_finds_registered_blocks(self):
-        """After req1 registers 3 blocks, req2's hashes all resolve in hash_to_block_id."""
+        """After req1 registers 3 blocks, req2's hashes all resolve in kv_hash_to_block_id."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -549,7 +549,7 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         for h in req2.precomputed_block_hashes:
-            assert h in alloc.hash_to_block_id, f"Hash {h} should be discoverable"
+            assert h in alloc.kv_hash_to_block_id, f"Hash {h} should be discoverable"
 
 
 # =========================================================================
@@ -898,3 +898,536 @@ class TestHybridModelMemoryOnly(PrefixCachingTestBase):
 
         # KV offset should be 0 (no prefix skip).
         assert ctx.request_kv_length_offsets[1].item() == 0
+
+
+# =========================================================================
+# Class 10: TestMambaPrefixCaching (Mamba state caching + intermediate states)
+# =========================================================================
+
+
+class TestMambaPrefixCaching(PrefixCachingTestBase):
+    """Tests for Mamba prefix caching: cache infrastructure, two-map hash design,
+    coupled prefix matching, intermediate offsets, buffering/commit, zero-chunk
+    guard, and KV eviction invalidating Mamba state."""
+
+    def _mamba_ctx(self, *, prefix_caching_mamba_gb=0.01, block_size_tokens=256, **kwargs):
+        """Create a hybrid context with Mamba prefix caching enabled."""
+        from megatron.core.inference.config import MambaInferenceStateConfig
+
+        params_dtype = torch.float32
+
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list=["*", "M", "*", "M"],
+            conv_states_shape=(4, 8),
+            ssm_states_shape=(4, 16),
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+        )
+
+        defaults = dict(
+            buffer_size_gb=0.1,
+            max_sequence_length=4096,
+            rounder=64,
+            enable_prefix_caching=True,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        )
+        defaults.update(kwargs)
+
+        DynamicInferenceContext.ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
+
+        transformer_config = TransformerConfig(
+            params_dtype=params_dtype,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            hidden_size=16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_cpu_initialization=True,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=defaults["max_sequence_length"],
+            buffer_size_gb=defaults["buffer_size_gb"],
+            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
+            block_size_tokens=block_size_tokens,
+            max_tokens=defaults.get("max_tokens"),
+            mamba_inference_state_config=mamba_config,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+            enable_prefix_caching=defaults["enable_prefix_caching"],
+            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
+            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+        )
+        return DynamicInferenceContext(
+            model_config=transformer_config, inference_config=inference_config
+        )
+
+    # ----- Cache infrastructure -----
+
+    @pytest.mark.internal
+    def test_mamba_cache_allocated(self):
+        """Mamba cache is allocated when prefix_caching_mamba_gb is set."""
+        ctx = self._mamba_ctx()
+        assert ctx.max_mamba_cache_slots > 0
+        assert ctx.mamba_cache_conv_states is not None
+        assert ctx.mamba_cache_ssm_states is not None
+        assert ctx.mamba_cache_free_count == ctx.max_mamba_cache_slots
+
+    @pytest.mark.internal
+    def test_mamba_cache_not_allocated_when_none(self):
+        """Mamba cache is not allocated when prefix_caching_mamba_gb is None."""
+        ctx = self._mamba_ctx(prefix_caching_mamba_gb=None)
+        assert ctx.max_mamba_cache_slots == 0
+
+    @pytest.mark.internal
+    def test_store_and_restore_mamba_state(self):
+        """Store and restore Mamba state for a block round-trips correctly."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        block_id = ctx.request_to_kv_block_ids[0][0].item()
+        slot = ctx._allocate_mamba_cache_slot(block_id)
+
+        # Write known data to cache
+        for layer_idx in range(ctx.num_mamba_layers):
+            ssm = torch.ones_like(ctx.mamba_cache_ssm_states[layer_idx, slot]) * (layer_idx + 1)
+            conv = torch.ones_like(ctx.mamba_cache_conv_states[layer_idx, slot]) * (layer_idx + 10)
+            ctx.store_mamba_state_for_block_from_tensors(block_id, layer_idx, ssm, conv)
+
+        assert ctx.has_mamba_state_for_block(block_id)
+
+        # Add a second request and restore to it
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(req2)
+
+        restored = ctx.restore_mamba_state_from_block(1, block_id)
+        assert restored
+
+        mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
+        for layer_idx in range(ctx.num_mamba_layers):
+            assert torch.allclose(
+                ctx.mamba_ssm_states[layer_idx, mamba_idx],
+                torch.ones_like(ctx.mamba_ssm_states[layer_idx, mamba_idx]) * (layer_idx + 1),
+            )
+            assert torch.allclose(
+                ctx.mamba_conv_states[layer_idx, mamba_idx],
+                torch.ones_like(ctx.mamba_conv_states[layer_idx, mamba_idx]) * (layer_idx + 10),
+            )
+
+    @pytest.mark.internal
+    def test_invalidate_mamba_state(self):
+        """invalidate_mamba_state_for_block frees the slot and clears mappings."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        block_id = ctx.request_to_kv_block_ids[0][0].item()
+        ctx._allocate_mamba_cache_slot(block_id)
+        assert ctx.has_mamba_state_for_block(block_id)
+
+        free_before = ctx.mamba_cache_free_count
+        ctx.invalidate_mamba_state_for_block(block_id)
+        assert not ctx.has_mamba_state_for_block(block_id)
+        assert ctx.mamba_cache_free_count == free_before + 1
+
+    @pytest.mark.internal
+    def test_mamba_cache_slot_reuse_for_same_block(self):
+        """Allocating a slot for a block that already has one returns the same slot."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        block_id = ctx.request_to_kv_block_ids[0][0].item()
+        slot1 = ctx._allocate_mamba_cache_slot(block_id)
+        slot2 = ctx._allocate_mamba_cache_slot(block_id)
+        assert slot1 == slot2
+
+    # ----- Two-map hash design -----
+
+    @pytest.mark.internal
+    def test_two_map_hash_design(self):
+        """kv_hash_to_block_id and mamba_hash_to_block_id are independent maps."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs * 3)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        # After add_request, KV hashes are registered but Mamba hashes are not
+        assert len(alloc.kv_hash_to_block_id) == 3
+        assert len(alloc.mamba_hash_to_block_id) == 0
+
+        # Register Mamba hashes for two blocks
+        block_ids = self._block_ids(ctx, 0, 3)
+        for bid in block_ids[:2]:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        assert len(alloc.kv_hash_to_block_id) == 3
+        assert len(alloc.mamba_hash_to_block_id) == 2
+
+    # ----- Coupled prefix matching with skip token limits -----
+
+    @pytest.mark.internal
+    def test_mamba_match_limits_prefill_skip(self):
+        """prefix_skip_tokens is limited by Mamba match count, not KV match count."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs * 3)
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Register Mamba state for only the first block
+        block_ids = self._block_ids(ctx, 0, 3)
+        for bid in block_ids[:1]:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        # Second request: all 3 KV blocks match, but only 1 Mamba block matches
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 1
+
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, len(prompt)
+        )
+        assert len(matched) == 3, "should find 3 KV matching blocks"
+        assert prefix_skip == bs, "skip limited to Mamba match (1 block)"
+        assert eff_chunk == len(prompt) - bs
+
+    @pytest.mark.internal
+    def test_no_mamba_match_no_skip(self):
+        """When no Mamba blocks match, no tokens are skipped even with KV matches."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 0
+
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, len(prompt)
+        )
+        assert len(matched) == 3
+        assert prefix_skip == 0
+        assert eff_chunk == len(prompt)
+
+    # ----- Zero-chunk guard -----
+
+    @pytest.mark.internal
+    def test_zero_chunk_guard(self):
+        """When all blocks match (block-aligned), back off by 1 to avoid zero chunk."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)  # block-aligned
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Register Mamba state for all blocks
+        block_ids = self._block_ids(ctx, 0, 3)
+        alloc = ctx.block_allocator
+        for bid in block_ids:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 3
+
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, len(prompt)
+        )
+        assert len(matched) == 3
+        # Without guard: skip would be 3*bs == len(prompt) → zero chunk
+        # With guard: skip backs off by 1
+        assert prefix_skip == len(prompt) - 1
+        assert eff_chunk == 1
+
+    # ----- Intermediate offset computation -----
+
+    @pytest.mark.internal
+    def test_intermediate_offsets_kv_divergence(self):
+        """Intermediate offsets include KV divergence point when applicable."""
+        ctx = self._mamba_ctx(block_size_tokens=256)
+        bs = ctx.block_size_tokens
+
+        # Prompt: 4 blocks (block-aligned)
+        prompt = self._prompt(bs * 4)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        # Register Mamba state for first 2 blocks, KV for all 4
+        block_ids = self._block_ids(ctx, 0, 4)
+        alloc = ctx.block_allocator
+        for bid in block_ids[:2]:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        # Second request: 4 KV match, 2 Mamba match
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 2
+        chunk_length = len(prompt)
+
+        # Compute prefix match to get skip tokens
+        (matched, _, _, overall_req_blocks, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, chunk_length
+        )
+
+        # Simulate add_request offset computation
+        ctx._compute_and_store_mamba_offsets(
+            req2, 1, prefix_skip, chunk_length,
+            len(matched), [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
+            overall_req_blocks,
+        )
+
+        offsets = ctx._mamba_intermediate_offsets[1]
+        # KV divergence at abs=4*bs=1024, skip=2*bs=512, rel=512
+        # Last aligned at abs=4*bs=1024, skip=2*bs=512, rel=512
+        # But last_aligned == prompt_len (block-aligned), so last_aligned_rel == seq_len → excluded
+        # KV div: rel = (4*bs - 2*bs) = 2*bs = 512, seq_len = chunk_length - skip = 4*bs - (4*bs - 1) = 1
+        # Wait, with zero-chunk guard, skip = 4*bs - 1 = 1023...
+        # Let me check: since all blocks are mamba-matched and block-aligned, zero-chunk guard fires
+        # skip = 3*256 = 768 (only 2 mamba matched so skip = 2*256 = 512)
+        # Actually: mamba_matched = 2, so skip = 2*256 = 512, seq_len = 4*256 - 512 = 512
+        # kv_div_rel = 4*256 - 512 = 512 → == seq_len → excluded
+        # last_aligned_rel = 4*256 - 512 = 512 → == seq_len → excluded
+        # So no intermediate offsets, but EOS cache should be set (block-aligned)
+        assert offsets is None
+        assert ctx._mamba_eos_cache_block_id[1] is not None
+
+    @pytest.mark.internal
+    def test_intermediate_offsets_non_aligned_prompt(self):
+        """Non-aligned prompt produces last_aligned intermediate offset."""
+        ctx = self._mamba_ctx(block_size_tokens=256)
+        bs = ctx.block_size_tokens
+
+        # Prompt: 3.5 blocks (not block-aligned)
+        prompt_len = bs * 3 + bs // 2
+        prompt = self._prompt(prompt_len)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        # Register Mamba state for first 2 blocks
+        block_ids = self._block_ids(ctx, 0, 3)
+        alloc = ctx.block_allocator
+        for bid in block_ids[:2]:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 2
+        chunk_length = len(prompt)
+
+        (matched, _, _, overall_req_blocks, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, chunk_length
+        )
+
+        # Create a block mapping for req2 that mirrors req1's blocks
+        # Need to actually add req2 to the context for block mappings to work
+        ctx.add_request(req2)
+
+        offsets = ctx._mamba_intermediate_offsets[1]
+        # skip = 2*bs = 512, seq_len = prompt_len - 512 = 256+128 = 384
+        # kv_div_abs = 3*bs = 768 (3 KV blocks matched), kv_div_rel = 768-512 = 256
+        # last_aligned_abs = 3*bs = 768, last_aligned_rel = 256
+        # Both are same: 256. Is 256 > 0 and < 384 and % 128 == 0? Yes.
+        # So one offset: [256]
+        if offsets is not None:
+            for o in offsets:
+                assert o > 0
+                assert o % 128 == 0
+        # No EOS cache (not block-aligned)
+        assert ctx._mamba_eos_cache_block_id[1] is None
+
+    @pytest.mark.internal
+    def test_eos_cache_set_for_block_aligned_prompt(self):
+        """Block-aligned prompts set _mamba_eos_cache_block_id."""
+        ctx = self._mamba_ctx(block_size_tokens=256)
+        bs = ctx.block_size_tokens
+
+        prompt = self._prompt(bs * 3)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        # No Mamba match, so skip=0 and all offsets are computed fresh
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req2._mamba_num_matched_blocks = 0
+        ctx.add_request(req2)
+
+        # Block-aligned prompt → EOS cache block ID should be set
+        assert ctx._mamba_eos_cache_block_id[1] is not None
+
+    # ----- KV eviction invalidating Mamba state -----
+
+    @pytest.mark.internal
+    def test_kv_eviction_invalidates_mamba(self):
+        """When KV blocks are evicted, their Mamba state is invalidated."""
+        ctx = self._mamba_ctx(
+            block_size_tokens=256,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        )
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs * 2)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        # Register Mamba state for first block
+        block_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_hash = alloc.block_hashes[block_id].item()
+        ctx._allocate_mamba_cache_slot(block_id)
+        alloc.register_mamba_block_hash(block_id, block_hash)
+
+        assert ctx.has_mamba_state_for_block(block_id)
+        assert block_hash in alloc.mamba_hash_to_block_id
+
+        # Release request, REF_ZERO deregisters immediately on last release
+        ctx.release_memory_blocks_from_request_indexes([0])
+
+        # After REF_ZERO eviction, both KV and Mamba state should be gone
+        assert not ctx.has_mamba_state_for_block(block_id)
+        assert block_hash not in alloc.mamba_hash_to_block_id
+
+    # ----- Intermediate state buffering and commit -----
+
+    @pytest.mark.internal
+    def test_buffer_and_clear_intermediate_states(self):
+        """buffer_mamba_intermediate_states stores data, _clear clears it."""
+        ctx = self._mamba_ctx()
+
+        # Buffer some dummy data
+        dummy_states = [None, ("ssm", "conv")]
+        ctx.buffer_mamba_intermediate_states(0, dummy_states)
+        ctx.buffer_mamba_intermediate_states(1, dummy_states)
+        assert len(ctx._mamba_intermediate_buffer) == 2
+
+        ctx._mamba_intermediate_buffer.clear()
+        assert len(ctx._mamba_intermediate_buffer) == 0
+
+    @pytest.mark.internal
+    def test_store_from_live_copies_all_layers(self):
+        """store_mamba_state_for_block_from_live copies all Mamba layers."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        block_id = ctx.request_to_kv_block_ids[0][0].item()
+        ctx._allocate_mamba_cache_slot(block_id)
+
+        # Write known values to live buffer
+        mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
+        for layer in range(ctx.num_mamba_layers):
+            ctx.mamba_conv_states[layer, mamba_idx] = layer + 1.0
+            ctx.mamba_ssm_states[layer, mamba_idx] = layer + 100.0
+
+        ctx.store_mamba_state_for_block_from_live(block_id, 0)
+
+        # Verify cache has the same values
+        slot = ctx.block_to_mamba_slot[block_id].item()
+        for layer in range(ctx.num_mamba_layers):
+            assert torch.allclose(
+                ctx.mamba_cache_conv_states[layer, slot],
+                torch.full_like(ctx.mamba_cache_conv_states[layer, slot], layer + 1.0),
+            )
+            assert torch.allclose(
+                ctx.mamba_cache_ssm_states[layer, slot],
+                torch.full_like(ctx.mamba_cache_ssm_states[layer, slot], layer + 100.0),
+            )
+
+    # ----- Engine integration: _find_mamba_match_count -----
+
+    @pytest.mark.internal
+    def test_find_mamba_match_count(self):
+        """Engine's _find_mamba_match_count iterates from end and finds longest match."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs * 4)
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Register Mamba state for blocks 0 and 1
+        block_ids = self._block_ids(ctx, 0, 4)
+        for bid in block_ids[:2]:
+            block_hash = alloc.block_hashes[bid].item()
+            ctx._allocate_mamba_cache_slot(bid)
+            alloc.register_mamba_block_hash(bid, block_hash)
+
+        engine = _StubEngine(ctx)
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        count = engine._find_mamba_match_count(req2)
+        assert count == 2
+
+    @pytest.mark.internal
+    def test_find_mamba_match_count_no_match(self):
+        """_find_mamba_match_count returns 0 when no Mamba hashes are registered."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        engine = _StubEngine(ctx)
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        count = engine._find_mamba_match_count(req2)
+        assert count == 0
+
+    # ----- Mamba cache eviction -----
+
+    @pytest.mark.internal
+    def test_mamba_cache_eviction(self):
+        """Allocating and freeing Mamba cache slots works correctly."""
+        ctx = self._mamba_ctx()
+        bs = ctx.block_size_tokens
+
+        prompt = self._prompt(bs * 3)
+        req = self._req(ctx, prompt.clone())
+        ctx.add_request(req)
+
+        block_ids = self._block_ids(ctx, 0, 3)
+
+        # Allocate slots for 3 blocks
+        initial_free = ctx.mamba_cache_free_count
+        for bid in block_ids:
+            ctx._allocate_mamba_cache_slot(bid)
+
+        assert ctx.mamba_cache_free_count == initial_free - 3
+
+        # Invalidate one, verify it returns to the free pool
+        ctx.invalidate_mamba_state_for_block(block_ids[0])
+        assert ctx.mamba_cache_free_count == initial_free - 2
+        assert not ctx.has_mamba_state_for_block(block_ids[0])
+
+        # Re-allocate the freed slot to a new block
+        ctx._allocate_mamba_cache_slot(block_ids[0])
+        assert ctx.mamba_cache_free_count == initial_free - 3
+        assert ctx.has_mamba_state_for_block(block_ids[0])

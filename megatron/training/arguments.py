@@ -1823,6 +1823,12 @@ def _add_inference_args(parser):
                        'block hash only. "longest_prefix" routes to the rank with '
                        'the longest matching prefix. "round_robin" ignores prefix '
                        'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=None,
+                       dest='inference_dynamic_batching_prefix_caching_mamba_gb',
+                       help='GPU memory budget (in GB) for the Mamba state cache '
+                       'used by prefix caching on hybrid models. When set, Mamba '
+                       'states at block boundaries are cached for reuse.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')

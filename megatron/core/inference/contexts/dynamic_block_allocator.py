@@ -58,7 +58,10 @@ class BlockAllocator:
             )
 
             # Hash-to-block mapping for O(1) prefix lookup
-            self.hash_to_block_id: Dict[int, int] = {}
+            self.kv_hash_to_block_id: Dict[int, int] = {}
+
+            # Mamba state hash-to-block mapping: only blocks with cached Mamba state
+            self.mamba_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
@@ -216,7 +219,8 @@ class BlockAllocator:
             self.block_hashes.fill_(-1)
 
             # Reset prefix caching state
-            self.hash_to_block_id.clear()
+            self.kv_hash_to_block_id.clear()
+            self.mamba_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -237,7 +241,16 @@ class BlockAllocator:
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
-        self.hash_to_block_id.update(zip(block_hashes, block_ids))
+        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+
+    def register_mamba_block_hash(self, block_id: int, block_hash: int) -> None:
+        """Register a block as having cached Mamba state.
+
+        Args:
+            block_id: The block ID.
+            block_hash: The block's hash value.
+        """
+        self.mamba_hash_to_block_id[block_hash] = block_id
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -255,11 +268,22 @@ class BlockAllocator:
         block_ids_i64 = block_ids.to(torch.int64)
         hashes = self.block_hashes[block_ids_i64].tolist()
 
-        # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
+        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
         deque(
-            map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0
+            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
+            maxlen=0,
         )
+
+        # Also deregister from mamba hash map and invalidate mamba cache
+        if self.mamba_hash_to_block_id:
+            mamba_keys = keys_to_delete & self.mamba_hash_to_block_id.keys()
+            if mamba_keys:
+                deque(map(self.mamba_hash_to_block_id.pop, mamba_keys), maxlen=0)
+                # Invalidate mamba cache slots for evicted blocks
+                block_ids_list = block_ids.tolist()
+                for bid in block_ids_list:
+                    self.context.invalidate_mamba_state_for_block(bid)
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1

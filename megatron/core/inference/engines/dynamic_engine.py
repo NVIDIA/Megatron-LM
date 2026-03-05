@@ -1213,6 +1213,21 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
+        """Find longest Mamba prefix match by iterating block hashes from the end.
+
+        Parent-chained hashes guarantee: if hash at position N exists in
+        mamba_hash_to_block_id, all hashes 0..N also exist. So the first
+        match from the end gives the longest prefix.
+        """
+        if not req.precomputed_block_hashes:
+            return 0
+        mamba_map = self.context.block_allocator.mamba_hash_to_block_id
+        for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
+            if req.precomputed_block_hashes[i] in mamba_map:
+                return i + 1
+        return 0
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
@@ -1225,6 +1240,12 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        mamba_caching_enabled = (
+            prefix_caching_enabled
+            and self.context.is_hybrid_model
+            and hasattr(self.context, 'max_mamba_cache_slots')
+            and self.context.max_mamba_cache_slots > 0
+        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1243,6 +1264,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(self.waiting_request_ids.popleft())
                     continue
 
+            # Find Mamba prefix match before check_availability (sets skip count)
+            if mamba_caching_enabled:
+                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
@@ -1250,7 +1275,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                        if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1282,6 +1307,12 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        mamba_caching_enabled = (
+            prefix_caching_enabled
+            and self.context.is_hybrid_model
+            and hasattr(self.context, 'max_mamba_cache_slots')
+            and self.context.max_mamba_cache_slots > 0
+        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1309,6 +1340,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     continue
 
+            # Find Mamba prefix match for non-continuing requests
+            if mamba_caching_enabled and not is_continuing_chunked_prefill:
+                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
             token_fully_can_be_added = (
@@ -1323,7 +1358,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
@@ -1340,7 +1375,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
 
@@ -1412,6 +1447,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
+
+        # Commit Mamba intermediate states after forward pass
+        if (
+            not is_decode_only
+            and self.context.is_hybrid_model
+            and hasattr(self.context, 'max_mamba_cache_slots')
+            and self.context.max_mamba_cache_slots > 0
+        ):
+            self.context.commit_mamba_intermediate_states()
 
         range_pop()
 
