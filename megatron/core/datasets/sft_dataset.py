@@ -163,18 +163,16 @@ class SFTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
-        tokens, _, lengths = self._query_document_sample_shuffle_indices(idx)
+        tokens, labels, lengths = self._query_document_sample_shuffle_indices(idx)
 
         tokens = torch.from_numpy(tokens).long()
         cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(torch.from_numpy(lengths), dim = 0))).to(torch.int32) # NOTE(asolergi-nv): torch.cumsum promotes int32 to int64
-        position_ids = torch.arange(tokens.shape[0], dtype=torch.long) # TODO(asolergi-nv): Create position_ids from lengths
         
         # TODO(asolergi-nv): Create labels, remember self.config.train_on_completitions_only
 
         return {
             'tokens': tokens[:-1].contiguous(),
             'labels': tokens[1:].contiguous(),
-            'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
         }
     def _query_document_sample_shuffle_indices(

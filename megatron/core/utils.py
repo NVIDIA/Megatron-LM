@@ -2161,6 +2161,10 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
         loss_mask[labels == padding_token_id] = 0.0  # NOTE(asolergi-nv): Mask paddings
         loss_mask[labels == padding_label_id] = 0.0  # NOTE(asolergi-nv): Mask prompts 
         # print(f"Trained tokens: {sum(loss_mask)} ({sum(loss_mask) / max_seq_len * 100:.2f}%), padding tokens: {sum(tokens == padding_token_id)} ({sum(tokens == padding_token_id) / max_seq_len * 100:.2f}%)")
+
+        # Position ids.
+        seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        position_ids = torch.cat([torch.arange(length) for length in seg_lengths])
         
         # NOTE(asolergi-nv): max_seqlen is computed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L423-L429
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
@@ -2173,7 +2177,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             'tokens': tokens.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
-            'position_ids': torch.arange(max_seq_len, dtype=torch.int64).unsqueeze(0), # batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
+            'position_ids': position_ids.unsqueeze(0), # batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
             'max_seqlen': max_seqlen,
