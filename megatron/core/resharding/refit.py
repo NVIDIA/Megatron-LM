@@ -3,6 +3,7 @@ from __future__ import annotations
 
 """
 High-level refit/reshard orchestration:
+- prepare_swap_model_weights: build and cache the reshard plan without any transfer.
 - swap_model_weights: public API; accepts a backend name or CopyService and delegates.
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
@@ -157,6 +158,93 @@ def clear_all_caches():
     clear_plan_cache()
 
 
+def _unwrap_model_cores(src_model, target_model):
+    """Extract (src_core, tgt_core, num_experts) from model arguments.
+
+    Handles list-wrapped modules and None (non-collocated) models.
+    Fills in missing DP groups from Megatron's parallel state on the source.
+
+    Returns:
+        (src_core, tgt_core, num_experts)
+    """
+    src_core = None
+    tgt_core = None
+    num_experts = None
+
+    if src_model is not None:
+        src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
+        num_experts = src_lm.config.num_moe_experts
+        src_core = unwrap_model(src_lm)
+        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
+            raise RuntimeError("Source model missing pg_collection required for reshard")
+        # Fill missing DP group on the source using Megatron's parallel state if not provided
+        if getattr(src_core.pg_collection, "dp", None) is None:
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+
+    if target_model is not None:
+        tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
+        if num_experts is None:
+            num_experts = tgt_lm.config.num_moe_experts
+        tgt_core = unwrap_model(tgt_lm)
+        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+            raise RuntimeError("Target model missing pg_collection required for reshard")
+
+    return src_core, tgt_core, num_experts
+
+
+def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset):
+    """Return the cached reshard plan, building it (collectively) if not yet cached.
+
+    All participating ranks must call this simultaneously when the plan is not
+    yet cached, because build_centralized_reshard_plan uses collective communication.
+    """
+    global _plan_cache
+    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
+    if cache_key not in _plan_cache:
+        _plan_cache[cache_key] = build_centralized_reshard_plan(
+            src_core,
+            tgt_core,
+            num_experts=num_experts,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
+        )
+    return _plan_cache[cache_key]
+
+
+def prepare_swap_model_weights(
+    src_model: LanguageModule,
+    target_model: LanguageModule,
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
+):
+    """Pre-build and cache the reshard plan without executing any weight transfer.
+
+    Call this during initialization while models are in their native (BF16) format,
+    before any weight format conversion (e.g., MXFP8).  The plan is stored in the
+    same module-level cache as swap_model_weights, so subsequent calls reuse it
+    without needing to inspect named_parameters() again.
+
+    All participating ranks must call this simultaneously — the plan builder uses
+    collective communication internally.
+
+    This is particularly important when destination weights will be converted to a
+    format that hides parameters from named_parameters() (such as MXFP8 tensors
+    stored in module.__dict__ instead of _parameters).  Building the plan before
+    conversion ensures all parameters are visible to the planner.
+
+    Args:
+        src_model: Source model, or None if this rank only receives weights.
+        target_model: Target model, or None if this rank only sends weights.
+        group: Optional process group for collective communication.
+        src_rank_offset: Rank offset for source (training) workers.
+        dst_rank_offset: Rank offset for destination (inference) workers.
+    """
+    src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+    _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset)
+
+
 def swap_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
@@ -223,74 +311,11 @@ def reshard_model_weights(
         src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
             in independent torch.distributed worlds.
     """
-    global _plan_cache
-
-    # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        cache_key = _build_plan_cache_key(
-            src_core=None, tgt_core=None, num_experts=None, group=group
-        )
-
-        # Use cached plan if available, otherwise build (with collective participation)
-        if cache_key not in _plan_cache:
-            plan = build_centralized_reshard_plan(
-                None,
-                None,
-                num_experts=None,
-                group=group,
-                src_rank_offset=src_rank_offset,
-                dst_rank_offset=dst_rank_offset,
-            )
-            _plan_cache[cache_key] = plan
-        else:
-            plan = _plan_cache[cache_key]
+        plan = _build_or_get_plan(None, None, None, group, src_rank_offset, dst_rank_offset)
         execute_reshard_plan(plan, None, None, service=service, group=group, transform=transform)
         return
 
-    # Handle None models - extract core modules only from non-None models
-    src_core = None
-    tgt_core = None
-    num_experts = None
-
-    if src_model is not None:
-        # Handle list-wrapped modules
-        src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        num_experts = src_lm.config.num_moe_experts
-        # Unwrap to get owning modules (with parameters and pg_collection)
-        src_core = unwrap_model(src_lm)
-        # Ensure pg_collection exists
-        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-            raise RuntimeError("Source model missing pg_collection required for reshard")
-        # Fill missing DP group on the source using Megatron's parallel state if not provided
-        if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
-
-    if target_model is not None:
-        # Handle list-wrapped modules
-        tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        if num_experts is None:
-            num_experts = tgt_lm.config.num_moe_experts
-        # Unwrap to get owning modules (with parameters and pg_collection)
-        tgt_core = unwrap_model(tgt_lm)
-        # Ensure pg_collection exists
-        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
-            raise RuntimeError("Target model missing pg_collection required for reshard")
-
-    # Build or retrieve cached plan
-    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
-
-    if cache_key not in _plan_cache:
-        # All ranks must participate in planning (collective operations)
-        plan = build_centralized_reshard_plan(
-            src_core,
-            tgt_core,
-            num_experts=num_experts,
-            group=group,
-            src_rank_offset=src_rank_offset,
-            dst_rank_offset=dst_rank_offset,
-        )
-        _plan_cache[cache_key] = plan
-    else:
-        plan = _plan_cache[cache_key]
-
+    src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+    plan = _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset)
     execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group, transform=transform)

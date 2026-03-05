@@ -270,6 +270,11 @@ class MXFP8ReshardTransform(ReshardTransform):
         self.persistent_buffers = persistent_buffers
         self.buffer_key_prefix = buffer_key_prefix
         self.convert_on_send = convert_on_send
+        # Accumulation buffers for 1D-scale params that arrive in partial slices.
+        # The 1D swizzled FlashInfer scale can't be updated partially; we collect
+        # all BF16 slices here and quantize the full weight once it's assembled.
+        # Maps buf_key -> (full-size BF16 accumulation tensor, elements written so far).
+        self._pending_1d: dict = {}
 
     def should_transform(self, param_name: str) -> bool:
         return param_name in self.convertible_params
@@ -297,14 +302,17 @@ class MXFP8ReshardTransform(ReshardTransform):
         if self.convert_on_send:
             # Receive MXFP8 data + scale (2 buffers).
             if buf.scale.ndim == 1:
-                # Flat 1D scale (swizzled FlashInfer format): allocate the full scale buffer.
-                scale_recv_buf = torch.empty_like(buf.scale.contiguous())
-            else:
-                scale_slice = _scale_slice_from_data_slice(dst_slice)
-                scale_recv_buf = torch.empty_like(buf.scale[scale_slice].contiguous())
+                # 1D swizzled scale can't be partially reconstructed from sender-quantized
+                # slices.  Use convert_on_send=False for models with 1D-scale params.
+                raise NotImplementedError(
+                    f"convert_on_send=True is not supported for parameters with 1D swizzled "
+                    f"scale (param={param_name!r}).  Use convert_on_send=False instead, which "
+                    f"receives BF16 and quantizes the full weight on the receiver."
+                )
+            scale_slice = _scale_slice_from_data_slice(dst_slice)
             return [
                 torch.empty_like(buf.data[dst_slice].contiguous()),
-                scale_recv_buf,
+                torch.empty_like(buf.scale[scale_slice].contiguous()),
             ]
         else:
             # Receive BF16 (1 buffer, same shape as the MXFP8 data slice).
@@ -315,24 +323,38 @@ class MXFP8ReshardTransform(ReshardTransform):
         buf_key = param_name.removeprefix(self.buffer_key_prefix)
         buf = self.persistent_buffers[buf_key]
 
-        if self.convert_on_send:
-            # Already MXFP8 — direct copy.
-            buf.data[dst_slice].copy_(recv_buffers[0])
-            if buf.scale.ndim == 1:
-                # Flat 1D scale (swizzled FlashInfer format): copy the full scale.
-                buf.scale.copy_(recv_buffers[1])
-            else:
-                scale_slice = _scale_slice_from_data_slice(dst_slice)
-                buf.scale[scale_slice].copy_(recv_buffers[1])
-        else:
-            # Convert received BF16 → MXFP8, then copy into persistent buffers.
-            from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
+        if self.convert_on_send:
+            # Already MXFP8 on the wire — copy data and 2D scale slices directly.
+            # (1D scale is rejected at prepare_recv time, so only 2D reaches here.)
+            buf.data[dst_slice].copy_(recv_buffers[0])
+            scale_slice = _scale_slice_from_data_slice(dst_slice)
+            buf.scale[scale_slice].copy_(recv_buffers[1])
+        elif buf.scale.ndim == 1:
+            # 1D swizzled scale (FlashInfer format) encodes scale values across the
+            # full weight tensor; partial updates would corrupt the swizzle layout.
+            # Accumulate BF16 slices and quantize once all slices are assembled.
+            if buf_key not in self._pending_1d:
+                # Use zeros so that any un-filled slice produces zeros rather than garbage.
+                self._pending_1d[buf_key] = [
+                    torch.zeros_like(buf.data, dtype=torch.bfloat16),
+                    0,  # elements written so far
+                ]
+            accum, written = self._pending_1d[buf_key]
+            accum[dst_slice].copy_(recv_buffers[0])
+            written += recv_buffers[0].numel()
+            if written >= buf.data.numel():
+                mxfp8 = MXFP8Tensor.from_bf16(accum)
+                buf.data.copy_(mxfp8.data)
+                buf.scale.copy_(mxfp8.scale)
+                del self._pending_1d[buf_key]
+            else:
+                self._pending_1d[buf_key][1] = written
+        else:
+            # 2D scale: each scale row covers exactly one data row, so partial
+            # row-wise updates are independent and can be applied immediately.
             mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0])
             buf.data[dst_slice].copy_(mxfp8.data)
-            if buf.scale.ndim == 1:
-                # Flat 1D scale (swizzled FlashInfer format): copy the full scale.
-                buf.scale.copy_(mxfp8.scale)
-            else:
-                scale_slice = _scale_slice_from_data_slice(dst_slice)
-                buf.scale[scale_slice].copy_(mxfp8.scale)
+            scale_slice = _scale_slice_from_data_slice(dst_slice)
+            buf.scale[scale_slice].copy_(mxfp8.scale)
