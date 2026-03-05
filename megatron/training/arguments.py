@@ -1437,6 +1437,17 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+        if args.muon_scale_mode is None:
+            if args.use_mup:
+                args.muon_scale_mode = 'unit_rms_norm'
+                warn_rank_0(
+                    "Muon+MuP detected and --muon-scale-mode was not set explicitly; "
+                    "switched muon_scale_mode to unit_rms_norm for MuP-principled scaling. "
+                    "Set --muon-scale-mode spectral explicitly if you want Adam-transfer-style behavior."
+                )
+            else:
+                args.muon_scale_mode = 'spectral'
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2168,9 +2179,11 @@ def _add_regularization_args(parser):
                        help='Whether to split QKV parameters for Muon optimizer')
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
-    group.add_argument('--muon-scale-mode', type=str, default='spectral',
+    group.add_argument('--muon-scale-mode', type=str, default=None,
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer')
+                       help='Scale mode for Muon optimizer. If not set, default is spectral. '
+                       'When MuP is enabled with Muon and this flag is not explicitly set, '
+                       'Megatron switches to unit_rms_norm for MuP-principled scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
