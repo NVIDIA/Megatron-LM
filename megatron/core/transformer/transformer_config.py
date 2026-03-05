@@ -446,7 +446,7 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
-    fused_residual_rmsnorm: bool = False
+    """If True, fuses residual connection and RMSNorm when TE is used."""
     """If True, uses fuses residual connection and RMSNorm when TE is used."""
 
     ####################
