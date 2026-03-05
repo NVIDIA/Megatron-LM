@@ -2173,7 +2173,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             'tokens': tokens.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
-            'position_ids': batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
+            'position_ids': torch.arange(max_seq_len, dtype=torch.int64, device=tokens.device).unsqueeze(0), # batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
             'max_seqlen': max_seqlen,

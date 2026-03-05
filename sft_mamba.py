@@ -42,7 +42,8 @@ from megatron.training import (
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.datasets.sft_dataset import SFTDataset, IGNORE_INDEX
+from megatron.training.datasets.sft_dataset import IGNORE_INDEX
+from megatron.core.datasets.sft_dataset import SFTDataset, SFTDatasetConfig
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -202,7 +203,7 @@ def forward_step(data_iterator, model: MambaModel):
 
     timers('batch-generator').stop()
 
-    print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.squeeze(0).shape}, cu_seqlens_padded: {cu_seqlens_padded.squeeze(0).shape}, max_seqlen: {max_seqlen.shape}")
+    # print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.squeeze(0).shape}, cu_seqlens_padded: {cu_seqlens_padded.squeeze(0).shape}, max_seqlen: {max_seqlen.shape}")
     # Shapes! tokens: torch.Size([1, 16384]), labels: torch.Size([1, 16384]), loss_mask: torch.Size([1, 16384]), cu_seqlens: torch.Size([2]), cu_seqlens_padded: torch.Size([2]), max_seqlen: torch.Size([1])
     # Shapes! tokens: [batch, seq_len // CP], labels: [batch, seq_len // CP], loss_mask: [batch, seq_len // CP], cu_seqlens: [Number of sequences], cu_seqlens_padded: [Number of sequences], max_seqlen: [1]  
     
@@ -237,12 +238,7 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-    sequences_per_dataset = None
-    if args.per_dataset_sequences_path is not None:
-        with open(args.per_dataset_sequences_path, "r") as f:
-            sequences_per_dataset = json.load(f)
-
-    return GPTDatasetConfig(
+    return SFTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=blend,
@@ -259,9 +255,7 @@ def core_gpt_dataset_config_from_args(args):
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-        fast_cache_load=args.dataloader_fast_cache_load,
-        sequences_per_dataset=sequences_per_dataset,
-        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        fast_cache_load=False,
         context_parallel_size=args.context_parallel_size,
     )
 
