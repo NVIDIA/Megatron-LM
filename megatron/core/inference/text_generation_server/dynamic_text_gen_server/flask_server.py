@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+    # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 import logging
@@ -92,14 +92,8 @@ async def run_flask_server_on_client(
         logger.info(f"Using tokenizer: {type(tokenizer)}")
         logger.info(f"Using parsers: {parsers}")
 
-    try:
-        await serve(
-            AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size),
-            config,
-            shutdown_trigger=shutdown_event.wait if shutdown_event else None,
-        )
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
+    await serve(AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size), config, shutdown_trigger=lambda: asyncio.Future())
 
 
 @trace_async_exceptions
