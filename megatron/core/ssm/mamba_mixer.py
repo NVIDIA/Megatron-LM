@@ -25,6 +25,8 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -45,20 +47,11 @@ from megatron.core.utils import (
 from .mamba_context_parallel import MambaContextParallel
 
 try:
-    # from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-    from megatron.core.ssm.ops.mamba_ssm import selective_state_update
-except ImportError:
-    selective_state_update = None
-
-try:
-    # from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
-    from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -463,8 +456,6 @@ class MambaMixer(MegatronModule):
             zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
 
             # Reshape from [N*S, 1, d] to [N, S, d] for the 3D Triton kernels
-            # if self.layer_number == 1:
-            # torch.distributed.breakpoint(0)
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
 
             # Get sequence lengths for the circular buffer calculation
@@ -968,6 +959,7 @@ class MambaMixer(MegatronModule):
 
         # Conv step
         if causal_conv1d_update is None:
+            # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
             xBC_squeeze = xBC.squeeze(1)
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
@@ -1007,6 +999,7 @@ class MambaMixer(MegatronModule):
 
         # SSM step
         if selective_state_update is None:
+            # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
 
             x = x.squeeze(1)
