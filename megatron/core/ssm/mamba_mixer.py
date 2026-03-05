@@ -827,7 +827,11 @@ class MambaMixer(MegatronModule):
             # allocate per-chunk output arrays of size chunk_size, so passing
             # cu_seqlens directly would cause out-of-bounds memory access when
             # any sequence exceeds chunk_size (default 128) tokens.
+            # Also build last_chunk_indices: the index of the last chunk for
+            # each sequence, used to extract final SSM states directly from
+            # the states tensor without a separate kernel call.
             chunk_boundaries = [0]
+            last_chunk_indices = []
             num_seqs = cu_seqlens.numel() - 1
             for i in range(num_seqs):
                 start = cu_seqlens[i].item()
@@ -837,7 +841,9 @@ class MambaMixer(MegatronModule):
                     chunk_boundaries.append(pos)
                     pos += self.chunk_size
                 chunk_boundaries.append(end)
+                last_chunk_indices.append(len(chunk_boundaries) - 2)
             cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
+            last_chunk_indices = cu_seqlens.new_tensor(last_chunk_indices)
 
             seq_idx_for_varlen = None
             if seq_idx is not None:
@@ -851,9 +857,8 @@ class MambaMixer(MegatronModule):
                 B=B,
                 C=C,
                 chunk_size=self.chunk_size,
-                cu_seqlens=cu_seqlens,
                 cu_chunk_seqlens=cu_chunk_seqlens,
-                last_chunk_indices=None,
+                last_chunk_indices=last_chunk_indices,
                 seq_idx=seq_idx_for_varlen,
                 out=y,
                 D=(

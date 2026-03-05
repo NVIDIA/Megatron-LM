@@ -13,7 +13,6 @@ from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import (
     _chunk_cumsum_fwd,
     _chunk_state_fwd,
-    chunk_state_varlen,
 )
 from .ssd_state_passing import _state_passing_fwd
 
@@ -38,7 +37,6 @@ def _mamba_chunk_scan_combined_fwd(
     initial_states=None,
     return_intermediate_states=False,
     seq_idx=None,
-    cu_seqlens=None,
     cu_chunk_seqlens=None,
     last_chunk_indices=None,
     dt_softplus=False,
@@ -73,10 +71,12 @@ def _mamba_chunk_scan_combined_fwd(
         z = z.contiguous()
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
-    assert cu_seqlens is not None, "Assuming varlen input - must supply cu_seqlens"
+    assert cu_chunk_seqlens is not None, "Assuming varlen input - must supply cu_chunk_seqlens"
+    assert last_chunk_indices is not None, "last_chunk_indices must be provided"
 
     if initial_states is not None:
-        assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim, dstate)
+        num_seqs = last_chunk_indices.shape[0]
+        assert initial_states.shape == (num_seqs, nheads, headdim, dstate)
 
     # This function executes 5 sub-functions for computing mamba
     # - a good resource is the blog https://goombalab.github.io/blog/2024/mamba2-part3-algorithm/
@@ -154,18 +154,9 @@ def _mamba_chunk_scan_combined_fwd(
     if return_intermediate_states:
         return states
     else:
-        # Per-sequence final state at exact last token (correct when sequences share chunks)
-        return chunk_state_varlen(
-            B,
-            x,
-            dt,
-            dA_cumsum,
-            cu_seqlens,
-            states,
-            initial_states=initial_states,
-            last_chunk_indices=last_chunk_indices,
-            cu_chunk_seqlens=cu_chunk_seqlens,
-        )
+        # With chunk-aligned sequences (one sequence per chunk), the final
+        # state for each sequence is simply the state at its last chunk.
+        return states[last_chunk_indices]
 
 
 def mamba_chunk_scan_combined_varlen(
@@ -175,7 +166,6 @@ def mamba_chunk_scan_combined_varlen(
     B,
     C,
     chunk_size,
-    cu_seqlens,
     cu_chunk_seqlens,
     last_chunk_indices,
     seq_idx,
@@ -197,7 +187,6 @@ def mamba_chunk_scan_combined_varlen(
         B: (seqlen, ngroups, dstate)
         C: (seqlen, ngroups, dstate)
         chunk_size: int
-        cu_seqlens: (batch + 1,)
         cu_chunk_seqlens: (nchunks + 1,)
         last_chunk_indices: (batch,)
         seq_idx: (nchunks,)
@@ -213,7 +202,6 @@ def mamba_chunk_scan_combined_varlen(
         varlen_states: (batch, nheads, headdim, dstate)
     """
 
-    assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
     assert seq_idx is not None
 
     varlen_states = _mamba_chunk_scan_combined_fwd(
@@ -230,7 +218,6 @@ def mamba_chunk_scan_combined_varlen(
         initial_states=initial_states,
         return_intermediate_states=return_intermediate_states,
         seq_idx=seq_idx,
-        cu_seqlens=cu_seqlens,
         cu_chunk_seqlens=cu_chunk_seqlens,
         last_chunk_indices=last_chunk_indices,
         dt_softplus=dt_softplus,

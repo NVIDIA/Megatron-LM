@@ -49,8 +49,6 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
         self.ngroups = 2
         self.dstate = 8
         self.batch = 2
-        # cu_seqlens: [0, 16, 32] -> two sequences of length 16 each
-        self.cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device=self.device)
         # 2 chunks of 16 each
         self.cu_chunk_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device=self.device)
         # last chunk index per sequence: seq0 ends in chunk 0, seq1 ends in chunk 1
@@ -73,7 +71,6 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
             B=B,
             C=C,
             chunk_size=self.chunk_size,
-            cu_seqlens=self.cu_seqlens,
             cu_chunk_seqlens=self.cu_chunk_seqlens,
             last_chunk_indices=self.last_chunk_indices,
             seq_idx=self.seq_idx,
@@ -102,7 +99,6 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
             B=B,
             C=C,
             chunk_size=self.chunk_size,
-            cu_seqlens=self.cu_seqlens,
             cu_chunk_seqlens=self.cu_chunk_seqlens,
             last_chunk_indices=self.last_chunk_indices,
             seq_idx=self.seq_idx,
@@ -115,8 +111,7 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
         self.assertFalse(torch.isnan(out).any())
 
     def test_mamba_chunk_scan_combined_varlen_single_sequence(self):
-        """Single sequence: cu_seqlens [0, 32], one sequence of 32."""
-        cu_seqlens = torch.tensor([0, 32], dtype=torch.int32, device=self.device)
+        """Single sequence of 32 tokens, split into 2 chunks of 16."""
         cu_chunk_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device=self.device)
         last_chunk_indices = torch.tensor([1], dtype=torch.int64, device=self.device)
         seq_idx = torch.tensor([0, 0], dtype=torch.int32, device=self.device)
@@ -135,7 +130,6 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
             B=B,
             C=C,
             chunk_size=self.chunk_size,
-            cu_seqlens=cu_seqlens,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
             seq_idx=seq_idx,
