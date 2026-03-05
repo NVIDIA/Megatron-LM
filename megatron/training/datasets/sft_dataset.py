@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import atexit, json
+import zlib
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -44,8 +45,8 @@ class SFTLowLevelDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+    def __getitem__(self, idx: int) -> dict:
+        return self.dataset[idx]
 
 
 class SFTDataset(MegatronDataset):
@@ -93,8 +94,11 @@ class SFTDataset(MegatronDataset):
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
+        raw_sample = self.dataset[int(self.indices[idx % len(self.indices)])]
+        merged_conversations = raw_sample["messages"]
         split_conversations = self._split_conversations(merged_conversations)
+        sample_type_str = str(raw_sample.get("type", "unknown")) if isinstance(raw_sample, dict) else "unknown"
+        sample_type_id = 0 if sample_type_str == "unknown" else zlib.crc32(sample_type_str.encode("utf-8"))
 
         def extend_with_padding(tokens, targets, positions, pad_len):
             tokens.extend([pad] * pad_len)
@@ -189,4 +193,6 @@ class SFTDataset(MegatronDataset):
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
+            'sample_type': torch.tensor(sample_type_id, dtype=torch.int64),
+            'sample_indices': torch.tensor(int(self.indices[idx % len(self.indices)]), dtype=torch.int64),
         }

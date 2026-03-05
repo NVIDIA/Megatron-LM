@@ -560,6 +560,16 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 if "local_cp_size" not in data
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
+            'sample_type': (
+                data["sample_type"].cuda(non_blocking=True)
+                if "sample_type" in data
+                else torch.zeros(data["tokens"].shape[0], dtype=torch.int64, device=torch.cuda.current_device())
+            ),
+            'sample_indices': (
+                data["sample_indices"].cuda(non_blocking=True)
+                if "sample_indices" in data
+                else torch.full((data["tokens"].shape[0],), -1, dtype=torch.int64, device=torch.cuda.current_device())
+            ),
         }
 
         def _broadcast_cu_seqlens(cu_seqlens):
@@ -590,6 +600,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
             _broadcast(batch['local_cp_size'])
+            _broadcast(batch['sample_type'])
+            _broadcast(batch['sample_indices'])
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
@@ -597,6 +609,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
+            _broadcast(batch['sample_type'])
+            _broadcast(batch['sample_indices'])
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -605,6 +619,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            _broadcast(batch['sample_type'])
+            _broadcast(batch['sample_indices'])
 
     else:
         if args.hybrid_context_parallel:
@@ -658,6 +674,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             dtype=torch.int32,
             device=torch.cuda.current_device(),
         ) if args.hybrid_context_parallel else None
+        sample_type = torch.empty(args.micro_batch_size, dtype=torch.int64, device=torch.cuda.current_device())
+        sample_indices = torch.empty(args.micro_batch_size, dtype=torch.int64, device=torch.cuda.current_device())
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
@@ -683,6 +701,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
             _broadcast(local_cp_size)
+            _broadcast(sample_type)
+            _broadcast(sample_indices)
 
         elif mpu.is_pipeline_first_stage():
             labels = None
@@ -693,6 +713,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
+            _broadcast(sample_type)
+            _broadcast(sample_indices)
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -706,6 +728,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+            _broadcast(sample_type)
+            _broadcast(sample_indices)
 
         batch = {
             'tokens': tokens,
@@ -716,6 +740,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
+            'sample_type': sample_type,
+            'sample_indices': sample_indices,
         }
 
     return batch
