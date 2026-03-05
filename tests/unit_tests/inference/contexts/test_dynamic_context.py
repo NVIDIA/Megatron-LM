@@ -919,6 +919,11 @@ class TestDynamicContext:
         for i in range(3):
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
+            dynamic_context.request_last_kv_block_id[i] = dynamic_context.request_to_kv_block_ids[
+                i, dynamic_context.request_kv_block_counts[i] - 1
+            ]
+            dynamic_context.request_last_kv_block_offset[i] = 0
+            dynamic_context.request_in_prefill_status_tensor[i] = 0
             if is_hybrid_model:
                 dynamic_context.mamba_conv_states[:, i, :, :].fill_(float(i + 1))
                 dynamic_context.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
@@ -1733,6 +1738,7 @@ class TestDynamicContext:
             enable_chunked_prefill=True,
         )
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        ctx.reset_tensors()
 
         # Setup a request that is already mid-chunked-prefill
         ctx.total_request_count = 1
