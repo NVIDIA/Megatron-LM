@@ -50,6 +50,8 @@ from megatron.training.utils import (
 )
 from model_provider import model_provider
 
+from transformers import AutoTokenizer
+
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
@@ -193,10 +195,10 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is not None:
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens_padded if cu_seqlens_padded is not None else None,
-            cu_seqlens_kv_padded=cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            cu_seqlens_kv_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
         )
@@ -231,7 +233,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = build_tokenizer(args)
+    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8", trust_remote_code=True) # build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
