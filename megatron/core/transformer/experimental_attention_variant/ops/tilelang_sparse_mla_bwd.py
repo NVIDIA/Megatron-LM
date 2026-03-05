@@ -283,18 +283,18 @@ def bwd(
 
                 # Load KV, V for this block of indices
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i
-                    ]
+                    idx = Indices[by, s_i, bz // NH, i_i * BS + bi_i]
+                    safe_idx = T.max(idx, 0)
+                    KV_shared[bi_i, d_i] = KV[by, safe_idx, bz // NH, d_i]
 
                 T.gemm(
                     Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol
                 )
 
                 for bi_i, d_i in T.Parallel(BS, D_tail):
-                    KV_tail_shared[bi_i, d_i] = KV[
-                        by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i
-                    ]
+                    idx = Indices[by, s_i, bz // NH, i_i * BS + bi_i]
+                    safe_idx = T.max(idx, 0)
+                    KV_tail_shared[bi_i, d_i] = KV[by, safe_idx, bz // NH, D + d_i]
                 T.gemm(
                     Q_tail_shared,
                     KV_tail_shared,
@@ -368,31 +368,20 @@ def bwd(
                             ]
 
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                        T.atomic_addx4(
-                            dKV[
-                                by,
-                                Indices[
-                                    by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)
-                                ],
-                                bz // NH,
-                                d_i * 4,
-                            ],
-                            acc_dkv_shared[bi_i, d_i * 4],
-                        )
+                        idx = Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)]
+                        if idx >= 0:
+                            T.atomic_addx4(
+                                dKV[by, idx, bz // NH, d_i * 4], acc_dkv_shared[bi_i, d_i * 4]
+                            )
 
                     # Atomically update dKV, dKV_tail tensors
                     for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
-                        T.atomic_addx4(
-                            dKV[
-                                by,
-                                Indices[
-                                    by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)
-                                ],
-                                bz // NH,
-                                D + d_i * 4,
-                            ],
-                            acc_dkv_tail_shared[bi_i, d_i * 4],
-                        )
+                        idx = Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)]
+                        if idx >= 0:
+                            T.atomic_addx4(
+                                dKV[by, idx, bz // NH, D + d_i * 4],
+                                acc_dkv_tail_shared[bi_i, d_i * 4],
+                            )
 
             # Store the accumulated dQ
             T.copy(acc_dq, dQ_shared)
