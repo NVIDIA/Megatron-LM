@@ -52,8 +52,8 @@ def test_muon_optimizer_smoke():
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
-        use_nesterov=True,
+        momentum=0.95,
+        nesterov=True,
         weight_decay=0.01,
         use_decoupled_weight_decay=True,
         split_qkv=False,
@@ -62,7 +62,7 @@ def test_muon_optimizer_smoke():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     # Test basic properties
@@ -147,7 +147,7 @@ class TestMuonOptimizerMultiRank:
             bf16=True,
             use_distributed_optimizer=False,  # Muon doesn't support distributed optimizer
             muon_momentum=0.95,
-            muon_use_nesterov=True,
+            muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
             muon_num_ns_steps=5,
             muon_scale_mode="spectral",
@@ -243,7 +243,7 @@ class TestMuonOptimizerMultiRank:
             bf16=True,
             use_layer_wise_distributed_optimizer=True,
             muon_momentum=0.95,
-            muon_use_nesterov=True,
+            muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
             muon_num_ns_steps=5,
             muon_scale_mode="spectral",
@@ -292,11 +292,11 @@ def test_muon_optimizer_different_modes_single_rank(mode):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
+        momentum=0.95,
         weight_decay=0.0,  # Disable weight decay for deterministic comparison
         num_ns_steps=5,
         pg_collection=None,
-        mode=mode,
+        tp_mode=mode,
     )
 
     # Use fixed input for deterministic results
@@ -352,11 +352,11 @@ class TestMuonOptimizerMultiRankTP:
         optimizer = TensorParallelMuon(
             params=[model.weight],
             lr=0.01,
-            momentum_beta=0.95,
+            momentum=0.95,
             weight_decay=0.0,
             num_ns_steps=5,
             pg_collection=pg_collection,
-            mode=mode,
+            tp_mode=mode,
         )
 
         return model, optimizer
@@ -418,7 +418,7 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
         coefficient_type=coefficient_type_and_steps[0],
         num_ns_steps=coefficient_type_and_steps[1],
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
@@ -447,7 +447,7 @@ def test_muon_optimizer_scale_modes(scale_mode):
         scale_mode=scale_mode,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
@@ -463,8 +463,8 @@ def test_muon_optimizer_scale_modes(scale_mode):
     ), f"Weight should be updated with scale_mode={scale_mode}"
 
 
-@pytest.mark.parametrize("use_nesterov", [True, False])
-def test_muon_optimizer_nesterov(use_nesterov):
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_optimizer_nesterov(nesterov):
     """Test TensorParallelMuon optimizer with and without Nesterov momentum."""
     model = torch.nn.Linear(50, 25, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -473,11 +473,11 @@ def test_muon_optimizer_nesterov(use_nesterov):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.9,
-        use_nesterov=use_nesterov,
+        momentum=0.9,
+        nesterov=nesterov,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 50, dtype=torch.float32, device='cuda')
@@ -490,7 +490,7 @@ def test_muon_optimizer_nesterov(use_nesterov):
 
     assert not torch.equal(
         model.weight.data, original_weight
-    ), f"Weight should be updated with use_nesterov={use_nesterov}"
+    ), f"Weight should be updated with nesterov={nesterov}"
 
 
 def test_muon_optimizer_multiple_steps():
@@ -502,11 +502,11 @@ def test_muon_optimizer_multiple_steps():
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
+        momentum=0.95,
         weight_decay=0.01,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     weights_history = [model.weight.data.clone()]
@@ -552,7 +552,7 @@ def test_muon_optimizer_qkv_split():
         qkv_split_shapes=qkv_split_shapes,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, hidden_size, dtype=torch.float32, device='cuda')
@@ -576,7 +576,7 @@ def test_muon_optimizer_qkv_split():
         split_qkv=False,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     output = model(input_tensor)
@@ -608,7 +608,7 @@ def test_muon_optimizer_extra_scale_factor():
         extra_scale_factor=2.0,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
@@ -637,7 +637,7 @@ def test_muon_optimizer_num_ns_steps(num_ns_steps):
         coefficient_type="quintic",
         num_ns_steps=num_ns_steps,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
