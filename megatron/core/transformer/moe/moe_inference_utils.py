@@ -111,24 +111,35 @@ def compute_local_tokens_per_expert(
 @triton.jit
 def _prefix_sum_kernel(
     tokens_per_expert_ptr,  # [num_local_experts] input
-    expert_offsets_ptr,  # [num_local_experts] output
+    exclusive_offsets_ptr,  # [num_local_experts] output - exclusive prefix sum
+    inclusive_offsets_ptr,  # [num_local_experts] output - inclusive prefix sum
     num_local_experts,
+    alignment: tl.constexpr,  # pad non-zero counts to this multiple
     BLOCK_SIZE: tl.constexpr,  # next_power_of_2(num_local_experts)
 ):
-    """Compute exclusive prefix sum of tokens_per_expert.
+    """Compute exclusive and inclusive prefix sums of (aligned) tokens_per_expert.
 
-    Runs as a single block. Reads tokens_per_expert, computes exclusive prefix
-    sum via tl.cumsum, and writes expert_offsets.
+    Runs as a single block. Reads tokens_per_expert, optionally pads each
+    non-zero count up to a multiple of `alignment`, computes both exclusive
+    and inclusive prefix sums, and writes them to separate output buffers.
+    Experts with 0 tokens are not padded (they stay at 0).
     """
     expert_range = tl.arange(0, BLOCK_SIZE)
     mask = expert_range < num_local_experts
     histogram = tl.load(tokens_per_expert_ptr + expert_range, mask=mask, other=0)
 
+    # Pad non-zero counts to alignment boundary
+    if alignment > 1:
+        needs_pad = histogram > 0
+        aligned = ((histogram + alignment - 1) // alignment) * alignment
+        histogram = tl.where(needs_pad, aligned, histogram)
+
     # Inclusive prefix sum, then shift to exclusive
     inclusive = tl.cumsum(histogram, axis=0)
     exclusive = inclusive - histogram
 
-    tl.store(expert_offsets_ptr + expert_range, exclusive, mask=mask)
+    tl.store(exclusive_offsets_ptr + expert_range, exclusive, mask=mask)
+    tl.store(inclusive_offsets_ptr + expert_range, inclusive, mask=mask)
 
 
 # --------------------------------------------------------------------------- #
@@ -136,34 +147,45 @@ def _prefix_sum_kernel(
 # --------------------------------------------------------------------------- #
 def compute_expert_offsets(
     tokens_per_expert: torch.Tensor,
-) -> torch.Tensor:
-    """Compute exclusive prefix sum of tokens_per_expert.
+    alignment: int = 1,
+) -> tuple:
+    """Compute exclusive and inclusive prefix sums of (optionally aligned) tokens_per_expert.
+
+    When alignment > 1, each non-zero expert count is rounded up to the
+    nearest multiple of `alignment` before computing the prefix sums.
+    Experts with 0 tokens are not padded.
 
     Args:
         tokens_per_expert (torch.Tensor): Token counts per local expert,
             shape [num_local_experts], dtype int32.
+        alignment (int): Pad non-zero expert counts to this multiple.
+            Set to 1 to disable (default).
 
     Returns:
-        torch.Tensor: expert_offsets, shape [num_local_experts].
-            Exclusive prefix sum: expert_offsets[i] is the start index of
-            expert i's tokens in the permuted buffer. Passed to permute_tokens
-            which mutates it in-place via atomic adds, turning the exclusive
-            start offsets into inclusive end offsets (i.e. expert_offsets[i]
-            becomes the end index of expert i's tokens after permutation).
+        tuple: (exclusive_offsets, inclusive_offsets) where:
+            - exclusive_offsets: [num_local_experts] exclusive prefix sum.
+              expert_offsets[i] is the start index of expert i's region.
+              Passed to permute_tokens as atomic counters (mutated in-place).
+            - inclusive_offsets: [num_local_experts] inclusive prefix sum.
+              inclusive_offsets[i] is the end index of expert i's region.
+              Passed directly as `offs` to torch._grouped_mm.
     """
     num_local_experts = tokens_per_expert.shape[0]
 
-    expert_offsets = torch.empty_like(tokens_per_expert)
+    exclusive_offsets = torch.empty_like(tokens_per_expert)
+    inclusive_offsets = torch.empty_like(tokens_per_expert)
 
     BLOCK_SIZE = triton.next_power_of_2(num_local_experts)
     _prefix_sum_kernel[(1,)](
         tokens_per_expert,
-        expert_offsets,
+        exclusive_offsets,
+        inclusive_offsets,
         num_local_experts,
+        alignment,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    return expert_offsets
+    return exclusive_offsets, inclusive_offsets
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +261,7 @@ def permute_tokens(
     expert_offsets: torch.Tensor,
     local_expert_start: int,
     num_local_experts: int,
+    output_size: int = 0,
 ) -> tuple:
     """Permute tokens into expert-grouped order for the torch grouped GEMM.
 
@@ -249,8 +272,7 @@ def permute_tokens(
     NOTE: expert_offsets is mutated in-place. On entry it contains exclusive
     start offsets (expert_offsets[i] = start index of expert i's region).
     The kernel atomically increments each entry as it places tokens, so on
-    exit expert_offsets[i] = end index (inclusive) of expert i's region.
-    The last entry equals the total number of routed tokens.
+    exit expert_offsets[i] = padded_exclusive_start[i] + real_count[i].
 
     Args:
         hidden_states (torch.Tensor): Input hidden states, shape [num_tokens, hidden_dim].
@@ -259,33 +281,39 @@ def permute_tokens(
             Contains global expert IDs.
         expert_offsets (torch.Tensor): Write position counters, shape [num_local_experts].
             Initialized to exclusive prefix sum by compute_expert_offsets.
-            Mutated in-place to inclusive end offsets by the permute kernel.
+            Mutated in-place by the permute kernel via atomic adds.
         local_expert_start (int): First global expert index on this rank.
         num_local_experts (int): Number of experts on this rank.
+        output_size (int): Total size of the permuted output buffer. When 0
+            (default), uses num_tokens * min(topk, num_local_experts). When
+            alignment is used, the caller should pass the total padded size
+            (inclusive_offsets[-1]) so the buffer covers all padded regions.
 
     Returns:
         tuple: (permuted_hidden_states, permuted_probs, source_token_indices) where:
             - permuted_hidden_states: [output_size, hidden_dim] tokens grouped by expert.
+              Padding rows (when output_size > real token count) are zero-initialized.
             - permuted_probs: [output_size] scalar prob per permuted slot.
             - source_token_indices: [output_size] original token index per permuted slot.
-            output_size = num_tokens * min(topk, num_local_experts).
-            Slots beyond the actual routed token count contain uninitialized data.
+              Initialized to -1; padding rows remain -1.
     """
     num_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
-    output_size = num_tokens * min(topk, num_local_experts)
+    if output_size <= 0:
+        output_size = num_tokens * min(topk, num_local_experts)
 
-    # Allocate output buffers (statically sized for CUDA graph compatibility)
+    # Zero-init hidden so padding rows produce zeros through grouped GEMMs.
+    # Init source_token_indices to -1 so unpermute can skip padding rows.
     permuted_hidden = torch.empty(
         output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
     )
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
-    source_token_indices = torch.empty(output_size, dtype=torch.int32, device=probs.device)
+    source_token_indices = torch.full(
+        (output_size,), -1, dtype=torch.int32, device=probs.device
+    )
 
     total_pairs = num_tokens * topk
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-    # After this kernel, expert_offsets is mutated: exclusive start offsets
-    # become inclusive end offsets (expert_offsets[-1] = total routed tokens).
     _permute_tokens_kernel[(total_pairs,)](
         hidden_states,
         probs,
@@ -314,8 +342,6 @@ def _unpermute_tokens_kernel(
     expert_output_ptr,  # [output_size, hidden_dim]
     permuted_probs_ptr,  # [output_size]
     source_token_indices_ptr,  # [output_size]
-    # GPU-resident valid count (read from last atomic counter after permute)
-    num_routed_slots_ptr,  # scalar tensor on GPU
     # Output pointer
     output_ptr,  # [num_tokens, hidden_dim] - must be zero-initialized
     # Dimensions
@@ -328,17 +354,16 @@ def _unpermute_tokens_kernel(
     source token index, multiplies the expert output by the routing probability,
     and atomically adds the result to the corresponding row in the output buffer.
     Multiple experts contributing to the same token are summed via atomic adds.
-    Rows beyond num_routed_slots (read from GPU) are skipped.
+    Padding rows (source_token_indices == -1) are skipped.
     The hidden dimension is processed in tiles of BLOCK_H to support large hidden sizes.
     """
     row_idx = tl.program_id(0)
 
-    # Read valid count from GPU — no host sync needed for CUDA graphability
-    num_valid = tl.load(num_routed_slots_ptr)
-    if row_idx >= num_valid:
+    token_idx = tl.load(source_token_indices_ptr + row_idx)
+    # Skip padding rows (sentinel value -1 from permute_tokens initialization)
+    if token_idx < 0:
         return
 
-    token_idx = tl.load(source_token_indices_ptr + row_idx)
     prob = tl.load(permuted_probs_ptr + row_idx)
 
     src_row_ptr = expert_output_ptr + row_idx * hidden_dim
@@ -359,7 +384,6 @@ def unpermute_tokens(
     permuted_probs: torch.Tensor,
     source_token_indices: torch.Tensor,
     num_tokens: int,
-    num_routed_slots: torch.Tensor,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
@@ -367,19 +391,14 @@ def unpermute_tokens(
     For each valid permuted row i, computes:
         output[source_token_indices[i], :] += expert_output[i, :] * permuted_probs[i]
     Multiple experts contributing to the same token are summed via atomic adds.
-    Rows beyond num_routed_slots are skipped. num_routed_slots is read from GPU
-    to avoid host synchronization, keeping the pipeline CUDA-graphable.
+    Padding rows where source_token_indices[i] == -1 are skipped.
 
     Args:
         expert_output (torch.Tensor): Expert outputs, shape [output_size, hidden_dim].
-            Only the first total_routed rows are valid.
         permuted_probs (torch.Tensor): Routing probs, shape [output_size].
-            Only the first total_routed entries are valid.
         source_token_indices (torch.Tensor): Source token index for each permuted row,
-            shape [output_size], dtype int32. Only the first total_routed are valid.
+            shape [output_size], dtype int32. Padding rows have value -1.
         num_tokens (int): Number of original tokens (for output allocation).
-        num_routed_slots (torch.Tensor): 1-element GPU tensor containing the
-            total number of routed tokens. Must stay on GPU (no host sync).
 
     Returns:
         torch.Tensor: Unpermuted output, shape [num_tokens, hidden_dim].
@@ -397,7 +416,6 @@ def unpermute_tokens(
         expert_output,
         permuted_probs,
         source_token_indices,
-        num_routed_slots,
         output,
         hidden_dim,
         BLOCK_H=BLOCK_H,

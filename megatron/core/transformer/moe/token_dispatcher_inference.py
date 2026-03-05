@@ -83,7 +83,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         # Intermediate state for torch backend (set in dispatch_postprocess, used in combine_preprocess)
         self._source_token_indices = None
-        self._num_routed_slots = None
         self._permuted_probs = None
         self._num_tokens_after_dispatch = None
         # Inclusive end offsets per expert after permutation. Reused as the
@@ -286,37 +285,37 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         # torch backend: permute tokens into expert-grouped order
         self._num_tokens_after_dispatch = hidden_states.size(0)
+        num_tokens = hidden_states.size(0)
         tokens_per_expert = compute_local_tokens_per_expert(
             self.routing_map, self._local_expert_start, self.num_local_experts
         )
-        exclusive_expert_offsets = compute_expert_offsets(tokens_per_expert)
-        # permute_tokens mutates the offsets tensor in-place via atomic adds,
-        # converting exclusive start offsets into inclusive end offsets.
-        # Example with 3 experts and tokens_per_expert = [2, 3, 1]:
-        #   exclusive_expert_offsets = [0, 2, 5]  (start of each expert's region)
-        #   inclusive_expert_offsets = [2, 5, 6]  (end of each expert's region)
-        # The last entry (6) equals the total number of routed tokens.
-        permuted_hidden, permuted_probs, source_token_indices = permute_tokens(
-            hidden_states, probs, self.routing_map, exclusive_expert_offsets,
-            self._local_expert_start, self.num_local_experts,
+        alignment = self.config.moe_expert_tensor_alignment
+        padded_exclusive_offsets, padded_inclusive_offsets = compute_expert_offsets(
+            tokens_per_expert, alignment=alignment,
         )
-        inclusive_expert_offsets = exclusive_expert_offsets  # mutated in-place by permute_tokens
+        # Static upper bound for output buffer size (no device-to-host sync).
+        # Worst case: every expert gets tokens, each padded by up to
+        # (alignment - 1) extra rows.
+        topk = probs.size(1)
+        max_output_size = (
+            num_tokens * min(topk, self.num_local_experts)
+            + alignment * self.num_local_experts
+        )
+        # permute_tokens mutates padded_exclusive_offsets in-place via atomic
+        # adds. padded_inclusive_offsets is untouched and used as `offs` for
+        # torch._grouped_mm.
+        permuted_hidden, permuted_probs, source_token_indices = permute_tokens(
+            hidden_states, probs, self.routing_map, padded_exclusive_offsets,
+            self._local_expert_start, self.num_local_experts,
+            output_size=max_output_size,
+        )
 
         # Cache state for combine_preprocess.
         self._source_token_indices = source_token_indices
-        # Number of (token, expert) slots actually routed to local experts on
-        # this rank. With topk > 1, a single token may occupy multiple slots.
-        # Only permuted_hidden[:num_routed_slots] contains real data; the
-        # remaining rows are uninitialized padding for static CUDA graph shapes.
-        # Used later in combine_preprocess/unpermute_tokens to read only the
-        # valid grouped GEMM outputs and skip garbage-padded rows.
-        # Stored as a 1-element GPU tensor view ([-1:], not [-1]) to avoid a
-        # device-to-host sync that would break CUDA graphability.
-        self._num_routed_slots = inclusive_expert_offsets[-1:]
         self._permuted_probs = permuted_probs
-        # Cache the full inclusive offsets so torch._grouped_mm can reuse them
-        # directly as `offs` without recomputing cumsum on tokens_per_expert.
-        self.inclusive_expert_offsets = inclusive_expert_offsets
+        # Cache the padded inclusive offsets so torch._grouped_mm can use them
+        # directly as `offs` — each expert's M dimension is aligned.
+        self.inclusive_expert_offsets = padded_inclusive_offsets
 
         # probs=None: expert skips prob-weighting, unpermute applies probs instead
         return permuted_hidden, tokens_per_expert, None
@@ -346,7 +345,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
             self._permuted_probs,
             self._source_token_indices,
             self._num_tokens_after_dispatch,
-            self._num_routed_slots,
         )
         return output
 

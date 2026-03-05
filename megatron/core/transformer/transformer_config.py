@@ -925,6 +925,13 @@ class TransformerConfig(ModelParallelConfig):
     'flashinfer': FlashInfer's fused cutlass_fused_moe kernel (default).
     'torch': triton permute/unpermute kernels + torch._grouped_mm."""
 
+    moe_expert_tensor_alignment: int = 64
+    """Alignment (in tokens) for per-expert M dimensions in grouped GEMMs.
+    Each expert's token count is rounded up to a multiple of this value
+    (experts with 0 tokens stay at 0). Aligning to 32 or 64 improves
+    CUTLASS/TMA efficiency on Hopper and Grace Blackwell GPUs.
+    Set to 1 to disable (default)."""
+
     moe_ggemm_inference_no_cg: str = "torch"
     """Backend for non-CUDA-graphed inference grouped GEMM.
     'torch': torch._grouped_mm with GPU-resident cumsum offsets (default).
