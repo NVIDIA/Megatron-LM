@@ -278,6 +278,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_offload_fraction": 1.0,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "sequence_packing_scheduler": None,
     "fallback_to_eager_attn": False,
     "linear_attention_type": None,
     "moe_router_force_biased": None,

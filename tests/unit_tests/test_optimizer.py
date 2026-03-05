@@ -106,10 +106,10 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
     net = Net()
-    # NOTE: to get legacy default overrides, supply None.
     opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
-    check_config_overrides_consistency(opt_config, None)
-    param_groups = _get_param_groups([net], opt_config, None)
+    config_overrides = get_standard_config_overrides(opt_config)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
