@@ -406,19 +406,6 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        # When using different EP sizes for inference and training (EP refit), the legacy
-        # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
-        if (
-            args.rl_inference_expert_model_parallel_size is not None
-            and args.rl_inference_expert_model_parallel_size != args.expert_model_parallel_size
-        ):
-            assert not args.moe_use_legacy_grouped_gemm, (
-                "Legacy GroupedMLP (--moe-use-legacy-grouped-gemm) is not supported when using "
-                "different expert parallelism sizes for inference and training. "
-                "Use SequentialMLP (default when --moe-grouped-gemm is not set) or "
-                "TEGroupedMLP (--moe-grouped-gemm without --moe-use-legacy-grouped-gemm)."
-            )
-
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -1411,7 +1398,7 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
-    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1:
+    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
 
@@ -1547,7 +1534,6 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
         assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
-        assert not args.moe_use_legacy_grouped_gemm, "MoE latent projection is not supported yet with legacy grouped GEMM."
 
     if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
         warn_rank_0(
@@ -1827,6 +1813,15 @@ def _add_inference_args(parser):
                        '"ref_zero" (default) immediately returns blocks to the '
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
+                       type=str, default='first_prefix_block',
+                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
+                       dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
+                       help='Coordinator routing policy for prefix caching. '
+                       '"first_prefix_block" (default) routes based on the first '
+                       'block hash only. "longest_prefix" routes to the rank with '
+                       'the longest matching prefix. "round_robin" ignores prefix '
+                       'affinity and cycles through ranks.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')

@@ -26,7 +26,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import tensor_swap
+from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
@@ -235,6 +235,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
+    TMS_TAG = "inference_context"
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -249,6 +250,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
+        self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
@@ -464,21 +466,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
 
-        # Request and token counts.
-        self.total_request_count = 0
-        self.active_token_count = 0
-        self.lifetime_prefill_token_count = 0
-        self.paused_request_count = 0
-        self.batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_active_token_count = 0
-        self.padded_active_request_count = 0
-        self.paused_tokens = None
-
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
@@ -511,11 +498,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
-        self.num_prefill_requests = 0
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
-        self.active_attn_metadata = None
-        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -549,7 +533,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
                 cuda_graph_max_tokens=self.max_requests,
-                cuda_graph_mixed_prefill_count=inference_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
@@ -557,11 +541,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        self.cuda_graph_mixed_prefill_count = inference_config.cuda_graph_mixed_prefill_count
-        self._using_cuda_graph_this_step = False
+        self.smallest_non_decode_cuda_graph_size = min(
+            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
+        )
+
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
-        self.chunked_prefill_request_id = -1
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -623,9 +608,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
-            )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
@@ -709,6 +691,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
+        # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
+        if self.is_hybrid_model:
+            self.mamba_metadata = MambaMetadata(
+                max_requests=self.max_requests, max_tokens=self.max_tokens
+            )
+
         # Allocate large non-graphed buffers.
         need_static_addr = (
             self.static_kv_memory_pointers
@@ -720,7 +708,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
         elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
             ctx_manager = torch_memory_saver.region(
-                tag="inference_context",
+                tag=self.TMS_TAG,
                 enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
             )
             self._uses_torch_memory_saver = True
@@ -728,9 +716,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
 
-        # Reset attention and Mamba state.
-        self.reset_attention_state()
-        self.reset_mamba_state()
+        # Reset tensor-related metadata.
+        self.reset_metadata()
 
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
@@ -745,10 +732,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
-            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-                self.reset()
+            # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
-                torch_memory_saver.resume("inference_context")
+                tag = self.TMS_TAG
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
+                    )
+                torch_memory_saver.resume(tag)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
+                    )
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset_metadata()
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -775,7 +772,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            torch_memory_saver.pause("inference_context")
+            tag = self.TMS_TAG
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
+                )
+            torch_memory_saver.pause(tag)
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
+                )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -1354,13 +1360,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
+            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            cuda_graph_mixed_prefill_count=self.cuda_graph_mixed_prefill_count,
         )
         self._using_cuda_graph_this_step = best_graph is not None
+
+        if construct_graph_dimensions is not None:
+            assert self._using_cuda_graph_this_step
 
         if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
             # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
@@ -1463,30 +1472,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-    def reset(self) -> None:
-        """Reset entire context.
-
-        This method does:
-        - Reset active/paused request/token counts to zero.
-        - Reset available blocks to entire memory.
-        - Reset other tensors to zeros (unncessary, just or sanity checking).
-
-        This method is useful after cuda graph warmup iterations, where the
-        context's memory buffer is referenced by the cuda graph system and
-        cannot be deallocated.
-        """
-
-        # Reset request/token counts.
-        self.total_request_count = 0
-        self.active_token_count = 0
-        self.lifetime_prefill_token_count = 0
-        self.paused_request_count = 0
-        self.batch_dimensions = InferenceBatchDimensions(
-            token_count=0, prefill_req_count=0, decode_req_count=0
-        )
-        self.padded_active_token_count = 0
-        self.padded_active_request_count = 0
-        self.paused_tokens = None
+    def reset_tensors(self) -> None:
+        """Fill all GPU tensors with sentinel values."""
 
         # Reset request indexes.
         self.request_ids.fill_(-1)
@@ -1510,7 +1497,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-        # Reset available block count.
+    def reset_metadata(self) -> None:
+        """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
+
+        This must be called after ``initialize_all_tensors()`` and after any
+        suspend/resume cycle to bring the context back to a clean state.
+        """
+
+        # Reset request/token counts.
+        self.total_request_count = 0
+        self.active_token_count = 0
+        self.lifetime_prefill_token_count = 0
+        self.paused_request_count = 0
+        self.batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
+        self.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
+        self.padded_active_token_count = 0
+        self.padded_active_request_count = 0
+        self.paused_tokens = None
+
+        # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
         self.block_allocator.reset()
@@ -1527,6 +1536,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+    def reset(self) -> None:
+        """Reset entire context.
+
+        This method does:
+        - Fill all GPU tensors with sentinel values.
+        - Reset active/paused request/token counts to zero.
+        - Reset available blocks to entire memory.
+
+        This method is useful after cuda graph warmup iterations, where the
+        context's memory buffer is referenced by the cuda graph system and
+        cannot be deallocated.
+        """
+        self.reset_tensors()
+        self.reset_metadata()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -1616,6 +1640,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_matched > 0 and block_aligned:
             prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
         else:
+            prefix_skip_tokens = 0
+
+        # Hybrid models: disable prefill skipping (no Mamba states per block),
+        # but keep matched blocks for memory sharing.
+        if self.is_hybrid_model:
             prefix_skip_tokens = 0
 
         effective_chunk_length = chunk_length - prefix_skip_tokens

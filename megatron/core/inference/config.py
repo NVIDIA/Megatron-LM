@@ -82,6 +82,19 @@ class PrefixCachingEvictionPolicy(str, Enum):
     """Keep released blocks in hash table. Evict oldest ref=0 blocks when space is needed."""
 
 
+class PrefixCachingCoordinatorPolicy(str, Enum):
+    """Routing policy for the DP inference coordinator with prefix caching."""
+
+    LONGEST_PREFIX = "longest_prefix"
+    """Route to the rank with the longest consecutive prefix match."""
+
+    FIRST_PREFIX_BLOCK = "first_prefix_block"
+    """Route to the rank that has the first block hash cached. O(ranks) check."""
+
+    ROUND_ROBIN = "round_robin"
+    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -224,6 +237,15 @@ class InferenceConfig:
     """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 
     Only applies when enable_prefix_caching is True.
+    """
+
+    prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    )
+    """Routing policy for the DP inference coordinator. See
+    `PrefixCachingCoordinatorPolicy` for options.
+
+    Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
     # =================================

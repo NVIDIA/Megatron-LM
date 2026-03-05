@@ -21,7 +21,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import (
-    GroupedMLP,
     SequentialMLP,
     TEGroupedMLP,
     TEGroupedMLPSubmodules,
@@ -56,9 +55,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    if expert_type == 'grouped':
-        model = GroupedMLP(num_local_experts, transformer_config, pg_collection)
-    elif expert_type == 'te_grouped':
+    if expert_type == 'te_grouped':
         layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=True
         )
@@ -98,14 +95,13 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         )
     else:
         raise ValueError(
-            'expert_type can only be one of ["sequential", "te_sequential", "grouped",'
-            ' "te_grouped"]'
+            'expert_type can only be one of ["sequential", "te_sequential", "te_grouped"]'
         )
     return model
 
 
-expert_type = ['sequential', 'grouped']
-src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
+expert_type = ['sequential']
+src_dest_expert_type = []
 if is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
