@@ -780,11 +780,12 @@ class MambaMixer(MegatronModule):
             # tensors to the conv state dtype for causal_conv1d_fn and then cast xBC
             # back to the original dtype
             xBC_dtype = xBC.dtype
+            conv_state_dtype = xBC_dtype if conv_state is None else conv_state.dtype
             weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
             xBC = causal_conv1d_fn(
-                x=xBC.to(conv_state.dtype),
-                weight=weight.to(conv_state.dtype),
-                bias=self.cp.get_conv1d_bias().to(conv_state.dtype),
+                x=xBC.to(conv_state_dtype),
+                weight=weight.to(conv_state_dtype),
+                bias=self.cp.get_conv1d_bias().to(conv_state_dtype),
                 activation=self.activation,
                 seq_idx=seq_idx,
                 initial_states=initial_conv_state,
