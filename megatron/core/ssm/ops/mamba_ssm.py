@@ -8,7 +8,24 @@
 import torch
 import triton
 import triton.language as tl
-from mamba_ssm.ops.triton.softplus import softplus
+from packaging import version
+
+TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
+
+
+if TRITON3:
+
+    @triton.jit
+    def softplus(dt):
+        """Optimized softplus."""
+        return tl.math.log(tl.math.exp(dt) + 1)
+
+else:
+
+    @triton.jit
+    def softplus(dt):
+        """Optimized softplus."""
+        return tl.math.log1p(tl.exp(dt))
 
 
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
