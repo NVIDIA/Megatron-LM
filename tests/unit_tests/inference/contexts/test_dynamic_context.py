@@ -68,7 +68,11 @@ class TestDynamicContext:
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
             mamba_inference_state_config = MambaInferenceStateConfig(
-                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+                layer_type_list,
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
         else:
             mamba_inference_state_config = None
@@ -1241,29 +1245,34 @@ class TestDynamicContext:
 
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
+        params_dtype = torch.float32
 
         if rank == 0:
             mamba_inference_state_config = MambaInferenceStateConfig(
                 [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
         else:
             mamba_inference_state_config = MambaInferenceStateConfig(
                 [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
 
         context = DynamicInferenceContext(
             model_config=TransformerConfig(
-                params_dtype=torch.float32,
+                params_dtype=params_dtype,
                 num_layers=10,
                 kv_channels=64,
                 num_attention_heads=8,
                 pipeline_model_parallel_size=pp_size,
                 tensor_model_parallel_size=1,
-                pipeline_dtype=torch.float32,
+                pipeline_dtype=params_dtype,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=128,
@@ -1312,7 +1321,11 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            layer_type_list,
+            mamba_conv_states_shape,
+            mamba_ssm_states_shape,
+            params_dtype,
+            params_dtype,
         )
 
         context = DynamicInferenceContext(

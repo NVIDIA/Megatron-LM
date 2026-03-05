@@ -29,6 +29,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -1777,7 +1778,7 @@ class TestDynamicInferenceEngine:
         engine = env.engine
         context = engine.context
 
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         deallocates = kv_cache_management_mode != "persist"
@@ -1800,7 +1801,7 @@ class TestDynamicInferenceEngine:
 
         # Suspend.
         engine.suspend()
-        assert engine.is_suspended
+        assert engine.state == EngineState.SUSPENDED
         assert not context.is_tensor_state_allocated
 
         gc.collect()
@@ -1830,7 +1831,7 @@ class TestDynamicInferenceEngine:
 
         # Resume.
         engine.resume()
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         if deallocates and not uses_tms:
