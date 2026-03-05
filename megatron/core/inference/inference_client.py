@@ -137,7 +137,7 @@ class InferenceClient:
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
                     completed_request = DynamicInferenceRequestRecord.deserialize(reply)
-                    completion_future.set_result(completed_request)        
+                    completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
