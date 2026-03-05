@@ -8,8 +8,14 @@ import torch.distributed as dist
 from openai import AsyncOpenAI, DefaultAioHttpClient
 from pydantic import PrivateAttr
 
+try:
+    import h2  # noqa: F401
+    use_http2 = True
+except ImportError:
+    use_http2 = False
+
 from megatron.core.inference.config import KVCacheManagementMode
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
@@ -35,7 +41,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None) 
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
@@ -100,7 +106,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
-            await client.start()
+            client.start()
 
             start_text_gen_server(
                 coordinator_addr=dp_addr,
@@ -120,21 +126,21 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        max_connections = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        custom_limits = httpx.Limits(
+            max_connections=concurrency_limit,
+            max_keepalive_connections=concurrency_limit,
+        )
+        http_client = DefaultAioHttpClient(
+            timeout=httpx.Timeout(connect=15, read=600, write=600, pool=600),
+            limits=custom_limits,
+            http2=use_http2
+        )
+
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{launched_server.host}:{launched_server.port}",
             api_key="NONE",
-            timeout=timeout,
-            max_retries=0,
-            http_client=httpx.AsyncClient(
-                timeout=timeout,
-                http2=use_http2,
-                limits=httpx.Limits(
-                    max_connections=max_connections,
-                    max_keepalive_connections=max_connections,
-                    keepalive_expiry=10,
-                ),
-            ),
+            http_client=http_client
         )
 
         return launched_server
@@ -145,11 +151,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             await self._openai_client.close()
 
         if dist.get_rank() == 0:
-            await self._client.stop_engines()
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
             stop_text_gen_server()
 
-        await self._inference_engine.stopped.wait()
+        if dist.get_rank() == 0:
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
+            self._client.stop_engines()
+        await self._inference_engine.wait_until(EngineState.STOPPED)
+
+        if dist.get_rank() == 0:
+            self._client.shutdown_coordinator()
+            self._client.stop()
 
     def increment_staleness(self):
         if dist.get_rank() == 0:
@@ -157,12 +172,21 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         if dist.get_rank() == 0:
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
             self._client.suspend_engines()
-        await self._inference_engine.paused.wait()
-        self._inference_engine.suspend()
+        await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
     async def resume(self):
+        if self._inference_engine._state_events[EngineState.RUNNING].is_set():
+            return
+
         if dist.get_rank() == 0:
             self._client.resume_engines()
-        await self._inference_engine.running.wait()
-        self._inference_engine.resume()
+        await self._inference_engine.wait_until(EngineState.RESUMED)
+
+        if dist.get_rank() == 0:
+            self._client.unpause_engines()
+        await self._inference_engine.wait_until(EngineState.RUNNING)
