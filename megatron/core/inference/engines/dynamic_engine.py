@@ -1242,17 +1242,13 @@ class DynamicInferenceEngine(AbstractEngine):
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if stop_len > self.num_speculative_tokens:
-                    if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
+                # We do this regardless of stop_len because speculative decoding can append
+                # multiple tokens at once, meaning the stop word might end at any of those positions.
+                for i in range(self.num_speculative_tokens + 1):
+                    end_idx = -i if i > 0 else None
+                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
                         return True
-                else:
-                    # Check the last stop len tokens shifting by 1 up to num_speculative_tokens
-                    for i in range(self.num_speculative_tokens + 1):
-                        end_idx = -i if i > 0 else None
-                        if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                            return True
-
         return False
 
     def get_prefix_coordination_metrics(self) -> dict:

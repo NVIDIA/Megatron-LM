@@ -1035,17 +1035,17 @@ class TestTextGenerationController:
         input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
 
         # We need the sampling function to return a 1D tensor for base logits,
-        # and a 2D tensor for the MTP logits to satisfy torch.cat(dim=1).
+        # and a 1D tensor for the flattened MTP logits.
         def mock_sampling_func(logits, *args, **kwargs):
-            if logits.dim() == 2:
+            if logits.shape[0] == 6:
                 # Base logits -> return 1D tensor of shape [6]
                 # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
                 # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
                 return torch.tensor([11, 12, 99, 99, 22, 23], dtype=torch.long, device='cuda')
             else:
-                # MTP logits -> return 2D tensor of shape [num_speculative_tokens, 6]
+                # MTP logits -> return 1D tensor of shape [12]
                 # The verification logic only uses base tokens, so we can return zeros here.
-                return torch.zeros((2, 6), dtype=torch.long, device='cuda')
+                return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
         self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]

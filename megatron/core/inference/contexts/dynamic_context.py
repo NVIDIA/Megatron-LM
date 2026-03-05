@@ -2564,7 +2564,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
         ).repeat_interleave(num_generated_tokens)
 
-        # shan : Same as token_to_pos_ids ?
         self.token_to_position_in_request[: self.active_token_count] = self.token_to_pos_ids[
             : self.active_token_count
         ]

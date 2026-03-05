@@ -784,7 +784,8 @@ class TextGenerationController:
     def _dynamic_step_sample_logits_and_verify_tokens(
         self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
     ):
-        f"""Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
+        """
+        Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count

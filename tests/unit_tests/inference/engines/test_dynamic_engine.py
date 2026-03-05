@@ -2110,3 +2110,34 @@ class TestDynamicInferenceEngine:
         stop_hit = env.engine._check_stop_words_for_request_post_append(req)
 
         assert stop_hit is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_long_stop_word_hit(self):
+        """Test that if an accepted speculative token completes a long stop word
+        (length > num_speculative_tokens), it is correctly detected."""
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0, num_speculative_tokens=2, materialize_only_last_token_logits=False
+        )
+        env = self._build_test_env(test_config)
+
+        # Mock request with a stop word
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.tensor([1, 2, 3], device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        # Stop word length 3 > num_speculative_tokens (2)
+        req.stop_word_ids = [[98, 99, 100]]
+
+        # Fast-forward state: base tokens were generated up to 99
+        req.generated_tokens = [98, 99]
+        tokens_to_append = [100, 101]  # Completes stop word at index -2
+        req.generated_tokens += tokens_to_append
+
+        stop_hit = env.engine._check_stop_words_for_request_post_append(req)
+        assert stop_hit is True
