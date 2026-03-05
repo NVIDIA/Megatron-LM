@@ -1,4 +1,6 @@
-# trigger_internal_ci.py
+# Trigger Internal CI
+
+:warning: This is only useful to NVIDIANs.
 
 Pushes the current branch to the internal GitLab remote and triggers a CI
 pipeline — without touching the GitLab UI.
@@ -8,10 +10,12 @@ pipeline — without touching the GitLab UI.
 **1. Add the internal GitLab as a git remote** (skip if you already have one configured):
 
 ```bash
-git remote add gitlab git@<gitlab-hostname>:<namespace>/<project>.git
+git remote add gitlab git@<gitlab-hostname>:ADLR/Megatron-LM.git
 ```
 
 To check existing remotes: `git remote -v`
+
+**The name of the origin will be required later!**
 
 **2. Obtain a pipeline trigger token:**
 
@@ -26,6 +30,8 @@ Reach out to @mcore-ci in case you don't have access to the settings page.
 ```bash
 export GITLAB_TRIGGER_TOKEN=glptt-<your-token>
 ```
+
+**Tip: Store this in your .env or .bashrc file**
 
 ## Usage
 
