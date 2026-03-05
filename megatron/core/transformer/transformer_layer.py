@@ -801,9 +801,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(
-        self,
-        mlp_output_with_bias: tuple[Tensor, Tensor | None],
-        residual: Tensor,
+        self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
