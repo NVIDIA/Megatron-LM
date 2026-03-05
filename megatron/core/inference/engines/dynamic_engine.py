@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -19,6 +20,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -40,9 +42,15 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_call
+from megatron.core.inference.utils import (
+    Counter,
+    await_process_call,
+    set_inference_cuda_graphed_iteration_for_ep_inference,
+    unset_inference_cuda_graphed_iteration_for_ep_inference,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -101,10 +109,21 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 
-if HAVE_TORCH_MEMORY_SAVER:
-    from torch_memory_saver import torch_memory_saver
+
+class EngineState(Enum):
+    """State machine for the inference engine."""
+
+    RUNNING = auto()  # Processing requests
+    PAUSING = auto()  # PAUSE received; waiting for EP consensus + world barrier
+    PAUSED = auto()  # Globally confirmed idle
+    UNPAUSING = auto()  # UNPAUSE received; waiting for world barrier
+    SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
+    SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
+    RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
+    RESUMED = auto()  # GPU onloaded, all ranks confirmed; cleared on next SUSPEND
+    STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
+    STOPPED = auto()  # All ranks confirmed; teardown complete
 
 
 class EngineSuspendedError(Exception):
@@ -150,6 +169,15 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
 
+    # Map stable states to their corresponding asyncio events.
+    _STATE_EVENTS = (
+        EngineState.RUNNING,
+        EngineState.PAUSED,
+        EngineState.SUSPENDED,
+        EngineState.RESUMED,
+        EngineState.STOPPED,
+    )
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -180,12 +208,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
         )
         self.cuda_graph_impl = model_config.cuda_graph_impl
-
+        self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
         self.reset()
 
@@ -242,7 +269,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
-        self.step_count = 0
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
@@ -250,17 +276,30 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
-        self.suspend_signal = False
-        self.is_suspended = False
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        self.state = EngineState.RUNNING
+        self._state_events[EngineState.RUNNING].set()
+        self._pending_signals = deque()
+
         self.resume_request_ids = None
+
+        # Prefix caching coordination state.
+        self._prefix_coordination_waits = 0
 
         # Coordinator state.
         self.use_coordinator = False
+
+    async def wait_until(self, state: EngineState):
+        """Wait until the engine reaches the given state.
+
+        Only stable states (RUNNING, PAUSED, SUSPENDED, RESUMED,
+        STOPPED) are supported.  Transient states (PAUSING, SUSPENDING,
+        RESUMING, STOPPING) are not directly waitable.
+        """
+        event = self._state_events.get(state)
+        if event is None:
+            raise ValueError(f"Cannot wait for transient state {state}")
+        await event.wait()
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -275,6 +314,15 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.cuda_graph_impl != "local":
             return
 
+        if (
+            CudaGraphScope.full_iteration in self.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
+        ):
+            warnings.warn(
+                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
+                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
+            )
+
         context = self.context
         controller = self.controller
 
@@ -284,6 +332,16 @@ class DynamicInferenceEngine(AbstractEngine):
         logging.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
+
+        # Enable inference dispatcher for EP during graph capture
+        model_config = controller.inference_wrapped_model.model.config
+        is_inference_optimized_ep = (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.expert_model_parallel_size > 1
+        )
+        if is_inference_optimized_ep:
+            unwrapped_model = controller.inference_wrapped_model.model
+            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -312,6 +370,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             context.reset()
 
+        # Disable inference dispatcher after graph capture
+        if is_inference_optimized_ep:
+            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
@@ -336,15 +398,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
-        if HAVE_TORCH_MEMORY_SAVER:
-            torch_memory_saver.pause("kv_cache")
-
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
@@ -396,7 +456,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        self.zmq_context = zmq.Context().instance()
+        self.zmq_context = zmq.Context.instance()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
@@ -430,6 +490,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.tokenizer,
                     inference_coordinator_port,
                     deterministic_mode,
+                    self.context.block_size_tokens,
+                    self.context.enable_prefix_caching,
+                    self.context.prefix_caching_coordinator_policy,
+                    coordinator_schedule_output_path,
                 ),
             )
             self.inference_coordinator_process.start()
@@ -518,6 +582,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=self.pg_collection.ep
             )
 
+        # initialize zmq-based world communicator for consensus barriers
+        total_world_size = torch.distributed.get_world_size()
+        if total_world_size > 1:
+            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
@@ -525,7 +594,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
             logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
-        # Finally run the engine infinite loop
+        # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
@@ -551,12 +620,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
+            range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
+            range_pop()
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -595,42 +666,48 @@ class DynamicInferenceEngine(AbstractEngine):
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
 
-        # Skip if already suspended, which can happen when using the inference
-        # coordinator.
-        if self.is_suspended:
+        # Skip if already suspended or in the process of suspending.
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = True
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_all_tensors()
+            self.context.deallocate_inference_state_buffers()
 
-        # Delete cuda graphs when not using unified memory at all (level 0) and
-        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
-        # maintain static memory addresses, so the cuda graphs are re-used.
-        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+        if (
+            self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+            and not self.context.static_kv_memory_pointers
+        ):
             delete_cuda_graphs()
 
-        # Maintain references to requests before reset.
+        # Build the list of requests to re-add on resume.
+        # All waiting requests are always included; active requests are included
+        # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
+        if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            recompute_active_ids = active_request_ids
+        else:
+            recompute_active_ids = set()
+        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend requests objects.
-        for request_id in active_request_ids:
+        # Checkpoint active requests that are marked for recompute.
+        for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
+
+        # If we are not using the inference coordinator, we need to manually handle state.
+        if not self.use_coordinator:
+            self.state = EngineState.SUSPENDED
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        # Skip if not suspended, which can happen when using the inference
-        # coordinator.
-        if not self.is_suspended:
+        # Skip if not suspended or in the process of suspending.
+        if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = False
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
@@ -640,23 +717,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.allocate_all_tensors(is_init=False)
+            self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
-            # Reset context and request data.
-            self.context.reset()
-
-            # Create cuda graphs (before adding requests, to be in decode mode).
-            # Only create cuda graphs when not using unified memory at all (level
-            # 0). For levels 1 and 2, the context's tensors maintain static
-            # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+            if (
+                self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+                and not self.context.static_kv_memory_pointers
+            ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests.
+            # Re-add requests saved during suspend.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
@@ -676,8 +749,13 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         )
 
-        # Notify event loop.
-        self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
+        # If we are not using the inference coordinator, we need to manually handle state.
+        if not self.use_coordinator:
+            self.state = EngineState.RUNNING
+            # Notify the condition variable that run_engine() waits on.
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task, self._notify_cond_for_new_request()
+            )
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -740,6 +818,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
+            request.sampling_params.num_tokens_total = None
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
@@ -834,6 +913,8 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            enable_prefix_caching=self.context.enable_prefix_caching,
         )
 
         # Add request.
@@ -877,6 +958,17 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        block_allocator = self.context.block_allocator
+
+        # Pre-compute step-level block stats (before the per-request loop)
+        if self.track_generated_token_events:
+            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            if block_allocator.enable_prefix_caching:
+                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            else:
+                blocks_hashed_active = blocks_allocated
+                blocks_ref_count = None
 
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
@@ -889,7 +981,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
                     if self.track_generated_token_events:
-                        event_generated_token = request.add_event_generated_token(token)
+                        if block_allocator.enable_prefix_caching:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
+                                blocks_ref_count=blocks_ref_count,
+                            )
+                        else:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
+                            )
                     if is_first_token:
                         if self.track_generated_token_events:
                             first_token_event = event_generated_token
@@ -1094,10 +1200,18 @@ class DynamicInferenceEngine(AbstractEngine):
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                if generated_tokens[-stop_len:] == stop_word_ids:
                     return True
 
         return False
+
+    def get_prefix_coordination_metrics(self) -> dict:
+        """Return prefix caching coordination metrics.
+
+        Returns:
+            Dict with coordination stats including the number of scheduling waits.
+        """
+        return {"waits": self._prefix_coordination_waits}
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1110,12 +1224,34 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
+
+            # Check for conflicting block hashes.
+            if prefix_caching_enabled:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(self.waiting_request_ids.popleft())
+                    continue
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                # Add these hashes to pending.
+                if prefix_caching_enabled:
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1125,6 +1261,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.waiting_request_ids.popleft()
             else:
                 break
+
+        # Prepend pending request ids to waiting queue.
+        if prefix_caching_enabled and pending_request_ids:
+            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     def schedule_chunked_prefill(self):
         """
@@ -1141,6 +1281,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
@@ -1149,6 +1293,21 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+
+            # Check for conflicting block hashes.
+            if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
+                        self.waiting_request_ids.popleft()
+                    )
+                    continue
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -1161,6 +1320,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    # Add these hashes to pending.
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1173,7 +1337,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
                 elif token_partially_can_be_added:
+                    # Add these hashes to pending.
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
+
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
+                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
+                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                    if remaining_len - chunk_length == 1 and chunk_length > 1:
+                        chunk_length -= 1
+
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1185,7 +1362,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float, int]:
+        # Prepend pending request ids to waiting queue.
+        if prefix_caching_enabled and pending_request_ids:
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            if is_continuing_chunked_prefill:
+                chunked_request_id = self.waiting_request_ids.popleft()
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+                self.waiting_request_ids.appendleft(chunked_request_id)
+            else:
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
@@ -1198,8 +1385,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # If suspended, no stepping.
-        if self.is_suspended:
-            raise EngineSuspendedError(self.step_count)
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            raise EngineSuspendedError(self.context.step_count)
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1224,14 +1411,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        self.step_count += 1
+        self.context.step_count += 1
 
         range_pop()
 
         if (
             self.logging_step_interval > 0
-            and self.step_count > 0
-            and self.step_count % self.logging_step_interval == 0
+            and self.context.step_count > 0
+            and self.context.step_count % self.logging_step_interval == 0
             and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1253,10 +1440,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
-        return result, context_state, step_time, self.step_count
+        return result, context_state, step_time
 
     async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1264,7 +1451,6 @@ class DynamicInferenceEngine(AbstractEngine):
             step_result (Optional[Dict]): The result of the step.
             context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
-            step_count (int): The count of the step.
 
         Returns:
             A dictionary containing:
@@ -1351,7 +1537,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
+                'inference/inference_step': int(
+                    self.inference_step_offset + int(self.context.step_count)
+                ),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -1371,19 +1559,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
-        if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+        if (
+            self.logging_step_interval > 0
+            and self.context.step_count % self.logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
-                "* rank %d | step %d | %s ... time: %.3f%s ... "
+                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    step_count,
+                    self.context.step_count,
                     datetime.now().strftime("%H:%M:%S"),
-                    step_time,
+                    step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
@@ -1567,73 +1758,105 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages = []
 
         range_pop()
+
+        # First pass: add all requests and detect staleness increments.
+        # Control signals are queued for the second pass.
+        has_staleness_increment = False
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
-
-            if self.received_stop:
-                assert (
-                    header == Headers.STOP_ACK
-                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
-
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
-            elif header == Headers.PAUSE:
-                # Pause thyself.
-                self.received_pause = True
-                self.running.clear()
-                # Send PAUSE_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.STOP:
-                # Stop thyself.
-                self.received_stop = True
-                self.running.clear()
-                # Send STOP_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.PAUSE_ACK:
-                self.paused.set()
-                self.received_pause = False
-            elif header == Headers.STOP_ACK:
-                self.stopped.set()
-                self.received_stop = False
+            elif header == Headers.INCREMENT_STALENESS:
+                has_staleness_increment = True
+            else:
+                # Control signal: queue for second pass.
+                self._pending_signals.append(message)
+
+        if has_staleness_increment:
+            waiting = set(self.waiting_request_ids)
+            for request_id, entry in self.requests.items():
+                entry.record.increment_staleness(policy_only=request_id in waiting)
+
+        # Second pass: apply at most one control signal (the engine loop
+        # processes one state transition per iteration).
+        if self._pending_signals:
+            message = self._pending_signals.popleft()
+            data = msgpack.unpackb(message, raw=False)
+            header = Headers(data[0])
+
+            if header == Headers.PAUSE:
+                if self.state == EngineState.RUNNING:
+                    self.state = EngineState.PAUSING
+                    self._state_events[EngineState.RUNNING].clear()
+                # Any other state can safely ignore PAUSE.
+
             elif header == Headers.UNPAUSE:
-                self.paused.clear()
-                self.running.set()
+                assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
+                self.state = EngineState.UNPAUSING
+
             elif header == Headers.SUSPEND:
-                self.suspend_signal = True
+                assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
+                self._state_events[EngineState.RESUMED].clear()
+                self.suspend()
+                self.state = EngineState.SUSPENDING
+
             elif header == Headers.RESUME:
-                self.suspend_signal = False
+                assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
+                self._state_events[EngineState.SUSPENDED].clear()
+                self.resume()
+                self.state = EngineState.RESUMING
+
             elif header == Headers.STOP:
-                self.received_stop = True
+                assert self.state in (
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
+                ), f"Received STOP in state {self.state}"
+                if self.state == EngineState.SUSPENDED:
+                    self._state_events[EngineState.SUSPENDED].clear()
+                self.state = EngineState.STOPPING
+
             else:
                 raise UnknownHeaderError(header)
 
         return len(all_messages)
 
-    def stop(self):
-        """
-        Stops the inference engine by terminating the inference coordinator process
-        if it exists, and destroys the model parallel state.
-        This method ensures that any running inference coordinator subprocess
-        is properly terminated, and cleans up resources associated with
-        model parallelism.
-        """
+    async def shutdown(self):
+        """Shut down the engine and clean up ZMQ resources.
 
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.join()
-        for socket in self.zmq_sockets:
-            socket.close()
+        Called from the engine loop's finally block after the loop exits.
+        """
+        self.state = EngineState.STOPPED
+
+        # Cleanup the request futures.
+        for entry in self.requests.values():
+            if not entry.future.done():
+                entry.future.cancel()
+
+        # ZMQ cleanup; designed to be idempotent.
+        sock = getattr(self, 'socket_for_receiving_requests', None)
+        if sock is not None and not sock.closed:
+            try:
+                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+            except Exception:
+                pass
+        for socket in getattr(self, 'zmq_sockets', []):
+            socket.close(linger=0)
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+        if hasattr(self, "world_zmq_communicator"):
+            self.world_zmq_communicator.close()
+        if not self.zmq_context.closed:
+            self.zmq_context.term()
+
+        # Set the stopped state at the very end.
+        self._state_events[EngineState.STOPPED].set()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1646,7 +1869,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            not self.is_suspended
+                            self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
@@ -1657,114 +1880,144 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def _ep_group_has_work(self, local_work: int) -> bool:
-        """Determines if there are some pending requests in the expert parallel group this
-        rank is a part of.
-        Args:
-            local_work (int): The local work count for this rank. This is a sum of active
-            and waiting requests.
-        Returns:
-            bool: True if there is some work in the EP group, False otherwise.
-        """
-        range_push("_ep_group_has_work")
+    async def _ep_establish_consensus(
+        self, local_work: int, signal_consensus: bool
+    ) -> tuple[int, bool]:
+        """EP all-reduce to share work counts and pause consensus.
 
-        is_stopped = self.stopped.is_set() or self.received_stop
-        is_paused = self.paused.is_set() or self.received_pause
-        is_suspended = self.suspend_signal
-        if is_stopped or is_paused or is_suspended:
-            # Signals can be received asynchronously on EP ranks.
-            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
-            # is yet to receive the signal.
-            # So this is an *attempt* to process the signal. This rank has received the signal
-            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
-            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
-            # and we will defer processing the signal.
-            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
-            local_work = 0
+        All-reduces two integers at once:
+        - local_work: actual pending request count (always >= 0).
+        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+
+        Using max for both:
+        - max(work) > 0 means at least one EP peer has real work.
+        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
+          Any RUNNING peer contributes 0, pulling the max to 0.
+
+        Args:
+            local_work: Pending request count for this rank.
+            signal_consensus: True if this rank is ready to pause.
+        Returns:
+            (global_work, all_pausing): max work across EP, and whether
+            all peers signaled consensus.
+        """
+        range_push("_ep_establish_consensus")
+
+        consensus_val = -1 if signal_consensus else 0
+
+        # Signals can be received asynchronously on EP ranks.
+        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
+        # So this is an *attempt* to process the signal. This rank has received the signal
+        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
+        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
+        # will be zero and we will defer processing the signal.
+        # When all ranks receive the signal, global consensus will be -1 and we can process.
 
         if self.ep_world_size > 1:
-            # Perform all-reduce to get max global work across EP group.
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop is megatron-rl.
-            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
+            # We have tried that and it blocks the event loop in megatron-rl.
+            global_work, global_consensus = (
+                await self.expert_parallel_zmq_communicator.all_reduce_max(
+                    local_work, consensus_val
+                )
+            )
         else:
-            max_global_work = local_work
+            global_work, global_consensus = local_work, consensus_val
 
         range_pop()
-        return max_global_work > 0
+        return global_work, global_consensus == -1
+
+    async def _world_barrier(self):
+        """World-wide ZMQ all-reduce barrier for global rank consensus.
+
+        Used for all state transitions that require global synchronization:
+        PAUSING → PAUSED, UNPAUSING → RUNNING, SUSPENDING → SUSPENDED,
+        RESUMING → PAUSED, and STOPPING → STOPPED.
+
+        No-op when world_size == 1 (communicator is not created).
+        """
+        range_push("world_barrier")
+        if hasattr(self, 'world_zmq_communicator'):
+            await self.world_zmq_communicator.all_reduce_max(1)
+        range_pop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
-        """Continually steps the engine asynchronously."""
+        """Continually steps the engine asynchronously.
+
+        State-dependent behavior:
+        - RUNNING: EP all-reduce to check for work, then step or idle.
+        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
+        - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
+        - STOPPED: Teardown and exit.
+        """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+
         try:
             while True:
                 self.schedule_requests()
 
-                # for the cases below (no active requests, or undergoing a state-change)
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
+                if self.state in (EngineState.RUNNING, EngineState.PAUSING):
+                    local_pending = self.context.get_active_request_count() + len(
+                        self.waiting_request_ids
+                    )
+                    global_work, all_pausing = await self._ep_establish_consensus(
+                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    )
 
-                local_pending_requests = self.context.get_active_request_count() + len(
-                    self.waiting_request_ids
-                )
-                # 1. Check for work availability (Consensus Step)
-                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
-
-                # 2. Dummy Work Logic (Keep group alive if peers have work)
-                if ep_group_has_work and local_pending_requests == 0:
-                    # run dummy forward pass if EP group as a whole has work,
-                    # but this rank does not have any work.
-                    self.step_start_event.record()
-                    self.controller.dummy_forward()
-                    self.step_end_event.record()
-                    self.step_end_event.synchronize()
-                    self.step_count += 1
-                    continue
-
-                # 3. No work in EP group
-                # We handle control signals (PAUSE/STOP/SUSPEND) only when
-                # the entire EP group has received the signal. It is important to
-                # not process these signals immediately upon receipt, because
-                # other ranks in the EP group may not have received them yet.
-                # If we exit prematurely, other ranks will deadlock at the all-to-all.
-                # We use self._ep_group_has_work() to build consensus across the EP group
-                # as to when it is safe to process these signals. The function returns False
-                # when all ranks have received the signal.
-                if not ep_group_has_work:
-                    # Priority A: STOP
-                    if self.stopped.is_set():
-                        if self.rank == 0:
-                            logging.info("Stopping engine.")
-                        self.stop()
-                        break
-
-                    # Priority B: SUSPEND
-                    if self.suspend_signal:
-                        self.suspend()
+                    if all_pausing:
+                        # All EP peers are PAUSING: pause immediately.
+                        await self._world_barrier()
+                        self.state = EngineState.PAUSED
+                        self._state_events[EngineState.PAUSED].set()
+                    elif global_work > 0:
+                        # At least one EP peer has work: all must participate.
+                        if local_pending > 0:
+                            await self.async_step()
+                        else:
+                            # Dummy forward to participate in the EP collective.
+                            self.step_start_event.record()
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            self.context.step_count += 1
                     else:
-                        self.resume()
+                        # No work, but not all pausing: idle.
+                        await asyncio.sleep(0.02)
 
-                    # Priority C: PAUSE or no work - nothing needs to be done
-                    # To avoid flooding the TP publisher socket with packets,
-                    # we sleep for 20 ms here.
-                    # todo [Siddharth]: Can this hardcoded sleep be avoided
-                    # with asyncio zmq sockets?
-                    await asyncio.sleep(0.02)  # Yield to event loop
-                    continue
+                elif self.state == EngineState.PAUSED:
+                    await asyncio.sleep(0.02)
 
-                await self.async_step()
+                elif self.state == EngineState.UNPAUSING:
+                    await self._world_barrier()
+                    self.state = EngineState.RUNNING
+                    self._state_events[EngineState.PAUSED].clear()
+                    self._state_events[EngineState.RUNNING].set()
 
-        except asyncio.CancelledError:
-            pass
+                elif self.state == EngineState.SUSPENDING:
+                    await self._world_barrier()
+                    self.state = EngineState.SUSPENDED
+                    self._state_events[EngineState.SUSPENDED].set()
+
+                elif self.state == EngineState.SUSPENDED:
+                    await asyncio.sleep(0.02)
+
+                elif self.state == EngineState.RESUMING:
+                    await self._world_barrier()
+                    self.state = EngineState.PAUSED
+                    self._state_events[EngineState.RESUMED].set()
+
+                elif self.state == EngineState.STOPPING:
+                    await self._world_barrier()
+                    if self.rank == 0:
+                        logging.info("Stopping engine.")
+                    break
+
+        finally:
+            await self.shutdown()
