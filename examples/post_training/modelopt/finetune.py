@@ -284,7 +284,7 @@ class SFTDataset(torch.utils.data.Dataset):
                 return None
 
         # We always add eos between samples for training purpose.
-        input_ids = self.tokenizer.apply_chat_template(example)["input_ids"]
+        input_ids = self.tokenizer.apply_chat_template(example, self.tokenizer.chat_template)["input_ids"]
         current_loss_mask = [1] * len(input_ids)
         input_ids = input_ids + [get_eos_id()]
         current_loss_mask += [0]
