@@ -50,7 +50,7 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --dataloader-type: external
   --data-path: ${DATA_PATH}
-  --language-model-checkpoint: ${ARTIFACTS_ROOT}/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
+  --language-model-checkpoint: ${CHECKPOINT_LOAD_PATH}/model/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
   --auto-detect-ckpt-format: true
   --accumulate-allreduce-grads-in-fp32: true
   --position-embedding-type: rope
