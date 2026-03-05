@@ -39,6 +39,7 @@ def _mamba_chunk_scan_combined_fwd(
     seq_idx=None,
     cu_chunk_seqlens=None,
     last_chunk_indices=None,
+    intermediate_chunk_indices=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
@@ -153,10 +154,13 @@ def _mamba_chunk_scan_combined_fwd(
 
     if return_intermediate_states:
         return states
+
+    final_states = states[last_chunk_indices]
+    if intermediate_chunk_indices is not None:
+        intermediate_states = states[intermediate_chunk_indices]
+        return final_states, intermediate_states
     else:
-        # With chunk-aligned sequences (one sequence per chunk), the final
-        # state for each sequence is simply the state at its last chunk.
-        return states[last_chunk_indices]
+        return final_states
 
 
 def mamba_chunk_scan_combined_varlen(
@@ -177,6 +181,7 @@ def mamba_chunk_scan_combined_varlen(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
+    intermediate_chunk_indices=None,
     state_dtype=None,
 ):
     """
@@ -196,10 +201,13 @@ def mamba_chunk_scan_combined_varlen(
         dt_bias: (nheads,)
         initial_states: (batch, nheads, headdim, dstate)
         dt_softplus: Whether to apply softplus to dt
-        out: (seqlen, nheads, headdim) preallocated output tensor
+        intermediate_chunk_indices: (N,) optional int64 tensor of chunk indices at which to
+            extract intermediate SSM states. When provided, returns (final_states,
+            intermediate_states) instead of just final_states.
         state_dtype: The data type of the ssm state
     Return:
-        varlen_states: (batch, nheads, headdim, dstate)
+        varlen_states: (batch, nheads, headdim, dstate), or
+        (varlen_states, intermediate_states) if intermediate_chunk_indices is provided
     """
 
     assert seq_idx is not None
@@ -220,6 +228,7 @@ def mamba_chunk_scan_combined_varlen(
         seq_idx=seq_idx,
         cu_chunk_seqlens=cu_chunk_seqlens,
         last_chunk_indices=last_chunk_indices,
+        intermediate_chunk_indices=intermediate_chunk_indices,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
