@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from .execution import MXFP8ReshardTransform, ReshardTransform, execute_reshard_plan
+from .execution import execute_reshard_plan
+from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .planner import build_centralized_reshard_plan
 from .refit import (
     clear_service_cache,

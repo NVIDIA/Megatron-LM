@@ -22,7 +22,7 @@ from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
-from .execution import ReshardTransform
+from .transforms import ReshardTransform
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
@@ -212,6 +212,71 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
     return _plan_cache[cache_key]
 
 
+def _needs_mxfp8_conversion(model) -> bool:
+    """Check if a model uses FlashInfer MXFP8 inference and needs weight conversion."""
+    if model is None:
+        return False
+    lm = model[0] if isinstance(model, (list, tuple)) else model
+    config = lm.config
+    return (
+        getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        and getattr(config, 'fp8_recipe', None) == 'mxfp8'
+    )
+
+
+def _setup_mxfp8_transform_on_plan(
+    plan,
+    target_model,
+) -> None:
+    """Detect MXFP8 needs and attach a transform to the plan if required.
+
+    If the *target_model* uses an inference-optimized layer spec with MXFP8,
+    this function:
+      1. Computes which params are eligible for MXFP8 conversion.
+      2. Quantizes the target model's decoder weights to FlashInfer MXFP8Tensor
+         (creating persistent buffers whose addresses are later captured by
+         CUDA graphs).
+      3. Builds an ``MXFP8ReshardTransform`` and attaches it to the plan as
+         ``plan.transform``.
+
+    If the model doesn't need MXFP8, ``plan.transform`` is set to None.
+    Subsequent calls are no-ops if the plan already has a transform attribute.
+    """
+    if hasattr(plan, 'transform'):
+        return  # Already set up
+
+    if not _needs_mxfp8_conversion(target_model):
+        plan.transform = None
+        return
+
+    from .transforms import MXFP8ReshardTransform
+    from megatron.core.inference.quantization.utils import (
+        _should_quantize_param,
+        quantize_params_to_mxfp8,
+    )
+
+    lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
+    core = unwrap_model(lm)
+    decoder = core.decoder if hasattr(core, 'decoder') else core
+
+    # 1. Compute which parameters are eligible for MXFP8 conversion.
+    #    Must be done while params are still visible as nn.Parameter (BF16).
+    convertible: set[str] = set()
+    for name, param in decoder.named_parameters():
+        if _should_quantize_param(param):
+            convertible.add(f"decoder.{name}")
+
+    # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
+    persistent_buffers = quantize_params_to_mxfp8(decoder)
+
+    # 3. Build the transform and attach it to the plan.
+    plan.transform = MXFP8ReshardTransform(
+        convertible_params=convertible,
+        persistent_buffers=persistent_buffers,
+        buffer_key_prefix="decoder.",
+    )
+
+
 def prepare_swap_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
@@ -219,20 +284,27 @@ def prepare_swap_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
 ):
-    """Pre-build and cache the reshard plan without executing any weight transfer.
+    """Pre-build and cache the reshard plan and any format-conversion transforms.
 
     Call this during initialization while models are in their native (BF16) format,
     before any weight format conversion (e.g., MXFP8).  The plan is stored in the
     same module-level cache as swap_model_weights, so subsequent calls reuse it
     without needing to inspect named_parameters() again.
 
+    If the *target_model* uses an inference-optimized layer spec with MXFP8
+    (``config.transformer_impl == 'inference_optimized'`` and
+    ``config.fp8_recipe == 'mxfp8'``), this function also:
+      - computes which parameters are eligible for MXFP8 conversion,
+      - quantizes the target decoder weights to persistent FlashInfer
+        MXFP8Tensor buffers (whose addresses are later baked into CUDA graphs),
+      - creates an ``MXFP8ReshardTransform`` that subsequent
+        ``swap_model_weights`` calls use automatically.
+
+    Callers do **not** need to know about MXFP8 — the transform is created and
+    cached transparently.
+
     All participating ranks must call this simultaneously — the plan builder uses
     collective communication internally.
-
-    This is particularly important when destination weights will be converted to a
-    format that hides parameters from named_parameters() (such as MXFP8 tensors
-    stored in module.__dict__ instead of _parameters).  Building the plan before
-    conversion ensures all parameters are visible to the planner.
 
     Args:
         src_model: Source model, or None if this rank only receives weights.
@@ -242,7 +314,12 @@ def prepare_swap_model_weights(
         dst_rank_offset: Rank offset for destination (inference) workers.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-    _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset)
+    plan = _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset)
+
+    # Auto-detect and set up MXFP8 transform on the plan for the target model.
+    # This must happen after the plan is built (while BF16 params are still visible)
+    # and before any swap_model_weights call.
+    _setup_mxfp8_transform_on_plan(plan, target_model)
 
 
 def swap_model_weights(
@@ -256,15 +333,22 @@ def swap_model_weights(
 ):
     """
     Orchestrate weight swap/refit.
-    - refit_method can be:
-        * a string backend name (one of the supported refit backends), or
-        * a CopyService instance.
-    - group: Optional process group for communication.
-    - src_rank_offset / dst_rank_offset: Offsets applied to local process group
-      ranks so that metadata contains globally unique rank IDs across independent
-      torch.distributed worlds (e.g., separate training and inference clusters).
-    - transform: Optional ReshardTransform for custom format conversion
-      during reshard.  Passed through to execute_reshard_plan.
+
+    If *transform* is not explicitly provided, the function automatically uses
+    any ``MXFP8ReshardTransform`` that was created and cached by a prior
+    ``prepare_swap_model_weights`` call for the same model pair.  This makes
+    MXFP8 handling transparent to callers.
+
+    Args:
+        refit_method: a string backend name (one of the supported refit
+            backends) or a CopyService instance.
+        group: Optional process group for communication.
+        src_rank_offset / dst_rank_offset: Offsets applied to local process
+            group ranks so that metadata contains globally unique rank IDs
+            across independent torch.distributed worlds.
+        transform: Optional ReshardTransform for custom format conversion.
+            If None, the cached transform (from prepare_swap_model_weights)
+            is used automatically when the receiver needs MXFP8 conversion.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -274,6 +358,16 @@ def swap_model_weights(
         raise TypeError(
             "refit_method must be a str backend name or a CopyService-compatible instance"
         )
+
+    # Auto-resolve MXFP8 transform from the cached plan when no
+    # explicit transform was provided.
+    if transform is None:
+        src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+        plan = _build_or_get_plan(
+            src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        )
+        transform = getattr(plan, 'transform', None)
+
     reshard_model_weights(
         src_model,
         target_model,

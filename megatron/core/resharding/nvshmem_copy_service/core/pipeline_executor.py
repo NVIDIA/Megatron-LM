@@ -198,21 +198,33 @@ class PipelineExecutor:
                 )
                 torch.cuda.nvtx.range_pop()
 
+            # Step 4a: Wait for prior unpack to complete BEFORE the barrier.
+            # The barrier lets the remote sender proceed to the next iteration,
+            # which reuses recv_slot[(i-1)%2] for a new put().  RDMA writes
+            # bypass CUDA stream ordering — they land in GPU memory regardless
+            # of which stream is active.  If the unpack kernel is still reading
+            # recv_slot[(i-1)%2] when the sender's put overwrites it, the
+            # kernel reads partially-overwritten data → silent corruption.
+            # Syncing the unpack event here ensures the receiver has finished
+            # reading the slot before the barrier signals the sender to proceed.
+            torch.cuda.nvtx.range_push("Step 4a: Wait Unpack")
+            if has_prior_recv:
+                self.unpack_events[(i - 1) % 2].synchronize()
+            torch.cuda.nvtx.range_pop()
+
             # Ensure all NVSHMEM operations on send_stream complete (stream-ordered)
             nvshmem.core.quiet(stream=self.send_stream)
 
-            # Step 4: Global barrier + record event for next iteration's unpack
-            torch.cuda.nvtx.range_push("Step 4: Barrier")
+            # Step 4b: Global barrier + record event for next iteration's unpack
+            torch.cuda.nvtx.range_push("Step 4b: Barrier")
             nvshmem.core.barrier_all(stream=self.send_stream)
             # Record barrier event on send_stream so unpack_stream can wait on it.
             # This is ordered after barrier_all on the same stream.
             self.barrier_events[slot].record(stream=self.torch_send_stream)
             torch.cuda.nvtx.range_pop()
 
-            # Step 5: Wait for async pack/unpack to complete (double-buffer safety)
-            torch.cuda.nvtx.range_push("Step 5: Wait Async")
-            if has_prior_recv:
-                self.unpack_events[(i - 1) % 2].synchronize()
+            # Step 5: Wait for async pack to complete (double-buffer safety)
+            torch.cuda.nvtx.range_push("Step 5: Wait Pack")
             if has_next_send:
                 self.pack_events[(i + 1) % 2].synchronize()
             torch.cuda.nvtx.range_pop()

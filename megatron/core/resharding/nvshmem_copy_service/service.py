@@ -116,6 +116,13 @@ class RemoteCopyService:
 
         # Allocate double-buffered send/recv slots
         self.buffer_manager.allocate()
+        # The .zero_() calls inside allocate() go to the default CUDA stream.
+        # Sync it now so the zeros are fully committed before any NVShmem
+        # operations (which bypass CUDA streams via RDMA) touch the buffers.
+        # Without this, a still-running zero() can race with the first
+        # nvshmem.core.put() and overwrite received data.
+        import torch
+        torch.cuda.synchronize()
 
         # Barrier to ensure all PEs complete buffer allocation before proceeding
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
@@ -302,7 +309,7 @@ class RemoteCopyService:
         self.pipeline_executor.execute_pipeline(self.iter_schedules, self.num_iterations)
         nvtx.range_pop()  # execute_pipeline
 
-        # Global barrier after execution
+        # Global sync after execution
         PELogger.debug("Barrier: Synchronizing all PEs after pipeline")
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
 

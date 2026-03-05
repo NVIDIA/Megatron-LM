@@ -103,9 +103,8 @@ def collect_mxfp8_param_metadata(
 ) -> Dict[str, Tuple[torch.Size, torch.dtype, torch.device]]:
     """Record shape/dtype/device for each parameter that will be quantized.
 
-    Called once before the first quantization so that
-    ``restore_params_from_mxfp8`` can recreate matching ``nn.Parameter``
-    placeholders later.
+    Called once before the first quantization to record the original parameter
+    metadata (shape, dtype, device) before any format conversion.
     """
     metadata: Dict[str, Tuple[torch.Size, torch.dtype, torch.device]] = {}
     for name, param in model.named_parameters():
@@ -184,55 +183,6 @@ def quantize_params_to_mxfp8(
             setattr(model, key, fi_tensor)
 
     return persistent_buffers
-
-
-def restore_params_from_mxfp8(
-    model: torch.nn.Module,
-    param_metadata: Dict[str, Tuple[torch.Size, torch.dtype, torch.device]],
-    _prefix: str = "",
-) -> None:
-    """Replace MXFP8Tensor attributes with nn.Parameter placeholders.
-
-    This is the inverse of ``quantize_params_to_mxfp8``.  After calling this
-    function, ``swap_model_weights`` can write new training weights into the
-    model's ``nn.Parameter`` objects via ``named_parameters()`` +
-    ``.data.copy_()``.
-
-    The MXFP8Tensor objects are **not** freed here – they remain alive in the
-    worker's ``persistent_buffers`` dict for reuse on the next quantization.
-
-    Args:
-        model: The model to restore.
-        param_metadata: Dict mapping fully-qualified names to
-            ``(shape, dtype, device)`` tuples (from ``collect_mxfp8_param_metadata``).
-        _prefix: Internal recursion prefix – callers should not set this.
-    """
-    # Recurse through child modules
-    for child_name, child_module in model.named_children():
-        child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
-        restore_params_from_mxfp8(child_module, param_metadata, _prefix=child_prefix)
-
-    # Check attributes on this module that are MXFP8Tensor (not in _parameters)
-    for key in list(vars(model).keys()):
-        val = getattr(model, key)
-        if not isinstance(val, MXFP8Tensor):
-            continue
-
-        fqn = f"{_prefix}{key}"
-        if fqn not in param_metadata:
-            continue
-
-        shape, dtype, device = param_metadata[fqn]
-
-        # Remove the MXFP8Tensor attribute
-        delattr(model, key)
-
-        # Register an nn.Parameter placeholder with matching shape/dtype
-        placeholder = torch.nn.Parameter(
-            torch.empty(shape, dtype=dtype, device=device),
-            requires_grad=False,
-        )
-        model.register_parameter(key, placeholder)
 
 
 def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
