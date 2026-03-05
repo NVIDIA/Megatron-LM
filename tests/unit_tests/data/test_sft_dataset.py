@@ -30,6 +30,7 @@ from tests.unit_tests.test_utilities import Utils
 from tools.build_sequences_per_dataset import build_sequences_per_dataset
 
 from megatron.core.tokenizers.text.libraries.sft_tokenizer import nemotron_nano_v2_custom_template
+from megatron.core.datasets.sft_dataset import Nemotron3ChatTemplateConfig
 
 # TODO(asolergi-nv): Add chat template to tokens | DONE
 # TODO(asolergi-nv): Use tokenize_conversation instead of apply_chat_template
@@ -145,6 +146,8 @@ def test_sft_dataset(
             "reset_attention_mask": False,
             "eod_mask_loss": False,
             "create_attention_mask": False,
+            "train_on_assistant_responses_only": False,
+            "train_on_thinking_traces": False,
         }
         config = SFTDatasetConfig(**data_args)
 

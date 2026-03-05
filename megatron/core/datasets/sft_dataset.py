@@ -21,10 +21,28 @@ from bisect import bisect
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ChatTemplateConfig:
+    system_start_str: str
+    user_start_str: str
+    assistant_start_str: str
+    end_str: str
+    think_start_str: str
+    think_end_str: str
+
+@dataclass
+class Nemotron3ChatTemplateConfig(ChatTemplateConfig):
+    system_start_str: str = "<|im_start|>system\n"
+    user_start_str: str = "<|im_start|>user\n"
+    assistant_start_str: str = "<|im_start|>assistant\n"
+    end_str: str = "<|im_end|>\n"
+    think_start_str: str = "<think>"
+    think_end_str: str = "</think>"
+
 
 @dataclass
 class SFTDatasetConfig(GPTDatasetConfig):
-    train_on_completitions_only: bool = False
+    train_on_assistant_responses_only: bool = True
     """If True, only train on completitions, otherwise train on full conversations"""
 
     train_on_thinking_traces: bool = True
@@ -36,7 +54,35 @@ class SFTDatasetConfig(GPTDatasetConfig):
     #completitions_end_tokens: List[int]
     """The tokens that indicate the end of a completition"""
 
-    truncate_conversations: bool = True # TODO(asolergi-nv): 
+    chat_template_config: ChatTemplateConfig = field(default_factory=Nemotron3ChatTemplateConfig)
+
+    role_start_tokens: Dict[str, List[int]] = field(init=False, default=None)
+    end_tokens: List[int] = field(init=False, default=None)
+    think_start_id: int = field(init=False, default=None)
+    think_end_id: int = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        """Do asserts and set fields post init"""
+        super().__post_init__()
+
+        assert not self.train_on_thinking_traces or self.train_on_assistant_responses_only, (
+            "train_on_assistant_responses_only must be True when train_on_thinking_traces is True"
+        )
+
+        assert not self.train_on_assistant_responses_only or self.chat_template_config is not None, (
+            "chat_template_config must be provided when train_on_assistant_responses_only is True"
+        )
+
+        if self.train_on_assistant_responses_only:
+            self.role_start_tokens = {
+                "system": self.tokenizer.encode(self.chat_template_config.system_start_str, add_special_tokens=False),
+                "user": self.tokenizer.encode(self.chat_template_config.user_start_str, add_special_tokens=False),
+                "assistant": self.tokenizer.encode(self.chat_template_config.assistant_start_str, add_special_tokens=False),
+            }
+            self.end_tokens = self.tokenizer.encode(self.chat_template_config.end_str, add_special_tokens=False)
+            self.think_start_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_start_str)
+            self.think_end_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_end_str)
+
 
 class SFTDataset(MegatronDataset):
     def __init__(
@@ -117,7 +163,7 @@ class SFTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
-        tokens, lengths = self._query_document_sample_shuffle_indices(idx)
+        tokens, _, lengths = self._query_document_sample_shuffle_indices(idx)
 
         tokens = torch.from_numpy(tokens).long()
         cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(lengths), dim = 0)))
@@ -151,7 +197,8 @@ class SFTDataset(MegatronDataset):
 
         document_ids = []
         sample_parts = []
-
+        loss_masks = []
+        
         # TODO(asolergi-nv): For PP add flag to JUST read cu_seqlens
         # TODO(asolergi-nv): sequence_pointer, sequence_length, sequence_mode = self.dataset.index[document_index[i or doc_index_beg]]
         
@@ -159,14 +206,28 @@ class SFTDataset(MegatronDataset):
             # Add the document id # TODO(asolergi-nv): Remove
             document_ids.append(self.document_index[i])
             
-            # Add the sample part
-            sample_parts.append(self.dataset.get(self.document_index[i]))
+            sample = self.dataset.get(self.document_index[i])
+            if self.config.train_on_assistant_responses_only:
+                segments = extract_segments(sample.tolist(), self.config.role_start_tokens, self.config.end_tokens, self.config.think_start_id, self.config.think_end_id)
+                loss_mask = numpy.zeros(sample.shape[0], dtype=numpy.int64)
+                for seg in segments:
+                    if seg["role"] == "assistant":
+                        loss_mask[seg["start"]:seg["end"]] = 1
+                    elif seg["role"] == "reasoning" and self.config.train_on_thinking_traces:
+                        loss_mask[seg["start"]:seg["end"]] = 1
+            else:
+                loss_mask = numpy.ones(sample.shape[0], dtype=numpy.int64)
+            
+            # Add the sample part & loss mask
+            sample_parts.append(sample)
+            loss_masks.append(loss_mask)
         assert len(document_ids) == len(
             sample_parts
         ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
+            numpy.concatenate(loss_masks,  dtype=numpy.int64),
             numpy.array([len(sample_part) for sample_part in sample_parts], dtype=numpy.int64), # NOTE(asolergi-nv): cu_seqlens
         )
 
@@ -470,3 +531,58 @@ def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[in
 
     # Convert to list of index lists (discard sizes)
     return [[idx for idx, _ in b] for b in bins if b]
+
+def find_subsequence(sequence, subsequence, start=0):
+    sub_len = len(subsequence)
+    for i in range(start, len(sequence) - sub_len + 1):
+        if sequence[i:i + sub_len] == subsequence:
+            return i
+    return -1
+
+def extract_segments(tokenized_conversation, role_start_tokens, end_tokens, think_start_id, think_end_id):
+    markers = []
+    for role, start_tokens in role_start_tokens.items():
+        pos = 0
+        while True:
+            idx = find_subsequence(tokenized_conversation, start_tokens, pos)
+            if idx == -1:
+                break
+            markers.append((idx, role, len(start_tokens)))
+            pos = idx + len(start_tokens)
+    markers.sort(key=lambda x: x[0])
+
+    segments = []
+    for start_pos, role, marker_len in markers:
+        content_start = start_pos + marker_len
+        end_pos = find_subsequence(tokenized_conversation, end_tokens, content_start)
+        if end_pos == -1:
+            content_end = len(tokenized_conversation)
+        else:
+            content_end = end_pos
+        content_tokens = tokenized_conversation[content_start:content_end]
+
+        if role == "assistant":
+            think_start_idx = None
+            think_end_idx = None
+            for i, tok in enumerate(content_tokens):
+                if tok == think_start_id and think_start_idx is None:
+                    think_start_idx = i
+                elif tok == think_end_id:
+                    think_end_idx = i
+                    break
+
+            if think_start_idx is not None and think_end_idx is not None:
+                reasoning_tokens = content_tokens[think_start_idx + 1:think_end_idx]
+                response_tokens = content_tokens[think_end_idx + 1:]
+                if reasoning_tokens:
+                    abs_start = content_start + think_start_idx + 1
+                    abs_end = content_start + think_end_idx
+                    segments.append({"role": "reasoning", "tokens": reasoning_tokens, "start": abs_start, "end": abs_end})
+                if response_tokens:
+                    abs_start = content_start + think_end_idx + 1
+                    segments.append({"role": "assistant", "tokens": response_tokens, "start": abs_start, "end": content_end})
+                continue
+
+        segments.append({"role": role, "tokens": content_tokens, "start": content_start, "end": content_end})
+
+    return segments
