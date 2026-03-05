@@ -156,7 +156,7 @@ try:
                 token_logprobs = result.get('log_probs', [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
-                tokens = tokenizer.batch_detokenize(tokens_to_decode)
+                tokens = list(map(tokenizer.detokenize, tokens_to_decode))
 
                 # Get top_n_logprobs if available
                 generated_top_n_logprobs = result.get('generated_top_n_logprobs')

@@ -132,7 +132,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             max_keepalive_connections=concurrency_limit,
         )
         http_client = DefaultAioHttpClient(
-            timeout=httpx.Timeout(connect=15, read=600, write=600, pool=600),
+            timeout=None,
             limits=custom_limits,
             http2=use_http2
         )
@@ -151,10 +151,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             await self._openai_client.close()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
-            stop_text_gen_server()
-
-        if dist.get_rank() == 0:
             self._client.pause_engines()
         await self._inference_engine.wait_until(EngineState.PAUSED)
 
@@ -165,6 +161,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
             self._client.stop()
+
+        if dist.get_rank() == 0:
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            stop_text_gen_server()
 
     def increment_staleness(self):
         if dist.get_rank() == 0:
