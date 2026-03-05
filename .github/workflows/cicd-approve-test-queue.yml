@@ -78,7 +78,7 @@ jobs:
 
           # Load SSO users for internal/external classification
           with open(os.environ["SSO_USERS_FILE"]) as f:
-              sso_users = set(json.load(f).keys())
+              sso_users = json.load(f)
 
           # Headers for GitHub API
           headers = {
@@ -104,9 +104,10 @@ jobs:
                   return None
 
           def is_internal_contributor(pr_info):
-              """Return True if the PR author is an NVIDIA SSO member."""
+              """Return True if the PR author is a member of NVIDIA or NVIDIA-NeMo org (is_org_member)."""
               login = pr_info.get("user", {}).get("login", "")
-              return login in sso_users
+              org_roles = sso_users.get(login, {}).get("org_roles", [])
+              return any(role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles)
 
           def get_pr_base_branch(workflow_run):
               """
