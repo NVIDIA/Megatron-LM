@@ -18,6 +18,9 @@
 Pushes the current branch to the internal GitLab remote under the
 pull-request/<branch> naming convention and triggers a pipeline with
 the specified test configuration.
+
+Requires a GitLab personal access token with at least the 'api' scope.
+Set the GITLAB_TOKEN environment variable or pass --access-token.
 """
 
 import argparse
@@ -82,7 +85,7 @@ def git_push(origin, target_branch, dry_run=False):
     )
 
 
-def trigger_pipeline(gitlab_url, trigger_token, ref, pipeline_vars, dry_run=False):
+def trigger_pipeline(gitlab_url, access_token, ref, pipeline_vars, dry_run=False):
     """Trigger a GitLab pipeline on the given ref with the provided variables."""
     if dry_run:
         logger.info(
@@ -95,9 +98,10 @@ def trigger_pipeline(gitlab_url, trigger_token, ref, pipeline_vars, dry_run=Fals
     logger.info(
         "Triggering pipeline on https://%s project %s @ %s", gitlab_url, GITLAB_PROJECT_ID, ref
     )
-    gl = gitlab.Gitlab(f"https://{gitlab_url}")
+    gl = gitlab.Gitlab(f"https://{gitlab_url}", private_token=access_token)
     project = gl.projects.get(GITLAB_PROJECT_ID, lazy=True)
-    pipeline = project.trigger_pipeline(ref=ref, token=trigger_token, variables=pipeline_vars)
+    variables = [{"key": k, "value": v} for k, v in pipeline_vars.items()]
+    pipeline = project.pipelines.create({"ref": ref, "variables": variables})
     logger.info("Pipeline triggered: %s", pipeline.web_url)
 
 
@@ -112,9 +116,9 @@ def main():
         help="Name of the git remote pointing to the internal GitLab (e.g. gitlab)",
     )
     parser.add_argument(
-        "--trigger-token",
-        default=os.environ.get("GITLAB_TRIGGER_TOKEN"),
-        help="GitLab pipeline trigger token (or set GITLAB_TRIGGER_TOKEN env var)",
+        "--access-token",
+        default=os.environ.get("GITLAB_TOKEN"),
+        help="GitLab personal access token with 'api' scope (or set GITLAB_TOKEN env var)",
     )
     parser.add_argument(
         "--functional-test-scope",
@@ -140,8 +144,8 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    if not args.trigger_token:
-        logger.error("--trigger-token or GITLAB_TRIGGER_TOKEN not set")
+    if not args.access_token:
+        logger.error("--access-token or GITLAB_TOKEN not set")
         sys.exit(1)
 
     branch = get_current_branch()
@@ -162,7 +166,7 @@ def main():
     }
 
     trigger_pipeline(
-        gitlab_hostname, args.trigger_token, target_branch, pipeline_vars, dry_run=args.dry_run
+        gitlab_hostname, args.access_token, target_branch, pipeline_vars, dry_run=args.dry_run
     )
 
 
