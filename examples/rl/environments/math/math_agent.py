@@ -126,6 +126,11 @@ class MathAgent(RewardOnlyAgent):
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 
-        prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+        # prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+        prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+    The question will be a word math problem. Show your work in <think> </think> tags.
+    {answer_format}
+    User: {kwargs[problem_key]}
+    Assistant:"""
 
         return prefix

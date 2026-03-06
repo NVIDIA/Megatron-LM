@@ -65,6 +65,17 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
+try:
+    from megatron.rl.rl_profiling import (
+        initialize_rl_profiler,
+        log_iteration_profile,
+        shutdown_rl_profiler,
+        get_rl_profiler,
+    )
+    has_rl_profiling = True
+except ImportError:
+    has_rl_profiling = False
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -1065,6 +1076,28 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
+    # Initialize RL profiler if enabled
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        profile_dir = getattr(args, 'rl_profile_dir', None)
+        if profile_dir is None:
+            if args.save:
+                profile_dir = os.path.join(args.save, 'profiles')
+            else:
+                profile_dir = './profiles'
+
+        run_id = os.getenv("SLURM_JOB_ID", None)
+        if run_id is None:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        initialize_rl_profiler(
+            output_dir=profile_dir,
+            run_id=run_id,
+            enabled=True,
+            log_to_wandb=(wandb_writer is not None),
+            log_to_tensorboard=(get_tensorboard_writer() is not None),
+        )
+        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -1923,14 +1956,17 @@ def training_log(
         ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+        timers_to_log.extend([
+            'rollout-collection', 'inference-setup', 'collect-rollouts',
+            'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
+            'prepare-trajectories', 'get-ltor-masks-and-position-ids',
+            'sequence-packing',
+            'compute-logprobs', 'compute-old-logprobs', 'compute-ref-logprobs',
+            'pack-logprobs', 'align-inference-logprobs',
+            'create-dataloader', 'log-wandb-tb',
+            'offload-optimizer-before-inference', 'onload-optimizer-after-inference',
+            'suspend-engine',
+        ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2114,11 +2150,126 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+
+            tokens_this_iter = batch_size * args.seq_length
+
+            # Compute and log MFU (Model FLOPs Utilization)
+            if not hasattr(args, '_gpu_peak_tflops'):
+                try:
+                    from megatron.training.gpu_peak_flops import get_gpu_peak_tflops
+                    args._gpu_peak_tflops = get_gpu_peak_tflops()
+                except Exception:
+                    args._gpu_peak_tflops = 0.0
+
+            training_mfu = 0.0
+            inference_mfu = 0.0
+            total_mfu = 0.0
+            has_tracker = False
+            iter_inference_tokens = 0
+            iter_inference_time = 0.0
+            iter_logprob_time = 0.0
+            training_only_time = elapsed_time_per_iteration
+            training_flops = 0.0
+            iter_inference_flops = 0.0
+            effective_tokens = tokens_this_iter
+
+            # Read compute-logprobs time from the existing Megatron timer
+            try:
+                iter_logprob_time = (
+                    timers('compute-logprobs').elapsed(reset=False, barrier=False)
+                    / total_iterations
+                )
+            except Exception:
+                pass
+
+            if args._gpu_peak_tflops > 0:
+                try:
+                    from megatron.training.mfu_tracker import get_mfu_tracker
+                    tracker = get_mfu_tracker()
+                    training_flops = num_floating_point_operations(args, batch_size)
+                    iter_inference_time = tracker.get_iter_inference_time()
+                    iter_inference_flops = tracker.get_iter_inference_flops()
+                    iter_inference_tokens = tracker.get_iter_inference_tokens()
+                    real_training_tokens = tracker.get_iter_real_training_tokens()
+                    if real_training_tokens > 0:
+                        effective_tokens = real_training_tokens
+                    training_only_time = max(
+                        elapsed_time_per_iteration - iter_inference_time - iter_logprob_time, 1e-6
+                    )
+                    tracker.add_training_flops(
+                        training_flops, training_only_time, tokens=effective_tokens
+                    )
+                    tracker.reset_iter()
+                    has_tracker = True
+                except Exception:
+                    has_tracker = False
+
+                training_mfu = throughput / args._gpu_peak_tflops * 100.0
+
+            ws = args.world_size
+
+            # Per-iteration toks/s/GPU breakdown (uses real tokens when seq packing is active)
+            train_tps = effective_tokens / (training_only_time * ws) if training_only_time > 0 else 0.0
+            inf_tps = iter_inference_tokens / (iter_inference_time * ws) if iter_inference_time > 0 else 0.0
+            total_tps = (effective_tokens + iter_inference_tokens) / (elapsed_time_per_iteration * ws)
+            e2e_tps = effective_tokens / (elapsed_time_per_iteration * ws)
+
+            if has_tracker:
+                log_string += (
+                    f' toks/s/GPU: train {train_tps:.0f}'
+                    f', infer {inf_tps:.0f}'
+                    f', total {total_tps:.0f}'
+                    f', e2e {e2e_tps:.0f} |'
+                )
+
+            # Per-iteration MFU breakdown
+            if args._gpu_peak_tflops > 0:
+                log_string += f' MFU: train {training_mfu:.1f}%'
+                if has_tracker:
+                    if iter_inference_time > 0:
+                        inference_mfu = (
+                            iter_inference_flops / (iter_inference_time * ws)
+                            / 1e12 / args._gpu_peak_tflops * 100.0
+                        )
+                    total_mfu = (
+                        (training_flops + iter_inference_flops)
+                        / (elapsed_time_per_iteration * ws)
+                        / 1e12 / args._gpu_peak_tflops * 100.0
+                    )
+                    log_string += (
+                        f', infer {inference_mfu:.1f}%'
+                        f', total {total_mfu:.1f}%'
+                    )
+                log_string += ' |'
+
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar('toks_per_sec_per_gpu/e2e', e2e_tps, iteration)
+                    if has_tracker:
+                        writer.add_scalar('toks_per_sec_per_gpu/training', train_tps, iteration)
+                        writer.add_scalar('toks_per_sec_per_gpu/inference', inf_tps, iteration)
+                        writer.add_scalar('toks_per_sec_per_gpu/total', total_tps, iteration)
+                    if args._gpu_peak_tflops > 0:
+                        writer.add_scalar('mfu/training_percent', training_mfu, iteration)
+                        if has_tracker:
+                            writer.add_scalar('mfu/inference_percent', inference_mfu, iteration)
+                            writer.add_scalar('mfu/total_percent', total_mfu, iteration)
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_log = {
+                        'throughput': throughput,
+                        'toks_per_sec_per_gpu/e2e': e2e_tps,
+                    }
+                    if has_tracker:
+                        wandb_log['toks_per_sec_per_gpu/training'] = train_tps
+                        wandb_log['toks_per_sec_per_gpu/inference'] = inf_tps
+                        wandb_log['toks_per_sec_per_gpu/total'] = total_tps
+                    if args._gpu_peak_tflops > 0:
+                        wandb_log['mfu/training_percent'] = training_mfu
+                        if has_tracker:
+                            wandb_log['mfu/inference_percent'] = inference_mfu
+                            wandb_log['mfu/total_percent'] = total_mfu
+                    wandb_writer.log(wandb_log, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -2153,6 +2304,35 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+
+        # Log avg sequence length (for both packing and non-packing RL paths)
+        if has_rl_utils and getattr(args, 'perform_rl_step', False):
+            runtime_state = rl_utils.get_rl_runtime_state()
+            packing_ctx = runtime_state.packing_context
+            if getattr(args, 'rl_use_sequence_packing', False) and packing_ctx is not None:
+                avg_seq_length = rl_utils.get_packing_avg_seq_length(packing_ctx)
+                packing_eff = rl_utils.get_packing_efficiency(packing_ctx)
+                log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+                log_string += f' packing_eff: {packing_eff:.1%} |'
+            elif args.log_throughput:
+                avg_seq_length = effective_tokens / batch_size if batch_size > 0 else 0.0
+                log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+
+        # Log RL profiling data if enabled (must be before timers.log which resets timers)
+        if has_rl_profiling and getattr(args, 'rl_profile', False):
+            _tps = e2e_tps if args.log_throughput else None
+            log_iteration_profile(
+                iteration=iteration,
+                timers=timers,
+                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
+                throughput_tflops=throughput if args.log_throughput else None,
+                global_batch_size=batch_size,
+                tokens_per_sec=_tps * args.world_size if _tps else None,
+                tokens_per_sec_per_gpu=_tps,
+                wandb_writer=wandb_writer,
+                tb_writer=writer,
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -3116,6 +3296,10 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    # Shutdown RL profiler and export summary
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        shutdown_rl_profiler()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:

@@ -52,6 +52,8 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
     update_microbatch_calculator,
+    get_packing_avg_seq_length,
+    get_packing_efficiency,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -294,16 +296,31 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.actual_tokens_this_iteration = 0
+        self.compute_tokens_this_iteration = 0
+        self.packing_efficiency = 0.0
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.actual_tokens_this_iteration = 0
+        self.compute_tokens_this_iteration = 0
+        self.packing_efficiency = 0.0
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
         self.sequences_this_iteration_on_rank += count
         self.latest_batch_num_sequences = count
+
+    def update_token_counts(self, actual_tokens: int, compute_tokens: int):
+        """Update token counts for the current iteration."""
+        self.actual_tokens_this_iteration = actual_tokens
+        self.compute_tokens_this_iteration = compute_tokens
+        if compute_tokens > 0:
+            self.packing_efficiency = actual_tokens / compute_tokens
+        else:
+            self.packing_efficiency = 0.0
 
 
 # Global runtime state instance
@@ -487,7 +504,7 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
+        with nvtx_range("offload-optimizer-before-inference", time=True):
             if not args.rl_training_cuda_graphs:
                 model[0].offload_grad_buffers()
             else:
@@ -495,6 +512,7 @@ def get_environment_rollouts(
                     "Gradient buffers will not be offloaded when training cudagraphs are used!"
                 )
             optimizer.offload_to_cpu()
+
 
     # If we have separate training and inference models we to refit weights from the training model to the inference model.
     has_separate_inference_model = inference_model is not None
@@ -519,7 +537,7 @@ def get_environment_rollouts(
     pg_size = get_pg_size(inference_pg_collection.ep)
     assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
-    with nvtx_range("rollout-collection"):
+    with nvtx_range("rollout-collection", time=True):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
             inference_model,
@@ -530,7 +548,7 @@ def get_environment_rollouts(
             increment_staleness_on_suspend=True,
         ) as inference_interface:
 
-            with nvtx_range("inference-setup"):
+            with nvtx_range("inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
                 rollout_generator = get_rollout_generator(
                     args, inference_interface, n_prompts, samples_per_group
@@ -538,7 +556,7 @@ def get_environment_rollouts(
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
-            with nvtx_range("collect-rollouts"):
+            with nvtx_range("collect-rollouts", time=True):
                 if rank == 0:
                     log_single_rank(
                         logger,
@@ -563,14 +581,14 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("sync-rollouts"):
+        with nvtx_range("sync-rollouts", time=True):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):
+        with nvtx_range("onload-optimizer-after-inference", time=True):
             model[0].restore_grad_buffers()
             optimizer.restore_from_cpu()
 
@@ -1282,8 +1300,8 @@ def prepare_data_for_update(
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    with nvtx_range("prepare-data-for-update"):
-        with nvtx_range("compute-group-stats"):
+    with nvtx_range("prepare-data-for-update", time=True):
+        with nvtx_range("compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
@@ -1323,7 +1341,7 @@ def prepare_data_for_update(
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
-        with nvtx_range("prepare_trajectories"):
+        with nvtx_range("prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
@@ -1331,7 +1349,7 @@ def prepare_data_for_update(
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
-            with nvtx_range("sequence_packing", time=True):
+            with nvtx_range("sequence-packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
@@ -1349,9 +1367,23 @@ def prepare_data_for_update(
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
+
+            my_real_tokens = sum(
+                packing_context.packing_info.seq_lengths[idx]
+                for indices in packing_context.packing_info.bin_seq_indices
+                for idx in indices
+            )
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
         else:
             # Always compute standard masks for the original data (we'll need them later)
-            with nvtx_range("get_ltor_masks_and_position_ids"):
+            with nvtx_range("get-ltor-masks-and-position-ids", time=True):
                 _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
                     trajs,
                     tokenizer.eod,
@@ -1370,7 +1402,20 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-        with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
+            # Without sequence packing, training.py defaults to GBS*seq_length which
+            # counts padding tokens and inflates TPS metrics.  Report only the real
+            # (non-padding) tokens so the metric is comparable to the SP path.
+            my_real_tokens = int((trajs != tokenizer.pad).sum().item())
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
+
+        with torch.no_grad(), nvtx_range("compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             # Wrap forward_backward_func for Full iteration CUDA graph
@@ -1388,7 +1433,7 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("compute-old-logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1403,7 +1448,7 @@ def prepare_data_for_update(
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("compute-ref-logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
@@ -1432,7 +1477,7 @@ def prepare_data_for_update(
 
 
         if sequence_packing:
-            with nvtx_range("pack_logprobs", time=True):
+            with nvtx_range("pack-logprobs", time=True):
                 # Store logprobs on gpu in packing context
                 # Since PackingContext is a dataclass, we add these as new attributes
                 packing_context.old_logprobs = old_logprobs.cuda()
@@ -1460,7 +1505,7 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("create-dataloader", time=True):
                 # @vitalyk: This function also reconfigures the data loader to count the
                 # global_batch_size in the bins frame of reference.
                 # I think it will be a better design if we split the data loader creating and logic
@@ -1477,7 +1522,7 @@ def prepare_data_for_update(
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
         else:
-            with nvtx_range("align_inference_logprobs", time=True):
+            with nvtx_range("align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
                     inference_logprobs = align_unpacked_inference_logprobs(
                         inference_logprobs=inference_logprobs,
@@ -1490,7 +1535,7 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("create-dataloader", time=True):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
                 runtime_state.packing_context = None
@@ -1851,7 +1896,7 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
+            with nvtx_range("offload-optimizer-before-inference", time=True):
                 if not args.rl_training_cuda_graphs:
                     # Offload grad buffers from the training model (if separate inference model is used)
                     # or from the inference model (if they're the same model)
@@ -1872,7 +1917,7 @@ def megatron_rl_inference_mode(
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
         yield inference_interface
 
-        with nvtx_range("suspend-engine"):
+        with nvtx_range("suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
             if increment_staleness_on_suspend:
                 inference_interface.increment_staleness()
@@ -1886,7 +1931,7 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
+            with nvtx_range("onload-optimizer-after-inference", time=True):
                 # Restore grad buffers to the training model (if separate inference model is used)
                 # or to the inference model (if they're the same model)
                 model_for_grad_offload = training_model if training_model is not None else model
