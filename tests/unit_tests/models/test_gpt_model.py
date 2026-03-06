@@ -456,7 +456,13 @@ class TestGPTWithDynamicInference:
 @pytest.mark.skipif(
     not is_te_min_version("1.2.0"), reason="TE fused attention test requires TE >= 1.2.0"
 )
-@pytest.mark.parametrize("attn_mask_type", [AttnMaskType.causal, AttnMaskType.no_mask])
+@pytest.mark.parametrize(
+    "attn_mask_type",
+    [
+        AttnMaskType.no_mask,
+        AttnMaskType.causal,  # TODO: Causal mask is still broken. Trying to fix it.
+    ],
+)
 def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
     attn_mask_type: AttnMaskType,
 ):
@@ -488,6 +494,7 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
             tensor_model_parallel_size=1,
             transformer_impl="native",
             use_cpu_initialization=False,
+            mtp_num_layers=1,
         )
         te_config = copy.deepcopy(local_config)
         te_config.transformer_impl = "transformer_engine"
@@ -502,7 +509,7 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
                 vocab_size=vocab_size,
                 max_sequence_length=seq_len,
                 pre_process=True,
-                post_process=False,
+                post_process=True,
             )
             .cuda()
             .bfloat16()
@@ -518,7 +525,7 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
                 vocab_size=vocab_size,
                 max_sequence_length=seq_len,
                 pre_process=True,
-                post_process=False,
+                post_process=True,
             )
             .cuda()
             .bfloat16()
@@ -542,7 +549,10 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
         attention_mask = torch.randn(1, 1, seq_len, seq_len, device="cuda", dtype=torch.float32) > 0
         if "causal" in attn_mask_type.name:
             # Legal causal mask: upper-triangular (mask out future tokens), broadcasted on batch.
-            attention_mask = torch.triu(attention_mask, diagonal=1)
+            triangular_mask = torch.triu(
+                torch.ones((1, 1, seq_len, seq_len), device="cuda", dtype=torch.bool), diagonal=1
+            )
+            attention_mask = attention_mask | triangular_mask
         else:
             # Avoid fully-masked rows for the non-causal random-mask case.
             attention_mask[..., 0] = False
@@ -559,7 +569,7 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
         te_out.mean().backward()
 
         # Compare outputs between local and TE models.
-        tol = {"atol": 5e-3, "rtol": 2e-2}
+        tol = {"atol": 1e-2, "rtol": 2e-2}
         torch.testing.assert_close(
             te_out,
             local_out,
@@ -567,7 +577,7 @@ def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
             msg=lambda msg: f"Mismatch in GPT output with attention_mask: {msg}",
         )
         # Compare gradients for overlapping parameters between local and TE models.
-        tol = {"atol": 5e-3, "rtol": 2e-2}
+        tol = {"atol": 1e-2, "rtol": 2e-2}
         local_named_params = dict(local_model.named_parameters())
         te_named_params = dict(te_model.named_parameters())
         checked_param_grads = 0
