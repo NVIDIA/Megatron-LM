@@ -10,6 +10,7 @@ from packaging import version
 from torch.nn import functional as F
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -24,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.dot_product_attention_context_parallel import (
     AttentionFuncionWithContextParallel,
     to_zz_mask_attn_bias,
@@ -1088,3 +1090,115 @@ def test_eager_attention_function_correctness():
             torch.testing.assert_close(
                 out_custom, out_torch, **tol, msg=lambda msg: f"Mismatch in {tensor_name}: {msg}"
             )
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("1.2.0"), reason="attention_bias in TE DPA requires TE >= 1.2.0"
+)
+def test_te_fused_attention_bias_matches_native_attention_mask():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        seed = 1234
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+
+        seq_len_q = 256
+        seq_len_kv = 256
+        batch_size = 1
+        num_heads = 4
+        head_dim = 128
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=num_heads * head_dim,
+            num_attention_heads=num_heads,
+            num_query_groups=num_heads,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            sequence_parallel=False,
+            context_parallel_size=1,
+            tensor_model_parallel_size=1,
+            use_cpu_initialization=False,
+        )
+
+        native_attn = DotProductAttention(
+            config=config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.padding,
+            attention_type="self",
+        ).cuda()
+        te_attn = TEDotProductAttention(
+            config=config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.no_mask,
+            attention_type="self",
+        ).cuda()
+
+        q = torch.randn(
+            seq_len_q, batch_size, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            seq_len_kv, batch_size, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            seq_len_kv, batch_size, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        attention_mask = (
+            torch.randn(batch_size, 1, seq_len_q, seq_len_kv, device="cuda", dtype=torch.float32)
+            > 0
+        )
+        # Avoid fully-masked rows that can make comparison noisy.
+        attention_mask[..., 0] = False
+        attention_bias = to_zz_mask_attn_bias(
+            attention_mask,
+            cp_size=1,
+            nheads=num_heads,
+            nheads_k=num_heads,
+            heads_k_stride=1,
+            device=q.device,
+            dtype=q.dtype,
+        )
+
+        q_native = q.detach().clone().requires_grad_(True)
+        k_native = k.detach().clone().requires_grad_(True)
+        v_native = v.detach().clone().requires_grad_(True)
+        native_out = native_attn(
+            query=q_native,
+            key=k_native,
+            value=v_native,
+            attention_mask=attention_mask,
+            attn_mask_type=AttnMaskType.padding,
+        )
+        native_out.sum().backward()
+
+        q_te = q.detach().clone().requires_grad_(True)
+        k_te = k.detach().clone().requires_grad_(True)
+        v_te = v.detach().clone().requires_grad_(True)
+        te_out = te_attn(
+            query=q_te,
+            key=k_te,
+            value=v_te,
+            attention_mask=None,
+            attn_mask_type=AttnMaskType.no_mask,
+            attention_bias=attention_bias,
+        )
+        te_out.sum().backward()
+
+        tol = {"atol": 5e-3, "rtol": 2e-2}
+        torch.testing.assert_close(
+            te_out, native_out, **tol, msg=lambda msg: f"Mismatch in attention output: {msg}"
+        )
+        torch.testing.assert_close(
+            q_te.grad, q_native.grad, **tol, msg=lambda msg: f"Mismatch in q grad: {msg}"
+        )
+        torch.testing.assert_close(
+            k_te.grad, k_native.grad, **tol, msg=lambda msg: f"Mismatch in k grad: {msg}"
+        )
+        torch.testing.assert_close(
+            v_te.grad, v_native.grad, **tol, msg=lambda msg: f"Mismatch in v grad: {msg}"
+        )
+    finally:
+        Utils.destroy_model_parallel()
