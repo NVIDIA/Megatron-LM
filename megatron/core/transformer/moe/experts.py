@@ -951,15 +951,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # of shape [num_experts, out_features, in_features] for torch._grouped_mm and
         # FlashInfer's cutlass_fused_moe. Per-expert views are registered so that
         # load_state_dict still writes into the contiguous buffers.
-        self._build_concatenated_weights()
+        # Skip for mxfp8 torch backend — _build_concatenated_weights destroys
+        # the TE MXFP8 weights by replacing them with BF16 Parameter views.
+        # The concatenation + reconversion is done lazily in _maybe_build_mxfp8_weights.
+        mxfp8_torch_backend = (
+            getattr(config, 'fp8_recipe', None) == 'mxfp8'
+            and getattr(config, 'mxfp8_backend', 'flashinfer') == 'torch'
+        )
+        if not mxfp8_torch_backend:
+            self._build_concatenated_weights()
 
         self.is_inference_cuda_graphed_iteration = False
 
         # torch._grouped_mm requires PyTorch >= 2.10
-        self._torch_grouped_mm_available = (
-            is_torch_min_version("2.10")
-            and hasattr(torch, '_grouped_mm')
-        )
+        # self._torch_grouped_mm_available = (
+        #     is_torch_min_version("2.10")
+        #     and hasattr(torch, '_grouped_mm')
+        # )
+        self._torch_grouped_mm_available = True
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
@@ -1072,18 +1081,285 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
-            fc1_output = torch._grouped_mm(
-                permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
-            )
+            if getattr(self.config, 'mxfp8_backend', None) == 'torch_debug':
+                fc1_output, fc2_output = self._debug_dynamic_mxfp8_grouped_mm(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+                    offs,
+                )
+            else:
+                fc1_output = torch._grouped_mm(
+                    permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
+                )
 
-            # Activation with routing probabilities
-            bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
+                # Activation with routing probabilities
+                bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
 
-            fc2_output = torch._grouped_mm(
-                bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
-            )
+                fc2_output = torch._grouped_mm(
+                    bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
+                )
         else:
             # No tokens allocated - return empty tensor with correct shape
+            fc2_output = permuted_local_hidden_states
+
+        return fc2_output, None
+
+    def _debug_dynamic_mxfp8_grouped_mm(
+        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs, offs,
+    ):
+        """Debug path: dynamically quantize BF16 weights+activations to MXFP8."""
+        from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        SWIZZLE = SwizzleType.SWIZZLE_32_4_4
+        RECIPE = ScalingType.BlockWise1x32
+        ALIGNMENT = 32
+
+        def _ceil_to(x, a):
+            return ((x + a - 1) // a) * a
+
+        def _pad_and_quantize(x_bf16, tpe, K):
+            """Pad each expert's tokens to ALIGNMENT, then quantize per expert."""
+            xq_list, xs_list = [], []
+            padded_counts = []
+            offset = 0
+            for count in tpe:
+                count = count.item()
+                if count > 0:
+                    padded = _ceil_to(count, ALIGNMENT)
+                    # Pad with zeros if needed
+                    chunk = x_bf16[offset:offset + count, :]
+                    if padded > count:
+                        pad = torch.zeros(
+                            padded - count, K, dtype=x_bf16.dtype, device=x_bf16.device
+                        )
+                        chunk = torch.cat([chunk, pad], dim=0)
+                    m = MXFP8Tensor.from_bf16_torch(chunk.contiguous())
+                    xq_list.append(m.data)
+                    xs_list.append(m.scale)
+                    padded_counts.append(padded)
+                else:
+                    padded_counts.append(0)
+                offset += count
+            xq = torch.cat(xq_list, dim=0).contiguous()
+            xs = torch.cat(xs_list, dim=0).contiguous().reshape(-1, K // 32)
+            padded_offs = torch.tensor(
+                padded_counts, dtype=torch.int32, device=x_bf16.device
+            ).cumsum(0).to(torch.int32)
+            return xq, xs, padded_offs
+
+        def _extract_real_rows(output, tpe, padded_offs):
+            """Extract non-padding rows from padded output."""
+            real_rows = []
+            for i, count in enumerate(tpe):
+                count = count.item()
+                if count > 0:
+                    start = 0 if i == 0 else padded_offs[i - 1].item()
+                    real_rows.append(output[start:start + count])
+            return torch.cat(real_rows, dim=0) if real_rows else output[:0]
+
+        def _quantize_weights(w_bf16):
+            wq_list, ws_list = [], []
+            for i in range(w_bf16.shape[0]):
+                m = MXFP8Tensor.from_bf16_torch(w_bf16[i])
+                wq_list.append(m.data)
+                ws_list.append(m.scale)
+            return torch.stack(wq_list, dim=0), torch.stack(ws_list, dim=0)
+
+        # FC1: pad activations, quantize, run GEMM
+        K1 = permuted_local_hidden_states.shape[-1]
+        xq1, xs1, padded_offs = _pad_and_quantize(
+            permuted_local_hidden_states, tokens_per_expert, K1
+        )
+        wq1, ws1 = _quantize_weights(self._fc1_weight)
+
+        fc1_padded = scaled_grouped_mm(
+            xq1, wq1.transpose(1, 2),
+            xs1, RECIPE,
+            ws1, RECIPE,
+            swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
+            offs=padded_offs, output_dtype=torch.bfloat16,
+        )
+
+        # Extract real rows, apply activation
+        fc1_output = _extract_real_rows(fc1_padded, tokens_per_expert, padded_offs)
+        bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
+
+        # FC2: pad activations, quantize, run GEMM
+        K2 = bias_act_output.shape[-1]
+        xq2, xs2, padded_offs2 = _pad_and_quantize(
+            bias_act_output, tokens_per_expert, K2
+        )
+        wq2, ws2 = _quantize_weights(self._fc2_weight)
+
+        fc2_padded = scaled_grouped_mm(
+            xq2, wq2.transpose(1, 2),
+            xs2, RECIPE,
+            ws2, RECIPE,
+            swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
+            offs=padded_offs2, output_dtype=torch.bfloat16,
+        )
+
+        fc2_output = _extract_real_rows(fc2_padded, tokens_per_expert, padded_offs2)
+        return fc1_output, fc2_output
+
+    def _maybe_build_mxfp8_weights(self):
+        """Lazily build stacked MXFP8 weight tensors on first forward.
+
+        After quantize_model_to_mxfp8, each per-expert weight (weight0, weight1, ...)
+        has been replaced with an MXFP8Tensor. This method stacks their data and
+        scales into _fc1_weight_mxfp8 / _fc2_weight_mxfp8 for scaled_grouped_mm.
+        Called once on the first forward, then cached.
+        """
+        if hasattr(self, '_fc1_weight_mxfp8'):
+            return
+
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+            linear = getattr(self, linear_name)
+            q_list, s_list = [], []
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                # w may be an MXFP8Tensor directly, or a Parameter whose
+                # underlying .data is an MXFP8Tensor (set via setattr).
+                mxfp8 = None
+                if isinstance(w, MXFP8Tensor):
+                    mxfp8 = w
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    mxfp8 = w.data
+                if mxfp8 is not None:
+                    q_list.append(mxfp8.data)
+                    s_list.append(mxfp8.scale)
+                else:
+                    raise RuntimeError(
+                        f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
+                        f"got {type(w).__name__} (data={type(getattr(w, 'data', None)).__name__}). "
+                        f"Was quantize_model_to_mxfp8 called?"
+                    )
+            stacked_data = torch.stack(q_list, dim=0).contiguous()
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+            print(f"[DEBUG _maybe_build_mxfp8_weights] {buf_name}: "
+                  f"data={stacked_data.shape} mean={stacked_data.float().abs().mean():.6f} "
+                  f"zeros={( stacked_data == 0).sum().item()}/{stacked_data.numel()} "
+                  f"scale={stacked_scale.shape} scale_mean={stacked_scale.view(torch.uint8).float().mean():.1f}")
+            setattr(self, f'{buf_name}_mxfp8', MXFP8Tensor(
+                data=stacked_data,
+                scale=stacked_scale,
+            ))
+        
+
+    def _torch_scaled_grouped_mm_forward(
+        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+        inclusive_expert_offsets=None,
+    ):
+        """MXFP8 grouped GEMM using torch.nn.functional.scaled_grouped_mm."""
+        from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        self._maybe_build_mxfp8_weights()
+
+        if not hasattr(self, '_debug_entry'):
+            self._debug_entry = True
+            print(f"[DEBUG ENTRY] permuted_local_hidden_states: {permuted_local_hidden_states.shape} "
+                  f"mean={permuted_local_hidden_states.abs().mean().item():.6f} "
+                  f"zeros={( permuted_local_hidden_states == 0).sum().item()}/{permuted_local_hidden_states.numel()}")
+
+        if permuted_probs is not None:
+            permuted_probs = permuted_probs.unsqueeze(-1)
+        if not tokens_per_expert.is_cuda:
+            tokens_per_expert = tokens_per_expert.to('cuda')
+
+        if self.config.moe_apply_probs_on_input and permuted_probs is not None:
+            assert self.config.moe_router_topk == 1
+            original_dtype = permuted_local_hidden_states.dtype
+            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+            permuted_probs = torch.ones_like(permuted_probs)
+
+        if permuted_local_hidden_states.nelement() != 0:
+            if inclusive_expert_offsets is not None:
+                offs = inclusive_expert_offsets
+            else:
+                offs = tokens_per_expert.cumsum(0).to(torch.int32)
+
+            SWIZZLE = SwizzleType.SWIZZLE_32_4_4
+            RECIPE = ScalingType.BlockWise1x32
+
+            def _quantize_activations_per_expert(x_bf16, tpe, K):
+                """Quantize activations per expert group.
+
+                Each group's scales are independently swizzled (to_blocked pads
+                M to multiples of 128 per group). Empty experts are skipped.
+                """
+                xq_list, xs_list = [], []
+                offset = 0
+                for count in tpe:
+                    count = count.item()
+                    if count > 0:
+                        group_mxfp8 = MXFP8Tensor.from_bf16_torch(
+                            x_bf16[offset:offset + count, :].contiguous()
+                        )
+                        xq_list.append(group_mxfp8.data)
+                        xs_list.append(group_mxfp8.scale)
+                    offset += count
+                xq = torch.cat(xq_list, dim=0).contiguous()
+                xs = torch.cat(xs_list, dim=0).contiguous().reshape(-1, K // 32)
+                return xq, xs
+
+            # FC1: quantize activations per expert, use pre-quantized weights
+            K1 = permuted_local_hidden_states.shape[-1]
+            xq1, xs1 = _quantize_activations_per_expert(
+                permuted_local_hidden_states, tokens_per_expert, K1
+            )
+
+            wq1 = self._fc1_weight_mxfp8.data.transpose(1, 2)
+            ws1 = self._fc1_weight_mxfp8.scale
+
+            if not hasattr(self, '_debug_fwd2'):
+                self._debug_fwd2 = True
+                print(f"[DEBUG FC1] input bf16 mean={permuted_local_hidden_states.abs().mean().item():.6f}")
+                print(f"  xq1: {xq1.shape} dtype={xq1.dtype} mean={xq1.float().abs().mean().item():.6f} "
+                      f"zeros={( xq1 == 0).sum().item()}/{xq1.numel()}")
+                print(f"  xs1: {xs1.shape} dtype={xs1.dtype} "
+                      f"bytes_sum={xs1.view(torch.uint8).sum().item()} "
+                      f"bytes_mean={xs1.view(torch.uint8).float().mean().item():.1f}")
+                print(f"  wq1: {wq1.shape} dtype={wq1.dtype} contig={wq1.is_contiguous()} "
+                      f"mean={wq1.float().abs().mean().item():.6f} "
+                      f"zeros={( wq1 == 0).sum().item()}/{wq1.numel()}")
+                print(f"  ws1: {ws1.shape} dtype={ws1.dtype} "
+                      f"bytes_sum={ws1.view(torch.uint8).sum().item()} "
+                      f"bytes_mean={ws1.view(torch.uint8).float().mean().item():.1f}")
+                print(f"  offs: {offs}")
+
+            fc1_output = scaled_grouped_mm(
+                xq1, wq1,
+                xs1, RECIPE,
+                ws1, RECIPE,
+                swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
+                offs=offs, output_dtype=torch.bfloat16,
+            )
+
+            if not hasattr(self, '_debug_fwd3'):
+                self._debug_fwd3 = True
+                print(f"  fc1_output: {fc1_output.shape}, mean={fc1_output.abs().mean().item():.6f}, "
+                      f"nan={fc1_output.isnan().any().item()}")
+
+            bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
+
+            # FC2: quantize activations per expert, use pre-quantized weights
+            K2 = bias_act_output.shape[-1]
+            xq2, xs2 = _quantize_activations_per_expert(
+                bias_act_output, tokens_per_expert, K2
+            )
+
+            fc2_output = scaled_grouped_mm(
+                xq2, self._fc2_weight_mxfp8.data.transpose(1, 2),
+                xs2, RECIPE,
+                self._fc2_weight_mxfp8.scale, RECIPE,
+                swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
+                offs=offs, output_dtype=torch.bfloat16,
+            )
+        else:
             fc2_output = permuted_local_hidden_states
 
         return fc2_output, None
@@ -1118,6 +1394,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        # MXFP8 torch backend: use scaled_grouped_mm with pre-quantized weights
+        if (
+            getattr(self.config, 'fp8_recipe', None) == 'mxfp8'
+            and getattr(self.config, 'mxfp8_backend', 'flashinfer') == 'torch'
+        ):
+            return self._torch_scaled_grouped_mm_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+                inclusive_expert_offsets=inclusive_expert_offsets,
+            )
 
         elif self.is_inference_cuda_graphed_iteration:
             if self.config.moe_ggemm_inference_cg == MoEGroupedGemmBackend.flashinfer:

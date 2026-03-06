@@ -925,6 +925,11 @@ class TransformerConfig(ModelParallelConfig):
     'flashinfer': FlashInfer's fused cutlass_fused_moe kernel (default).
     'torch': triton permute/unpermute kernels + torch._grouped_mm."""
 
+    mxfp8_backend: str = "flashinfer"
+    """Backend for MXFP8 quantization and matmul when fp8_recipe='mxfp8'.
+    'flashinfer': FlashInfer fused CUDA kernel (default).
+    'torch': Triton quantization + torch.nn.functional.scaled_mm."""
+
     moe_expert_tensor_alignment: int = 64
     """Alignment (in tokens) for per-expert M dimensions in grouped GEMMs.
     Each expert's token count is rounded up to a multiple of this value

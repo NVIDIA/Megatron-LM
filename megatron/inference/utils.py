@@ -67,7 +67,8 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        quantize_model_to_mxfp8(unwrap_model(model))
+        mxfp8_backend = getattr(args, "mxfp8_backend", "flashinfer")
+        quantize_model_to_mxfp8(unwrap_model(model), backend=mxfp8_backend)
 
     return model
 

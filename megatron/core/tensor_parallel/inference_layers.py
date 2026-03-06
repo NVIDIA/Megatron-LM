@@ -15,7 +15,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-from megatron.core.inference.quantization.utils import mm_mxfp8
+from megatron.core.inference.quantization.utils import mm_mxfp8, mm_mxfp8_torch
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_tp
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,9 +52,16 @@ def _apply_linear(
 ) -> torch.Tensor:
     """
     Helper to apply either MXFP8 or standard GEMM based on the configuration.
+
+    For MXFP8, the backend is selected by config.mxfp8_backend:
+      - "flashinfer": FlashInfer fused CUDA kernel (default)
+      - "torch": torch.nn.functional.scaled_mm with Triton quantization
     """
     kwargs = {"out": out} if out is not None else {}
     if config.fp8_recipe == "mxfp8":
+        backend = getattr(config, "mxfp8_backend", "flashinfer")
+        if backend == "torch":
+            return mm_mxfp8_torch(x, weight, **kwargs)
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
 
