@@ -572,8 +572,8 @@ class TestMuPOptimizerTypeHandling:
         assert 'eps' not in bias_override
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_warns_for_non_principled_scale_mode(self, caplog, optimizer_type):
-        """Muon+MuP should warn when scale mode is not unit_rms_norm."""
+    def test_muon_warns_for_spectral_scale_mode(self, caplog, optimizer_type):
+        """Muon+MuP should warn when scale mode is spectral."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='spectral')
         width_mult = 4.0
 
@@ -583,11 +583,15 @@ class TestMuPOptimizerTypeHandling:
         )
 
         assert len(overrides) == 1
-        assert any("not MuP-principled" in rec.message for rec in caplog.records)
+        assert any(
+            "muon_scale_mode=spectral" in rec.message
+            and "--muon-scale-mode unit_rms_norm" in rec.message
+            for rec in caplog.records
+        )
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_no_warning_for_unit_rms_norm_mode(self, caplog, optimizer_type):
-        """Muon+MuP should not warn when scale mode is MuP-principled."""
+    def test_muon_unit_rms_norm_mode_has_no_warning(self, caplog, optimizer_type):
+        """Muon+MuP should not warn when scale mode is unit_rms_norm."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='unit_rms_norm')
         width_mult = 4.0
 
@@ -597,10 +601,10 @@ class TestMuPOptimizerTypeHandling:
         )
 
         assert len(overrides) == 1
-        assert not any("not MuP-principled" in rec.message for rec in caplog.records)
+        assert not any("muon_scale_mode=spectral" in rec.message for rec in caplog.records)
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_warns_for_non_principled_mode_at_unity_width_mult(self, caplog, optimizer_type):
+    def test_muon_warns_for_spectral_mode_at_unity_width_mult(self, caplog, optimizer_type):
         """Muon+MuP warning should still fire when width_mult==1.0."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='spectral')
         width_mult = 1.0
@@ -611,7 +615,7 @@ class TestMuPOptimizerTypeHandling:
         )
 
         assert len(overrides) == 0
-        assert any("not MuP-principled" in rec.message for rec in caplog.records)
+        assert any("muon_scale_mode=spectral" in rec.message for rec in caplog.records)
 
 
 class TestMuPMTPLossScaling:
