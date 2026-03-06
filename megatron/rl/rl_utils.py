@@ -445,7 +445,7 @@ def get_inference_interface(args, loop, model):
                 model[0],
                 host='0.0.0.0',
                 port=8294,
-                verbose=args.inference_flask_server_logging)
+                verbose=args.inference_text_gen_server_logging)
         )
     return _INFERENCE_INTERFACE
 
