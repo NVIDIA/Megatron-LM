@@ -222,7 +222,12 @@ def _determine_source_ranks_for_dst_param(
 
 
 def build_centralized_reshard_plan(
-    src_module: torch.nn.Module, dst_module: torch.nn.Module, num_experts: int = None
+    src_module: torch.nn.Module,
+    dst_module: torch.nn.Module,
+    num_experts: int = None,
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
 ) -> ReshardPlan:
     """
     Centralized planning: Rank 0 builds complete plan for all ranks, then scatters.
@@ -237,8 +242,10 @@ def build_centralized_reshard_plan(
     This metadata is sufficient for rank 0 to build correct transfer plans without
     requiring dummy models.
     """
-    my_global_rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # Use group.rank() instead of dist.get_rank(group) to support cross-cluster
+    # ProcessGroups where members have independent default PGs (same default rank).
+    my_global_rank = group.rank() if group is not None else dist.get_rank()
+    world_size = group.size() if group is not None else dist.get_world_size()
 
     # Extract metadata from source model if present
     if src_module is not None:
@@ -255,6 +262,7 @@ def build_centralized_reshard_plan(
                 src_pg,
                 num_experts=num_experts,
                 layer_module_prefix_map=src_layer_prefix_map,
+                rank_offset=src_rank_offset,
             )
             for name, p in my_src_params.items()
         ]
@@ -277,6 +285,7 @@ def build_centralized_reshard_plan(
                 dst_pg,
                 num_experts=num_experts,
                 layer_module_prefix_map=dst_layer_prefix_map,
+                rank_offset=dst_rank_offset,
             )
             for name, p in my_dst_params.items()
         ]
@@ -286,8 +295,8 @@ def build_centralized_reshard_plan(
 
     all_src_metadata_by_rank = [None] * world_size
     all_dst_metadata_by_rank = [None] * world_size
-    dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata)
-    dist.all_gather_object(all_dst_metadata_by_rank, my_dst_metadata)
+    dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata, group=group)
+    dist.all_gather_object(all_dst_metadata_by_rank, my_dst_metadata, group=group)
 
     # Parameter to metadata maps keyed by resolved_name
     src_param_metadata_by_rank = {}
@@ -362,7 +371,9 @@ def build_centralized_reshard_plan(
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
     else:
         plans_list = [None] * world_size
-    torch.distributed.broadcast_object_list(plans_list, src=0)
+    # Use group_src= (group rank) instead of src= (default PG global rank) to support
+    # cross-cluster ProcessGroups where members share the same default PG rank.
+    torch.distributed.broadcast_object_list(plans_list, group_src=0, group=group)
     my_plan = plans_list[my_global_rank]
 
     logger.info(
