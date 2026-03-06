@@ -49,7 +49,7 @@ MODEL_ARGS:
   --deterministic-mode: true
   --log-memory-to-tensorboard: true
   --dataloader-type: external
-  --data-path: ${DATA_PATH}
+  --data-path: ${DATA_PATH}/mixed/mcore_mimo_vlm/llava_pretrain_energon
   --language-model-checkpoint: ${CHECKPOINT_LOAD_PATH}/model/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
   --auto-detect-ckpt-format: true
   --accumulate-allreduce-grads-in-fp32: true
