@@ -8,6 +8,7 @@ import types
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
+from unittest import mock
 
 import pytest
 import torch
@@ -41,6 +42,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
@@ -139,19 +141,18 @@ class DynamicEngineTestConfig:
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
-
-    fp8: bool = False
+    num_speculative_tokens: int = 0
 
     def __post_init__(self):
 
         # Compute max_sequence_length.
-        assert self.max_sequence_length is None
-        assert self.num_tokens_to_generate is None or self.num_tokens_total is None
-        if self.num_tokens_to_generate is not None:
-            self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
-        else:
-            assert self.num_tokens_total is not None
-            self.max_sequence_length = self.num_tokens_total
+        if self.max_sequence_length is None:
+            assert self.num_tokens_to_generate is None or self.num_tokens_total is None
+            if self.num_tokens_to_generate is not None:
+                self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
+            else:
+                assert self.num_tokens_total is not None
+                self.max_sequence_length = self.num_tokens_total
 
         # Default paused buffer size.
         if self.context_paused_buffer_size_gb is None:
@@ -263,6 +264,7 @@ class TestDynamicInferenceEngine:
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
+                num_speculative_tokens=test_config.num_speculative_tokens,
             ),
         )
 
@@ -296,6 +298,7 @@ class TestDynamicInferenceEngine:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
+                mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
@@ -337,6 +340,14 @@ class TestDynamicInferenceEngine:
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec()
 
+            # MTP block spec (needed for speculative decoding).
+            mtp_block_spec = None
+            if test_config.num_speculative_tokens > 0:
+                use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
+                mtp_block_spec = get_gpt_mtp_block_spec(
+                    config=transformer_config, spec=layer_spec, use_transformer_engine=use_te,
+                )
+
             # GPT model.
             model = GPTModel(
                 config=transformer_config,
@@ -346,6 +357,7 @@ class TestDynamicInferenceEngine:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                mtp_block_spec=mtp_block_spec,
             ).cuda()
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
@@ -355,6 +367,7 @@ class TestDynamicInferenceEngine:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+                mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 mamba_num_heads=16,
                 num_attention_heads=16,
@@ -1999,3 +2012,275 @@ class TestDynamicInferenceEngine:
 
         assert (record[-1].policy_staleness == pre_ps + 1).all()
         assert (record[-1].kv_cache_staleness == 0).all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_with_early_termination(self):
+        """Test that speculative decoding handles premature request termination safely
+        (e.g. hitting max_sequence_length mid-speculative-batch)."""
+
+        # Set max_sequence_length tight so it terminates during a speculative step
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=3,  # Prompt (4) + Gen (3) = 7
+            max_sequence_length=7,  # Will force termination after 3 tokens
+            model_provider="gpt",
+            num_speculative_tokens=3,
+            materialize_only_last_token_logits=False,
+        )
+
+        env = self._build_test_env(test_config)
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+
+        # Mock forward to return deterministic data so speculative tokens are always accepted
+        def mock_mtp_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+
+            base_logits = torch.zeros(
+                tokens.size(0),
+                tokens.size(1),
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            base_logits[:, :, 0] = 100.0  # High probability for token 0
+
+            unwrapped_model._mtp_logits_cache = torch.zeros(
+                3,
+                tokens.size(1),
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            unwrapped_model._mtp_logits_cache[:, :, 0] = 100.0  # High probability for token 0
+            return base_logits
+
+        unwrapped_model.forward = mock_mtp_forward
+
+        env.engine._add_request(env.requests[0])
+        env.engine.schedule_waiting_requests()
+
+        # Step engine until finished naturally
+        # This allows the bookkeeping logic to gracefully truncate the
+        # speculative tokens to the max_sequence_length boundary.
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        assert env.requests[0].status == Status.COMPLETED
+
+        # It should trim the output to the max_sequence_length boundary
+        # Prompt was 4, Max was 7, so it should have generated exactly 3 tokens.
+        assert len(env.requests[0].generated_tokens) == 3
+
+        # Validate the engine's tracking state is clean
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_stop_word_hit(self):
+        """Test that if an accepted speculative token completes a stop word,
+        the request correctly triggers the stop logic without crashing."""
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0, num_speculative_tokens=2, materialize_only_last_token_logits=False
+        )
+        env = self._build_test_env(test_config)
+
+        # Mock request with a stop word
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.tensor([1, 2, 3], device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        # Let's say the stop word is [99, 100]
+        req.stop_word_ids = [[99, 100]]
+
+        # Fast-forward state: The base token was 99
+        req.generated_tokens = [99]
+        tokens_to_append = [100, 101]  # 1 accepted spec token, 1 rejected
+
+        # Check before appending speculative tokens
+        stop_hit = env.engine._check_stop_words_for_request_post_append(req)
+        assert stop_hit is False  # Only 99 is in generated_tokens initially
+
+        # Now append the tokens as `post_process_requests` would
+        req.generated_tokens += tokens_to_append
+
+        # Check again. It should detect the stop word [99, 100] inside [99, 100, 101]
+        # Specifically, it shifts backwards due to the speculative tokens.
+        stop_hit = env.engine._check_stop_words_for_request_post_append(req)
+
+        assert stop_hit is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_long_stop_word_hit(self):
+        """Test that if an accepted speculative token completes a long stop word
+        (length > num_speculative_tokens), it is correctly detected."""
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0, num_speculative_tokens=2, materialize_only_last_token_logits=False
+        )
+        env = self._build_test_env(test_config)
+
+        # Mock request with a stop word
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.tensor([1, 2, 3], device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        # Stop word length 3 > num_speculative_tokens (2)
+        req.stop_word_ids = [[98, 99, 100]]
+
+        # Fast-forward state: base tokens were generated up to 99
+        req.generated_tokens = [98, 99]
+        tokens_to_append = [100, 101]  # Completes stop word at index -2
+        req.generated_tokens += tokens_to_append
+
+        stop_hit = env.engine._check_stop_words_for_request_post_append(req)
+        assert stop_hit is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_with_prefix_caching(self):
+        """Test that speculative decoding works correctly when prefix caching is enabled.
+
+        Two requests share the same prompt prefix. The second request should reuse
+        cached KV blocks from the first and still generate correctly with spec decoding.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        # Enable prefix caching on the context.
+        env.engine.context.enable_prefix_caching = True
+
+        # Create two pairs of requests with shared prefixes.
+        shared_prompt_a = torch.randint(
+            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+        )
+        shared_prompt_b = torch.randint(
+            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+        )
+
+        for i, prompt in enumerate([shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]):
+            env.requests[i].prompt_tokens = prompt.clone()
+
+        # Run all requests through the engine.
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        # All requests should complete.
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+            if request.status == Status.COMPLETED:
+                assert len(request.generated_tokens) > 0
+
+        # Context should be clean after all requests finish.
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_with_chunked_prefill(self):
+        """Test that speculative decoding combined with chunked prefill completes correctly."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=2,
+            min_prompt_length=16,
+            max_prompt_length=16,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            enable_chunked_prefill=True,
+            model_provider="gpt",
+            context_max_tokens=32,  # Force chunking by limiting token budget
+        )
+        env = self._build_test_env(test_config)
+
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_chunked_prefill_and_prefix_caching(self):
+        """End-to-end test combining speculative decoding, chunked prefill, and prefix caching.
+
+        Verifies that all three features interact correctly:
+        - Prefix caching shares KV blocks between requests with common prompts
+        - Chunked prefill processes long prompts in chunks
+        - Speculative decoding generates multiple tokens per step
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=16,
+            max_prompt_length=16,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            enable_chunked_prefill=True,
+            model_provider="gpt",
+            context_max_tokens=48,  # Force chunking
+        )
+        env = self._build_test_env(test_config)
+
+        # Enable prefix caching.
+        env.engine.context.enable_prefix_caching = True
+
+        # Create pairs with shared prefixes to exercise prefix caching.
+        shared_prompt = torch.randint(
+            0, test_config.vocab_size - 1, (16,), dtype=torch.int64, device='cuda'
+        )
+        for i in range(len(env.requests)):
+            env.requests[i].prompt_tokens = shared_prompt.clone()
+
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
