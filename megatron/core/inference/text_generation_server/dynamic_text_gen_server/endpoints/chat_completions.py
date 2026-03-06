@@ -13,9 +13,30 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 logger = logging.getLogger(__name__)
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    import orjson
+
+    HAVE_ORJSON = True
+except ImportError:
+    HAVE_ORJSON = False
+
+
+try:
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
+
+    def apply_parsers(text, tools, parsers_list):
+        """Runs CPU-intensive text parsing."""
+        meta = {}
+        for parser in parsers_list:
+            if parser not in PARSER_MAPPING:
+                raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+            text, new_info = PARSER_MAPPING[parser].parse(text, tools=tools)
+            assert not (
+                meta.keys() & new_info.keys()
+            ), "Multiple parsers found the same information."
+            meta.update(new_info)
+        return text, meta
 
     @bp.route('/chat/completions', methods=['POST'])
     @bp.route('/v1/chat/completions', methods=['POST'])
@@ -25,18 +46,22 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Messages ---
         messages = req.get("messages")
         if not messages:
-            return "Missing 'messages' field", 400
+            return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
-            return "'messages' must be a list", 400
+            return Response("'messages' must be a list", status=400)
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=req.get("tools", None),
+                **req.get("chat_template_kwargs", {}),
             )
         except (AttributeError, AssertionError):
             warnings.warn(
@@ -47,7 +72,7 @@ try:
             )
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
-            return f"Error processing 'messages': {e}", 500
+            return Response(f"Error processing 'messages': {e}", status=500)
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -70,8 +95,12 @@ try:
             # input. Since we pre-tokenize via apply_chat_template, we must handle
             # BOS ourselves, matching the logic in tokenize_prompt().
             if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
-                while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
-                    prompt_tokens.pop(0)
+                start_idx = 0
+                while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
+                    start_idx += 1
+                if start_idx > 0:
+                    prompt_tokens = prompt_tokens[start_idx:]
+
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
@@ -90,13 +119,10 @@ try:
                 add_BOS=add_BOS,
             )
         except ValueError as e:
-            return f"Invalid sampling parameter: {e}", 400
+            return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
-        # For chat, we run the *same* prompt 'n' times.
-        tasks = []
-        for _ in range(n):
-            tasks.append(client.add_request(prompt_tokens, sampling_params))
+        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
@@ -105,7 +131,7 @@ try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
-            return f"Error during inference: {e}", 500
+            return Response(f"Error during inference: {e}", status=500)
 
         if current_app.config['verbose']:
             logging.info(
@@ -121,20 +147,22 @@ try:
         request_idx = 0
         for record in batch_results:
             result = record.merge().serialize()
-            # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
+
             result = {
                 k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
                 for k, v in result.items()
             }
-            prompt_tokens = result["prompt_tokens"]  # The engine can modify prompt_tokens.
+            prompt_tokens_out = result["prompt_tokens"]
             text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens) if prompt_tokens is not None else 0
+            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
 
             logprobs_content = None
             if sampling_params.return_log_probs:
                 token_logprobs = result.get('log_probs', [])
-                tokens = [tokenizer.detokenize([tok]) for tok in result["generated_tokens"]]
+
+                tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
+                tokens = list(map(tokenizer.detokenize, tokens_to_decode))
 
                 # Get top_n_logprobs if available
                 generated_top_n_logprobs = result.get('generated_top_n_logprobs')
@@ -154,27 +182,23 @@ try:
                                 }
                             )
 
-                    entry = {
-                        "token": tok,
-                        "logprob": lp,
-                        "bytes": list(tok.encode("utf-8")),
-                        "top_logprobs": top_logprobs_list,
-                    }
-                    logprobs_content.append(entry)
+                    logprobs_content.append(
+                        {
+                            "token": tok,
+                            "logprob": lp,
+                            "bytes": list(tok.encode("utf-8")),
+                            "top_logprobs": top_logprobs_list,
+                        }
+                    )
 
             metadata = {}
             message_text = text_output
+
             if parsers:
-                for parser in parsers:
-                    if parser not in PARSER_MAPPING:
-                        raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
-                    message_text, new_info = PARSER_MAPPING[parser].parse(
-                        message_text, tools=req.get("tools", None)
-                    )
-                    assert not (
-                        metadata.keys() & new_info.keys()
-                    ), "Multiple parsers found the same information."
-                    metadata.update(new_info)
+                message_text, metadata = apply_parsers(
+                    message_text, req.get("tools", None), parsers
+                )
+
             message = {"role": "assistant", "content": message_text}
             if "tool_calls" in metadata:
                 message["tool_calls"] = metadata["tool_calls"]
@@ -184,7 +208,7 @@ try:
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
-            message["generation_log_probs"] = result.get("generated_log_probs", None)
+            message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             choice_data = {
@@ -192,37 +216,33 @@ try:
                 "message": message,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result["generated_log_probs"],
+                "generation_log_probs": result.get("generated_log_probs", []),
                 "raw_text": result["prompt"] + result["generated_text"],
-                # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
-                "finish_reason": (
-                    "tool_calls" if metadata.get("tool_calls", []) else "stop"
-                ),  # Original code hardcoded this.
+                "logprobs": (
+                    {"content": logprobs_content} if sampling_params.return_log_probs else None
+                ),
+                "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else "stop",
             }
-            if result.get("policy_staleness") is not None:
-                choice_data["policy_staleness"] = result["policy_staleness"]
-            if result.get("kv_cache_staleness") is not None:
-                choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
-            events = result.get("events")
-            if events is not None:
-                num_evictions = sum(1 for e in events if e.get("type") == "EVICT")
-                if num_evictions > 0:
-                    choice_data["num_evictions"] = num_evictions
+            choice_data["policy_staleness"] = result["policy_staleness"]
+            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["num_evictions"] = sum(
+                1 for e in result["events"] if e.get("type") == "EVICT"
+            )
             if current_app.config['verbose']:
                 logging.info(result)
+
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
                     choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
+
             choices.append(choice_data)
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
-        prompt_token_count = max(prompt_tokens_counts)
+        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         response = {
             "id": str(uuid.uuid4()),
             "created": int(time.time()),
@@ -235,7 +255,12 @@ try:
                 "total_tokens": prompt_token_count + total_completion_tokens,
             },
         }
-        return jsonify(response)
+
+        if HAVE_ORJSON:
+            # Use orjson for faster serialization
+            return Response(orjson.dumps(response), mimetype="application/json")
+        else:
+            return jsonify(response)
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")
