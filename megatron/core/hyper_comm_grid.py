@@ -255,3 +255,12 @@ class HyperCommGrid:
 
         unique_group_key = "-".join(ordered_dims)
         return ordered_dims, unique_group_key
+
+    def is_current_rank_in_grid(self) -> bool:
+        """Check if the current rank belongs to this grid.
+
+        Returns:
+            True if the current rank is within [rank_offset, rank_offset + size).
+        """
+        rank = dist.get_rank()
+        return self.rank_offset <= rank < self.rank_offset + self.size
