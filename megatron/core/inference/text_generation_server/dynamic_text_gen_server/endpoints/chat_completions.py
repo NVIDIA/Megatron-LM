@@ -7,15 +7,21 @@ import traceback
 import uuid
 import warnings
 
-import orjson
-
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
 
 try:
-    from quart import Blueprint, Response, current_app, request
+    import orjson
+
+    HAVE_ORJSON = True
+except ImportError:
+    HAVE_ORJSON = False
+
+
+try:
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
 
@@ -250,8 +256,11 @@ try:
             },
         }
 
-        # Use orjson for faster serialization
-        return Response(orjson.dumps(response), mimetype="application/json")
+        if HAVE_ORJSON:
+            # Use orjson for faster serialization
+            return Response(orjson.dumps(response), mimetype="application/json")
+        else:
+            return jsonify(response)
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")
