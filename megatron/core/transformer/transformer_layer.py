@@ -1317,6 +1317,42 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.offload_mlp_norm = False
             self.offload_expert_fc1 = False
             self.offload_moe_act = False
+        # Check the compatibility of fine-grained activation offloading and cuda graph.
+        if self.config.fine_grained_activation_offloading:
+            if CudaGraphScope.attn in self.config.cuda_graph_scope:
+                self.offload_attn_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "attn_norm offloading is not supported with attn cudagraph. "
+                    "Disabling attn_norm offloading.",
+                )
+            mark_mlp_norm_offloading_not_supported = False
+            # For moe layer, mlp_norm offloading isn't supported with attn or moe_router cudagraph.
+            if self.is_moe_layer:
+                if (
+                    CudaGraphScope.attn in self.config.cuda_graph_scope
+                    or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                ):
+                    mark_mlp_norm_offloading_not_supported = True
+            # For non-moe layer, mlp_norm is the boundary of attn or mlp cudagraph.
+            # The only case where mlp_norm offloading is supported is when whole layer is captured.
+            elif (
+                CudaGraphScope.attn in self.config.cuda_graph_scope
+                and CudaGraphScope.mlp not in self.config.cuda_graph_scope
+            ) or (
+                CudaGraphScope.attn not in self.config.cuda_graph_scope
+                and CudaGraphScope.mlp in self.config.cuda_graph_scope
+            ):
+                mark_mlp_norm_offloading_not_supported = True
+            if mark_mlp_norm_offloading_not_supported:
+                self.offload_mlp_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "mlp_norm offloading is not supported with the current cudagraph scope. "
+                    "Disabling mlp_norm offloading.",
+                )
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
