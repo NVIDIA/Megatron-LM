@@ -270,17 +270,52 @@ class TestPrefillTokenSavings(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_full_match_adds_single_token(self):
-        """Prompt exactly N*bs, fully matched: second request query length == 1."""
+        """Prompt exactly N*bs, fully matched: multiple dependent requests each get query_length == 1.
+
+        When a block-aligned prompt fully matches a cached prefix, the chunk_length - 1
+        guard causes only N-1 tokens to be skipped, re-processing the last token. Multiple
+        such requests all map their single token to the same position in the shared block
+        (a benign race writing identical values).
+        """
         ctx = self._ctx()
         bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)
+        alloc = ctx.block_allocator
+        num_blocks = 3
+        num_dependents = 5
+        prompt = self._prompt(bs * num_blocks)
 
         ctx.add_request(self._req(ctx, prompt.clone()))
-        tokens_after_a = ctx.active_token_count
+        tokens_after_first = ctx.active_token_count
+        first_blocks = self._block_ids(ctx, 0, num_blocks)
 
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert ctx.active_token_count - tokens_after_a == 1
-        assert ctx.request_query_lengths[1].item() == 1
+        for i in range(num_dependents):
+            ctx.add_request(self._req(ctx, prompt.clone(), request_id=i + 2))
+
+            req_idx = i + 1
+            token_start = tokens_after_first + i
+            token_end = tokens_after_first + i + 1
+
+            # Each dependent adds exactly 1 token
+            assert ctx.request_query_lengths[req_idx].item() == 1
+
+            # That single token maps to the same shared block as req0's last block
+            assert ctx.token_to_block_idx[token_start].item() == first_blocks[-1]
+
+            # Position within that block is bs - 1 (last position)
+            assert ctx.token_to_local_position_within_kv_block[token_start].item() == bs - 1
+
+            # The input token value matches req0's last token
+            assert ctx.token_to_input_ids[token_start].item() == prompt[-1].item()
+
+        # Total tokens: 1 per dependent request
+        assert ctx.active_token_count - tokens_after_first == num_dependents
+
+        # All matched blocks have ref count == 1 (first) + num_dependents
+        for bid in first_blocks:
+            assert alloc.block_ref_counts[bid].item() == 1 + num_dependents
+
+        # Lifetime count: full prefill for req0 + 1 token per dependent
+        assert ctx.lifetime_prefill_token_count == bs * num_blocks + num_dependents
 
     @pytest.mark.internal
     def test_no_match_adds_full_prompt(self):
