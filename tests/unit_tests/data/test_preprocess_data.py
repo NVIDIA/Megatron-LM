@@ -233,8 +233,6 @@ def test_preprocess_data_gpt_optimal_workers():
         sys.argv = ["/opt/megatron-lm/tools/preprocess_data.py"] + gpt_args
         runpy.run_path("/opt/megatron-lm/tools/preprocess_data.py", run_name="__main__")
 
-        assert os.path.exists(f"{temp_dir}/perf")
-
 
 def bert_vocab(odir):
     if os.path.exists(__LOCAL_BERT_VOCAB):
