@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import copy
 import warnings
 from typing import Optional, Union
 
@@ -725,11 +726,13 @@ def get_gpt_mtp_block_spec_for_backend(
 
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
-        transformer_layer_spec = spec.layer_specs[-1]
+        transformer_layer_spec = copy.copy(spec.layer_specs[-1])
     elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
-        transformer_layer_spec = spec
+        transformer_layer_spec = copy.copy(spec)
     else:
         raise ValueError(f"Invalid spec: {spec}")
+
+    transformer_layer_spec.submodules = copy.copy(transformer_layer_spec.submodules)
 
     # MTP does not support hyper connections yet; strip HC modules and
     # downgrade the layer class to plain TransformerLayer.
