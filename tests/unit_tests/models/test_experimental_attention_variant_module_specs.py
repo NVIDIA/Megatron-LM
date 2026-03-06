@@ -8,7 +8,10 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers: fake backend and config builders
@@ -82,6 +85,7 @@ def _make_config(**overrides):
         use_kitchen_attention=False,
         kitchen_attention_backend="sdpa",
         fallback_to_eager_attn=False,
+        enable_hyper_connections=False,
     )
     defaults.update(overrides)
     cfg = MagicMock()
@@ -528,7 +532,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[2].submodules.self_attention is exp_attn_spec
         assert specs[3].submodules.self_attention is std_attn_spec
 
-    def test_hybrid_moe_pattern(self):
+    def test_hybrid_moe_pattern_with_mhc(self):
         """Verify MLP alternates between MoE and dense specs per moe_layer_freq pattern."""
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_transformer_layer_with_experimental_attention_variant_spec,
@@ -540,6 +544,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
             num_moe_experts=8,
             moe_layer_freq=2,
             normalization="RMSNorm",
+            enable_hyper_connections=True,
         )
         backend = _make_backend()
         attn_spec = self._make_attention_spec(fuse_input_layernorm=False)
@@ -563,6 +568,8 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[1].submodules.mlp is dense_spec
         assert specs[2].submodules.mlp is moe_spec
         assert specs[3].submodules.mlp is dense_spec
+        for s in specs:
+            assert s.module is HyperConnectionTransformerLayer
 
 
 # ===================================================================
