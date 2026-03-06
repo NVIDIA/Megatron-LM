@@ -222,7 +222,7 @@ class CUDAGraphBatchDimensionBuilder:
     """
 
     # Constant for rounding token counts when generating CUDA graph batch dimensions
-    CUDA_GRAPH_ROUNDER = 8
+    CUDA_GRAPH_ROUNDER = 2
 
     @staticmethod
     def _calculate_cuda_graph_token_counts(
@@ -231,8 +231,9 @@ class CUDAGraphBatchDimensionBuilder:
         """
         Calculate CUDA graph token counts for a given configuration.
 
-        This method computes evenly-spaced token counts from step_size up to
-        cuda_graph_max_tokens, ensuring proper rounding and TP alignment.
+        This method computes exponentially-decreasing token counts (powers of 2)
+        from cuda_graph_max_tokens down to CUDA_GRAPH_ROUNDER, ensuring proper
+        rounding and TP alignment.
 
         Args:
             tp_size: Tensor parallel size (for alignment)
@@ -244,8 +245,8 @@ class CUDAGraphBatchDimensionBuilder:
 
         Example:
             >>> _calculate_cuda_graph_token_counts
-            (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
-            [1000, 752, 504, 256]
+            (tp_size=1, num_cuda_graphs=8, cuda_graph_max_tokens=128)
+            [128, 64, 32, 16, 8, 4, 2, 1]
         """
         if num_cuda_graphs == -1:
             # automatically determine the number of CUDA graphs to
@@ -271,30 +272,44 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
 
-        # Cuda graph step size.
-        cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-        cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
-            math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
-        )
-        # Make sure divisible by TP size
-        cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
 
-        # round down cuda graph max tokens to be multiple of TP size
+        # Round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
 
-        # Cuda graph token counts.
         if num_cuda_graphs == 1:
-            cuda_graph_token_counts = [cuda_graph_max_tokens]
-        else:
-            cuda_graph_token_counts = list(
-                range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
-            )
-            if (
-                len(cuda_graph_token_counts) == 0
-                or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
-            ):
-                cuda_graph_token_counts.append(cuda_graph_max_tokens)
-            cuda_graph_token_counts.reverse()
+            return [cuda_graph_max_tokens]
+
+        # Exponentially decreasing, stops after num_cuda_graphs entries
+        # or when below the minimum size.
+        # TODO(helenn/lmcafee): Extend upper range of distribution to be linearly-spaced.
+        cuda_graph_token_counts = []
+        val = cuda_graph_max_tokens
+        for _ in range(num_cuda_graphs):
+            # Round down to multiple of rounder, then up to multiple of TP size
+            rounded = max(rounder, (val // rounder) * rounder)
+            rounded = math.ceil(rounded / tp_size) * tp_size
+            if rounded not in cuda_graph_token_counts:
+                cuda_graph_token_counts.append(rounded)
+            val //= 2
+            if val < rounder:
+                break
+
+        # Ensure cuda_graph_max_tokens is always included
+        if cuda_graph_token_counts[0] != cuda_graph_max_tokens:
+            cuda_graph_token_counts.insert(0, cuda_graph_max_tokens)
+
+        # Include a (possibly extra) size-1 graph
+        if cuda_graph_token_counts[-1] != tp_size:
+            cuda_graph_token_counts.append(tp_size)
+
+        # Trim from the middle if we exceed num_cuda_graphs requested by the user
+        #  Since num_cuda_graphs >= 1, this only runs when we have at least 2 elements.
+        while len(cuda_graph_token_counts) > num_cuda_graphs:
+            cuda_graph_token_counts.pop(-2)
+
+        assert len(cuda_graph_token_counts) == num_cuda_graphs
+        assert cuda_graph_max_tokens in cuda_graph_token_counts
 
         return cuda_graph_token_counts
 
