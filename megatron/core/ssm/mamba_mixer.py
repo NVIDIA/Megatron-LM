@@ -551,6 +551,7 @@ class MambaMixer(MegatronModule):
                 ssm_state=ssm_state,
                 batch_indices=metadata.batch_indices_chunked_prefill,
                 is_chunked_prefill=True,
+                cache_seqlens=metadata.chunked_prefill_cache_seqlens,
             )
 
             # Update zxBCdt to contain the remaining slice for regular prefill
@@ -720,6 +721,7 @@ class MambaMixer(MegatronModule):
         return_varlen_states: bool = False,
         batch_indices: Optional[torch.Tensor] = None,
         is_chunked_prefill: bool = False,
+        cache_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference prefill step.
@@ -791,17 +793,33 @@ class MambaMixer(MegatronModule):
             # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
             assert batch_indices is not None
+            assert cache_seqlens is not None
             state_len = conv_state.shape[-1]
+            
+            # Read last (d_conv - 1) tokens from the circular buffer
+            seq_len = cache_seqlens.view(-1, 1, 1)
+            gather_indices = (seq_len - self.d_conv + 1 + torch.arange(self.d_conv - 1, device=conv_state.device).view(1, 1, -1)) % state_len
+            gather_indices = gather_indices.expand(len(batch_indices), conv_state.shape[1], self.d_conv - 1)
+            initial_conv_state = torch.gather(conv_state[batch_indices], 2, gather_indices)
+            
             initial_conv_state = (
-                conv_state[batch_indices, :, -self.d_conv + 1 :]
-                .permute(0, 2, 1)
+                initial_conv_state.permute(0, 2, 1)
                 .contiguous()
                 .transpose(1, 2)
             )
             xBC = xBC.transpose(1, 2)
-            tensor_masked_update(
-                conv_state, batch_indices, F.pad(xBC, (state_len - xBC.shape[-1], 0))
-            )
+            
+            # We only need to retain at most the last `state_len` tokens of the chunk
+            chunk_len = xBC.shape[-1]
+            copy_len = min(chunk_len, state_len)
+            xBC_tail = xBC[..., -copy_len:]
+            
+            update_indices = (seq_len + chunk_len - copy_len + torch.arange(copy_len, device=conv_state.device).view(1, 1, -1)) % state_len
+            update_indices = update_indices.expand(len(batch_indices), conv_state.shape[1], copy_len)
+
+            conv_state_slice = conv_state[batch_indices]
+            conv_state_slice.scatter_(2, update_indices, xBC_tail)
+            tensor_masked_update(conv_state, batch_indices, conv_state_slice)
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()

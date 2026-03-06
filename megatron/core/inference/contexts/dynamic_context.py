@@ -1426,10 +1426,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.padded_batch_dimensions = best_graph
         else:
             if self.is_decode_only():
-                padded_decode_req_count = min(
-                    self.max_requests, self.round_up_requests(self.num_decode_requests)
-                )
-                padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
+                if self.num_speculative_tokens > 0:
+                    padded_decode_req_count = min(
+                        self.max_requests, self.round_up_requests(self.num_decode_requests)
+                    )
+                    padded_token_count = padded_decode_req_count * (
+                        self.num_speculative_tokens + 1
+                    )
+                else:
+                    padded_token_count = min(
+                        self.max_tokens,
+                        self.max_requests,
+                        self.round_up_tokens(self.active_token_count),
+                    )
+                    padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
                 padded_token_count = self.round_up_tokens(self.active_token_count)
@@ -1504,6 +1514,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
+                request_kv_length_offsets_view,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
@@ -2504,9 +2515,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count].clone()
-            self.paused_speculative_tokens = new_speculative_tokens[
-                :, : self.paused_request_count
-            ].clone()
+            if new_speculative_tokens is not None:
+                self.paused_speculative_tokens = new_speculative_tokens[
+                    :, : self.paused_request_count
+                ].clone()
 
         # add_ and fill_ calls seems to work as intended with sliced indexing
         # (i.e. x[3:5].add(...) or x[3:5].fill_) but when another tensor is used

@@ -41,6 +41,11 @@ class MambaMetadata:
             (1,), -1, dtype=torch.int32, device=self.device
         )
 
+        # Cache sequence lengths for the chunked prefill request
+        self._chunked_prefill_cache_seqlens_buffer = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+
         # Map from token id to request id for active prefill requests
         self._seq_idx_buffer = torch.full(
             (1, self.max_tokens), -1, dtype=torch.int32, device=self.device
@@ -95,12 +100,14 @@ class MambaMetadata:
         self.seq_idx = None
         self.device_decode_prefill = None
         self.device_chunked_prefill = None
+        self.chunked_prefill_cache_seqlens = None
 
     def update(
         self,
         active_mamba_indices: torch.Tensor,
         token_to_request_idx: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        request_kv_length_offsets: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
         enable_chunked_prefill: bool,
@@ -188,6 +195,10 @@ class MambaMetadata:
             # Update chunked prefill indices
             self._batch_indices_chunked_prefill_buffer[0] = active_mamba_indices[chunked_req_idx]
             self.batch_indices_chunked_prefill = self._batch_indices_chunked_prefill_buffer
+            
+            # Update chunked prefill cache seqlen
+            self._chunked_prefill_cache_seqlens_buffer[0] = request_kv_length_offsets[chunked_req_idx]
+            self.chunked_prefill_cache_seqlens = self._chunked_prefill_cache_seqlens_buffer
         else:
             self.batch_indices_chunked_prefill = None
 
