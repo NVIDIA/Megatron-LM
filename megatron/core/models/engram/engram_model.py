@@ -1,28 +1,86 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 """
-Engram-augmented GPT Model.
+Engram-augmented GPT Model and Transformer Layer.
 
-Extends GPTModel to support DeepSeek's Engram n-gram hash embedding mechanism.
-Before each forward pass, the model pre-computes n-gram hash embeddings from
-input_ids and distributes them to the relevant EngramTransformerLayers.
+Extends GPTModel and TransformerLayer to support DeepSeek's Engram n-gram hash
+embedding mechanism. Before each forward pass, the model pre-computes n-gram
+hash embeddings from input_ids and distributes them to the relevant
+EngramTransformerLayers.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from torch import Tensor
 
+from megatron.core.models.engram.engram_module import EngramConfig, EngramModule, NgramHashMapping
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
-from megatron.core.models.engram.engram_module import EngramConfig, NgramHashMapping
 
-logger = logging.getLogger(__name__)
+class EngramTransformerLayer(TransformerLayer):
+    """A transformer layer augmented with an Engram module.
+
+    The Engram module is applied as a residual before the standard self-attention
+    computation. The pre-computed engram embeddings must be set via the
+    ``engram.precompute_embeddings()`` method before each forward pass (handled
+    by ``EngramGPTModel``).
+
+    For layers that are not in the engram_layer_ids list, this behaves identically
+    to a standard TransformerLayer.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
+        engram_config: Optional[EngramConfig] = None,
+        engram_vocab_size_across_layers: Optional[dict] = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
+            add_layer_offset=add_layer_offset,
+            pp_layer_offset=pp_layer_offset,
+        )
+
+        self.engram: Optional[EngramModule] = None
+        if (
+            engram_config is not None
+            and engram_vocab_size_across_layers is not None
+            and self.layer_number in engram_config.engram_layer_ids
+            and self.layer_number in engram_vocab_size_across_layers
+        ):
+            self.engram = EngramModule(
+                layer_id=self.layer_number,
+                hidden_size=config.hidden_size,
+                engram_config=engram_config,
+                vocab_size_for_layer=engram_vocab_size_across_layers[self.layer_number],
+            )
+
+    def forward(self, hidden_states: Tensor, *args: Any, **kwargs: Any):
+        if self.engram is not None:
+            engram_output = self.engram(hidden_states)
+            hidden_states = engram_output + hidden_states
+
+        return super().forward(hidden_states, *args, **kwargs)
 
 
 class EngramGPTModel(GPTModel):
@@ -99,15 +157,9 @@ class EngramGPTModel(GPTModel):
         )
 
     def _precompute_engram_hashes(self, input_ids: Tensor) -> None:
-        """Pre-compute n-gram hash embeddings and distribute to engram layers.
-
-        Args:
-            input_ids: [B, S] token IDs tensor.
-        """
         if input_ids is None:
             return
 
-        # input_ids is [B, S] — compute hashes for all engram layers at once
         hash_ids_all_layers = self.ngram_hash_mapping.hash(input_ids)
 
         device = next(self.decoder.parameters()).device
@@ -116,9 +168,7 @@ class EngramGPTModel(GPTModel):
             if hasattr(layer, 'engram') and layer.engram is not None:
                 layer_id = layer.engram.layer_id
                 if layer_id in hash_ids_all_layers:
-                    layer.engram.precompute_embeddings(
-                        hash_ids_all_layers[layer_id], device
-                    )
+                    layer.engram.precompute_embeddings(hash_ids_all_layers[layer_id], device)
 
     def forward(
         self,
@@ -136,12 +186,6 @@ class EngramGPTModel(GPTModel):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Forward pass with Engram pre-computation.
-
-        Pre-computes n-gram hash embeddings from input_ids before running the
-        standard GPT forward pass. The embeddings are distributed to each
-        EngramTransformerLayer and consumed during their forward calls.
-        """
         if self.pre_process:
             self._precompute_engram_hashes(input_ids)
 

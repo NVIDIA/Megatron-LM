@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 """
 Engram module for Megatron-LM.
@@ -12,6 +12,8 @@ The module operates in two phases:
      per forward pass at the model level).
   2. Forward: Gate the pre-computed embeddings against hidden states and apply a
      short causal convolution (called per layer).
+
+Reference: https://github.com/deepseek-ai/Engram
 """
 
 from __future__ import annotations
@@ -23,19 +25,16 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from sympy import isprime
+from tokenizers import Regex, normalizers
+from transformers import AutoTokenizer
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 @dataclass
 class EngramConfig:
     """Configuration for the Engram module."""
 
-    engram_vocab_size: List[int] = field(
-        default_factory=lambda: [129280 * 5, 129280 * 5]
-    )
+    engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
@@ -47,10 +46,6 @@ class EngramConfig:
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
 
 
-# ---------------------------------------------------------------------------
-# Compressed Tokenizer
-# ---------------------------------------------------------------------------
-
 class CompressedTokenizer:
     """Normalizes tokens into a compressed vocabulary via unicode normalization.
 
@@ -60,24 +55,23 @@ class CompressedTokenizer:
     """
 
     def __init__(self, tokenizer_name_or_path: str):
-        from tokenizers import Regex, normalizers
-        from transformers import AutoTokenizer
-
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name_or_path, trust_remote_code=True
         )
 
         SENTINEL = "\uE000"
-        self.normalizer = normalizers.Sequence([
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), SENTINEL),
-            normalizers.Strip(),
-            normalizers.Replace(SENTINEL, " "),
-        ])
+        self.normalizer = normalizers.Sequence(
+            [
+                normalizers.NFKC(),
+                normalizers.NFD(),
+                normalizers.StripAccents(),
+                normalizers.Lowercase(),
+                normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+                normalizers.Replace(Regex(r"^ $"), SENTINEL),
+                normalizers.Strip(),
+                normalizers.Replace(SENTINEL, " "),
+            ]
+        )
 
         self.lookup_table, self.num_new_token = self._build_lookup_table()
 
@@ -121,36 +115,13 @@ class CompressedTokenizer:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Primality utilities (avoids sympy dependency)
-# ---------------------------------------------------------------------------
-
-def _is_prime(n: int) -> bool:
-    if n < 2:
-        return False
-    if n < 4:
-        return True
-    if n % 2 == 0 or n % 3 == 0:
-        return False
-    i = 5
-    while i * i <= n:
-        if n % i == 0 or n % (i + 2) == 0:
-            return False
-        i += 6
-    return True
-
-
 def _find_next_prime(start: int, seen_primes: set) -> int:
     candidate = start + 1
     while True:
-        if _is_prime(candidate) and candidate not in seen_primes:
+        if isprime(candidate) and candidate not in seen_primes:
             return candidate
         candidate += 1
 
-
-# ---------------------------------------------------------------------------
-# N-gram Hash Mapping
-# ---------------------------------------------------------------------------
 
 class NgramHashMapping:
     """Deterministic n-gram hash mapping for Engram.
@@ -179,7 +150,7 @@ class NgramHashMapping:
         self.layer_ids = layer_ids
 
         self.compressed_tokenizer = CompressedTokenizer(
-            tokenizer_name_or_path=tokenizer_name_or_path,
+            tokenizer_name_or_path=tokenizer_name_or_path
         )
         self.tokenizer_vocab_size = len(self.compressed_tokenizer)
         if self.pad_id is not None:
@@ -194,9 +165,7 @@ class NgramHashMapping:
         for layer_id in self.layer_ids:
             base_seed = int(seed + PRIME_1 * int(layer_id))
             g = np.random.default_rng(base_seed)
-            r = g.integers(
-                low=0, high=half_bound, size=(self.max_ngram_size,), dtype=np.int64
-            )
+            r = g.integers(low=0, high=half_bound, size=(self.max_ngram_size,), dtype=np.int64)
             multipliers = r * 2 + 1
             self.layer_multipliers[layer_id] = multipliers
 
@@ -214,9 +183,7 @@ class NgramHashMapping:
                 current_prime_search_start = vocab_size - 1
 
                 for _ in range(self.n_head_per_ngram):
-                    found_prime = _find_next_prime(
-                        current_prime_search_start, seen_primes
-                    )
+                    found_prime = _find_next_prime(current_prime_search_start, seen_primes)
                     seen_primes.add(found_prime)
                     current_ngram_heads_sizes.append(found_prime)
                     current_prime_search_start = found_prime
@@ -226,9 +193,7 @@ class NgramHashMapping:
 
         return vocab_size_across_layers
 
-    def _get_ngram_hashes(
-        self, input_ids: np.ndarray, layer_id: int
-    ) -> np.ndarray:
+    def _get_ngram_hashes(self, input_ids: np.ndarray, layer_id: int) -> np.ndarray:
         x = np.asarray(input_ids, dtype=np.int64)
         B, T = x.shape
 
@@ -237,9 +202,9 @@ class NgramHashMapping:
         def shift_k(k: int) -> np.ndarray:
             if k == 0:
                 return x
-            shifted = np.pad(
-                x, ((0, 0), (k, 0)), mode='constant', constant_values=self.pad_id
-            )[:, :T]
+            shifted = np.pad(x, ((0, 0), (k, 0)), mode='constant', constant_values=self.pad_id)[
+                :, :T
+            ]
             return shifted
 
         base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
@@ -274,15 +239,9 @@ class NgramHashMapping:
         input_ids = self.compressed_tokenizer(input_ids)
         hash_ids_for_all_layers = {}
         for layer_id in self.layer_ids:
-            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(
-                input_ids, layer_id=layer_id
-            )
+            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(input_ids, layer_id=layer_id)
         return hash_ids_for_all_layers
 
-
-# ---------------------------------------------------------------------------
-# Multi-Head Embedding
-# ---------------------------------------------------------------------------
 
 class MultiHeadEmbedding(nn.Module):
     """Packs multiple embedding tables (one per hash head) into a single table.
@@ -317,10 +276,6 @@ class MultiHeadEmbedding(nn.Module):
         return self.embedding(shifted_input_ids)
 
 
-# ---------------------------------------------------------------------------
-# Short Convolution
-# ---------------------------------------------------------------------------
-
 class ShortConv(nn.Module):
     """Depthwise causal 1D convolution with per-group RMSNorm.
 
@@ -352,9 +307,7 @@ class ShortConv(nn.Module):
             dilation=dilation,
         )
 
-        self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_size, eps=norm_eps) for _ in range(hc_mult)
-        ])
+        self.norms = nn.ModuleList([nn.RMSNorm(hidden_size, eps=norm_eps) for _ in range(hc_mult)])
 
         if self.activation:
             self.act_fn = nn.SiLU()
@@ -386,10 +339,6 @@ class ShortConv(nn.Module):
 
         return y
 
-
-# ---------------------------------------------------------------------------
-# Engram Module
-# ---------------------------------------------------------------------------
 
 class EngramModule(nn.Module):
     """Core Engram module that augments transformer hidden states with n-gram
@@ -423,10 +372,7 @@ class EngramModule(nn.Module):
         head_vocab_sizes = [x for ngram_sizes in vocab_size_for_layer for x in ngram_sizes]
         per_head_dim = engram_config.n_embed_per_ngram // engram_config.n_head_per_ngram
 
-        self.multi_head_embedding = MultiHeadEmbedding(
-            list_of_N=head_vocab_sizes,
-            D=per_head_dim,
-        )
+        self.multi_head_embedding = MultiHeadEmbedding(list_of_N=head_vocab_sizes, D=per_head_dim)
 
         self.short_conv = ShortConv(
             hidden_size=hidden_size,
@@ -437,22 +383,15 @@ class EngramModule(nn.Module):
 
         engram_hidden_size = (engram_config.max_ngram_size - 1) * engram_config.n_embed_per_ngram
         self.value_proj = nn.Linear(engram_hidden_size, hidden_size)
-        self.key_projs = nn.ModuleList([
-            nn.Linear(engram_hidden_size, hidden_size)
-            for _ in range(engram_config.hc_mult)
-        ])
-        self.norm1 = nn.ModuleList([
-            nn.RMSNorm(hidden_size) for _ in range(engram_config.hc_mult)
-        ])
-        self.norm2 = nn.ModuleList([
-            nn.RMSNorm(hidden_size) for _ in range(engram_config.hc_mult)
-        ])
+        self.key_projs = nn.ModuleList(
+            [nn.Linear(engram_hidden_size, hidden_size) for _ in range(engram_config.hc_mult)]
+        )
+        self.norm1 = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(engram_config.hc_mult)])
+        self.norm2 = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(engram_config.hc_mult)])
 
         self._cached_embeddings: Optional[torch.Tensor] = None
 
-    def precompute_embeddings(
-        self, hash_ids: np.ndarray, device: torch.device
-    ) -> None:
+    def precompute_embeddings(self, hash_ids: np.ndarray, device: torch.device) -> None:
         """Pre-compute embeddings from hash IDs. Called once per forward pass.
 
         Args:
@@ -472,18 +411,16 @@ class EngramModule(nn.Module):
         Returns:
             [S, B, H] engram output to be added as a residual.
         """
-        assert self._cached_embeddings is not None, (
-            "Must call precompute_embeddings() before forward()"
-        )
+        assert (
+            self._cached_embeddings is not None
+        ), "Must call precompute_embeddings() before forward()"
         embeddings = self._cached_embeddings  # [B, T, engram_hidden]
 
         # Megatron uses [S, B, H]; convert to [B, S, H] for engram processing
         hidden_states_bsh = hidden_states.transpose(0, 1).contiguous()
 
         # Expand to HC_MULT slots: [B, S, HC_MULT, H]
-        hidden_states_hc = hidden_states_bsh.unsqueeze(2).expand(
-            -1, -1, self.hc_mult, -1
-        )
+        hidden_states_hc = hidden_states_bsh.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
 
         # Compute gates per HC slot
         gates = []
