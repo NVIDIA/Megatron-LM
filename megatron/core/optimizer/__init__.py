@@ -162,7 +162,7 @@ def get_mup_config_overrides(
                 logger,
                 logging.WARNING,
                 "Muon + MuP is configured with muon_scale_mode=spectral. "
-                "For MuP-principled scaling, use --muon-scale-mode unit_rms_norm.",
+                "For MuP-principled scaling, explicitly set --muon-scale-mode unit_rms_norm.",
             )
 
     if mup_width_mult == 1.0:
