@@ -14,6 +14,11 @@ from .utils import ReshardPlan
 logger = logging.getLogger(__name__)
 
 
+def _is_mxfp8_tensor(param):
+    """Check if param is a TE MXFP8Tensor (fp8_param=true)."""
+    return hasattr(param, 'quantize_') and hasattr(param, 'dequantize') and hasattr(param, '_rowwise_data')
+
+
 def execute_reshard_plan(
     plan: ReshardPlan,
     src_module: torch.nn.Module,
@@ -102,7 +107,13 @@ def execute_reshard_plan(
     torch.cuda.synchronize()
     dist.barrier(group=group)
 
-    # Write back received buffers into their destination parameter slices
+    # Write back received buffers into their destination parameter slices.
+    #
+    # For quantized destination params (fp8_param=true on receiver),
+    # accumulate ALL BF16 slices per-param before calling quantize_() once.
+    # This avoids corrupting MXFP8 per-block scales from partial-slice updates.
+    pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor, list]] = {}
+
     for wb in recv_writebacks:
         with torch.no_grad():
             if wb[0] == 'transform':
@@ -110,7 +121,21 @@ def execute_reshard_plan(
                 transform.finalize_recv(param_name, dst_slice, recv_bufs)
             else:
                 _, recv_buffer, dst_param, dst_slice = wb
-                dst_param.data[dst_slice].copy_(recv_buffer)
+                if _is_mxfp8_tensor(dst_param):
+                    # Accumulate BF16 slices for deferred quantization
+                    param_id = id(dst_param)
+                    if param_id not in pending_quantized:
+                        full_bf16 = dst_param.dequantize().clone()
+                        pending_quantized[param_id] = (dst_param, full_bf16, [])
+                    pending_quantized[param_id][2].append((dst_slice, recv_buffer))
+                    pending_quantized[param_id][1][dst_slice].copy_(recv_buffer)
+                else:
+                    dst_param.data[dst_slice].copy_(recv_buffer)
+
+    # Finalize deferred quantized param updates
+    for param_id, (dst_param, full_bf16, slices) in pending_quantized.items():
+        with torch.no_grad():
+            dst_param.quantize_(full_bf16)
 
     # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
     # graph warmup).  The synchronize() above fires *before* the writeback loop,
