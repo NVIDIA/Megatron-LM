@@ -363,11 +363,11 @@ def save(
 
     assert common_strategy is None
 
-    if sharded_strategy is None:
+    if not (
+        isinstance(sharded_strategy, TorchDistSaveShardedStrategy)
+        or isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
+    ):
         sharded_strategy = TorchDistSaveShardedStrategy()
-    assert isinstance(sharded_strategy, TorchDistSaveShardedStrategy) or isinstance(
-        sharded_strategy, FullyParallelSaveStrategyWrapper
-    ), f"Unknown sharded strategy type: {type(sharded_strategy)}"
 
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
