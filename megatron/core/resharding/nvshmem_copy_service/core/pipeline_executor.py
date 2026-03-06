@@ -168,13 +168,13 @@ class PipelineExecutor:
                     f"  Unpack prior (iter {i-1}): {prior_batch.total_size} bytes "
                     f"← PE {prior_batch.src_pe}"
                 )
-                # GPU-level event wait: ensures NVSHMEM RDMA-written recv_slot data
-                # from the prior iteration is visible to unpack_stream.
-                # barrier_events[(i-1)%2] was recorded on send_stream after
-                # barrier_all in iteration i-1.
+                # GPU-level event wait: ensures send_stream's barrier_all from
+                # the prior iteration has completed before unpack_stream proceeds.
+                #nvshmem.core.quiet(stream=self.unpack_stream) 
                 self.torch_unpack_stream.wait_event(self.barrier_events[(i - 1) % 2])
                 self._launch_unpack(i - 1, prior_batch)
                 torch.cuda.nvtx.range_pop()
+
 
             # Step 3: Send CURRENT iteration
             if has_send:
@@ -215,11 +215,15 @@ class PipelineExecutor:
             # Ensure all NVSHMEM operations on send_stream complete (stream-ordered)
             nvshmem.core.quiet(stream=self.send_stream)
 
-            # Step 4b: Global barrier + record event for next iteration's unpack
+            # Step 4b: Global barrier + CPU sync + record event
             torch.cuda.nvtx.range_push("Step 4b: Barrier")
             nvshmem.core.barrier_all(stream=self.send_stream)
-            # Record barrier event on send_stream so unpack_stream can wait on it.
-            # This is ordered after barrier_all on the same stream.
+            # CPU-sync the send_stream to ensure barrier_all has actually
+            # completed (not just submitted). Without this, the barrier_event
+            # can fire before RDMA data from the remote PE is visible, because
+            # stream-ordered operations are only guaranteed to be submitted,
+            # not completed, when the event is recorded.
+            self.torch_send_stream.synchronize()
             self.barrier_events[slot].record(stream=self.torch_send_stream)
             torch.cuda.nvtx.range_pop()
 
