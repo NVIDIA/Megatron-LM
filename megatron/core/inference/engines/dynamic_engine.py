@@ -436,11 +436,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 ),
             )
             self.inference_coordinator_process.start()
-            print(f"[DEBUG DE] waiting for coordinator addr via pipe...", flush=True)
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
             dp_pipe.close()
-            print(f"[DEBUG DE] coordinator addr received: {dp_addr}", flush=True)
 
             # Check if the port number is not inference_coordinator_port
             actual_port = int(dp_addr.rsplit(":", 1)[-1])
@@ -513,9 +511,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.model_parallel_num_msgs_subscriber_socket,
         ]
 
-        print(f"[DEBUG DE] before barrier(mp_group)", flush=True)
         torch.distributed.barrier(mp_group)
-        print(f"[DEBUG DE] after barrier(mp_group)", flush=True)
 
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
@@ -526,11 +522,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
-            print(f"[DEBUG DE] waiting for coordinator_ready_event...", flush=True)
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
-            print(f"[DEBUG DE] coordinator is ready!", flush=True)
             logging.info("Inference co-ordinator is ready to receive requests!")
             logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
