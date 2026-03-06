@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Awaitable, List, Optional, Union
+from typing import List, Optional, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
@@ -24,8 +24,6 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
-
-from .headers import Headers
 
 
 class InferenceClient:
@@ -72,10 +70,6 @@ class InferenceClient:
         socket.connect(inference_coordinator_address)
 
         self._loop = None
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
-
         self.socket = socket
         self.completion_futures = {}
         self.request_submission_times = {}
@@ -101,8 +95,6 @@ class InferenceClient:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequestRecord` object containing the completed result.
         """
-        if not self.running.is_set():
-            raise RuntimeError("InferenceClient is not currently running.")
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
@@ -143,10 +135,6 @@ class InferenceClient:
                     completion_future.get_loop().call_soon_threadsafe(
                         completion_future.set_result, completed_request
                     )
-                elif header == Headers.PAUSE_ACK:
-                    self.paused.set()
-                elif header == Headers.STOP_ACK:
-                    self.stopped.set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -165,19 +153,16 @@ class InferenceClient:
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
         assert Headers(reply) == Headers.CONNECT_ACK
 
-    async def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """
         Connects to the coordinator and starts the background listener task.
 
-        This method must be awaited before submitting any requests. It handles
+        This must be called before submitting any requests. It handles
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
-        self.running.set()
-        self.paused.clear()
-        self.stopped.clear()
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
@@ -192,58 +177,51 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self) -> Awaitable:
-        """Sends a signal to pause all inference engines.
+    def pause_engines(self):
+        """Sends PAUSE to all engines via coordinator.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `paused` flags upon seeing the ACK.
-
-        Returns:
-            Awaitable: An awaitable that resolves when all engines have paused.
+        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
+        then synchronizes via a world-wide barrier before transitioning to
+        PAUSED. Callers should await engine.paused for confirmation.
         """
         self._send_signal_to_engines(Headers.PAUSE)
-        return self.paused.wait()
 
     def unpause_engines(self) -> None:
-        """Sends a signal to unpause all inference engines."""
-        self.paused.clear()
-        self.running.set()
+        """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
     def increment_staleness(self):
         """Sends a signal to increment staleness on all in-flight requests."""
-        assert self.paused.is_set(), "Can only increment staleness while engines are paused."
         self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
 
     def suspend_engines(self):
-        """Sends a signal to pause all inference engines."""
-        self._send_signal_to_engines(Headers.PAUSE)
+        """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
+
+        Callers should await engine.suspended for confirmation.
+        """
         self._send_signal_to_engines(Headers.SUSPEND)
 
     def resume_engines(self):
-        """Sends a signal to unpause all inference engines."""
-        self.paused.clear()
+        """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
+
+        Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
+        """
         self._send_signal_to_engines(Headers.RESUME)
-        self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def stop_engines(self) -> Awaitable:
-        """Sends a signal to gracefully stop all inference engines.
+    def stop_engines(self):
+        """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `stopped` flags upon seeing the ACK.
-
-        Returns:
-            Awaitable: An awaitable that resolves when all engines have stopped.
+        Callers should await engine.stopped for confirmation.
+        Does not affect the coordinator.
         """
         self._send_signal_to_engines(Headers.STOP)
-        self.running.clear()
-        return self.stopped.wait()
+
+    def shutdown_coordinator(self):
+        """Tells the coordinator process to exit its main loop.
+
+        Does not affect the engines.
+        """
+        self._send_signal_to_engines(Headers.SHUTDOWN)
 
     def stop(self):
         """
@@ -253,6 +231,12 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        self.listener_task.cancel()
-        self.socket.close()
+        if hasattr(self, 'listener_task') and not self.listener_task.done():
+            self.listener_task.cancel()
+        # Wake up any listeners.
+        for future in self.completion_futures.values():
+            if not future.done():
+                future.cancel()
+        self.completion_futures.clear()
+        self.socket.close(linger=0)
         self.context.term()

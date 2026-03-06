@@ -12,6 +12,7 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
@@ -223,8 +224,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Suspend and resume the dynamic engine every "
-        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "`suspend_resume_interval` requests. This is used to test the suspend/resume "
         "system.",
+    )
+    group.add_argument(
+        "--suspend-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep while the engine is suspended (simulates a training step).",
     )
     group.add_argument(
         "--inference-repeat-n",
@@ -251,7 +258,12 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Comma-separated list of request indices where each batch starts. "
         "Used with --drain-between-batches.",
     )
-
+    group.add_argument(
+        "--coordinator-schedule-output-path",
+        type=str,
+        default=None,
+        help="Path to write coordinator request scheduling decisions as JSON",
+    )
     return parser
 
 
@@ -280,7 +292,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     if args.inference_dynamic_batching_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
-    mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+    mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+        model,
+        conv_states_dtype=args.mamba_inference_conv_states_dtype,
+        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
+    )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get inference logging configuration from args
@@ -331,6 +347,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )
