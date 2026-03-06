@@ -70,9 +70,13 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
 
-# Offloading
+# Full Offloading
   --cpu-offloading: true
   --cpu-offloading-num-layers: 4
+
+# Full Recompute
+  --recompute-granularity:  "full"
+  --recompute-num-layers: 4
 
 # Logger
   --log-params-norm: true
