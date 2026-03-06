@@ -794,15 +794,8 @@ class MambaMixer(MegatronModule):
             )
             initial_conv_state = initial_conv_state.permute(0, 2, 1).contiguous().transpose(1, 2)
 
-            # We only need to retain at most the last `state_len` tokens of the chunk
-            chunk_len = xBC.shape[-1]
-            copy_len = min(chunk_len, state_len)
-            xBC_tail = xBC[..., -copy_len:]
-
             # Scatter tail back into the main buffer using fused Triton kernel
-            scatter_conv_state(
-                conv_state, xBC_tail, batch_indices, cache_seqlens, chunk_len, copy_len
-            )
+            scatter_conv_state(conv_state, xBC, batch_indices, cache_seqlens)
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()

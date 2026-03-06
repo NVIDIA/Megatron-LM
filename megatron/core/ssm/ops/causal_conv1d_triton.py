@@ -185,13 +185,13 @@ def _scatter_conv_state_kernel(
     conv_state_ptr,
     batch_indices_ptr,
     cache_seqlens_ptr,
-    xbc_tail_ptr,
+    xBC_tail_ptr,
     stride_cs_b,
     stride_cs_d,
     stride_cs_w,
-    stride_xbc_b,
-    stride_xbc_d,
-    stride_xbc_w,
+    stride_xBC_b,
+    stride_xBC_d,
+    stride_xBC_w,
     D: tl.constexpr,
     state_len: tl.constexpr,
     chunk_len: tl.constexpr,
@@ -219,8 +219,8 @@ def _scatter_conv_state_kernel(
     update_indices = (seq_len + chunk_len - copy_len + w_offsets) % state_len
 
     # Calculate memory offsets
-    xbc_offsets = (
-        xbc_tail_ptr + (b * stride_xbc_b) + (d * stride_xbc_d) + (w_offsets * stride_xbc_w)
+    xBC_offsets = (
+        xBC_tail_ptr + (b * stride_xBC_b) + (d * stride_xBC_d) + (w_offsets * stride_xBC_w)
     )
     cs_offsets = (
         conv_state_ptr
@@ -229,20 +229,25 @@ def _scatter_conv_state_kernel(
         + (update_indices * stride_cs_w)
     )
 
-    data = tl.load(xbc_offsets, mask=mask)
+    data = tl.load(xBC_offsets, mask=mask)
     tl.store(cs_offsets, data, mask=mask)
 
 
 def scatter_conv_state(
     conv_state: torch.Tensor,
-    xbc_tail: torch.Tensor,
+    xBC: torch.Tensor,
     batch_indices: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    chunk_len: int,
-    copy_len: int,
 ):
     """Writes the newest chunk of tokens into the circular convolution state."""
-    B, D, _ = xbc_tail.shape
+    state_len = conv_state.shape[2]
+    chunk_len = xBC.shape[-1]
+
+    # We only need to retain at most the last `state_len` tokens of the chunk
+    copy_len = min(chunk_len, state_len)
+    xBC_tail = xBC[..., -copy_len:]
+
+    B, D, _ = xBC_tail.shape
     state_len = conv_state.shape[2]
     BLOCK_W = triton.next_power_of_2(copy_len)
 
@@ -251,13 +256,13 @@ def scatter_conv_state(
         conv_state,
         batch_indices,
         cache_seqlens,
-        xbc_tail,
+        xBC_tail,
         conv_state.stride(0),
         conv_state.stride(1),
         conv_state.stride(2),
-        xbc_tail.stride(0),
-        xbc_tail.stride(1),
-        xbc_tail.stride(2),
+        xBC_tail.stride(0),
+        xBC_tail.stride(1),
+        xBC_tail.stride(2),
         D,
         state_len,
         chunk_len,
