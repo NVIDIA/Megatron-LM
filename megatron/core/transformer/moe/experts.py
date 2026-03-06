@@ -707,7 +707,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1:
+        if self.offload_expert_fc1 and not self.config.fp8:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -776,18 +776,18 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
+        expert_fc1_manager = off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
+        )
+        with expert_fc1_manager as permuted_local_hidden_states:
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
-        if self.offload_expert_fc1:
-            fc1_output = off_interface.group_commit(
-                fc1_output,
-                name="expert_fc1",
-                forced_released_tensors=[permuted_local_hidden_states],
-            )
+        fc1_output = expert_fc1_manager.group_offload(
+            fc1_output,
+            forced_released_tensors=[permuted_local_hidden_states],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
@@ -847,14 +847,15 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
@@ -863,10 +864,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        if self.offload_moe_act:
-            output = off_interface.group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
-            )
+        output = moe_act_manager.group_offload(
+            output,
+            forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
