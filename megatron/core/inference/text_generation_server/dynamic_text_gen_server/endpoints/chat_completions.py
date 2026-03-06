@@ -126,9 +126,7 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(
-                    int(max_tokens) if max_tokens is not None else None
-                ),
+                num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
             )
