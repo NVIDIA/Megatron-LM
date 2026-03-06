@@ -126,6 +126,7 @@ class DynamicEngineTestConfig:
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
+    enable_prefix_caching: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
         default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
@@ -260,6 +261,7 @@ class TestDynamicInferenceEngine:
                 ),
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
@@ -2169,13 +2171,11 @@ class TestDynamicInferenceEngine:
             max_prompt_length=8,
             num_tokens_to_generate=4,
             num_speculative_tokens=2,
+            enable_prefix_caching=True,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
         )
         env = self._build_test_env(test_config)
-
-        # Enable prefix caching on the context.
-        env.engine.context.enable_prefix_caching = True
 
         # Create two pairs of requests with shared prefixes.
         shared_prompt_a = torch.randint(
