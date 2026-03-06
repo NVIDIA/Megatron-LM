@@ -41,6 +41,8 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --context-parallel-size: 1
   --transformer-impl: transformer_engine
+  --bf16: true
+  --no-gradient-accumulation-fusion: true
   --init-method-std: 0.006
   --adam-beta1: 0.9
   --adam-beta2: 0.95
