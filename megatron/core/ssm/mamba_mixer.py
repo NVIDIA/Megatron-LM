@@ -776,14 +776,20 @@ class MambaMixer(MegatronModule):
             xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
+            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+            # tensors to the conv state dtype for causal_conv1d_fn and then cast xBC
+            # back to the original dtype
+            xBC_dtype = xBC.dtype
+            conv_state_dtype = xBC_dtype if conv_state is None else conv_state.dtype
+            weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
             xBC = causal_conv1d_fn(
-                x=xBC,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
+                x=xBC.to(conv_state_dtype),
+                weight=weight.to(conv_state_dtype),
+                bias=self.cp.get_conv1d_bias().to(conv_state_dtype),
                 activation=self.activation,
                 seq_idx=seq_idx,
                 initial_states=initial_conv_state,
-            )
+            ).to(xBC_dtype)
 
         # transpose b pd l --> b l pd
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -920,14 +926,19 @@ class MambaMixer(MegatronModule):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=xBC.dtype)
         else:
+            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+            # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
+            # back to the original dtype
+            xBC_dtype = xBC.dtype
+            weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
             xBC = causal_conv1d_update(
-                xBC,
+                xBC.to(conv_state.dtype),
                 conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
+                weight.to(conv_state.dtype),
+                self.conv1d.bias.to(conv_state.dtype),
                 self.activation,
                 conv_state_indices=batch_indices,
-            )
+            ).to(xBC_dtype)
 
         x, B, C = torch.split(
             xBC,

@@ -8,7 +8,12 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*"]
+include = [
+    "megatron.core",
+    "megatron.core.*",
+    "megatron.training",
+    "megatron.training.*",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -136,6 +141,7 @@ test = [
     "wrapt",
     "pytest==8.3.5",
     "pytest-mock",
+    "mock",
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
@@ -245,6 +251,7 @@ omit = [
     "/opt/megatron-lm/tests/*",
     "/opt/megatron-lm/tools/*",
     "/usr/local/lib/python3.12/dist-packages/*",
+    "/opt/megatron-lm/_remote_module_non_scriptable",
 ]
 parallel = true
 sigterm = false
