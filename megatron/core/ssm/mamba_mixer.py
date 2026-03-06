@@ -24,6 +24,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_merge,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -366,6 +369,21 @@ class MambaMixer(MegatronModule):
         )
         self.tp_group = pg_collection.tp
 
+        self.offload_in_proj = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_in_proj" in self.config.offload_modules
+        )
+
+        self.offload_out_proj = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_out_proj" in self.config.offload_modules
+        )
+
+        self.offload_ssm = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_ssm" in self.config.offload_modules
+        )
+
     def forward(
         self,
         hidden_states,
@@ -398,7 +416,13 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
-        zxBCdt, _ = self.in_proj(hidden_states)
+        with off_interface(self.offload_in_proj, hidden_states, "mamba_in_proj") as hidden_states:
+            zxBCdt, _ = self.in_proj(hidden_states)
+
+        if self.offload_in_proj:
+            zxBCdt = off_interface.group_commit(
+                zxBCdt, name="mamba_in_proj", forced_released_tensors=[]
+            )
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
@@ -413,7 +437,11 @@ class MambaMixer(MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-        out, out_bias = self.out_proj(y)
+        with off_interface(self.offload_out_proj, y, "mamba_out_proj") as y:
+            out, out_bias = self.out_proj(y)
+
+        if self.offload_out_proj:
+            out = off_interface.group_commit(out, name="mamba_out_proj", forced_released_tensors=[])
 
         return out, out_bias
 
@@ -630,24 +658,29 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
-        y = mamba_split_conv1d_scan_combined(
-            zxBCdt,
-            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            self.cp.get_conv1d_bias(),
-            self.cp.get_dt_bias().float(),
-            A,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
-            chunk_size=self.chunk_size,
-            activation=self.activation,
-            headdim=None if self.D_has_hdim else self.headdim,
-            ngroups=self.cp.ngroups_local_tpcp,
-            norm_before_gate=self.norm_before_gate,
-            seq_idx=seq_idx,
-        )
+        with off_interface(self.offload_ssm, zxBCdt, "mamba_ssm") as zxBCdt:
+
+            y = mamba_split_conv1d_scan_combined(
+                zxBCdt,
+                rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                self.cp.get_conv1d_bias(),
+                self.cp.get_dt_bias().float(),
+                A,
+                D=(
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.cp.get_D()
+                ),
+                chunk_size=self.chunk_size,
+                activation=self.activation,
+                headdim=None if self.D_has_hdim else self.headdim,
+                ngroups=self.cp.ngroups_local_tpcp,
+                norm_before_gate=self.norm_before_gate,
+                seq_idx=seq_idx,
+            )
+
+        if self.offload_ssm:
+            y = off_interface.group_commit(y, name="mamba_ssm", forced_released_tensors=[])
 
         y = rearrange(y, "b l d -> l b d").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params)
