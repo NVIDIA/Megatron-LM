@@ -1095,7 +1095,14 @@ def test_eager_attention_function_correctness():
 @pytest.mark.skipif(
     not is_te_min_version("1.2.0"), reason="attention_bias in TE DPA requires TE >= 1.2.0"
 )
-def test_te_fused_attention_bias_matches_native_attention_mask():
+@pytest.mark.parametrize(
+    "attn_mask_type",
+    [
+        AttnMaskType.no_mask,
+        AttnMaskType.causal,  # TODO: Causal mask is still broken. Trying to fix it.
+    ],
+)
+def test_te_fused_attention_bias_matches_native_attention_mask(attn_mask_type):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         seed = 1234
@@ -1124,16 +1131,10 @@ def test_te_fused_attention_bias_matches_native_attention_mask():
         )
 
         native_attn = DotProductAttention(
-            config=config,
-            layer_number=1,
-            attn_mask_type=AttnMaskType.padding,
-            attention_type="self",
+            config=config, layer_number=1, attn_mask_type=attn_mask_type, attention_type="self"
         ).cuda()
         te_attn = TEDotProductAttention(
-            config=config,
-            layer_number=1,
-            attn_mask_type=AttnMaskType.no_mask,
-            attention_type="self",
+            config=config, layer_number=1, attn_mask_type=attn_mask_type, attention_type="self"
         ).cuda()
 
         q = torch.randn(
@@ -1147,11 +1148,21 @@ def test_te_fused_attention_bias_matches_native_attention_mask():
         )
 
         attention_mask = (
-            torch.randn(batch_size, 1, seq_len_q, seq_len_kv, device="cuda", dtype=torch.float32)
-            > 0
+            torch.randn(1, 1, seq_len_q, seq_len_kv, device="cuda", dtype=torch.float32) > 0
         )
+        if "causal" in attn_mask_type.name:
+            # Legal causal mask: upper-triangular (mask out future tokens), broadcasted on batch.
+            triangular_mask = torch.triu(
+                torch.ones((1, 1, seq_len_q, seq_len_kv), device="cuda", dtype=torch.bool),
+                diagonal=1,
+            )
+            attention_mask = attention_mask | triangular_mask
+        else:
+            # Avoid fully-masked rows for the non-causal random-mask case.
+            attention_mask[..., 0] = False
+        attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+
         # Avoid fully-masked rows that can make comparison noisy.
-        attention_mask[..., 0] = False
         attention_bias = to_zz_mask_attn_bias(
             attention_mask,
             cp_size=1,
@@ -1170,7 +1181,7 @@ def test_te_fused_attention_bias_matches_native_attention_mask():
             key=k_native,
             value=v_native,
             attention_mask=attention_mask,
-            attn_mask_type=AttnMaskType.padding,
+            attn_mask_type=attn_mask_type,
         )
         native_out.sum().backward()
 
@@ -1182,7 +1193,7 @@ def test_te_fused_attention_bias_matches_native_attention_mask():
             key=k_te,
             value=v_te,
             attention_mask=None,
-            attn_mask_type=AttnMaskType.no_mask,
+            attn_mask_type=attn_mask_type,
             attention_bias=attention_bias,
         )
         te_out.sum().backward()
