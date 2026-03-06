@@ -2251,6 +2251,10 @@ def save_checkpoint_and_time(
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
+    # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
+    if should_disable_forward_pre_hook(args):
+        force_param_sync(model)
+
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
     energy_monitor.pause()
@@ -2261,8 +2265,6 @@ def save_checkpoint_and_time(
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
     # D2H tensor transfers.
