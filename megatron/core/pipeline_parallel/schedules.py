@@ -2,7 +2,7 @@
 
 import contextlib
 from functools import partial
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -15,7 +15,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
-    backward_step_multimodule,
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
@@ -271,9 +270,9 @@ def forward_step_calc_loss(
             ignore_virtual=False, vp_stage=vp_stage
         )
     else:
-        assert (
-            cp_group_size is not None and is_last_stage is not None
-        ), "cp_group_size and is_last_stage must be provided"
+        assert is_last_stage is not None, "is_last_stage must be provided"
+        if is_last_stage:
+            assert cp_group_size is not None, "cp_group_size must be provided on last stage"
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
@@ -316,7 +315,8 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -529,6 +529,67 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    return input_tensor_grad
+
+
+def backward_step_multimodule(
+    input_tensor: Dict[str, torch.Tensor],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Optional[Dict[str, torch.Tensor]],
+    config,
+    language_model_module_name: str,
+) -> Dict[str, torch.Tensor]:
+    """Backward step for multi-module pipelines.
+
+    In multi-module pipelines, tensors are organized as dictionaries with
+    module names as keys. Each module's backward pass is performed independently.
+    """
+    # Retain gradients on all input tensors.
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is not None:
+            tensor.retain_grad()
+
+    # Last stage: output_tensor is a scalar loss from the language model.
+    # Associate it with the language_model_module_name.
+    if not isinstance(output_tensor, dict):
+        output_tensor = {language_model_module_name: output_tensor}
+
+    # Handle output_tensor_grad: None (last stage) or dict (intermediate stages).
+    if not output_tensor_grad:
+        output_tensor_grad = {key: None for key in output_tensor.keys()}
+
+    # Apply grad scaling if needed (for last stage only).
+    for module_name in output_tensor.keys():
+        if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
+            output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
+
+    # Perform backward pass for each module.
+    for module_name in output_tensor.keys():
+        output_tensor_module = output_tensor[module_name]
+        output_tensor_grad_module = output_tensor_grad[module_name]
+
+        # In multi-modal models like VLM, some batches may not have images.
+        # In such cases, skip backward while preserving zero gradients.
+        if output_tensor_module is not None and output_tensor_module.requires_grad:
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor_module, output_tensor_grad_module)
+            else:
+                torch.autograd.backward(
+                    output_tensor_module, grad_tensors=output_tensor_grad_module
+                )
+
+    # Collect gradients for input tensors.
+    input_tensor_grad = {}
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is None:
+            input_tensor_grad[module_name] = None
+        else:
+            input_tensor_grad[module_name] = tensor.grad
 
     return input_tensor_grad
 
@@ -2080,8 +2141,8 @@ def forward_backward_pipelining_without_interleaving(
             if pg_collection.has_language_model():
                 cp_size = pg_collection.get_language_model_cp_size()
             else:
-                # Encoder-only ranks: cp_size not used for loss scaling, default to 1
-                cp_size = 1
+                # Encoder-only ranks should not use CP loss scaling.
+                cp_size = None
             # tp_group and cp_group stay None (variable_seq_lengths mode)
 
         elif isinstance(pg_collection, ProcessGroupCollection):
