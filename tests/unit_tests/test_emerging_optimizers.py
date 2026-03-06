@@ -11,15 +11,17 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+from emerging_optimizers.soap import SOAP
+
 # Skip all tests in this file for LTS versions
 pytestmark = pytest.mark.skipif(
     Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
-    reason="Skip muon optimizer for LTS test",
+    reason="Skip emerging optimizer tests for LTS test",
 )
 
 
@@ -39,6 +41,11 @@ class Net(nn.Module):
         x = F.relu(self.fc4(x))
         x = self.fc5(x)
         return x
+
+
+# ===========================================================================
+# Muon optimizer tests
+# ===========================================================================
 
 
 def test_muon_optimizer_smoke():
@@ -651,3 +658,292 @@ def test_muon_optimizer_num_ns_steps(num_ns_steps):
     assert not torch.equal(
         model.weight.data, original_weight
     ), f"Weight should be updated with num_ns_steps={num_ns_steps}"
+
+
+# ===========================================================================
+# SOAP optimizer tests
+# ===========================================================================
+
+skip_no_soap = pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
+)
+
+
+@skip_no_soap
+def test_soap_optimizer_smoke():
+    """Smoke test for SOAP optimizer."""
+
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        weight_decay=0.01,
+        precondition_frequency=1,
+    )
+
+    # Test basic properties
+    assert optimizer is not None, "Optimizer should not be None"
+    assert hasattr(optimizer, 'param_groups'), "Optimizer should have param_groups"
+    assert len(optimizer.param_groups) > 0, "Optimizer should have at least one parameter group"
+
+    # Test forward and backward pass
+    input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    # Store original weight
+    original_weight = model.weight.data.clone()
+
+    # Test optimizer step
+    optimizer.step()
+
+    # Verify weight was updated
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), "Weight should be updated after optimizer step"
+
+    # Test zero_grad
+    optimizer.zero_grad()
+    assert model.weight.grad is None or torch.all(
+        model.weight.grad == 0
+    ), "Gradients should be zeroed"
+
+    # Test state_dict and load_state_dict
+    state_dict = optimizer.state_dict()
+    assert 'state' in state_dict, "State dict should contain state"
+    assert 'param_groups' in state_dict, "State dict should contain param_groups"
+
+    # Load state dict should not raise error
+    optimizer.load_state_dict(state_dict)
+
+
+@skip_no_soap
+def test_soap_optimizer_multiple_steps():
+    """Test SOAP optimizer across multiple optimization steps."""
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        weight_decay=0.01,
+        precondition_frequency=1,
+    )
+
+    weights_history = [model.weight.data.clone()]
+
+    for i in range(3):
+        input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        optimizer.step()
+        optimizer.zero_grad()
+        weights_history.append(model.weight.data.clone())
+
+    # Verify weights changed at each step
+    for i in range(len(weights_history) - 1):
+        assert not torch.equal(
+            weights_history[i], weights_history[i + 1]
+        ), f"Weight should change at step {i}"
+
+
+@skip_no_soap
+@pytest.mark.parametrize("precondition_frequency", [1, 5, 10])
+def test_soap_optimizer_precondition_frequency(precondition_frequency):
+    """Test SOAP optimizer with different precondition frequencies."""
+    from emerging_optimizers.soap import SOAP
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        precondition_frequency=precondition_frequency,
+    )
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with precondition_frequency={precondition_frequency}"
+
+
+@skip_no_soap
+@pytest.mark.parametrize("use_kl_shampoo", [True, False])
+def test_soap_optimizer_kl_shampoo(use_kl_shampoo):
+    """Test SOAP optimizer with and without KL-Shampoo preconditioner."""
+    from emerging_optimizers.soap import SOAP
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        use_kl_shampoo=use_kl_shampoo,
+        precondition_frequency=1,
+    )
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with use_kl_shampoo={use_kl_shampoo}"
+
+
+@skip_no_soap
+@pytest.mark.parametrize("shampoo_beta", [0.5, 0.9, 0.99])
+def test_soap_optimizer_shampoo_beta(shampoo_beta):
+    """Test SOAP optimizer with different shampoo_beta values."""
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=shampoo_beta,
+        precondition_frequency=1,
+    )
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with shampoo_beta={shampoo_beta}"
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestSoapOptimizerMultiRank:
+    """Test class for SOAP optimizer with multi-rank setup."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Setup and teardown for each test."""
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    def create_ddp_model(self, model):
+        """Wrap model in DDP."""
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+    def test_get_megatron_optimizer_soap_smoke(self):
+        """Smoke test for get_megatron_optimizer with SOAP."""
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        for param in model.parameters():
+            assert param.requires_grad, "All parameters should require gradients"
+
+        optimizer_config = OptimizerConfig(
+            optimizer='soap',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            soap_shampoo_beta=0.95,
+            soap_precondition_frequency=1,
+            soap_use_kl_shampoo=True,
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        assert optimizer is not None, "Optimizer should not be None"
+        assert hasattr(optimizer, 'param_groups'), "Optimizer should have param_groups"
+        assert hasattr(optimizer, 'chained_optimizers'), "Should be a ChainedOptimizer"
+        assert len(optimizer.chained_optimizers) >= 1, "Should have at least one chained optimizer"
+
+        # Test forward and backward pass
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        # Store original parameters
+        original_params = {}
+        for name, param in model.named_parameters():
+            original_params[name] = param.data.clone()
+
+        # Test optimizer step
+        optimizer.step()
+
+        # Verify at least some parameters were updated
+        params_updated = 0
+        for name, param in model.named_parameters():
+            if not torch.equal(param.data, original_params[name]):
+                params_updated += 1
+
+        assert params_updated > 0, "At least some parameters should be updated after optimizer step"
+
+        # Test zero_grad
+        optimizer.zero_grad()
+        for param in model.parameters():
+            assert param.grad is None or torch.all(
+                param.grad == 0
+            ), "Gradients should be zeroed for all parameters"
+
+        # Test state_dict and load_state_dict
+        state_dict = optimizer.state_dict()
+        assert isinstance(state_dict, list), "State dict should be a list"
+        optimizer.load_state_dict(state_dict)
+
+    def test_get_megatron_optimizer_soap_validation(self):
+        """Test validation logic for get_megatron_optimizer with SOAP."""
+        model = torch.nn.Linear(100, 50, bias=False, dtype=torch.bfloat16, device='cuda')
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        # FP16 should raise exception
+        optimizer_config_fp16 = OptimizerConfig(
+            optimizer='soap', lr=0.01, fp16=True, use_distributed_optimizer=False
+        )
+
+        with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
+            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])

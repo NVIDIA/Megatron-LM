@@ -146,7 +146,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 coefficient_type=coefficient_type,
                 tp_group=tp_group,
                 partition_dim=partition_dim,
-                mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
@@ -162,7 +162,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             params,
             lr,
             momentum,
-            nesterov=nesterov,
+            use_nesterov=nesterov,
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
@@ -263,7 +263,6 @@ def _soap_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     """Convert OptimizerConfig to SOAP constructor kwargs."""
     kwargs = _kwargs_from_config(SOAP, "soap", config)
     kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
-    kwargs["pg_collection"] = pg_collection
     return kwargs
 
 
