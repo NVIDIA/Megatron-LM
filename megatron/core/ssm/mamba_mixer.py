@@ -458,19 +458,13 @@ class MambaMixer(MegatronModule):
             # Reshape from [N*S, 1, d] to [N, S, d] for the 3D Triton kernels
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
 
-            # Get sequence lengths for the circular buffer calculation
-            req_start = context.paused_request_count
-            cache_seqlens = context.request_kv_length_offsets[
-                req_start : req_start + decode_req_count
-            ]
-
             y_decode = self._ssm_decode(
                 zxBCdt_decode,
                 conv_state,
                 ssm_state,
                 batch_indices=context.mamba_metadata.batch_indices_decode,
                 intermediate_ssm_state=int_ssm_state,
-                cache_seqlens=cache_seqlens,
+                cache_seqlens=context.mamba_metadata.cache_seqlens_decode,
             )
 
             # Flatten back to [N*S, 1, d] to match merge logic
@@ -551,7 +545,7 @@ class MambaMixer(MegatronModule):
                 ssm_state=ssm_state,
                 batch_indices=metadata.batch_indices_chunked_prefill,
                 is_chunked_prefill=True,
-                cache_seqlens=metadata.chunked_prefill_cache_seqlens,
+                cache_seqlens=metadata.cache_seqlens_chunked_prefill,
             )
 
             # Update zxBCdt to contain the remaining slice for regular prefill
