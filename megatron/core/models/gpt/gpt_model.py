@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -24,6 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer.dot_product_attention_context_parallel import to_zz_mask_attn_bias
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.multi_token_prediction import (
@@ -527,6 +528,42 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        block_kwargs = dict(extra_block_kwargs or {})
+        attention_bias = block_kwargs.pop("attention_bias", None)
+
+        # TE fused attention backend ignores attention_mask
+        # in some paths. Convert to bias proactively.
+        if (
+            attention_bias is None
+            and attention_mask is not None
+            and self.config.transformer_impl == "transformer_engine"
+            and not self.config.fallback_to_eager_attn
+            and attention_mask.shape[2] > 1
+        ):
+            assert (
+                packed_seq_params is None
+            ), "TE fused attention with attention mask is not supported for packed sequences."
+            assert attention_mask.dim() == 4, "TE fused attention only supports 4D attention mask."
+            if hasattr(packed_seq_params, 'cp_group'):
+                cp_size = packed_seq_params.cp_group.size()
+            elif hasattr(packed_seq_params, 'local_cp_size'):
+                cp_size = packed_seq_params.local_cp_size
+            elif self.pg_collection.cp is not None:
+                cp_size = self.pg_collection.cp.size()
+            else:
+                cp_size = self.config.context_parallel_size
+            device = decoder_input.device if decoder_input is not None else attention_mask.device
+            dtype = decoder_input.dtype if decoder_input is not None else self.config.params_dtype
+            attention_bias = to_zz_mask_attn_bias(
+                attention_mask,
+                cp_size=cp_size,
+                nheads=self.config.num_attention_heads,
+                nheads_k=self.config.num_query_groups,
+                heads_k_stride=1,
+                device=device,
+                dtype=dtype,
+            )
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -536,10 +573,11 @@ class GPTModel(LanguageModule):
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
+            **block_kwargs,
         )
 
         return self._postprocess(
@@ -554,11 +592,12 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
+            attention_bias=attention_bias,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             runtime_gather_output=runtime_gather_output,
-            extra_block_kwargs=extra_block_kwargs,
+            extra_block_kwargs=block_kwargs,
             inference_context=inference_context,
         )
 
@@ -575,6 +614,7 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
+        attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
@@ -601,6 +641,7 @@ class GPTModel(LanguageModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                attention_bias=attention_bias,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
