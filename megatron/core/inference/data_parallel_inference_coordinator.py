@@ -394,9 +394,7 @@ class DataParallelInferenceCoordinator:
                     self.schedule_records.append(
                         {
                             "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[
-                                next_identity
-                            ],
+                            "rank_index": self.identity_to_rank_index[next_identity],
                             "num_hashes": len(request_hashes),
                         }
                     )
