@@ -662,6 +662,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -684,14 +685,23 @@ def topk_routing_with_score_function(
                                              recorded routing sequence.
 
                                               Defaults to None.
+        dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
+                                       sparse tensors [num_tokens, num_experts]. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
+            When dense_output=False (default):
+                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts]. Sparse tensor
+                  containing the normalized routing probability for each token-expert pair. Non-zero
+                  entries correspond to the top-k selected experts per token.
+                - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
+                  True indicates the token is routed to that expert (i.e. the expert was in the
+                  token's top-k selection).
+            When dense_output=True:
+                - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
+                  probabilities for each token's top-k selected experts.
+                - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
+                  selected for each token.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
@@ -773,6 +783,9 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    if dense_output:
+        return probs, top_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
@@ -1036,13 +1049,20 @@ def track_moe_metrics(
     """
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
-    # Initialize the tracker if force_initialize is True
+    # Initialize the tracker if force_initialize is True.
+    # The values tensor size must match what the router creates in save_to_aux_losses_tracker,
+    # which uses (num_layers + mtp_num_layers). This is important for PP ranks that have no
+    # MoE layers (so the tracker is empty and force_initialize creates the entry); their tensor
+    # size must match ranks that do have MoE layers, otherwise all_reduce across PP will hang.
+    tracker_num_layers = num_layers
+    if mtp_num_layers is not None:
+        tracker_num_layers += mtp_num_layers
     if force_initialize:
         if track_names is not None:
             for key in track_names:
                 if key not in tracker:
                     tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["values"] = torch.zeros(tracker_num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False

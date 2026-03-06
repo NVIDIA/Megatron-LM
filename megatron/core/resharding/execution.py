@@ -18,6 +18,7 @@ def execute_reshard_plan(
     src_module: torch.nn.Module,
     dst_module: torch.nn.Module,
     service: CopyService,
+    group=None,
 ) -> None:
     """
     Execute a reshard plan (from centralized controller).
@@ -67,7 +68,8 @@ def execute_reshard_plan(
     # Execute
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
-    dist.barrier()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
 
     # Write back received buffers into their destination parameter slices
     for recv_buffer, dst_param, dst_slice in recv_writebacks:
