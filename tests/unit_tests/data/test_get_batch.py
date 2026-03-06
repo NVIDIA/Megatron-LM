@@ -34,6 +34,7 @@ def initialize_test_environment(
     args.sequence_parallel = True if tp_size > 1 else False
     args.pipeline_model_parallel_size = 1
     args.context_parallel_size = cp_size
+    args.hybrid_context_parallel = False
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
@@ -102,7 +103,9 @@ def test_sft_batch(tp_size, cp_size, seq_length):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
+        hybrid_cp_group,
         labels,
+        local_cp_size,
         loss_mask,
         max_seqlen,
         position_ids,
@@ -116,9 +119,15 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     assert cu_seqlens is not None
     assert max_seqlen is not None
     assert attention_mask is None
-    
+    assert hybrid_cp_group is None
+    assert local_cp_size is None
+
     if cp_size > 1:
         assert cu_seqlens_padded is not None
+        import os
+        if os.environ.get("RANK") == "0":
+            print(cu_seqlens_padded)
+            print(cu_seqlens)
     else:
         assert cu_seqlens_padded is None
     
@@ -143,7 +152,9 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
+        hybrid_cp_group,
         labels,
+        local_cp_size,
         loss_mask,
         max_seqlen,
         position_ids,
@@ -162,7 +173,11 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert cu_seqlens is None
     assert cu_seqlens_padded is None
     assert max_seqlen is None
+    assert hybrid_cp_group is None
+    assert local_cp_size is None
     
     if torch.distributed.is_initialized():
             torch.distributed.barrier()
     
+if __name__ == "__main__":
+    test_pretrain_batch(2, 1, 1024, True)

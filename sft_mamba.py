@@ -26,7 +26,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.parallel_state import get_context_parallel_group, get_hybrid_data_context_parallel_groups
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -72,7 +72,7 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    BATCH_KEYS = ["tokens", "labels", "loss_mask", "position_ids", "attention_mask", "cu_seqlens", "cu_seqlens_padded", "max_seqlen"]
+    BATCH_KEYS = ["tokens", "labels", "loss_mask", "position_ids", "attention_mask", "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size", "hybrid_cp_group"]
 
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -85,6 +85,7 @@ def get_batch(data_iterator, vp_stage=None):
     is_sft = args.sft
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
+    is_hybrid_cp = args.hybrid_context_parallel
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank: # TODO(asolergi-nv): Add HybridCP condition
         return [None for _ in BATCH_KEYS]
@@ -98,8 +99,9 @@ def get_batch(data_iterator, vp_stage=None):
         for key in BATCH_KEYS:
             batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 
-    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
-    batch = get_batch_on_this_cp_rank(batch, cp_group=get_context_parallel_group())
+    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, is_hybrid_cp=is_hybrid_cp, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
+    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
+    print(f"Batch keys: {batch.keys()}")
     return [batch[key] for key in sorted(batch.keys())]
 
 
@@ -184,7 +186,9 @@ def forward_step(data_iterator, model: MambaModel):
             attention_mask,
             cu_seqlens,
             cu_seqlens_padded,
+            hybrid_cp_group,
             labels,
+            local_cp_size,
             loss_mask,
             max_seqlen,
             position_ids,
@@ -201,6 +205,8 @@ def forward_step(data_iterator, model: MambaModel):
             cu_seqlens_kv_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=local_cp_size,
+            cp_group=hybrid_cp_group,
         )
 
     timers('batch-generator').stop()
