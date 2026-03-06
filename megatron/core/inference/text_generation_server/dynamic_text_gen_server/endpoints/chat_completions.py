@@ -56,10 +56,6 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
 
-        # The OpenAI client merges extra_body keys into the top-level JSON,
-        # so {"enable_thinking": True} arrives at req["chat_template_kwargs"].
-        chat_template_kwargs = req.get("chat_template_kwargs", {}) or {}
-
         # The OpenAI spec sends tool_call arguments as a JSON string, but
         # Jinja chat templates iterate over them with |items, requiring a dict.
         for msg in messages:
@@ -79,7 +75,7 @@ try:
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=req.get("tools", None),
-                **chat_template_kwargs,
+                **req.get("chat_template_kwargs", {}),
             )
         except (AttributeError, AssertionError):
             warnings.warn(
