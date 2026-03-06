@@ -1492,9 +1492,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             context = attention_output_with_bias["context"]
 
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(
-                self.training, self.config.bias_dropout_fusion
-            )(attention_output_with_bias, residual, self.hidden_dropout)
+            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                attention_output_with_bias, residual, self.hidden_dropout
+            )
 
         return hidden_states, context
 
