@@ -428,13 +428,9 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
-        assert args.rl_forced_lag == 0 or not args.rl_partial_rollouts, (
-            "--rl-forced-lag and --rl-partial-rollouts are incompatible."
+        assert not args.rl_batch_results or args.rl_partial_rollouts, (
+            "--rl-batch-results requires --rl-partial-rollouts."
         )
-        if args.rl_forced_lag > 0 and args.rl_parallel_generation_tasks != 512:
-            print_rank_0('WARNING: --rl-parallel-generation-tasks is ignored when '
-                         '--rl-forced-lag is set. Parallel generation tasks will be '
-                         'computed as (rl_forced_lag + 1) * grpo_prompts_per_step.')
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2232,12 +2228,12 @@ def _add_rl_args(parser):
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, use partial rollouts.')
-    group.add_argument('--rl-forced-lag', type=int, default=0,
-                       help='Forced rollout lag of L steps. After an initial warm-up of L steps, '
-                            'All steps N+L use only rollouts that were started on step N. '
-                            '0 (default) disables this behavior.'
-                       )
+                       help='If set, use partial rollouts (persistent streaming generator across iterations).')
+    group.add_argument('--rl-batch-results', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, use semaphore-gated ordered batch accumulation. '
+                            'Requires --rl-partial-rollouts. Combined with an appropriate '
+                            '--rl-parallel-generation-tasks value of (L+1)*prompts_per_step, '
+                            'this produces forced rollout lag of L steps.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
