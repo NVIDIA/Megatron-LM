@@ -16,7 +16,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-from emerging_optimizers.soap import SOAP
+if HAVE_EMERGING_OPTIMIZERS:
+    from emerging_optimizers.soap import SOAP
+else:
+    SOAP = None
 
 # Skip all tests in this file for LTS versions
 pytestmark = pytest.mark.skipif(
@@ -762,7 +765,6 @@ def test_soap_optimizer_multiple_steps():
 @pytest.mark.parametrize("precondition_frequency", [1, 5, 10])
 def test_soap_optimizer_precondition_frequency(precondition_frequency):
     """Test SOAP optimizer with different precondition frequencies."""
-    from emerging_optimizers.soap import SOAP
 
     model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -793,7 +795,6 @@ def test_soap_optimizer_precondition_frequency(precondition_frequency):
 @pytest.mark.parametrize("use_kl_shampoo", [True, False])
 def test_soap_optimizer_kl_shampoo(use_kl_shampoo):
     """Test SOAP optimizer with and without KL-Shampoo preconditioner."""
-    from emerging_optimizers.soap import SOAP
 
     model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
