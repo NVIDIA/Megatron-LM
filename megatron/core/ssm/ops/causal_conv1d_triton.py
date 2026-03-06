@@ -144,7 +144,8 @@ def _gather_conv_state_kernel(
     )
     out_offsets = out_ptr + (b * stride_out_b) + (d * stride_out_d) + (w_offsets * stride_out_w)
 
-    data = tl.load(cs_offsets, mask=mask)
+    valid_mask = mask & (val >= 0)
+    data = tl.load(cs_offsets, mask=valid_mask, other=0.0)
     tl.store(out_offsets, data, mask=mask)
 
 
