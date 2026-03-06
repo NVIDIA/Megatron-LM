@@ -450,17 +450,13 @@ _ROLLOUT_GENERATOR = None
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
-    streaming = args.rl_partial_rollouts or args.rl_forced_lag > 0
+    streaming = args.rl_partial_rollouts
     if not streaming or _ROLLOUT_GENERATOR is None:
-        if args.rl_forced_lag > 0:
-            pgt = (args.rl_forced_lag + 1) * n_prompts
-        else:
-            pgt = args.rl_parallel_generation_tasks
-        agent = get_agent(args, parallel_generation_tasks=pgt)
+        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             streaming=streaming,
-            batch_results=args.rl_forced_lag > 0,
+            batch_results=args.rl_batch_results,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -558,7 +554,7 @@ def get_environment_rollouts(
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
-                    if not args.rl_partial_rollouts and args.rl_forced_lag == 0:
+                    if not args.rl_partial_rollouts:
                         while True:
                             try:
                                 loop.run_until_complete(anext(rollout_generator))
