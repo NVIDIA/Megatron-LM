@@ -157,15 +157,12 @@ def get_mup_config_overrides(
 
     if is_muon_optimizer:
         muon_scale_mode = getattr(config, 'muon_scale_mode', 'spectral')
-        if muon_scale_mode != 'unit_rms_norm':
+        if muon_scale_mode == 'spectral':
             log_single_rank(
                 logger,
                 logging.WARNING,
-                "Muon + MuP is configured with muon_scale_mode="
-                f"{muon_scale_mode}, which is not MuP-principled. "
-                "For MuP-compatible scaling, use --muon-scale-mode unit_rms_norm. "
-                "If you want Adam-transfer-style behavior, set "
-                "--muon-scale-mode spectral explicitly.",
+                "Muon + MuP is configured with muon_scale_mode=spectral. "
+                "For MuP-principled scaling, use --muon-scale-mode unit_rms_norm.",
             )
 
     if mup_width_mult == 1.0:
