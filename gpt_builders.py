@@ -136,6 +136,8 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            fallback_to_eager_attn=config.fallback_to_eager_attn,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
@@ -154,4 +156,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
