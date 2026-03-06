@@ -49,7 +49,7 @@ uv pip install "megatron-core[training]"
 For all extras including [Transformer Engine](https://github.com/NVIDIA/TransformerEngine):
 
 ```bash
-uv pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2" pybind11 "torch>=2.6.0"
+uv pip install --group build
 uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
@@ -85,7 +85,7 @@ uv pip install -e .
 To install with all development dependencies (includes Transformer Engine, requires pre-installed build deps):
 
 ```bash
-uv pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2" pybind11 "torch>=2.6.0"
+uv pip install --group build
 uv pip install --no-build-isolation -e ".[training,dev]"
 ```
 

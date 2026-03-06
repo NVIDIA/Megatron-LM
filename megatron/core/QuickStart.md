@@ -21,6 +21,7 @@ This guide for Megatron Core walks you through the following tasks:
 
     git clone https://github.com/NVIDIA/Megatron-LM.git
     cd Megatron-LM
+    pip install uv
     uv pip install -e .
     ```
 
