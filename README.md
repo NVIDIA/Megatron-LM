@@ -27,7 +27,7 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 **Install from PyPI:**
 
 ```bash
-pip install megatron-core
+uv pip install megatron-core
 ```
 
 **Or clone and install from source:**
@@ -35,10 +35,10 @@ pip install megatron-core
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-pip install --no-build-isolation -e .
+uv pip install -e .
 ```
 
-> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 pip install --no-build-isolation -e .`).
+> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
 
 For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
 
