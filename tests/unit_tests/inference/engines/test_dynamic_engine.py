@@ -28,6 +28,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -124,7 +125,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration]
+        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
@@ -389,8 +390,9 @@ class TestDynamicInferenceEngine:
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
-                hybrid_attention_ratio=0.3,
-                hybrid_mlp_ratio=0.3,
+                hybrid_layer_pattern=(
+                    "M*-" if pp_size == 1 else "M*-|M*-"
+                ),  # 3 or 6 layers (2 PP stages)
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
@@ -455,7 +457,7 @@ class TestDynamicInferenceEngine:
         # Suspend + resume.
         if (
             env.config.suspend_resume_interval is not None
-            and env.engine.step_count % env.config.suspend_resume_interval == 0
+            and env.engine.context.step_count % env.config.suspend_resume_interval == 0
         ):
             suspend_resume_mems = {}
             suspend_resume_mems["start"] = torch.cuda.memory_stats()
@@ -463,7 +465,7 @@ class TestDynamicInferenceEngine:
             suspend_resume_mems["mid"] = torch.cuda.memory_stats()
             env.engine.resume()  # resume.
             suspend_resume_mems["end"] = torch.cuda.memory_stats()
-            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+            env.mem_usage["suspend_resume"][env.engine.context.step_count] = suspend_resume_mems
 
         # Nothing done?
         finished_request_records = result["finished_request_records"]
@@ -543,8 +545,8 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -557,10 +559,23 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
+            context_max_requests=128,
         )
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
+
+        if num_cuda_graphs is not None:
+            assert env.engine.context.cuda_graph_token_counts is not None
+            assert env.engine.context.cuda_graph_batch_dimensions_list
+            model = env.engine.controller.inference_wrapped_model.model
+            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
+                # check if cudagraph runners are created at the decoder level
+                assert model.decoder.cudagraph_manager.cudagraph_runners
+            else:
+                # check if cudagraph runners are created at the layer level
+                for layer in model.decoder.layers:
+                    assert layer.cudagraph_manager.cudagraph_runners
 
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
@@ -1720,7 +1735,7 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.step_count
+        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
@@ -1760,7 +1775,7 @@ class TestDynamicInferenceEngine:
         engine = env.engine
         context = engine.context
 
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         deallocates = kv_cache_management_mode != "persist"
@@ -1783,7 +1798,7 @@ class TestDynamicInferenceEngine:
 
         # Suspend.
         engine.suspend()
-        assert engine.is_suspended
+        assert engine.state == EngineState.SUSPENDED
         assert not context.is_tensor_state_allocated
 
         gc.collect()
@@ -1813,7 +1828,7 @@ class TestDynamicInferenceEngine:
 
         # Resume.
         engine.resume()
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         if deallocates and not uses_tms:

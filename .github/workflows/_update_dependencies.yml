@@ -37,11 +37,20 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
 
+      - name: Mock test data
+        run: mkdir -p assets/
+
+      - name: Fetch NGC Version
+        id: ngc-version
+        run: |
+          NGC_VERSION=$(cat docker/.ngc_version.dev)
+          echo "NGC_VERSION=${NGC_VERSION}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Build container
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.06-py3" --target=main -t megatron-core .
+          docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="${{ steps.ngc-version.outputs.NGC_VERSION }}" --target=main -t megatron-core .
 
       - name: Create bump branch if not exists
         run: |
@@ -86,18 +95,6 @@ jobs:
           token: ${{ secrets.PAT }}
           ref: ${{ env.TARGET_BRANCH }}
 
-      - name: Install GPG
-        run: sudo apt-get install -y gnupg2
-
-      - name: Import GPG key (for signing)
-        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
-        id: gpg-action
-        with:
-          gpg_private_key: ${{ secrets.SSH_KEY }}
-          passphrase: ${{ secrets.SSH_PWD }}
-          git_user_signingkey: true
-          git_commit_gpgsign: true
-
       - name: Rebase against ${{ env.SOURCE_BRANCH }}
         run: |
           if git ls-remote --exit-code origin ${{ env.SOURCE_BRANCH }}; then
@@ -129,4 +126,102 @@ jobs:
             🙏 Please merge this PR only if the CI workflow completed successfully.
           commit-message: ${{ env.title }}
           signoff: true
-          committer: "${{ steps.gpg-action.outputs.name }} <${{ steps.gpg-action.outputs.email }}>"
+          committer: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+      - name: Post /ok to test comment
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping comment"
+            exit 0
+          fi
+          SHA="${{ steps.create-pull-request.outputs.pull-request-head-sha }}"
+          gh pr comment "$PR_NUMBER" --body "/ok to test $SHA"
+
+      - name: Wait for CI checks
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping wait"
+            exit 0
+          fi
+
+          # Fetch required status checks from branch protection rules
+          REQUIRED_CHECKS=$(gh api \
+            "repos/${{ github.repository }}/branches/${{ env.TARGET_BRANCH }}/protection/required_status_checks" \
+            --jq '.checks[].context' 2>/dev/null \
+            || gh api \
+            "repos/${{ github.repository }}/branches/${{ env.TARGET_BRANCH }}/protection/required_status_checks" \
+            --jq '.contexts[]' 2>/dev/null \
+            || true)
+
+          if [ -z "$REQUIRED_CHECKS" ]; then
+            echo "No branch protection rules found for ${{ env.TARGET_BRANCH }}, skipping wait"
+            exit 0
+          fi
+
+          echo "Required checks from branch protection:"
+          echo "$REQUIRED_CHECKS"
+
+          echo "Waiting for required checks to complete on PR #$PR_NUMBER..."
+          i=0
+          INITIALIZED=false
+          while true; do
+            i=$((i + 1))
+            CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null || echo "[]")
+            ALL_DONE=true
+            FAILED_CHECKS=""
+            while IFS= read -r check; do
+              CHECK_STATE=$(echo "$CHECKS_JSON" | jq -r --arg name "$check" '.[] | select(.name == $name) | .state // ""' | tr '[:upper:]' '[:lower:]')
+              case "$CHECK_STATE" in
+                *success*|*pass*|*skip*|*neutral*) ;;
+                *pending*|*queued*|*progress*|*waiting*|*request*|"")
+                  ALL_DONE=false
+                  INITIALIZED=true
+                  break
+                  ;;
+                *)
+                  if [ "$INITIALIZED" = "true" ]; then
+                    FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n'
+                  else
+                    ALL_DONE=false
+                  fi
+                  ;;
+              esac
+            done <<< "$REQUIRED_CHECKS"
+            if [ "$ALL_DONE" = "true" ]; then
+              if [ -n "$FAILED_CHECKS" ]; then
+                echo "Required check(s) did not pass:"
+                echo "$FAILED_CHECKS"
+                exit 1
+              fi
+              echo "All required checks passed!"
+              break
+            fi
+            echo "Checks not yet complete (attempt $i), retrying in 30s..."
+            sleep 30
+          done
+
+      - name: Merge PR
+        env:
+          title: "chore(beep boop 🤖): Bump `uv.lock` (${{ env.TARGET_BRANCH}}) (${{ needs.pre-flight.outputs.date }})"
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping merge"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ${{ env.SOURCE_BRANCH }}
+          git fetch origin ${{ env.TARGET_BRANCH }}
+          git checkout ${{ env.TARGET_BRANCH }}
+          git merge --squash origin/${{ env.SOURCE_BRANCH }}
+          git commit -m "${{ env.title }}"
+          git pull --rebase origin ${{ env.TARGET_BRANCH }}
+          git push origin ${{ env.TARGET_BRANCH }}
+          git push origin --delete ${{ env.SOURCE_BRANCH }}

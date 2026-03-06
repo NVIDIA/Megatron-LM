@@ -1,6 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import os
-
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
@@ -17,11 +15,17 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import (
+    SequentialMLP,
+    TEGroupedMLP,
+    TEGroupedMLPSubmodules,
+)
+from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -51,48 +55,53 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    if expert_type == 'grouped':
-        model = GroupedMLP(num_local_experts, transformer_config, pg_collection)
-    elif expert_type == 'te_grouped':
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+    if expert_type == 'te_grouped':
+        layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=True
+        )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(
+            layer_submodules.mlp.submodules.experts.submodules, TEGroupedMLPSubmodules
         )
         model = TEGroupedMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     elif expert_type == 'sequential':
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        layer_submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
         model = SequentialMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     elif expert_type == 'te_sequential':
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
         model = SequentialMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     else:
         raise ValueError(
-            'expert_type can only be one of ["sequential", "te_sequential", "grouped",'
-            ' "te_grouped"]'
+            'expert_type can only be one of ["sequential", "te_sequential", "te_grouped"]'
         )
     return model
 
 
-expert_type = ['sequential', 'grouped']
-src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
+expert_type = ['sequential']
+src_dest_expert_type = []
 if is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
