@@ -6,7 +6,7 @@ import time
 import traceback
 import uuid
 
-from ._request_utils import format_inference_result, parse_sampling_params, tokenize_messages
+from .request_utils import format_inference_result, parse_sampling_params, tokenize_messages
 
 logger = logging.getLogger(__name__)
 

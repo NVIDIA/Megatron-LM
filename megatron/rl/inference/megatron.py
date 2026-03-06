@@ -43,12 +43,49 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
+    _use_responses_api: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
+        if self._use_responses_api:
+            return await self._generate_responses_api(request)
+        return await self._generate_chat_completions(request)
+
+    async def _generate_chat_completions(self, request: InferenceRequest) -> InferenceResponse:
         tokenizer = get_tokenizer()
         args = get_args()
+        client = self._openai_client
 
-        # Use the shared, optimized client
+        response = await client.chat.completions.create(
+            model="",
+            messages=[message.model_dump() for message in request.prompt],
+            temperature=request.generation_args.temperature or 1.0,
+            top_p=request.generation_args.top_p or 0.0,
+            n=1,
+            logprobs=True,
+            extra_body={
+                "skip_prompt_log_probs": True,
+                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+            },
+        )
+
+        choice = response.choices[0]
+
+        return InferenceResponse(
+            # TODO: Handle tool calls and reasoning in LLMChatMessage
+            response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
+            raw_text=choice.raw_text,
+            token_ids=choice.prompt_token_ids + choice.generation_token_ids,
+            logprobs=choice.generation_log_probs,
+            prompt_length=len(choice.prompt_token_ids),
+            policy_staleness=choice.policy_staleness,
+            kv_cache_staleness=choice.kv_cache_staleness,
+            completed_at_step=args.curr_iteration,
+            num_evictions=getattr(choice, 'num_evictions', 0),
+        )
+
+    async def _generate_responses_api(self, request: InferenceRequest) -> InferenceResponse:
+        tokenizer = get_tokenizer()
+        args = get_args()
         client = self._openai_client
 
         # Submit request (returns immediately with status="queued")
@@ -133,6 +170,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
         )
+        launched_server._use_responses_api = args.rl_use_responses_api
 
         concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         custom_limits = httpx.Limits(
@@ -148,7 +186,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{launched_server.host}:{launched_server.port}",
             api_key="NONE",
-            http_client=http_client
+            max_retries=0,
+            http_client=http_client,
         )
 
         return launched_server
