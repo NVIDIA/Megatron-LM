@@ -1258,12 +1258,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self._maybe_build_mxfp8_weights()
 
-        if not hasattr(self, '_debug_entry'):
-            self._debug_entry = True
-            print(f"[DEBUG ENTRY] permuted_local_hidden_states: {permuted_local_hidden_states.shape} "
-                  f"mean={permuted_local_hidden_states.abs().mean().item():.6f} "
-                  f"zeros={( permuted_local_hidden_states == 0).sum().item()}/{permuted_local_hidden_states.numel()}")
-
         if permuted_probs is not None:
             permuted_probs = permuted_probs.unsqueeze(-1)
         if not tokens_per_expert.is_cuda:
@@ -1285,76 +1279,40 @@ class InferenceGroupedMLP(TEGroupedMLP):
             SWIZZLE = SwizzleType.SWIZZLE_32_4_4
             RECIPE = ScalingType.BlockWise1x32
 
-            def _quantize_activations_per_expert(x_bf16, tpe, K):
-                """Quantize activations per expert group.
+            # Each expert's token count is a multiple of 128 (enforced by
+            # moe_expert_tensor_alignment), so MXFP8 swizzle blocks (128 rows)
+            # never straddle expert boundaries. Quantize the entire activation
+            # tensor in a single kernel call.
 
-                Each group's scales are independently swizzled (to_blocked pads
-                M to multiples of 128 per group). Empty experts are skipped.
+            def _reshape_blocked_scale(scale, K):
+                """Reshape blocked scale to 2D using padded column count.
+
+                to_blocked pads columns to multiples of 4, so use the padded
+                count to infer the row dimension (which may also be padded to
+                multiples of 128).
                 """
-                xq_list, xs_list = [], []
-                offset = 0
-                for count in tpe:
-                    count = count.item()
-                    if count > 0:
-                        group_mxfp8 = MXFP8Tensor.from_bf16_torch(
-                            x_bf16[offset:offset + count, :].contiguous()
-                        )
-                        xq_list.append(group_mxfp8.data)
-                        xs_list.append(group_mxfp8.scale)
-                    offset += count
-                xq = torch.cat(xq_list, dim=0).contiguous()
-                xs = torch.cat(xs_list, dim=0).contiguous().reshape(-1, K // 32)
-                return xq, xs
+                padded_cols = ((K // 32 + 3) // 4) * 4
+                return scale.reshape(-1, padded_cols)
 
-            # FC1: quantize activations per expert, use pre-quantized weights
+            # FC1: single-tensor quantize + grouped GEMM
+            act1 = MXFP8Tensor.from_bf16_torch(permuted_local_hidden_states)
             K1 = permuted_local_hidden_states.shape[-1]
-            xq1, xs1 = _quantize_activations_per_expert(
-                permuted_local_hidden_states, tokens_per_expert, K1
-            )
-
-            wq1 = self._fc1_weight_mxfp8.data.transpose(1, 2)
-            ws1 = self._fc1_weight_mxfp8.scale
-
-            if not hasattr(self, '_debug_fwd2'):
-                self._debug_fwd2 = True
-                print(f"[DEBUG FC1] input bf16 mean={permuted_local_hidden_states.abs().mean().item():.6f}")
-                print(f"  xq1: {xq1.shape} dtype={xq1.dtype} mean={xq1.float().abs().mean().item():.6f} "
-                      f"zeros={( xq1 == 0).sum().item()}/{xq1.numel()}")
-                print(f"  xs1: {xs1.shape} dtype={xs1.dtype} "
-                      f"bytes_sum={xs1.view(torch.uint8).sum().item()} "
-                      f"bytes_mean={xs1.view(torch.uint8).float().mean().item():.1f}")
-                print(f"  wq1: {wq1.shape} dtype={wq1.dtype} contig={wq1.is_contiguous()} "
-                      f"mean={wq1.float().abs().mean().item():.6f} "
-                      f"zeros={( wq1 == 0).sum().item()}/{wq1.numel()}")
-                print(f"  ws1: {ws1.shape} dtype={ws1.dtype} "
-                      f"bytes_sum={ws1.view(torch.uint8).sum().item()} "
-                      f"bytes_mean={ws1.view(torch.uint8).float().mean().item():.1f}")
-                print(f"  offs: {offs}")
-
             fc1_output = scaled_grouped_mm(
-                xq1, wq1,
-                xs1, RECIPE,
-                ws1, RECIPE,
+                act1.data, self._fc1_weight_mxfp8.data.transpose(1, 2),
+                _reshape_blocked_scale(act1.scale, K1), RECIPE,
+                self._fc1_weight_mxfp8.scale, RECIPE,
                 swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
                 offs=offs, output_dtype=torch.bfloat16,
             )
 
-            if not hasattr(self, '_debug_fwd3'):
-                self._debug_fwd3 = True
-                print(f"  fc1_output: {fc1_output.shape}, mean={fc1_output.abs().mean().item():.6f}, "
-                      f"nan={fc1_output.isnan().any().item()}")
-
             bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
 
-            # FC2: quantize activations per expert, use pre-quantized weights
+            # FC2: single-tensor quantize + grouped GEMM
+            act2 = MXFP8Tensor.from_bf16_torch(bias_act_output)
             K2 = bias_act_output.shape[-1]
-            xq2, xs2 = _quantize_activations_per_expert(
-                bias_act_output, tokens_per_expert, K2
-            )
-
             fc2_output = scaled_grouped_mm(
-                xq2, self._fc2_weight_mxfp8.data.transpose(1, 2),
-                xs2, RECIPE,
+                act2.data, self._fc2_weight_mxfp8.data.transpose(1, 2),
+                _reshape_blocked_scale(act2.scale, K2), RECIPE,
                 self._fc2_weight_mxfp8.scale, RECIPE,
                 swizzle_a=SWIZZLE, swizzle_b=SWIZZLE,
                 offs=offs, output_dtype=torch.bfloat16,

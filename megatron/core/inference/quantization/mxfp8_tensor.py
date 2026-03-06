@@ -109,8 +109,7 @@ class MXFP8Tensor:
         assert HAVE_TRITON_MXFP, "triton_kernels.numerics_details.mxfp not available"
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
-        from torch.testing._internal.common_quantized import to_blocked
         xq, xs = downcast_to_mxfp(x, torch.float8_e4m3fn, 1)
         if xs.dtype == torch.uint8:
             xs = xs.view(torch.float8_e8m0fnu)
-        return cls(data=xq, scale=to_blocked(xs))
+        return cls(data=xq, scale=swizzle_scales(xs))

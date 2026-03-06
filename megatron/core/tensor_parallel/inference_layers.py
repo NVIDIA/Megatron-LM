@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
@@ -64,6 +65,113 @@ def _apply_linear(
             return mm_mxfp8_torch(x, weight, **kwargs)
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
+
+
+class InferenceColumnParallelLinear(TEColumnParallelLinear):
+    """
+    Inference optimized version of TEColumnParallelLinear.
+    Performs NVLS all-gather + MXFP8-aware GEMM without layernorm fusion.
+    Used for shared expert fc1 where layernorm is applied separately.
+
+    NOTE: Does not support fused reduce-scatter + add + rms-norm + all-gather.
+    Use InferenceLayerNormColumnParallelLinear for that.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: TransformerConfig,
+        init_method: Callable,
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        stride: int = 1,
+        skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        super().__init__(
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            gather_output=gather_output,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            stride=stride,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+        )
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self.tp_size = dist.get_world_size(self.tp_group)
+
+        assert (
+            output_size % self.tp_size == 0
+        ), f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
+
+        if self.tp_size > 1:
+            assert (
+                config.sequence_parallel
+            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+
+        self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
+
+    def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
+        """
+        Attempt to allocate symmetric memory buffer for all-gather.
+        """
+        symm_mem_buffer_dims = list(x.size())
+        symm_mem_buffer_dims[0] *= self.tp_size
+        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
+            symm_mem_buffer_dims, dtype=x.dtype
+        )
+        return symm_mem_buffer
+
+    def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> torch.Tensor:
+        """
+        Attempt an NVLS all-gather into symmetric memory. If not possible,
+        revert to torch dist (NCCL) all-gather.
+        """
+        if self.tp_size == 1:
+            return x
+
+        can_use_nvls = (
+            self.triton_nvls_kernels_allowed
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        )
+        if can_use_nvls:
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            return symm_mem_buffer["tensor"]
+        else:
+            x, _ = gather_along_first_dim(x, process_group=self.tp_group)
+            return x
+
+    def _set_next_layer_norm_weights(self, weights: torch.Tensor):
+        raise NotImplementedError(
+            "InferenceColumnParallelLinear does not support fused "
+            "reduce-scatter + add + rms-norm + all-gather. "
+            "Use InferenceLayerNormColumnParallelLinear instead."
+        )
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """
+        Forward pass: all-gather + linear.
+        """
+        if self.tp_size > 1:
+            symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
+            x = self._all_gather(x, symm_mem_buffer)
+
+        x = _apply_linear(x, self.weight, self.config)
+
+        return x, None
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):

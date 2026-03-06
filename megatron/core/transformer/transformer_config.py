@@ -930,12 +930,12 @@ class TransformerConfig(ModelParallelConfig):
     'flashinfer': FlashInfer fused CUDA kernel (default).
     'torch': Triton quantization + torch.nn.functional.scaled_mm."""
 
-    moe_expert_tensor_alignment: int = 64
+    moe_expert_tensor_alignment: int = 128
     """Alignment (in tokens) for per-expert M dimensions in grouped GEMMs.
     Each expert's token count is rounded up to a multiple of this value
-    (experts with 0 tokens stay at 0). Aligning to 32 or 64 improves
-    CUTLASS/TMA efficiency on Hopper and Grace Blackwell GPUs.
-    Set to 1 to disable (default)."""
+    (experts with 0 tokens stay at 0). Must be a multiple of 128 when using
+    the 'torch' MXFP8 backend so that MXFP8 scale swizzle blocks don't
+    straddle expert boundaries, enabling single-tensor quantization."""
 
     moe_ggemm_inference_no_cg: str = "torch"
     """Backend for non-CUDA-graphed inference grouped GEMM.
@@ -1198,6 +1198,18 @@ class TransformerConfig(ModelParallelConfig):
                     "backend (--moe-ggemm-inference-cg=torch), disable CUDA graphs "
                     "(--cuda-graph-impl=none), or use a non-gated activation (e.g. squared_relu)."
                 )
+
+        if (
+            self.num_moe_experts is not None
+            and getattr(self, 'fp8_recipe', None) == 'mxfp8'
+            and getattr(self, 'mxfp8_backend', 'flashinfer') == 'torch'
+            and self.moe_expert_tensor_alignment % 128 != 0
+        ):
+            raise ValueError(
+                f"moe_expert_tensor_alignment ({self.moe_expert_tensor_alignment}) must be a "
+                f"multiple of 128 when using the 'torch' MXFP8 backend, so that MXFP8 scale "
+                f"swizzle blocks (128 rows) don't straddle expert boundaries."
+            )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
