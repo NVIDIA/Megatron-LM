@@ -1290,6 +1290,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
+    # Tag ETP params with their full dotted names for debug logging.
+    try:
+        from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+            ETPShardedParam, tag_etp_params_with_names,
+        )
+        for model_module in model:
+            tag_etp_params_with_names(model_module)
+    except ImportError:
+        pass
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
