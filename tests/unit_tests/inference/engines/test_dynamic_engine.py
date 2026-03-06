@@ -42,6 +42,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
@@ -339,6 +340,14 @@ class TestDynamicInferenceEngine:
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec()
 
+            # MTP block spec (needed for speculative decoding).
+            mtp_block_spec = None
+            if test_config.num_speculative_tokens > 0:
+                use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
+                mtp_block_spec = get_gpt_mtp_block_spec(
+                    config=transformer_config, spec=layer_spec, use_transformer_engine=use_te,
+                )
+
             # GPT model.
             model = GPTModel(
                 config=transformer_config,
@@ -348,6 +357,7 @@ class TestDynamicInferenceEngine:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                mtp_block_spec=mtp_block_spec,
             ).cuda()
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
