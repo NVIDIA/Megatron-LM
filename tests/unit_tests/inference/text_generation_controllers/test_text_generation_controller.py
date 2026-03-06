@@ -1197,3 +1197,97 @@ class TestTextGenerationController:
 
         assert sampled_tokens.shape == (2,)
         assert sampled_mtp_tokens.shape == (num_spec, 2)
+
+    @pytest.mark.internal
+    def test_rewind_kv_cache_with_prefix_caching_ref_counts(self):
+        """Test that _rewind_kv_cache correctly decrements ref counts on shared blocks
+        when speculative token rejection causes a block boundary crossing."""
+        self.setup_model(torch.float32, static=False)
+
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        self.text_generation_controller.num_speculative_tokens = 2
+        ctx.num_speculative_tokens = 2
+        ctx.block_size_tokens = 4
+        ctx.enable_prefix_caching = True
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+
+        # Initialize allocator ref count tracking.
+        ctx.block_allocator.enable_prefix_caching = True
+        if not hasattr(ctx.block_allocator, 'block_ref_counts'):
+            ctx.block_allocator.block_ref_counts = torch.zeros(
+                ctx.block_allocator.total_count, dtype=torch.int32, device='cuda'
+            )
+
+        # Req 0: 3 blocks, offset 1 in last block. Rewinding 1 token -> no block release.
+        # Req 1: 3 blocks, offset 0 in last block. Rewinding 2 tokens -> crosses back, release block.
+        ctx.request_kv_length_offsets[:2] = torch.tensor([9, 9], device='cuda')
+        ctx.request_kv_block_counts[:2] = torch.tensor([3, 3], device='cuda')
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([1, 0], device='cuda')
+        ctx.request_last_kv_block_id[:2] = torch.tensor([10, 20], device='cuda')
+        ctx.request_to_kv_block_ids[:2, :3] = torch.tensor(
+            [[8, 9, 10], [18, 19, 20]], dtype=torch.int, device='cuda'
+        )
+
+        # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
+        ctx.block_allocator.block_ref_counts[20] = 2
+        ctx.block_allocator.block_ref_counts[10] = 1
+
+        initial_avail = ctx.block_allocator.total_avail
+
+        # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
+            [1, 0], device='cuda'
+        )
+
+        self.text_generation_controller._rewind_kv_cache()
+
+        # Req 1 should have released block 20 (ref count decremented).
+        assert ctx.block_allocator.block_ref_counts[20].item() == 1
+        # Block 10 should be untouched.
+        assert ctx.block_allocator.block_ref_counts[10].item() == 1
+
+    @pytest.mark.internal
+    def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
+        """Test that rewinding only releases the last block, never shared prefix blocks."""
+        self.setup_model(torch.float32, static=False)
+
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        self.text_generation_controller.num_speculative_tokens = 3
+        ctx.num_speculative_tokens = 3
+        ctx.block_size_tokens = 4
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+
+        # 4 blocks. Offset 2 in last block. Rewinding 3 crosses into previous block.
+        ctx.request_kv_length_offsets[:1] = torch.tensor([14], device='cuda')
+        ctx.request_kv_block_counts[:1] = torch.tensor([4], device='cuda')
+        ctx.request_last_kv_block_offset[:1] = torch.tensor([2], device='cuda')
+        ctx.request_last_kv_block_id[:1] = torch.tensor([40], device='cuda')
+        ctx.request_to_kv_block_ids[0, :4] = torch.tensor(
+            [10, 20, 30, 40], dtype=torch.int, device='cuda'
+        )
+
+        # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
+        ctx.block_allocator.total_avail = 50
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
+            [0], device='cuda'
+        )
+
+        self.text_generation_controller._rewind_kv_cache()
+
+        # Only block 40 should be released, not blocks 10, 20, or 30.
+        assert ctx.request_kv_block_counts[0].item() == 3
+        assert ctx.request_last_kv_block_id[0].item() == 30
+        assert ctx.request_to_kv_block_ids[0, 3].item() == -1
+        assert ctx.block_allocator.total_avail == 51  # exactly 1 block released
+
+        # Prefix blocks remain in request_to_kv_block_ids.
+        assert ctx.request_to_kv_block_ids[0, 0].item() == 10
+        assert ctx.request_to_kv_block_ids[0, 1].item() == 20
+        assert ctx.request_to_kv_block_ids[0, 2].item() == 30

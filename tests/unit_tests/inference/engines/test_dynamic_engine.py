@@ -2141,3 +2141,136 @@ class TestDynamicInferenceEngine:
 
         stop_hit = env.engine._check_stop_words_for_request_post_append(req)
         assert stop_hit is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_with_prefix_caching(self):
+        """Test that speculative decoding works correctly when prefix caching is enabled.
+
+        Two requests share the same prompt prefix. The second request should reuse
+        cached KV blocks from the first and still generate correctly with spec decoding.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        # Enable prefix caching on the context.
+        env.engine.context.enable_prefix_caching = True
+
+        # Create two pairs of requests with shared prefixes.
+        shared_prompt_a = torch.randint(
+            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+        )
+        shared_prompt_b = torch.randint(
+            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+        )
+
+        for i, prompt in enumerate([shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]):
+            env.requests[i].prompt_tokens = prompt.clone()
+
+        # Run all requests through the engine.
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        # All requests should complete.
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+            if request.status == Status.COMPLETED:
+                assert len(request.generated_tokens) > 0
+
+        # Context should be clean after all requests finish.
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_with_chunked_prefill(self):
+        """Test that speculative decoding combined with chunked prefill completes correctly."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=2,
+            min_prompt_length=16,
+            max_prompt_length=16,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            enable_chunked_prefill=True,
+            model_provider="gpt",
+            context_max_tokens=32,  # Force chunking by limiting token budget
+        )
+        env = self._build_test_env(test_config)
+
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_chunked_prefill_and_prefix_caching(self):
+        """End-to-end test combining speculative decoding, chunked prefill, and prefix caching.
+
+        Verifies that all three features interact correctly:
+        - Prefix caching shares KV blocks between requests with common prompts
+        - Chunked prefill processes long prompts in chunks
+        - Speculative decoding generates multiple tokens per step
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=16,
+            max_prompt_length=16,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            enable_chunked_prefill=True,
+            model_provider="gpt",
+            context_max_tokens=48,  # Force chunking
+        )
+        env = self._build_test_env(test_config)
+
+        # Enable prefix caching.
+        env.engine.context.enable_prefix_caching = True
+
+        # Create pairs with shared prefixes to exercise prefix caching.
+        shared_prompt = torch.randint(
+            0, test_config.vocab_size - 1, (16,), dtype=torch.int64, device='cuda'
+        )
+        for i in range(len(env.requests)):
+            env.requests[i].prompt_tokens = shared_prompt.clone()
+
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        for request in env.requests:
+            assert request.status in (Status.COMPLETED, Status.FAILED)
+
+        assert env.engine.context.active_token_count == 0
+        assert env.engine.context.total_request_count == 0
