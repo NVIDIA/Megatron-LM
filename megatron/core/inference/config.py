@@ -248,6 +248,12 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
+    prefix_caching_mamba_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
+    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
+    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    block boundaries are cached and reused across requests with matching prefixes."""
+
     # =================================
     # Logging config
     # =================================
