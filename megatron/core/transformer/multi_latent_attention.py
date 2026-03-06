@@ -926,16 +926,22 @@ class MLASelfAttention(MultiLatentAttention):
         # We should only have to call to set once at start
         if not hasattr(self, "up_k_weight"):
             with torch.no_grad():
-                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
-                    split_te_layernorm_column_parallel_linear(
-                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
+                if isinstance(self.linear_kv_up_proj, TELayerNormColumnParallelLinear):
+                    linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                        split_te_layernorm_column_parallel_linear(
+                            self.linear_kv_up_proj,
+                            self.config,
+                            None,
+                            self.linear_kv_up_proj.tp_group,
+                        )
                     )
-                )
 
-                # Note: When caching latents we overide the kv_layernorm
-                # which was an identity before because in the is path
-                # we unfused the linear_kv_up_proj
-                self.kv_layernorm = linear_kv_up_proj_norm
+                    # Note: When caching latents we overide the kv_layernorm
+                    # which was an identity before because in the is path
+                    # we unfused the linear_kv_up_proj
+                    self.kv_layernorm = linear_kv_up_proj_norm
+                else:
+                    linear_kv_up_proj_linear = self.linear_kv_up_proj
 
                 # This is used in absorption when we are
                 # uncompressing the KV cache in prefill/mixed stages
