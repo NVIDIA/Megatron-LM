@@ -139,7 +139,7 @@ The first training iteration serves as a **warmup phase** where the manager reco
 
 ### CPU Tensor Pool
 
-A `GPUTensorPool` (on CPU with pinned memory) caches allocated tensors by `(shape, dtype)`. This avoids repeated `cudaMallocHost` / `cudaFreeHost` calls and reduces D2H latency after the first iteration.
+A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(shape, dtype)`. This avoids repeated `cudaMallocHost` / `cudaFreeHost` calls and reduces D2H latency after the first iteration.
 
 ### CUDA Graph Support
 

@@ -95,9 +95,9 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     torch.distributed.barrier()
 
 
-class GPUTensorPool:
+class OffloadTensorPool:
     """
-    GPU memory pool for efficient allocation and deallocation of tensors.
+    Memory pool for efficient allocation and deallocation of tensors.
 
     Features:
     - Supports multiple tensor shapes and dtypes, each with its own pool
@@ -106,7 +106,7 @@ class GPUTensorPool:
     - Uses queue-based management for O(1) allocation and deallocation
 
     Example:
-        pool = GPUTensorPool(device='cuda:0')
+        pool = OffloadTensorPool(device='cuda:0')
         tensor = pool.allocate((128, 512), dtype=torch.float32)
         # ... use tensor ...
         pool.free(tensor, (128, 512), dtype=torch.float32)
@@ -114,10 +114,10 @@ class GPUTensorPool:
 
     def __init__(self, device: str = 'cuda', pin_memory: bool = False):
         """
-        Initialize GPU tensor pool.
+        Initialize offload tensor pool.
 
         Args:
-            device: GPU device, default 'cuda'
+            device: Device, default 'cuda'
             pin_memory: Whether to use pinned memory (mainly for CPU tensors)
         """
         self.device = torch.device(device)
@@ -137,7 +137,7 @@ class GPUTensorPool:
             'pool_misses': 0,  # Number of times a new tensor was created
         }
 
-        debug_rank("GPUTensorPool: Initialized with dynamic allocation")
+        debug_rank("OffloadTensorPool: Initialized with dynamic allocation")
 
     def _get_pool_key(self, shape: Tuple, dtype: torch.dtype) -> Tuple:
         """Generate a unique key for the pool based on shape and dtype."""
@@ -182,7 +182,7 @@ class GPUTensorPool:
             tensor = pool['free'].popleft()
             self._stats['pool_hits'] += 1
             debug_rank(
-                f"GPUTensorPool.allocate: Reused tensor from pool, "
+                f"OffloadTensorPool.allocate: Reused tensor from pool, "
                 f"shape={shape}, dtype={dtype}, "
                 f"remaining in pool={len(pool['free'])}"
             )
@@ -195,7 +195,7 @@ class GPUTensorPool:
 
             memory_mb = self._calculate_memory_size(shape, dtype) / (1024**2)
             debug_rank(
-                f"GPUTensorPool.allocate: Created new tensor, "
+                f"OffloadTensorPool.allocate: Created new tensor, "
                 f"shape={shape}, dtype={dtype}, "
                 f"memory={memory_mb:.2f} MB, "
                 f"total_created={len(pool['all'])}"
@@ -245,7 +245,7 @@ class GPUTensorPool:
         self._stats['current_in_use'] -= 1
 
         debug_rank(
-            f"GPUTensorPool.free: shape={shape}, dtype={dtype}, "
+            f"OffloadTensorPool.free: shape={shape}, dtype={dtype}, "
             f"available in pool={len(pool['free'])}"
         )
 
@@ -294,7 +294,7 @@ class GPUTensorPool:
 
     def reset(self):
         """Reset the pool, marking all tensors as available."""
-        debug_rank("GPUTensorPool: Resetting pool...")
+        debug_rank("OffloadTensorPool: Resetting pool...")
 
         for pool_key, pool in self._pools.items():
             # Clear and refill the free queue
@@ -304,11 +304,11 @@ class GPUTensorPool:
             pool['allocated_count'] = 0
 
         self._stats['current_in_use'] = 0
-        debug_rank("GPUTensorPool: Reset complete")
+        debug_rank("OffloadTensorPool: Reset complete")
 
     def clear(self):
         """Clear the pool and release all GPU memory."""
-        debug_rank("GPUTensorPool: Clearing pool...")
+        debug_rank("OffloadTensorPool: Clearing pool...")
 
         for pool_key, pool in self._pools.items():
             # Clear all references, allowing PyTorch GC to reclaim memory
@@ -322,7 +322,7 @@ class GPUTensorPool:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        debug_rank("GPUTensorPool: Clear complete")
+        debug_rank("OffloadTensorPool: Clear complete")
 
     def __del__(self):
         """Destructor to ensure resources are released."""
@@ -415,7 +415,7 @@ class PipelineOffloadManager:
         self._cuda_graph_stream = torch.cuda.Stream()
         self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
-        self._cpu_tensor_pool = GPUTensorPool(device="cpu", pin_memory=True)
+        self._cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
@@ -476,7 +476,7 @@ class PipelineOffloadManager:
     def flush_delayed_groups(self):
         """Flush the delayed groups."""
         debug_rank("flushing delayed groups")
-        # Flush the delayed groups in reverse order to maintain the order of the groups.
+        # Flush the delayed groups in forward order.
         for group_hook, name, forced_released_tensors in self._delayed_offload_groups:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
@@ -587,7 +587,9 @@ class PipelineOffloadManager:
             for group in chunk.offload_groups:
                 if group.offload:
                     offloaded_groups_count += 1
-            disabled_groups_count = offloaded_groups_count * (1 - self._activation_offload_fraction)
+            disabled_groups_count = int(
+                offloaded_groups_count * (1 - self._activation_offload_fraction)
+            )
             debug_rank(f"Disabled {disabled_groups_count}/{offloaded_groups_count} groups")
             for group in reversed(chunk.offload_groups):
                 if group.offload:
@@ -673,6 +675,7 @@ class PipelineOffloadManager:
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
             delta_offload_bytes_across_pp_ranks:
                 Difference of offload bytes across PP ranks to balance the offload load.
+            activation_offload_fraction: Fraction of eligible groups to offload, in range [0, 1].
         """
         if not self._is_warmup:
             return

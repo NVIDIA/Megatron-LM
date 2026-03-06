@@ -1419,10 +1419,6 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
-            if self.delay_offload_until_cuda_graph:
-                assert (
-                    self.transformer_impl == "transformer_engine"
-                ), "delay_offload_until_cuda_graph must be used with cuda graph."
             assert (
                 self.min_offloaded_tensor_size >= 0
             ), "min_offloaded_tensor_size must be non-negative."
@@ -1432,28 +1428,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
-            if self.external_cuda_graph or self.enable_cuda_graph:
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                ), "cuda_graph_impl must be transformer_engine when enabling offloading."
-            if self.cuda_graph_impl == "transformer_engine":
-                assert (
-                    self.cuda_graph_scope is not None
-                ), "cuda_graph_scope must be set when enabling offloading."
-                if (
-                    "attn" in self.cuda_graph_scope
-                    or "moe_router" in self.cuda_graph_scope
-                    or "moe_preprocess" in self.cuda_graph_scope
-                    or CudaGraphScope.attn in self.cuda_graph_scope
-                    or CudaGraphScope.moe_router in self.cuda_graph_scope
-                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
-                ):
-                    assert (
-                        "attn_norm" not in self.offload_modules
-                    ), "attn_norm is the start point of cuda graph, so can't be offloaded."
-                    assert (
-                        "mlp_norm" not in self.offload_modules
-                    ), "mlp_norm goes through the boundary of cuda graph, so can't be offloaded."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2043,6 +2017,18 @@ class TransformerConfig(ModelParallelConfig):
                         ) or "moe" not in self.recompute_modules, (
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
+
+            if self.fine_grained_activation_offloading:
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "fine_grained_activation_offloading must be used with TE impl of cuda_graph."
+                assert (
+                    CudaGraphScope.moe not in self.cuda_graph_scope
+                ), "Token-drop MoE is temporarily not supported with activation offloading."
+                assert self.cuda_graph_warmup_steps > 0, (
+                    "cuda_graph_warmup_steps must be greater than 0 when enabling "
+                    "fine-grained activation offloading."
+                )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
