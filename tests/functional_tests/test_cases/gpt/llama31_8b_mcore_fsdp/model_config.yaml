@@ -4,7 +4,7 @@ ENV_VARS:
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
-  --num-layers: 16 # Reduced set of layers from 32.
+  --num-layers: 32
   --hidden-size: 4096
   --ffn-hidden-size: 14336
   --num-attention-heads: 32
@@ -46,16 +46,24 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 5
   --transformer-impl: transformer_engine
+
+  # Parallelism
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
   --use-megatron-fsdp: true
+  --data-parallel-sharding-strategy: "optim_grads_params"
+  --outer-dp-sharding-strategy: "no_shard"
+
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
+
   --use-mcore-models: true
   --log-memory-to-tensorboard: true
   --exit-interval: 50
+
+  # Precision
   --fp8-param: true
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
