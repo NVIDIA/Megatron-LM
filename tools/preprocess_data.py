@@ -414,7 +414,7 @@ def main():
             if args.partitions == 1:
                 continue
 
-        def process_json_file(name, q):
+        def process_json_file(name, q, input_key):
             worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
             q.put(worker_performance)
 
@@ -423,7 +423,7 @@ def main():
         input_key = 'sentence_split' if args.split_sentences else 'partition'
         q = multiprocessing.Queue()
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=process_json_file, args=(name, q))
+            p = multiprocessing.Process(target=process_json_file, args=(name, q, input_key))
 
             p.start()
             processes.append(p)
@@ -431,7 +431,6 @@ def main():
         for _ in processes:
             worker_performance = q.get()
             if args.find_optimal_num_workers:
-                print("YES YOU ARE HERE")
                 performance[num_workers] = worker_performance
 
         for p in processes:
