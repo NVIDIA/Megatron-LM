@@ -6,11 +6,11 @@ the async checkpoint save calls.
 """
 import logging
 
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest, PersistentAsyncCaller
 from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
     CachedMetadataFileSystemReader,
 )
-from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
+from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync, _results_queue
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
@@ -71,6 +71,11 @@ def is_empty_async_queue() -> bool:
 
 def reset_persistent_async_worker():
     global _async_calls_queue, _results_queue
+    # Clean up worker data cache first to release IPC handles
+    PersistentAsyncCaller.cleanup_worker_data_cache()
+    # Clear the main-process identifier cache so the next checkpoint re-sends
+    # GPU tensors to the fresh worker (worker's _worker_data_cache is gone after restart)
+    FileSystemWriterAsync._cached_identifiers.clear()
     if _async_calls_queue is not None:
         _async_calls_queue.close(abort=True)
         del _async_calls_queue
