@@ -56,7 +56,7 @@ MODEL_ARGS:
   --auto-detect-ckpt-format: true
   --accumulate-allreduce-grads-in-fp32: true
   --position-embedding-type: rope
-TEST_TYPE: regular
+TEST_TYPE: frozen-start
 METRICS:
   - "iteration-time"
   - "lm loss"
