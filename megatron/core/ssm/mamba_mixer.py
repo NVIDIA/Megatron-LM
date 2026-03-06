@@ -25,7 +25,12 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.causal_conv1d_triton import (
+    causal_conv1d_update,
+    gather_conv_state,
+    roll_conv_varlen_states,
+    scatter_conv_state,
+)
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -765,17 +770,8 @@ class MambaMixer(MegatronModule):
                 xBC.squeeze(0), cu_seqlens, state_len=state_len
             )
 
-            # Roll into circular buffer layout expected by decode
-            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-            # Shift required to move token from `state_len - 1` to `(seqlen - 1) % state_len`
-            shifts = (seqlens % state_len).view(-1, 1, 1)
-
-            B, D, W = conv_varlen_states.shape
-            base_idx = torch.arange(W, device=conv_state.device).view(1, 1, W)
-            gather_idx = (base_idx - shifts) % W
-            gather_idx = gather_idx.expand(B, D, W)
-
-            conv_varlen_states_circular = torch.gather(conv_varlen_states, dim=2, index=gather_idx)
+            # Roll into circular buffer layout expected by decode using fused Triton kernel
+            conv_varlen_states_circular = roll_conv_varlen_states(conv_varlen_states, cu_seqlens)
 
             # Update state
             tensor_masked_update(conv_state, batch_indices, conv_varlen_states_circular)
@@ -789,31 +785,24 @@ class MambaMixer(MegatronModule):
             assert batch_indices is not None
             assert cache_seqlens is not None
             state_len = conv_state.shape[-1]
-            
-            # Read last (d_conv - 1) tokens from the circular buffer
-            seq_len = cache_seqlens.view(-1, 1, 1)
-            gather_indices = (seq_len - self.d_conv + 1 + torch.arange(self.d_conv - 1, device=conv_state.device).view(1, 1, -1)) % state_len
-            gather_indices = gather_indices.expand(len(batch_indices), conv_state.shape[1], self.d_conv - 1)
-            initial_conv_state = torch.gather(conv_state[batch_indices], 2, gather_indices)
-            
-            initial_conv_state = (
-                initial_conv_state.permute(0, 2, 1)
-                .contiguous()
-                .transpose(1, 2)
-            )
+
             xBC = xBC.transpose(1, 2)
-            
+
+            # Read last (d_conv - 1) tokens from the circular buffer
+            initial_conv_state = gather_conv_state(
+                conv_state, batch_indices, cache_seqlens, self.d_conv
+            )
+            initial_conv_state = initial_conv_state.permute(0, 2, 1).contiguous().transpose(1, 2)
+
             # We only need to retain at most the last `state_len` tokens of the chunk
             chunk_len = xBC.shape[-1]
             copy_len = min(chunk_len, state_len)
             xBC_tail = xBC[..., -copy_len:]
-            
-            update_indices = (seq_len + chunk_len - copy_len + torch.arange(copy_len, device=conv_state.device).view(1, 1, -1)) % state_len
-            update_indices = update_indices.expand(len(batch_indices), conv_state.shape[1], copy_len)
 
-            conv_state_slice = conv_state[batch_indices]
-            conv_state_slice.scatter_(2, update_indices, xBC_tail)
-            tensor_masked_update(conv_state, batch_indices, conv_state_slice)
+            # Scatter tail back into the main buffer using fused Triton kernel
+            scatter_conv_state(
+                conv_state, xBC_tail, batch_indices, cache_seqlens, chunk_len, copy_len
+            )
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()

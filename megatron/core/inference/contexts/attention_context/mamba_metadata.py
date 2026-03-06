@@ -206,9 +206,11 @@ class MambaMetadata:
             # Update chunked prefill indices
             self._batch_indices_chunked_prefill_buffer[0] = active_mamba_indices[chunked_req_idx]
             self.batch_indices_chunked_prefill = self._batch_indices_chunked_prefill_buffer
-            
+
             # Update chunked prefill cache seqlen
-            self._cache_seqlens_chunked_prefill_buffer[0] = request_kv_length_offsets[chunked_req_idx]
+            self._cache_seqlens_chunked_prefill_buffer[0] = request_kv_length_offsets[
+                chunked_req_idx
+            ]
             self.cache_seqlens_chunked_prefill = self._cache_seqlens_chunked_prefill_buffer
         else:
             self.batch_indices_chunked_prefill = None

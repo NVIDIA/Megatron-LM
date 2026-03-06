@@ -1430,9 +1430,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = min(
                         self.max_requests, self.round_up_requests(self.num_decode_requests)
                     )
-                    padded_token_count = padded_decode_req_count * (
-                        self.num_speculative_tokens + 1
-                    )
+                    padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
                 else:
                     padded_token_count = min(
                         self.max_tokens,
