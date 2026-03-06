@@ -102,14 +102,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             },
         )
 
-        # Poll until completed
+        # Long-poll until completed (server holds connection until result is ready)
         while response.status != "completed":
             if response.status == "failed":
                 raise RuntimeError(
                     f"Inference request {response.id} failed: "
                     f"{getattr(response, 'error', 'unknown error')}"
                 )
-            await asyncio.sleep(1.0)
             response = await client.responses.retrieve(response.id)
 
         return InferenceResponse(

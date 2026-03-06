@@ -135,22 +135,32 @@ try:
     @bp.route('/responses/<response_id>', methods=['GET'])
     @bp.route('/v1/responses/<response_id>', methods=['GET'])
     async def get_response(response_id):
-        """Poll for the result of a background inference request."""
+        """Poll for the result of a background inference request.
+
+        Supports long polling: the server waits up to `timeout` seconds
+        (query param, default 1) for the task to complete before returning
+        "in_progress". This eliminates busy-polling overhead on the client.
+        """
         entry = _pending.get(response_id)
         if entry is None:
             return jsonify({"error": "Response not found", "id": response_id}), 404
 
         task = entry["task"]
 
+        # Long poll: wait briefly for the task to complete before returning
+        # "in_progress". Keeps connections short-lived while avoiding busy-polling.
         if not task.done():
-            return jsonify({
-                "id": response_id,
-                "object": "response",
-                "status": "in_progress",
-                "created_at": entry["created_at"],
-                "model": "EMPTY",
-                "output": [],
-            })
+            timeout = min(float(request.args.get("timeout", 1)), 10.0)
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                return jsonify({
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "created_at": entry["created_at"],
+                    "model": "EMPTY",
+                    "output": [],
+                })
 
         # Check for exception (keep entry so retries get "failed" instead of 404).
         exc = task.exception()
