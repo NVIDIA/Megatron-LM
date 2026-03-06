@@ -38,6 +38,6 @@ jobs:
 
       - name: Run Auto Swap Labels
         run: |
-          export GH_TOKEN=${{ github.token }}
+          export GH_TOKEN=${{ secrets.PAT }}
           export PR_NUMBER=${{ github.event.pull_request.number }}
           python tests/test_utils/python_scripts/swap_pr_labels.py
