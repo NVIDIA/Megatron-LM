@@ -145,8 +145,8 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge().serialize()
+        for result_item in batch_results:
+            result = result_item if isinstance(result_item, dict) else result_item.serialize()
 
             result = {
                 k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v

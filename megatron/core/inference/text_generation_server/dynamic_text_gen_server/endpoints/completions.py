@@ -128,30 +128,32 @@ try:
         choices = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge()
-            full_text = result.generated_text or ""
+        for completed_request in batch_results:
+            request_dict = (
+                completed_request
+                if isinstance(completed_request, dict)
+                else completed_request.serialize()
+            )
+            # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
+            result = {
+                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+                for k, v in request_dict.items()
+            }
+            full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
             logprobs_data = None
             if sampling_params.return_log_probs:
                 # Get prompt tokens and logprobs
-                prompt_tokens_list = []
-                if result.prompt_tokens is not None:
-                    if hasattr(result.prompt_tokens, 'tolist'):
-                        prompt_tokens_list = result.prompt_tokens.tolist()
-                    else:
-                        prompt_tokens_list = list(result.prompt_tokens)
+                prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = getattr(result, 'prompt_log_probs', None) or []
-                prompt_top_n_logprobs = getattr(result, 'prompt_top_n_logprobs', None) or []
+                prompt_log_probs = result.get('prompt_log_probs') or []
+                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
 
                 # Get generated tokens and logprobs
-                generated_tokens_list = (
-                    list(result.generated_tokens) if result.generated_tokens else []
-                )
-                generated_log_probs = getattr(result, 'generated_log_probs', None) or []
-                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
+                generated_tokens_list = result["generated_tokens"] or []
+                generated_log_probs = result.get('generated_log_probs') or []
+                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -204,13 +206,15 @@ try:
                 }
 
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
-            if result.routing_indices is not None:
-                choices[-1]["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
+            if result["routing_indices"] is not None:
+                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                prompt_length = (
+                    len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
+                )
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
-                    ].tolist()
+                    ]
 
             request_idx += 1
 

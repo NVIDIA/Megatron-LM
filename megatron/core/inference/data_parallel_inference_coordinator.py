@@ -389,14 +389,12 @@ class DataParallelInferenceCoordinator:
                     return
 
                 if request_hashes:
-                    self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
+                    self._update_rank_hashes(next_identity, request_hashes)
                 if self.schedule_records is not None:
                     self.schedule_records.append(
                         {
                             "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[
-                                next_data_parallel_rank_identity
-                            ],
+                            "rank_index": self.identity_to_rank_index[next_identity],
                             "num_hashes": len(request_hashes),
                         }
                     )
@@ -458,11 +456,11 @@ class DataParallelInferenceCoordinator:
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_request_records = deserialized_payload[1]
+                finished_requests = deserialized_payload[1]
 
-                for finished_request_record in finished_request_records:
-                    self.detokenize(finished_request_record)
-                    fid = finished_request_record["requests"][0]["request_id"]
+                for finished_request in finished_requests:
+                    self.detokenize(finished_request)
+                    fid = finished_request["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -472,7 +470,7 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [header.value, client_request_identity, finished_request_record],
+                                [header.value, client_request_identity, finished_request],
                                 use_bin_type=True,
                             ),
                         ]
@@ -491,21 +489,24 @@ class DataParallelInferenceCoordinator:
             else:
                 raise UnknownHeaderError(header)
 
-    def detokenize(self, finished_request_record):
+    def detokenize(self, finished_request):
         """
-        Detokenizes the generated tokens in the finished request record.
+        Detokenizes the generated tokens in the finished request.
 
         This method uses the coordinator's tokenizer to convert the list of
         generated token IDs back into human-readable text.
 
         Args:
-            finished_request_record (dict): The record containing the generated
-                tokens to be detokenized. It is modified in place.
+            finished_request (dict): The serialized merged request containing the
+                generated tokens to be detokenized. It is modified in place.
         """
-        for request in finished_request_record["requests"]:
-            if request["prompt"] is None:
-                request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
-            request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
+        if finished_request["prompt"] is None:
+            finished_request["prompt"] = self.tokenizer.detokenize(
+                finished_request["prompt_tokens"][1]
+            )
+        finished_request["generated_text"] = self.tokenizer.detokenize(
+            finished_request["generated_tokens"]
+        )
 
     @classmethod
     def entrypoint(

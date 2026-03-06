@@ -171,7 +171,8 @@ class DummyEngine(DynamicInferenceEngine):
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
+                        use_bin_type=True,
                     )
                     self.socket_for_receiving_requests.send(payload)
 
@@ -369,6 +370,52 @@ class TestCoordinator:
             )
         finally:
             await cleanup_engine(engine, client)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_deserialize_flag(self, initialize_model_parallel):
+        """Test that the correct response type is returned based on the deserialize flag."""
+        engine = DummyEngine()
+        requests = self.build_requests(num_requests=2)
+
+        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+        )
+
+        try:
+            if torch.distributed.get_rank() == 0:
+                # Test deserialize=True
+                client = InferenceClient(dp_addr, deserialize=True)
+                await client.start()
+                futures = [
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                for result in results:
+                    assert isinstance(result, DynamicInferenceRequest)
+                client.stop()
+
+                # Test deserialize=False (default)
+                client = InferenceClient(dp_addr)
+                await client.start()
+                futures = [
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                for result in results:
+                    assert isinstance(result, dict)
+                client.stop()
+        finally:
+            if torch.distributed.get_rank() == 0:
+                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
+                client.stop()
+            try:
+                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                engine.engine_loop_task.cancel()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
