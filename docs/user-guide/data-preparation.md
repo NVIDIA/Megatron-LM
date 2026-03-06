@@ -60,7 +60,6 @@ python tools/preprocess_data.py \
     --workers 8 \
     --find-optimal-num-workers \
     --workers-to-check 4 8 16 32 \
-    --performance-dir /path/to/save/perf/results \
     --max-documents 50000
 ```
 
@@ -70,7 +69,6 @@ python tools/preprocess_data.py \
 |----------|-------------|
 | `--find-optimal-num-workers` | Activates search of optimal number of workers |
 | `--workers-to-check` | List of possible number of workers to run |
-| `--performance-dir` | Directory where to save performance results |
 | `--max-documents` | Number of documents to be preprocessed during each run |
 
 **Output example**

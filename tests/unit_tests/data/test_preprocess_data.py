@@ -227,8 +227,6 @@ def test_preprocess_data_gpt_optimal_workers():
             "2",
             "4",
             "8",
-            "--performance-dir",
-            f"{temp_dir}/perf",
             "--max-documents",
             "1002",
         ]

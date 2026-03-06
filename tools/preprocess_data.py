@@ -112,7 +112,7 @@ class Partition(object):
     def __init__(self, args, workers):
         self.args = args
         self.workers = workers
-        self.performance = {self.workers: []}
+        self.performance = []
 
     def print_processing_stats(self, count, proc_start, total_bytes_processed):
         if count % self.args.log_interval == 0:
@@ -122,7 +122,8 @@ class Partition(object):
             print(f"Processed {count} documents",
                   f"({count/elapsed} docs/s, {mbs} MB/s).",
                   file=sys.stderr)
-            self.performance[self.workers].append(count/elapsed)
+            if self.args.find_optimal_num_workers:
+                self.performance.append(count/elapsed)
 
     def split_sentences(self, file_name):
         input_file_name, output_file_name = file_name
@@ -189,17 +190,14 @@ class Partition(object):
                     builders[key].add_document(doc[key], sentence_lens[key])
                 self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        # Save performance data (preprocessed docs/s)
-        if self.args.find_optimal_num_workers:
-            perf_file_path = os.path.join(self.args.performance_dir, f"{self.workers}_workers.json")
-            with open(perf_file_path, "w") as perf_file:
-                json.dump(self.performance, perf_file)
-
         fin.close()
         builders[key].finalize(output_idx_files[key])
 
         pool.close()
         pool.join()
+
+        return self.performance
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -239,9 +237,6 @@ def get_args():
                        help=('Maximum number of documents to preprocess '
                              'to find  optimal number of workers.'
                              'Works only when --find-optimal-num-workers is enabled.'))
-    group.add_argument('--performance-dir', type=str, default=None,
-                       help=('Path where to save performance results. '
-                       'Works only when --find-optimal-num-workers is enabled.'))
     group.add_argument('--partitions', type=int, default=1,
                         help='Number of file partitions')
     group.add_argument('--log-interval', type=int, default=1000,
@@ -283,24 +278,15 @@ def check_files_exist(in_ss_out_names, key, num_partitions):
     return True
 
 
-def find_optimal_num_workers(args):
+def find_optimal_num_workers(performance, partitions):
     """Parses saved .json files with perf. numbers and prints optimal number of workers"""
     results = []
 
-    for filename in os.listdir(args.performance_dir):
-        if not filename.endswith(".json"):
-            continue
-
-        filepath = os.path.join(args.performance_dir, filename)
-
-        with open(filepath, "r") as f:
-            data = json.load(f)
-
-        # each file assumed to contain a single {workers: [perf_list]}
-        for workers, perf_list in data.items():
-            workers = int(workers)
-            avg_perf = np.mean(perf_list)
-            results.append((workers, avg_perf))
+    # each file assumed to contain a single {workers: [perf_list]}
+    for workers, perf_list in performance.items():
+        workers = int(workers)
+        avg_perf = np.mean(perf_list)
+        results.append((workers, avg_perf))
 
     # sort by average performance (descending: fastest first)
     results.sort(key=lambda x: x[1], reverse=True)
@@ -308,13 +294,13 @@ def find_optimal_num_workers(args):
     print("\n-----------------------------------")
     print("Performance results (fastest → slowest):")
     for i, (workers, avg_perf) in enumerate(results):
-        print(f"{i+1}. {workers * args.partitions} workers → avg. docs/s: {avg_perf:.4f}")
+        print(f"{i+1}. {workers * partitions} workers → avg. docs/s: {avg_perf:.4f}")
     
     best_workers, best_perf = results[0]
 
     print("\n-----------------------------------")
     print(
-        f"The most optimal num of workers is {best_workers * args.partitions} "
+        f"The most optimal num of workers is {best_workers * partitions} "
         f"with avg. preprocessed docs/s: {best_perf:.4f}."
     )
     print("-----------------------------------")
@@ -333,10 +319,9 @@ def main():
             workers.remove(num_workers)
     assert workers, "Please, provide valid number of workers which is divisible by number of partitions."
     if args.find_optimal_num_workers:
-        assert args.performance_dir, "Directory where to save performance results should be specified."
-        os.makedirs(args.performance_dir, exist_ok=True)
         args.log_interval = 1000
 
+    performance = {}
     for num_workers in workers:
         print(f"Processing data with {num_workers} workers.")
         if args.split_sentences:
@@ -429,15 +414,25 @@ def main():
             if args.partitions == 1:
                 continue
 
+        def process_json_file(name, q):
+            worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
+            q.put(worker_performance)
 
         # encode partition files in parallel
         processes = []
         input_key = 'sentence_split' if args.split_sentences else 'partition'
+        q = multiprocessing.Queue()
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=partition.process_json_file,
-                                        args=((name[input_key], name['output_prefix']),))
+            p = multiprocessing.Process(target=process_json_file, args=(name, q))
+
             p.start()
             processes.append(p)
+
+        for _ in processes:
+            worker_performance = q.get()
+            if args.find_optimal_num_workers:
+                print("YES YOU ARE HERE")
+                performance[num_workers] = worker_performance
 
         for p in processes:
             p.join()
@@ -474,7 +469,7 @@ def main():
 
     # Find the most optimal number of workers
     if args.find_optimal_num_workers:
-        find_optimal_num_workers(args)
+        find_optimal_num_workers(performance, args.partitions)
 
 if __name__ == '__main__':
 
