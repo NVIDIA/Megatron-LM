@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import inspect
 import os
 from datetime import timedelta
@@ -17,12 +18,14 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -448,3 +451,152 @@ class TestGPTWithDynamicInference:
 
         # Assert that all padding logits are zero.
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("1.2.0"), reason="TE fused attention test requires TE >= 1.2.0"
+)
+@pytest.mark.parametrize(
+    "attn_mask_type",
+    [
+        AttnMaskType.no_mask,
+        AttnMaskType.causal,  # TODO: Causal mask is still broken. Trying to fix it.
+    ],
+)
+def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
+    attn_mask_type: AttnMaskType,
+):
+    """Red test for step-3: expected to fail before mask->bias conversion is added in GPTModel."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        seed = 4321
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+
+        seq_len = 64
+        batch_size = 2
+        hidden_size = 256
+        num_attention_heads = 4
+        vocab_size = 128
+
+        local_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_query_groups=num_attention_heads,
+            kv_channels=hidden_size // num_attention_heads,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            sequence_parallel=False,
+            context_parallel_size=1,
+            tensor_model_parallel_size=1,
+            transformer_impl="native",
+            use_cpu_initialization=False,
+            mtp_num_layers=1,
+        )
+        te_config = copy.deepcopy(local_config)
+        te_config.transformer_impl = "transformer_engine"
+
+        # Build local model with the same attn_mask_type
+        local_spec = get_gpt_layer_local_spec()
+        local_spec.submodules.self_attention.params["attn_mask_type"] = attn_mask_type
+        local_model = (
+            GPTModel(
+                config=local_config,
+                transformer_layer_spec=local_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=seq_len,
+                pre_process=True,
+                post_process=True,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        # Build TE model with the same attn_mask_type
+        te_spec = get_gpt_layer_with_transformer_engine_spec()
+        te_spec.submodules.self_attention.params["attn_mask_type"] = attn_mask_type
+        te_model = (
+            GPTModel(
+                config=te_config,
+                transformer_layer_spec=te_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=seq_len,
+                pre_process=True,
+                post_process=True,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        te_model.load_state_dict(local_model.state_dict(), strict=False)
+
+        local_model.eval()
+        te_model.eval()
+
+        # Prepare input_ids
+        input_ids = torch.randint(
+            0, vocab_size, (batch_size, seq_len), device="cuda", dtype=torch.long
+        )
+        position_ids = (
+            torch.arange(seq_len, device="cuda", dtype=torch.long)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
+
+        # Prepare attention mask
+        attention_mask = torch.randn(1, 1, seq_len, seq_len, device="cuda", dtype=torch.float32) > 0
+        if "causal" in attn_mask_type.name:
+            # Legal causal mask: upper-triangular (mask out future tokens), broadcasted on batch.
+            triangular_mask = torch.triu(
+                torch.ones((1, 1, seq_len, seq_len), device="cuda", dtype=torch.bool), diagonal=1
+            )
+            attention_mask = attention_mask | triangular_mask
+        else:
+            # Avoid fully-masked rows for the non-causal random-mask case.
+            attention_mask[..., 0] = False
+        attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+
+        local_out = local_model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        te_out = te_model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        local_out.mean().backward()
+        te_out.mean().backward()
+
+        # Compare outputs between local and TE models.
+        tol = {"atol": 1e-2, "rtol": 2e-2}
+        torch.testing.assert_close(
+            te_out,
+            local_out,
+            **tol,
+            msg=lambda msg: f"Mismatch in GPT output with attention_mask: {msg}",
+        )
+        # Compare gradients for overlapping parameters between local and TE models.
+        tol = {"atol": 1e-2, "rtol": 2e-2}
+        local_named_params = dict(local_model.named_parameters())
+        te_named_params = dict(te_model.named_parameters())
+        checked_param_grads = 0
+        for param_name, local_param in local_named_params.items():
+            te_param = te_named_params.get(param_name)
+            if te_param is None:
+                continue
+            if local_param.grad is None or te_param.grad is None:
+                continue
+            if local_param.grad.shape != te_param.grad.shape:
+                continue
+            torch.testing.assert_close(
+                te_param.grad,
+                local_param.grad,
+                **tol,
+                msg=lambda msg, n=param_name: f"Mismatch in parameter grad for {n}: {msg}",
+            )
+            checked_param_grads += 1
+
+        assert checked_param_grads > 0, "No overlapping parameter gradients were compared."
+    finally:
+        Utils.destroy_model_parallel()
