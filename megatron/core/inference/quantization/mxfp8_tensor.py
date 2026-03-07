@@ -105,11 +105,9 @@ class MXFP8Tensor:
 
     @classmethod
     def from_bf16_torch(cls, x: torch.Tensor, group_size: int = 32):
-        """Quantize BF16 tensor to MXFP8 using Triton (downcast_to_mxfp + to_blocked)."""
-        assert HAVE_TRITON_MXFP, "triton_kernels.numerics_details.mxfp not available"
+        """Quantize BF16 tensor to MXFP8 (fused quantize + swizzle in one kernel)."""
+        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
-        xq, xs = downcast_to_mxfp(x, torch.float8_e4m3fn, 1)
-        if xs.dtype == torch.uint8:
-            xs = xs.view(torch.float8_e8m0fnu)
-        return cls(data=xq, scale=swizzle_scales(xs))
+        xq, xs = mxfp8_quantize(x)
+        return cls(data=xq, scale=xs)
