@@ -803,6 +803,8 @@ class Attention(MegatronModule, ABC):
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
+            elif self.config.softmax_scale is not None:
+                softmax_scale = self.config.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
             if HAVE_FA3:
