@@ -39,7 +39,7 @@ class GroupedRolloutRequest(Request):
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    batch_results: bool = False
+    generation_batch_size: int = 1
 
 
 class Rollout(AgentBaseModel):
@@ -191,18 +191,14 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        if request.batch_results:
+        # generation_batch_size controls how many groups each worker generates and yields together.
+        # When it's set to 1, the semaphore is a no-op.
+        groups_per_worker = request.generation_batch_size
+        if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
-                "Filtering is not supported with batch_results"
-            # Each worker gets a permit for a batch of num_groups groups.
-            # The semaphore ensures that each batch only starts after the previous is consumed.
-            groups_per_worker = request.num_groups
-            num_workers = self.parallel_generation_tasks // groups_per_worker
-            submission_gate = asyncio.Semaphore(num_workers)
-        else:
-            groups_per_worker = 1
-            num_workers = self.parallel_generation_tasks
-            submission_gate = None
+                "Filtering is not supported with generation_batch_size > 1"
+        num_workers = self.parallel_generation_tasks // groups_per_worker
+        submission_gate = asyncio.Semaphore(num_workers)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
             group = await self.group_rollout(request=request)
@@ -221,8 +217,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         async def generate_task():
             nonlocal submitted_groups
             while request.streaming or submitted_groups < self.parallel_generation_tasks:
-                if submission_gate is not None:
-                    await submission_gate.acquire()
+                await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
                 if groups_per_worker > 1:
@@ -232,28 +227,24 @@ class GroupedRolloutGenerator(Agent, ABC):
                     ])
                 else:
                     if not await generate_and_enqueue(batch_id, 0):
-                        submitted_groups -= 1
+                        submitted_groups -= groups_per_worker
+                        submission_gate.release()
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
         try:
-            if request.batch_results:
-                # Accumulate groups into ordered batches of num_groups.
-                next_batch_id = 0
-                pending: dict[int, list[list[Rollout]]] = {}
-                while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                    group = await grouped_rollouts.get()
-                    pending.setdefault(group[0].batch_id, []).append(group)
-                    if len(pending.get(next_batch_id, [])) >= request.num_groups:
-                        batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g[0].submission_index)
-                        next_batch_id += 1
-                        for g in batch:
-                            yield g
-                        submission_gate.release()
-            else:
-                while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                    yield await grouped_rollouts.get()
+            next_batch_id = 0
+            pending: dict[int, list[list[Rollout]]] = {}
+            while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                group = await grouped_rollouts.get()
+                pending.setdefault(group[0].batch_id, []).append(group)
+                if len(pending.get(next_batch_id, [])) >= groups_per_worker:
+                    batch = pending.pop(next_batch_id)
+                    batch.sort(key=lambda g: g[0].submission_index)
+                    next_batch_id += 1
+                    for g in batch:
+                        yield g
+                    submission_gate.release()
         finally:
             for task in tasks:
                 task.cancel()

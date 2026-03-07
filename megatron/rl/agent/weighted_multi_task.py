@@ -184,7 +184,7 @@ class WeightedMultiTask(
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
 
-        if request.batch_results:
+        if request.generation_batch_size > 1:
             # Each sub-agent batches independently and yields individual groups.
             # Collect each agent's share of groups per batch, then yield them.
             agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
@@ -200,7 +200,7 @@ class WeightedMultiTask(
                     sub_request = GroupedRolloutRequest(
                         num_groups=num_groups,
                         streaming=request.streaming,
-                        batch_results=True,
+                        generation_batch_size=request.generation_batch_size,
                         rollouts_per_group=request.rollouts_per_group,
                         inference_interface=request.inference_interface,
                         validation=request.validation,
