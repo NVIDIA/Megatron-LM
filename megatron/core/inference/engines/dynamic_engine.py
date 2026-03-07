@@ -839,10 +839,16 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ) or (request.sampling_params.num_tokens_to_generate < 0):
+            logging.error(
+                f"Invalid number of tokens to generate. Prompt len: {len(request.prompt_tokens)}, tokens to generate: {request.sampling_params.num_tokens_to_generate}, max seq len: {self.context.max_sequence_length}."
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            logging.error(
+                f"Prompt is longer than context.max_tokens. Prompt tokens: {len(request.prompt_tokens)}, context.max_tokens: {self.context.max_tokens}, chunked_prefill: {self.enable_chunked_prefill}"
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
