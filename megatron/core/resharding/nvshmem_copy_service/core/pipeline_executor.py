@@ -170,7 +170,6 @@ class PipelineExecutor:
                 )
                 # GPU-level event wait: ensures send_stream's barrier_all from
                 # the prior iteration has completed before unpack_stream proceeds.
-                #nvshmem.core.quiet(stream=self.unpack_stream) 
                 self.torch_unpack_stream.wait_event(self.barrier_events[(i - 1) % 2])
                 self._launch_unpack(i - 1, prior_batch)
                 torch.cuda.nvtx.range_pop()
@@ -199,14 +198,6 @@ class PipelineExecutor:
                 torch.cuda.nvtx.range_pop()
 
             # Step 4a: Wait for prior unpack to complete BEFORE the barrier.
-            # The barrier lets the remote sender proceed to the next iteration,
-            # which reuses recv_slot[(i-1)%2] for a new put().  RDMA writes
-            # bypass CUDA stream ordering — they land in GPU memory regardless
-            # of which stream is active.  If the unpack kernel is still reading
-            # recv_slot[(i-1)%2] when the sender's put overwrites it, the
-            # kernel reads partially-overwritten data → silent corruption.
-            # Syncing the unpack event here ensures the receiver has finished
-            # reading the slot before the barrier signals the sender to proceed.
             torch.cuda.nvtx.range_push("Step 4a: Wait Unpack")
             if has_prior_recv:
                 self.unpack_events[(i - 1) % 2].synchronize()

@@ -396,20 +396,69 @@ def reshard_model_weights(
     - (None, target_model): Destination rank - only receives data (non-collocated)
     - (None, None): Idle rank - participates in collectives but has no transfers (non-collocated)
 
-    In non-collocated mode, metadata includes local rank positions within parallel groups,
-    allowing the planner to correctly map between different process group configurations
-    without requiring dummy models on every rank.
-
     Args:
         group: Optional process group for collective communication.
         src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
             in independent torch.distributed worlds.
+        transform: Optional ReshardTransform for custom format conversion.
     """
     if src_model is None and target_model is None:
-        plan = _build_or_get_plan(None, None, None, group, src_rank_offset, dst_rank_offset)
+        cache_key = _build_plan_cache_key(
+            src_core=None, tgt_core=None, num_experts=None, group=group
+        )
+
+        # Use cached plan if available, otherwise build (with collective participation)
+        if cache_key not in _plan_cache:
+            plan = build_centralized_reshard_plan(
+                None,
+                None,
+                num_experts=None,
+                group=group,
+                src_rank_offset=src_rank_offset,
+                dst_rank_offset=dst_rank_offset,
+            )
+            _plan_cache[cache_key] = plan
+        else:
+            plan = _plan_cache[cache_key]
         execute_reshard_plan(plan, None, None, service=service, group=group, transform=transform)
         return
 
-    src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-    plan = _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset)
+    # Handle None models - extract core modules only from non-None models
+    src_core = None
+    tgt_core = None
+    num_experts = None
+
+    if src_model is not None:
+        src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
+        num_experts = src_lm.config.num_moe_experts
+        src_core = unwrap_model(src_lm)
+        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
+            raise RuntimeError("Source model missing pg_collection required for reshard")
+        if getattr(src_core.pg_collection, "dp", None) is None:
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+
+    if target_model is not None:
+        tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
+        if num_experts is None:
+            num_experts = tgt_lm.config.num_moe_experts
+        tgt_core = unwrap_model(tgt_lm)
+        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+            raise RuntimeError("Target model missing pg_collection required for reshard")
+
+    # Build or retrieve cached plan
+    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
+
+    if cache_key not in _plan_cache:
+        plan = build_centralized_reshard_plan(
+            src_core,
+            tgt_core,
+            num_experts=num_experts,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
+        )
+        _plan_cache[cache_key] = plan
+    else:
+        plan = _plan_cache[cache_key]
+
     execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group, transform=transform)

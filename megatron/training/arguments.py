@@ -406,19 +406,6 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        # When using different EP sizes for inference and training (EP refit), the legacy
-        # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
-        if (
-            args.rl_inference_expert_model_parallel_size is not None
-            and args.rl_inference_expert_model_parallel_size != args.expert_model_parallel_size
-        ):
-            assert not args.moe_use_legacy_grouped_gemm, (
-                "Legacy GroupedMLP (--moe-use-legacy-grouped-gemm) is not supported when using "
-                "different expert parallelism sizes for inference and training. "
-                "Use SequentialMLP (default when --moe-grouped-gemm is not set) or "
-                "TEGroupedMLP (--moe-grouped-gemm without --moe-use-legacy-grouped-gemm)."
-            )
-
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -826,8 +813,9 @@ def validate_args(args, defaults={}):
     )
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
-            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp \
+            or args.optimizer == 'dist_muon', \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -873,6 +861,7 @@ def validate_args(args, defaults={}):
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
+    # Map string data-type to torch.dtype.
     dtype_map = {
         'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
     }
@@ -882,6 +871,12 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+    args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
+    args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+
+    args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
+    args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
+    args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1404,7 +1399,7 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
-    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1:
+    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
 
@@ -1426,9 +1421,9 @@ def validate_args(args, defaults={}):
     # Muon optimizer check
     if 'muon' in args.optimizer:
 
-        # TODO: remove these checks once we support them
-        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
-        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
+        if args.optimizer == 'muon':
+            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
+            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
 
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
@@ -1540,7 +1535,6 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
         assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
-        assert not args.moe_use_legacy_grouped_gemm, "MoE latent projection is not supported yet with legacy grouped GEMM."
 
     if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
         warn_rank_0(
@@ -1805,6 +1799,30 @@ def _add_inference_args(parser):
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--inference-dynamic-batching-prefix-caching',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Enable/disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
+                       type=str, default='ref_zero',
+                       choices=['ref_zero', 'lru'],
+                       dest='inference_dynamic_batching_prefix_caching_eviction_policy',
+                       help='Eviction policy for prefix caching blocks. '
+                       '"ref_zero" (default) immediately returns blocks to the '
+                       'free pool when ref_count hits 0. "lru" keeps blocks '
+                       'cached and evicts via LRU only when space is needed.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
+                       type=str, default='first_prefix_block',
+                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
+                       dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
+                       help='Coordinator routing policy for prefix caching. '
+                       '"first_prefix_block" (default) routes based on the first '
+                       'block hash only. "longest_prefix" routes to the rank with '
+                       'the longest matching prefix. "round_robin" ignores prefix '
+                       'affinity and cycles through ranks.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -1814,13 +1832,19 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
-    group.add_argument('--inference-flask-server-logging', action=argparse.BooleanOptionalAction,
+    group.add_argument('--inference-text-gen-server-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False,
-                       help='Enable per-request logging in the Flask inference server.')
+                       help='Enable per-request logging in the inference text generation server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--mamba-inference-conv-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference conv states tensor')
+    group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference SSM states tensor')
     return parser
 
 
@@ -3079,15 +3103,15 @@ def _add_experimental_args(parser):
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
-    # Args of precision-aware optimizer
+    # Args of precision-aware optimizer.
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '
                        'fp16, bf16 and fp8.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
-                       help='Dtype of main grads when enabling precision-aware-optimizer')
+                       help='Dtype of main grads when enabling precision-aware-optimizer.')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
-                       help='Dtype of main params when enabling precision-aware-optimizer')
+                       help='Dtype of main params when enabling precision-aware-optimizer.')
     group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
                        help='Dtype of exp_avg (1st moment in adam optimizer) when enabling '
                             'precision-aware-optimizer. This dtype is used for storing the '
@@ -3098,6 +3122,18 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
+
+    # Megatron-FSDP Arguments
+    group.add_argument('--megatron-fsdp-main-params-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16'],
+                       help="Data type for the main weight buffer utilized for distributed optimization "
+                            "and quantization with Megatron-FSDP.")
+    group.add_argument('--megatron-fsdp-main-grads-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16'],
+                       help="Data type for the main gradient buffer utilized for distributed optimization "
+                            "with Megatron-FSDP.")
+    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='fp32', choices=['fp32', 'fp16', 'bf16'],
+                        help="When using Megatron-FSDP, this controls the data-type used when communicating "
+                             "model gradients during FSDP.")
+    
     return parser
 
 
