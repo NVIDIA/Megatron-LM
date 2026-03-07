@@ -9,6 +9,7 @@
 #include <math.h>
 #include <set>
 #include <stdexcept>
+#include <vector>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <random>
@@ -245,6 +246,94 @@ py::array_t<T> build_sample_idx(
     {2 * byte_size, byte_size},               // C-style contiguous strides
     sample_idx,                               // the data pointer
     free_when_done                            // numpy array references
+  );
+}
+
+template <typename T>
+py::array_t<T> build_sft_sample_idx(
+  const py::array_t<int32_t> &sizes_,
+  const py::array_t<int32_t> &document_idx_,
+  const int32_t seq_length,
+  const int32_t num_epochs,
+  const int64_t tokens_per_epoch,
+  const bool drop_last_partial_sequence = true,
+  const int add_extra_token_to_sequence = 1
+){
+  /*
+      SFT sample index: same as build_sample_idx but with the constraint that
+      ALL samples MUST start from a new/fresh document (i.e. at doc_offset == 0).
+      So every sample boundary is at a document boundary; no sample starts
+      in the middle of a document.
+  */
+
+  // Consistency checks.
+  assert(seq_length > 1);
+  assert(num_epochs > 0);
+  assert(tokens_per_epoch > 1);
+
+  auto sizes = sizes_.unchecked<1>();
+  auto document_idx = document_idx_.unchecked<1>();
+  const int64_t num_docs = document_idx_.shape(0);
+
+  std::vector<std::pair<T, T>> sample_idx_vec;
+  sample_idx_vec.push_back({0, 0});
+
+  T document_idx_index = 0;
+  T doc_offset = 0;
+
+  while (document_idx_index < num_docs)
+  {
+    int32_t remaining_seq_length = seq_length + add_extra_token_to_sequence;
+    while (remaining_seq_length != 0 && document_idx_index < num_docs)
+    {
+      auto document_index = document_idx[document_idx_index];
+      auto document_length = sizes[document_index] - doc_offset;
+      remaining_seq_length -= document_length;
+      if (remaining_seq_length <= 0)
+      {
+        doc_offset += (remaining_seq_length + document_length - add_extra_token_to_sequence);
+        remaining_seq_length = 0;
+      }
+      else
+      {
+        if (document_idx_index == num_docs - 1)
+          break;
+        ++document_idx_index;
+        doc_offset = 0;
+      }
+    }
+
+    if (remaining_seq_length != 0)
+      break;
+
+    // Next sample MUST start at the beginning of the next document.
+    ++document_idx_index;
+    doc_offset = 0;
+    if (document_idx_index >= num_docs)
+      break;
+    sample_idx_vec.push_back({document_idx_index, doc_offset});
+  }
+
+  const int64_t num_samples = static_cast<int64_t>(sample_idx_vec.size()) - 1;
+  T *sample_idx = new T[2 * (num_samples + 1)];
+  for (int64_t i = 0; i <= num_samples; ++i) {
+    sample_idx[2 * i] = sample_idx_vec[i].first;
+    sample_idx[2 * i + 1] = sample_idx_vec[i].second;
+  }
+
+  py::capsule free_when_done(
+    sample_idx,
+    [](void *mem_) {
+      T *mem = reinterpret_cast<T *>(mem_);
+      delete[] mem;
+    });
+
+  const auto byte_size = sizeof(T);
+  return py::array_t<T>(
+    std::vector<int64_t>{num_samples + 1, 2},
+    {2 * byte_size, byte_size},
+    sample_idx,
+    free_when_done
   );
 }
 
@@ -844,6 +933,8 @@ PYBIND11_MODULE(helpers_cpp, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);
   m.def("build_sample_idx_int64", &build_sample_idx<int64_t>);
+  m.def("build_sft_sample_idx_int32", &build_sft_sample_idx<int32_t>);
+  m.def("build_sft_sample_idx_int64", &build_sft_sample_idx<int64_t>);
   m.def("build_blending_indices", &build_blending_indices);
   m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);
 }

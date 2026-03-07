@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 
+from megatron.core.tokenizers.text.libraries.chat_template import MegatronTokenizerChatTemplate
 
 class NullTokenizer:
     """
@@ -15,6 +16,7 @@ class NullTokenizer:
         """ """
         self._vocab_size_without_eod = int(vocab_size)
         self._eod_id = self._vocab_size_without_eod
+        self.pad_id = self._vocab_size_without_eod - 1
 
     def text_to_ids(self, text):
         """Converts text to ids."""
@@ -85,3 +87,15 @@ class NullTokenizer:
     def additional_special_tokens_ids(self):
         """ """
         return None
+
+class NullSFTTokenizer(NullTokenizer, MegatronTokenizerChatTemplate):
+    """
+    Synthetic tokenizer for performance benchmarking and debugging
+
+    Args:
+        vocab_size: vocabulary size for embedding
+    """
+
+    def text_to_ids(self, text):
+        """Converts text to ids by mapping each character to its ASCII code point."""
+        return [ord(c) % self._vocab_size_without_eod for c in text]

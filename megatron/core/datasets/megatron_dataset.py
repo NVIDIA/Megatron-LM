@@ -161,7 +161,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         Returns:
             List[str]: The key config attributes
         """
-        return ["random_seed", "sequence_length", "split", "split_matrix", "tokenizer"]
+        return ["random_seed", "sequence_length", "split", "split_matrix"]
 
     @abstractmethod
     def __len__(self) -> int:

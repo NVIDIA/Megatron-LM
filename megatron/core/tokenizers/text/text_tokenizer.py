@@ -14,6 +14,7 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
         ("null-text", "NullTokenizer"),
+        ("null-sft", "NullSFTTokenizer"),
         ("sft", "SFTTokenizer"),
     ]
 )
@@ -57,7 +58,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        if self.library in ['byte-level', 'null-text']:
+        if self.library in ['byte-level', 'null-text', 'null-sft']:
             return library_class(**kwargs)
         else:
             return library_class(self.path, **kwargs)

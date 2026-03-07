@@ -28,6 +28,7 @@ TEXT_LIBRARIES = [
     "byte-level",
     "null-text",
     "sft",
+    "null-sft",
 ]
 VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
@@ -81,7 +82,7 @@ class MegatronTokenizer:
             )
 
         tokenizer_library = metadata.get('library', None)
-        if tokenizer_library not in ['byte-level', 'null-text', 'null-multimodal']:
+        if tokenizer_library not in ['byte-level', 'null-text', 'null-multimodal', 'null-sft']:
             assert tokenizer_path, "Tokenizer path must be specified."
 
         if tokenizer_library in ['multimodal']:

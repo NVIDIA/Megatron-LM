@@ -152,12 +152,12 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         if not path_to_cache or (not cache_hit and torch.distributed.get_rank() == 0):
             log_single_rank(
-                logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
+                logger, logging.DEBUG, f"Build and save the {type(self).__name__} indices"
             )
 
             # Build the dataset and dataset sample indexes
             log_single_rank(
-                logger, logging.INFO, f"\tBuild and save the dataset and dataset sample indexes"
+                logger, logging.DEBUG, f"\tBuild and save the dataset and dataset sample indexes"
             )
             t_beg = time.time()
             from megatron.core.datasets import helpers
@@ -214,10 +214,10 @@ class BlendedDataset(torch.utils.data.Dataset):
 
             return dataset_index, dataset_sample_index
 
-        log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} indices")
+        log_single_rank(logger, logging.DEBUG, f"Load the {type(self).__name__} indices")
 
         log_single_rank(
-            logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
+            logger, logging.DEBUG, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
         dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
@@ -226,7 +226,7 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         log_single_rank(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             f"\tLoad the dataset sample index from {path_to_dataset_sample_index}",
         )
         t_beg = time.time()

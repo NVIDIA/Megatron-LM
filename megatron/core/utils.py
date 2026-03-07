@@ -85,6 +85,8 @@ except ImportError:
     # TE isn’t installed or the torch wrapper is missing
     tex = None
 
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp # TODO(asolergi-nv): Clean up!
+
 try:
     _torch_version = PkgVersion(torch.__version__)
 except Exception:
@@ -2074,25 +2076,335 @@ def is_submodule(module, parent_module, strict=True):
             return True
     return False
 
+########################
+###### sft utils #######
+########################
+
+def pad_or_truncate_thd_tensors(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    sequence_length: int,
+    padding_token_id: int,
+    padding_label_id: int,
+):
+    if input_ids.shape[0] > sequence_length: # Truncate
+        input_ids = input_ids[:sequence_length]
+        labels = labels[:sequence_length]
+        # NOTE(asolergi-nv): Truncate cu_seqlens
+        # Find the largest index such that cu_seqlens[index] <= sequence_length
+        idx = (cu_seqlens < sequence_length).nonzero(as_tuple=True)[0]
+        # We want to keep all elements up to and including that index, and add a last element containing sequence_length
+        cu_seqlens = torch.cat([
+            cu_seqlens[: idx[-1] + 1],
+            cu_seqlens.new_tensor([sequence_length])
+        ])
+        # NOTE(asolergi-nv): Truncate cu_seqlens_padded if CP
+        if cu_seqlens_padded is not None:
+            # Find the largest index such that cu_seqlens_padded[index] <= sequence_length
+            idx = (cu_seqlens_padded < sequence_length).nonzero(as_tuple=True)[0]
+            # We want to keep all elements up to and including that index, and add a last element containing sequence_length
+            cu_seqlens_padded = torch.cat([
+                cu_seqlens_padded[: idx[-1] + 1],
+                cu_seqlens_padded.new_tensor([sequence_length])
+            ])
+    else: # Pad
+        input_ids = torch.cat([input_ids, torch.full((sequence_length - input_ids.shape[0],), padding_token_id, dtype=input_ids.dtype, device=input_ids.device)])
+        labels = torch.cat([labels, torch.full((sequence_length - labels.shape[0],), padding_label_id, dtype=labels.dtype, device=labels.device)])
+        cu_seqlens = torch.cat([cu_seqlens[:-1], cu_seqlens.new_tensor([sequence_length])])
+        # NOTE(asolergi-nv): Pad cu_seqlens_padded if CP
+        if cu_seqlens_padded is not None:
+            cu_seqlens_padded = torch.cat([cu_seqlens_padded[:-1], cu_seqlens_padded.new_tensor([sequence_length])])
+    
+    return input_ids, labels, cu_seqlens, cu_seqlens_padded 
+
+def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_size: int, sp: bool, padding_token_id: int, padding_label_id: int, max_seq_len: int):
+    """Preprocess SFT batch."""
+    if tp_rank == 0:
+        # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
+        ### 1. Create cu_seqlens_padded if CP is enabled
+        ### 2. Pad or truncate tensors if necessary
+        ### 3. Create max_seqlen
+        # From this point, all tensors have shape [1, sequence_length] (Except for cu_seqlens, cu_seqlens_padded and max_seqlen)
+        
+        # TODO(asolergi-nv): Create position_ids
+
+
+        tokens, labels, cu_seqlens = batch["tokens"].squeeze(0), batch["labels"].squeeze(0), batch["cu_seqlens"].squeeze(0) # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension, so we need to remove it since TE expects cu_seqlens to be 1D
+
+        # NOTE(asolergi-nv): This is performed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L393C5-L408C77
+        # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
+        if cp_size > 1:
+            divisibility_factor = 1
+            if cp_size > 1:
+                divisibility_factor *= cp_size * 2
+            if tp_size > 1 and sp:
+                divisibility_factor *= tp_size
+
+            tokens, labels, cu_seqlens_padded = pad_thd_sequences_for_cp(
+                    tokens,
+                    labels,
+                    cu_seqlens,
+                    divisibility_factor,
+                    padding_token_id=padding_token_id,
+                    padding_label_id=padding_label_id,
+                )
+            cu_seqlens_padded = cu_seqlens_padded.to(torch.int32) # NOTE(asolergi-nv): pad_thd_sequences_for_cp uses torch.cumsum which promotes int32 cu_seqlens_padded to int64
+        else:
+            cu_seqlens_padded = None
+
+        tokens, labels, cu_seqlens, cu_seqlens_padded = pad_or_truncate_thd_tensors(tokens, labels, cu_seqlens, cu_seqlens_padded, max_seq_len, padding_token_id, padding_label_id)
+
+        # Loss mask.
+        loss_mask = torch.ones(max_seq_len, dtype=torch.float32)
+        loss_mask[labels == padding_token_id] = 0.0  # NOTE(asolergi-nv): Mask paddings
+        loss_mask[labels == padding_label_id] = 0.0  # NOTE(asolergi-nv): Mask prompts 
+        # print(f"Trained tokens: {sum(loss_mask)} ({sum(loss_mask) / max_seq_len * 100:.2f}%), padding tokens: {sum(tokens == padding_token_id)} ({sum(tokens == padding_token_id) / max_seq_len * 100:.2f}%)")
+
+        # Position ids.
+        seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        position_ids = torch.cat([torch.arange(length) for length in seg_lengths])
+        
+        # NOTE(asolergi-nv): max_seqlen is computed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L423-L429
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        max_seqlen = torch.tensor(
+            [seq_lens.max().item()],
+            dtype=torch.int32,
+            )
+        
+        batch = {
+            'tokens': tokens.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
+            'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
+            'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
+            'position_ids': position_ids.unsqueeze(0), # batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
+            'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            'max_seqlen': max_seqlen,
+        }
+    return batch
+
+########################
+### tensor parallel ####
+########################
+
+def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_hybrid_cp: bool, create_attention_mask_in_dataloader: bool, broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
+    # TODO(asolergi-nv): Enable PP wit sft
+
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(
+                item,
+                broadcast_src_rank,
+                group=broadcast_group,
+            )
+
+    if tp_rank == 0:
+
+        def _broadcast_cu_seqlens(cu_seqlens):
+            dev = torch.cuda.current_device()
+            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
+            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
+            _broadcast(n_tensor)
+
+            if n == 0:
+                buf = torch.empty(0, dtype=torch.int32, device=dev)
+            else:
+                assert isinstance(cu_seqlens, torch.Tensor), f"Expected cu_seqlens to be a torch.Tensor, got {type(cu_seqlens)}"
+                assert cu_seqlens.dtype == torch.int32, f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
+                buf = cu_seqlens
+            _broadcast(buf)
+
+        if is_hybrid_cp:
+            hybrid_cp_seq_length = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(hybrid_cp_seq_length)
+            
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['position_ids'])
+            if is_sft or is_hybrid_cp:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if create_attention_mask_in_dataloader and not is_sft:
+                _broadcast(batch['attention_mask'])
+            if is_hybrid_cp:
+                _broadcast(batch['local_cp_size'])
+
+        elif is_pipeline_first_stage:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['position_ids'])
+            if is_sft or is_hybrid_cp:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if create_attention_mask_in_dataloader and not is_sft:
+                _broadcast(batch['attention_mask'])
+            if is_hybrid_cp:
+                _broadcast(batch['local_cp_size'])
+
+        elif is_pipeline_last_stage:
+            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+
+    else:
+        if is_hybrid_cp:
+            hybrid_cp_seq_length = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(hybrid_cp_seq_length)
+            shape = (hybrid_cp_seq_length,)
+        else:
+            shape = (micro_batch_size, seq_length)
+            
+        tokens = torch.empty(
+            shape,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        labels = torch.empty(
+            shape,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        loss_mask = torch.empty(
+            shape,
+            dtype=torch.float32,
+            device=torch.cuda.current_device(),
+        )
+        position_ids = torch.empty(
+            shape,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        cu_seqlens = None
+        cu_seqlens_padded = None
+        max_seqlen = None
+        attention_mask = None
+        local_cp_size = None
+        if is_sft or is_hybrid_cp:
+            max_seqlen = torch.empty(
+                1,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+        if create_attention_mask_in_dataloader and not is_sft:
+            shape_attention_mask = (micro_batch_size, 1, seq_length, seq_length) if not is_hybrid_cp else (1, 1, hybrid_cp_seq_length, hybrid_cp_seq_length)
+            attention_mask = torch.empty(
+                shape_attention_mask,
+                dtype=torch.bool,
+                device=torch.cuda.current_device(),
+            )
+        
+        if is_hybrid_cp:
+            local_cp_size = torch.empty(
+                1,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+
+        def _broadcast_cu_seqlens():
+            dev = torch.cuda.current_device()
+
+            n = torch.empty((), dtype=torch.int64, device=dev)
+            _broadcast(n)
+            n = int(n.item())
+
+            if n == 0:
+                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
+            else:
+                cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
+            _broadcast(cu_seqlens)
+
+            assert cu_seqlens.numel() > 0, f"Expected cu_seqlens to have more than 0 elements, got {cu_seqlens.numel()}"
+
+            return cu_seqlens
+
+        if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+            _broadcast(tokens)
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(position_ids)
+            if is_sft or is_hybrid_cp:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            if create_attention_mask_in_dataloader and not is_sft:
+                _broadcast(attention_mask)
+            if is_hybrid_cp:
+                _broadcast(local_cp_size)
+
+        elif is_pipeline_first_stage:
+            labels = None
+            loss_mask = None
+
+            _broadcast(tokens)
+            _broadcast(position_ids)
+            if is_sft or is_hybrid_cp:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            if create_attention_mask_in_dataloader and not is_sft:
+                _broadcast(attention_mask)
+            if is_hybrid_cp:
+                _broadcast(local_cp_size)
+
+        elif is_pipeline_last_stage:
+            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+            tokens = None
+            cu_seqlens = None
+            cu_seqlens_padded = None
+            max_seqlen = None
+
+            _broadcast(labels)
+            _broadcast(loss_mask)
+
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
+            'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded,
+            'max_seqlen': max_seqlen,
+            'local_cp_size': local_cp_size,
+            'hybrid_cp_group': None,
+        }
+
+    return batch
 
 ########################
 ### context parallel ###
 ########################
 
+def get_sft_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup):
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
 
-def get_batch_on_this_cp_rank(
-    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
-):
-    """Slice batch input along sequence dimension into multiple chunks,
-    which are parallelized across GPUs in a context parallel group.
+    if cp_size > 1:
+        index = tex.thd_get_partitioned_indices(
+            batch["cu_seqlens_padded"] if batch["cu_seqlens_padded"] is not None else batch["cu_seqlens"],
+            batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1), # NOTE(asolergi-nv): Labels to enable PP!
+            cp_size,
+            cp_rank,
+        )
+        for key, data in batch.items():
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', 'hybrid_cp_group'}:
+                continue
+            batch[key] = data.index_select(1, index)
+    return batch
 
-    Args:
-        batch (Dict[str, Any]): Input batch tensors.
-        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
-            If provided, uses this group's size and rank. Otherwise, falls back to
-            the current context-parallel settings from parallel_state.
-    """
-
+def get_pretrain_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup):
     # With causal masking, each token only attends to its prior tokens. Simply split
     # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
     # at the end of sequence have bigger workload than others. To address this issue,
@@ -2100,12 +2412,9 @@ def get_batch_on_this_cp_rank(
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     # Determine CP topology either from provided group or from current context parallel state
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
         for key, val in batch.items():
@@ -2122,104 +2431,36 @@ def get_batch_on_this_cp_rank(
                 index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
+            batch[key] = val
 
     return batch
 
 
-def get_thd_batch_on_this_cp_rank(
-    batch: Dict[str, Any],
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    max_seqlen: torch.Tensor,
-    cp_size: Optional[int] = None,
-    cp_rank: Optional[int] = None,
-):
-    """Slice each sub-sample in a packed sample batch input along
-    sequence dimension into multiple chunks, which are parallelized
-    across GPUs in a context parallel group.
-    """
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen[0].item()),
-        max_seqlen_kv=int(max_seqlen[0].item()),
-    )
-
-    cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
-    cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
-    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-        )
-        for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
-                continue
-            batch[key] = data.index_select(1, index)
-
-    return batch, packed_seq_params
-
-
-################################
-### hybrid context parallel ###
-################################
-
-
-def get_batch_on_this_hybrid_cp_rank(
-    batch: Dict[str, Any],
-    local_cp_size: int,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], is_hybrid_cp: bool, cp_group: Optional[torch.distributed.ProcessGroup] = None, hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
+            If provided, uses this group's size and rank. Otherwise, falls back to
+            the current context-parallel settings from parallel_state.
     """
-    assert local_cp_size is not None
-    if cp_group is None:
-        # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
-        if local_cp_size > 1:
-            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
-                group_size=local_cp_size
-            )
+
+    if batch["cu_seqlens"] is not None:
+        if is_hybrid_cp:
+            assert batch['local_cp_size'] is not None, "local_cp_size is required for hybrid context parallel"
+            if batch['local_cp_size'].item() > 1:
+                hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+                batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+                batch["hybrid_cp_group"] = hybrid_cp_group
+        else:
+            batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:
-        # If cp group is provided, it must match the local cp size
-        # as defined by the HybridCPDataLoaderWrapper
-        assert cp_group.size() == local_cp_size
-
-    # Convert [seqlen] to [1, seqlen] similar to default collate_fn
-    # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
-    for key, data in batch.items():
-        if key in ['attention_mask']:
-            continue
-        batch[key] = torch.stack([data], 0)
-    sample_length = batch['tokens'].shape[1]
-    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
-    # Create packed_seq_params for SBHD format with cp group information.
-    packed_seq_params = PackedSeqParams(
-        qkv_format="sbhd",
-        cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        max_seqlen_q=sample_length,
-        max_seqlen_kv=sample_length,
-        local_cp_size=local_cp_size,
-        cp_group=cp_group,
-    )
-
-    if cp_group is not None and cp_group.size() > 1:
-        # When using hybrid_context_parallel, each sub-sample of a packed sample is
-        # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
-
-    return batch, packed_seq_params
-
+        batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
+    return batch
 
 ######################
 ### NVTX profiling ###
