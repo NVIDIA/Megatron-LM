@@ -21,6 +21,7 @@ try:
 except ImportError:
     HAVE_NVSHMEM = False
 
+import torch
 import torch.cuda.nvtx as nvtx
 
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
@@ -121,7 +122,6 @@ class RemoteCopyService:
         # operations (which bypass CUDA streams via RDMA) touch the buffers.
         # Without this, a still-running zero() can race with the first
         # nvshmem.core.put() and overwrite received data.
-        import torch
         torch.cuda.synchronize()
 
         # Barrier to ensure all PEs complete buffer allocation before proceeding
@@ -309,7 +309,7 @@ class RemoteCopyService:
         self.pipeline_executor.execute_pipeline(self.iter_schedules, self.num_iterations)
         nvtx.range_pop()  # execute_pipeline
 
-        # Global sync after execution
+        # Global barrier after execution
         PELogger.debug("Barrier: Synchronizing all PEs after pipeline")
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
 

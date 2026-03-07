@@ -53,6 +53,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                     )
                 )
             elif args.num_experts:
+                assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -115,37 +116,35 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-
+    
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-
+        
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
     args = get_args()
-    # Check inference_optimized first: it takes precedence over use_te since
-    # args.transformer_impl may still be "transformer_engine" when
-    # config.transformer_impl is "inference_optimized" (set via TransformerConfig).
-    if config.transformer_impl == "inference_optimized":
-        return get_gpt_layer_with_inference_spec(
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            qk_l2_norm=args.qk_l2_norm,
-        )
-    elif use_te:
+    if use_te:
         return get_gpt_layer_with_transformer_engine_spec(
             args.num_experts,
             args.moe_grouped_gemm,
             args.qk_layernorm,
             args.multi_latent_attention,
             args.experimental_attention_variant,
+            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+        )
+    elif config.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            qk_l2_norm=args.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -154,6 +153,7 @@ def _get_transformer_layer_spec(use_te, config):
             args.qk_layernorm,
             args.multi_latent_attention,
             args.experimental_attention_variant,
+            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,

@@ -14,7 +14,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8, mxfp8_quantize
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -86,7 +87,11 @@ def _should_quantize_param(val: torch.Tensor) -> bool:
         return False
     if HAVE_TE and isinstance(val, TEMXFP8Tensor):
         return True
-    if isinstance(val, torch.nn.Parameter) and val.dim() == 2 and val.dtype in (torch.bfloat16, torch.float16):
+    if (
+        isinstance(val, torch.nn.Parameter)
+        and val.dim() == 2
+        and val.dtype in (torch.bfloat16, torch.float16)
+    ):
         return True
     return False
 

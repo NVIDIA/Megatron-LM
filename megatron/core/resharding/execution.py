@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 
 def _is_mxfp8_tensor(param):
     """Check if param is a TE MXFP8Tensor (fp8_param=true)."""
-    return hasattr(param, 'quantize_') and hasattr(param, 'dequantize') and hasattr(param, '_rowwise_data')
+    return (
+        hasattr(param, 'quantize_')
+        and hasattr(param, 'dequantize')
+        and hasattr(param, '_rowwise_data')
+    )
 
 
 def execute_reshard_plan(

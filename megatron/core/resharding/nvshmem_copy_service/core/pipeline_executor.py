@@ -174,7 +174,6 @@ class PipelineExecutor:
                 self._launch_unpack(i - 1, prior_batch)
                 torch.cuda.nvtx.range_pop()
 
-
             # Step 3: Send CURRENT iteration
             if has_send:
                 torch.cuda.nvtx.range_push("Step 3: Send Current")

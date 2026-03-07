@@ -9,9 +9,9 @@ Reshard transforms for custom send/recv/writeback during weight transfer.
   MXFP8Tensor buffers so CUDA-graph device-pointer captures remain valid.
 """
 
-from typing import Optional
-
 import torch
+
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 
 class ReshardTransform:
@@ -35,10 +35,7 @@ class ReshardTransform:
         return False
 
     def prepare_send(
-        self,
-        param_name: str,
-        src_slice: tuple[slice, ...],
-        src_param: torch.nn.Parameter,
+        self, param_name: str, src_slice: tuple[slice, ...], src_param: torch.nn.Parameter
     ) -> list[torch.Tensor]:
         """Produce tensor(s) to send for *param_name*.
 
@@ -48,19 +45,12 @@ class ReshardTransform:
         """
         raise NotImplementedError
 
-    def prepare_recv(
-        self,
-        param_name: str,
-        dst_slice: tuple[slice, ...],
-    ) -> list[torch.Tensor]:
+    def prepare_recv(self, param_name: str, dst_slice: tuple[slice, ...]) -> list[torch.Tensor]:
         """Allocate receive buffer(s).  Count must match ``prepare_send`` output."""
         raise NotImplementedError
 
     def finalize_recv(
-        self,
-        param_name: str,
-        dst_slice: tuple[slice, ...],
-        recv_buffers: list[torch.Tensor],
+        self, param_name: str, dst_slice: tuple[slice, ...], recv_buffers: list[torch.Tensor]
     ) -> None:
         """Write received data into final destination (e.g. persistent buffers).
 
@@ -75,9 +65,9 @@ class ReshardTransform:
 # MXFP8 transform helpers
 # ---------------------------------------------------------------------------
 
+
 def _scale_slice_from_data_slice(
-    data_slice: tuple[slice, ...],
-    block_size: int = 32,
+    data_slice: tuple[slice, ...], block_size: int = 32
 ) -> tuple[slice, ...]:
     """Convert an MXFP8 data slice to the corresponding scale slice.
 
@@ -115,9 +105,7 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     parameters are returned via ``.data`` (unwrapped from autograd).
     """
     try:
-        from transformer_engine.pytorch.tensor.mxfp8_tensor import (
-            MXFP8Tensor as _TEMXFP8,
-        )
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TEMXFP8
 
         if isinstance(param, _TEMXFP8):
             return param.dequantize()
@@ -195,7 +183,6 @@ class MXFP8ReshardTransform(ReshardTransform):
     def prepare_send(self, param_name, src_slice, src_param):
         src_data = _ensure_sendable(src_param)
         if self.convert_on_send:
-            from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
             bf16_data = src_data[src_slice].contiguous().to(torch.bfloat16)
             mxfp8 = MXFP8Tensor.from_bf16(bf16_data)
@@ -233,8 +220,6 @@ class MXFP8ReshardTransform(ReshardTransform):
     def finalize_recv(self, param_name, dst_slice, recv_buffers):
         buf_key = param_name.removeprefix(self.buffer_key_prefix)
         buf = self.persistent_buffers[buf_key]
-
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
         if self.convert_on_send:
             # Already MXFP8 on the wire — copy data and 2D scale slices directly.
