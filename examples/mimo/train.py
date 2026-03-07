@@ -24,11 +24,13 @@ sys.path.append(
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
+    qwen35_train_valid_test_datasets_provider,
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 )
 from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
+from model_providers.qwen35_vlm import model_provider_qwen35_vlm
 from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
@@ -39,10 +41,12 @@ _MODEL_PROVIDERS = {
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
     "llava_avlm": model_provider_llava_avlm,
+    "qwen35_vlm": model_provider_qwen35_vlm,
 }
 
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
+    "qwen35_mock": qwen35_train_valid_test_datasets_provider,
     "llava_vlm": llava_vlm_dataloader_provider,
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
     "llava_avlm": llava_avlm_dataloader_provider,
@@ -199,6 +203,7 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    **kwargs,
 ):
     """Model provider for MIMO model training.
 
@@ -229,8 +234,15 @@ def model_provider(
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
         }
+    elif runtime_args.model_provider == "qwen35_vlm":
+        kwargs = {
+            "image_special_token_id": getattr(runtime_args, "image_token_id", 248056),
+        }
     else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(
+            f"Unknown model provider: {runtime_args.model_provider}. "
+            f"Must be one of {list(_MODEL_PROVIDERS.keys())}"
+        )
 
     return builder_fn(
         pre_process,

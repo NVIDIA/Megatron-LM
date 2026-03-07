@@ -283,6 +283,134 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     return train_dataset, valid_dataset, test_dataset
 
+
+class MockQwen35VLMDataset(Dataset):
+    """Mock dataset that produces data compatible with the qwen35_vlm model provider.
+
+    Generates synthetic pixel_values and grid_thw tensors matching the format
+    expected by HFQwen35VisionEncoderWrapper, with modality_inputs keys matching
+    the qwen35_vlm MimoModelConfig.
+    """
+
+    PATCH_SIZE = 16
+    TEMPORAL_PATCH_SIZE = 2
+    IN_CHANNELS = 3
+    SPATIAL_MERGE_SIZE = 2
+
+    def __init__(
+        self,
+        size: int = 10000,
+        image_size: int = 224,
+        seq_len: int = 512,
+        vocab_size: int = 256,
+        pad_token_id: int = 0,
+        image_token_id: int = 248056,
+    ):
+        self.size = size
+        self.image_size = image_size
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.pad_token_id = pad_token_id
+        self.image_token_id = image_token_id
+
+        self.h_patches = image_size // self.PATCH_SIZE
+        self.w_patches = image_size // self.PATCH_SIZE
+        self.num_patches = self.h_patches * self.w_patches
+        self.patch_dim = (
+            self.IN_CHANNELS * self.TEMPORAL_PATCH_SIZE
+            * self.PATCH_SIZE * self.PATCH_SIZE
+        )
+        self.image_seq_length = (
+            (self.h_patches // self.SPATIAL_MERGE_SIZE)
+            * (self.w_patches // self.SPATIAL_MERGE_SIZE)
+        )
+
+        if self.seq_len < self.image_seq_length:
+            raise ValueError(
+                f"seq_len ({self.seq_len}) must be >= image_seq_length ({self.image_seq_length})."
+            )
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> Dict:
+        pixel_values = torch.randn(self.num_patches, self.patch_dim)
+        grid_thw = torch.tensor([[1, self.h_patches, self.w_patches]], dtype=torch.long)
+
+        input_ids = self._mock_tokenize()
+        labels = input_ids.clone()
+        labels[:-1] = input_ids[1:]
+        labels[-1] = self.pad_token_id
+        labels[input_ids == self.image_token_id] = -100
+
+        loss_mask = torch.ones_like(input_ids).float()
+        loss_mask[input_ids == self.pad_token_id] = 0.0
+        loss_mask[input_ids == self.image_token_id] = 0.0
+
+        position_ids = torch.arange(len(input_ids), dtype=torch.long)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+            "modality_inputs": {
+                "images": {
+                    "qwen35_vision": {
+                        "pixel_values": pixel_values,
+                        "grid_thw": grid_thw,
+                    },
+                },
+            },
+        }
+
+    def _mock_tokenize(self) -> torch.Tensor:
+        image_tokens = torch.full(
+            (self.image_seq_length,), self.image_token_id, dtype=torch.long
+        )
+        num_text_tokens = self.seq_len - self.image_seq_length
+        text_tokens = torch.randint(
+            low=1, high=self.vocab_size, size=(num_text_tokens,), dtype=torch.long,
+        )
+        return torch.cat((image_tokens, text_tokens), dim=0)
+
+
+def qwen35_train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Dataset provider for qwen35_vlm model with mock data."""
+    from megatron.core import mpu
+    from megatron.training import get_args
+
+    args = get_args()
+
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        from examples.mimo.data.mock import MockQwen35VLMDataset
+
+        common_kwargs = dict(
+            image_size=args.image_size,
+            seq_len=args.total_seq_length,
+            pad_token_id=args.pad_token_id,
+            image_token_id=args.image_token_id,
+        )
+        train_dataset = MockQwen35VLMDataset(
+            size=train_val_test_num_samples[0], **common_kwargs,
+        )
+        valid_dataset = MockQwen35VLMDataset(
+            size=max(train_val_test_num_samples[1], 100), **common_kwargs,
+        )
+        test_dataset = None
+
+        print(
+            f"MockQwen35VLMDataset: image_size={args.image_size}, "
+            f"image_seq_length={train_dataset.image_seq_length}, "
+            f"num_patches={train_dataset.num_patches}, seq_len={args.total_seq_length}"
+        )
+    else:
+        train_dataset = None
+        valid_dataset = None
+        test_dataset = None
+
+    return train_dataset, valid_dataset, test_dataset
+
 if __name__ == "__main__":
     print("\nCreating mock VLM dataloader...")
     dataloader = get_mock_vlm_dataloader(batch_size=4, dataset_size=10)
