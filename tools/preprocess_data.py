@@ -73,6 +73,9 @@ class Encoder(object):
 
         else:
             Encoder.splitter = IdentitySplitter()
+          
+        if Encoder.tokenizer.eod is None:
+            raise ValueError("EOD token is not set.")
 
     def split(self, json_line):
         data = json.loads(json_line)
