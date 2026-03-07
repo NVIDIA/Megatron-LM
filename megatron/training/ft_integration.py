@@ -238,6 +238,7 @@ def _update_timeouts(selected_sections, calc_out_of_section):
         ft_state = rmon_cli.state_dict()
         with open(_ft_state_path, "w") as f:
             json.dump(ft_state, f)
+            f.write("\n")  # End file in newline
         print_rank_0(f"FT: updated timeouts saved to {_ft_state_path}. {rmon_cli.section_timeouts}")
 
 

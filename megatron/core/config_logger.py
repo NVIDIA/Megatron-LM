@@ -121,6 +121,7 @@ def log_config_to_disk(config, dict_data, prefix='', rank_str=''):
     else:
         with open(f'{path}.json', 'w') as fp:
             json.dump(dict_data, fp, cls=JSONEncoderWithMcoreTypes)
+            fp.write('\n')  # End file in newline
 
 
 __all__ = ['has_config_logger_enabled', 'log_config_to_disk']

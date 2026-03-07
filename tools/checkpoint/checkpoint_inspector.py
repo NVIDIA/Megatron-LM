@@ -967,6 +967,7 @@ def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
         json_file_path = os.path.join(torch_dcp_dir, "param_to_param_group_map.json")
         with open(json_file_path, "w") as json_file:
             json.dump(serializable_dict, json_file, indent=2)
+            json_file.write("\n")  # End file in newline
         click.echo(f"Saved converted param_to_param_group_map to: {json_file_path}")
 
 

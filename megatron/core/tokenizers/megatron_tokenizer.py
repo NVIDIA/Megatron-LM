@@ -163,6 +163,7 @@ class MegatronTokenizer:
 
             with open(metadata_path, "w") as f:
                 json.dump(metadata, f)
+                f.write("\n")  # End file in newline
 
             logger.info(f"Metadata file was sucessfully saved: {metadata_path}.")
 
