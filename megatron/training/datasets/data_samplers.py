@@ -10,10 +10,49 @@ import torch
 from torch.utils.data import Dataset
 
 from megatron.core import mpu
+from megatron.core.parallel_state import RankGenerator
 from megatron.core.datasets.utils import Split
 
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+
+_PREFORK_DATALOADER_START_EVENT = None
+
+
+def set_prefork_dataloader_start_event(event):
+    """Set/clear dataloader worker startup gate for prefork flow."""
+    global _PREFORK_DATALOADER_START_EVENT
+    _PREFORK_DATALOADER_START_EVENT = event
+
+
+def _get_data_parallel_rank_and_size(args):
+    """Get data-parallel rank and size before/after model-parallel init."""
+    if mpu.model_parallel_is_initialized():
+        return mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size()
+
+    model_size = (
+        args.tensor_model_parallel_size
+        * args.pipeline_model_parallel_size
+        * args.context_parallel_size
+    )
+    assert (
+        args.world_size % model_size == 0
+    ), f"world_size ({args.world_size}) must be divisible by model_size ({model_size})"
+    data_parallel_size = args.world_size // model_size
+    order = 'tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp'
+    rank_generator = RankGenerator(
+        tp=args.tensor_model_parallel_size,
+        ep=1,
+        dp=data_parallel_size,
+        pp=args.pipeline_model_parallel_size,
+        cp=args.context_parallel_size,
+        order=order,
+        rank_offset=0,
+    )
+    for ranks in rank_generator.get_ranks("dp"):
+        if args.rank in ranks:
+            return ranks.index(args.rank), len(ranks)
+    raise RuntimeError(f"Unable to resolve data-parallel group for rank={args.rank}")
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -31,38 +70,41 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         split = None
 
     if split == Split.valid and args.full_validation:
+        data_parallel_rank, data_parallel_size = _get_data_parallel_rank_and_size(args)
         batch_sampler = MegatronPretrainingSampler(
             total_samples=len(dataset),
             consumed_samples=0,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
         )
     elif args.dataloader_type == 'single':
+        data_parallel_rank, data_parallel_size = _get_data_parallel_rank_and_size(args)
         if args.hybrid_context_parallel:
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
                 global_batch_size=args.global_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_rank=data_parallel_rank,
+                data_parallel_size=data_parallel_size)
         else:
             # Megatron sampler
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_rank=data_parallel_rank,
+                data_parallel_size=data_parallel_size)
     elif args.dataloader_type == 'cyclic':
+        data_parallel_rank, data_parallel_size = _get_data_parallel_rank_and_size(args)
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
             data_sharding=args.data_sharding,
         )
     elif args.dataloader_type == "external":
@@ -73,10 +115,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
     def worker_init_fn(_):
-        DistributedSignalHandler(args.exit_signal).__enter__()
+        if args.prefork_dataloader_before_cuda and _PREFORK_DATALOADER_START_EVENT is not None:
+            _PREFORK_DATALOADER_START_EVENT.wait()
+        if args.exit_signal_handler:
+            DistributedSignalHandler(args.exit_signal).__enter__()
 
     maybe_worker_init_fn = (
-        worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
+        worker_init_fn
+        if (args.prefork_dataloader_before_cuda or args.exit_signal_handler) and args.num_workers > 0
+        else None
     )
     # Torch dataloader.
     if args.hybrid_context_parallel:
