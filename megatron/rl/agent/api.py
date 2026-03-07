@@ -40,6 +40,7 @@ class GroupedRolloutRequest(Request):
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
     generation_batch_size: int = 1
+    enforce_order: bool = False
 
 
 class Rollout(AgentBaseModel):
@@ -197,6 +198,9 @@ class GroupedRolloutGenerator(Agent, ABC):
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
                 "Filtering is not supported with generation_batch_size > 1"
+        assert self.parallel_generation_tasks >= groups_per_worker, \
+            f"parallel_generation_tasks ({self.parallel_generation_tasks}) must be >= " \
+            f"generation_batch_size ({groups_per_worker})"
         num_workers = self.parallel_generation_tasks // groups_per_worker
         submission_gate = asyncio.Semaphore(num_workers)
 
@@ -237,13 +241,19 @@ class GroupedRolloutGenerator(Agent, ABC):
             pending: dict[int, list[list[Rollout]]] = {}
             while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
                 group = await grouped_rollouts.get()
-                pending.setdefault(group[0].batch_id, []).append(group)
-                if len(pending.get(next_batch_id, [])) >= groups_per_worker:
-                    batch = pending.pop(next_batch_id)
-                    batch.sort(key=lambda g: g[0].submission_index)
-                    next_batch_id += 1
-                    for g in batch:
-                        yield g
+                if request.enforce_order:
+                    # Accumulate groups and enforce submission order across batches.
+                    pending.setdefault(group[0].batch_id, []).append(group)
+                    while len(pending.get(next_batch_id, [])) >= groups_per_worker:
+                        batch = pending.pop(next_batch_id)
+                        batch.sort(key=lambda g: g[0].submission_index)
+                        next_batch_id += 1
+                        for g in batch:
+                            yield g
+                        submission_gate.release()
+                else:
+                    # Yield in completion order, no HOL blocking.
+                    yield group
                     submission_gate.release()
         finally:
             for task in tasks:

@@ -416,7 +416,19 @@ def validate_args(args, defaults={}):
             print_rank_0(
                 "WARNING: --rl-parallel-generation-tasks is deprecated, "
                 "use --rl-num-parallel-generations instead.")
-            args.rl_num_parallel_generations = args.rl_parallel_generation_tasks
+            args.rl_num_parallel_generations = (
+                args.rl_parallel_generation_tasks * args.grpo_group_size)
+
+        # Convert --rl-generation-batch-size from rollout units to group units.
+        if args.rl_generation_batch_size is not None:
+            assert args.rl_generation_batch_size % args.grpo_group_size == 0, \
+                f"--rl-generation-batch-size ({args.rl_generation_batch_size}) " \
+                f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
+            args.rl_generation_batch_size = (
+                args.rl_generation_batch_size // args.grpo_group_size)
+
+        # Derive enforce_order from whether --rl-generation-batch-size was explicitly set.
+        args.rl_enforce_generation_order = (args.rl_generation_batch_size is not None)
 
         # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
         assert args.rl_num_parallel_generations is None \
@@ -426,16 +438,23 @@ def validate_args(args, defaults={}):
         if args.rl_num_parallel_generations is not None:
             assert args.rl_partial_rollouts, \
                 "--rl-num-parallel-generations requires --rl-partial-rollouts."
-            args.rl_parallel_generation_tasks = args.rl_num_parallel_generations
-            args.rl_generation_batch_size = 1
+            assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
+                f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
+                f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generations // args.grpo_group_size)
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
         elif args.rl_num_parallel_generation_batches is not None:
             assert args.rl_partial_rollouts, \
                 "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
-            args.rl_generation_batch_size = args.grpo_prompts_per_step
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = args.grpo_prompts_per_step
             args.rl_parallel_generation_tasks = (
-                args.rl_num_parallel_generation_batches * args.grpo_prompts_per_step)
+                args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
         else:
-            args.rl_generation_batch_size = 1
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
             args.rl_parallel_generation_tasks = 512
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
@@ -2225,14 +2244,20 @@ def _add_rl_args(parser):
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
     group.add_argument('--rl-num-parallel-generations', type=int, default=None,
-                       help='Number of parallel generation groups in flight (no batching). '
+                       help='Number of parallel rollouts in flight (no batching). '
+                            'Internally divided by grpo_group_size. '
                             'Requires --rl-partial-rollouts. '
                             'Mutually exclusive with --rl-num-parallel-generation-batches.')
     group.add_argument('--rl-num-parallel-generation-batches', type=int, default=None,
                        help='Number of generation batches in flight (lag = N - 1). '
-                            'Each batch contains grpo_prompts_per_step groups. '
+                            'Each batch contains grpo_prompts_per_step groups by default. '
                             'Requires --rl-partial-rollouts. '
                             'Mutually exclusive with --rl-num-parallel-generations.')
+    group.add_argument('--rl-generation-batch-size', type=int, default=None,
+                       help='Override the number of rollouts per generation batch. '
+                            'Internally divided by grpo_group_size. '
+                            'Defaults to grpo_prompts_per_step * grpo_group_size when '
+                            '--rl-num-parallel-generation-batches is set.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
