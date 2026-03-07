@@ -150,6 +150,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
+    "mlp_chunks_for_training": 1,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
     "moe_deepep_num_sms": 20,

@@ -70,6 +70,7 @@ class TestParallelTransformerLayer:
                 hidden_size,
                 num_attention_heads,
                 mlp_chunks_for_prefill,
+                mlp_chunks_for_training,
                 hidden_states,
                 inference_context,
             ):
@@ -79,6 +80,7 @@ class TestParallelTransformerLayer:
                     hidden_size=12,
                     num_attention_heads=4,
                     mlp_chunks_for_prefill=4,
+                    mlp_chunks_for_training=4,
                     add_bias_linear=True,
                     use_cpu_initialization=True,
                 )
@@ -121,6 +123,7 @@ class TestParallelTransformerLayer:
                     hidden_size,
                     num_attention_heads,
                     mlp_chunks_for_prefill,
+                    1,
                     input_hidden_states,
                     inference_context,
                 )
@@ -130,7 +133,25 @@ class TestParallelTransformerLayer:
 
                 outputs[mlp_chunks_for_prefill] = (hidden_states, context)
 
-        assert torch.equal(outputs[1][0], outputs[4][0])
+            assert torch.equal(outputs[1][0], outputs[4][0])
+            inference_context = None
+            for mlp_chunks_for_training in [1, 4]:
+                hidden_states, context = test(
+                    num_layers,
+                    hidden_size,
+                    num_attention_heads,
+                    1,
+                    mlp_chunks_for_training,
+                    input_hidden_states,
+                    inference_context,
+                )
+                assert hidden_states.shape[0] == sequence_length
+                assert hidden_states.shape[1] == micro_batch_size
+                assert hidden_states.shape[2] == hidden_size
+
+                outputs[mlp_chunks_for_training] = (hidden_states, context)
+
+            assert torch.equal(outputs[1][0], outputs[4][0])
 
     def test_get_layer_offset(self):
         config = self.parallel_transformer_layer.config
