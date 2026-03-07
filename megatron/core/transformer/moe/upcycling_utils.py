@@ -218,7 +218,10 @@ def _convert_to_moe_state_dict(moe_model, dense_model):
             value = src_dict[key]
             new_value = value_process_func(value)
             new_key = key.replace(key_replace_old, key_replace_new)
-            dist_dict[new_key] = new_value.clone() if hasattr(new_value, 'clone') else new_value
+            if (
+                new_key in dist_dict
+            ):  # Skip keys absent in target (e.g. dense layers in mixed dense/MoE)
+                dist_dict[new_key] = new_value.clone() if hasattr(new_value, 'clone') else new_value
         return
 
     _convert_key_value(
@@ -257,7 +260,10 @@ def _convert_to_moe_state_dict(moe_model, dense_model):
             params = value_process_func(param)
             for idx in range(num_local_experts):
                 new_key = key.replace(key_replace_old, key_replace_new).format(idx)
-                dist_dict[new_key] = params[ep_rank * num_local_experts + idx]
+                if (
+                    new_key in dist_dict
+                ):  # Skip keys absent in target (e.g. dense layers in mixed dense/MoE)
+                    dist_dict[new_key] = params[ep_rank * num_local_experts + idx]
         return
 
     if experts_type == ExpertsType.SequentialMLP:
