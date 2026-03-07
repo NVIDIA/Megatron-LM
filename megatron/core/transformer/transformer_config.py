@@ -942,6 +942,11 @@ class TransformerConfig(ModelParallelConfig):
     'torch': torch._grouped_mm with GPU-resident cumsum offsets (default).
     'te': TE GroupedGEMM fallback."""
 
+    moe_activation_no_skip_pad: bool = False
+    """When False (default), padding-aware activation kernels in mcore_fused_moe
+    skip rows where source_indices == -1 (alignment padding). Set to True to
+    run activations on all rows including padding."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """

@@ -417,21 +417,12 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         if (
-            hasattr(self, "_inference_token_dispatcher")
-            and self.is_inference_cuda_graphed_iteration
+            self.config.transformer_impl == "inference_optimized"
+            and not self.training
         ):
-            if self.config.moe_ggemm_inference_cg == MoEGroupedGemmBackend.flashinfer:
-                routing_map = self.token_dispatcher.routing_map
-                expert_output, mlp_bias = self.experts(
-                    dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
-                )
-            else:
-                # torch backend: dispatcher already permuted tokens; tokens_per_expert is set.
-                # Pass precomputed inclusive offsets to avoid recomputing cumsum.
-                expert_output, mlp_bias = self.experts(
-                    dispatched_input, tokens_per_expert, permuted_probs,
-                    inclusive_expert_offsets=self.token_dispatcher.inclusive_expert_offsets,
-                )
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs, routing_map=self.token_dispatcher.routing_map
+            )
         else:
             expert_output, mlp_bias = self.experts(
                 dispatched_input, tokens_per_expert, permuted_probs

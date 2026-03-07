@@ -65,7 +65,7 @@ class AsyncZMQCommunicator:
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
 
-    async def all_reduce_max(self, local_val: int) -> int:
+    async def all_reduce_max(self, local_val: int, async_op=False) -> int:
         """
         Asyncio friendly all reduce max operation. Gathers on rank 0, computes max,
         and broadcasts the result.
@@ -81,11 +81,15 @@ class AsyncZMQCommunicator:
 
             # Non-blocking gather from N-1 peers
             while len(values) < self.world_size:
-                try:
-                    msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
+                if async_op:
+                    try:
+                        msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
+                        values.append(struct.unpack('!i', msg)[0])
+                    except zmq.Again:
+                        await asyncio.sleep(0.001)  # Yield to event loop
+                else:
+                    msg = self.gather_sock.recv()
                     values.append(struct.unpack('!i', msg)[0])
-                except zmq.Again:
-                    await asyncio.sleep(0.001)  # Yield to event loop
 
             max_val = max(values)
             self.bcast_sock.send(struct.pack('!i', max_val))
@@ -94,13 +98,16 @@ class AsyncZMQCommunicator:
         else:
             # Worker: Send -> Wait for Broadcast
             self.gather_sock.send(payload)
-
-            while True:
-                try:
-                    msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
-                    return struct.unpack('!i', msg)[0]
-                except zmq.Again:
-                    await asyncio.sleep(0.001)  # Yield to event loop
+            if async_op:
+                while True:
+                    try:
+                        msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
+                        return struct.unpack('!i', msg)[0]
+                    except zmq.Again:
+                        await asyncio.sleep(0.001)  # Yield to event loop
+            else:
+                msg = self.bcast_sock.recv()
+                return struct.unpack('!i', msg)[0]
 
     def close(self):
         """

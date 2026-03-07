@@ -27,12 +27,6 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import MoEGroupedGemmBackend
-from megatron.core.transformer.moe.moe_inference_utils import (
-    compute_expert_offsets,
-    compute_local_tokens_per_expert,
-    permute_tokens,
-    unpermute_tokens,
-)
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -80,15 +74,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         # Backend selection for CUDA-graphed grouped GEMM
         self._moe_backend = config.moe_ggemm_inference_cg
         self._local_expert_start = local_expert_indices[0]
-
-        # Intermediate state for torch backend (set in dispatch_postprocess, used in combine_preprocess)
-        self._source_token_indices = None
-        self._permuted_probs = None
-        self._num_tokens_after_dispatch = None
-        # Inclusive end offsets per expert after permutation. Reused as the
-        # `offs` arg to torch._grouped_mm to avoid recomputing cumsum.
-        # None for the flashinfer backend (not needed).
-        self.inclusive_expert_offsets = None
 
     def _maybe_allocate_ag_buffers(
         self, routing_map: torch.Tensor, probs: torch.Tensor, hidden_states: torch.Tensor
@@ -262,11 +247,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
-        """Post-process dispatched tokens for expert computation.
-
-        For the flashinfer backend, this is a pass-through: the FlashInfer fused
-        kernel operates directly on self.routing_map. For the torch backend,
-        uses triton kernels to permute tokens into expert-grouped order.
+        """Pass-through: experts.py calls fused_moe() which handles permutation.
 
         Args:
             hidden_states (torch.Tensor): Gathered hidden states,
@@ -275,78 +256,22 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 shape [global_tokens, topk].
 
         Returns:
-            tuple: (hidden_states, tokens_per_expert, probs) where:
-                - flashinfer: tokens_per_expert=None, probs=original probs
-                - torch: tokens_per_expert=GPU histogram, probs=None
-                  (probs deferred to combine_preprocess unpermute)
+            tuple: (hidden_states, None, probs) — permutation is handled
+                inside fused_moe() called by experts.py.
         """
-        if self._moe_backend == MoEGroupedGemmBackend.flashinfer:
-            return hidden_states, None, probs
-
-        # torch backend: permute tokens into expert-grouped order
-        self._num_tokens_after_dispatch = hidden_states.size(0)
-        num_tokens = hidden_states.size(0)
-        tokens_per_expert = compute_local_tokens_per_expert(
-            self.routing_map, self._local_expert_start, self.num_local_experts
-        )
-        alignment = self.config.moe_expert_tensor_alignment
-        padded_exclusive_offsets, padded_inclusive_offsets = compute_expert_offsets(
-            tokens_per_expert, alignment=alignment,
-        )
-        # Static upper bound for output buffer size (no device-to-host sync).
-        # Worst case: every expert gets tokens, each padded by up to
-        # (alignment - 1) extra rows.
-        topk = probs.size(1)
-        max_output_size = (
-            num_tokens * min(topk, self.num_local_experts)
-            + alignment * self.num_local_experts
-        )
-        # permute_tokens mutates padded_exclusive_offsets in-place via atomic
-        # adds. padded_inclusive_offsets is untouched and used as `offs` for
-        # torch._grouped_mm.
-        permuted_hidden, permuted_probs, source_token_indices = permute_tokens(
-            hidden_states, probs, self.routing_map, padded_exclusive_offsets,
-            self._local_expert_start, self.num_local_experts,
-            output_size=max_output_size,
-        )
-
-        # Cache state for combine_preprocess.
-        self._source_token_indices = source_token_indices
-        self._permuted_probs = permuted_probs
-        # Cache the padded inclusive offsets so torch._grouped_mm can use them
-        # directly as `offs` — each expert's M dimension is aligned.
-        self.inclusive_expert_offsets = padded_inclusive_offsets
-
-        # probs=None: expert skips prob-weighting, unpermute applies probs instead
-        return permuted_hidden, tokens_per_expert, None
+        return hidden_states, None, probs
 
     def combine_preprocess(self, expert_output):
-        """Unpermute expert outputs back to original token order.
-
-        For flashinfer, this is a pass-through (FlashInfer already produces
-        output in token order). For the torch backend, uses the triton unpermute
-        kernel to scatter-add expert outputs weighted by routing probs.
+        """Pass-through: unpermutation is handled inside fused_moe().
 
         Args:
-            expert_output (torch.Tensor): Output from InferenceGroupedMLP,
-                shape [output_size, hidden_dim] (torch) or
-                [global_tokens, hidden_dim] (flashinfer).
+            expert_output (torch.Tensor): Output from expert forward,
+                shape [global_tokens, hidden_dim].
 
         Returns:
-            torch.Tensor: Output in original token order,
-                shape [global_tokens, hidden_dim].
+            torch.Tensor: Same tensor, unchanged.
         """
-        if self._moe_backend == MoEGroupedGemmBackend.flashinfer:
-            return expert_output
-
-        # torch backend: unpermute with routing probs
-        output = unpermute_tokens(
-            expert_output,
-            self._permuted_probs,
-            self._source_token_indices,
-            self._num_tokens_after_dispatch,
-        )
-        return output
+        return expert_output
 
     def token_combine(self, hidden_states):
         """Combines expert outputs across EP ranks using Reduce-Scatter.
