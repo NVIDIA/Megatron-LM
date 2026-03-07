@@ -269,6 +269,10 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         _reset_cuda_memory()
 
         # 3) Correctness checks (forward + selected grads)
+        rank = torch.distributed.get_rank()
+        if not torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3):
+            max_diff = (off_logits - base_logits).abs().max().item()
+            print(f"Rank {rank}: LOGIT MISMATCH max_abs_diff={max_diff:.6e}")
         assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
         assert set(off_grads.keys()) == set(base_grads.keys())
         for name, gb in base_grads.items():
@@ -276,7 +280,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             if gb is None or go is None:
                 assert gb is None and go is None, f"Grad None mismatch for {name}"
                 continue
-            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
+            if not torch.allclose(go, gb, rtol=1e-3, atol=1e-3):
+                max_diff = (go - gb).abs().max().item()
+                rel_diff = ((go - gb).abs() / (gb.abs() + 1e-8)).max().item()
+                print(f"Rank {rank}: GRAD MISMATCH {name} max_abs_diff={max_diff:.6e} max_rel_diff={rel_diff:.6e}")
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Rank {rank}: Grad mismatch for {name}"
 
         # 4) Memory checks (peak allocated over forward+backward)
         saved_mib = (base_peak - off_peak) / (1024**2)
