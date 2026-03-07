@@ -1781,6 +1781,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param_idx += 1
         return state
 
+    @torch.no_grad
     def load_parameter_state_from_dp_reshardable(self, state_dict):
         """Loads the parameter state from an internal representation.
 
