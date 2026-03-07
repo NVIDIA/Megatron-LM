@@ -406,20 +406,37 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        # Resolve deprecated --grpo-prompts-per-step → --rl-prompts-per-step.
-        assert args.rl_prompts_per_step is None or args.grpo_prompts_per_step is None, \
-            "Cannot specify both --rl-prompts-per-step and --grpo-prompts-per-step. " \
-            "Use --rl-prompts-per-step (--grpo-prompts-per-step is deprecated)."
-        if args.grpo_prompts_per_step is not None:
-            print_rank_0("WARNING: --grpo-prompts-per-step is deprecated, use --rl-prompts-per-step instead.")
-            args.rl_prompts_per_step = args.grpo_prompts_per_step
-        elif args.rl_prompts_per_step is None:
-            args.rl_prompts_per_step = 32
-        args.grpo_prompts_per_step = args.rl_prompts_per_step
+        # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_parallel_generation_tasks is None, \
+            "Cannot specify both --rl-num-parallel-generations and " \
+            "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
+            "(--rl-parallel-generation-tasks is deprecated)."
+        if args.rl_parallel_generation_tasks is not None:
+            print_rank_0(
+                "WARNING: --rl-parallel-generation-tasks is deprecated, "
+                "use --rl-num-parallel-generations instead.")
+            args.rl_num_parallel_generations = args.rl_parallel_generation_tasks
 
-        # Compute internal parallel_generation_tasks.
-        # generation_batch_size is always multiplied in (default 1 = no-op).
-        args.rl_parallel_generation_tasks = args.rl_parallel_generation_tasks * args.rl_generation_batch_size
+        # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_num_parallel_generation_batches is None, \
+            "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
+            "are mutually exclusive."
+        if args.rl_num_parallel_generations is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generations requires --rl-partial-rollouts."
+            args.rl_parallel_generation_tasks = args.rl_num_parallel_generations
+            args.rl_generation_batch_size = 1
+        elif args.rl_num_parallel_generation_batches is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
+            args.rl_generation_batch_size = args.grpo_prompts_per_step
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generation_batches * args.grpo_prompts_per_step)
+        else:
+            args.rl_generation_batch_size = 1
+            args.rl_parallel_generation_tasks = 512
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
@@ -428,7 +445,7 @@ def validate_args(args, defaults={}):
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
         # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
-            "grpo_group_size * rl_prompts_per_step * grpo_iterations "
+            "grpo_group_size * grpo_prompts_per_step * grpo_iterations "
             "should be divisible by global_batch_size"
 
         # For now only exit/checkpoint on iterations where we generate data. We don't currently
@@ -2203,17 +2220,19 @@ def _add_rl_args(parser):
                         'This evaluation can be very expensive when using environments'
                         'that evaluate pass@k so we default to a lower number.')
     # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
-    group.add_argument('--rl-prompts-per-step', type=int, default=None,
-                       help="Number of prompts per training data collection step. "
-                            "Replaces --grpo-prompts-per-step.")
+    group.add_argument('--grpo-prompts-per-step', type=int, default=32,
+                       help="Number of prompts per training data collection step.")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-batch-size', type=int, default=1,
-                       help="Number of groups per generation batch. Controls how many "
-                            "groups each worker generates together. Default 1 (no batching).")
-    # Deprecated aliases:
-    group.add_argument('--grpo-prompts-per-step', type=int, default=None,
-                       help="Deprecated: use --rl-prompts-per-step instead.")
+    group.add_argument('--rl-num-parallel-generations', type=int, default=None,
+                       help='Number of parallel generation groups in flight (no batching). '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generation-batches.')
+    group.add_argument('--rl-num-parallel-generation-batches', type=int, default=None,
+                       help='Number of generation batches in flight (lag = N - 1). '
+                            'Each batch contains grpo_prompts_per_step groups. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generations.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2321,9 +2340,8 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
-                       help='Number of parallel generation tasks for RL inference. '
-                            'Internally multiplied by rl_generation_batch_size.')
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
+                       help='Deprecated: use --rl-num-parallel-generations instead.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
