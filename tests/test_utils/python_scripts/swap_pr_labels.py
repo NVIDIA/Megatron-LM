@@ -45,6 +45,24 @@ class PRReviewTracker:
         self.stage = self.get_stage(self.pr)
         self.org = self.github.get_organization(self.repo.organization.login)
         self._team_cache = {}
+        self._codeowner_teams = self._parse_codeowner_teams()
+
+    def _parse_codeowner_teams(self):
+        """Parse CODEOWNERS to get the set of teams that are blocking reviewers."""
+        teams = set()
+        try:
+            with open(".github/CODEOWNERS") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for token in line.split():
+                        if token.startswith("@NVIDIA/"):
+                            teams.add(token.split("/", 1)[1])
+        except FileNotFoundError:
+            logger.warning("CODEOWNERS file not found")
+        logger.info(f"CODEOWNERS teams: {teams}")
+        return teams
 
     def get_stage(self, pr):
         """Get current review stage."""
@@ -111,40 +129,42 @@ class PRReviewTracker:
             pending_individuals = set()
             pending_team_slugs = set()
 
-        # 3. Classify teams into expert vs final (excluded)
+        # 3. Filter to only CODEOWNERS teams (ignore optional teams like mcore-oncall)
+        pending_team_slugs = pending_team_slugs & self._codeowner_teams
+        logger.info(f"Pending CODEOWNERS teams: {pending_team_slugs}")
+
+        # 4. Classify teams into expert vs final (excluded)
         expert_team_slugs = pending_team_slugs - self.EXCLUDED_TEAMS
         final_team_slugs = pending_team_slugs & self.EXCLUDED_TEAMS
 
-        # 4. Get team members
+        # 5. Get team members
         expert_team_members = self._get_teams_members(expert_team_slugs)
         all_excluded_members = self._get_teams_members(self.EXCLUDED_TEAMS)
 
-        # 5. Compute pending expert reviewers
+        # 6. Compute pending expert reviewers
         expert_non_approvers = non_approvers - all_excluded_members
         pending_expert = (
             pending_individuals | expert_team_members | expert_non_approvers
         ) - approvers
         logger.info(f"Pending expert reviewers: {pending_expert}")
 
-        # 6. Compute pending final reviewers
+        # 7. Compute pending final reviewers
         final_pending_members = self._get_teams_members(final_team_slugs)
         final_non_approvers = non_approvers & all_excluded_members
         pending_final = (final_pending_members | final_non_approvers) - approvers
         logger.info(f"Pending final reviewers: {pending_final}")
 
-        # 7. Determine if final review is needed at all (excluded teams are assigned)
+        # 8. Determine if final review is needed at all (excluded teams are assigned)
         excluded_who_reviewed = (approvers | non_approvers) & all_excluded_members
         needs_final_review = bool(final_team_slugs) or bool(excluded_who_reviewed)
 
-        # 8. Guard: if no reviewers exist at all, the review process hasn't started yet.
-        #    This prevents a race condition where the swap script runs before the oncall
-        #    reviewer is assigned (both trigger on ready_for_review concurrently).
+        # 9. Guard: if no codeowner reviewers exist at all, the review process hasn't started yet.
         has_any_reviewers = pending_individuals or pending_team_slugs or approvers or non_approvers
         if not has_any_reviewers and self.stage == self.EXPERT_REVIEW:
             logger.info(f"PR #{pr.number} has no reviewers assigned yet. Skipping.")
             return
 
-        # 9. State machine: update labels based on current stage and pending reviewers
+        # 10. State machine: update labels based on current stage and pending reviewers
         if self.stage == self.APPROVED:
             self._handle_approved_stage(pr, pending_expert, pending_final)
         elif self.stage == self.FINAL_REVIEW:

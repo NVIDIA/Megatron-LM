@@ -387,7 +387,8 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if self.mtp_process:
+        mtp_forward_ran = self.mtp_process
+        if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -402,7 +403,7 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers:
+        if self.config.mtp_num_layers is not None and mtp_forward_ran:
             assert self.config.mtp_num_layers > 0
             # The new process_mtp_loss function doesn't handle mtp_logits_cache,
             # so we manually generate and cache MTP logits when in inference mode.
