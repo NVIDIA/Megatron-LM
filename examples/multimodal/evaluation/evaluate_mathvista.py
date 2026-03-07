@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import json
 import re
@@ -73,7 +75,8 @@ def extract_answer(text):
 
 def compute_mathvista_accuracy(result_file):
     """Compute MathVista accuracy."""
-    merged_results = json.load(open(result_file))
+    with open(result_file, "r") as f:
+        merged_results = json.load(f)
 
     vqa = VQAEval(vqa=None, vqaRes=None)
     acc = 0

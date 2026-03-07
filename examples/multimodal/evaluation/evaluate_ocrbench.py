@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import json
 
@@ -32,7 +34,8 @@ def merge_input_files(input_path):
 
 def compute_ocrbench_score(result_file):
     """Compute OCRBench score."""
-    merged_results = json.load(open(result_file))
+    with open(result_file, "r") as f:
+        merged_results = json.load(f)
 
     # OCRBench score calculation is adopted from https://github.com/Yuliang-Liu/MultimodalOCR/blob/1b7713f44c91f30f64efb6d3e494c416861ef15f/example.py#L1
     # MIT License. Copyright (c) 2023 Yuliang Liu
