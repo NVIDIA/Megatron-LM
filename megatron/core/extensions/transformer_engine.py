@@ -2330,6 +2330,7 @@ try:
         activation_offloading,
         weight_offloading,
         double_buffering,
+        retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
@@ -2341,6 +2342,7 @@ try:
                 activation_offloading,
                 weight_offloading,
                 double_buffering,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
