@@ -544,7 +544,11 @@ class TopKRouter(Router):
                 layer_number = self.layer_number
 
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss",
+                z_loss / moe_z_loss_coeff,
+                layer_number,
+                num_layers,
+                avg_group=self.tp_dp_cp_group,
             )
         return logits
 
