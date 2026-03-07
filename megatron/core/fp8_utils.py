@@ -566,6 +566,16 @@ if HAVE_TE:
                 fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
                     fp8_format=fp8_format
                 )
+                # Prevent Inf scales when gradient blocks are all-zero (e.g. in
+                # RL training when advantages are zero on the first step).
+                # Float8BlockScaling defaults amax_epsilon=0, which yields
+                # scale = max_fp8 / 0 = Inf for zero-gradient blocks, causing
+                # the NaN/Inf grad-norm check to fire.  Setting a small epsilon
+                # keeps scales finite without affecting numerics in practice.
+                _use_p2 = fp8_recipe.fp8_quant_bwd_grad.power_2_scale
+                fp8_recipe.fp8_quant_bwd_grad = transformer_engine.common.recipe.QParams(
+                    power_2_scale=_use_p2, amax_epsilon=1e-12
+                )
             elif config.fp8_recipe == Fp8Recipe.mxfp8:
                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
                     fp8_format=fp8_format
