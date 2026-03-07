@@ -38,6 +38,8 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
+    streaming: bool = False
+    generation_batch_size: int = 1
 
 
 class Rollout(AgentBaseModel):
@@ -182,32 +184,67 @@ class GroupedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        # If num_groups is -1, we generate a stream of groups.
-        # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.
+        # When streaming, use buffer_size to create backpressure
+        # for balanced generation in a multi-task setting.
         grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
-            maxsize=self.buffer_size if request.num_groups < 0 else 0
+            maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
 
-        @trace_async_exceptions(verbose=True)
-        async def group_task():
-            nonlocal submitted_groups
-            while request.num_groups == -1 or submitted_groups < request.num_groups:
-                submitted_groups += 1
-                group = await self.group_rollout(request=request)
-                if (
-                    not request.filter_groups_with_same_reward
-                    or np.std([r.reward for r in group]) > 1e-6
-                ):
-                    await grouped_rollouts.put(group)
-                else:
-                    submitted_groups -= 1
+        # generation_batch_size controls how many groups each worker generates and yields together.
+        # When it's set to 1, the semaphore is a no-op.
+        groups_per_worker = request.generation_batch_size
+        if groups_per_worker > 1:
+            assert not request.filter_groups_with_same_reward, \
+                "Filtering is not supported with generation_batch_size > 1"
+        num_workers = self.parallel_generation_tasks // groups_per_worker
+        submission_gate = asyncio.Semaphore(num_workers)
 
-        tasks = [asyncio.create_task(group_task()) for _ in range(self.parallel_generation_tasks)]
+        async def generate_and_enqueue(batch_id, index_in_batch):
+            group = await self.group_rollout(request=request)
+            if (
+                not request.filter_groups_with_same_reward
+                or np.std([r.reward for r in group]) > 1e-6
+            ):
+                for rollout in group:
+                    rollout.submission_index = batch_id * groups_per_worker + index_in_batch
+                    rollout.batch_id = batch_id
+                await grouped_rollouts.put(group)
+                return True
+            return False
+
+        @trace_async_exceptions(verbose=True)
+        async def generate_task():
+            nonlocal submitted_groups
+            while request.streaming or submitted_groups < self.parallel_generation_tasks:
+                await submission_gate.acquire()
+                batch_id = submitted_groups // groups_per_worker
+                submitted_groups += groups_per_worker
+                if groups_per_worker > 1:
+                    await asyncio.gather(*[
+                        generate_and_enqueue(batch_id, i)
+                        for i in range(groups_per_worker)
+                    ])
+                else:
+                    if not await generate_and_enqueue(batch_id, 0):
+                        submitted_groups -= groups_per_worker
+                        submission_gate.release()
+
+        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
         try:
+            next_batch_id = 0
+            pending: dict[int, list[list[Rollout]]] = {}
             while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                yield await grouped_rollouts.get()
+                group = await grouped_rollouts.get()
+                pending.setdefault(group[0].batch_id, []).append(group)
+                if len(pending.get(next_batch_id, [])) >= groups_per_worker:
+                    batch = pending.pop(next_batch_id)
+                    batch.sort(key=lambda g: g[0].submission_index)
+                    next_batch_id += 1
+                    for g in batch:
+                        yield g
+                    submission_gate.release()
         finally:
             for task in tasks:
                 task.cancel()
