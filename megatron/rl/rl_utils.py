@@ -456,7 +456,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             streaming=streaming,
-            batch_results=args.rl_batch_results,
+            generation_batch_size=args.rl_generation_batch_size,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
