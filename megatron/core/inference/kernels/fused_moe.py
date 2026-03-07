@@ -137,7 +137,140 @@ def compute_expert_offsets(
 
 
 # =========================================================================== #
-# Permute / unpermute kernels
+# Fused permute + MXFP8 quantize kernel
+# =========================================================================== #
+@triton.jit
+def _permute_quantize_kernel(
+    hidden_ptr, probs_ptr, routing_map_ptr,
+    out_fp8_ptr, out_scale_ptr, out_probs_ptr, out_src_idx_ptr,
+    counters_ptr,
+    num_tokens, K,
+    n_col_blocks,
+    topk: tl.constexpr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """Fused permute + MXFP8 quantize + swizzle in one kernel.
+
+    Grid: (num_tokens * topk,) — one program per (token, k) pair.
+    Reads BF16 from source token, quantizes to FP8 e4m3, writes FP8 data +
+    swizzled e8m0 scales to the permuted write position.
+    """
+    pair = tl.program_id(0)
+    tok = pair // topk
+    k = pair % topk
+    if tok >= num_tokens:
+        return
+    eid = tl.load(routing_map_ptr + tok * topk + k)
+    lid = eid - local_expert_start
+    if lid < 0 or lid >= num_local_experts:
+        return
+
+    pos = tl.atomic_add(counters_ptr + lid, 1)
+
+    # Load full row from source token
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Per-group-of-32 quantization
+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+    abs_grouped = tl.abs(x_grouped)
+    max_vals = tl.max(abs_grouped, axis=1)
+
+    dequant_scale = max_vals / 448.0
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+    quantized = x_grouped * quant_scale[:, None]
+    quantized_flat = tl.reshape(quantized, [BLOCK_K])
+    out_fp8 = quantized_flat.to(tl.float8e4nv)
+
+    # Store FP8 data at permuted position
+    tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
+
+    # Store swizzled scales at permuted position
+    scale_exp = (dequant_exp >> 23).to(tl.uint8)
+    col_offs = tl.arange(0, BLOCK_GROUPS)
+    col_mask = col_offs < REAL_GROUPS
+
+    macro_row_block = pos // 128
+    macro_col_block = col_offs // 4
+    local_row = pos % 128
+    local_col = col_offs % 4
+    group = local_row // 32
+    sub_row = local_row % 32
+    tile_idx = macro_row_block * n_col_blocks + macro_col_block
+    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+
+    tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+    # Store prob and source index
+    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+    tl.store(out_src_idx_ptr + pos, tok)
+
+
+def permute_and_quantize(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    output_size: int,
+) -> tuple:
+    """Fused permute + MXFP8 quantize + swizzle.
+
+    Reads BF16 from source tokens, quantizes to FP8, writes directly to
+    permuted positions with swizzled scales. Single kernel launch replaces
+    permute_tokens + mxfp8_quantize.
+
+    NOTE: expert_offsets is mutated in-place via atomic adds.
+
+    Returns:
+        (out_fp8, out_scale, out_probs, out_src_idx):
+            out_fp8: [output_size, K] float8_e4m3fn
+            out_scale: 1D swizzled e8m0 scales
+            out_probs: [output_size] routing probs
+            out_src_idx: [output_size] source token indices (-1 for padding)
+    """
+    num_tokens, K = hidden_states.shape
+    topk = probs.shape[1]
+    assert K % 32 == 0
+
+    scale_cols = K // 32
+    n_row_blocks = _ceil_div(output_size, 128)
+    n_col_blocks = _ceil_div(scale_cols, 4)
+    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+
+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)
+    out_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
+    out_src_idx = torch.full((output_size,), -1, dtype=torch.int32, device=probs.device)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_GROUPS = BLOCK_K // 32
+
+    _permute_quantize_kernel[(num_tokens * topk,)](
+        hidden_states, probs, routing_map,
+        out_fp8, out_scale, out_probs, out_src_idx,
+        expert_offsets,
+        num_tokens, K, n_col_blocks,
+        topk, local_expert_start, num_local_experts,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_GROUPS,
+    )
+
+    return out_fp8, out_scale.view(torch.float8_e8m0fnu), out_probs, out_src_idx
+
+
+# =========================================================================== #
+# Permute / unpermute kernels (BF16 path)
 # =========================================================================== #
 @triton.jit
 def _permute_tokens_kernel(
@@ -306,22 +439,122 @@ def padded_swiglu(
 
 
 # =========================================================================== #
+# Fused activation + MXFP8 quantize kernels
+# =========================================================================== #
+@triton.jit
+def _squared_relu_quantize_kernel(
+    input_ptr, out_fp8_ptr, out_scale_ptr, src_idx_ptr,
+    K,
+    n_col_blocks,
+    skip_padding: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """Fused squared ReLU + MXFP8 quantize + swizzle in one kernel.
+
+    Grid: (M,) — one program per row.
+    Reads BF16 FC1 output, applies squared ReLU, quantizes to FP8,
+    writes FP8 data + swizzled scales in place.
+    """
+    row = tl.program_id(0)
+    if skip_padding:
+        if tl.load(src_idx_ptr + row) < 0:
+            return
+
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+
+    # Load and apply squared ReLU
+    x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
+    relu = tl.maximum(x, 0.0)
+    activated = relu * relu
+
+    # Per-group-of-32 quantization
+    x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
+    abs_grouped = tl.abs(x_grouped)
+    max_vals = tl.max(abs_grouped, axis=1)
+
+    dequant_scale = max_vals / 448.0
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+    quantized = x_grouped * quant_scale[:, None]
+    quantized_flat = tl.reshape(quantized, [BLOCK_K])
+    out_fp8 = quantized_flat.to(tl.float8e4nv)
+
+    # Store FP8 data
+    tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
+
+    # Store swizzled scales
+    scale_exp = (dequant_exp >> 23).to(tl.uint8)
+    col_offs = tl.arange(0, BLOCK_GROUPS)
+    col_mask = col_offs < REAL_GROUPS
+
+    macro_row_block = row // 128
+    macro_col_block = col_offs // 4
+    local_row = row % 128
+    local_col = col_offs % 4
+    group = local_row // 32
+    sub_row = local_row % 32
+    tile_idx = macro_row_block * n_col_blocks + macro_col_block
+    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+
+    tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+
+def squared_relu_and_quantize(
+    x: torch.Tensor,
+    source_indices: torch.Tensor,
+    skip_padding: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused squared ReLU + MXFP8 quantize + swizzle.
+
+    Reads BF16 FC1 output, applies squared ReLU, quantizes to FP8 with
+    swizzled scales. Single kernel replaces padded_squared_relu + mxfp8_quantize.
+
+    Returns:
+        (out_fp8, out_scale):
+            out_fp8: [M, K] float8_e4m3fn
+            out_scale: 1D swizzled e8m0 scales
+    """
+    M, K = x.shape
+    assert K % 32 == 0
+
+    scale_cols = K // 32
+    n_row_blocks = _ceil_div(M, 128)
+    n_col_blocks = _ceil_div(scale_cols, 4)
+    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+
+    out_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_GROUPS = BLOCK_K // 32
+
+    _squared_relu_quantize_kernel[(M,)](
+        x, out_fp8, out_scale, source_indices,
+        K, n_col_blocks,
+        skip_padding,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_GROUPS,
+    )
+
+    return out_fp8, out_scale.view(torch.float8_e8m0fnu)
+
+
+# =========================================================================== #
 # MXFP8 helpers
 # =========================================================================== #
-def _mxfp8_grouped_mm(
-    x_bf16: torch.Tensor, weight: MXFP8Tensor, offs: torch.Tensor,
+def _mxfp8_grouped_gemm(
+    act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor,
 ) -> torch.Tensor:
-    """MXFP8 quantize activations + scaled_grouped_mm."""
-    assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
-    act = MXFP8Tensor.from_bf16_torch(x_bf16)
-    K = x_bf16.shape[-1]
-    # swizzle_scales pads rows to multiples of 128 and cols to multiples of 4.
-    # Reshape 1D swizzled scale to 2D: (padded_M, padded_cols).
-    n_col_blocks = _ceil_div(K // 32, 4)
-    padded_cols = n_col_blocks * 4
+    """MXFP8 scaled_grouped_mm with pre-quantized activations and weights."""
     return scaled_grouped_mm(
         act.data, weight.data.transpose(1, 2),
-        act.scale.reshape(-1, padded_cols), _RECIPE,
+        act.scale_2d(), _RECIPE,
         weight.scale, _RECIPE,
         swizzle_a=_SWIZZLE, swizzle_b=_SWIZZLE,
         offs=offs, output_dtype=torch.bfloat16,
@@ -393,16 +626,9 @@ def mcore_fused_moe(
     num_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
 
-    if use_mxfp8:
-        assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available"
-        mm_fn = _mxfp8_grouped_mm
-    else:
-        assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
-        mm_fn = _bf16_grouped_mm
-
     activation_func = _get_activation_func(activation_type, skip_padding)
 
-    # --- Permute ---
+    # --- Common: compute expert offsets ---
     tokens_per_expert = compute_local_tokens_per_expert(
         routing_map, local_expert_start, num_local_experts,
     )
@@ -414,24 +640,57 @@ def mcore_fused_moe(
         num_tokens * min(topk, num_local_experts)
         + expert_alignment * num_local_experts
     )
-    permuted_hidden, permuted_probs, source_indices = permute_tokens(
-        hidden_states, probs, routing_map, padded_exc,
-        local_expert_start, num_local_experts,
-        output_size=max_output_size,
-    )
     offs = padded_inc
 
-    if permuted_hidden.nelement() == 0:
-        return torch.zeros_like(hidden_states)
+    if use_mxfp8:
+        assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available"
 
-    # --- FC1 ---
-    fc1_output = mm_fn(permuted_hidden, fc1_weight, offs)
+        # --- Fused permute + quantize (FC1 input) ---
+        permuted_fp8, permuted_scale, permuted_probs, source_indices = (
+            permute_and_quantize(
+                hidden_states, probs, routing_map, padded_exc,
+                local_expert_start, num_local_experts,
+                output_size=max_output_size,
+            )
+        )
 
-    # --- Activation (padding-aware) ---
-    activated = activation_func(fc1_output, source_indices)
+        if permuted_fp8.nelement() == 0:
+            return torch.zeros_like(hidden_states)
 
-    # --- FC2 ---
-    fc2_output = mm_fn(activated, fc2_weight, offs)
+        # --- FC1: scaled_grouped_mm with pre-quantized activations ---
+        permuted_act = MXFP8Tensor(data=permuted_fp8, scale=permuted_scale)
+        fc1_output = _mxfp8_grouped_gemm(permuted_act, fc1_weight, offs)
+
+        # --- Fused activation + quantize (FC2 input) ---
+        if activation_type == ActivationType.SQUARED_RELU:
+            fc2_fp8, fc2_scale = squared_relu_and_quantize(
+                fc1_output, source_indices, skip_padding=skip_padding,
+            )
+            fc2_act = MXFP8Tensor(data=fc2_fp8, scale=fc2_scale)
+        else:
+            # SwiGLU: separate activation + quantize (TODO: fuse)
+            activated = activation_func(fc1_output, source_indices)
+            fc2_act = MXFP8Tensor.from_bf16_torch(activated)
+
+        # --- FC2 ---
+        fc2_output = _mxfp8_grouped_gemm(fc2_act, fc2_weight, offs)
+
+    else:
+        assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
+
+        # --- BF16 path: permute + grouped_mm ---
+        permuted_hidden, permuted_probs, source_indices = permute_tokens(
+            hidden_states, probs, routing_map, padded_exc,
+            local_expert_start, num_local_experts,
+            output_size=max_output_size,
+        )
+
+        if permuted_hidden.nelement() == 0:
+            return torch.zeros_like(hidden_states)
+
+        fc1_output = _bf16_grouped_mm(permuted_hidden, fc1_weight, offs)
+        activated = activation_func(fc1_output, source_indices)
+        fc2_output = _bf16_grouped_mm(activated, fc2_weight, offs)
 
     # --- Unpermute ---
     return unpermute_tokens(fc2_output, permuted_probs, source_indices, num_tokens)

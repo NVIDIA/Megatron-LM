@@ -95,6 +95,20 @@ class MXFP8Tensor:
         """Wrapper for calling self.data.size()"""
         return self.data.size(idx)
 
+    def scale_2d(self, K: Optional[int] = None) -> torch.Tensor:
+        """Reshape 1D swizzled scale to 2D for scaled_grouped_mm / scaled_mm.
+
+        Swizzle pads rows to multiples of 128 and cols to multiples of 4.
+        Returns (padded_M, padded_cols) where padded_cols = ceil(K//32, 4) * 4.
+        """
+        if self.scale.dim() == 2:
+            return self.scale
+        if K is None:
+            K = self.data.shape[-1]
+        n_col_blocks = _ceil_div(K // 32, 4)
+        padded_cols = n_col_blocks * 4
+        return self.scale.reshape(-1, padded_cols)
+
     @classmethod
     def from_bf16_flashinfer(cls, x: torch.Tensor, group_size: int = 32):
         """Quantize BF16 tensor to MXFP8 using FlashInfer (single fused CUDA kernel)."""
