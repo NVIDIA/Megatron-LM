@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from typing import Dict, List, Optional
@@ -19,6 +19,15 @@ CHECK_THRESHOLDS = {
     "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "generated_tokens": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "logprobs": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "load_balancing_loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "seq_load_balancing_loss": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol=0, rtol=0.05),
+    ],
+    "global_load_balancing_loss": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol=0, rtol=0.05),
+    ],
 }
 
 

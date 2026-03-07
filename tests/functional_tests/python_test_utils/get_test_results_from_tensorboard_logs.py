@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -63,6 +64,9 @@ def collect_train_test_metrics(
             "lm loss",
             "num-zeros",
             "mtp_1 loss",
+            "load_balancing_loss",
+            "seq_load_balancing_loss",
+            "global_load_balancing_loss",
         ]
     }
 
