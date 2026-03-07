@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import json
 import logging
 import time
 import traceback
@@ -11,6 +12,128 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
+
+
+def _get_field(obj, key, default=None):
+    """Read a field from dict-like or object-like values."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalize_tool_calls(tool_calls):
+    """Normalize tool calls to OpenAI-compatible JSON primitives."""
+    normalized = []
+    for call in tool_calls or []:
+        fn = _get_field(call, "function", {}) or {}
+        fn_name = _get_field(fn, "name")
+        fn_args = _get_field(fn, "arguments", "")
+        if fn_name is None:
+            continue
+        if not isinstance(fn_args, str):
+            try:
+                fn_args = json.dumps(fn_args, ensure_ascii=False)
+            except TypeError:
+                fn_args = str(fn_args)
+        normalized.append(
+            {
+                "id": str(_get_field(call, "id", f"call_{uuid.uuid4().hex[:24]}")),
+                "type": "function",
+                "function": {"name": str(fn_name), "arguments": fn_args},
+            }
+        )
+    return normalized
+
+
+def _coerce_arguments_mapping(arguments):
+    """Coerce function.arguments to a mapping for HF/Jinja chat templates.
+
+    Examples:
+    - {"x": 1} -> {"x": 1}
+    - '{"x": 1}' -> {"x": 1}
+    - "[1, 2]" -> {}  # JSON parses, but not a mapping
+    - "not-json" -> {}
+    - None -> {}
+    """
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _sanitize_messages_for_template(messages):
+    """Prepare messages so tokenizer chat templates can safely consume them.
+
+    This only normalizes tool-call argument payloads inside each message:
+    - messages[*].tool_calls[*].function.arguments is coerced to a dict.
+
+    Example transformation:
+    Input:
+      [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}}]}]
+    Output:
+      [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": {"x": 1}}}]}]
+
+    Another example:
+    - arguments: "[1,2,3]" -> arguments: {}
+    """
+    if not isinstance(messages, list):
+        return messages
+    sanitized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            continue
+        msg_copy = dict(message)
+        tool_calls = msg_copy.get("tool_calls")
+        if isinstance(tool_calls, list):
+            sanitized_tool_calls = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    sanitized_tool_calls.append(call)
+                    continue
+                call_copy = dict(call)
+                function = call_copy.get("function")
+                if isinstance(function, dict):
+                    function_copy = dict(function)
+                    function_copy["arguments"] = _coerce_arguments_mapping(function_copy.get("arguments", {}))
+                    call_copy["function"] = function_copy
+                sanitized_tool_calls.append(call_copy)
+            msg_copy["tool_calls"] = sanitized_tool_calls
+        sanitized.append(msg_copy)
+    return sanitized
+
+
+def _sanitize_tools_for_template(tools):
+    """Ensure tools payload is template-safe and has mapping parameters.
+
+    Example transformations:
+    - {"function": {"name": "f", "parameters": "not-a-dict"}}
+      -> {"function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}
+    - non-dict tool entries are dropped.
+    - non-list input returns None.
+    """
+    if not isinstance(tools, list):
+        return None
+
+    sanitized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_copy = dict(tool)
+        function = tool_copy.get("function")
+        if isinstance(function, dict):
+            function_copy = dict(function)
+            if not isinstance(function_copy.get("parameters"), dict):
+                function_copy["parameters"] = {"type": "object", "properties": {}}
+            tool_copy["function"] = function_copy
+        sanitized.append(tool_copy)
+    return sanitized
+
 
 try:
     import orjson
@@ -47,6 +170,12 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        tools = req.get("tools", None)
+        tools_requested = bool(tools)
+        chat_template_kwargs = req.get("chat_template_kwargs", {})
+        if not isinstance(chat_template_kwargs, dict):
+            logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__)
+            chat_template_kwargs = {}
 
         # --- 1. Parse Messages ---
         messages = req.get("messages")
@@ -54,14 +183,16 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        template_messages = _sanitize_messages_for_template(messages)
+        template_tools = _sanitize_tools_for_template(tools)
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages,
+                template_messages,
                 tokenize=True,
                 add_generation_prompt=True,
-                tools=req.get("tools", None),
-                **req.get("chat_template_kwargs", {}),
+                tools=template_tools,
+                **chat_template_kwargs,
             )
         except (AttributeError, AssertionError):
             warnings.warn(
@@ -195,12 +326,24 @@ try:
             message_text = text_output
 
             if parsers:
-                message_text, metadata = apply_parsers(
-                    message_text, req.get("tools", None), parsers
+                parsed_text, new_info = apply_parsers(
+                    message_text, tools=tools, parsers=parsers
                 )
+                prev_text = message_text
+                if "tool_calls" in new_info:
+                    new_info["tool_calls"] = _normalize_tool_calls(new_info.get("tool_calls", []))
+                    if not tools_requested:
+                        # Ignore incidental tool-call syntax in plain chat mode.
+                        parsed_text = prev_text
+                        new_info.pop("tool_calls", None)
+                message_text = parsed_text
+                assert not (
+                    metadata.keys() & new_info.keys()
+                ), "Multiple parsers found the same information."
+                metadata.update(new_info)
 
             message = {"role": "assistant", "content": message_text}
-            if "tool_calls" in metadata:
+            if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
                 message["reasoning"] = metadata["reasoning"]
