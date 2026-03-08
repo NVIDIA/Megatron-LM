@@ -2173,7 +2173,9 @@ def _add_regularization_args(parser):
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer')
+                       help='Scale mode for Muon optimizer. With MuP, set '
+                       '--muon-scale-mode unit_rms_norm for MuP-principled scaling, '
+                       'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
