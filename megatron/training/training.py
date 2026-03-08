@@ -1065,11 +1065,14 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not args.skip_train:
-        print_rank_0('training ...')
+    if not args.skip_train or args.perform_rl_step:
+        if args.skip_train:
+            print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
+        else:
+            print_rank_0('training ...')
 
         iteration = 0
-        if args.do_train and args.train_iters > 0:
+        if args.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
@@ -1086,7 +1089,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if args.save and iteration != 0 and iteration % args.save_interval != 0:
+        if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(
                 iteration,
                 model,
@@ -1109,7 +1112,7 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        if getattr(args, 'perform_rl_step', False):
+        if args.perform_rl_step:
             rl_eval_model = model
             rl_training_model = None
             if inference_model is not None:
@@ -1164,7 +1167,7 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
     ft_integration.shutdown()
@@ -1500,12 +1503,15 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-    wrap_with_ddp = not args.skip_train
+    # RL inference-only mode (skip_train + perform_rl_step) still needs DDP and
+    # optimizer for the rollout collection loop inside train().
+    skip_optimizer = args.skip_train and not args.perform_rl_step
+    wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    if args.skip_train:
+    if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
@@ -1922,7 +1928,7 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
                               'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
                               'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
@@ -1998,7 +2004,7 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if getattr(args, 'perform_rl_step', False):
+        if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
             if wandb_writer:
@@ -2515,47 +2521,53 @@ def train(
     args = get_args()
     timers = get_timers()
 
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
     # Additional variable initialization for RL training
-    if getattr(args, 'perform_rl_step', False):
-        print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-        load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-        args.no_load_optim = True
+    if args.perform_rl_step:
+        if args.skip_train:
+            # In inference-only mode, use current weights as reference
+            # (no training updates, so policy == reference).
+            print_rank_0("> RL inference-only: using current weights as reference.")
+            ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+        else:
+            print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
+            load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
+            args.no_load_optim = True
 
-        # Load pretrained checkpoint
-        args.load = None
-        args.finetune = True
-        load_checkpoint(
-                model,
-                None,  # Don't load optimizer state
-                None,  # Don't load scheduler state
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-            )
-        ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            # Load pretrained checkpoint
+            args.load = None
+            args.finetune = True
+            load_checkpoint(
+                    model,
+                    None,  # Don't load optimizer state
+                    None,  # Don't load scheduler state
+                    checkpointing_context=checkpointing_context,
+                    skip_load_to_model_and_opt=HAVE_FSDP2
+                    and getattr(args, "use_torch_fsdp2", False)
+                    and args.ckpt_format == "torch_dist",
+                )
+            ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
-        # Reload RL training checkpoint weights
-        args.load = load
-        args.finetune = finetune
-        print_rank_0("> Reloading RL training checkpoint...")
-        load_checkpoint(
-                model,
-                None,
-                None,
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-            )
+            # Reload RL training checkpoint weights
+            args.load = load
+            args.finetune = finetune
+            print_rank_0("> Reloading RL training checkpoint...")
+            load_checkpoint(
+                    model,
+                    None,
+                    None,
+                    checkpointing_context=checkpointing_context,
+                    skip_load_to_model_and_opt=HAVE_FSDP2
+                    and getattr(args, "use_torch_fsdp2", False)
+                    and args.ckpt_format == "torch_dist",
+                )
 
-        args.no_load_optim = no_load_optim
+            args.no_load_optim = no_load_optim
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
@@ -2864,7 +2876,7 @@ def train(
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
-        if getattr(args, 'perform_rl_step', False):
+        if args.perform_rl_step:
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
                     model, inference_model, optimizer, iteration, ref_state_dict,
@@ -2880,20 +2892,31 @@ def train(
                 # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
-        ft_integration.on_training_step_start()
-        (
-            loss_dict,
-            skipped_iter,
-            should_checkpoint,
-            should_exit,
-            exit_code,
-            grad_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-        ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-        )
-        ft_integration.on_training_step_end()
+        if args.skip_train:
+            # RL inference-only mode: skip gradient updates, just collect rollouts.
+            loss_dict = {}
+            skipped_iter = 0
+            should_checkpoint = False
+            should_exit = False
+            exit_code = 0
+            grad_norm = 0.0
+            num_zeros_in_grad = 0
+            max_attention_logit = None
+        else:
+            ft_integration.on_training_step_start()
+            (
+                loss_dict,
+                skipped_iter,
+                should_checkpoint,
+                should_exit,
+                exit_code,
+                grad_norm,
+                num_zeros_in_grad,
+                max_attention_logit,
+            ) = train_step(
+                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+            )
+            ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -2950,7 +2973,7 @@ def train(
                     if pad_buf is not None:
                         pad_buf.manual_buffer_registration()
 
-        if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
+        if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
@@ -3021,7 +3044,7 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            if getattr(args, 'perform_rl_step', False):
+            if args.perform_rl_step:
                 rl_eval_model = model
                 rl_training_model = None
                 # If separate inference and training models, swap training weights
@@ -3126,7 +3149,7 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
-        if getattr(args, 'perform_rl_step', False):
+        if args.perform_rl_step:
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
@@ -3479,14 +3502,14 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets and dataloders.
-        if getattr(args, 'perform_rl_step', True):
+        if args.perform_rl_step:
             # we don't need to build any dataloaders for RL training
             train_dataloader = None
             valid_dataloaders = None
             test_dataloader = None
-            do_train = args.train_iters > 0
+            do_train = (args.train_iters or 0) > 0
             do_valid = (args.full_validation or args.eval_iters > 0)
-            do_test = (args.full_validation or args.eval_iters > 0)
+            do_test = False
 
         else:
             # Build datasets.
@@ -3524,9 +3547,6 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
-    if getattr(args, 'perform_rl_step', False):
-        args.to_test = False
-
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
