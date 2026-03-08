@@ -427,9 +427,6 @@ def validate_args(args, defaults={}):
             args.rl_generation_batch_size = (
                 args.rl_generation_batch_size // args.grpo_group_size)
 
-        # Derive enforce_order from whether --rl-generation-batch-size was explicitly set.
-        args.rl_enforce_generation_order = (args.rl_generation_batch_size is not None)
-
         # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
         assert args.rl_num_parallel_generations is None \
             or args.rl_num_parallel_generation_batches is None, \
@@ -457,6 +454,9 @@ def validate_args(args, defaults={}):
                 args.rl_generation_batch_size = 1
             args.rl_parallel_generation_tasks = 512
 
+        # Derive enforce_order after all resolution is complete.
+        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -464,7 +464,7 @@ def validate_args(args, defaults={}):
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
         # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
-            "grpo_group_size * grpo_prompts_per_step * grpo_iterations "
+            "grpo_group_size * grpo_prompts_per_step * grpo_iterations " \
             "should be divisible by global_batch_size"
 
         # For now only exit/checkpoint on iterations where we generate data. We don't currently
