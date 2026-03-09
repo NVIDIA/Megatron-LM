@@ -7,7 +7,6 @@
 
 import logging
 import math
-import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -39,6 +38,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
+    is_using_quantization_scales,
     log_single_rank,
 )
 
@@ -163,10 +163,6 @@ class MambaMixer(MegatronModule):
         # Fused kernel and sharding options
         chunk_size=128,
         layer_number=None,
-        use_mem_eff_path=None,
-        d_state=None,
-        headdim=None,
-        ngroups=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
     ):
@@ -194,33 +190,6 @@ class MambaMixer(MegatronModule):
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
-
-        # Check for deprecated arguments and raise warnings
-        if use_mem_eff_path is not None:
-            warnings.warn(
-                "The 'use_mem_eff_path' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if d_state is not None:
-            warnings.warn(
-                "The 'd_state' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if headdim is not None:
-            warnings.warn(
-                "The 'headdim' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if ngroups is not None:
-            warnings.warn(
-                "The 'ngroups' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -519,6 +488,11 @@ class MambaMixer(MegatronModule):
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
+        # Clear the outputs for padding tokens when using quantization scales
+        # to avoid corrupting amax calculations
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
+
         # Output projection
         out, out_bias = self.out_proj(y)
 
@@ -533,8 +507,14 @@ class MambaMixer(MegatronModule):
     ) -> torch.Tensor:
         """Helper to run dynamic inference prefill (chunked prefill request separately)."""
         metadata = context.mamba_metadata
-        prefill_req_count = context.padded_batch_dimensions.prefill_req_count
+
+        # Use the regular prefill request count to determine if regular
+        # prefill path needs to be run when chunked prefill is enabled
+        prefill_req_count = context.batch_dimensions.prefill_req_count
+
+        # Padded prefill token count
         prefill_token_count = zxBCdt.shape[0]
+
         enable_chunked_prefill = context.is_chunked_prefill_enabled()
 
         y_chunked = None
@@ -648,7 +628,7 @@ class MambaMixer(MegatronModule):
                 _check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
-            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+            seq_idx = packed_seq_params.seq_idx
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
@@ -676,36 +656,6 @@ class MambaMixer(MegatronModule):
             y = self.norm(y)
 
         return y
-
-    def _create_packed_seq_idx(self, packed_seq_params: PackedSeqParams, total_tokens: int):
-        """
-        If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
-        (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
-        [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
-        which is [0]*(5-0) + [1]*(7-5) + [2]*(11-7) + [3]*(16-11)
-        In the above example, there are three sequences in the pack.
-        In general, the output has an additional sequence index (e.g. 0, 1, 2, 3) so that any tokens
-        beyond the last padded input sequence are accounted for as an extra sequence. However, If
-        cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
-        included.
-        """
-        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
-        if packed_seq_params.cu_seqlens_q_padded is not None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-        else:
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-        total_tokens_tensor = torch.tensor(
-            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-        )
-        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
-        # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
-        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-        # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
-        seq_idx = torch.repeat_interleave(
-            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
-        )
-        seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
-        return seq_idx
 
     def _ssm_prefill(
         self,
@@ -796,14 +746,20 @@ class MambaMixer(MegatronModule):
             xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
+            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+            # tensors to the conv state dtype for causal_conv1d_fn and then cast xBC
+            # back to the original dtype
+            xBC_dtype = xBC.dtype
+            conv_state_dtype = xBC_dtype if conv_state is None else conv_state.dtype
+            weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
             xBC = causal_conv1d_fn(
-                x=xBC,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
+                x=xBC.to(conv_state_dtype),
+                weight=weight.to(conv_state_dtype),
+                bias=self.cp.get_conv1d_bias().to(conv_state_dtype),
                 activation=self.activation,
                 seq_idx=seq_idx,
                 initial_states=initial_conv_state,
-            )
+            ).to(xBC_dtype)
 
         # transpose b pd l --> b l pd
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -940,14 +896,19 @@ class MambaMixer(MegatronModule):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=xBC.dtype)
         else:
+            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+            # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
+            # back to the original dtype
+            xBC_dtype = xBC.dtype
+            weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
             xBC = causal_conv1d_update(
-                xBC,
+                xBC.to(conv_state.dtype),
                 conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
+                weight.to(conv_state.dtype),
+                self.conv1d.bias.to(conv_state.dtype),
                 self.activation,
                 conv_state_indices=batch_indices,
-            )
+            ).to(xBC_dtype)
 
         x, B, C = torch.split(
             xBC,

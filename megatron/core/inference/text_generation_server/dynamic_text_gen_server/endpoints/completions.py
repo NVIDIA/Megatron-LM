@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -21,7 +21,7 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -110,15 +110,19 @@ try:
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
-        start_time = time.perf_counter()
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
+
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             return f"Error during inference: {e}", 500
 
-        logger.info(
-            f"Batch of {len(tasks)} requests processed in {time.perf_counter() - start_time:.2f}s"
-        )
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
 
         # --- 4. Format Response (matching old_completions.py) ---
         choices = []
@@ -213,4 +217,4 @@ try:
         return jsonify({"choices": choices})
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")
