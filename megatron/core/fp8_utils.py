@@ -152,10 +152,18 @@ def _resolve_callable_from_python_import_path(dotted_path: str):
     return fn
 
 
-def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, Fp4Recipe]:
+def _get_custom_recipe(
+    quantizer_factory_python_path: str,
+    fp8_dpa: bool = False,
+    fp8_mha: bool = False,
+) -> Union[Fp8Recipe, Fp4Recipe]:
     quantizer_factory = _resolve_callable_from_python_import_path(quantizer_factory_python_path)
     try:
-        custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
+        custom_recipe = transformer_engine.common.recipe.CustomRecipe(
+            qfactory=quantizer_factory,
+            fp8_dpa=fp8_dpa,
+            fp8_mha=fp8_mha,
+        )
     except AttributeError:
         raise ValueError(
             """CustomRecipe recipe is not available in this version of 
@@ -572,7 +580,11 @@ if HAVE_TE:
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
                 assert config.fp8_quantizer_factory is not None
-                fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
+                fp8_recipe = _get_custom_recipe(
+                    config.fp8_quantizer_factory,
+                    fp8_dpa=config.fp8_dot_product_attention,
+                    fp8_mha=config.fp8_multi_head_attention,
+                )
             else:
                 raise ValueError(
                     "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
