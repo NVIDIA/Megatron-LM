@@ -1101,6 +1101,36 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
+
+    if args.parameter_sharding_size > 1 or args.expert_parameter_sharding_size > 1:
+        ps_size = args.parameter_sharding_size
+        eps_size = args.expert_parameter_sharding_size
+        if get_device_arch_version() >= 10:
+            # Setting ETP communication groups for high priority streams for Blackwell and later
+            # architectures. Assigning high priority to communication streams ensures that
+            # communication kernels are scheduled with higher priority, minimizing the exposed
+            # communication when it is overlapped with other computation kernels.
+            if 'ps' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('ps')
+                warn_rank_0("Setting 'ps' group for high priority streams.")
+            if eps_size > 1 and 'expt_ps' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('expt_ps')
+                warn_rank_0("Setting 'expt_ps' group for high priority streams.")
+
+            # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
+            if args.cuda_graph_impl != "none":
+                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", \
+                    'ETP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained ETP ' \
+                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for ' \
+                    'Blackwell and later architecture.'
+
+        # Sanity check for 'NCCL_PROTO'.
+        if os.environ.get('NCCL_PROTO', '').lower() == "simple":
+            warn_rank_0(
+                "Generally ETP prefers 'NCCL_PROTO=LL128 or LL' while get 'NCCL_PROTO=simple', "
+                "force setting NCCL_PROTO=Simple might introduce bad perf."
+            )
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
