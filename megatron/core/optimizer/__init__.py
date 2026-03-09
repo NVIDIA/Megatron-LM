@@ -627,7 +627,18 @@ def _get_megatron_optimizer_based_on_param_groups(
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
-            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
+            # Besides, for Megatron-FSDP with no_shard, gradients are replicated across DP ranks (after
+            # all-reduce), so grad stats should only be reduced across model-parallel ranks
+            # (TP*PP) to avoid inflating the grad norm by sqrt(DP_world_size).
+            ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+            if (
+                ddp_config is not None
+                and getattr(ddp_config, 'use_megatron_fsdp', False)
+                and ddp_config.data_parallel_sharding_strategy == 'no_shard'
+            ):
+                setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+            else:
+                setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
