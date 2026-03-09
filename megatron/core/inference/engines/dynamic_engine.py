@@ -1023,31 +1023,31 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
-                    # TODO : SHAN Should check and change the following for speculative tokens
-                    token = tokens[0]
+                    first_token_event = None
                     if self.track_generated_token_events:
-                        if block_allocator.enable_prefix_caching:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                                blocks_ref_count=blocks_ref_count,
-                            )
-                        else:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                            )
+                        for token in tokens:
+                            if block_allocator.enable_prefix_caching:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                    blocks_ref_count=blocks_ref_count,
+                                )
+                            else:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                )
+                            if first_token_event is None:
+                                first_token_event = event
                     if is_first_token:
-                        if self.track_generated_token_events:
-                            first_token_event = event_generated_token
-                        else:
+                        if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
-                                payload={"token_id": token},
+                                payload={"token_id": tokens[0]},
                             )
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
