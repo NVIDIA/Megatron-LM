@@ -1503,9 +1503,9 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-    # RL inference-only mode (skip_train + perform_rl_step) still needs DDP and
-    # optimizer for the rollout collection loop inside train().
-    skip_optimizer = args.skip_train and not args.perform_rl_step
+    # Skip optimizer when not training. In RL inference-only mode (skip_train + perform_rl_step),
+    # --no-load-optim controls whether the optimizer is created (for memory testing) or skipped.
+    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -2527,10 +2527,11 @@ def train(
     # Additional variable initialization for RL training
     if args.perform_rl_step:
         if args.skip_train:
-            # In inference-only mode, use current weights as reference
-            # (no training updates, so policy == reference).
+            # In inference-only mode, use current weights as reference.
             print_rank_0("> RL inference-only: using current weights as reference.")
-            ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            ref_state_dict = {
+                k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
+            }
         else:
             print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
             load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
@@ -2640,7 +2641,7 @@ def train(
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
     # Setup some training config params.
-    config.grad_scale_func = optimizer.scale_loss
+    config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
     if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, (
@@ -3005,7 +3006,7 @@ def train(
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
         # Logging.
-        if not optimizer.is_stub_optimizer:
+        if optimizer is not None and not optimizer.is_stub_optimizer:
             loss_scale = optimizer.get_loss_scale().item()
         else:
             loss_scale = 1.0
@@ -3013,7 +3014,10 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+        if optimizer is not None:
+            learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+        else:
+            learning_rate = None
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,

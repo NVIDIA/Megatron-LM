@@ -991,7 +991,7 @@ def validate_args(args, defaults={}):
     args.variable_seq_lengths = False
 
     # Iteration-based training.
-    # Skip these checks when skip_train is set — LR config is irrelevant.
+    # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
@@ -1415,13 +1415,15 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    if args.skip_train and not args.no_load_optim:
+    # When perform_rl_step is set, let the user control --no-load-optim to toggle
+    # whether the optimizer is created (useful for memory testing).
+    if args.skip_train and not (args.perform_rl_step or args.no_load_optim):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
-    if args.skip_train and not args.perform_rl_step \
-            and getattr(args, 'rl_offload_optimizer_during_inference', False):
+    if args.skip_train and (not args.perform_rl_step or args.no_load_optim) \
+            and args.rl_offload_optimizer_during_inference:
         assert False, \
-            '--rl-offload-optimizer-during-inference is incompatible with --skip-train (no optimizer exists).'
+            '--rl-offload-optimizer-during-inference is incompatible (no optimizer exists).'
 
     # Muon optimizer check
     if 'muon' in args.optimizer:
@@ -2474,8 +2476,12 @@ def _add_checkpointing_args(parser):
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
-    group.add_argument('--no-load-optim', action='store_true', default=None,
+    group.add_argument('--no-load-optim', dest='no_load_optim',
+                       action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
+    group.add_argument('--load-optim', dest='no_load_optim',
+                       action='store_false',
+                       help='Load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
     group.add_argument('--use-dist-ckpt', action='store_true',
