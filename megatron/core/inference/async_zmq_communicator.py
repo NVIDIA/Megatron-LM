@@ -38,7 +38,7 @@ class AsyncZmqEndpoint:
     startup buffering (messages sent before `is_running` are queued until the event fires).
 
     Subclasses should implement `_recv_task`. Subclasses that need a handshake before `is_running`
-    should call `start(loop, set_running=False)` and set ``is_running`` in their ``_recv_task``.
+    should call `start(loop, set_running=False)` and set `is_running` in their `_recv_task`.
 
     Multiple sockets can be created by passing a list to `socket_type` (and optionally to the other
     parameters). If `process_group` is provided, bind addresses are broadcast from the leader.

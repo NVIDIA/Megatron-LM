@@ -4,11 +4,7 @@ from enum import Enum, auto
 
 
 class Headers(Enum):
-    """
-    Enum representing headers used for communication with the inference-coordinator.
-
-    Headers are sent as binary bytes (header.value.to_bytes()) in ZMQ multipart frames.
-    """
+    """Enum representing headers used for communication with the inference-coordinator."""
 
     ENGINE_CONNECT = auto()
     CLIENT_CONNECT = auto()

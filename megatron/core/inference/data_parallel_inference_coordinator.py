@@ -47,10 +47,6 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
     5.  **Control Signal Broadcasting**: It relays control signals (e.g., PAUSE, STOP)
         from a client to all connected data parallel ranks.
 
-    Sends are decoupled from the main recv loop via a send queue pattern:
-    ``_isend()`` enqueues send futures, and a background ``_send_task`` drains
-    and awaits them.
-
     Attributes:
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
@@ -89,7 +85,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         Initializes the inference coordinator.
 
         This sets up the async ZMQ context and a ROUTER socket, binding it to the
-        given port. Worker registration is deferred to the ``_recv_task`` which
+        given port. Worker registration is deferred to the `_recv_task` which
         handles ENGINE_CONNECT messages.
 
         Args:
@@ -121,6 +117,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.next_request_id = 0
         self.tokenizer = tokenizer
         self.state = self.CoordinatorState.RUNNING
+        self._is_shutdown = False
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -151,8 +148,6 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
-        # Purge this engine from the prefix-cache affinity table so
-        # get_best_data_parallel_rank won't route to a dead engine.
         for rank_info in self.hash_to_rank_info.values():
             rank_info.pop(identity, None)
         logging.warning(
@@ -416,7 +411,8 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 if identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
-                break
+                await self.shutdown()
+                return
 
             elif header == Headers.DISCONNECT:
                 if identity in self.identities_of_data_parallel_ranks:
@@ -498,9 +494,10 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         logging.info("Inference Coordinator: shut down successfully.")
 
     async def shutdown(self):
-        """
-        Stops the inference coordinator, performing any necessary cleanup operations.
-        """
+        """Stops the inference coordinator, performing any necessary cleanup operations."""
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
         if self.schedule_output_path and self.schedule_records:
             schedule_data = {
                 "policy": self.prefix_caching_coordinator_policy.value,
@@ -512,3 +509,4 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 json.dump(schedule_data, f, indent=2)
         await super().shutdown()
         self._ctx.term()
+        asyncio.get_event_loop().stop()

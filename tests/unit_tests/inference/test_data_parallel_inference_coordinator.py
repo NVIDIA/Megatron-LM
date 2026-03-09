@@ -193,7 +193,7 @@ class DummyEngine(DynamicInferenceEngine):
 async def cleanup_engine(engine, client=None, timeout=30.0):
     """Disconnect an engine between tests. The coordinator stays alive.
 
-    PAUSE is injected into each rank's pending_microbatch rather than sent through the coordinator.
+    PAUSE is injected into each rank's pending_messages rather than sent through the coordinator.
     This avoids state-mismatch bugs: the shared coordinator's state may differ from the engine's
     (e.g. the coordinator is PAUSED from a previous test while the engine is RUNNING).
     """
@@ -202,7 +202,7 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
         # Inject PAUSE locally so every rank transitions to PAUSED without
         # relying on the coordinator's current state.
         cc = engine.coordinator_client
-        cc.pending_microbatch.append((Headers.PAUSE, None))
+        cc.pending_messages.append((Headers.PAUSE, None))
         async with engine._cond:
             engine._cond.notify_all()
         await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)

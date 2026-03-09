@@ -517,8 +517,7 @@ class DynamicInferenceEngine(AbstractEngine):
             steps_before_microbatch=steps_before_microbatch,
         )
 
-        # Start communication tasks now so ENGINE_CONNECT can be sent
-        # before we block waiting for the coordinator to be ready.
+        # Start communication tasks now so ENGINE_CONNECT can be sent to the coordinator.
         loop = get_asyncio_loop(loop)
         self._loop = loop
         self.coordinator_client.start(loop)
@@ -1792,7 +1791,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            (cc and (cc.pending_microbatch or cc.world_has_signal))
+                            (cc and (cc.pending_messages or cc.world_has_signal))
                             or self.state
                             not in (EngineState.RUNNING, EngineState.PAUSED, EngineState.SUSPENDED)
                             or (

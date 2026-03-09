@@ -5,10 +5,10 @@
 Three classes:
 
 - `_DPCoordinator` (AsyncZmqEndpoint subclass): DEALER connected to the DP coordinator.
-    Receives messages and accumulates them in `pending_microbatch`. Only exists on MP coordinator ranks.
+    Receives messages and accumulates them. Only exists on MP coordinator ranks.
 
 - `_MPChannel` (AsyncZmqEndpoint subclass): PUB on the MP coordinator, SUB on followers.
-    Leader sends batched messages via PUB; followers unpack into `pending_microbatch`.
+    Leader sends batched messages via PUB; followers unpack into `pending_messages`.
 
 - `_CollectiveChannel` (AsyncZmqEndpoint subclass): Multiplexed PUSH/PULL + PUB/SUB channel
     to support collectives (all-reduce) and signals. Used for both EP consensus and global signals.
@@ -25,18 +25,18 @@ import torch
 from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.async_zmq_communicator import AsyncZmqEndpoint
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import asyncio_Queue
-from megatron.core.utils import get_pg_rank, get_pg_size, trace_async_exceptions
+from megatron.core.utils import get_asyncio_loop, get_pg_rank, get_pg_size, trace_async_exceptions
 
 
 class _DPCoordinator(AsyncZmqEndpoint):
     """DEALER socket connected to the DP coordinator (MP coordinator only).
 
-    Receives messages from the coordinator and accumulates them in
-    ``pending_microbatch``.  ``schedule_requests`` later sends the accumulated
-    batch to all MP ranks via the ``_MPChannel``.
+    Receives messages from the coordinator and accumulates them in `pending_messages`.
+    `schedule_requests` later sends the accumulated batch to all MP ranks via the `_MPChannel`.
 
     Provides `send_engine_reply` to send messages back to the coordinator.
     """
@@ -54,7 +54,7 @@ class _DPCoordinator(AsyncZmqEndpoint):
         self,
         dp_addr: str | None,
         dp_rank: int,
-        pending_microbatch: deque,
+        pending_messages: deque,
         cond: asyncio.Condition,
         *,
         process_group,
@@ -62,7 +62,7 @@ class _DPCoordinator(AsyncZmqEndpoint):
         identity = f'mp-coord-{dp_rank}'
         super().__init__("DEALER", identity=identity, connect=dp_addr, process_group=process_group)
 
-        self._pending_microbatch = pending_microbatch
+        self._pending_messages = pending_messages
         self._cond = cond
         self._world_channel = None
 
@@ -75,16 +75,15 @@ class _DPCoordinator(AsyncZmqEndpoint):
 
     @trace_async_exceptions
     async def _recv_task(self):
-        """Receive from the coordinator and accumulate in pending_microbatch."""
+        """Receive from the coordinator and accumulate in pending_messages."""
         while True:
             try:
                 _, header, data = await self._irecv()
-                if self._world_channel is not None and header in self._CONTROL_HEADERS:
-                    if self._world_channel._is_leader:
+                if header in self._CONTROL_HEADERS:
+                    if self._world_channel is not None and self._world_channel._is_leader:
                         self._world_channel.notify_has_signal(header)
-                    # Non-leader MP coordinators: drop. Signal arrives via world channel.
                 else:
-                    self._pending_microbatch.append((header, data))
+                    self._pending_messages.append((header, data))
                     async with self._cond:
                         self._cond.notify_all()
             except asyncio.CancelledError:
@@ -103,14 +102,14 @@ class _DPCoordinator(AsyncZmqEndpoint):
 class _MPChannel(AsyncZmqEndpoint):
     """PUB/SUB channel for broadcasting batched messages to all MP ranks.
 
-    Leader (MP coordinator) sends batches via PUB from ``schedule_requests``.
-    Followers listen via SUB, unpack the batch into ``pending_microbatch``,
-    and signal ``microbatch_processing_event``.
+    Leader (MP coordinator) sends batches via PUB from `schedule_requests`.
+    Followers listen via SUB, unpack the batch into `pending_messages`,
+    and signal `microbatch_processing_event`.
     """
 
     def __init__(
         self,
-        pending_microbatch: deque,
+        pending_messages: deque,
         microbatch_processing_event: asyncio.Event,
         cond: asyncio.Condition,
         *,
@@ -119,12 +118,11 @@ class _MPChannel(AsyncZmqEndpoint):
     ):
         socket_type = "PUB" if is_leader else "SUB"
         super().__init__(
-            socket_type, bind=True,
-            process_group=process_group, is_leader=is_leader,
+            socket_type, bind=True, process_group=process_group, is_leader=is_leader,
         )
 
         self._is_leader = is_leader
-        self._pending_microbatch = pending_microbatch
+        self._pending_messages = pending_messages
         self._microbatch_processing_event = microbatch_processing_event
         self._cond = cond
 
@@ -137,7 +135,7 @@ class _MPChannel(AsyncZmqEndpoint):
             try:
                 _, header, batch = await self._irecv()
                 for header_int, data in batch:
-                    self._pending_microbatch.append((Headers(header_int), data))
+                    self._pending_messages.append((Headers(header_int), data))
                 self._microbatch_processing_event.set()
                 async with self._cond:
                     self._cond.notify_all()
@@ -148,14 +146,12 @@ class _MPChannel(AsyncZmqEndpoint):
 class _CollectiveChannel(AsyncZmqEndpoint):
     """Multiplexed gather+bcast channel supporting collectives and signals.
 
-    Owns a PULL/PUSH + PUB/SUB socket pair and runs a ``_recv_task`` that
-    demuxes by header, feeding ``all_reduce_max`` data into
-    ``_collective_inbox`` and ``COLLECTIVE_SIGNAL`` notifications into
-    ``pending_signals``.
+    Owns a PULL/PUSH + PUB/SUB socket pair and runs a `_recv_task` that demuxes by header,
+    feeding `all_reduce_max` data into `_collective_inbox`
+    and `COLLECTIVE_SIGNAL` notifications into `pending_signals`.
 
-    Socket creation is handled by the base class via ``bind=True`` +
-    ``process_group``: the leader binds PULL+PUB, addresses are broadcast,
-    and followers auto-complement to PUSH+SUB and connect.
+    Socket creation is handled by the base class via `bind=True` + `process_group`: the leader
+    binds PULL+PUB, addresses are broadcast, and followers auto-complement to PUSH+SUB and connect.
     """
 
     GATHER, BCAST = 0, 1
@@ -183,8 +179,6 @@ class _CollectiveChannel(AsyncZmqEndpoint):
         self.pending_signals: deque[Headers] = deque()
         self.has_signal_event = asyncio.Event()
 
-    # -- Background task ---------------------------------------------------
-
     @trace_async_exceptions
     async def _recv_task(self):
         """Sole consumer of the receive socket; demuxes by header."""
@@ -208,8 +202,6 @@ class _CollectiveChannel(AsyncZmqEndpoint):
                             self._cond.notify_all()
             except asyncio.CancelledError:
                 break
-
-    # -- Collectives --------------------------------------------------------
 
     async def all_reduce_max(self, *local_vals: int) -> int | tuple[int, ...]:
         """Element-wise all-reduce max, routed through the recv_task."""
@@ -239,8 +231,6 @@ class _CollectiveChannel(AsyncZmqEndpoint):
             result = struct.unpack(fmt, msg)
             return result[0] if n == 1 else result
 
-    # -- Signal notifications -----------------------------------------------
-
     def notify_has_signal(self, header: Headers):
         """Inject a signal into the channel. Any rank can call this."""
         payload = header.value.to_bytes()
@@ -253,22 +243,16 @@ class _CollectiveChannel(AsyncZmqEndpoint):
             self._isend(Headers.COLLECTIVE_SIGNAL, payload, sock=self.GATHER, serialize=False)
 
 
-# ---------------------------------------------------------------------------
-# Coordinator client (owns the endpoints)
-# ---------------------------------------------------------------------------
-
-
 class EngineCoordinatorClient:
     """ZMQ layer between DynamicInferenceEngine and the DP coordinator.
 
     On all ranks:
-      - ``_mp_channel`` (_MPChannel) — PUB on MP coordinator, SUB on followers
+      - `_mp_channel` (_MPChannel) — PUB on MP coordinator, SUB on followers
 
     On MP coordinator ranks only:
-      - ``_coord`` (_DPCoordinator) — DEALER connected to the DP coordinator
+      - `_coord` (_DPCoordinator) — DEALER connected to the DP coordinator
 
-    Also owns ``_CollectiveChannel`` instances for EP consensus and world
-    barriers, supporting both collectives and async EP notifications.
+    Also owns `_CollectiveChannel` instances for EP consensus and world barriers.
     """
 
     def __init__(
@@ -289,13 +273,13 @@ class EngineCoordinatorClient:
         self.steps_before_microbatch = steps_before_microbatch
 
         # Shared mutable state consumed by endpoints and schedule_requests.
-        self.pending_microbatch = deque()
+        self.pending_messages = deque()
         self.microbatch_processing_event = asyncio.Event()
 
         # Combined PUB/SUB channel for all MP ranks.
         # Leader (MP coordinator) binds PUB; followers connect SUB.
         self._mp_channel = _MPChannel(
-            self.pending_microbatch,
+            self.pending_messages,
             self.microbatch_processing_event,
             cond,
             process_group=mp_group,
@@ -310,15 +294,13 @@ class EngineCoordinatorClient:
             self._coord = _DPCoordinator(
                 dp_addr,
                 dp_rank,
-                self.pending_microbatch,
+                self.pending_messages,
                 cond,
                 process_group=dp_group,
             )
             self._endpoints.append(self._coord)
         else:
             self._coord = None
-
-        torch.distributed.barrier(mp_group)
 
         # EP and world collective channels.
         self.ep_rank = get_pg_rank(ep_group)
@@ -339,12 +321,8 @@ class EngineCoordinatorClient:
         if self._world_channel is not None:
             self._endpoints.append(self._world_channel)
 
-    # -- Lifecycle -----------------------------------------------------------
-
     def start(self, loop: asyncio.AbstractEventLoop | None = None):
         """Start all owned endpoints and collective channels."""
-        from megatron.core.utils import get_asyncio_loop
-
         loop = get_asyncio_loop(loop)
         for ep in self._endpoints:
             ep.start(loop)
@@ -353,8 +331,6 @@ class EngineCoordinatorClient:
         """Stop all endpoints and collective channels."""
         for ep in self._endpoints:
             await ep.shutdown()
-
-    # -- Public API ----------------------------------------------------------
 
     def send_engine_reply(self, data: list):
         """Send an ENGINE_REPLY to the coordinator."""
@@ -381,15 +357,13 @@ class EngineCoordinatorClient:
 
         Using max for both:
         - max(work) > 0 means at least one EP peer has real work.
-        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
-          Any RUNNING peer contributes 0, pulling the max to 0.
+        - max(consensus) == -1 means ALL peers signaled -1 (PAUSING). A RUNNING peer contributes 0.
 
         Args:
             local_work: Pending request count for this rank.
             signal_consensus: True if this rank is ready to pause.
         Returns:
-            (global_work, all_pausing): max work across EP, and whether
-            all peers signaled consensus.
+            (global_work, all_pausing): max work across EP; whether all peers signaled consensus.
         """
         range_push("ep_establish_consensus")
 
@@ -424,39 +398,27 @@ class EngineCoordinatorClient:
     async def schedule_requests(self, engine):
         """Drains pending ZMQ messages and adds requests to the engine.
 
-        This method is a collective operation that must be called by all ranks
-        in a Model Parallel (MP) group at the same time.  It does not block —
-        idle-blocking is handled by the engine's ``_cond`` before this method
-        is called.
+        This method is a collective operation that must be called by all ranks in an MP group.
+        It does not block; idle-blocking is handled by the engine's `_cond`.
 
         The synchronization uses a batched microbatch pattern:
-        1.  Background ``_DPCoordinator._recv_task`` continuously receives
-            messages from the coordinator and accumulates them in
-            ``pending_microbatch``.
+        1.  Background `_DPCoordinator._recv_task` continuously receives
+            messages from the coordinator and accumulates them in `pending_messages`.
         2.  When this method runs, the MP coordinator sends the accumulated
-            messages as a single ``MICROBATCH`` to all TP ranks via PUB.
-        3.  Background ``_MPChannel._recv_task`` on follower ranks unpacks
-            the batch into ``pending_microbatch`` and sets
-            ``microbatch_processing_event``.
-
-        Note:
-            This coroutine must be called collectively by all ranks in a MP group.
-            It should not be launched in a separate task to ensure all ranks
-            execute it in lockstep before proceeding to the next engine step.
+            messages as a single `MICROBATCH` to all TP ranks via PUB.
+        3.  Background `_MPChannel._recv_task` on follower ranks unpacks
+            the batch into `pending_messages` and sets `microbatch_processing_event`.
         """
-        from megatron.core.inference.engines.dynamic_engine import EngineState
-
         # If the engine has active requests and is not at (step % N) == 0, return early.
-        # Never skip in idle states — always check for control signals.
         engine_idle = engine.state in (EngineState.PAUSED, EngineState.SUSPENDED)
         count_trigger = (engine.context.step_count % self.steps_before_microbatch) == 0
         if not engine_idle and engine.has_unfinished_requests() and (not count_trigger):
             return
 
-        # MP coordinator: snapshot pending_microbatch and send as a single batch.
+        # MP coordinator: snapshot pending_messages and send as a single batch.
         if self.is_mp_coordinator:
-            messages = list(self.pending_microbatch)
-            self.pending_microbatch.clear()
+            messages = list(self.pending_messages)
+            self.pending_messages.clear()
             self._mp_channel._isend(
                 Headers.MICROBATCH, [(h.value, d) for h, d in messages]
             )
@@ -464,8 +426,8 @@ class EngineCoordinatorClient:
             # Followers: wait for the batch to arrive via _MPChannel._recv_task.
             await self.microbatch_processing_event.wait()
             self.microbatch_processing_event.clear()
-            messages = list(self.pending_microbatch)
-            self.pending_microbatch.clear()
+            messages = list(self.pending_messages)
+            self.pending_messages.clear()
 
         # Drain world channel control signals.
         has_staleness_increment = False
@@ -479,8 +441,8 @@ class EngineCoordinatorClient:
                 else:
                     pending_signals.append(sig)
 
-        # Process batch — SUBMIT_REQUEST (data plane) always flows here.
-        # Control signals only arrive here as fallback (world_size == 1).
+        # Process batch. SUBMIT_REQUEST (data plane) always flows here.
+        # Control signals only arrive here as fallback for world_size == 1.
         has_new_requests = False
         for header, message in messages:
             if header == Headers.SUBMIT_REQUEST:
@@ -506,14 +468,13 @@ class EngineCoordinatorClient:
             for request_id, entry in engine.requests.items():
                 entry.record.increment_staleness(policy_only=request_id in waiting)
 
-        # Apply at most one control signal (the engine loop processes one state
-        # transition per iteration).  Put remaining signals back.
+        # Apply at most one control signal. Put remaining signals back.
         for sig in reversed(pending_signals[1:]):
             if self._world_channel is not None:
                 self._world_channel.pending_signals.appendleft(sig)
                 self._world_channel.has_signal_event.set()
             else:
-                self.pending_microbatch.appendleft((sig, None))
+                self.pending_messages.appendleft((sig, None))
         if pending_signals:
             header = pending_signals[0]
 
@@ -521,7 +482,6 @@ class EngineCoordinatorClient:
                 if engine.state == EngineState.RUNNING:
                     engine.state = EngineState.PAUSING
                     engine._state_events[EngineState.RUNNING].clear()
-                # Any other state can safely ignore PAUSE.
 
             elif header == Headers.UNPAUSE:
                 assert (
