@@ -1534,7 +1534,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
-                request_kv_length_offsets_view,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),

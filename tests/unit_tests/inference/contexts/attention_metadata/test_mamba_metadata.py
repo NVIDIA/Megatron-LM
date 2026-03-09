@@ -31,7 +31,6 @@ class TestMambaMetadata:
         num_decode_requests: int,
         padded_dims: InferenceBatchDimensions,
         enable_chunked_prefill: bool,
-        request_kv_length_offsets: list[int] | None = None,
     ):
         """
         Helper to construct inputs and run update().
@@ -43,7 +42,6 @@ class TestMambaMetadata:
             num_decode_requests: Number of requests in req_seq_lengths that are in the decode phase.
             padded_dims: The padded batch dimensions to test against.
             enable_chunked_prefill: Whether chunked prefill is enabled.
-            request_kv_length_offsets: KV cache length offsets per request. Defaults to zeros.
         """
         num_active_requests = len(req_seq_lengths)
         total_tokens = sum(req_seq_lengths)
@@ -53,12 +51,6 @@ class TestMambaMetadata:
             token_count=total_tokens,
             prefill_req_count=num_prefill_requests,
             decode_req_count=num_decode_requests,
-        )
-
-        if request_kv_length_offsets is None:
-            request_kv_length_offsets = [0] * num_active_requests
-        kv_length_offsets_tensor = torch.tensor(
-            request_kv_length_offsets, dtype=torch.int32, device=metadata.device
         )
 
         # Assuming 1:1 mapping (req_id i -> slot i)
@@ -82,7 +74,6 @@ class TestMambaMetadata:
             active_mamba_indices=active_mamba_indices,
             token_to_request_idx=token_to_req_tensor,
             cu_seqlens=cu_seqlens_tensor,
-            request_kv_length_offsets=kv_length_offsets_tensor,
             batch_dimensions=real_dims,
             padded_batch_dimensions=padded_dims,
             enable_chunked_prefill=enable_chunked_prefill,
@@ -99,7 +90,6 @@ class TestMambaMetadata:
         """Test simple decode only case where real dims match padded dims."""
         seq_lengths = [1, 1, 1, 1]  # 4 requests
         num_decode = 4
-        kv_offsets = [5, 10, 15, 20]
         padded_dims = InferenceBatchDimensions(
             token_count=4, prefill_req_count=0, decode_req_count=4
         )
@@ -110,20 +100,13 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=False,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
 
-        expected_cache_seqlens = torch.tensor(
-            kv_offsets, dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens)
-
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
-        assert metadata_context.cache_seqlens_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
         assert metadata_context.cu_seqlens is None
         assert metadata_context.seq_idx is None
@@ -133,7 +116,6 @@ class TestMambaMetadata:
         """Test decode only with padding (e.g. using CUDA graphs bucket)."""
         seq_lengths = [1, 1]  # 2 requests
         num_decode = 2
-        kv_offsets = [7, 12]
         # Padding to 4 requests
         padded_dims = InferenceBatchDimensions(
             token_count=4, prefill_req_count=0, decode_req_count=4
@@ -145,7 +127,6 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=False,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_decode = torch.tensor(
@@ -153,14 +134,8 @@ class TestMambaMetadata:
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
 
-        expected_cache_seqlens = torch.tensor(
-            [7, 12, 0, 0], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens)
-
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
-        assert metadata_context.cache_seqlens_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
 
     @pytest.mark.internal
@@ -168,7 +143,6 @@ class TestMambaMetadata:
         """Test edge case: Chunked prefill enabled, but only decode requests exist."""
         seq_lengths = [1, 1]
         num_decode = 2
-        kv_offsets = [3, 8]
         padded_dims = InferenceBatchDimensions(
             token_count=2, prefill_req_count=0, decode_req_count=2
         )
@@ -179,20 +153,13 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=True,
-            request_kv_length_offsets=kv_offsets,
         )
 
         # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
 
-        expected_cache_seqlens = torch.tensor(
-            [3, 8], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens)
-
         assert metadata_context.batch_indices_chunked_prefill is None
-        assert metadata_context.cache_seqlens_chunked_prefill is None
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.cu_seqlens is None
         assert metadata_context.seq_idx is None
@@ -228,9 +195,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
         assert metadata_context.batch_indices_decode is None
-        assert metadata_context.cache_seqlens_decode is None
         assert metadata_context.batch_indices_chunked_prefill is None
-        assert metadata_context.cache_seqlens_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
 
     @pytest.mark.internal
@@ -264,9 +229,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
         assert metadata_context.batch_indices_decode is None
-        assert metadata_context.cache_seqlens_decode is None
         assert metadata_context.batch_indices_chunked_prefill is None
-        assert metadata_context.cache_seqlens_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
 
     # -------------------------------------------------------------------------
@@ -279,7 +242,6 @@ class TestMambaMetadata:
         # 2 decode (len 1), 2 prefill (len 10, 20)
         seq_lengths = [1, 1, 10, 20]
         num_decode = 2
-        kv_offsets = [5, 10, 0, 0]
         padded_dims = InferenceBatchDimensions(
             token_count=32, prefill_req_count=2, decode_req_count=2
         )
@@ -290,17 +252,10 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=False,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
-
-        expected_cache_seqlens = torch.tensor(
-            [5, 10], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens)
-        assert metadata_context.cache_seqlens_chunked_prefill is None
 
         expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
@@ -331,7 +286,6 @@ class TestMambaMetadata:
         # Real: 1 decode, 1 prefill.
         seq_lengths = [1, 10]
         num_decode = 1
-        kv_offsets = [25, 0]
 
         # Padded: 4 decode, 4 prefill. Total tokens 32.
         padded_dims = InferenceBatchDimensions(
@@ -344,19 +298,12 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=False,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_decode = torch.tensor(
             [0, -1, -1, -1], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
-
-        expected_cache_seqlens = torch.tensor(
-            [25, 0, 0, 0], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens)
-        assert metadata_context.cache_seqlens_chunked_prefill is None
 
         expected_prefill = torch.tensor(
             [1, -1, -1, -1], dtype=torch.int32, device=metadata_context.device
@@ -389,7 +336,6 @@ class TestMambaMetadata:
         # 1 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
         seq_lengths = [1, 50, 10]
         num_decode = 1
-        kv_offsets = [9, 100, 0]
 
         # Exact dimensions
         padded_dims = InferenceBatchDimensions(
@@ -402,7 +348,6 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=True,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_device_chunked_prefill = torch.tensor(
@@ -411,18 +356,6 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.device_chunked_prefill, expected_device_chunked_prefill)
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 1
-
-        expected_cache_seqlens_decode = torch.tensor(
-            [9], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens_decode)
-
-        expected_cache_seqlens_chunked = torch.tensor(
-            [100], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(
-            metadata_context.cache_seqlens_chunked_prefill, expected_cache_seqlens_chunked
-        )
 
         expected_prefill = torch.tensor([2, -1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
@@ -447,7 +380,6 @@ class TestMambaMetadata:
         # 2 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
         seq_lengths = [1, 1, 50, 10]
         num_decode = 2
-        kv_offsets = [4, 6, 200, 0]
         padded_dims = InferenceBatchDimensions(
             token_count=62, prefill_req_count=2, decode_req_count=2
         )
@@ -458,16 +390,10 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=True,
-            request_kv_length_offsets=kv_offsets,
         )
 
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
-
-        expected_cache_seqlens_decode = torch.tensor(
-            [4, 6], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(metadata_context.cache_seqlens_decode, expected_cache_seqlens_decode)
 
         expected_device_chunked_prefill = torch.tensor(
             [50, 10], dtype=torch.int32, device=metadata_context.device
@@ -475,13 +401,6 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.device_chunked_prefill, expected_device_chunked_prefill)
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 2
-
-        expected_cache_seqlens_chunked = torch.tensor(
-            [200], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(
-            metadata_context.cache_seqlens_chunked_prefill, expected_cache_seqlens_chunked
-        )
 
         expected_prefill = torch.tensor([3, -1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
@@ -506,7 +425,6 @@ class TestMambaMetadata:
         # 1 chunked prefill request.
         seq_lengths = [100]
         num_decode = 0
-        kv_offsets = [50]
 
         padded_dims = InferenceBatchDimensions(
             token_count=128, prefill_req_count=2, decode_req_count=0
@@ -518,20 +436,11 @@ class TestMambaMetadata:
             num_decode,
             padded_dims,
             enable_chunked_prefill=True,
-            request_kv_length_offsets=kv_offsets,
         )
 
         assert metadata_context.batch_indices_decode is None
-        assert metadata_context.cache_seqlens_decode is None
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 0
-
-        expected_cache_seqlens_chunked = torch.tensor(
-            [50], dtype=torch.int32, device=metadata_context.device
-        )
-        assert torch.equal(
-            metadata_context.cache_seqlens_chunked_prefill, expected_cache_seqlens_chunked
-        )
 
         expected_prefill = torch.tensor([-1, -1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
