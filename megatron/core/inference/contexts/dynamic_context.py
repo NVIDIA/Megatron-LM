@@ -2612,7 +2612,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             old_offsets + num_generated_tokens
         ) % self.block_size_tokens
 
-        # ================================================================
         self.active_token_count = active_request_count * num_generated_tokens
         sampled_tokens = next_tokens[self.paused_request_count : self.total_request_count]
 

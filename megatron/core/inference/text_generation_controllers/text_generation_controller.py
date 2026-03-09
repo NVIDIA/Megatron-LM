@@ -1119,10 +1119,10 @@ class TextGenerationController:
         if context.config.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
-            required_token_indices = logits.squeeze(0)
+            required_token_logits = logits.squeeze(0)
         else:
             # todo : Should do verification here and get approrpiate las token logits
-            required_token_indices = context.last_token_logits(logits)
+            required_token_logits = context.last_token_logits(logits)
 
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
@@ -1137,7 +1137,7 @@ class TextGenerationController:
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
                     self._torch_sampling_func(
-                        required_token_indices[indices, :], temp, top_k, top_p
+                        required_token_logits[indices, :], temp, top_k, top_p
                     )
                 )
                 indices_list.append(torch.tensor(indices))

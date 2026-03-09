@@ -188,7 +188,6 @@ class MambaMetadata:
             # Update chunked prefill indices
             self._batch_indices_chunked_prefill_buffer[0] = active_mamba_indices[chunked_req_idx]
             self.batch_indices_chunked_prefill = self._batch_indices_chunked_prefill_buffer
-
         else:
             self.batch_indices_chunked_prefill = None
 

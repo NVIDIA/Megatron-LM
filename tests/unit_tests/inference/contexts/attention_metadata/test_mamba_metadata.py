@@ -95,11 +95,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=False,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
         )
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
@@ -122,11 +118,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=False,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
         )
 
         expected_decode = torch.tensor(
@@ -148,11 +140,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=True,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
         )
 
         # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
@@ -247,11 +235,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=False,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
         )
 
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
@@ -293,11 +277,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=False,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
         )
 
         expected_decode = torch.tensor(
@@ -343,11 +323,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=True,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
         )
 
         expected_device_chunked_prefill = torch.tensor(
@@ -385,11 +361,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=True,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
         )
 
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
@@ -431,11 +403,7 @@ class TestMambaMetadata:
         )
 
         self._run_update_test(
-            metadata_context,
-            seq_lengths,
-            num_decode,
-            padded_dims,
-            enable_chunked_prefill=True,
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=True
         )
 
         assert metadata_context.batch_indices_decode is None
