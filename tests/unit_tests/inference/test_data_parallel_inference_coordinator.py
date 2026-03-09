@@ -203,8 +203,8 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
         # relying on the coordinator's current state.
         cc = engine.coordinator_client
         cc.pending_microbatch.append((Headers.PAUSE, None))
-        cc.microbatch_processing_event.set()
-        cc.microbatch_not_empty.set()
+        async with engine._cond:
+            engine._cond.notify_all()
         await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
 
         task.cancel()

@@ -198,22 +198,18 @@ class TestAsyncZmqEndpoint:
         await receiver.shutdown()
 
 
-# ── TestCoordRecvLockPattern ─────────────────────────────────────────────────
+# ── TestRecvDoesNotBlockOtherCoroutines ──────────────────────────────────────
 
 
-class TestCoordRecvLockPattern:
-    """Regression tests for the coord_recv_lock fix in DynamicInferenceEngine."""
+class TestRecvDoesNotBlockOtherCoroutines:
+    """Regression test: blocking recv must not prevent other coroutines from running."""
 
-    async def test_recv_outside_lock_no_deadlock(self, zmq_ctx):
-        """schedule_requests can acquire the lock while recv blocks.
+    async def test_recv_does_not_block_lock(self, zmq_ctx):
+        """A coroutine blocked on recv does not prevent another from acquiring a lock.
 
-        If recv were inside the lock (the old bug), this test would deadlock
-        because the recv task holds the lock while blocked on recv, and the
-        schedule_requests task can never acquire it.
-
-        With recv outside the lock (the fix), the lock is only held briefly
-        during the forward, so schedule_requests can acquire it even when no
-        coordinator messages are arriving.
+        If recv were called inside a held lock (an old bug), this test would
+        deadlock because the recv coroutine holds the lock while blocked on
+        recv, and no other coroutine can acquire it.
         """
         lock = asyncio.Lock()
 

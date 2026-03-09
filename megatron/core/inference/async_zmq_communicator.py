@@ -35,16 +35,13 @@ class AsyncZmqEndpoint:
 
     Handles socket creation, multipart frame encoding/decoding with msgpack,
     a background send queue (one send at a time per zmq.asyncio socket), and
-    startup buffering (messages sent before ``is_running`` are queued and
-    drained once the event fires).
+    startup buffering (messages sent before `is_running` are queued until the event fires).
 
-    Subclasses should implement ``_recv_task``.  Subclasses that need a
-    handshake before ``is_running`` should call ``start(loop, set_running=False)``
-    and set ``is_running`` in their ``_recv_task``.
+    Subclasses should implement `_recv_task`. Subclasses that need a handshake before `is_running`
+    should call `start(loop, set_running=False)` and set ``is_running`` in their ``_recv_task``.
 
-    Multiple sockets can be created by passing a list to ``socket_type``
-    (and optionally to the other parameters).  If ``process_group`` is
-    provided, bind addresses are broadcast from the leader.
+    Multiple sockets can be created by passing a list to `socket_type` (and optionally to the other
+    parameters). If `process_group` is provided, bind addresses are broadcast from the leader.
     """
 
     if HAVE_ZMQ:
