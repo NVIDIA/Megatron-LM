@@ -1323,8 +1323,8 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Muon / emerging optimizer check
-    if args.optimizer in ('muon', 'dist_muon'):
+    # emerging optimizer check
+    if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
