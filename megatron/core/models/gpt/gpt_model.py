@@ -657,12 +657,18 @@ class GPTModel(LanguageModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [B, 1, H]
-                # (so that the output layer, which expects S×B×H, receives only the final token)
-                hidden_states = inference_context.last_token_logits(
-                    hidden_states.squeeze(1).unsqueeze(0)
-                ).unsqueeze(1)
+                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                # then back to [S’, B, H] for the output layer.
+                reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                if inference_context.config.num_speculative_tokens > 0:
+                    # For speculative decoding, keep all decode tokens + last prefill token.
+                    hidden_states = inference_context.speculative_required_logits(
+                        reshaped
+                    ).unsqueeze(1)
+                else:
+                    hidden_states = inference_context.last_token_logits(
+                        reshaped
+                    ).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

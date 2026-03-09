@@ -636,16 +636,40 @@ class TextGenerationController:
                 expected_mtp_logits_length == self.num_mtp_heads
             ), f"MTP logits length mismatch. Expected mtp logits length {self.num_mtp_heads}, got {expected_mtp_logits_length}"
             mtp_logits = mtp_logits[: self.num_speculative_tokens]
+
+            if context.config.materialize_only_last_token_logits:
+                # Base logits are already filtered to required positions by the model.
+                # Filter MTP logits to match before concatenation.
+                active_slice = slice(context.paused_request_count, context.total_request_count)
+                request_in_prefill = context.request_in_prefill_status_tensor[active_slice]
+                query_lengths = context.request_query_lengths[active_slice]
+                num_prefill = (request_in_prefill == 1).sum().item()
+                num_decode = active_request_count - num_prefill
+                required_logit_indices = self._get_required_logit_indices(
+                    request_in_prefill, query_lengths, num_decode, num_prefill, mtp_logits.device
+                )
+                mtp_logits = mtp_logits[:, required_logit_indices, :]
+
             logits = torch.cat(
                 [logits, mtp_logits], dim=0
-            )  # [num_speculative_tokens + 1, seq_len, vocab_size]
+            )  # [num_speculative_tokens + 1, seq_len_or_required, vocab_size]
 
         if self.model_is_pipeline_parallel:
-            logits_seq_len = (
-                active_request_count
-                if context.config.materialize_only_last_token_logits
-                else input_ids.shape[1]
-            )
+            if context.config.materialize_only_last_token_logits:
+                if self.num_speculative_tokens > 0:
+                    active_slice = slice(
+                        context.paused_request_count, context.total_request_count
+                    )
+                    request_in_prefill = context.request_in_prefill_status_tensor[active_slice]
+                    num_prefill = (request_in_prefill == 1).sum().item()
+                    num_decode = active_request_count - num_prefill
+                    logits_seq_len = (
+                        num_decode * (self.num_speculative_tokens + 1) + num_prefill
+                    )
+                else:
+                    logits_seq_len = active_request_count
+            else:
+                logits_seq_len = input_ids.shape[1]
             logits_shape = [self.num_speculative_tokens + 1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
@@ -1016,12 +1040,17 @@ class TextGenerationController:
             logits.device,
         )
 
-        required_logits = logits.squeeze(0)[
-            required_logit_indices, :
-        ]  # Shape [num_required, vocab_size]
-        required_mtp_logits = mtp_logits[
-            :, required_logit_indices, :
-        ]  # Shape [num_speculative_tokens, num_required, vocab_size]
+        if context.config.materialize_only_last_token_logits:
+            # Logits are already pre-filtered to required positions by the model forward.
+            required_logits = logits.squeeze(0)  # Shape [num_required, vocab_size]
+            required_mtp_logits = mtp_logits  # Shape [num_speculative_tokens, num_required, vocab_size]
+        else:
+            required_logits = logits.squeeze(0)[
+                required_logit_indices, :
+            ]  # Shape [num_required, vocab_size]
+            required_mtp_logits = mtp_logits[
+                :, required_logit_indices, :
+            ]  # Shape [num_speculative_tokens, num_required, vocab_size]
 
         # Sample tokens from logits and MTP logits.
         output_tokens, mtp_output_tokens, repeats = self._sample_speculative_logits(
