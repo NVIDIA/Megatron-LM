@@ -1217,12 +1217,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
-    # TODO : We also might have to delete some tokens, if stop word hit in the middle (speculative case)
     def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
-        been appended to request.generated_tokens.
+        been appended to request.generated_tokens. In the speculative decoding case,
+        multiple tokens may have been appended at once. If a stop word is found in the
+        middle of the speculative tokens, the trailing tokens after the stop word are
+        truncated from generated_tokens.
 
         Args:
             request: The request to check.
@@ -1246,6 +1248,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 for i in range(self.num_speculative_tokens + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
+                        # If the stop word was found in the middle of speculative tokens
+                        # (i > 0), truncate the trailing tokens after the stop word.
+                        if i > 0:
+                            del request.generated_tokens[-i:]
                         return True
         return False
 

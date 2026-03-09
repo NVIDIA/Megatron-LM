@@ -31,7 +31,7 @@ class TestStopWordDetection:
     """Test stop word detection logic."""
 
     def _check_stop_words_for_request_post_append(
-        self, request: MockDynamicInferenceRequest
+        self, request: MockDynamicInferenceRequest, num_speculative_tokens: int = 0
     ) -> bool:
         """
         Check if a request should stop due to stop words (after token is appended).
@@ -48,9 +48,12 @@ class TestStopWordDetection:
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
-                    return True
+                for i in range(num_speculative_tokens + 1):
+                    end_idx = -i if i > 0 else None
+                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
+                        if i > 0:
+                            del request.generated_tokens[-i:]
+                        return True
 
         return False
 
@@ -157,6 +160,69 @@ class TestStopWordDetection:
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
+
+    def test_speculative_stop_word_at_end(self):
+        """Test stop word at end of speculative tokens (no truncation needed)."""
+        # Speculative tokens appended: [200, 300], stop word is [300]
+        request = MockDynamicInferenceRequest(
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300]]
+        )
+        assert (
+            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=2)
+            is True
+        )
+        assert request.generated_tokens == [100, 200, 300]
+
+    def test_speculative_stop_word_in_middle_truncates(self):
+        """Test that stop word in middle of speculative tokens truncates trailing tokens."""
+        # Speculative tokens appended: [200, 300, 400], stop word is [200]
+        # Token 200 is at position -3, so tokens [300, 400] should be truncated
+        request = MockDynamicInferenceRequest(
+            request_id=1, generated_tokens=[100, 200, 300, 400], stop_word_ids=[[200]]
+        )
+        assert (
+            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=3)
+            is True
+        )
+        assert request.generated_tokens == [100, 200]
+
+    def test_speculative_multi_token_stop_word_in_middle_truncates(self):
+        """Test multi-token stop word in middle of speculative tokens truncates."""
+        # Generated: [100, 200, 300, 400, 500], stop word is [200, 300]
+        # Stop word ends at -2, so tokens [400, 500] should be truncated
+        request = MockDynamicInferenceRequest(
+            request_id=1,
+            generated_tokens=[100, 200, 300, 400, 500],
+            stop_word_ids=[[200, 300]],
+        )
+        assert (
+            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=4)
+            is True
+        )
+        assert request.generated_tokens == [100, 200, 300]
+
+    def test_speculative_stop_word_not_found(self):
+        """Test no stop word found even with speculative scanning."""
+        request = MockDynamicInferenceRequest(
+            request_id=1, generated_tokens=[100, 200, 300, 400], stop_word_ids=[[999]]
+        )
+        assert (
+            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=3)
+            is False
+        )
+        assert request.generated_tokens == [100, 200, 300, 400]
+
+    def test_speculative_stop_word_one_trailing_token(self):
+        """Test stop word with exactly one trailing token to truncate."""
+        # Generated: [100, 200, 300], stop word is [200], one trailing token [300]
+        request = MockDynamicInferenceRequest(
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200]]
+        )
+        assert (
+            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=2)
+            is True
+        )
+        assert request.generated_tokens == [100, 200]
 
 
 class TestStopWordTrackingFlow:
