@@ -1832,9 +1832,9 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
-    group.add_argument('--inference-flask-server-logging', action=argparse.BooleanOptionalAction,
+    group.add_argument('--inference-text-gen-server-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False,
-                       help='Enable per-request logging in the Flask inference server.')
+                       help='Enable per-request logging in the inference text generation server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int,
