@@ -50,7 +50,12 @@ class SharedExpertMLP(MLP):
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            ps_group=pg_collection.ps,
+        )
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:

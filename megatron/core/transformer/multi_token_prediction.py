@@ -802,6 +802,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
+            ps_group=pg_collection.ps,
         )
 
         # Build inner layers: two possible paths

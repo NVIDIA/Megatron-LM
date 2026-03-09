@@ -359,6 +359,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            ps_group=self.pg_collection.ps,
         )
 
         if (
@@ -1276,6 +1277,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            ps_group=self.pg_collection.ps,
         )
 
         if submodules.q_layernorm is not None:
