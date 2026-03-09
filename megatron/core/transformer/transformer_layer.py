@@ -1303,6 +1303,62 @@ class MoETransformerLayer(TransformerLayer):
 
         super().__init__(*args, **kwargs)
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Controls whether the full-layer cudagraph_manager captures the entire forward call
+        as a single graph. Returns False to skip full-layer capture and route through _forward_mlp.
+
+        MoE layers have two cudagraph modes:
+        - Full-layer (use_partial_cudagraphs=False): the full-layer cudagraph_manager captures
+          the forward pass as one graph. This is used during inference.
+        - Partial (use_partial_cudagraphs=True): the full-layer manager is bypassed (returns
+          False), and _forward_mlp routes through cudagraph_manager_router and
+          cudagraph_manager_postprocess, which are monkey-patched onto _forward_mlp_router
+          and _forward_mlp_postprocess by CudaGraphManager.__init__. The expert dispatch
+          in between runs eagerly. This is used during training.
+        """
+        if self.use_partial_cudagraphs:
+            return False
+        if self.config.cuda_graph_impl != "local":
+            return False
+        return super()._should_call_local_cudagraph(*args, **kwargs)
+
+    def transition_cudagraph_scope(self, mode):
+        """Transition between full-layer and partial CUDA graph capture.
+
+        Args:
+            mode: 'full' for inference (full-layer capture) or 'partial' for training
+            (router + postprocess captured, expert dispatch runs eagerly).
+        """
+        from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+        if mode == 'partial':
+            self.use_partial_cudagraphs = True
+            self.moe_layer_recompute = (
+                self.config.recompute_granularity == 'selective'
+                and "moe" in self.config.recompute_modules
+                and self.config.cuda_graph_impl == "local"
+            )
+            if not hasattr(self, '_router_dtoh_event'):
+                self._router_dtoh_event = torch.cuda.Event()
+            if not hasattr(self, 'cudagraph_manager_router'):
+                self.cudagraph_manager_router = CudaGraphManager(
+                    self.config, self, function_name="_forward_mlp_router"
+                )
+            if not hasattr(self, 'cudagraph_manager_postprocess'):
+                self.cudagraph_manager_postprocess = CudaGraphManager(
+                    self.config, self, function_name="_forward_mlp_postprocess"
+                )
+        elif mode == 'full':
+            self.use_partial_cudagraphs = False
+            self.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+            assert hasattr(self, 'cudagraph_manager'), (
+                "MoETransformerLayer missing full cudagraph_manager; "
+                "expected it to be created at __init__ with scope = [] "
+            )
+        else:
+            raise ValueError(f"Unknown MoE cudagraph mode: {mode}, expected 'full' or 'partial'")
+
     def create_mcore_cudagraph_manager(self, config):
         """
         Initializes the CUDA graph manager(s) for the MoE layer.
@@ -1321,21 +1377,7 @@ class MoETransformerLayer(TransformerLayer):
             CudaGraphScope.moe_router in self.config.cuda_graph_scope
             or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
         ):
-            # full MoE layer recompute with partial_cudagraphs. If not partial cudagraphs, MoE
-            # layer recompute is handled by the moe_layer.MoELayer class
-            self.moe_layer_recompute = (
-                self.config.recompute_granularity == 'selective'
-                and "moe" in self.config.recompute_modules
-                and self.config.cuda_graph_impl == "local"
-            )
-
-            self.use_partial_cudagraphs = True
-            self.cudagraph_manager_router = CudaGraphManager(
-                self.config, self, function_name="_forward_mlp_router"
-            )
-            self.cudagraph_manager_postprocess = CudaGraphManager(
-                self.config, self, function_name="_forward_mlp_postprocess"
-            )
+            self.transition_cudagraph_scope('partial')
 
     def _forward_mlp_router(self, hidden_states, padding_mask=None):
         """
@@ -1400,6 +1442,12 @@ class MoETransformerLayer(TransformerLayer):
 
         """
 
+        # Restore token dispatcher attributes. During graph warmup, the router capture leaves these
+        # attrs pointing into cudagraph pool memory; restoring them here ensures the postprocess
+        # graph captures with valid pointers.
+        for name, attr in self.token_dispatcher_attrs.items():
+            setattr(self.mlp.token_dispatcher, name, attr)
+
         self.mlp.fwd_execution_map = "postprocess"
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
@@ -1425,6 +1473,16 @@ class MoETransformerLayer(TransformerLayer):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
                 hidden_states, padding_mask=padding_mask
             )
+
+            # After the router graph replays, the captured .copy_() operations that update
+            # self.token_dispatcher_attrs via `_maybe_dtoh_and_synchronize` are queued on the
+            # current stream but may not have completed. Record an event after the router
+            # graph and wait on it, so we block only until the router's D2H copies complete.
+            self._router_dtoh_event.record()
+            self._router_dtoh_event.synchronize()
+            for name, attr in self.token_dispatcher_attrs.items():
+                setattr(self.mlp.token_dispatcher, name, attr)
+
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias

@@ -1510,6 +1510,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        self.kept_packed_seq_params.discard("total_tokens")
+        self.kept_packed_seq_params.discard("seq_idx")
+
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
             assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
@@ -2657,7 +2661,13 @@ except ImportError:
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
-    from transformer_engine.pytorch.module.base import get_workspace
+
+    try:
+        from transformer_engine.pytorch.module.base import get_workspace
+
+        _get_workspace = get_workspace
+    except ImportError:
+        _get_workspace = None
 
     def te_general_gemm(
         A: torch.Tensor,
@@ -2675,10 +2685,7 @@ try:
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
         """
-        return general_gemm(
-            A,
-            B,
-            workspace=get_workspace(),
+        kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
@@ -2694,6 +2701,9 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
+        if _get_workspace is not None:
+            kwargs["workspace"] = _get_workspace()
+        return general_gemm(A, B, **kwargs)
 
 except ImportError:
     te_general_gemm = None  # type: ignore[assignment, misc]
