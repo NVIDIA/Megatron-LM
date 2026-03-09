@@ -35,6 +35,7 @@ class Reminder:
 class PRReviewTracker:
     EXPERT_REVIEW = "Expert Review"
     FINAL_REVIEW = "Final Review"
+    APPROVED = "Approved"
     EXCLUDED_TEAMS = {"core-adlr", "core-nemo"}
 
     def __init__(self, token: str, repo_name: str, pr_number: str):
@@ -43,26 +44,67 @@ class PRReviewTracker:
         self.pr = self.repo.get_pull(pr_number)
         self.stage = self.get_stage(self.pr)
         self.org = self.github.get_organization(self.repo.organization.login)
+        self._team_cache = {}
+        self._codeowner_teams = self._parse_codeowner_teams()
+
+    def _parse_codeowner_teams(self):
+        """Parse CODEOWNERS to get the set of teams that are blocking reviewers."""
+        teams = set()
+        try:
+            with open(".github/CODEOWNERS") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for token in line.split():
+                        if token.startswith("@NVIDIA/"):
+                            teams.add(token.split("/", 1)[1])
+        except FileNotFoundError:
+            logger.warning("CODEOWNERS file not found")
+        logger.info(f"CODEOWNERS teams: {teams}")
+        return teams
 
     def get_stage(self, pr):
         """Get current review stage."""
         labels = {l.name for l in pr.labels}
-        return self.FINAL_REVIEW if self.FINAL_REVIEW in labels else self.EXPERT_REVIEW
+        if self.APPROVED in labels:
+            return self.APPROVED
+        if self.FINAL_REVIEW in labels:
+            return self.FINAL_REVIEW
+        return self.EXPERT_REVIEW
+
+    def _get_team_members(self, slug):
+        """Get all members of a team, with caching."""
+        if slug not in self._team_cache:
+            try:
+                self._team_cache[slug] = {
+                    m.login for m in self.org.get_team_by_slug(slug).get_members()
+                }
+            except Exception as e:
+                logger.warning(f"Could not get members for team {slug}: {e}")
+                self._team_cache[slug] = set()
+        return self._team_cache[slug]
+
+    def _get_teams_members(self, slugs):
+        """Get all members of multiple teams."""
+        members = set()
+        for slug in slugs:
+            members.update(self._get_team_members(slug))
+        return members
 
     def swap_labels(self):
-        """Get filtered reviewer emails who haven't approved yet."""
+        """Evaluate review state and update labels accordingly."""
         pr = self.pr
-        if self.stage == self.FINAL_REVIEW:
-            logger.info(f"PR #{self.pr.number} is in the {self.stage} stage. No reviewers needed.")
+        if pr.draft:
+            logger.info(f"PR #{pr.number} is a draft. Skipping label swap.")
             return
 
         # 1. Get the latest review state for everyone who has submitted a review
         latest_reviews = {}
         try:
             for review in pr.get_reviews():
-                if not review.user:  # Handle rare cases of deleted users
+                if not review.user:
                     continue
-                # Only track 'APPROVED' or 'CHANGES_REQUESTED' as definitive states
                 if review.state in ("APPROVED", "CHANGES_REQUESTED"):
                     if (
                         review.user.login not in latest_reviews
@@ -72,61 +114,141 @@ class PRReviewTracker:
         except Exception as e:
             logger.warning(f"Could not get reviews for PR #{pr.number}: {e}")
 
-        # 2. Separate reviewers into approvers (List B) and non-approvers
         approvers = {user for user, review in latest_reviews.items() if review.state == "APPROVED"}
-        non_approving_reviewers = {
+        non_approvers = {
             user for user, review in latest_reviews.items() if review.state == "CHANGES_REQUESTED"
         }
 
-        # 3. Get all *currently pending* review requests
+        # 2. Get all currently pending review requests
         try:
             pending_users_req, pending_teams_req = pr.get_review_requests()
             pending_individuals = {r.login for r in pending_users_req}
-            pending_teams_slugs = {t.slug for t in pending_teams_req}
+            pending_team_slugs = {t.slug for t in pending_teams_req}
         except Exception as e:
             logger.warning(f"Could not get review requests for PR #{pr.number}: {e}")
             pending_individuals = set()
-            pending_teams_slugs = set()
+            pending_team_slugs = set()
 
-        # 4. Filter pending teams based on the current stage
-        teams_to_query = (
-            pending_teams_slugs - self.EXCLUDED_TEAMS
-            if self.stage == self.EXPERT_REVIEW
-            else pending_teams_slugs & self.EXCLUDED_TEAMS
-        )
+        # 3. Filter to only CODEOWNERS teams (ignore optional teams like mcore-oncall)
+        pending_team_slugs = pending_team_slugs & self._codeowner_teams
+        logger.info(f"Pending CODEOWNERS teams: {pending_team_slugs}")
 
-        # 5. Get members from the required pending teams
-        pending_team_members = set()
-        for slug in teams_to_query:
+        # 4. Classify teams into expert vs final (excluded)
+        expert_team_slugs = pending_team_slugs - self.EXCLUDED_TEAMS
+        final_team_slugs = pending_team_slugs & self.EXCLUDED_TEAMS
+
+        # 5. Get team members
+        expert_team_members = self._get_teams_members(expert_team_slugs)
+        all_excluded_members = self._get_teams_members(self.EXCLUDED_TEAMS)
+
+        # 6. Compute pending expert reviewers
+        expert_non_approvers = non_approvers - all_excluded_members
+        pending_expert = (
+            pending_individuals | expert_team_members | expert_non_approvers
+        ) - approvers
+        logger.info(f"Pending expert reviewers: {pending_expert}")
+
+        # 7. Compute pending final reviewers
+        final_pending_members = self._get_teams_members(final_team_slugs)
+        final_non_approvers = non_approvers & all_excluded_members
+        pending_final = (final_pending_members | final_non_approvers) - approvers
+        logger.info(f"Pending final reviewers: {pending_final}")
+
+        # 8. Determine if final review is needed at all (excluded teams are assigned)
+        excluded_who_reviewed = (approvers | non_approvers) & all_excluded_members
+        needs_final_review = bool(final_team_slugs) or bool(excluded_who_reviewed)
+
+        # 9. Guard: if no codeowner reviewers exist at all, the review process hasn't started yet.
+        has_any_reviewers = pending_individuals or pending_team_slugs or approvers or non_approvers
+        if not has_any_reviewers and self.stage == self.EXPERT_REVIEW:
+            logger.info(f"PR #{pr.number} has no reviewers assigned yet. Skipping.")
+            return
+
+        # 10. State machine: update labels based on current stage and pending reviewers
+        if self.stage == self.APPROVED:
+            self._handle_approved_stage(pr, pending_expert, pending_final)
+        elif self.stage == self.FINAL_REVIEW:
+            self._handle_final_review_stage(pr, pending_expert, pending_final)
+        else:
+            self._handle_expert_review_stage(pr, pending_expert, pending_final, needs_final_review)
+
+    def _handle_approved_stage(self, pr, pending_expert, pending_final):
+        """Handle PRs that already have the Approved label."""
+        if len(pending_expert) > 0 or len(pending_final) > 0:
+            # New reviewers appeared — revert
             try:
-                pending_team_members.update(
-                    m.login for m in self.org.get_team_by_slug(slug).get_members()
+                pr.remove_from_labels(self.APPROVED)
+                logger.info(f'Removed "{self.APPROVED}" from PR #{pr.number}')
+            except Exception as e:
+                logger.warning(f'Failed to remove "{self.APPROVED}" from PR #{pr.number}: {e}')
+
+            if len(pending_expert) > 0:
+                # Back to expert review — also remove Final Review if present
+                try:
+                    pr.remove_from_labels(self.FINAL_REVIEW)
+                except Exception:
+                    pass
+                logger.info(
+                    f'Reverted PR #{pr.number} to expert review — pending: {pending_expert}'
+                )
+            else:
+                # Expert review done but final review needed again
+                try:
+                    pr.add_to_labels(self.FINAL_REVIEW)
+                except Exception:
+                    pass
+                logger.info(f'Reverted PR #{pr.number} to final review — pending: {pending_final}')
+        else:
+            logger.info(f"PR #{pr.number} is approved. No changes needed.")
+
+    def _handle_final_review_stage(self, pr, pending_expert, pending_final):
+        """Handle PRs in the Final Review stage."""
+        if len(pending_expert) > 0:
+            # New expert reviewers appeared — revert to expert review
+            try:
+                pr.remove_from_labels(self.FINAL_REVIEW)
+                logger.info(
+                    f'Removed "{self.FINAL_REVIEW}" from PR #{pr.number} — '
+                    f'new expert reviewers pending: {pending_expert}'
                 )
             except Exception as e:
-                logger.warning(f"Could not get members for team {slug} on PR #{pr.number}: {e}")
-
-        # 6. "List A": Combine all users who *still need to review*
-        all_required_reviewers = (
-            pending_individuals | pending_team_members | non_approving_reviewers
-        )
-
-        # 7. Final list (List A - List B):
-        pending_reviewers = all_required_reviewers - approvers
-        logger.info(f"Pending reviewers: {pending_reviewers}")
-        if len(pending_reviewers) == 0:
+                logger.warning(f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}')
+        elif len(pending_final) == 0:
+            # All final reviewers approved — move to Approved, remove Final Review
             try:
-                pr.remove_from_labels(self.EXPERT_REVIEW)
-                logger.info(f'Removed "{self.EXPERT_REVIEW}" label from PR #{pr.number}')
+                pr.remove_from_labels(self.FINAL_REVIEW)
+                logger.info(f'Removed "{self.FINAL_REVIEW}" from PR #{pr.number}')
             except Exception as e:
-                logger.warning(
-                    f'Failed to remove "{self.EXPERT_REVIEW}" label from PR #{pr.number}: {e}'
-                )
+                logger.warning(f'Failed to remove "{self.FINAL_REVIEW}" from PR #{pr.number}: {e}')
+            try:
+                pr.add_to_labels(self.APPROVED)
+                logger.info(f'Added "{self.APPROVED}" to PR #{pr.number}')
+            except Exception as e:
+                logger.warning(f'Failed to add "{self.APPROVED}" to PR #{pr.number}: {e}')
+        else:
+            logger.info(f"PR #{pr.number} is in final review. Pending: {pending_final}")
 
+    def _handle_expert_review_stage(self, pr, pending_expert, pending_final, needs_final_review):
+        """Handle PRs in the Expert Review stage (no review labels yet)."""
+        if len(pending_expert) > 0:
+            logger.info(f"PR #{pr.number} is in expert review. Pending: {pending_expert}")
+            return
+
+        # All expert reviewers approved
+        if needs_final_review and len(pending_final) > 0:
+            # Final review teams are assigned and still pending
             try:
                 pr.add_to_labels(self.FINAL_REVIEW)
-                logger.info(f'Added "{self.FINAL_REVIEW}" label to PR #{pr.number}')
+                logger.info(f'Added "{self.FINAL_REVIEW}" to PR #{pr.number}')
             except Exception as e:
-                logger.warning(f'Failed to add "{self.FINAL_REVIEW}" label to PR #{pr.number}: {e}')
+                logger.warning(f'Failed to add "{self.FINAL_REVIEW}" to PR #{pr.number}: {e}')
+        else:
+            # No final review needed, or final reviewers already approved
+            try:
+                pr.add_to_labels(self.APPROVED)
+                logger.info(f'Added "{self.APPROVED}" to PR #{pr.number}')
+            except Exception as e:
+                logger.warning(f'Failed to add "{self.APPROVED}" to PR #{pr.number}: {e}')
 
 
 def main():
