@@ -283,8 +283,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             if not torch.allclose(go, gb, rtol=1e-3, atol=1e-3):
                 max_diff = (go - gb).abs().max().item()
                 rel_diff = ((go - gb).abs() / (gb.abs() + 1e-8)).max().item()
-                print(f"Rank {rank}: GRAD MISMATCH {name} max_abs_diff={max_diff:.6e} max_rel_diff={rel_diff:.6e}")
-            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Rank {rank}: Grad mismatch for {name}"
+                print(
+                    f"Rank {rank}: GRAD MISMATCH {name} max_abs_diff={max_diff:.6e} max_rel_diff={rel_diff:.6e}"
+                )
+            assert torch.allclose(
+                go, gb, rtol=1e-3, atol=1e-3
+            ), f"Rank {rank}: Grad mismatch for {name}"
 
         # 4) Memory checks (peak allocated over forward+backward)
         saved_mib = (base_peak - off_peak) / (1024**2)
@@ -333,9 +337,9 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
         ),
         (
-           "alltoall",
-           False,
-           ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+            "alltoall",
+            False,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
         ),
     ],
 )
