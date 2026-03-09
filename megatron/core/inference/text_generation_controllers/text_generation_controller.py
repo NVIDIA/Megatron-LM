@@ -1136,9 +1136,7 @@ class TextGenerationController:
             # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
-                    self._torch_sampling_func(
-                        required_token_logits[indices, :], temp, top_k, top_p
-                    )
+                    self._torch_sampling_func(required_token_logits[indices, :], temp, top_k, top_p)
                 )
                 indices_list.append(torch.tensor(indices))
 
