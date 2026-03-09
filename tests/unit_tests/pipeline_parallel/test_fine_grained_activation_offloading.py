@@ -324,9 +324,9 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
         ),
         (
-           "alltoall",
-           False,
-           ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+            "alltoall",
+            False,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
         ),
     ],
 )
