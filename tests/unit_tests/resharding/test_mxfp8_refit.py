@@ -3,9 +3,7 @@
 import pytest
 import torch
 
-_IS_BLACKWELL = torch.cuda.is_available() and (
-    torch.cuda.get_device_properties(0).major >= 10
-)
+_IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
 try:
     from flashinfer import mxfp8_quantize
@@ -170,8 +168,7 @@ class TestQuantizeParamsToMXFP8:
         from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 
         model = torch.nn.Sequential(
-            torch.nn.Linear(128, 64, bias=False),
-            torch.nn.Linear(64, 32, bias=False),
+            torch.nn.Linear(128, 64, bias=False), torch.nn.Linear(64, 32, bias=False)
         ).to(dtype=torch.bfloat16, device="cuda")
         buffers = quantize_params_to_mxfp8(model)
 

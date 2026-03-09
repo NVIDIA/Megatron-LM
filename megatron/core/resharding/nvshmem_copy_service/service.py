@@ -150,10 +150,10 @@ class RemoteCopyService:
             self.gpu_resources.unpack_stream,
             self.gpu_resources.send_stream,
             self.gpu_resources.copy_stream,
-            self.gpu_resources.torch_pack_stream,
-            self.gpu_resources.torch_unpack_stream,
-            self.gpu_resources.torch_send_stream,
-            self.gpu_resources.torch_copy_stream,
+            self.gpu_resources.torch_pack_stream_wrapper,
+            self.gpu_resources.torch_unpack_stream_wrapper,
+            self.gpu_resources.torch_send_stream_wrapper,
+            self.gpu_resources.torch_copy_stream_wrapper,
         )
 
         # Synchronize all NVSHMEM streams before returning
