@@ -2592,6 +2592,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
         raw_positions = (
             old_offsets[:, None]
+            + 1  # Offset by 1 because old_offsets points to the LAST token
             + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]
         )
         #
