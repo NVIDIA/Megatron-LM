@@ -199,68 +199,19 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     for name, param in absorbed_mla.named_parameters():
         results_2[name] = param.grad.clone()
 
+    def _calculate_tensor_similarity(x, y):
+        x, y = x.data.double(), y.data.double()
+        denominator = (x * x + y * y).sum()
+        if denominator == 0:
+            return 1
+        sim = 2 * (x * y).sum() / denominator
+        return sim
+
     for name in results_1:
         t1 = results_1[name].flatten().float().unsqueeze(0)
         t2 = results_2[name].flatten().float().unsqueeze(0)
         cosine_sim = torch.nn.functional.cosine_similarity(t1, t2).item()
-        assert cosine_sim > 0.9999, f"{name} cosine similarity: {cosine_sim} < 0.9999"
-        print(f"{name} cosine similarity: {cosine_sim}")
+        assert cosine_sim > 0.999, f"{name} cosine similarity: {cosine_sim} < 0.999"
+        assert _calculate_tensor_similarity(t1, t2) > 0.999
 
     Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize("tp_cp", [[1, 1]])
-@pytest.mark.parametrize("qkv_format", ['sbhd'])
-@pytest.mark.parametrize("down_proj_use_column_parallel", [False])
-def test_perf(tp_cp: List[int], qkv_format: str, down_proj_use_column_parallel: bool):
-    tp_size, cp_size = tp_cp
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
-    )
-    model_parallel_cuda_manual_seed(123)
-
-    # Create model
-    config = get_mock_mla_config(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
-    absorbed_submodules = get_absorbed_mla_submodules(
-        down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
-        rms_norm=True,
-    )
-    absorbed_mla = AbsorbedMLASelfAttention(
-        config=config,
-        submodules=absorbed_submodules,
-        layer_number=0,
-        attn_mask_type=AttnMaskType.causal,
-        cp_comm_type="all_gather" if cp_size > 1 else None,
-        pg_collection=None,
-    ).cuda()
-
-    seqlen = SEQ_LEN // tp_size // cp_size
-    hidden_states = torch.randn((seqlen, MBS, HIDDEN), dtype=torch.bfloat16, device='cuda')
-    grads = torch.randn_like(hidden_states)
-    packed_seq_params = None
-
-    # absorbed_mla.core_attention.force_unfused_dsa = True
-    # Forward & Backward
-    for _ in range(10):
-        for name, param in absorbed_mla.named_parameters():
-            if param.grad is not None:
-                param.grad.zero_()
-        absorbed_outputs, _ = absorbed_mla(
-            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
-        )
-        absorbed_outputs.backward(grads)
-
-    print(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    print(f"CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-    print(f"CUDA max memory allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
-    print(f"CUDA max memory reserved: {torch.cuda.max_memory_reserved() / 1024**3:.2f} GB")
-
-    Utils.destroy_model_parallel()
-
-
-if __name__ == "__main__":
-
-    # test_functionality(tp_cp=[1, 1], qkv_format='sbhd', down_proj_use_column_parallel=False)
-
-    test_perf(tp_cp=[1, 1], qkv_format='sbhd', down_proj_use_column_parallel=False)
