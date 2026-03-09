@@ -9,6 +9,7 @@ import uuid
 import warnings
 
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,32 @@ def _sanitize_tools_for_template(tools):
         sanitized.append(tool_copy)
     return sanitized
 
+def _replace_prefix_tokens(
+    eos_token_id, 
+    previous_turn_token_ids,
+    retokeenized_previous_turn_token_ids,
+    current_turn_token_ids
+):
+    """Replace the token ids that are associated with the previous turn with the actual tokens
+    from the previous generation (rather than the ones from the chat template application)."""
 
+    # Strip the EOS from the previous turn token ids if it exists
+    if previous_turn_token_ids[-1] == eos_token_id:
+        previous_turn_token_ids = previous_turn_token_ids[:-1]
+
+    # Find the last EOS token id in the previous turn token ids
+    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
+    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+        if current_turn_token_ids[i] == eos_token_id:
+            last_eos_token_id_index = i
+            break
+
+    # Replace the current turn token ids with the tokens from the previous generation
+    current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
+
+    # Return the previous turn token ids + the current turn token ids
+    return previous_turn_token_ids + current_turn_additional_token_ids
+    
 try:
     from flask import Blueprint, current_app, jsonify, request
 
@@ -151,13 +177,13 @@ try:
         req = request.get_json()
         tools = req.get("tools", None)
         tools_requested = bool(tools)
+        messages = req.get("messages")
         chat_template_kwargs = req.get("chat_template_kwargs", {})
         if not isinstance(chat_template_kwargs, dict):
             logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__)
             chat_template_kwargs = {}
 
         # --- 1. Parse Messages ---
-        messages = req.get("messages")
         if not messages:
             return "Missing 'messages' field", 400
         if not isinstance(messages, list):
@@ -166,20 +192,67 @@ try:
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            prompt_tokens = tokenizer.apply_chat_template(
-                template_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=template_tools,
-                **chat_template_kwargs,
-            )
-        except (AttributeError, AssertionError):
-            warnings.warn(
-                "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
-            )
-            prompt_tokens = tokenizer.tokenize(
-                "\n".join([message["content"] for message in messages])
-            )
+            if hasattr(tokenizer, 'apply_chat_template'):
+                prompt_tokens = tokenizer.apply_chat_template(
+                    template_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=template_tools,
+                    **chat_template_kwargs,
+                )
+
+                if req.get("prevent_retokenization", True):
+                    # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
+                    # This improves prefix cache hits and reduces logprob variation between training and inference.
+
+                    eos_token_id = tokenizer.eos_id
+                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                    warnings.warn(
+                        "Avoiding prefix retokenization." \
+                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation." \
+                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    )
+
+                    # Find the last assistant message
+                    last_assistant_message_idx = None
+                    for i in reversed(range(len(template_messages))):
+                        if template_messages[i]["role"] == "assistant":
+                            last_assistant_message_idx = i
+                            break
+
+                    # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
+                    if last_assistant_message_idx is not None:
+                        messages_to_last_assistant_message = template_messages[: last_assistant_message_idx + 1]
+
+                        # Get the templated tokenization of just the previous generation
+                        retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
+                            messages_to_last_assistant_message,
+                            tokenize=True,
+                            add_generation_prompt=False,
+                            tools=template_tools,
+                            **chat_template_kwargs,
+                        )
+
+                        # Replace the prefix tokens with the tokens from the previous generation
+                        last_assistant_message = template_messages[last_assistant_message_idx]
+                        assert "prompt_token_ids" in last_assistant_message and "generation_token_ids" in last_assistant_message, \
+                            "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
+                        previous_turn_token_ids = last_assistant_message["prompt_token_ids"] + last_assistant_message["generation_token_ids"]
+                        prompt_tokens = _replace_prefix_tokens(
+                            eos_token_id,
+                            previous_turn_token_ids,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
+                        )
+
+            else:
+                warnings.warn(
+                    "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
+                )
+                prompt_tokens = tokenizer.tokenize(
+                    "\n".join([message["content"] for message in messages])
+                )
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
@@ -261,6 +334,13 @@ try:
                 k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
                 for k, v in result.items()
             }
+
+            if result["status"] == "FAILED":
+                if result["sampling_params"]["num_tokens_to_generate"] <= 0:
+                    return f"Request {request_idx} failed due to context length overflow", 400
+                else:
+                    return f"Request {request_idx} failed due to internal error {result["events"]}", 500
+
             prompt_tokens = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
             prompt_tokens_count = len(prompt_tokens) if prompt_tokens is not None else 0
@@ -330,6 +410,10 @@ try:
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
+            finish_reason = "tool_calls" if metadata.get("tool_calls", []) else "stop"
+            if len(result["generated_tokens"]) >= result["sampling_params"]["num_tokens_to_generate"]:
+                finish_reason = "length"
+
             choice_data = {
                 "index": request_idx,
                 "message": message,
@@ -340,9 +424,7 @@ try:
                 # 'logprobs' in chat API is an object containing 'content'
                 # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
-                "finish_reason": (
-                    "tool_calls" if metadata.get("tool_calls", []) else "stop"
-                ),  # Original code hardcoded this.
+                "finish_reason": finish_reason,
             }
             if result.get("policy_staleness") is not None:
                 choice_data["policy_staleness"] = result["policy_staleness"]
@@ -362,6 +444,8 @@ try:
                         :prompt_tokens_count
                     ]
             choices.append(choice_data)
+            if choice_data["generation_log_probs"] is None:
+                print(f"Generation log probs is None for request:\n{json.dumps(result, indent=4)}", flush=True)
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
