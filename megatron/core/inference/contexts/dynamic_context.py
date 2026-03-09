@@ -2322,6 +2322,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
+            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
             # Restore Mamba state from last consecutive cached block
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
@@ -2334,7 +2335,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             if not restored:
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
-            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
             # Compute intermediate offsets for state extraction during forward pass
             if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
