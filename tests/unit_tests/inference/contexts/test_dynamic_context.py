@@ -1720,6 +1720,110 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_speculative_tokens_less_than_block_size_assert(self):
+        self._setup_model_parallel_group(1, 1)
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            num_speculative_tokens=16,
+            unified_memory_level=0,
+        )
+        with pytest.raises(
+            AssertionError, match="num_speculative_tokens.*must be < block_size_tokens"
+        ):
+            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_swap_book_keeping_tensors_with_speculative_tokens(self):
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=32,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        ctx.request_ids[:2] = torch.tensor([10, 11])
+        next_tokens = torch.tensor([99, 100], device='cuda')
+        new_speculative_tokens = torch.tensor([[991, 1001], [992, 1002]], device='cuda')
+
+        ctx._swap_book_keeping_tensors(
+            src_idxs=torch.tensor([0]),
+            dst_idxs=torch.tensor([1]),
+            next_tokens=next_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        assert torch.equal(ctx.request_ids[:2], torch.tensor([11, 10], device='cuda'))
+        assert torch.equal(next_tokens[:2], torch.tensor([100, 99], device='cuda'))
+        assert torch.equal(
+            new_speculative_tokens[:, :2], torch.tensor([[1001, 991], [1002, 992]], device='cuda')
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_with_finished_requests_and_speculative_tokens(self):
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=32,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        # Setup 3 active requests: req0 (active), req1 (finished), req2 (active)
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 3
+        ctx.request_ids[:3] = torch.tensor([10, 11, 12])
+        ctx.request_query_lengths[:3] = 1
+        ctx.request_kv_length_offsets[:3] = torch.tensor([5, 8, 12])
+        ctx.request_last_kv_block_offset[:3] = torch.tensor([5, 8, 12])
+        ctx.request_to_kv_block_ids[:3, 0] = torch.tensor([0, 1, 2])
+        ctx.request_last_kv_block_id[:3] = torch.tensor([0, 1, 2])
+        ctx.request_kv_block_counts[:3] = 1
+
+        active_requests_mask = torch.tensor([1, 0, 1], device='cuda')
+        new_tokens = torch.tensor([99, 100, 101], device='cuda')
+        new_speculative_tokens = torch.tensor([[991, 1001, 1011], [992, 1002, 1012]], device='cuda')
+
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # req1 is finished. req2 moves to req1's position.
+        assert ctx.total_request_count == 2
+        assert torch.equal(
+            ctx.request_ids[:2], torch.tensor([10, 12], device='cuda', dtype=torch.int32)
+        )
+
+        # Check interleaving for req0 and req2
+        # req0: [99, 991, 992]
+        # req2: [101, 1011, 1012]
+        expected_tokens = torch.tensor([99, 991, 992, 101, 1011, 1012], device='cuda')
+        assert torch.equal(ctx.token_to_input_ids[:6], expected_tokens)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_chunked_prefill_speculative_offset_math(self):
         """
         Test that the active_token_count is correctly adjusted by chunked_prefill_offset
@@ -1778,6 +1882,79 @@ class TestDynamicContext:
             + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_chunked_prefill_swap_with_speculative_tokens(self):
+        """Test that swapping a chunked prefill request to the end of the buffer
+        correctly brings along the 2D speculative tokens for the other decode requests.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=32,
+            num_speculative_tokens=2,
+            enable_chunked_prefill=True,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        # Setup 2 active requests in the WRONG order (violating the invariant)
+        # Index 0: Chunked Prefill Request (ID 42)
+        # Index 1: Standard Decode Request (ID 99)
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 2
+
+        ctx.chunked_prefill_request_id = 42
+        ctx.request_ids[:2] = torch.tensor([42, 99])
+
+        # Status: 1 = Prefill, 0 = Decode
+        ctx.request_in_prefill_status_tensor[:2] = torch.tensor([1, 0])
+        ctx.request_query_lengths[:2] = 1
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 20])
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([10, 20])
+        ctx.request_to_kv_block_ids[:2, 0] = torch.tensor([0, 1])
+        ctx.request_last_kv_block_id[:2] = torch.tensor([0, 1])
+        ctx.request_kv_block_counts[:2] = 1
+
+        active_requests_mask = torch.tensor([1, 1], device='cuda')
+
+        # New base tokens: [100 (for prefill), 200 (for decode)]
+        new_tokens = torch.tensor([100, 200], device='cuda')
+
+        # New spec tokens: Col 0 for prefill (dummy), Col 1 for decode (real draft tokens)
+        new_speculative_tokens = torch.tensor([[101, 201], [102, 202]], device='cuda')
+
+        # Trigger update_requests.
+        # It must detect ID 42 is at index 0, and swap it with index 1.
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # 1. Verify the IDs were swapped successfully
+        assert torch.equal(
+            ctx.request_ids[:2], torch.tensor([99, 42], dtype=torch.int32, device='cuda')
+        )
+
+        # 2. Verify the Decode request (now at Index 0) correctly flattened its
+        #    base token (200) AND its specific speculative tokens (201, 202).
+        # 3. Verify the Prefill request (now at Index 1) flattened its tokens (100, 101, 102).
+        expected_flattened_tokens = torch.tensor(
+            [200, 201, 202, 100, 101, 102],  # Decode request (ID 99)  # Prefill request (ID 42)
+            device='cuda',
+        )
+
+        assert torch.equal(
+            ctx.token_to_input_ids[:6], expected_flattened_tokens
+        ), "Speculative tokens were not correctly swapped alongside the chunked prefill request!"
 
     @pytest.mark.internal
     @rounder_override(64)

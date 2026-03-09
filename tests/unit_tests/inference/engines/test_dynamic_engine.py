@@ -2447,6 +2447,107 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_speculative_decoding_with_eviction_and_swapping(self):
+        """Test that speculative decoding works correctly when requests are paused and evicted.
+
+        This exercises the `_swap_book_keeping_tensors` logic with the 2D `new_speculative_tokens`
+        tensor, ensuring no dimensional mismatch or index errors occur during tensor swapping.
+        """
+        # Very constrained memory environment to force pausing and eviction
+        test_config = DynamicEngineTestConfig(
+            num_requests=3,
+            min_prompt_length=16,
+            max_prompt_length=16,
+            num_tokens_to_generate=32,
+            context_block_size_tokens=16,
+            num_speculative_tokens=2,
+            # 40 KB translates to 3 blocks.
+            # 3 requests * 3 blocks per request (1 prompt + 2 gen) = 9 blocks needed.
+            # This guarantees we will run out of active memory mid-generation.
+            context_buffer_size_gb=0.00004,
+            context_paused_buffer_size_gb=0.0,  # 0 paused buffer forces immediate eviction
+            model_provider="gpt",
+            materialize_only_last_token_logits=False,
+            use_fixed_output_lengths=True,
+        )
+
+        env = self._build_test_env(test_config)
+
+        print(f"total block count = {env.engine.context.block_allocator.total_count}")
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+
+        # Mock forward pass to return safe, deterministic logits to avoid NaN/Inf crashes
+        # in torch.multinomial caused by randomly initialized weights.
+        def mock_safe_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            b, s = tokens.shape
+
+            base_logits = torch.zeros(
+                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            base_logits[:, :, 0] = 100.0  # Force model to deterministically pick token 0
+
+            mtp_logits = torch.zeros(
+                test_config.num_speculative_tokens,
+                s,
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            mtp_logits[:, :, 0] = 100.0  # Force speculative heads to also pick token 0
+
+            unwrapped_model._mtp_logits_cache = mtp_logits
+            return base_logits
+
+        unwrapped_model.forward = mock_safe_forward
+
+        # Add all requests at once. They will all start prefill, but as they generate
+        # and request more blocks, the engine will run out of active blocks.
+        # Since paused_buffer_size is 0, any request that pauses will immediately
+        # overflow the paused buffer and trigger an eviction.
+        for request in env.requests:
+            request.sampling_params.num_tokens_to_generate = 32
+            env.engine._add_request(request)
+
+        eviction_occurred = False
+
+        # Step the engine manually until all requests finish.
+        while env.engine.has_unfinished_requests():
+            # Record the number of evicted requests before the step
+            evicted_before = env.engine.evicted_request_count
+
+            # Step the engine
+            env.engine.schedule_waiting_requests()
+            env.engine.step_modern()
+
+            # Check if any request was evicted during this step
+            if env.engine.evicted_request_count > evicted_before:
+                eviction_occurred = True
+
+        # Assert that our constrained memory actually caused an eviction,
+        # proving we exercised the evict_overflow_paused_requests path with spec tokens.
+        assert (
+            eviction_occurred
+        ), "Test failed to trigger an eviction. The test environment memory wasn't tight enough."
+
+        # Verify all requests successfully went back through the queue and finished cleanly.
+        # We MUST check the merged records from the engine, because eviction checkpoints
+        # the requests, leaving the original instances in env.requests permanently active.
+        for request_id, entry in env.engine.requests.items():
+            merged_req = entry.record.merge()
+            assert (
+                merged_req.status == Status.COMPLETED
+            ), f"Request {request_id} failed to complete."
+            assert (
+                len(merged_req.generated_tokens) == 31
+            ), f"Request {request_id} didn't generate expected tokens."
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_speculative_decoding_with_prefix_caching(self):
         """Test that speculative decoding works correctly when prefix caching is enabled.
 

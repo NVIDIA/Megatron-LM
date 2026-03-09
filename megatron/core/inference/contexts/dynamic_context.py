@@ -280,6 +280,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_heads_per_partition = 1
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        assert self.num_speculative_tokens < inference_config.block_size_tokens, (
+            f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
+            f"block_size_tokens ({inference_config.block_size_tokens})"
+        )
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -2032,7 +2036,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
             )
 
-    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+    def _swap_book_keeping_tensors(
+        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+    ):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
@@ -2046,6 +2052,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+
+        if new_speculative_tokens is not None:
+            # new_speculative_tokens has request dimension as second dimension,
+            # so swap on transposed view
+            tensor_swap(new_speculative_tokens.t(), src_idxs, dst_idxs)
 
         for metadata_tensor in self.request_metadata.values():
             tensor_swap(metadata_tensor, src_idxs, dst_idxs)
@@ -2090,10 +2101,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.free_slots(request_indexes)
 
     def resume_paused_requests(
-        self,
-        active_request_count: int,
-        newly_paused_request_ids: torch.Tensor,
-        next_tokens: torch.Tensor,
+        self, active_request_count: int, newly_paused_request_ids: torch.Tensor
     ) -> tuple[int, torch.Tensor]:
         """Resume as many paused requests as we have space for in the active buffer.
 
@@ -2177,7 +2185,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         return active_request_count, newly_paused_request_ids
 
     def evict_overflow_paused_requests(
-        self, active_request_count: int, next_tokens: torch.Tensor
+        self,
+        active_request_count: int,
+        next_tokens: torch.Tensor,
+        new_speculative_tokens: Optional[torch.Tensor] = None,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Evict requests that overflow the paused buffer.
 
@@ -2268,7 +2279,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Swap evicted and active requests.
         self._swap_book_keeping_tensors(
-            src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
+            src_idxs=src_idxs,
+            dst_idxs=dst_idxs,
+            next_tokens=next_tokens,
+            new_speculative_tokens=new_speculative_tokens,
         )
 
         # Update tracking vars.
@@ -2514,15 +2528,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids, next_tokens
+            active_request_count, newly_paused_request_ids
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
+        evict_request_ids = self.evict_overflow_paused_requests(
+            active_request_count, next_tokens, new_speculative_tokens
+        )
 
         # 6.c. Resume any additional requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids, next_tokens
+            active_request_count, newly_paused_request_ids
         )
 
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
@@ -2534,6 +2550,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
                 dst_idxs=torch.tensor([self.total_request_count - 1]),
                 next_tokens=next_tokens,
+                new_speculative_tokens=new_speculative_tokens,
             )
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
