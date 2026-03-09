@@ -2089,6 +2089,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
+            # Clone needed: flip() returns a view, and subsequent += (line below) would
+            # write through to self.request_kv_block_counts without the clone.
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count].clone()
             # Flip counts before cumsum, since paused requests are resumed from
             # the right-most index, so we must count resumed blocks starting from
@@ -2209,6 +2211,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         evict_request_idxs = torch.arange(
             evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
         )
+        # Clone needed: subsequent release_memory_blocks_from_request_indexes and
+        # _swap_book_keeping_tensors calls mutate self.request_ids in place.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
         # Release memory.
@@ -2482,6 +2486,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # for resumed requests, but we need the OLD block for tokens that don't cross.
         prev_last_block_ids = None
         if self.num_speculative_tokens > 0:
+            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
+            # (assigns new block IDs), but we need the old values later to determine
+            # which block tokens should go to when they don't cross a block boundary.
             prev_last_block_ids = self.request_last_kv_block_id.clone()
 
         # 6.a. First, resume temporarily paused requests.
@@ -2512,8 +2519,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
+            # Clone needed: next_tokens is a shared buffer that will be overwritten in
+            # the next iteration; paused_tokens must persist independently.
             self.paused_tokens = next_tokens[: self.paused_request_count].clone()
             if new_speculative_tokens is not None:
+                # Clone needed: same reason as paused_tokens above.
                 self.paused_speculative_tokens = new_speculative_tokens[
                     :, : self.paused_request_count
                 ].clone()
@@ -2530,6 +2540,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_generated_tokens
         )
 
+        # Clone needed: old_offsets is reused later (line ~2606) to compute raw_positions
+        # for block-boundary detection. The write-back on the next line overwrites the
+        # underlying tensor, so without clone the boundary-crossing logic would see the
+        # new offsets instead of the pre-update values.
         old_offsets = self.request_last_kv_block_offset[
             self.paused_request_count : self.total_request_count
         ].clone()
@@ -2635,8 +2649,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Start with current (new) block for all
             # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
             # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
-            block_idx = (
-                current_block_ids[:, None].expand(-1, num_generated_tokens).clone()
+            # No clone needed: expand() returns a read-only view, and downstream
+            # torch.where() and .flatten() both return new tensors without in-place mutation.
+            block_idx = current_block_ids[:, None].expand(
+                -1, num_generated_tokens
             )  # [active_count, N]
 
             # For requests that have crossing, tokens BEFORE boundary use prev block

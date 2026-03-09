@@ -306,6 +306,8 @@ class TextGenerationController:
             # in the original implementation:
             #   https://github.com/ari-holtzman/degen/blob/master/gen.py
             # and I guess it is needed so keeping it for now.
+            # Clone needed: filter_[:, 1:] and filter_[:, :-1] are overlapping views;
+            # without clone, each write would corrupt the next read during the shift.
             filter_[:, 1:] = filter_[:, :-1].clone()
             # Make sure we at least have one token to select from.
             filter_[..., 0] = 0
@@ -318,6 +320,8 @@ class TextGenerationController:
         if top_k == 1:
             sampled_logits = torch.argmax(last_token_logits, dim=-1)
         else:
+            # Clone needed: .div_() and masked_fill_() below modify in-place,
+            # which would mutate the caller's tensor without this clone.
             last_token_logits = last_token_logits.clone()
             if temperature != 1.0:
                 last_token_logits.div_(temperature)
@@ -741,8 +745,9 @@ class TextGenerationController:
             # Convert to absolute indices in the context tensors
             absolute_indices = requests_needing_release + context.paused_request_count
 
-            # Get the block IDs to release (current last block for these requests)
-            blocks_to_release = context.request_last_kv_block_id[absolute_indices].clone()
+            # No clone needed: advanced (fancy) indexing with a tensor already returns
+            # a copy, not a view.
+            blocks_to_release = context.request_last_kv_block_id[absolute_indices]
 
             # Reduce block counts for requests that crossed back
             context.request_kv_block_counts[absolute_indices] -= 1
@@ -1362,7 +1367,8 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
-        # New sample gets updated in update_requests, so we pass in a clone
+        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
+        # which would corrupt the reused _sampled_tokens_cuda buffer.
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
@@ -1465,8 +1471,10 @@ class TextGenerationController:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
         ret = {
+            # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
             "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
             "accepted_tokens": (
+                # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
                 self._accepted_tokens_per_request.clone()
                 if self.num_speculative_tokens > 0
                 else None
