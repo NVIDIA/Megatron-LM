@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import gc
 import random
 
 import numpy as np
@@ -225,6 +226,10 @@ class TestFullyShardedDataParallel:
                 msg=f"Parameters for {name1} don't match",
             )
 
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
@@ -389,6 +394,10 @@ class TestFullyShardedDataParallel:
                 atol=0,
                 msg=f"Parameters for {name1} don't match",
             )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @classmethod
     def hsdp_one_step_test(cls, num_fsdp_group):
@@ -642,6 +651,7 @@ class TestMegatronFSDPE2E:
             ("optim_grads_params", True),
             ("optim_grads", False),
             ("optim", True),
+            ("no_shard", False),
         ],
     )
     def test_compatible_with_nd_parallel(
@@ -653,10 +663,13 @@ class TestMegatronFSDPE2E:
                 use_distributed_optimizer=True
             )
 
+        # no_shard is incompatible with meta device initialization. See fully_shard.py:326.
+        init_model_with_meta_device = True if fsdp_sharding_strategy != "no_shard" else False
+
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
             data_parallel_sharding_strategy=fsdp_sharding_strategy,
-            init_model_with_meta_device=True,
+            init_model_with_meta_device=init_model_with_meta_device,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
             fsdp_double_buffer=use_double_buffer,
@@ -678,6 +691,10 @@ class TestMegatronFSDPE2E:
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                     ),
                 )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):

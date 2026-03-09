@@ -1121,6 +1121,9 @@ class MegatronFSDP(torch.nn.Module):
         """
         self._replace_param_with_raw_if_needed()
 
+        if self.data_parallel_sharding_strategy == "no_shard":
+            return
+
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
             if self.ddp_config.fsdp_all_gather_in_start_param_sync:
