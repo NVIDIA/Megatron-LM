@@ -366,8 +366,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Add memory for intermediate conv and SSM states
                 intermediate_memory_per_request = (
                     math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape)
-                    * self.mamba_ssm_states_dtype.itemsize
+                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
                 )
                 intermediate_memory_per_request *= self.num_mamba_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1

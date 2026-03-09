@@ -657,15 +657,11 @@ class TextGenerationController:
         if self.model_is_pipeline_parallel:
             if context.config.materialize_only_last_token_logits:
                 if self.num_speculative_tokens > 0:
-                    active_slice = slice(
-                        context.paused_request_count, context.total_request_count
-                    )
+                    active_slice = slice(context.paused_request_count, context.total_request_count)
                     request_in_prefill = context.request_in_prefill_status_tensor[active_slice]
                     num_prefill = (request_in_prefill == 1).sum().item()
                     num_decode = active_request_count - num_prefill
-                    logits_seq_len = (
-                        num_decode * (self.num_speculative_tokens + 1) + num_prefill
-                    )
+                    logits_seq_len = num_decode * (self.num_speculative_tokens + 1) + num_prefill
                 else:
                     logits_seq_len = active_request_count
             else:
@@ -1048,7 +1044,9 @@ class TextGenerationController:
         if context.config.materialize_only_last_token_logits:
             # Logits are already pre-filtered to required positions by the model forward.
             required_logits = logits.squeeze(0)  # Shape [num_required, vocab_size]
-            required_mtp_logits = mtp_logits  # Shape [num_speculative_tokens, num_required, vocab_size]
+            required_mtp_logits = (
+                mtp_logits  # Shape [num_speculative_tokens, num_required, vocab_size]
+            )
         else:
             required_logits = logits.squeeze(0)[
                 required_logit_indices, :

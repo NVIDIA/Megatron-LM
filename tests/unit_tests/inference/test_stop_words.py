@@ -192,9 +192,7 @@ class TestStopWordDetection:
         # Generated: [100, 200, 300, 400, 500], stop word is [200, 300]
         # Stop word ends at -2, so tokens [400, 500] should be truncated
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300, 400, 500],
-            stop_word_ids=[[200, 300]],
+            request_id=1, generated_tokens=[100, 200, 300, 400, 500], stop_word_ids=[[200, 300]]
         )
         assert (
             self._check_stop_words_for_request_post_append(request, num_speculative_tokens=4)

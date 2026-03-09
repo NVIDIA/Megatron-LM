@@ -56,12 +56,7 @@ class TestCausalConv1dUpdate:
         weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
 
         result = causal_conv1d_update(
-            x,
-            conv_state_triton,
-            weight,
-            bias=None,
-            silu_activation=False,
-            conv_state_indices=None,
+            x, conv_state_triton, weight, bias=None, silu_activation=False, conv_state_indices=None
         )
         expected = causal_conv1d_update_ref(
             x, conv_state_ref, weight, bias=None, silu_activation=False
@@ -81,12 +76,7 @@ class TestCausalConv1dUpdate:
         bias = torch.randn(D, device="cuda", dtype=torch.float32)
 
         result = causal_conv1d_update(
-            x,
-            conv_state_triton,
-            weight,
-            bias=bias,
-            silu_activation=False,
-            conv_state_indices=None,
+            x, conv_state_triton, weight, bias=bias, silu_activation=False, conv_state_indices=None
         )
         expected = causal_conv1d_update_ref(
             x, conv_state_ref, weight, bias=bias, silu_activation=False
@@ -105,12 +95,7 @@ class TestCausalConv1dUpdate:
         bias = torch.randn(D, device="cuda", dtype=torch.float32)
 
         result = causal_conv1d_update(
-            x,
-            conv_state_triton,
-            weight,
-            bias=bias,
-            silu_activation="silu",
-            conv_state_indices=None,
+            x, conv_state_triton, weight, bias=bias, silu_activation="silu", conv_state_indices=None
         )
         expected = causal_conv1d_update_ref(
             x, conv_state_ref, weight, bias=bias, silu_activation=True
@@ -127,12 +112,7 @@ class TestCausalConv1dUpdate:
         weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
 
         result = causal_conv1d_update(
-            x,
-            conv_state,
-            weight,
-            bias=None,
-            silu_activation=False,
-            conv_state_indices=None,
+            x, conv_state, weight, bias=None, silu_activation=False, conv_state_indices=None
         )
 
         assert result.dim() == 2
@@ -203,12 +183,7 @@ class TestCausalConv1dUpdate:
         weight = torch.randn(D, width, device="cuda", dtype=dtype)
 
         result = causal_conv1d_update(
-            x,
-            conv_state,
-            weight,
-            bias=None,
-            silu_activation=False,
-            conv_state_indices=None,
+            x, conv_state, weight, bias=None, silu_activation=False, conv_state_indices=None
         )
 
         assert result.dtype == dtype
@@ -244,9 +219,7 @@ class TestCausalConv1dUpdate:
         for s in range(seq_len):
             conv_state_ref[:, :, :-1] = conv_state_ref[:, :, 1:].clone()
             conv_state_ref[:, :, -1] = x[:, s, :]
-            torch.testing.assert_close(
-                int_states[:, s, :, :], conv_state_ref, atol=1e-5, rtol=1e-5
-            )
+            torch.testing.assert_close(int_states[:, s, :, :], conv_state_ref, atol=1e-5, rtol=1e-5)
 
     def test_intermediate_state_with_indices(self):
         """Test intermediate states work correctly with conv_state_indices mapping."""
