@@ -2385,6 +2385,7 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
@@ -2398,6 +2399,7 @@ try:
                 cu_seqlens=cu_seqlens,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
+                interleaved=interleaved,
             )
         else:
             assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
