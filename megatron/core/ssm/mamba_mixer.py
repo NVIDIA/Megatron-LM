@@ -429,6 +429,7 @@ class MambaMixer(MegatronModule):
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         # Fetch intermediate states for speculative decoding
+        # (just buffers, existing data is overwritten)
         int_conv_state = None
         int_ssm_state = None
         if context.num_speculative_tokens > 0:

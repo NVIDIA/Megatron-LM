@@ -204,6 +204,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
 
         assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
 
@@ -221,9 +224,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.materialize_only_last_token_logits = (
-            inference_config.materialize_only_last_token_logits
-        )
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
