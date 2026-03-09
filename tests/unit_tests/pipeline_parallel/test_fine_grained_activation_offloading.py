@@ -141,7 +141,7 @@ def _run_one_iter_and_capture(
         (True, False, ["qkv_linear"]),
         (True, False, ["core_attn"]),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        # (True, True, ["core_attn", "attn_proj"]),  # TODO(helenn/CI): re-enable this case on AWS.
+        (True, True, ["core_attn", "attn_proj"]),
         (True, False, ["mlp_norm"]),
         (True, False, ["expert_fc1"]),
         (True, False, ["moe_act"]),
@@ -318,17 +318,16 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         ("alltoall", False, ["expert_fc1"]),
         ("alltoall", False, ["moe_act"]),
         ("alltoall", False, ["mlp_norm", "expert_fc1", "moe_act"]),
-        # TODO(helenn/CI): re-enable this test.
-        # (
-        #     "alltoall",
-        #     True,
-        #     ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
-        # ),
-        # (
-        #    "alltoall",
-        #    False,
-        #    ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
-        # ),
+        (
+            "alltoall",
+            True,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
+        (
+            "alltoall",
+            False,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
     ],
 )
 def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
