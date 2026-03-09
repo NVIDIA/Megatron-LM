@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from unittest.mock import patch
+
+import pytest
 import torch
 
 from megatron.rl import rl_utils, sequence_packing_utils
@@ -407,3 +410,91 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
 
     # Stats should remain None due to shape mismatch
     assert group_stats.mean_piold_to_inf_prob is None
+
+
+@pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
+def test_cu_seqlens_size(num_sequences):
+    """Test that cu_seqlens always has a fixed size regardless of how many sequences are packed."""
+    max_sequences_per_bin = 50
+    bin_size = 1024
+
+    seq_len = bin_size // max_sequences_per_bin
+    seq_lengths = [seq_len] * num_sequences
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[list(range(num_sequences))],
+        seq_starts={0: []},
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0] * num_sequences,
+        packing_algo='fifo',
+    )
+
+    params = sequence_packing_utils.create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=max_sequences_per_bin,
+        device=torch.device('cpu'),
+    )
+
+    expected_size = max_sequences_per_bin + 2
+    assert params.cu_seqlens_q.shape[0] == expected_size, (
+        f"cu_seqlens_q has size {params.cu_seqlens_q.shape[0]} but expected {expected_size} "
+        f"for {num_sequences} sequences"
+    )
+    assert params.cu_seqlens_kv.shape[0] == expected_size
+    assert params.cu_seqlens_q[0] == 0
+    assert params.cu_seqlens_q[-1] == bin_size
+
+
+@pytest.mark.parametrize(
+    "ratio,local_bins,world,expected_bs",
+    [
+        (1.0, 1, 8, 8),  # no stale data (ratio 1.), everything divides perfectly.
+        (1.0, 42, 8, 42 * 8),  # no stale data (ratio 1.), everything divides perfectly, more bins
+        (
+            0.5,
+            1,
+            8,
+            8,
+        ),  # 0.5 means we use half of all seqs per step, they all fit 1 bin -> we should reuse
+        (1 / 3, 4, 8, 16),  # third of the data per step, nonint division
+    ],
+)
+def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
+    # Make a dummy struct to check only the required fields.
+    # Divide by ratio to make sure the samples are divisible by global_bs in the test.
+    n_seqs = int(world * 7 / ratio)
+    global_bs_in_seq = int(n_seqs * ratio)
+
+    def side_eff(
+        rank,
+        rampup_batch_size,
+        global_batch_size,
+        micro_batch_size,
+        data_parallel_size,
+        decrease_batch_size_if_needed,
+    ):
+        # Inside of the get_microbatch_dataloader, we compute the batch size in bins.
+        # We want to test this variable.
+        global actual_bs
+        actual_bs = global_batch_size
+
+    with patch('megatron.rl.sequence_packing_utils.get_num_microbatches', return_value=1):
+        with patch(
+            'megatron.rl.sequence_packing_utils.reconfigure_num_microbatches_calculator',
+            side_effect=side_eff,
+        ):
+            with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=world):
+                sequence_packing_utils.update_microbatch_calculator(
+                    samples_ratio_per_step=ratio,
+                    num_bins_this_rank=local_bins,
+                    bin_seq_indices=[],
+                    global_batch_size=global_bs_in_seq,
+                    rampup_batch_size=1,
+                    micro_batch_size=1,
+                    decrease_batch_size_if_needed=False,
+                )
+
+    # Iterator is local, batch size is global
+    assert expected_bs == actual_bs

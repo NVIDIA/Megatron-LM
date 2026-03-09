@@ -25,16 +25,15 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -51,6 +50,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
+from megatron.training.datasets.sft_dataset import SFTDataset, MockSFTDataset
 from model_provider import model_provider
 
 try:
@@ -68,6 +68,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
+
+    if args.sequence_packing_scheduler is not None:
+        return get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            vp_stage=vp_stage,
+        )
+
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
@@ -214,10 +223,7 @@ def is_dataset_built_on_rank(vp_stage=None):
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -255,6 +261,7 @@ def core_gpt_dataset_config_from_args(args):
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
+        "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
     }
 
     # add FIM args to the config
@@ -292,7 +299,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
     if args.sft:
-        dataset_type = SFTDataset
+        if args.mock_data:
+            dataset_type = MockSFTDataset
+        else:
+            dataset_type = SFTDataset
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

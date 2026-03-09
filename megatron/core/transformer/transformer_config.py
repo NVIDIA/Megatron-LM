@@ -1,5 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -13,6 +14,7 @@ from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
+from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -22,6 +24,8 @@ from ..utils import (
     is_torch_min_version,
     scaled_init_method_normal,
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -59,6 +63,15 @@ class TransformerConfig(ModelParallelConfig):
     We compute the average of the MTP losses across all depths, 
     and multiply it the scaling factor to obtain the overall MTP loss, 
     which serves as an additional training objective.
+    """
+
+    mtp_use_repeated_layer: bool = False
+    """Use a single MTP layer repeatedly instead of multiple separate layers."""
+
+    mtp_hybrid_override_pattern: Optional[str] = None
+    """DEPRECATED: Use unified hybrid_override_pattern instead.
+    Legacy argument for loading old checkpoints.
+    Force a specific hybrid layer pattern for MTP layers.
     """
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
@@ -172,7 +185,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     """Use a gated linear unit for the first linear layer in the MLP."""
 
-    activation_func: Callable = F.gelu
+    activation_func: Callable[[torch.Tensor], torch.Tensor] = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
     activation_func_fp8_input_store: bool = False
@@ -415,7 +428,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+             "shared_experts", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -424,7 +438,10 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -708,6 +725,12 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    """moe_pad_experts_for_cuda_graph_inference (bool): If True, the router will switch to dropping
+    and padding during decode time which does not have a D2H sync. The capacity factor is set to the
+    max that an expert could see during inference so no tokens are actually dropped. The default
+    setting is False."""
+
     moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
@@ -803,6 +826,35 @@ class TransformerConfig(ModelParallelConfig):
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -841,6 +893,9 @@ class TransformerConfig(ModelParallelConfig):
     """What type of symmetric all reduce to use. The default is None
     which is no use of symmetric memory.
     """
+
+    nccl_all_reduce_for_prefill: bool = False
+    """If True, use NCCL all-reduce kernels when symmetric all-reduce is enabled."""
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
@@ -927,6 +982,20 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # When fp32 residual connections are enabled, pipeline parallel communication must
+        # use fp32 to match the dtype of the residual stream between pipeline stages.
+        if self.fp32_residual_connection and self.pipeline_dtype is not None:
+            if self.pipeline_dtype != torch.float:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"fp32_residual_connection is enabled, overriding pipeline_dtype "
+                    f"from {self.pipeline_dtype} to torch.float to match the "
+                    f"residual stream dtype between pipeline stages.",
+                )
+            self.pipeline_dtype = torch.float
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
@@ -1229,6 +1298,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1290,6 +1360,50 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "'mhc' in recompute_modules is incompatible with "
+                    "fine_grained_activation_offloading. The mHC recompute hook fires "
+                    "before the offloading backward chunk is initialized, causing "
+                    "tensor_pop on a None chunk. Disable one of them."
+                )
+
+        if self.enable_hyper_connections and not (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        # Validation for hyper_connections with MTP
+        if self.enable_hyper_connections and self.mtp_num_layers is not None:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
+                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2039,6 +2153,40 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.sequence_packing_scheduler is not None:
+            # Check TE version.
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True
+
+            # TODO(tailaim): add support for other dispatcher types
+            assert self.moe_token_dispatcher_type == "alltoall", (
+                f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                f"got '{self.moe_token_dispatcher_type}'"
+            )
+
+            supported_schedulers = ['dp_balanced']
+            if (
+                self.sequence_packing_scheduler is not None
+                and self.sequence_packing_scheduler not in supported_schedulers
+            ):
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
 
 
 @dataclass

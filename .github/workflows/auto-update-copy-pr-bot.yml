@@ -3,12 +3,11 @@ name: Auto Update Copy PR Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
 
 jobs:
   auto-update-copy-pr-bot:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Checkout code

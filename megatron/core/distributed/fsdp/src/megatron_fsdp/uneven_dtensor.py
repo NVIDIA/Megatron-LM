@@ -58,6 +58,7 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         # TODO: add documentation for the offset calculation
         # Add on the offset of the current mesh dimension
         offsets[shard_dim] += offset
+        # Calculate the global shape using the sum of the sharding dim sizes.
         cumulative_shape[shard_dim] = sum(s[shard_dim] for s in global_shapes)
 
     # Get the shard placements order.
@@ -174,6 +175,11 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     )
 
     # Check that all boundaries (start and end) are touched.
+    # Skip under fake process group — all_reduce is a no-op so only rank 0's
+    # boundaries are visible, which makes the end-boundary check always fail.
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
+        return
+
     boundary_checks = torch.tensor(
         [
             [offset == 0, offset + size == dtensor.shape[dim]]
@@ -240,7 +246,9 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
-    for key_chain in visit_dtensor:
+    # Sort the keys, since some state dictionaries are mocked
+    # and extended to include empty global keys.
+    for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
         update_uneven_dtensor_chunk_metadata(dtensor)

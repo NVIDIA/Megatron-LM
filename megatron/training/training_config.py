@@ -449,6 +449,25 @@ class CheckpointConfig:
     ckpt_fully_parallel_load: bool = False
     """Apply full load parallelization across DP for distributed checkpoints."""
 
+    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
+    """Algorithm for fully parallel load of distributed checkpoints.
+    "broadcast"(default): Broadcast the checkpoint from rank 0 to all other ranks.
+    "gather_rounds": Gather the checkpoint from all ranks in rounds.
+    "gather_object": Gather the checkpoint from all ranks in a single operation.
+    """
+
+    ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
+    """Process group for fully parallel save of distributed checkpoints.
+    "dp"(default): Data parallel process group.
+    "ep_dp": Expert data parallel process group.
+    """
+
+    ckpt_fully_parallel_load_process_group: Literal["dp", "ep_dp"] = "dp"
+    """Process group for fully parallel load of distributed checkpoints.
+    "dp"(default): Data parallel process group.
+    "ep_dp": Expert data parallel process group.
+    """
+
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 

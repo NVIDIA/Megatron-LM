@@ -22,6 +22,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
 
 
@@ -481,13 +482,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            layer.pre_mlp_layernorm, hidden_states
+                            apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
                     with off_interface(
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
+                            hidden_states
+                        )
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
@@ -610,6 +613,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
         return output
 
+    @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
         """Wrapper for Dense forward."""
         return layer._forward_mlp(*args, **kwargs)
@@ -638,9 +642,9 @@ def build_mtp_layer_callables(layer):
     multi-token prediction layer nodes (attention, MLP, etc.)
     """
 
-    forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
+    forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
     attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
-    is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
+    is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_attn_forward(node, hidden_states):

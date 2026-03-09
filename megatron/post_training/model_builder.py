@@ -2,6 +2,7 @@
 
 """ModelOpt GPT model provider."""
 
+import logging
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -135,7 +136,7 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+                use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
@@ -226,21 +227,18 @@ def modelopt_gpt_mamba_builder(
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
-            local_core_attention=args.export_force_local_attention
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
-                use_arbitrary_attention_mask = False
             else:
-                use_arbitrary_attention_mask = True
+                local_core_attention=args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                use_arbitrary_attention_mask=False,
             )
 
         model_kwargs = {
@@ -262,8 +260,16 @@ def modelopt_gpt_mamba_builder(
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
+        if args.export_default_te_spec and args.export_te_mcore_model:
+            logging.getLogger(__name__).warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            args.export_te_mcore_model = False
+
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
             "mamba_stack_spec": mamba_stack_spec,
@@ -317,6 +323,9 @@ def modelopt_gpt_mamba_builder(
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
         if args.pipeline_model_parallel_size > 1:
             assert (
                 args.virtual_pipeline_model_parallel_size is None

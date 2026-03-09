@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -9,7 +9,6 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -213,7 +212,10 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                layer.transformer_layer.current_microbatch = microbatch_id
+                assert hasattr(
+                    layer, 'mtp_model_layer'
+                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
@@ -1012,10 +1014,6 @@ def forward_backward_pipelining_with_interleaving(
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
@@ -1149,7 +1147,15 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    # Determine hidden dimension for P2P communication
+    # For hyper connections with multiple PP stages, use n-stream dimension
+    hidden_dim = config.hidden_size
+    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+        # For interleaved PP with hyper connections, all intermediate communications use n-stream
+        # Note: This is a simplified approach - proper VPP support may need more complex logic
+        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2084,10 +2090,20 @@ def get_tensor_shapes(
     config,
     tp_group: torch.distributed.ProcessGroup,
     cp_group: torch.distributed.ProcessGroup,
+    pp_group: torch.distributed.ProcessGroup = None,
+    is_recv: bool = True,
 ):
     """
     Determine right tensor sizes (based on position of rank with respect to split rank) and
     model size.
+
+    For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
+    with dimension hidden_size * num_residual_streams.
+
+    Args:
+        is_recv: If True, compute shape for receiving; if False, for sending.
+                 This matters for hyper connections where first/last stages have different
+                 send/recv dimensions.
     """
 
     tensor_shapes = []
@@ -2098,7 +2114,27 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    # Determine hidden dimension based on hyper connections and pipeline stage
+    hidden_size = config.hidden_size
+    # TODO: make this more robust, including flexible VPP layout
+    if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # For hyper connections:
+        # - recv: stages with rank > 0 receive n-stream (n*C) from previous stage
+        # - send: stages with rank < pp_size-1 send n-stream (n*C) to next stage
+        use_nstream = False
+        if is_recv and pp_rank > 0:
+            # Receiving from previous stage (which sends n*C)
+            use_nstream = True
+        elif not is_recv and pp_rank < pp_size - 1:
+            # Sending to next stage (send n*C)
+            use_nstream = True
+
+        if use_nstream:
+            hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 
@@ -2160,10 +2196,6 @@ def forward_backward_pipelining_without_interleaving(
         )
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model)
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
@@ -2251,6 +2283,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=p2p_communicator.pp_group,
+        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2259,6 +2293,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=p2p_communicator.pp_group,
+        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(

@@ -1,6 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import os
-
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
@@ -17,11 +15,18 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+    TEGroupedMLPSubmodules,
+)
+from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -54,33 +59,41 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     if expert_type == 'grouped':
         model = GroupedMLP(num_local_experts, transformer_config, pg_collection)
     elif expert_type == 'te_grouped':
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=True
+        )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(
+            layer_submodules.mlp.submodules.experts.submodules, TEGroupedMLPSubmodules
         )
         model = TEGroupedMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     elif expert_type == 'sequential':
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        layer_submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
         model = SequentialMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     elif expert_type == 'te_sequential':
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
+        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
+        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
         model = SequentialMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            layer_submodules.mlp.submodules.experts.submodules,
             pg_collection,
         )
     else:

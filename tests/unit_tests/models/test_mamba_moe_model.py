@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -37,7 +38,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "apply_query_key_layer_scaling": False,
     "apply_residual_connection_post_layernorm": False,
     "apply_rope_fusion": False,
-    "async_tensor_model_parallel_allreduce": True,
     "attention_backend": {
         "__objclass__": "megatron.core.transformer.enums.AttnBackend",
         "_name_": "flash",
@@ -88,6 +88,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
+    "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
     "expert_model_parallel_size": 4,
@@ -149,6 +150,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_state_dim": 128,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_layer_num": None,
+    "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
     "moe_apply_probs_on_input": False,
@@ -156,7 +160,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": 20,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
-    "moe_extended_tp": False,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
@@ -166,6 +169,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_pad_expert_input_to_capacity": False,
+    "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
     "moe_router_bias_update_rate": 0.001,
@@ -193,10 +197,13 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
     "mrope_section": None,
+    "mtp_hybrid_override_pattern": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
+    "mtp_use_repeated_layer": False,
     "multi_latent_attention": False,
+    "nccl_all_reduce_for_prefill": False,
     "no_rope_freq": None,
     "no_sync_func": None,
     "normalization": "RMSNorm",
@@ -209,6 +216,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "num_microbatches_with_partial_activation_checkpoints": None,
     "num_moe_experts": 128,
     "num_query_groups": 2,
+    "num_residual_streams": 4,
     "output_layer_init_method": {},
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
@@ -273,6 +281,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "sequence_packing_scheduler": None,
     "fallback_to_eager_attn": False,
     "linear_attention_type": None,
     "moe_router_force_biased": None,
@@ -437,7 +446,6 @@ class TestMambaMoEModel:
         args.padded_vocab_size = 131072
 
         # The following args would be set in the user's nano v3 config.
-        args.async_tensor_model_parallel_allreduce = True
         args.attention_backend = AttnBackend.flash
         args.bf16 = True
         args.ckpt_format = 'torch_dist'
@@ -476,6 +484,7 @@ class TestMambaMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 

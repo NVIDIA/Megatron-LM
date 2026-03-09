@@ -1,5 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  THROUGHPUT_START_STEP: 10
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -39,8 +40,6 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --tokenizer-type: HuggingFaceTokenizer
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
-  --langrl-inference-server-type: inplace_megatron_chat
-  --langrl-inference-server-conversation-template: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
   --vocab-size: 151936
   --make-vocab-size-divisible-by: 128
   --optimizer: adam
@@ -99,5 +98,3 @@ METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "iteration-time"
-THROUGHPUT_TEST_PARAMS:
-  --start_step: 10

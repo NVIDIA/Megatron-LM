@@ -12,6 +12,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -392,14 +393,18 @@ class TestGPTWithDynamicInference:
         config = self.gpt_model.config
 
         inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_sequence_length=self.gpt_model.module.max_sequence_length,
-            buffer_size_gb=1.0,
-            block_size_tokens=256,
-            materialize_only_last_token_logits=False,
+            model_config=TransformerConfig(
+                params_dtype=config.params_dtype,
+                num_layers=config.num_layers,
+                kv_channels=config.hidden_size // config.num_attention_heads,
+                num_attention_heads=config.num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=self.gpt_model.module.max_sequence_length,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+            ),
         )
 
         # Add a request with 10 tokens. Since 10 is not a multiple of 64,
