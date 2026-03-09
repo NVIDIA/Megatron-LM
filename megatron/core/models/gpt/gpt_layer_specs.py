@@ -187,7 +187,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
-    mla_fusion: bool = False,
+    mla_down_proj_fusion: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -204,7 +204,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
-        mla_fusion (bool, optional): Enable best-effort MLA fusion.
+        mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
+                                               layernorm when backend supports. Otherwise fall back
+                                               to the unfused MLA.
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
@@ -252,9 +254,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
             else backend.column_parallel_linear()
         )
 
-        if mla_fusion:
+        if mla_down_proj_fusion:
             fuse_input_layernorm = (
-                mla_fusion and backend.column_parallel_layer_norm_linear() is not None
+                mla_down_proj_fusion and backend.column_parallel_layer_norm_linear() is not None
             )
             input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
             down_proj_linear = (

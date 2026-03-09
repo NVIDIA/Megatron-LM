@@ -2258,11 +2258,9 @@ class MLATransformerConfig(TransformerConfig):
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
 
-    mla_fusion: bool = False
-    """Enable best-effort MLA fusion.
-
-    This enables fused q/kv down-projection and fused input layernorm when
-    backend support is available; otherwise it falls back to unfused MLA.
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
     """
 
     def __post_init__(self):
