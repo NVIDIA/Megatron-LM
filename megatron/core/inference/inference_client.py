@@ -60,22 +60,11 @@ class InferenceClient(AsyncZmqEndpoint):
 
     @trace_async_exceptions
     async def _recv_task(self):
-        """
-        Listen for packets from the coordinator.
-
-        This coroutine runs in an infinite loop, continuously polling the socket
-        for data.
-        When a request reply is received, it unpacks the message, finds the
-        corresponding Future using the request ID, and sets the result.
-        Other control packets are handled appropriately.
-
-        This method is started as a background task by the `start()` method.
-        """
+        """Listen for replies from the coordinator and resolve futures."""
         while True:
             try:
                 _, header, data = await self._irecv()
 
-                assert header == Headers.ACK or self.is_running.is_set()
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data
                     reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
@@ -90,28 +79,20 @@ class InferenceClient(AsyncZmqEndpoint):
                         completion_future.set_result, completed_request
                     )
                 elif header == Headers.ACK:
-                    self.is_running.set()
+                    pass  # Coordinator acknowledged our connect; no action needed.
             except asyncio.CancelledError:
                 break
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
-        """
-        Connects to the coordinator and starts the background tasks.
-
-        This method must be completed before submitting any requests. It handles
-        the initial handshake and spawns background tasks.
-        """
+        """Connects to the coordinator and starts the background tasks."""
         logging.info("Client: Connecting to InferenceCoordinator...")
 
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
 
-        # Send CLIENT_CONNECT directly (bypass _isend buffer — we need this
-        # to reach the coordinator so it can ACK and unblock is_running).
-        self._zmq.isend(self._sockets[0], Headers.CLIENT_CONNECT)
-
-        super().start(loop, set_running=False)
+        self._isend(Headers.CLIENT_CONNECT)
+        super().start(loop)
 
     def send_signal(self, header: Union[str, Headers]):
         """Send a control signal to the coordinator (e.g. "PAUSE", "STOP", "SHUTDOWN")."""

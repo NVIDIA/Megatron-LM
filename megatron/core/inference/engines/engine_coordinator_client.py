@@ -245,10 +245,11 @@ class _CollectiveChannel(AsyncZmqEndpoint):
         payload = header.value.to_bytes()
         if self._is_leader:
             self._isend(Headers.COLLECTIVE_SIGNAL, payload, sock=self.BCAST, serialize=False)
+            # The leader will not receive its own broadcast, so handle the signal locally as well.
+            self.pending_signals.append(header)
+            self.has_signal_event.set()
         else:
             self._isend(Headers.COLLECTIVE_SIGNAL, payload, sock=self.GATHER, serialize=False)
-        self.pending_signals.append(header)
-        self.has_signal_event.set()
 
 
 # ---------------------------------------------------------------------------

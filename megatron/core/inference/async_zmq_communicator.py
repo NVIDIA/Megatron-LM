@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import errno
 import logging
 import socket as _socket_mod
 from typing import Optional
@@ -27,134 +26,36 @@ try:
 except ImportError:
     HAVE_ZMQ = False
 
-_SOCKET_TYPES = {
-    'DEALER': zmq.DEALER,
-    'ROUTER': zmq.ROUTER,
-    'PUB': zmq.PUB,
-    'SUB': zmq.SUB,
-    'PUSH': zmq.PUSH,
-    'PULL': zmq.PULL,
-}
-
 # Sentinel to distinguish "no process group" from process_group=None
 _NO_PROCESS_GROUP = object()
-
-
-class AsyncZmqSendRecv:
-    """Shared async ZMQ send/receive helper used by composition.
-
-    Encapsulates the send queue pattern (asyncio Queue + background drain task)
-    and multipart frame encoding/decoding with msgpack serialization.
-    """
-
-    def __init__(self):
-        assert HAVE_ZMQ, "please install the pyzmq library \n pip install pyzmq"
-        assert HAVE_MSGPACK, "please install the msgpack library \n pip install msgpack"
-        self._send_awaitables = asyncio_Queue()
-
-    def isend(
-        self,
-        socket,
-        header: Headers,
-        data=None,
-        *,
-        identity: Optional[bytes] = None,
-        serialize: bool = True,
-    ):
-        """Enqueue a non-blocking multipart send.
-
-        Args:
-            socket: The zmq.asyncio socket to send on.
-            header (Headers): The signal header to send.
-            data: The data payload to send.
-            identity (Optional[bytes]): The ZMQ identity of the recipient (ROUTER sockets).
-            serialize (bool): Whether to serialize data with msgpack.
-        """
-        frames = []
-        if identity is not None:
-            frames.append(identity)
-        frames.append(header.value.to_bytes())
-        if data is not None:
-            if serialize:
-                data = msgpack.packb(data, use_bin_type=True)
-            frames.append(data)
-        awaitable = socket.send_multipart(frames)
-        self._send_awaitables.put_nowait((awaitable, identity))
-
-    async def irecv(
-        self, socket, *, socket_uses_identity: bool = False, deserialize: bool = True
-    ) -> tuple[Optional[bytes], Headers, list | bytes | None]:
-        """Await a multipart receive and parse frames.
-
-        Args:
-            socket: The zmq.asyncio socket to receive from.
-            socket_uses_identity (bool): Whether the first frame is a ZMQ identity.
-            deserialize (bool): Whether to deserialize data with msgpack.
-
-        Returns:
-            identity (Optional[bytes]): The source identity, or None.
-            header (Headers): The signal header received.
-            data: The data payload received.
-        """
-        raw = await socket.recv_multipart()
-        if socket_uses_identity:
-            identity, header, *rest = raw
-        else:
-            header, *rest = raw
-            identity = None
-
-        header = Headers(int.from_bytes(header))
-        data = rest[0] if rest else None
-
-        if deserialize:
-            message = msgpack.unpackb(data, raw=False) if data is not None else None
-        else:
-            message = data
-
-        return identity, header, message
-
-    @trace_async_exceptions
-    async def send_task(self):
-        """Background task: drain the send queue and await each send."""
-        while True:
-            try:
-                awaitable, identity = await self._send_awaitables.get()
-                await awaitable
-                self._send_awaitables.task_done()
-            except asyncio_QueueShutDown:
-                break
-            except zmq.error.ZMQError as e:
-                if e.errno == zmq.EHOSTUNREACH:
-                    logging.warning(
-                        "ZMQ send failed, recipient unreachable (identity=%s)", identity
-                    )
-                    self._send_awaitables.task_done()
-                else:
-                    raise
-
-    def shutdown(self):
-        """Shut down the send queue."""
-        self._send_awaitables.shutdown()
 
 
 class AsyncZmqEndpoint:
     """Base class for async ZMQ endpoints with send queue and startup buffering.
 
-    Subclasses should implement `_recv_task`. Subclasses that need a handshake before `is_running`
-    should call `start(loop, set_running=False)` and set `is_running` in their `_recv_task`.
+    Handles socket creation, multipart frame encoding/decoding with msgpack,
+    a background send queue (one send at a time per zmq.asyncio socket), and
+    startup buffering (messages sent before ``is_running`` are queued and
+    drained once the event fires).
 
-    Multiple sockets can be created by passing in a list to the appropriate parameters.
-    If `process_group` is provided, the bind address will be broadcasted from the leader.
+    Subclasses should implement ``_recv_task``.  Subclasses that need a
+    handshake before ``is_running`` should call ``start(loop, set_running=False)``
+    and set ``is_running`` in their ``_recv_task``.
 
-    Args:
-        socket_type: Socket type name(s) (e.g. "DEALER").
-        connect: Address(es) to connect to.
-        bind: Whether to bind (per socket).
-        bind_port: Preferred port(s); falls back to random on failure.
-        identity: ZMQ IDENTITY option(s).
-        process_group: process group for address broadcasting.
-        is_leader: Whether this rank is the leader of the process group.
+    Multiple sockets can be created by passing a list to ``socket_type``
+    (and optionally to the other parameters).  If ``process_group`` is
+    provided, bind addresses are broadcast from the leader.
     """
+
+    if HAVE_ZMQ:
+        _SOCKET_TYPES = {
+            'DEALER': zmq.DEALER,
+            'ROUTER': zmq.ROUTER,
+            'PUB': zmq.PUB,
+            'SUB': zmq.SUB,
+            'PUSH': zmq.PUSH,
+            'PULL': zmq.PULL,
+        }
 
     def __init__(
         self,
@@ -167,8 +68,10 @@ class AsyncZmqEndpoint:
         process_group=_NO_PROCESS_GROUP,
         is_leader: bool = True,
     ):
-        ctx = zmq.asyncio.Context.instance()
+        assert HAVE_ZMQ, "please install the pyzmq library \n pip install pyzmq"
+        assert HAVE_MSGPACK, "please install the msgpack library \n pip install msgpack"
 
+        ctx = zmq.asyncio.Context.instance()
         has_pg = process_group is not _NO_PROCESS_GROUP
 
         # Normalize parameters to lists.
@@ -184,7 +87,7 @@ class AsyncZmqEndpoint:
         self._socket_uses_identity = []
 
         for i in range(n):
-            st = _SOCKET_TYPES[socket_type[i]]
+            st = self._SOCKET_TYPES[socket_type[i]]
             sock = ctx.socket(st)
             conn = connect[i]
 
@@ -207,7 +110,7 @@ class AsyncZmqEndpoint:
                     if port is not None:
                         try:
                             sock.bind(f"tcp://{local_ip}:{port}")
-                        except zmq.error.ZMQError as e:
+                        except zmq.error.ZMQError:
                             logging.warning(f"Port {port} is in use. Binding to available port.")
                     if sock.getsockopt_string(zmq.LAST_ENDPOINT) == '':
                         sock.bind_to_random_port(f"tcp://{local_ip}")
@@ -229,7 +132,7 @@ class AsyncZmqEndpoint:
             self._socket_uses_identity.append(st == zmq.ROUTER)
 
         self._ctx = ctx
-        self._zmq = AsyncZmqSendRecv()
+        self._send_awaitables = asyncio_Queue()
         self.is_running = asyncio.Event()
         self.is_shutdown = False
         self._startup_sends: list | None = []
@@ -243,68 +146,52 @@ class AsyncZmqEndpoint:
         serialize: bool = True,
         sock: int = 0,
     ):
-        """Send a message, buffering it if the endpoint is not yet running.
-
-        Args:
-            header: The signal header to send.
-            data: The data payload to send.
-            identity: The ZMQ identity of the recipient (ROUTER sockets only).
-            serialize: Whether to serialize data with msgpack.
-            sock: Index into ``self._sockets`` (default 0).
-        """
+        """Send a message, buffering it if the endpoint is not yet running."""
         if not self.is_running.is_set():
             self._startup_sends.append((header, data, identity, sock))
             return
-        self._zmq.isend(self._sockets[sock], header, data, identity=identity, serialize=serialize)
+        frames = []
+        if identity is not None:
+            frames.append(identity)
+        frames.append(header.value.to_bytes())
+        if data is not None:
+            if serialize:
+                data = msgpack.packb(data, use_bin_type=True)
+            frames.append(data)
+        awaitable = self._sockets[sock].send_multipart(frames)
+        self._send_awaitables.put_nowait((awaitable, identity))
 
     async def _irecv(
         self, deserialize: bool = True, *, sock: int = 0
     ) -> tuple[Optional[bytes], Headers, list | bytes | None]:
-        """Receive a message from a socket.
-
-        Args:
-            deserialize: Whether to deserialize data with msgpack.
-            sock: Index into ``self._sockets`` (default 0).
-
-        Returns:
-            identity: The source identity, or None for non-ROUTER sockets.
-            header: The signal header received.
-            data: The data payload received.
-        """
-        return await self._zmq.irecv(
-            self._sockets[sock],
-            socket_uses_identity=self._socket_uses_identity[sock],
-            deserialize=deserialize,
-        )
+        """Receive and decode a multipart message from a socket."""
+        raw = await self._sockets[sock].recv_multipart()
+        if self._socket_uses_identity[sock]:
+            identity, header, *rest = raw
+        else:
+            header, *rest = raw
+            identity = None
+        header = Headers(int.from_bytes(header))
+        data = rest[0] if rest else None
+        if deserialize:
+            data = msgpack.unpackb(data, raw=False) if data is not None else None
+        return identity, header, data
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None, *, set_running: bool = True):
-        """Start background tasks.
-
-        Resolves the event loop, creates the send-queue and startup-buffer
-        tasks, and — if the subclass defines ``_recv_task`` — creates the
-        receive task as well.
-
-        Args:
-            loop: Event loop to schedule on; defaults to the running loop.
-            set_running: If True (default), mark the endpoint as running
-                immediately.  Subclasses that need a handshake before
-                ``is_running`` (e.g. waiting for ACK) should pass
-                ``set_running=False`` and set it themselves.
-        """
+        """Start background tasks (send queue, startup buffer, recv task)."""
         from megatron.core.utils import get_asyncio_loop
 
         loop = get_asyncio_loop(loop)
 
         @trace_async_exceptions
         async def startup_sends_task():
-            """Drain the startup send buffer once ``is_running`` is set."""
             await self.is_running.wait()
             for header, data, identity, sock in self._startup_sends:
                 self._isend(header, data, identity=identity, sock=sock)
             self._startup_sends = None
 
-        self._startup_sends_task = loop.create_task(startup_sends_task())
-        self._send_task = loop.create_task(self._zmq.send_task())
+        self.startup_sends = loop.create_task(startup_sends_task())
+        self.send_task = loop.create_task(self._send_task())
         if hasattr(self, '_recv_task'):
             self.recv_task = loop.create_task(self._recv_task())
         if set_running:
@@ -313,11 +200,30 @@ class AsyncZmqEndpoint:
     async def shutdown(self):
         """Stop background tasks and close all sockets."""
         self.is_shutdown = True
-        self._zmq.shutdown()
+        self._send_awaitables.shutdown()
         for s in self._sockets:
             if not s.closed:
                 s.close(linger=0)
-        tasks = [getattr(self, a, None) for a in ('recv_task', '_startup_sends_task', '_send_task')]
+        tasks = [getattr(self, a, None) for a in ('recv_task', 'startup_sends', 'send_task')]
         tasks = [t for t in tasks if t is not None and not t.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    @trace_async_exceptions
+    async def _send_task(self):
+        """Background task: drain the send queue and await each send."""
+        while True:
+            try:
+                awaitable, identity = await self._send_awaitables.get()
+                await awaitable
+                self._send_awaitables.task_done()
+            except asyncio_QueueShutDown:
+                break
+            except zmq.error.ZMQError as e:
+                if e.errno == zmq.EHOSTUNREACH:
+                    logging.warning(
+                        "ZMQ send failed, recipient unreachable (identity=%s)", identity
+                    )
+                    self._send_awaitables.task_done()
+                else:
+                    raise

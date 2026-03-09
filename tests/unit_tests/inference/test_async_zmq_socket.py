@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for AsyncZmqSendRecv -- no torch.distributed required."""
+"""Unit tests for AsyncZmqEndpoint -- no torch.distributed required."""
 
 import asyncio
 import multiprocessing
@@ -28,7 +28,7 @@ pytestmark = [
     pytest.mark.asyncio,
 ]
 
-from megatron.core.inference.async_zmq_communicator import AsyncZmqSendRecv
+from megatron.core.inference.async_zmq_communicator import AsyncZmqEndpoint
 from megatron.core.inference.headers import Headers
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -43,235 +43,159 @@ async def zmq_ctx():
 
 
 @pytest.fixture
-async def push_pull(zmq_ctx):
-    """PUSH/PULL socket pair on a random TCP port."""
-    push = zmq_ctx.socket(zmq.PUSH)
-    pull = zmq_ctx.socket(zmq.PULL)
-    port = push.bind_to_random_port("tcp://127.0.0.1")
-    pull.connect(f"tcp://127.0.0.1:{port}")
-    yield push, pull
-    push.close(linger=0)
-    pull.close(linger=0)
+async def push_pull():
+    """PUSH/PULL AsyncZmqEndpoint pair on a random TCP port."""
+    sender = AsyncZmqEndpoint("PUSH", bind=True)
+    receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
+    sender.start()
+    receiver.start()
+    yield sender, receiver
+    await sender.shutdown()
+    await receiver.shutdown()
 
 
 @pytest.fixture
-async def router_dealer(zmq_ctx):
-    """ROUTER/DEALER socket pair on a random TCP port.
-
-    ROUTER has ROUTER_MANDATORY set so sends to unknown identities raise.
-    DEALER identity is b"test-dealer".
-    """
-    router = zmq_ctx.socket(zmq.ROUTER)
-    router.setsockopt(zmq.ROUTER_MANDATORY, 1)
-    dealer = zmq_ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.IDENTITY, b"test-dealer")
-    port = router.bind_to_random_port("tcp://127.0.0.1")
-    dealer.connect(f"tcp://127.0.0.1:{port}")
+async def router_dealer():
+    """ROUTER/DEALER AsyncZmqEndpoint pair on a random TCP port."""
+    router = AsyncZmqEndpoint("ROUTER", bind=True)
+    dealer = AsyncZmqEndpoint("DEALER", identity="test-dealer", connect=router.address)
+    router.start()
+    dealer.start()
     # Brief sleep to let ZMQ handshake complete.
     await asyncio.sleep(0.05)
     yield router, dealer
-    dealer.close(linger=0)
-    router.close(linger=0)
+    await router.shutdown()
+    await dealer.shutdown()
 
 
-# ── TestAsyncZmqSendRecv ─────────────────────────────────────────────────────
+# ── TestAsyncZmqEndpoint ────────────────────────────────────────────────────
 
 
-class TestAsyncZmqSendRecv:
-    """Tests for the AsyncZmqSendRecv helper."""
+class TestAsyncZmqEndpoint:
+    """Tests for the AsyncZmqEndpoint send/recv and lifecycle."""
 
     # -- Roundtrip tests --
 
     async def test_roundtrip_push_pull(self, push_pull):
         """PUSH/PULL roundtrip with serialized data."""
-        push, pull = push_pull
-        sender = AsyncZmqSendRecv()
-        receiver = AsyncZmqSendRecv()
+        sender, receiver = push_pull
 
         data = [1, "hello", {"key": True}]
-        sender.isend(push, Headers.SUBMIT_REQUEST, data)
-        task = asyncio.create_task(sender.send_task())
+        sender._isend(Headers.SUBMIT_REQUEST, data)
 
-        identity, header, received = await asyncio.wait_for(receiver.irecv(pull), timeout=2.0)
+        identity, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
 
         assert identity is None
         assert header == Headers.SUBMIT_REQUEST
         assert received == data
 
-        sender.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
-
     async def test_roundtrip_no_data(self, push_pull):
         """Header-only message (no payload)."""
-        push, pull = push_pull
-        sender = AsyncZmqSendRecv()
-        receiver = AsyncZmqSendRecv()
+        sender, receiver = push_pull
 
-        sender.isend(push, Headers.PAUSE)
-        task = asyncio.create_task(sender.send_task())
+        sender._isend(Headers.PAUSE)
 
-        identity, header, received = await asyncio.wait_for(receiver.irecv(pull), timeout=2.0)
+        identity, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
 
         assert identity is None
         assert header == Headers.PAUSE
         assert received is None
 
-        sender.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
-
     async def test_roundtrip_serialize_false(self, push_pull):
         """Raw bytes with serialize=False / deserialize=False."""
-        push, pull = push_pull
-        sender = AsyncZmqSendRecv()
-        receiver = AsyncZmqSendRecv()
+        sender, receiver = push_pull
 
         raw_data = b"\x01\x02\x03\xff"
-        sender.isend(push, Headers.ENGINE_REPLY, raw_data, serialize=False)
-        task = asyncio.create_task(sender.send_task())
+        sender._isend(Headers.ENGINE_REPLY, raw_data, serialize=False)
 
         identity, header, received = await asyncio.wait_for(
-            receiver.irecv(pull, deserialize=False), timeout=2.0
+            receiver._irecv(deserialize=False), timeout=2.0
         )
 
         assert identity is None
         assert header == Headers.ENGINE_REPLY
         assert received == raw_data
 
-        sender.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
-
     async def test_roundtrip_router_dealer(self, router_dealer):
         """ROUTER/DEALER roundtrip with identity routing."""
         router, dealer = router_dealer
-        router_helper = AsyncZmqSendRecv()
-        dealer_helper = AsyncZmqSendRecv()
 
-        # ROUTER → DEALER: send with explicit identity.
-        router_helper.isend(router, Headers.ACK, [42], identity=b"test-dealer")
-        router_task = asyncio.create_task(router_helper.send_task())
+        # ROUTER -> DEALER: send with explicit identity.
+        router._isend(Headers.ACK, [42], identity=b"test-dealer")
 
-        identity, header, data = await asyncio.wait_for(dealer_helper.irecv(dealer), timeout=2.0)
+        identity, header, data = await asyncio.wait_for(dealer._irecv(), timeout=2.0)
         assert identity is None  # DEALER strips identity frame
         assert header == Headers.ACK
         assert data == [42]
 
-        # DEALER → ROUTER: send without identity; ROUTER adds it.
-        dealer_helper.isend(dealer, Headers.ENGINE_CONNECT)
-        dealer_task = asyncio.create_task(dealer_helper.send_task())
+        # DEALER -> ROUTER: send without identity; ROUTER adds it.
+        dealer._isend(Headers.ENGINE_CONNECT)
 
-        identity, header, data = await asyncio.wait_for(
-            router_helper.irecv(router, socket_uses_identity=True), timeout=2.0
-        )
+        identity, header, data = await asyncio.wait_for(router._irecv(), timeout=2.0)
         assert identity == b"test-dealer"
         assert header == Headers.ENGINE_CONNECT
         assert data is None
 
-        router_helper.shutdown()
-        dealer_helper.shutdown()
-        await asyncio.wait_for(router_task, timeout=2.0)
-        await asyncio.wait_for(dealer_task, timeout=2.0)
+    # -- Send queue behavior tests --
 
-    # -- send_task behavior tests --
-
-    async def test_send_task_drains_queue(self, push_pull):
-        """send_task drains all queued sends then exits on shutdown."""
-        push, pull = push_pull
-        sender = AsyncZmqSendRecv()
-        receiver = AsyncZmqSendRecv()
+    async def test_send_drains_queue(self, push_pull):
+        """Send queue drains all queued sends then exits on shutdown."""
+        sender, receiver = push_pull
 
         n = 5
         for i in range(n):
-            sender.isend(push, Headers.SUBMIT_REQUEST, [i])
-
-        task = asyncio.create_task(sender.send_task())
+            sender._isend(Headers.SUBMIT_REQUEST, [i])
 
         received = []
         for _ in range(n):
-            _, header, data = await asyncio.wait_for(receiver.irecv(pull), timeout=2.0)
+            _, header, data = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
             assert header == Headers.SUBMIT_REQUEST
             received.append(data[0])
 
         assert received == list(range(n))
 
-        sender.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
-
-    async def test_send_task_shutdown_empty(self):
-        """shutdown() on an empty queue causes send_task to exit cleanly."""
-        helper = AsyncZmqSendRecv()
-        task = asyncio.create_task(helper.send_task())
-        # Give send_task a chance to block on get().
+    async def test_shutdown_empty(self):
+        """shutdown() on an endpoint with no pending sends exits cleanly."""
+        ep = AsyncZmqEndpoint("PUSH", bind=True)
+        ep.start()
+        # Give send queue time to block on get().
         await asyncio.sleep(0.01)
-        helper.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
+        await asyncio.wait_for(ep.shutdown(), timeout=2.0)
 
-    async def test_send_task_error_handled(self, zmq_ctx):
-        """on_send_error returning True suppresses the exception."""
-        router = zmq_ctx.socket(zmq.ROUTER)
-        router.setsockopt(zmq.ROUTER_MANDATORY, 1)
-        router.bind_to_random_port("tcp://127.0.0.1")
+    async def test_ehostunreach_handled(self):
+        """EHOSTUNREACH on ROUTER is logged as a warning, not raised."""
+        router = AsyncZmqEndpoint("ROUTER", bind=True)
+        router.start()
 
-        helper = AsyncZmqSendRecv()
+        # Send to a non-existent identity -- ROUTER_MANDATORY makes this fail
+        # with EHOSTUNREACH.
+        router._isend(Headers.ACK, identity=b"nonexistent")
 
-        # Send to a non-existent identity — ROUTER_MANDATORY makes this fail.
-        helper.isend(router, Headers.ACK, identity=b"nonexistent")
-
-        errors = []
-
-        def on_error(e, identity):
-            errors.append((e, identity))
-            return True  # handled
-
-        task = asyncio.create_task(helper.send_task(on_send_error=on_error))
-        # Give send_task time to process the failing send.
+        # Give send queue time to process the failing send.
         await asyncio.sleep(0.1)
-        helper.shutdown()
-        await asyncio.wait_for(task, timeout=2.0)
 
-        assert len(errors) == 1
-        assert isinstance(errors[0][0], zmq.error.ZMQError)
-        assert errors[0][1] == b"nonexistent"
+        # If EHOSTUNREACH wasn't handled, the send task would have crashed.
+        await asyncio.wait_for(router.shutdown(), timeout=2.0)
 
-        router.close(linger=0)
+    async def test_shutdown_preserves_pending(self):
+        """A pending send completes before shutdown finishes.
 
-    async def test_send_task_error_propagates(self, zmq_ctx):
-        """on_send_error returning False lets the exception propagate."""
-        router = zmq_ctx.socket(zmq.ROUTER)
-        router.setsockopt(zmq.ROUTER_MANDATORY, 1)
-        router.bind_to_random_port("tcp://127.0.0.1")
-
-        helper = AsyncZmqSendRecv()
-        helper.isend(router, Headers.ACK, identity=b"nonexistent")
-
-        def on_error(e, identity):
-            return False  # not handled
-
-        task = asyncio.create_task(helper.send_task(on_send_error=on_error))
-
-        with pytest.raises(zmq.error.ZMQError):
-            await asyncio.wait_for(task, timeout=2.0)
-
-        router.close(linger=0)
-
-    async def test_shutdown_preserves_pending(self, push_pull):
-        """A pending send completes before send_task exits on shutdown.
-
-        This is the DISCONNECT-before-sentinel guarantee: isend(DISCONNECT)
+        This is the DISCONNECT-before-sentinel guarantee: _isend(DISCONNECT)
         followed by shutdown() means the DISCONNECT send is processed first.
         """
-        push, pull = push_pull
-        sender = AsyncZmqSendRecv()
-        receiver = AsyncZmqSendRecv()
+        sender = AsyncZmqEndpoint("PUSH", bind=True)
+        receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
+        sender.start()
+        receiver.start()
 
-        sender.isend(push, Headers.DISCONNECT)
-        sender.shutdown()
+        sender._isend(Headers.DISCONNECT)
+        await asyncio.wait_for(sender.shutdown(), timeout=2.0)
 
-        task = asyncio.create_task(sender.send_task())
-        await asyncio.wait_for(task, timeout=2.0)
-
-        # The message should have been sent before send_task exited.
-        _, header, _ = await asyncio.wait_for(receiver.irecv(pull), timeout=2.0)
+        # The message should have been sent before shutdown completed.
+        _, header, _ = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
         assert header == Headers.DISCONNECT
+
+        await receiver.shutdown()
 
 
 # ── TestCoordRecvLockPattern ─────────────────────────────────────────────────

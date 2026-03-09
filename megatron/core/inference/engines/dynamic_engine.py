@@ -28,7 +28,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engine_coordinator_client import EngineCoordinatorClient
+from megatron.core.inference.engines.engine_coordinator_client import EngineCoordinatorClient
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
