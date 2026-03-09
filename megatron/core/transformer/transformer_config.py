@@ -1419,6 +1419,15 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                offload_inside_moe = {"moe_act", "expert_fc1"} & set(self.offload_modules)
+                assert not offload_inside_moe, (
+                    f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
+                    f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
+                    f"so offloading activations inside it is redundant and will cause errors. "
+                    f"Either remove 'moe' from --recompute-modules or remove "
+                    f"{offload_inside_moe} from --offload-modules."
+                )
             assert (
                 self.min_offloaded_tensor_size >= 0
             ), "min_offloaded_tensor_size must be non-negative."
