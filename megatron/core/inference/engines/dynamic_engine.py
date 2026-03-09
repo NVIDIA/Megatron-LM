@@ -296,6 +296,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.resume_request_ids = None
 
+        # Speculative decoding acceptance tracking.
+        self._spec_tokens_proposed = 0
+        self._spec_tokens_accepted = 0
+        self._spec_steps = 0
+
         # Prefix caching coordination state.
         self._prefix_coordination_waits = 0
 
@@ -989,6 +994,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # empty lists for each request, so the zip produces the correct number of iterations
         accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
 
+        if self.num_speculative_tokens > 0 and accepted_tokens is not None:
+            self._spec_steps += 1
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
@@ -999,6 +1007,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
+
+                # Track acceptance statistics for logging.
+                self._spec_tokens_proposed += self.num_speculative_tokens
+                self._spec_tokens_accepted += len(accepted_tokens)
 
                 # The order `accepted_tokens + tokens` is correct here.
                 # `accepted_tokens` contains the sequence of
@@ -1611,6 +1623,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
+            # Add speculative decoding acceptance metrics.
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+                metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
+                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
             else:
@@ -1660,9 +1680,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+                output_str += (
+                    " ... spec: accept %.1f%% (%d/%d in %d steps)"
+                    % (
+                        spec_rate,
+                        self._spec_tokens_accepted,
+                        self._spec_tokens_proposed,
+                        self._spec_steps,
+                    )
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
+
+            # Reset speculative decoding accumulators after both wandb and console logging.
+            if self.num_speculative_tokens > 0:
+                self._spec_tokens_proposed = 0
+                self._spec_tokens_accepted = 0
+                self._spec_steps = 0
 
         return {
             "active_request_ids": active_request_ids,
