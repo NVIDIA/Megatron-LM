@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """NVIDIA DLFw Inspect integration for tensor inspection and statistics collection."""
 
@@ -25,11 +13,7 @@ MISSING_NVINSPECT_MSG = (
 
 try:
     import nvdlfw_inspect.api as nvinspect_api
-    from nvdlfw_inspect.logging import (
-        BaseLogger,
-        MetricLogger,
-        wrap_tensorboard_writer,
-    )
+    from nvdlfw_inspect.logging import BaseLogger, MetricLogger, wrap_tensorboard_writer
 
     HAVE_NVINSPECT = True
 except (ImportError, ModuleNotFoundError):
@@ -75,7 +59,7 @@ def _clean_metric_name(name: str) -> str:
     prefixes = ["model.module.module.", "model.module.", "model."]
     for prefix in prefixes:
         if name.startswith(prefix):
-            return name[len(prefix):]
+            return name[len(prefix) :]
     return name
 
 
