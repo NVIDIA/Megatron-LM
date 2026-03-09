@@ -85,7 +85,7 @@ except ImportError:
     # TE isn’t installed or the torch wrapper is missing
     tex = None
 
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp # TODO(asolergi-nv): Clean up!
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -97,6 +97,8 @@ _fa_version = None
 _flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
+
+# TODO(asolergi-nv): Clean up imports!
 
 
 @contextmanager
@@ -2125,11 +2127,10 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
         # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
         ### 1. Create cu_seqlens_padded if CP is enabled
         ### 2. Pad or truncate tensors if necessary
-        ### 3. Create max_seqlen
+        ### 3. Create loss mask
+        ### 4. Create position ids
+        ### 5. Create max_seqlen
         # From this point, all tensors have shape [1, sequence_length] (Except for cu_seqlens, cu_seqlens_padded and max_seqlen)
-        
-        # TODO(asolergi-nv): Create position_ids
-
 
         tokens, labels, cu_seqlens = batch["tokens"].squeeze(0), batch["labels"].squeeze(0), batch["cu_seqlens"].squeeze(0) # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension, so we need to remove it since TE expects cu_seqlens to be 1D
 
@@ -2177,7 +2178,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             'tokens': tokens.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
-            'position_ids': position_ids.unsqueeze(0), # batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
+            'position_ids': position_ids.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
             'max_seqlen': max_seqlen,

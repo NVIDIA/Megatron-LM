@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 NULL_TOKENIZERS = {'NullTokenizer': 'null-text', 'NullMultimodalTokenizer': 'null-multimodal', 'NullSFTTokenizer': 'null-sft'}
 
+# TODO(asolergi-nv): Fix elif args.tokenizer_type == 'SFTTokenizer':, upstream is different
+
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
     kwargs = {}
@@ -84,14 +86,6 @@ def build_tokenizer(args, **kwargs):
     elif args.tokenizer_type == 'SFTTokenizer':
         # SFTTokenizer uses the legacy tokenizer system
         from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer 
-        tokenizer = SFTTokenizer(
-            args.tokenizer_model,
-            args.sft_tokenizer_prompt_format,
-        )
-        return tokenizer
-    elif args.tokenizer_type == 'SFTTokenizer':
-        # SFTTokenizer uses the legacy tokenizer system
-        from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
         tokenizer = SFTTokenizer(
             args.tokenizer_model,
             args.sft_tokenizer_prompt_format,

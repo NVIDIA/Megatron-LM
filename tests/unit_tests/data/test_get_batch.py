@@ -27,6 +27,10 @@ import torch
 
 from torch.utils.data import DataLoader, Dataset
 
+# TODO(asolergi-nv): Clean imports
+# TODO(asolergi-nv): Check shapes and so on in tests
+# TODO(asolergi-nv): Finish HybridCP tests
+
 def initialize_test_environment(
     tp_size: int, cp_size: int, seq_length: int, micro_batch_size: int, global_batch_size: int = 1, sft: bool = False, hybrid_context_parallel: bool = False, max_seqlen_per_cp_rank: int = 1024, create_attention_mask: bool = False
 ):

@@ -61,15 +61,14 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# TODO(asolergi-nv): Develop tests!
-# TODO(asolergi-nv): Develop pretokenized format
-# TODO(asolergi-nv): Para esto si hacemos truncar --> Facil, tal y como lo tenemos ahora pero forzando siempre empezar las samples por el principio. Si deseamos no truncar tendremos que saltar a la siguiente sample una vez la siguiente sample + actual > seqlen
 # TODO(asolergi-nv): Remove chat templates & refactor SFTTokenizer
 # TODO(asolergi-nv): Craft docs with expected inputs & formats
-# TODO(asolergi-nv): Dropped positions_ids & attention_mask from batch
+# TODO(asolergi-nv): Drop positions_ids & attention_mask from batch
 # TODO(asolergi-nv): Add shape assertions!
-# TODO(asolergi-nv): Fused CP sharding, fuse TP sharing!
-# TODO(asolergi-nv): How are we going to have attention mask in hybrid cp if we already have cu_seqlens and everything is SFTDataset?
+# TODO(asolergi-nv): How are we going to have attention mask in hybrid cp if we already have cu_seqlens and everything is SFTDataset? REMOVED
+# TODO(asolergi-nv): Add back SFTDataset
+# TODO(asolergi-nv): Fix SFTTokenizer, specially in preprocess script!
+# TODO(asolergi-nv): Fix NullSFTTokenizer
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
