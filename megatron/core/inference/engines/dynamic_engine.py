@@ -1245,7 +1245,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
                 # We do this regardless of stop_len because speculative decoding can append
                 # multiple tokens at once, meaning the stop word might end at any of those positions.
-                for i in range(self.num_speculative_tokens + 1):
+                max_shift = min(self.num_speculative_tokens, len(generated_tokens) - stop_len)
+                for i in range(max_shift + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
                         # If the stop word was found in the middle of speculative tokens

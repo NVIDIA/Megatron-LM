@@ -48,7 +48,8 @@ class TestStopWordDetection:
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                for i in range(num_speculative_tokens + 1):
+                max_shift = min(num_speculative_tokens, len(generated_tokens) - stop_len)
+                for i in range(max_shift + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
                         if i > 0:

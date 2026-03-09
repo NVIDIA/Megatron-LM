@@ -1571,6 +1571,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = 0
         self.padded_active_request_count = 0
         self.paused_tokens = None
+        self.paused_speculative_tokens = None
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
@@ -2360,7 +2361,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count != 0:
             assert self.paused_tokens is not None
             next_tokens = torch.cat((self.paused_tokens, new_tokens))
-            if new_speculative_tokens is not None:
+            if new_speculative_tokens is not None and self.paused_speculative_tokens is not None:
                 new_speculative_tokens = torch.cat(
                     (self.paused_speculative_tokens, new_speculative_tokens), dim=1
                 )
