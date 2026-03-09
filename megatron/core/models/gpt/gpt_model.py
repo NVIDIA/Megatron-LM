@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    compute_mtp_inference_logits,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -617,21 +618,13 @@ class GPTModel(LanguageModule):
             # The new process_mtp_loss function doesn't handle mtp_logits_cache,
             # so we manually generate and cache MTP logits when in inference mode.
             if in_inference_mode:
-                hidden_states_list = torch.chunk(
-                    hidden_states, 1 + self.config.mtp_num_layers, dim=0
+                hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
+                    hidden_states=hidden_states,
+                    mtp_num_layers=self.config.mtp_num_layers,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
                 )
-                hidden_states = hidden_states_list[0]
-                self._mtp_logits_cache = None
-                mtp_inference_logits = []
-                for mtp_layer_number in range(self.config.mtp_num_layers):
-                    mtp_logits, _ = self.output_layer(
-                        hidden_states_list[mtp_layer_number + 1],
-                        weight=output_weight,
-                        runtime_gather_output=runtime_gather_output,
-                    )
-                    # mtp logits shape [b, 1, vocab size]
-                    mtp_inference_logits.append(mtp_logits.squeeze(1).unsqueeze(0))
-                self._mtp_logits_cache = torch.cat(mtp_inference_logits, dim=0)
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(

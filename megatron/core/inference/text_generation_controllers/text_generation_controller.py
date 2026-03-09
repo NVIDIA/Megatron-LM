@@ -137,6 +137,8 @@ class TextGenerationController:
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
 
+        self._init_mtp_sampling_tensor()
+
     def _init_mtp_sampling_tensor(self):
         """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
         if self.num_speculative_tokens is not None and self.num_speculative_tokens > 0:
@@ -781,39 +783,31 @@ class TextGenerationController:
                     ]
                 )
 
-    def _dynamic_step_sample_logits_and_verify_tokens(
-        self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
-    ):
+    def _get_required_logit_indices(
+        self,
+        request_in_prefill_status_tensor: Tensor,
+        request_query_lengths: Tensor,
+        num_decode_requests: int,
+        num_prefill_requests: int,
+        device: torch.device,
+    ) -> Tensor:
+        """Get indices into the logits tensor for tokens that need sampling.
+
+        For decode requests, all tokens (base + speculative) are needed.
+        For prefill requests, only the last token logits are needed.
+        Decode requests will always be on the left, followed by prefill requests.
+
+        Example with 5 requests (2 spec tokens):
+            Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
+            Request to prefill                  [    0         |         0         |          0        |    1        |         1          ]
+            Request query lengths               [    3         |         3         |          3        |    2        |         4          ]
+            OUTPUT : required_logit_indices     [ 0    1    2  |  3     4     5    |  6     7     8    |      10     |         14         ]
+
+        Returns:
+            Tensor: Indices into the sequence dimension of the logits tensor.
         """
-        Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
-        """
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-
-        # ================ PART 1 The following part of the code is to get all the relevant logit indices alone =========
-        # i.e For prefill requests just the last token logits are enough.
-        # i.e For decode requests we will need all tokens
-        # Decode request will always be on the left, followed by prefill requests
-        # In non speculative case, it was simple in the other function, we just always get the last token logits using query lengths.
-
-        # 5 requests #  Input ids shape : [1, 15]
-        # Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
-        # Request to prefill                  [    0         |         0         |          0        |    1        |         1          ]
-        # Request query lengths               [    3         |         3         |          3        |    2        |         4          ]
-        # OUTPUT : required_logit_indices     [ 0    1    2  |  3     4     5    |  6     7     8    |      10     |         14         ]
-
-        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
-        ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
-
-        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
-        num_decode_requests = active_request_count - num_prefill_requests
-
         decode_request_indices = torch.arange(
-            num_decode_requests * (self.num_speculative_tokens + 1), device=logits.device
+            num_decode_requests * (self.num_speculative_tokens + 1), device=device
         )
         prefill_request_indices = (
             request_query_lengths.cumsum(dim=0)[request_in_prefill_status_tensor == 1] - 1
@@ -828,43 +822,32 @@ class TextGenerationController:
             f"but got {len(required_logit_indices)} for num_decode_requests {num_decode_requests} "
             f"and num_prefill_requests {num_prefill_requests}"
         )
+        return required_logit_indices
 
-        required_logits = logits.squeeze(0)[required_logit_indices, :]  # Shape [1, 11, vocab_size]
-        required_mtp_logits = mtp_logits[
-            :, required_logit_indices, :
-        ]  # Shape [num_speculative_tokens, 11, vocab_size]
+    def _sample_speculative_logits(
+        self,
+        required_logits: Tensor,
+        required_mtp_logits: Tensor,
+        request_in_prefill_status_tensor: Tensor,
+    ) -> tuple:
+        """Sample tokens from logits and MTP logits using sampling buckets.
 
-        # ================ PART 1 The following part of the code is to sample the logits and mtp logits based on the sampling parameters =========
+        For torch sampling buckets: [request_indices, temp, top_k, top_p]
 
-        # request_indices will be 0, 1, 2, 3, 4 (since we have only 5 requests)
-        # For torch sampling buckets :-[request_indices, temp, top_k, top_p]
-        # [
-        # [[0,2], temp1, top_k1, top_p1],
-        # [1], temp3, top_k3, top_p3]
-        # [3, 4], temp2, top_k2, top_p2],
-        # ]
+        Example with 5 requests:
+            token_to_request_idx :              [ 0    0     0  |  1     1     1     |  2     2     2     |   3    |   4  ]
+            required_logits :                   [ a5l  a6l  a7l |  b3l    b4l  b5l   |  c6l   c7l   c8l   |  d2l   | e4l  ]  # Shape [11, vocab_size]
 
-        # Token to request idx :              [ 0    0     0  |  1     1     1     |  2     2     2     |   3    |   4  ]
-        # required_logits :                   [ a5l  a6l  a7l |  b3l    b4l  b5l   |  c6l   c7l   c8l   |  d2l   | e4l  ] # Shape [11, vocab_size]
-        # For first iteration :
-        #   sampling buckets : [0,2], temp1, top_k1, top_p1
-        #   output_tokens_jumbled_list = [a5s  a6s  a7s  c6s  c7s  c8s] #s->sampled tokens #
-        #   request_order_list = [0, 2]
-        #   token_order_list = [0, 1, 2, 6, 7, 8]
-        # For second iteration :
-        #   sampling buckets : [1], temp3, top_k3, top_p3
-        #   output_tokens_jumbled_list = [b3s  b4s  b5s]
-        #   request_order_list = [1]
-        #   token_order_list = [3, 4, 5]
-        # For third iteration :
-        #   sampling buckets : [3, 4], temp2, top_k2, top_p2
-        #   output_tokens_jumbled_list = [d2s  e4s] #s->sampled tokens #
-        #   request_order_list = [3, 4]
-        #   token_order_list = [9,10]
-        # Final output tokens : [a5s  a6s  a7s  c6s  c7s  c8s  b3s  b4s  b5s  d2s  e4s] # Shape [11]
-        # Final request order list : [0, 2, 1, 3, 4]
-        # Final token order list : [0, 1, 2, 6, 7, 8, 3, 4, 5, 9, 10]
+            Sampling buckets: [[[0,2], temp1, top_k1, top_p1], [[1], temp3, top_k3, top_p3], [[3, 4], temp2, top_k2, top_p2]]
 
+            Final output tokens : [a5s  a6s  a7s  c6s  c7s  c8s  b3s  b4s  b5s  d2s  e4s]  # Shape [11]
+            (Rearranged from sampling bucket order back to input order using token_order)
+
+        Returns:
+            tuple: (output_tokens, mtp_output_tokens, repeats) where output_tokens has shape
+                [total_required_tokens] and mtp_output_tokens has shape
+                [num_speculative_tokens, total_required_tokens].
+        """
         repeats = torch.where(
             request_in_prefill_status_tensor == 0, 1 + self.num_speculative_tokens, 1
         )
@@ -880,7 +863,6 @@ class TextGenerationController:
         mtp_output_tokens_jumbled_list = []
         token_order_list = []
 
-        # TODO : Maybe its okay to have a loop with num spec tokens ? (Since it will only be max 3 , so might be faster)
         for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
             request_indices_tensor = torch.tensor(
                 request_indices, device=token_to_request_index.device
@@ -888,8 +870,6 @@ class TextGenerationController:
             required_indices = torch.where(
                 torch.isin(token_to_request_index, request_indices_tensor)
             )[0]
-            # TODO : Can maybe club the following two and then split later ?
-            # TODO : Can directly initialize output tokens as a tensor and put the logits in the right place
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
@@ -908,9 +888,7 @@ class TextGenerationController:
             dtype=output_tokens_jumbled.dtype,
         )
         token_order = torch.cat(token_order_list, dim=0)
-        # Rearrange output tokens because previously it will be in the order of the
-        # sampling_bucket request indices, but now we want to put them according to
-        # their corresponding input ids
+        # Rearrange output tokens from sampling_bucket request order back to input ids order
         output_tokens[token_order] = output_tokens_jumbled
 
         mtp_output_tokens_jumbled = torch.cat(
@@ -919,24 +897,37 @@ class TextGenerationController:
         mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
         mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
 
-        ### ================ PART 3 This part is to do the following : ================
-        # Create the accepted tokens tensor
-        # For prefill it is always set to 1
-        # For decode, the first token is always accepted, then we compare with input tokens
-        # and accept the next tokens if its a match
-        # Then find the index of the last 1 in every request of the accepted tokens tensor
-        # Then these are the index of the tokens that will be sent to the next forward pass
-        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted
-        # in the first 3 requests
+        return output_tokens, mtp_output_tokens, repeats
 
-        # Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
-        # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
-        # Output tokens                       [ a6o a7o  a8o |  b40   b5o  b6o   |  c7o  c8o   c9o   |     d3o     |         e5o        ]  # At every index we get next positions sample
-        # Output tokens right shift           [ d3o a6o  a7o |  a8o   b40  b5o   |  b6o  c7o   c8o   |     c9o     |         d3o        ]
-        # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
-        # Last one indices                    [      1       |         5         |        6          |      9      |         10         ]
+    def _verify_speculative_tokens(
+        self,
+        output_tokens: Tensor,
+        input_tokens_required: Tensor,
+        request_in_prefill_status_tensor: Tensor,
+        repeats: Tensor,
+        num_decode_requests: int,
+        num_prefill_requests: int,
+        active_request_count: int,
+    ) -> tuple:
+        """Verify speculative tokens against input tokens and compute acceptance.
 
-        input_tokens_required = input_ids[0, required_logit_indices]
+        Creates an accepted tokens mask where:
+        - For prefill requests, the token is always accepted.
+        - For decode requests, the first token (base token) is always accepted, then we compare
+          sampled tokens with input tokens and accept consecutive matches.
+        Then finds the index of the last accepted token per request.
+
+        Example (assume 1, 2, and 0 spec tokens are accepted in the first 3 decode requests):
+            input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
+            Output tokens                       [ a6o a7o  a8o |  b40   b5o  b6o   |  c7o  c8o   c9o   |     d3o     |         e5o        ]
+            Output tokens right shift           [ d3o a6o  a7o |  a8o   b40  b5o   |  b6o  c7o   c8o   |     c9o     |         d3o        ]
+            Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
+            Last one indices                    [      1       |         5         |        6          |      9      |         10         ]
+
+        Returns:
+            tuple: (last_one_indices, accepted_tokens_mask, input_tokens_required) where
+                last_one_indices contains the index of the last accepted token per request.
+        """
         if input_tokens_required.ndim == 2:
             assert (
                 input_tokens_required.shape[0] == 1
@@ -946,11 +937,12 @@ class TextGenerationController:
         # Initialize mask with False to prevent boundary bleed
         accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
 
-        # This is to make all prefill tokens accepted
+        # Make all prefill tokens accepted
         token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
         accepted_tokens_mask[token_to_prefill_idx == 1] = True
 
         # Safe decode token verification without cross-batch boundary contamination
+        decode_mask_2d = None
         if num_decode_requests > 0:
             decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
 
@@ -963,23 +955,15 @@ class TextGenerationController:
 
             # Shift outputs right by 1 *within* each request to align sampled tokens with input targets
             decode_outputs_shifted = decode_outputs.roll(1, dims=1)
-
             decode_mask_2d = decode_inputs == decode_outputs_shifted
-
             # The first token (base token) is always accepted
             decode_mask_2d[:, 0] = True
-
-            # ENFORCE CONSECUTIVE ACCEPTANCE:
-            # cummin() on booleans propagates False (0) to the right, invalidating all subsequent mismatches
+            # Enforce consecutive acceptance: cummin propagates False to the right
             decode_mask_2d = decode_mask_2d.cummin(dim=1).values
-
-            # Put the consecutive-enforced mask back into the flattened 1D tensor
             accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
 
-        # This is to find the index of the last 1 in every request
-        # (Now mathematically guaranteed to be the final consecutive match)
         last_one_indices = torch.full(
-            (active_request_count,), -1, device=token_to_request_index.device
+            (active_request_count,), -1, device=input_tokens_required.device
         )
 
         if num_decode_requests > 0:
@@ -991,47 +975,92 @@ class TextGenerationController:
             last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
 
         if num_prefill_requests > 0:
-            # Prefill requests only have 1 token evaluated, so nonzero() is perfectly safe here
             decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
             prefill_valid = (
                 torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
             )
             last_one_indices[num_decode_requests:] = prefill_valid
 
-        # These are the tokens (output + speculative tokens) that will be going to the next forward pass
+        return last_one_indices, accepted_tokens_mask, input_tokens_required
+
+    def _dynamic_step_sample_logits_and_verify_tokens(
+        self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
+    ):
+        """
+        Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
+            context.paused_request_count : context.total_request_count
+        ]
+        request_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        # Get the logit indices for tokens that need sampling.
+        required_logit_indices = self._get_required_logit_indices(
+            request_in_prefill_status_tensor,
+            request_query_lengths,
+            num_decode_requests,
+            num_prefill_requests,
+            logits.device,
+        )
+
+        required_logits = logits.squeeze(0)[required_logit_indices, :]  # Shape [num_required, vocab_size]
+        required_mtp_logits = mtp_logits[
+            :, required_logit_indices, :
+        ]  # Shape [num_speculative_tokens, num_required, vocab_size]
+
+        # Sample tokens from logits and MTP logits.
+        output_tokens, mtp_output_tokens, repeats = self._sample_speculative_logits(
+            required_logits, required_mtp_logits, request_in_prefill_status_tensor
+        )
+
+        # Verify speculative tokens against input tokens.
+        input_tokens_required = input_ids[0, required_logit_indices]
+        last_one_indices, accepted_tokens_mask, input_tokens_required = (
+            self._verify_speculative_tokens(
+                output_tokens,
+                input_tokens_required,
+                request_in_prefill_status_tensor,
+                repeats,
+                num_decode_requests,
+                num_prefill_requests,
+                active_request_count,
+            )
+        )
+
+        # Store the final sampled tokens and MTP tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
         self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
             :, last_one_indices
         ]
 
-        ### ================ PART 4 This part is to do the following : ================
-        # To fill the speculative tokens and accepted_token counts
-        # For prefill it is always set to 1
-        # For decode, the first token is always accepted, then we compare with input tokens and
-        # accept the next tokens if its a match
-        # Then find the index of the last 1 in every request of the accepted tokens tensor
-        # Then these are the index of the tokens that will be sent to the next forward pass
-        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in
-        # the first 3 requests
-
-        # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
-        # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
-        # Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only handle decod requests, (Prefill already defaults to -1s)
-        # Accepted token counts               [      1       |         2         |         0         ]  # Prefill defaults to 0
-
-        # This part is to extract the accepted tokens
-        input_tokens_required[accepted_tokens_mask == 0] = -1  # Masks out non accepted tokens
+        # Extract accepted tokens and counts for decode requests.
+        # For prefill it is always set to 1. For decode, the first token is always accepted,
+        # then we compare with input tokens and accept the next tokens if its a match.
+        #
+        # Example (continuing from above):
+        #   input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]
+        #   Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
+        #   Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only decode requests (prefill defaults to -1)
+        #   Accepted token counts               [      1       |         2         |         0         ]  # Prefill defaults to 0
+        input_tokens_required[accepted_tokens_mask == 0] = -1  # Mask out non-accepted tokens
         input_tokens_decode_mode = input_tokens_required[
             : num_decode_requests * (self.num_speculative_tokens + 1)
         ]
         input_tokens_reshaped = input_tokens_decode_mode.reshape(
             -1, self.num_speculative_tokens + 1
-        )  # shape : [num_decode_requests, num_speculative_tokens + 1]
+        )  # shape: [num_decode_requests, num_speculative_tokens + 1]
 
-        accepted_tokens = input_tokens_reshaped[
-            :, 1:
-        ]  # Skip the first token of every decode request (i.e a5, b3, c6)
+        # Skip the first token of every decode request (i.e a5, b3, c6)
+        accepted_tokens = input_tokens_reshaped[:, 1:]
         self._accepted_tokens_per_request[: accepted_tokens.shape[0], :] = accepted_tokens
         self._accepted_token_counts_per_request = (self._accepted_tokens_per_request != -1).sum(
             dim=1
