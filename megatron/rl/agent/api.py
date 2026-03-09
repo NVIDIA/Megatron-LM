@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
@@ -197,11 +198,17 @@ class GroupedRolloutGenerator(Agent, ABC):
         groups_per_worker = request.generation_batch_size
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
-                "Filtering is not supported with generation_batch_size > 1"
+                "Cannot use filter_groups_with_same_reward with generation_batch_size > 1."
         assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"parallel_generation_tasks ({self.parallel_generation_tasks}) must be >= " \
-            f"generation_batch_size ({groups_per_worker})"
+            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
         num_workers = self.parallel_generation_tasks // groups_per_worker
+        unused = self.parallel_generation_tasks % groups_per_worker
+        if unused:
+            logging.warning(
+                f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
+                f"divisible by generation_batch_size ({groups_per_worker}); "
+                f"{unused} generation task(s) will be unused."
+            )
         submission_gate = asyncio.Semaphore(num_workers)
 
         async def generate_and_enqueue(batch_id, index_in_batch):

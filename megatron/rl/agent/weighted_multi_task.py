@@ -189,7 +189,7 @@ class WeightedMultiTask(
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts):
+        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
