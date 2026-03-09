@@ -1016,7 +1016,9 @@ class TextGenerationController:
             logits.device,
         )
 
-        required_logits = logits.squeeze(0)[required_logit_indices, :]  # Shape [num_required, vocab_size]
+        required_logits = logits.squeeze(0)[
+            required_logit_indices, :
+        ]  # Shape [num_required, vocab_size]
         required_mtp_logits = mtp_logits[
             :, required_logit_indices, :
         ]  # Shape [num_speculative_tokens, num_required, vocab_size]
