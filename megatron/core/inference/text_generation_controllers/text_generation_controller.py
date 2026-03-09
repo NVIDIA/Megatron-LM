@@ -1358,7 +1358,6 @@ class TextGenerationController:
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
-        # TODO : SHAN : Correclty implement this
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)

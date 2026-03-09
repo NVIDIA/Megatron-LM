@@ -1021,7 +1021,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         - len(request.generated_tokens)
                     ]
                 if request_id not in self.stop_word_being_finished_ids:
-
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
                     # TODO : SHAN Should check and change the following for speculative tokens
