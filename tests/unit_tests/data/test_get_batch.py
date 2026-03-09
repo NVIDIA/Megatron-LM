@@ -19,17 +19,10 @@ import pytest
 
 from megatron.core import mpu
 
-from megatron.training.datasets.data_samplers import HybridCPMegatronPretrainingSampler
-
 from sft_mamba import get_batch
 
 import torch
 
-from torch.utils.data import DataLoader, Dataset
-
-# TODO(asolergi-nv): Clean imports
-# TODO(asolergi-nv): Check shapes and so on in tests
-# TODO(asolergi-nv): Finish HybridCP tests
 
 def initialize_test_environment(
     tp_size: int, cp_size: int, seq_length: int, micro_batch_size: int, global_batch_size: int = 1, sft: bool = False, hybrid_context_parallel: bool = False, max_seqlen_per_cp_rank: int = 1024, create_attention_mask: bool = False
@@ -51,11 +44,8 @@ def initialize_test_environment(
     args.create_attention_mask_in_dataloader = create_attention_mask
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
-    #
     args.vocab_size = 1024
     args.tokenizer_type = "NullTokenizer"
-
-    #
     args.num_layers = 4
     args.hidden_size = 512
     args.num_attention_heads = 8
@@ -66,6 +56,7 @@ def initialize_test_environment(
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
     return args
+
 
 def create_sft_data_iterator(max_seq_length: int = 1024):
     min_len = max(1, int(0.1 * max_seq_length))
@@ -93,20 +84,21 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     batch = {"tokens": tokens, "labels": labels, "cu_seqlens": cu_seqlens}
     return iter([batch])
 
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
 def test_sft_batch(tp_size, cp_size, seq_length):
     if cp_size * tp_size > torch.cuda.device_count():
         pytest.skip(f"Skipping test because cp_size * tp_size > torch.cuda.device_count() ({cp_size * tp_size} > {torch.cuda.device_count()})")
-    
+
     global_batch_size = int(os.environ.get("WORLD_SIZE", 1)) // (tp_size * cp_size)
     initialize_test_environment(tp_size, cp_size, seq_length, micro_batch_size=1, global_batch_size=global_batch_size, sft=True)
 
     data_iterator = None
-    if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
+    if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator = create_sft_data_iterator(seq_length)
-    
+
     (
         attention_mask,
         cu_seqlens,
@@ -120,6 +112,7 @@ def test_sft_batch(tp_size, cp_size, seq_length):
         tokens,
     ) = get_batch(data_iterator)
 
+    # Presence checks
     assert tokens is not None
     assert labels is not None
     assert loss_mask is not None
@@ -130,47 +123,78 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     assert hybrid_cp_group is None
     assert local_cp_size is None
 
+    # Shape: preprocess_sft_batch pads to seq_length; THD CP slicing gives seq_length // cp_size per rank
+    seq_len_per_rank = seq_length // cp_size
+    assert tokens.shape == (1, seq_len_per_rank), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
+    assert labels.shape == (1, seq_len_per_rank), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
+    assert loss_mask.shape == (1, seq_len_per_rank), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
+    assert position_ids.shape == (1, seq_len_per_rank), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+
+    # Dtype checks
+    assert tokens.dtype == torch.int64
+    assert labels.dtype == torch.int64
+    assert loss_mask.dtype == torch.float32
+    assert position_ids.dtype == torch.int64
+
+    # cu_seqlens: 1D int32, starts at 0, ends at seq_length (padded by preprocess_sft_batch)
+    assert cu_seqlens.dim() == 1
+    assert cu_seqlens.dtype == torch.int32
+    assert cu_seqlens[0].item() == 0
+    assert cu_seqlens[-1].item() == seq_length
+    assert cu_seqlens.shape[0] >= 2  # at least one sequence
+
+    # max_seqlen: scalar, positive, within seq_length
+    assert max_seqlen.shape == (1,)
+    assert max_seqlen.dtype == torch.int32
+    assert 0 < max_seqlen.item() <= seq_length
+
     if cp_size > 1:
         assert cu_seqlens_padded is not None
-        if os.environ.get("RANK") == "0":
-            print(cu_seqlens_padded)
-            print(cu_seqlens)
+        assert cu_seqlens_padded.dim() == 1
+        assert cu_seqlens_padded.dtype == torch.int32
+        assert cu_seqlens_padded[0].item() == 0
+        assert cu_seqlens_padded[-1].item() == seq_length
+        assert cu_seqlens_padded.shape == cu_seqlens.shape
     else:
         assert cu_seqlens_padded is None
-    
+
     if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        torch.distributed.barrier()
+
 
 def create_pretrain_data_iterator(seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False):
     text = torch.randint(0, 10000, (micro_batch_size, seq_length + 1), dtype=torch.int64)
     tokens = text[:, :-1].contiguous()
     labels = text[:, 1:].contiguous()
-    position_ids = torch.arange(seq_length, dtype=torch.long).unsqueeze(0)
-    loss_mask = torch.ones((1, seq_length), dtype=torch.float)
+    position_ids = torch.arange(seq_length, dtype=torch.long).unsqueeze(0).expand(micro_batch_size, -1).contiguous()
+    loss_mask = torch.ones((micro_batch_size, seq_length), dtype=torch.float)
 
     batch = {"tokens": tokens, "labels": labels, "loss_mask": loss_mask, "position_ids": position_ids}
 
     if create_attention_mask:
         batch["attention_mask"] = torch.tril(
-            torch.ones((seq_length, seq_length))
-        ).unsqueeze(0).bool()
-    
+            torch.ones((micro_batch_size, 1, seq_length, seq_length))
+        ).bool()
+
     return iter([batch])
+
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
 @pytest.mark.parametrize("create_attention_mask", [True, False])
-def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask, micro_batch_size):
     if cp_size * tp_size > torch.cuda.device_count():
         pytest.skip(f"Skipping test because cp_size * tp_size > torch.cuda.device_count() ({cp_size * tp_size} > {torch.cuda.device_count()})")
-    global_batch_size = int(os.environ.get("WORLD_SIZE", 1)) // (tp_size * cp_size)
-    initialize_test_environment(tp_size, cp_size, seq_length, 1, global_batch_size=global_batch_size, sft=False, create_attention_mask=create_attention_mask)
+    dp_size = int(os.environ.get("WORLD_SIZE", 1)) // (tp_size * cp_size)
+    global_batch_size = micro_batch_size * dp_size
+    initialize_test_environment(tp_size, cp_size, seq_length, micro_batch_size, global_batch_size=global_batch_size, sft=False, create_attention_mask=create_attention_mask)
 
     data_iterator = None
-    if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
-        data_iterator = create_pretrain_data_iterator(seq_length, create_attention_mask=create_attention_mask)
-    
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator = create_pretrain_data_iterator(seq_length, micro_batch_size=micro_batch_size, create_attention_mask=create_attention_mask)
+
     (
         attention_mask,
         cu_seqlens,
@@ -184,30 +208,86 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
         tokens,
     ) = get_batch(data_iterator)
 
+    # Presence checks
     assert tokens is not None
-    assert labels is not None   
+    assert labels is not None
     assert loss_mask is not None
     assert position_ids is not None
-    if create_attention_mask:
-        assert attention_mask is not None
-    else:
-        assert attention_mask is None
-
     assert cu_seqlens is None
     assert cu_seqlens_padded is None
     assert max_seqlen is None
     assert hybrid_cp_group is None
     assert local_cp_size is None
-    
+
+    # Shape: pretrain CP slicing takes 2 non-contiguous chunks → seq_length // cp_size tokens per rank
+    seq_len_per_rank = seq_length // cp_size
+    assert tokens.shape == (micro_batch_size, seq_len_per_rank), f"Expected tokens shape ({micro_batch_size}, {seq_len_per_rank}), got {tokens.shape}"
+    assert labels.shape == (micro_batch_size, seq_len_per_rank), f"Expected labels shape ({micro_batch_size}, {seq_len_per_rank}), got {labels.shape}"
+    assert loss_mask.shape == (micro_batch_size, seq_len_per_rank), f"Expected loss_mask shape ({micro_batch_size}, {seq_len_per_rank}), got {loss_mask.shape}"
+    assert position_ids.shape == (micro_batch_size, seq_len_per_rank), f"Expected position_ids shape ({micro_batch_size}, {seq_len_per_rank}), got {position_ids.shape}"
+
+    # Dtype checks
+    assert tokens.dtype == torch.int64
+    assert labels.dtype == torch.int64
+    assert loss_mask.dtype == torch.float32
+    assert position_ids.dtype == torch.int64
+
+    # Pretrain loss_mask is all-ones (no masking in the dataloader)
+    assert loss_mask.sum().item() == micro_batch_size * seq_len_per_rank
+
+    if create_attention_mask:
+        assert attention_mask is not None
+        # attention_mask input shape (B, 1, S, S); seq_dim=2 splits the query dim → (B, 1, S // cp_size, S)
+        assert attention_mask.shape == (micro_batch_size, 1, seq_len_per_rank, seq_length), \
+            f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
+        assert attention_mask.dtype == torch.bool
+    else:
+        assert attention_mask is None
+
     if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-def create_hybrid_cp_data_iterator(seq_length: int = 1024, number_of_samples: int = 100, global_batch_size: int = 16, micro_batch_size: int = 1):
-    # TODO(asolergi-nv): Implement HybridCP data iterator when it's ready
-    return None
+        torch.distributed.barrier()
 
 
-@pytest.mark.skip(reason="deactivated")
+def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
+    # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
+    n_seqs = max(2, 2 * cp_size)
+    align = max(1, 2 * cp_size)
+    seq_len_each = (seq_length // n_seqs // align) * align
+    if seq_len_each == 0:
+        seq_len_each = align
+    total_seq_len = n_seqs * seq_len_each
+
+    text = torch.randint(0, 10000, (1, total_seq_len + 1), dtype=torch.int64)
+    tokens = text[:, :-1].contiguous()       # (1, total_seq_len)
+    labels = text[:, 1:].contiguous()        # (1, total_seq_len)
+    loss_mask = torch.ones((1, total_seq_len), dtype=torch.float32)
+    position_ids = torch.cat([
+        torch.arange(seq_len_each, dtype=torch.int64) for _ in range(n_seqs)
+    ]).unsqueeze(0)  # (1, total_seq_len)
+
+    cu_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32),
+        torch.cumsum(torch.tensor([seq_len_each] * n_seqs, dtype=torch.int64), dim=0).to(torch.int32),
+    ])
+    max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32)
+    local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32)
+
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+        "local_cp_size": local_cp_size_tensor,
+    }
+
+    if cp_size > 1:
+        batch["cu_seqlens_padded"] = cu_seqlens.clone()
+
+    return iter([batch])
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024])
@@ -219,9 +299,9 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     initialize_test_environment(tp_size, cp_size, seq_length, 1, 16, sft=False, hybrid_context_parallel=True, create_attention_mask=create_attention_mask)
 
     data_iterator = None
-    if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
-        data_iterator = create_hybrid_cp_data_iterator(seq_length)
-    
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator = create_hybrid_cp_data_iterator(seq_length, cp_size=cp_size)
+
     (
         attention_mask,
         cu_seqlens,
@@ -235,24 +315,70 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         tokens,
     ) = get_batch(data_iterator)
 
+    # Presence checks
     assert tokens is not None
-    assert labels is not None   
+    assert labels is not None
     assert loss_mask is not None
     assert position_ids is not None
-    if create_attention_mask:
-        assert attention_mask is not None
-    else:
-        assert attention_mask is None
+    assert attention_mask is None          # HybridCP does not use attention mask from dataloader
+    assert cu_seqlens is not None          # HybridCP always has cu_seqlens
+    assert max_seqlen is not None          # HybridCP always has max_seqlen
+    assert local_cp_size is not None       # HybridCP always has local_cp_size
 
-    assert cu_seqlens is None
-    assert cu_seqlens_padded is None
-    assert max_seqlen is None
-    assert hybrid_cp_group is None
-    assert local_cp_size is None
-    
+    # Data iterator parameters (must match create_hybrid_cp_data_iterator)
+    n_seqs = max(2, 2 * cp_size)
+    align = max(1, 2 * cp_size)
+    seq_len_each = (seq_length // n_seqs // align) * align
+    if seq_len_each == 0:
+        seq_len_each = align
+    total_seq_len = n_seqs * seq_len_each  # equals seq_length for the test parameters
+
+    # Shape: HybridCP CP splitting gives total_seq_len // cp_size tokens per rank
+    seq_len_per_rank = total_seq_len // cp_size
+    assert tokens.shape == (1, seq_len_per_rank), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
+    assert labels.shape == (1, seq_len_per_rank), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
+    assert loss_mask.shape == (1, seq_len_per_rank), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
+    assert position_ids.shape == (1, seq_len_per_rank), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+
+    # Dtype checks
+    assert tokens.dtype == torch.int64
+    assert labels.dtype == torch.int64
+    assert loss_mask.dtype == torch.float32
+    assert position_ids.dtype == torch.int64
+
+    # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
+    assert loss_mask.sum().item() == seq_len_per_rank
+
+    # cu_seqlens: 1D int32, [0, seq_len_each, 2*seq_len_each, ..., total_seq_len]
+    assert cu_seqlens.shape == (n_seqs + 1,), f"Expected cu_seqlens shape ({n_seqs + 1},), got {cu_seqlens.shape}"
+    assert cu_seqlens.dtype == torch.int32
+    assert cu_seqlens[0].item() == 0
+    assert cu_seqlens[-1].item() == total_seq_len
+
+    # max_seqlen: scalar int32 equal to the per-sequence length in the iterator
+    assert max_seqlen.shape == (1,)
+    assert max_seqlen.dtype == torch.int32
+    assert max_seqlen.item() == seq_len_each
+
+    # local_cp_size: scalar int32 equal to cp_size
+    assert local_cp_size.shape == (1,)
+    assert local_cp_size.dtype == torch.int32
+    assert local_cp_size.item() == cp_size
+
+    if cp_size > 1:
+        assert cu_seqlens_padded is not None
+        assert cu_seqlens_padded.shape == (n_seqs + 1,)
+        assert cu_seqlens_padded.dtype == torch.int32
+        assert cu_seqlens_padded[0].item() == 0
+        assert cu_seqlens_padded[-1].item() == total_seq_len
+        assert hybrid_cp_group is not None
+    else:
+        assert cu_seqlens_padded is None
+        assert hybrid_cp_group is None
+
     if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-    
+        torch.distributed.barrier()
+
+
 if __name__ == "__main__":
-    # test_pretrain_batch(2, 1, 1024, True)
-    test_hybrid_cp_batch(1, 2, 1024, False)
+    test_pretrain_batch(1, 2, 1024, True, 2)
