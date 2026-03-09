@@ -659,10 +659,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
 
-        sequential = False
         if self.separation_hint is not None and self.thread_count <= 1:
             self.thread_count = 2
-            sequential = True
 
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
@@ -670,7 +668,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
-            sequential=sequential,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -766,7 +763,7 @@ def _get_filesystem_reader(
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
-        return CachedMetadataFileSystemReader(checkpoint_dir)
+        return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
 
     return FileSystemReader(checkpoint_dir)
 
@@ -774,8 +771,9 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self):
+    def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
+        self.cache_metadata = cache_metadata
         super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -806,7 +804,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
-        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
@@ -818,9 +816,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             ),
         )
 
-        self.cached_global_metadata = (
-            fsr.read_metadata()
-        )  # no storage interaction thanks to caching
+        if self.cache_metadata:
+            self.cached_global_metadata = (
+                fsr.read_metadata()
+            )  # no storage interaction thanks to caching
 
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict

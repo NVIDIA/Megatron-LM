@@ -53,12 +53,33 @@ on:
         description: Starting tag for changelog builder (leave empty for auto-detect)
         type: string
         default: ""
+      publish-docs:
+        required: false
+        description: Publish documentation to S3 after release
+        type: boolean
+        default: true
     secrets:
       TWINE_PASSWORD:
         required: true
       SLACK_WEBHOOK:
         required: true
       PAT:
+        required: true
+      AWS_ASSUME_ROLE_ARN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AKAMAI_HOST:
+        required: true
+      AKAMAI_CLIENT_TOKEN:
+        required: true
+      AKAMAI_CLIENT_SECRET:
+        required: true
+      AKAMAI_ACCESS_TOKEN:
+        required: true
+      S3_BUCKET_NAME:
         required: true
 
 permissions:
@@ -199,9 +220,6 @@ jobs:
           # Extract PR number from URL
           PR_NUMBER=$(echo $PR_URL | grep -o '[0-9]*$')
 
-          # Add comment to the newly created PR
-          echo gh pr comment $PR_NUMBER --body "/ok to test $(git rev-parse HEAD)"
-
       - name: Wait for status checks on tmp branch
         uses: actions/github-script@v7
         id: wait-status
@@ -326,7 +344,6 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: false
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
@@ -344,7 +361,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
       VERSION: ${{ needs.bump-next-version.outputs.release-version }}
-      TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
+      TAG_PREFIX: core_
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -455,6 +472,12 @@ jobs:
   publish-docs:
     needs: [bump-next-version, create-gh-release]
     uses: ./.github/workflows/release-docs.yml
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.publish-docs == true
+      && !cancelled()
     with:
       dry-run: ${{ inputs.dry-run }}
       publish-as-latest: true
