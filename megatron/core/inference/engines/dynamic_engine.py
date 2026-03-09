@@ -1214,11 +1214,12 @@ class DynamicInferenceEngine(AbstractEngine):
         return {"waits": self._prefix_coordination_waits}
 
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
-        """Find longest Mamba prefix match by iterating block hashes from the end.
+        """Find farthest block with cached Mamba state by iterating from the end.
 
-        Parent-chained hashes guarantee: if hash at position N exists in
-        mamba_hash_to_block_id, all hashes 0..N also exist. So the first
-        match from the end gives the longest prefix.
+        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
+        only divergence and last-aligned blocks do. Iterating from the end
+        finds the farthest block with cached state, which is the only one
+        needed for restore since Mamba state is cumulative.
         """
         if not req.precomputed_block_hashes:
             return 0
