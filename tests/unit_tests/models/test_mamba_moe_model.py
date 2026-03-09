@@ -279,7 +279,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
-    "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "sequence_packing_scheduler": None,
     "fallback_to_eager_attn": False,

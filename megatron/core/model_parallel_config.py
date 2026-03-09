@@ -65,16 +65,16 @@ class ModelParallelConfig:
     each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
     """
 
     sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
     """
-    Scheduler for sequence packing and hybrid context parallel.
+    Scheduler for sequence packing and dynamic context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
     """
 
