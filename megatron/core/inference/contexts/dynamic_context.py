@@ -2089,9 +2089,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
-            # Clone needed: flip() returns a view, and subsequent += (line below) would
-            # write through to self.request_kv_block_counts without the clone.
-            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count].clone()
+            # Clone not needed: flip() makes a copy.
+            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
             # Flip counts before cumsum, since paused requests are resumed from
             # the right-most index, so we must count resumed blocks starting from
             # the right side.
@@ -2540,7 +2539,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_generated_tokens
         )
 
-        # Clone needed: old_offsets is reused later (line ~2606) to compute raw_positions
+        # Clone needed: old_offsets is reused later to compute raw_positions
         # for block-boundary detection. The write-back on the next line overwrites the
         # underlying tensor, so without clone the boundary-crossing logic would see the
         # new offsets instead of the pre-update values.
