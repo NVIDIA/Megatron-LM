@@ -52,6 +52,11 @@ class TestTextGenerationController:
         batch_size: int = 4,
         static: bool = True,
         use_training_random_init: bool = False,
+        materialize_only_last_token_logits: bool = False,
+        num_speculative_tokens: int = 0,
+        block_size_tokens: int = 256,
+        enable_prefix_caching: bool = False,
+        max_requests: int = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -108,10 +113,14 @@ class TestTextGenerationController:
                 inference_config=InferenceConfig(
                     max_sequence_length=2048,
                     buffer_size_gb=0.2,
-                    materialize_only_last_token_logits=False,
+                    materialize_only_last_token_logits=materialize_only_last_token_logits,
                     use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                     # this is for compatibility with the LTS environment
                     unified_memory_level=0,  # unit tests currently broken with UVM
+                    num_speculative_tokens=num_speculative_tokens,
+                    block_size_tokens=block_size_tokens,
+                    enable_prefix_caching=enable_prefix_caching,
+                    max_requests=max_requests,
                 ),
             )
 
@@ -224,11 +233,15 @@ class TestTextGenerationController:
         self, backend: str, materialize_only_last_token_logits: bool
     ):
         batch_size = 12
-        self.setup_model(torch.float32, batch_size=batch_size, static=False)
+        self.setup_model(
+            torch.float32,
+            batch_size=batch_size,
+            static=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = materialize_only_last_token_logits
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
@@ -743,11 +756,15 @@ class TestTextGenerationController:
         3. Correct number of tokens are returned for each request
         """
         batch_size = 4
-        self.setup_model(torch.bfloat16, batch_size=batch_size, static=False)
+        self.setup_model(
+            torch.bfloat16,
+            batch_size=batch_size,
+            static=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = materialize_only_last_token_logits
 
         # Prepare sampling params
         top_n = 5
@@ -1011,13 +1028,11 @@ class TestTextGenerationController:
     @pytest.mark.internal
     def test_speculative_verify_tokens(self):
         """Test consecutive token acceptance logic for speculative decoding."""
-        self.setup_model(torch.float32, static=False)
+        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
 
         # Enable speculative decoding
         self.text_generation_controller.num_speculative_tokens = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.num_speculative_tokens = 2
-        ctx.max_requests = 2
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
         ctx.request_in_prefill_status_tensor = torch.tensor(
@@ -1076,11 +1091,9 @@ class TestTextGenerationController:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_rewind_kv_cache(self, is_hybrid_model):
         """Test KV cache state is properly rewound for rejected speculative tokens."""
-        self.setup_model(torch.float32, static=False)
+        self.setup_model(torch.float32, static=False, num_speculative_tokens=3, block_size_tokens=4)
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.num_speculative_tokens = 3
-        ctx.block_size_tokens = 4
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
         ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
@@ -1104,6 +1117,8 @@ class TestTextGenerationController:
             ctx.mamba_metadata.request_to_mamba_state_idx = torch.tensor([0, 1], device='cuda')
             ctx.mamba_ssm_states = torch.zeros((1, 2, 16), device='cuda')
             ctx.mamba_intermediate_ssm_states = torch.ones((1, 2, 4, 16), device='cuda') * 99
+            ctx.mamba_conv_states = torch.zeros((1, 2, 8), device='cuda')
+            ctx.mamba_intermediate_conv_states = torch.ones((1, 2, 4, 8), device='cuda') * 77
 
         # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
         self.text_generation_controller._init_mtp_sampling_tensor()
@@ -1138,19 +1153,21 @@ class TestTextGenerationController:
             # Check Mamba state was restored from intermediate cache based on accepted counts
             assert torch.all(ctx.mamba_ssm_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
             assert torch.all(ctx.mamba_ssm_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(ctx.mamba_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.mamba_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
 
     @pytest.mark.internal
     def test_speculative_multinomial_sampling(self):
         """Test that speculative decoding can successfully use non-greedy sampling
         (top_k > 1, top_p > 0) by flattening 3D MTP logits for torch.multinomial."""
-        self.setup_model(torch.float32, static=False)
+        num_spec = 3
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=2
+        )
 
         # Enable speculative decoding
-        num_spec = 3
         self.text_generation_controller.num_speculative_tokens = num_spec
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.num_speculative_tokens = num_spec
-        ctx.max_requests = 2
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
         ctx.request_in_prefill_status_tensor = torch.tensor(
@@ -1158,9 +1175,6 @@ class TestTextGenerationController:
         )  # Decode requests
         # query lengths for decode with spec tokens is (1 + num_spec) = 4
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
-
-        # Init accepted tokens tensors
-        self.text_generation_controller._init_mtp_sampling_tensor()
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
@@ -1202,23 +1216,18 @@ class TestTextGenerationController:
     def test_rewind_kv_cache_with_prefix_caching_ref_counts(self):
         """Test that _rewind_kv_cache correctly decrements ref counts on shared blocks
         when speculative token rejection causes a block boundary crossing."""
-        self.setup_model(torch.float32, static=False)
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            block_size_tokens=4,
+            enable_prefix_caching=True,
+        )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        self.text_generation_controller.num_speculative_tokens = 2
-        ctx.num_speculative_tokens = 2
-        ctx.block_size_tokens = 4
-        ctx.enable_prefix_caching = True
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
         ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
-
-        # Initialize allocator ref count tracking.
-        ctx.block_allocator.enable_prefix_caching = True
-        if not hasattr(ctx.block_allocator, 'block_ref_counts'):
-            ctx.block_allocator.block_ref_counts = torch.zeros(
-                ctx.block_allocator.total_count, dtype=torch.int32, device='cuda'
-            )
 
         # Req 0: 3 blocks, offset 1 in last block. Rewinding 1 token -> no block release.
         # Req 1: 3 blocks, offset 0 in last block. Rewinding 2 tokens -> crosses back, release block.
@@ -1252,12 +1261,11 @@ class TestTextGenerationController:
     @pytest.mark.internal
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
         """Test that rewinding only releases the last block, never shared prefix blocks."""
-        self.setup_model(torch.float32, static=False)
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=3, block_size_tokens=4
+        )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        self.text_generation_controller.num_speculative_tokens = 3
-        ctx.num_speculative_tokens = 3
-        ctx.block_size_tokens = 4
         ctx.total_request_count = 1
         ctx.paused_request_count = 0
         ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
