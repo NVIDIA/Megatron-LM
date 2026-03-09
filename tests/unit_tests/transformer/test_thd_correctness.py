@@ -150,21 +150,29 @@ def compute_sbhd_padded_max_len(
 
 
 def compute_thd_padded_seqlens(
-    seqlens: List[int], cp_size: int, tp_size: int, sp_enabled: bool, pad_to_max: bool = False
+    seqlens: List[int],
+    cp_size: int,
+    tp_size: int,
+    sp_enabled: bool,
+    pad_to_max: bool = False,
+    dynamic_cp: bool = False,
 ) -> List[int]:
     """Padded per-sequence lengths for THD.
 
     When pad_to_max=True, each sequence is padded to max(seqlens) so that
     total THD tokens = max_len * B, matching SBHD. This ensures TE GEMM
     kernels see identical M dimensions for bitwise comparison.
+
+    When dynamic_cp=True, pad to the global upper-bound CP size so that the
+    same packed layout works regardless of which dynamic CP sub-group the
+    sequence lands in.
     """
-    # With dynamic CP, a sequence may be assigned to any sub-group whose
-    # local_cp_size ranges from 1 to MAX_CP_SIZE.  We must pad to the
-    # *global* upper-bound so that the same packed layout works regardless
-    # of which sub-group the sequence lands in.  Hard-coded to 8 (single
-    # node with 8 GPUs).
-    MAX_CP_SIZE = 8
-    cp_divisor = 2 * max(cp_size, MAX_CP_SIZE) if cp_size > 1 else 1
+    if dynamic_cp:
+        MAX_CP_SIZE = 8
+        effective_cp = max(cp_size, MAX_CP_SIZE)
+    else:
+        effective_cp = cp_size
+    cp_divisor = 2 * effective_cp if cp_size > 1 else 1
     if pad_to_max:
         max_len = _round_up(max(seqlens), cp_divisor)
         padded = [max_len] * len(seqlens)
@@ -188,6 +196,7 @@ def make_packed_seq_params(
     tp_size: int = 1,
     sp_enabled: bool = False,
     pad_to_max: bool = False,
+    dynamic_cp: bool = False,
 ) -> PackedSeqParams:
     """Create PackedSeqParams with cu_seqlens and cu_seqlens_padded."""
 
@@ -197,7 +206,9 @@ def make_packed_seq_params(
             cu[i + 1] = cu[i] + l
         return cu.cuda()
 
-    padded = compute_thd_padded_seqlens(seqlens, cp_size, tp_size, sp_enabled, pad_to_max)
+    padded = compute_thd_padded_seqlens(
+        seqlens, cp_size, tp_size, sp_enabled, pad_to_max, dynamic_cp=dynamic_cp
+    )
     return PackedSeqParams(
         cu_seqlens_q=to_cu_seqlens(seqlens),
         cu_seqlens_kv=to_cu_seqlens(seqlens),
@@ -369,10 +380,21 @@ def shard_sbhd(tensor, cp_rank, cp_size, tp_rank, tp_size, sp_enabled):
 
 
 def shard_thd(
-    seq_data_list, seqlens, cp_rank, cp_size, tp_rank, tp_size, sp_enabled, H, pad_to_max=False
+    seq_data_list,
+    seqlens,
+    cp_rank,
+    cp_size,
+    tp_rank,
+    tp_size,
+    sp_enabled,
+    H,
+    pad_to_max=False,
+    dynamic_cp=False,
 ):
     """Shard per-sequence data into local THD [local_T, 1, H]."""
-    padded = compute_thd_padded_seqlens(seqlens, cp_size, tp_size, sp_enabled, pad_to_max)
+    padded = compute_thd_padded_seqlens(
+        seqlens, cp_size, tp_size, sp_enabled, pad_to_max, dynamic_cp=dynamic_cp
+    )
 
     chunks = []
     for data, sl, psl in zip(seq_data_list, seqlens, padded):
@@ -453,7 +475,7 @@ class _GatherTHD(torch.autograd.Function):
     """Gather THD outputs from all ranks with gradient support."""
 
     @staticmethod
-    def forward(ctx, local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max):
+    def forward(ctx, local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max, dynamic_cp):
         ctx.seqlens, ctx.cp_size, ctx.tp_size, ctx.sp_enabled, ctx.H = (
             seqlens,
             cp_size,
@@ -463,7 +485,9 @@ class _GatherTHD(torch.autograd.Function):
         )
         ctx.cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
         ctx.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        ctx.padded = compute_thd_padded_seqlens(seqlens, cp_size, tp_size, sp_enabled, pad_to_max)
+        ctx.padded = compute_thd_padded_seqlens(
+            seqlens, cp_size, tp_size, sp_enabled, pad_to_max, dynamic_cp=dynamic_cp
+        )
 
         out = local
         if sp_enabled:
@@ -502,7 +526,7 @@ class _GatherTHD(torch.autograd.Function):
         if ctx.sp_enabled:
             seg = packed.shape[0] // ctx.tp_size
             packed = packed[ctx.tp_rank * seg : (ctx.tp_rank + 1) * seg]
-        return packed.unsqueeze(1).contiguous(), None, None, None, None, None, None
+        return packed.unsqueeze(1).contiguous(), None, None, None, None, None, None, None
 
 
 def gather_sbhd(local, cp_size, tp_size, sp_enabled):
@@ -511,8 +535,8 @@ def gather_sbhd(local, cp_size, tp_size, sp_enabled):
     return _GatherSBHD.apply(local, cp_size, tp_size, sp_enabled)
 
 
-def gather_thd(local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max=False):
-    return _GatherTHD.apply(local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max)
+def gather_thd(local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max=False, dynamic_cp=False):
+    return _GatherTHD.apply(local, seqlens, cp_size, tp_size, sp_enabled, H, pad_to_max, dynamic_cp)
 
 
 # =============================================================================
@@ -822,7 +846,9 @@ class _GatherTHDDynamic(torch.autograd.Function):
         )
         ctx.cp_rank = cp_rank
         ctx.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        ctx.padded = compute_thd_padded_seqlens(seqlens, cp_size, tp_size, sp_enabled, False)
+        ctx.padded = compute_thd_padded_seqlens(
+            seqlens, cp_size, tp_size, sp_enabled, False, dynamic_cp=True
+        )
 
         out = local
         if sp_enabled:
@@ -923,15 +949,15 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     base_grad_data = [all_grad_data[i] for i in base_indices]
 
     local_thd_base = shard_thd(
-        base_seq_data, base_seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H
+        base_seq_data, base_seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H, dynamic_cp=True
     )
-    packed_base = make_packed_seq_params(base_seqlens, cp_size, tp_size, sp)
+    packed_base = make_packed_seq_params(base_seqlens, cp_size, tp_size, sp, dynamic_cp=True)
     rotary_pos_emb_base = rope(packed_base.max_seqlen_q, packed_seq=True)
     input_base = local_thd_base.detach().clone().requires_grad_(True)
     out_base, _ = layer(
         hidden_states=input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
     )
-    gathered_base = gather_thd(out_base, base_seqlens, cp_size, tp_size, sp, H)
+    gathered_base = gather_thd(out_base, base_seqlens, cp_size, tp_size, sp, H, dynamic_cp=True)
     grad_base = torch.cat(base_grad_data, dim=0).unsqueeze(1)
     gathered_base.backward(grad_base)
     baseline_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
@@ -955,9 +981,17 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
     dcp_cp_rank = dist.get_rank(group=dcp_cp_group)
 
     local_thd_dcp = shard_thd(
-        dcp_seq_data, dcp_seqlens, dcp_cp_rank, local_cp_size, tp_rank, tp_size, sp, H
+        dcp_seq_data,
+        dcp_seqlens,
+        dcp_cp_rank,
+        local_cp_size,
+        tp_rank,
+        tp_size,
+        sp,
+        H,
+        dynamic_cp=True,
     )
-    packed_dcp = make_packed_seq_params(dcp_seqlens, local_cp_size, tp_size, sp)
+    packed_dcp = make_packed_seq_params(dcp_seqlens, local_cp_size, tp_size, sp, dynamic_cp=True)
     packed_dcp.local_cp_size = local_cp_size
     packed_dcp.cp_group = dcp_cp_group
     rotary_pos_emb_dcp = rope(packed_dcp.max_seqlen_q, packed_seq=True)
