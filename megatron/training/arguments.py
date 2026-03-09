@@ -2709,8 +2709,8 @@ def _add_distributed_args(parser):
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
     group.add_argument('--create-all-gather-group', action='store_true',
-                   help='Create a separate process group for all-gather operations '
-                   'to overlap reduce-scatter and all-gather operations.')
+                       help='Create a separate process group for all-gather operations '
+                       'to overlap reduce-scatter and all-gather operations.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
