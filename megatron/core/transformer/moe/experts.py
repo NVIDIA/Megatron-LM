@@ -1144,6 +1144,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             self.ep_group.rank() * self.num_local_experts,
             expert_alignment=self.config.moe_expert_tensor_alignment,
             skip_padding=not self.config.moe_activation_no_skip_pad,
+            fuse_quant=self.config.inference_moe_fuse_quant,
         )
         return output, None
 

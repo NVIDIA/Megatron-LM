@@ -947,6 +947,11 @@ class TransformerConfig(ModelParallelConfig):
     skip rows where source_indices == -1 (alignment padding). Set to True to
     run activations on all rows including padding."""
 
+    moe_disable_fuse_quant: bool = False
+    """Set to True to disable fusing MXFP8 quantization with permute (FC1 input)
+    and with activation (FC2 input). When disabled, permute and quantize run
+    as separate kernels."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -2248,6 +2253,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        # Derived fusion flag (positive sense for cleaner kernel code)
+        self.inference_moe_fuse_quant = not self.moe_disable_fuse_quant
 
 
 @dataclass

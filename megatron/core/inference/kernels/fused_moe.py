@@ -595,6 +595,7 @@ def mcore_fused_moe(
     local_expert_start: int,
     expert_alignment: int = 128,
     skip_padding: bool = True,
+    fuse_quant: bool = False,
 ) -> torch.Tensor:
     """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
@@ -615,6 +616,8 @@ def mcore_fused_moe(
         expert_alignment: per-expert token alignment (default 128).
         skip_padding: if True (default), activation kernels skip rows where
             source_indices == -1. Set to False to run on all rows.
+        fuse_quant: if True, fuse MXFP8 quantization with permute (FC1 input)
+            and with activation (FC2 input, squared_relu only). MXFP8 only.
 
     Returns:
         [num_tokens, hidden_size] BF16 output.
@@ -645,30 +648,38 @@ def mcore_fused_moe(
     if use_mxfp8:
         assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available"
 
-        # --- Fused permute + quantize (FC1 input) ---
-        permuted_fp8, permuted_scale, permuted_probs, source_indices = (
-            permute_and_quantize(
+        # --- FC1 input: permute + quantize ---
+        if fuse_quant:
+            permuted_fp8, permuted_scale, permuted_probs, source_indices = (
+                permute_and_quantize(
+                    hidden_states, probs, routing_map, padded_exc,
+                    local_expert_start, num_local_experts,
+                    output_size=max_output_size,
+                )
+            )
+            if permuted_fp8.nelement() == 0:
+                return torch.zeros_like(hidden_states)
+            permuted_act = MXFP8Tensor(data=permuted_fp8, scale=permuted_scale)
+        else:
+            permuted_hidden, permuted_probs, source_indices = permute_tokens(
                 hidden_states, probs, routing_map, padded_exc,
                 local_expert_start, num_local_experts,
                 output_size=max_output_size,
             )
-        )
+            if permuted_hidden.nelement() == 0:
+                return torch.zeros_like(hidden_states)
+            permuted_act = MXFP8Tensor.from_bf16_torch(permuted_hidden)
 
-        if permuted_fp8.nelement() == 0:
-            return torch.zeros_like(hidden_states)
-
-        # --- FC1: scaled_grouped_mm with pre-quantized activations ---
-        permuted_act = MXFP8Tensor(data=permuted_fp8, scale=permuted_scale)
+        # --- FC1 ---
         fc1_output = _mxfp8_grouped_gemm(permuted_act, fc1_weight, offs)
 
-        # --- Fused activation + quantize (FC2 input) ---
-        if activation_type == ActivationType.SQUARED_RELU:
+        # --- FC2 input: activation + quantize ---
+        if fuse_quant and activation_type == ActivationType.SQUARED_RELU:
             fc2_fp8, fc2_scale = squared_relu_and_quantize(
                 fc1_output, source_indices, skip_padding=skip_padding,
             )
             fc2_act = MXFP8Tensor(data=fc2_fp8, scale=fc2_scale)
         else:
-            # SwiGLU: separate activation + quantize (TODO: fuse)
             activated = activation_func(fc1_output, source_indices)
             fc2_act = MXFP8Tensor.from_bf16_torch(activated)
 
