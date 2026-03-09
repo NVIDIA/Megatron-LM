@@ -1274,6 +1274,12 @@ def validate_args(args, defaults={}):
         args.fsdp_manual_registration = True
         warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
 
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
+
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
