@@ -2289,6 +2289,90 @@ class TestDynamicInferenceEngine:
         assert [7, 8, 9] in token_triplets
 
     @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_stop_word_truncates_trailing_tokens(self):
+        """Test that when a stop word lands in the middle of speculative tokens,
+        the extra tokens generated after the stop word are removed.
+
+        With num_speculative_tokens=2, each step produces up to 3 tokens
+        (1 base + 2 speculative). If the stop word is [6] and the engine
+        generates [5, 6, 7] in one step, token 7 must be truncated so the
+        output ends with the stop word [6]."""
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=10,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+
+        # Mock forward to deterministically output an ascending sequence (1->2->3...)
+        def mock_deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            b, s = tokens.shape
+
+            base_logits = torch.zeros(
+                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+            base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
+
+            mtp_logits = torch.zeros(
+                2, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            mtp1_toks = (tokens + 2).clamp(max=test_config.vocab_size - 1)
+            mtp_logits[0].scatter_(1, mtp1_toks.squeeze(0).unsqueeze(-1), 100.0)
+
+            mtp2_toks = (tokens + 3).clamp(max=test_config.vocab_size - 1)
+            mtp_logits[1].scatter_(1, mtp2_toks.squeeze(0).unsqueeze(-1), 100.0)
+
+            unwrapped_model._mtp_logits_cache = mtp_logits
+            return base_logits
+
+        unwrapped_model.forward = mock_deterministic_forward
+
+        env.engine.add_request(
+            request_id=0,
+            prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+        )
+
+        # Stop word [6] will land in the middle of a speculative batch [5, 6, 7].
+        # Token 7 should be truncated from the output.
+        tracked_req = env.engine.get_request(0)
+        tracked_req.stop_word_ids = [[6]]
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        finished_req = finished_records[0].merge()
+
+        assert finished_req.status == Status.COMPLETED
+        # The output should end exactly at the stop word, with no trailing tokens.
+        assert finished_req.generated_tokens[-1] == 6, (
+            f"Expected last token to be stop word 6, "
+            f"got {finished_req.generated_tokens[-1]}. "
+            f"Trailing tokens after stop word were not truncated. "
+            f"Full output: {finished_req.generated_tokens}"
+        )
+        # Verify no tokens after the stop word exist
+        assert 7 not in finished_req.generated_tokens, (
+            f"Token 7 should have been truncated after stop word 6. "
+            f"Full output: {finished_req.generated_tokens}"
+        )
+
+    @pytest.mark.internal
     @torch.inference_mode()
     def test_speculative_sequence_length_double_counting(self):
         """Test to verify active_sequence_lengths is not double-counted.
