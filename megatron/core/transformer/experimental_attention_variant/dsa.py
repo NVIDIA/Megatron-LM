@@ -1148,14 +1148,14 @@ class DSAttention(MegatronModule):
             # Attach indexer topk and loss
             # ===================================
             # For MQA mode, expand key to match query heads for loss computation
-            key_for_loss = key.expand(-1, -1, np, -1) if is_mqa else key
+            key_for_loss = key.detach().expand(-1, -1, np, -1) if is_mqa else key.detach()
             # Compute KL divergence loss between indexer scores and true attention scores
             topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
                 q,
                 weights,
                 k,
                 query.detach(),
-                key_for_loss.detach(),
+                key_for_loss,
                 self.softmax_scale,
                 self.indexer.index_topk,
                 indexer_loss_coeff,
@@ -1184,12 +1184,10 @@ class DSAttention(MegatronModule):
                     and self.v_channels == 512
                 ):
                     # Currently fused kernel only supports specific config combination.
-                    # print("Using fused MQA kernel")
                     output = FusedDSAMQA.apply(
                         query, key, self.v_channels, topk_indices, self.softmax_scale
                     )
                 else:
-                    # print("Using unfused MQA kernel")
                     output = unfused_dsa_fn_mqa(
                         query, key, self.v_channels, topk_indices, self.softmax_scale
                     )
