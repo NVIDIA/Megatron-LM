@@ -362,7 +362,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
             mamba_states_memory_per_request *= self.num_mamba_layers
-            mamba_states_memory_per_request *= self.num_speculative_tokens + 1
+            if self.num_speculative_tokens > 0:
+                # Add memory for intermediate conv and SSM states
+                intermediate_memory_per_request = (
+                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+                    + math.prod(self.mamba_ssm_states_shape)
+                    * self.mamba_ssm_states_dtype.itemsize
+                )
+                intermediate_memory_per_request *= self.num_mamba_layers
+                intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -615,10 +624,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
             )
-            expanded_conv_shape = list(self.mamba_conv_states_shape)
-            expanded_conv_shape[-1] += self.num_speculative_tokens
             self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests, *expanded_conv_shape),
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -628,6 +635,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
             if self.num_speculative_tokens > 0:
+                self.mamba_intermediate_conv_states = torch.empty(
+                    (
+                        self.num_mamba_layers,
+                        self.max_requests,
+                        self.num_speculative_tokens + 1,
+                        *self.mamba_conv_states_shape,
+                    ),
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
                 self.mamba_intermediate_ssm_states = torch.empty(
                     (
                         self.num_mamba_layers,
@@ -652,6 +669,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.mamba_ssm_states, device="cpu"
                 ).pin_memory()
                 if self.num_speculative_tokens > 0:
+                    self._offloadable_tensor_names.add("mamba_intermediate_conv_states")
+                    self._offloadable_cpu_backups["mamba_intermediate_conv_states"] = (
+                        torch.empty_like(
+                            self.mamba_intermediate_conv_states, device="cpu"
+                        ).pin_memory()
+                    )
                     self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
                     self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
                         torch.empty_like(
@@ -986,7 +1009,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
-            conv_state = None
+            conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
             ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
         else:
             conv_state = self.mamba_conv_states[mamba_layer_number]

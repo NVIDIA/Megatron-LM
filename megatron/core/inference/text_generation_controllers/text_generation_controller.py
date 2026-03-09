@@ -806,6 +806,11 @@ class TextGenerationController:
             accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
 
             if decode_mamba_indices.numel() > 0:
+                context.mamba_conv_states[:, decode_mamba_indices] = (
+                    context.mamba_intermediate_conv_states[
+                        :, decode_mamba_indices, accepted_tokens_per_decode_request
+                    ]
+                )
                 context.mamba_ssm_states[:, decode_mamba_indices] = (
                     context.mamba_intermediate_ssm_states[
                         :, decode_mamba_indices, accepted_tokens_per_decode_request
