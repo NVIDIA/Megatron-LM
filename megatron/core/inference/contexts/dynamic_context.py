@@ -1678,45 +1678,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
-    def speculative_required_logits(self, logits: Tensor) -> Tensor:
-        """Extract logits at positions required for speculative decoding.
-
-        For decode requests, all tokens (base + speculative) are needed.
-        For prefill requests, only the last token is needed.
-
-        Args:
-            logits (Tensor): Hidden states of shape [1, padded_active_token_count, ...].
-
-        Return:
-            (Tensor) Logits at required positions, shape
-                [num_decode * (num_spec + 1) + num_prefill, ...].
-        """
-        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
-        assert logits.size(1) == self.padded_active_token_count, (
-            f"logits.size(1) ({tuple(logits.shape)}) != "
-            f"padded_active_token_count ({self.padded_active_token_count})."
-        )
-
-        logits = logits.squeeze(0)
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        request_in_prefill = self.request_in_prefill_status_tensor[active_slice]
-        query_lengths = self.request_query_lengths[active_slice]
-
-        num_prefill = (request_in_prefill == 1).sum().item()
-        num_decode = len(request_in_prefill) - num_prefill
-        num_speculative_tokens = self.config.num_speculative_tokens
-
-        # All tokens for decode requests (they come first in the packed sequence).
-        decode_indices = torch.arange(
-            num_decode * (num_speculative_tokens + 1), device=logits.device
-        )
-
-        # Last token index for each prefill request.
-        prefill_indices = query_lengths.cumsum(dim=0)[request_in_prefill == 1] - 1
-
-        required_indices = torch.cat([decode_indices, prefill_indices])
-        return logits[required_indices, :]
-
     def _compute_prefix_match(
         self, req: DynamicInferenceRequest, chunk_length: int
     ) -> Tuple[list, int, int, int, int, int]:
