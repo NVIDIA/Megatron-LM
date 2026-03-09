@@ -1091,7 +1091,13 @@ class TestTextGenerationController:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_rewind_kv_cache(self, is_hybrid_model):
         """Test KV cache state is properly rewound for rejected speculative tokens."""
-        self.setup_model(torch.float32, static=False, num_speculative_tokens=3, block_size_tokens=4)
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=3,
+            block_size_tokens=4,
+            max_requests=16,
+        )
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
@@ -1222,6 +1228,7 @@ class TestTextGenerationController:
             num_speculative_tokens=2,
             block_size_tokens=4,
             enable_prefix_caching=True,
+            max_requests=16,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1262,7 +1269,11 @@ class TestTextGenerationController:
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
         """Test that rewinding only releases the last block, never shared prefix blocks."""
         self.setup_model(
-            torch.float32, static=False, num_speculative_tokens=3, block_size_tokens=4
+            torch.float32,
+            static=False,
+            num_speculative_tokens=3,
+            block_size_tokens=4,
+            max_requests=16,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
