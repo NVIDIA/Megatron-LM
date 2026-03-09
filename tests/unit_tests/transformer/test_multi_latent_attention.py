@@ -108,9 +108,9 @@ def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
 
 
 def get_fused_mla_submodules():
-    """Get submodules for FusedMLASelfAttention via the mla_fusion spec path."""
+    """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True, mla_fusion=True
+        multi_latent_attention=True, mla_down_proj_fusion=True
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     assert submodules.linear_qkv_down_proj is not None
