@@ -1688,8 +1688,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
                 spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
                 output_str += (
-                    " ... spec: accept %.1f%% (%d/%d in %d steps)"
-                    % (
+                    " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
                         spec_rate,
                         self._spec_tokens_accepted,
                         self._spec_tokens_proposed,
