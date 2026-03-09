@@ -625,7 +625,9 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
-
+        # if is_te_min_version("2.10.0"):
+        if is_te_min_version("2.10.0") and ps_group is not None:
+            extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
         super().__init__(
             in_features=input_size,
@@ -642,7 +644,6 @@ class TELinear(te.pytorch.Linear):
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode=te_parallel_mode,
-            etp_group=ps_group,
             **extra_kwargs,
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -830,6 +831,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
+        # if is_te_min_version("2.10.0"):
+        if is_te_min_version("2.10.0") and ps_group is not None:
+            extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
+
         self.stride = stride
 
         super().__init__(
@@ -853,7 +858,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_layernorm_output=False,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            etp_group=ps_group,
             **extra_kwargs,
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1560,6 +1564,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            # if is_te_min_version("2.10.0"):
+            if is_te_min_version("2.10.0") and ps_group is not None:
+                extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
+
             super().__init__(
                 num_gemms=num_gemms,
                 in_features=input_size,
@@ -1575,7 +1583,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=parallel_mode,
-                etp_group=ps_group,
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None

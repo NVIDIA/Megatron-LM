@@ -1316,7 +1316,7 @@ def initialize_model_parallel(
             group = create_group(
                 eps_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("eps", nccl_comm_cfgs),
+                pg_options=get_nccl_options("expt_ps", nccl_comm_cfgs),
                 group_desc="EXPERT_PARAMETER_SHARDING_GROUP",
             )
             if rank in eps_ranks:
