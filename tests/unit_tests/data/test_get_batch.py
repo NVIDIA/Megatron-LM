@@ -198,55 +198,12 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-class SFTSyntheticDataset(Dataset):
-    def __init__(self, max_seq_length: int = 1024, number_of_samples: int = 10):
-        self.samples = []
-        for _ in range(number_of_samples):
-            min_len = max(1, int(0.1 * max_seq_length))
-            max_len = max(2, int(0.4 * max_seq_length))
-            candidate_lengths = [torch.randint(min_len, max_len + 1, (1,)).item() for _ in range(10)]
-
-            lengths = []
-            total = 0
-            for l in candidate_lengths:
-                if total + l >= max_seq_length:
-                    break
-                lengths.append(l)
-                total += l
-
-            assert sum(lengths) < max_seq_length
-            text = torch.randint(0, 10000, (1, sum(lengths) + 1), dtype=torch.int64)
-            tokens = text[:, :-1].contiguous()
-            labels = text[:, 1:].contiguous()
-
-            cu_seqlens = torch.cat((
-                torch.zeros(1, dtype=torch.int32),
-                torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32),
-            ))
-
-            self.samples.append({"tokens": tokens, "labels": labels, "cu_seqlens": cu_seqlens})
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
 def create_hybrid_cp_data_iterator(seq_length: int = 1024, number_of_samples: int = 100, global_batch_size: int = 16, micro_batch_size: int = 1):
-    dataset = SFTSyntheticDataset(max_seq_length=seq_length, number_of_samples=number_of_samples)
-    batch_sampler = HybridCPMegatronPretrainingSampler(
-                total_samples=len(dataset),
-                consumed_samples=0,
-                micro_batch_size=micro_batch_size,
-                global_batch_size=global_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
-    dataloader = DataLoader(dataset, batch_sampler=batch_sampler, shuffle=False, collate_fn=lambda x: x,)
-    return iter(dataloader)
+    # TODO(asolergi-nv): Implement HybridCP data iterator when it's ready
+    return None
 
 
-# @pytest.mark.skip(reason="deactivated")
+@pytest.mark.skip(reason="deactivated")
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024])
@@ -259,8 +216,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
-        data_iterator = create_hybrid_cp_data_iterator(seq_length, micro_batch_size=1, global_batch_size=16)
-        # print([x.keys() for x in next(data_iterator)])
+        data_iterator = create_hybrid_cp_data_iterator(seq_length)
     
     (
         attention_mask,

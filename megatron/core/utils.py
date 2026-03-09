@@ -2229,7 +2229,7 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader and not is_sft:
+            if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
@@ -2242,7 +2242,7 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader and not is_sft:
+            if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
@@ -2287,16 +2287,16 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
         max_seqlen = None
         attention_mask = None
         local_cp_size = None
+        
         if is_sft or is_hybrid_cp:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
-        if create_attention_mask_in_dataloader and not is_sft:
-            shape_attention_mask = (micro_batch_size, 1, seq_length, seq_length) if not is_hybrid_cp else (1, 1, hybrid_cp_seq_length, hybrid_cp_seq_length)
+        if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
-                shape_attention_mask,
+                (micro_batch_size, 1, seq_length, seq_length),
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
@@ -2335,7 +2335,7 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
-            if create_attention_mask_in_dataloader and not is_sft:
+            if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
             if is_hybrid_cp:
                 _broadcast(local_cp_size)
@@ -2351,7 +2351,7 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
-            if create_attention_mask_in_dataloader and not is_sft:
+            if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
             if is_hybrid_cp:
                 _broadcast(local_cp_size)
@@ -2449,7 +2449,7 @@ def get_batch_on_this_cp_rank(
             the current context-parallel settings from parallel_state.
     """
 
-    if batch["cu_seqlens"] is not None:
+    if batch["cu_seqlens"] is not None: # NOTE(asolergi-nv): SFT & HybridCP case
         if is_hybrid_cp:
             assert batch['local_cp_size'] is not None, "local_cp_size is required for hybrid context parallel"
             if batch['local_cp_size'].item() > 1:
@@ -2458,7 +2458,7 @@ def get_batch_on_this_cp_rank(
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
             batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
-    else:
+    else: # NOTE(asolergi-nv): Pretrain case
         batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
     return batch
 
