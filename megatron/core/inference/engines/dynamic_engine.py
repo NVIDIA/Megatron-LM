@@ -1139,6 +1139,29 @@ class DynamicInferenceEngine(AbstractEngine):
                         [request.routing_indices, step_routing], dim=0
                     )
 
+            # Stamp this request with the current generation epoch.
+            if self._generation_epoch is not None:
+                it = self._generation_epoch
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                for attr in ('policy_epoch', 'kv_cache_epoch'):
+                    tensor = getattr(request, attr)
+                    if tensor is None:
+                        setattr(
+                            request, attr,
+                            torch.full((total,), it, dtype=torch.int32, device='cpu'),
+                        )
+                    elif len(tensor) < total:
+                        setattr(
+                            request, attr,
+                            torch.cat((
+                                tensor,
+                                torch.full(
+                                    (total - len(tensor),), it,
+                                    dtype=tensor.dtype, device=tensor.device,
+                                ),
+                            ), dim=0),
+                        )
+
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
 
@@ -1511,40 +1534,6 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
-
-        # Stamp tokens produced this step with the current generation epoch.
-        # This covers both still-active and just-finished/failed requests.
-        if self._generation_epoch is not None and step_result is not None:
-            it = self._generation_epoch
-            records = [
-                self.requests[rid].record for rid in active_request_ids
-            ] + finished_request_records
-            for record in records:
-                request = record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                for attr in ('policy_epoch', 'kv_cache_epoch'):
-                    tensor = getattr(request, attr)
-                    if tensor is None:
-                        setattr(
-                            request, attr, torch.full((total,), it, dtype=torch.int32, device='cpu')
-                        )
-                    elif len(tensor) < total:
-                        setattr(
-                            request,
-                            attr,
-                            torch.cat(
-                                (
-                                    tensor,
-                                    torch.full(
-                                        (total - len(tensor),),
-                                        it,
-                                        dtype=tensor.dtype,
-                                        device=tensor.device,
-                                    ),
-                                ),
-                                dim=0,
-                            ),
-                        )
 
         range_pop()
 
