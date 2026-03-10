@@ -52,6 +52,9 @@ except:
 
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,
@@ -59,10 +62,9 @@ try:
     )
     from megatron.core.post_training.modelopt.layers import Linear
 
-    HAVE_TE = True
 except ImportError:
-    TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
     HAVE_TE = False
+    TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
 
 
 @dataclass
