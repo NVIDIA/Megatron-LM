@@ -32,7 +32,9 @@ Final Review might get declined if these requirements are not fulfilled.
 
 For PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.
 
-For PRs outside `megatron/core`, this step is skipped.
+PRs that change only `megatron/training` will go straight to `Final Review`, no expert reviewers are required.
+
+For PRs outside `megatron/core` and `megatron/training`, this step is skipped.
 
 #### Step 3: Approved
 
