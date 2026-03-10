@@ -359,7 +359,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         for i in range(20):
             try:
                 ctx3.add_request(
-                    self._req(ctx3, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
+                    self._req(
+                        ctx3, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100
+                    )
                 )
             except Exception:
                 break
@@ -593,7 +595,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx3.has_mamba_state_for_block(bid3)
         free_before = ctx3.mamba_cache_free_count
         ctx3.invalidate_mamba_state_for_block(bid3)
-        assert not ctx3.has_mamba_state_for_block(bid3) and ctx3.mamba_cache_free_count == free_before + 1
+        assert (
+            not ctx3.has_mamba_state_for_block(bid3)
+            and ctx3.mamba_cache_free_count == free_before + 1
+        )
 
         # slot reuse for same block
         ctx4 = self._mctx()
@@ -629,7 +634,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
-        assert _StubEngine(ctx7)._find_mamba_match_count(self._req(ctx7, self._prompt(bs * 3), request_id=2)) == 0
+        assert (
+            _StubEngine(ctx7)._find_mamba_match_count(
+                self._req(ctx7, self._prompt(bs * 3), request_id=2)
+            )
+            == 0
+        )
 
         # allocate, free, re-allocate
         ctx8 = self._mctx()
@@ -640,9 +650,14 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             ctx8._allocate_mamba_cache_slot(bid)
         assert ctx8.mamba_cache_free_count == initial_free - 3
         ctx8.invalidate_mamba_state_for_block(bids8[0])
-        assert ctx8.mamba_cache_free_count == initial_free - 2 and not ctx8.has_mamba_state_for_block(bids8[0])
+        assert (
+            ctx8.mamba_cache_free_count == initial_free - 2
+            and not ctx8.has_mamba_state_for_block(bids8[0])
+        )
         ctx8._allocate_mamba_cache_slot(bids8[0])
-        assert ctx8.mamba_cache_free_count == initial_free - 3 and ctx8.has_mamba_state_for_block(bids8[0])
+        assert ctx8.mamba_cache_free_count == initial_free - 3 and ctx8.has_mamba_state_for_block(
+            bids8[0]
+        )
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
@@ -698,9 +713,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx4._cached_logit_hash[ctx4.total_request_count - 1] == last_hash
 
         # KV eviction invalidates mamba
-        ctx5 = self._mctx(
-            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-        )
+        ctx5 = self._mctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
         alloc5 = ctx5.block_allocator
         p5 = self._prompt(bs * 2)
         ctx5.add_request(self._req(ctx5, p5.clone()))
@@ -728,7 +741,11 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2._mamba_num_matched_blocks = 2
         (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
         ctx._compute_and_store_mamba_offsets(
-            req2, 1, prefix_skip, len(prompt), len(matched),
+            req2,
+            1,
+            prefix_skip,
+            len(prompt),
+            len(matched),
             [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
             overall,
         )

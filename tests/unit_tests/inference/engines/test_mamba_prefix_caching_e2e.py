@@ -158,18 +158,23 @@ class TestMambaPrefixCachingE2E:
         extra_0 = torch.arange(offset + 1708, offset + 1752, dtype=torch.int64, device=device)
 
         prompts = [
-            torch.cat([base, extra_0]),                              # 300
-            torch.cat([base, seg_B, seg_1rest]),                     # 800
-            torch.cat([base, seg_B, seg_2rest]),                     # 800
-            torch.cat([base, seg_B, seg_3rest]),                     # 800
-            torch.cat([base, seg_B, seg_1rest[:256], seg_4ext]),     # 1100
+            torch.cat([base, extra_0]),  # 300
+            torch.cat([base, seg_B, seg_1rest]),  # 800
+            torch.cat([base, seg_B, seg_2rest]),  # 800
+            torch.cat([base, seg_B, seg_3rest]),  # 800
+            torch.cat([base, seg_B, seg_1rest[:256], seg_4ext]),  # 1100
         ]
         assert [len(p) for p in prompts] == [300, 800, 800, 800, 1100]
         return prompts
 
     def _build_engine(
-        self, model, mamba_config, enable_prefix_caching,
-        buffer_size_gb=0.5, prefix_caching_mamba_gb=0.05, request_rounder=4,
+        self,
+        model,
+        mamba_config,
+        enable_prefix_caching,
+        buffer_size_gb=0.5,
+        prefix_caching_mamba_gb=0.05,
+        request_rounder=4,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -215,10 +220,20 @@ class TestMambaPrefixCachingE2E:
             enable_prefix_caching=enable_pc,
         )
 
-    def _run_simple(self, model, mamba_config, prompts, enable_pc,
-                    base_req_id=0, num_tokens=NUM_TOKENS_TO_GENERATE, **engine_kwargs):
+    def _run_simple(
+        self,
+        model,
+        mamba_config,
+        prompts,
+        enable_pc,
+        base_req_id=0,
+        num_tokens=NUM_TOKENS_TO_GENERATE,
+        **engine_kwargs,
+    ):
         """Run all prompts with given pc setting, return (finished_dict, lifetime_prefill)."""
-        engine = self._build_engine(model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs)
+        engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
+        )
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(base_req_id + i, prompt, enable_pc, num_tokens))
         finished = {}
@@ -244,7 +259,9 @@ class TestMambaPrefixCachingE2E:
             assert len(alloc.mamba_hash_to_block_id) == G
             assert step_prefill == G * 300, f"step 1: expected {G * 300}, got {step_prefill}"
             if G == 1:
-                assert self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 1
+                assert (
+                    self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 1
+                )
 
         elif step == 2:
             for g in range(G):
@@ -254,7 +271,9 @@ class TestMambaPrefixCachingE2E:
             assert len(alloc.mamba_hash_to_block_id) == G * 2
             assert step_prefill == G * 544, f"step 2: expected {G * 544}, got {step_prefill}"
             if G == 1:
-                assert self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 2
+                assert (
+                    self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 2
+                )
 
         elif step == 3:
             for g in range(G):
@@ -269,7 +288,9 @@ class TestMambaPrefixCachingE2E:
                 assert self._get_ref_count(alloc, h0) == 4, f"step 3 group {g}"
                 assert self._get_ref_count(alloc, h1) == 3, f"step 3 group {g}"
             assert len(alloc.mamba_hash_to_block_id) == G * 5
-            assert step_prefill == G * (544 + 332), f"step 3: expected {G * 876}, got {step_prefill}"
+            assert step_prefill == G * (
+                544 + 332
+            ), f"step 3: expected {G * 876}, got {step_prefill}"
 
         elif step == 4:
             for g in range(G):
@@ -319,8 +340,11 @@ class TestMambaPrefixCachingE2E:
     def _run_multi_pc_on(self, model, mamba_config, all_prompts):
         """Run 4 groups with prefix caching enabled, verifying per-step state."""
         engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=True,
-            buffer_size_gb=2.0, prefix_caching_mamba_gb=0.2,
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            buffer_size_gb=2.0,
+            prefix_caching_mamba_gb=0.2,
         )
         alloc = engine.context.block_allocator
         ctx = engine.context
@@ -374,9 +398,9 @@ class TestMambaPrefixCachingE2E:
         on_outputs, on_prefill = self._run_pc_on(model, mamba_config, prompts)
 
         for req_id in range(5):
-            assert off_outputs[req_id] == on_outputs[req_id], (
-                f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
-            )
+            assert (
+                off_outputs[req_id] == on_outputs[req_id]
+            ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
 
     @torch.inference_mode()
@@ -388,25 +412,31 @@ class TestMambaPrefixCachingE2E:
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
         _, off_prefill = self._run_simple(
-            model, mamba_config,
+            model,
+            mamba_config,
             [p for group in all_prompts for p in group],
             False,
             num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
-            buffer_size_gb=2.0, prefix_caching_mamba_gb=0.2,
+            buffer_size_gb=2.0,
+            prefix_caching_mamba_gb=0.2,
         )
         on_outputs, on_prefill = self._run_multi_pc_on(model, mamba_config, all_prompts)
 
         # verify per-group outputs match independent runs
         for g in range(NUM_GROUPS):
             ref_outputs, _ = self._run_simple(
-                model, mamba_config, all_prompts[g], True,
-                base_req_id=g * 5, num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
+                model,
+                mamba_config,
+                all_prompts[g],
+                True,
+                base_req_id=g * 5,
+                num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
             )
             for lid in range(5):
                 rid = g * 5 + lid
-                assert on_outputs[rid] == ref_outputs[rid], (
-                    f"group {g} req {lid}: multi {on_outputs[rid]} != per-group {ref_outputs[rid]}"
-                )
+                assert (
+                    on_outputs[rid] == ref_outputs[rid]
+                ), f"group {g} req {lid}: multi {on_outputs[rid]} != per-group {ref_outputs[rid]}"
 
         assert off_prefill == NUM_GROUPS * 3800
         assert on_prefill == NUM_GROUPS * 2008 and on_prefill < off_prefill
@@ -416,7 +446,12 @@ class TestMambaPrefixCachingE2E:
         device = torch.cuda.current_device()
         seg_0 = torch.arange(8000, 8256, dtype=torch.int64, device=device)
         seg_1 = torch.arange(8256, 8512, dtype=torch.int64, device=device)
-        prompts = [seg_0.clone(), seg_0.clone(), torch.cat([seg_0, seg_1]), torch.cat([seg_0, seg_1])]
+        prompts = [
+            seg_0.clone(),
+            seg_0.clone(),
+            torch.cat([seg_0, seg_1]),
+            torch.cat([seg_0, seg_1]),
+        ]
         assert [len(p) for p in prompts] == [256, 256, 512, 512]
         return prompts
 
@@ -481,9 +516,9 @@ class TestMambaPrefixCachingE2E:
         on_outputs, on_prefill = self._run_eos_pc_on(model, mamba_config, prompts)
 
         for req_id in range(4):
-            assert off_outputs[req_id] == on_outputs[req_id], (
-                f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
-            )
+            assert (
+                off_outputs[req_id] == on_outputs[req_id]
+            ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
         assert off_prefill == 1536 and on_prefill == 512 and on_prefill < off_prefill
 
     def _create_eviction_prompts(self):
@@ -503,8 +538,12 @@ class TestMambaPrefixCachingE2E:
         prompts = self._create_eviction_prompts()
 
         engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=True,
-            buffer_size_gb=0.002, prefix_caching_mamba_gb=0.05, request_rounder=1,
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            buffer_size_gb=0.002,
+            prefix_caching_mamba_gb=0.05,
+            request_rounder=1,
         )
         alloc = engine.context.block_allocator
         ctx = engine.context
