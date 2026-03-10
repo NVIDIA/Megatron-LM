@@ -414,6 +414,9 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        if dispatched_input.numel() == 0:
+            output = torch.tensor([], device=dispatched_input.device)
+            return output, None
         if (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
