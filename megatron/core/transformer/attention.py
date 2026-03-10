@@ -114,6 +114,8 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+FMLA_REQUIRED_BLOCK_SIZE = 64
+
 
 class LinearQkv(Protocol):
     """Protocol for linear_qkv modules."""
@@ -617,18 +619,19 @@ class Attention(MegatronModule, ABC):
             )
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+            # Read key/value *pointer* tensors from cache.
+            key, value, block_table = inference_context.key_value_cache(
+                self.layer_number - pp_layer_offset
+            )
+            block_size_tokens = key.size(1)
+            # Do not use absorption when block size doesn't match what's expected by FlashMLA.
+            if getattr(self.config, "cache_mla_latents", None) and (
+                max_seqlen_q > 1 or block_size_tokens != FMLA_REQUIRED_BLOCK_SIZE
+            ):
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
-                kv_cache, _, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
+                kv_cache = key
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
-            else:
-                # Read key/value *pointer* tensors from cache.
-                key, value, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
@@ -834,8 +837,13 @@ class Attention(MegatronModule, ABC):
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
-            # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            # If using MLA we use the FlashMLA kernel when possible.
+            block_size_tokens = k.size(1)
+            if (
+                isinstance(self.config, MLATransformerConfig)
+                # Only use FlashMLA when the block size matches
+                and block_size_tokens == FMLA_REQUIRED_BLOCK_SIZE
+            ):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -871,6 +879,7 @@ class Attention(MegatronModule, ABC):
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
                     "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    "softmax_scale": getattr(self, "softmax_scale", self.config.softmax_scale),
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)

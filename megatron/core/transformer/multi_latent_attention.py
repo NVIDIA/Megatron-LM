@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import FMLA_REQUIRED_BLOCK_SIZE, Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -334,7 +334,10 @@ class MultiLatentAttention(Attention):
                     inference_context.is_decode_only(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
+                if (
+                    not inference_context.is_decode_only()
+                    or inference_context.block_size_tokens != FMLA_REQUIRED_BLOCK_SIZE
+                ):
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
@@ -342,7 +345,11 @@ class MultiLatentAttention(Attention):
                 )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context.is_decode_only()
+            and inference_context.block_size_tokens == FMLA_REQUIRED_BLOCK_SIZE
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -712,6 +719,7 @@ class MLASelfAttention(MultiLatentAttention):
                 self.config.cache_mla_latents
                 and inference_context
                 and inference_context.is_decode_only()
+                and inference_context.block_size_tokens == FMLA_REQUIRED_BLOCK_SIZE
             )
             # Compute query components. Multiply by up k if absorbing
             q_content = (
