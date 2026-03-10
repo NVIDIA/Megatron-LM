@@ -31,7 +31,6 @@ from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
-    "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
 }

@@ -48,8 +48,9 @@ def get_eos_id():
 
     We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
     we need to replace it with some other special tokens that do not appear in message."""
-    tokenizer = get_tokenizer()
-    hf_tokenizer = tokenizer._tokenizer
+    hf_tokenizer = get_tokenizer()._tokenizer
+    if hasattr(hf_tokenizer, "tokenizer"):
+        hf_tokenizer = hf_tokenizer.tokenizer
 
     if hf_tokenizer.eos_token == "<|eot_id|>":
         return 128001
@@ -341,9 +342,13 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     """
     print_rank_0("> building train, validation, and test SFT datasets ...")
     args = get_args()
-    tokenizer = get_tokenizer()
+    hf_tokenizer = get_tokenizer()._tokenizer
 
-    if not isinstance(tokenizer._tokenizer, transformers.PreTrainedTokenizerBase):
+    if hasattr(hf_tokenizer, "tokenizer"):
+        hf_tokenizer = hf_tokenizer.tokenizer
+
+
+    if not isinstance(hf_tokenizer, transformers.PreTrainedTokenizerBase):
         raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
 
     if args.micro_batch_size > 1:
@@ -358,7 +363,7 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     else:
         kwargs = {
             "hf_dataset": args.finetune_hf_dataset,
-            "tokenizer": tokenizer._tokenizer,
+            "tokenizer": hf_tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs
             "num_shards": mpu.get_expert_data_parallel_world_size(),
