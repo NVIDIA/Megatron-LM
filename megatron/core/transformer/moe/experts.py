@@ -72,6 +72,7 @@ except ImportError:
     def is_batch_invariant_mode_enabled():
         return False
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -663,13 +664,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
             total_tokens = permuted_local_hidden_states.size(0)
             fc1_out_features = self._fc1_weight.size(1)
             fc1_output = torch.empty(
-                total_tokens, fc1_out_features,
+                total_tokens,
+                fc1_out_features,
                 device=permuted_local_hidden_states.device,
                 dtype=permuted_local_hidden_states.dtype,
             )
             grouped_gemm_batch_invariant(
-                permuted_local_hidden_states, self._fc1_weight, fc1_output,
-                batch_sizes, trans_b=True,
+                permuted_local_hidden_states,
+                self._fc1_weight,
+                fc1_output,
+                batch_sizes,
+                trans_b=True,
             )
 
             # Activation with routing probabilities
@@ -678,13 +683,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # fc2: _fc2_weight is [E, out_features, in_features] (TE layout [N, K])
             fc2_out_features = self._fc2_weight.size(1)
             fc2_output = torch.empty(
-                total_tokens, fc2_out_features,
+                total_tokens,
+                fc2_out_features,
                 device=bias_act_output.device,
                 dtype=bias_act_output.dtype,
             )
             grouped_gemm_batch_invariant(
-                bias_act_output, self._fc2_weight, fc2_output,
-                batch_sizes, trans_b=True,
+                bias_act_output, self._fc2_weight, fc2_output, batch_sizes, trans_b=True
             )
         else:
             fc2_output = permuted_local_hidden_states

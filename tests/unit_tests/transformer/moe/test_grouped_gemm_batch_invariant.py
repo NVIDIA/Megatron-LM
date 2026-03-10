@@ -18,6 +18,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
     set_batch_invariant_mode,
 )
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 
 
@@ -247,9 +248,9 @@ class TestGroupedGemmBatchInvariance:
             c2_reordered_chunks[perm[i].item()] = c2_chunks[i]
         c2 = torch.cat(c2_reordered_chunks, dim=0)
 
-        assert torch.equal(c1, c2), (
-            f"Batch invariance violated: max diff = {(c1 - c2).abs().max().item()}"
-        )
+        assert torch.equal(
+            c1, c2
+        ), f"Batch invariance violated: max diff = {(c1 - c2).abs().max().item()}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_token_permutation_within_expert(self):
@@ -348,10 +349,7 @@ class TestGroupedGemmBatchInvariance:
             m1 = batch_sizes_1[e].item()
             m2 = batch_sizes_2[e].item()
             shared = min(m1, m2)
-            assert torch.equal(
-                c1[offset1 : offset1 + shared],
-                c2[offset2 : offset2 + shared],
-            ), (
+            assert torch.equal(c1[offset1 : offset1 + shared], c2[offset2 : offset2 + shared]), (
                 f"Expert {e}: shared tokens differ across batch compositions. "
                 f"max diff = {(c1[offset1:offset1+shared] - c2[offset2:offset2+shared]).abs().max().item()}"
             )
@@ -372,9 +370,9 @@ class TestGroupedGemmBatchInvariance:
             results.append(c.clone())
 
         for i in range(1, len(results)):
-            assert torch.equal(results[0], results[i]), (
-                f"Run 0 vs run {i}: max diff = {(results[0] - results[i]).abs().max().item()}"
-            )
+            assert torch.equal(
+                results[0], results[i]
+            ), f"Run 0 vs run {i}: max diff = {(results[0] - results[i]).abs().max().item()}"
 
 
 # ============================================================================
@@ -397,14 +395,14 @@ class TestInferenceGroupedMLPBatchInvariant:
 
         model_parallel_cuda_manual_seed(42)
 
-        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-        from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
-        from megatron.core.transformer.transformer_config import TransformerConfig
-        from megatron.core.transformer.mlp import MLPSubmodules
         from megatron.core.extensions.transformer_engine import (
             TEColumnParallelGroupedLinear,
             TERowParallelGroupedLinear,
         )
+        from megatron.core.transformer.mlp import MLPSubmodules
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+        from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+        from megatron.core.transformer.transformer_config import TransformerConfig
 
         self.num_experts = 4
         self.hidden_size = 128
@@ -426,18 +424,20 @@ class TestInferenceGroupedMLPBatchInvariant:
             moe_router_topk=1,
             moe_grouped_gemm=True,
             batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
         )
 
         submodules = MLPSubmodules(
-            linear_fc1=TEColumnParallelGroupedLinear,
-            linear_fc2=TERowParallelGroupedLinear,
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )
 
-        self.mlp = InferenceGroupedMLP(
-            num_local_experts=self.num_experts,
-            config=self.config,
-            submodules=submodules,
-        ).cuda().eval()
+        self.mlp = (
+            InferenceGroupedMLP(
+                num_local_experts=self.num_experts, config=self.config, submodules=submodules
+            )
+            .cuda()
+            .eval()
+        )
 
         self.ffn_hidden = self.config.ffn_hidden_size
 
@@ -451,9 +451,7 @@ class TestInferenceGroupedMLPBatchInvariant:
         torch.manual_seed(100)
         tokens_per_expert = torch.tensor([8, 12, 4, 16], device="cuda", dtype=torch.int64)
         total_tokens = tokens_per_expert.sum().item()
-        hidden_states = torch.randn(
-            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
-        )
+        hidden_states = torch.randn(total_tokens, self.hidden_size, device="cuda", dtype=self.dtype)
         probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
 
         # Run with TE path (parent forward)
@@ -477,9 +475,7 @@ class TestInferenceGroupedMLPBatchInvariant:
         torch.manual_seed(200)
         tokens_per_expert = torch.tensor([10, 6, 14, 8], device="cuda", dtype=torch.int64)
         total_tokens = tokens_per_expert.sum().item()
-        hidden_states = torch.randn(
-            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
-        )
+        hidden_states = torch.randn(total_tokens, self.hidden_size, device="cuda", dtype=self.dtype)
         probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
 
         # Run 1: original order
@@ -522,7 +518,9 @@ class TestInferenceGroupedMLPBatchInvariant:
         perm_offsets = torch.zeros(self.num_experts + 1, dtype=torch.int64)
         perm_offsets[1:] = perm_tpe.cpu().cumsum(0)
 
-        out2_chunks = [out2_perm[perm_offsets[i] : perm_offsets[i + 1]] for i in range(self.num_experts)]
+        out2_chunks = [
+            out2_perm[perm_offsets[i] : perm_offsets[i + 1]] for i in range(self.num_experts)
+        ]
         # out2_chunks[i] corresponds to expert perm[i]
         reordered = [None] * self.num_experts
         for i in range(self.num_experts):
@@ -540,9 +538,7 @@ class TestInferenceGroupedMLPBatchInvariant:
         torch.manual_seed(300)
         tokens_per_expert = torch.tensor([4, 4, 4, 4], device="cuda", dtype=torch.int64)
         total_tokens = tokens_per_expert.sum().item()
-        hidden_states = torch.randn(
-            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
-        )
+        hidden_states = torch.randn(total_tokens, self.hidden_size, device="cuda", dtype=self.dtype)
         probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
 
         # Run via the direct batch-invariant method
@@ -556,10 +552,8 @@ class TestInferenceGroupedMLPBatchInvariant:
         self.mlp.training = False
         with torch.no_grad():
             with set_batch_invariant_mode(True):
-                out_dispatch, _ = self.mlp.forward(
-                    hidden_states, tokens_per_expert, probs
-                )
+                out_dispatch, _ = self.mlp.forward(hidden_states, tokens_per_expert, probs)
 
-        assert torch.equal(out_direct, out_dispatch), (
-            "forward() dispatch did not use batch-invariant path"
-        )
+        assert torch.equal(
+            out_direct, out_dispatch
+        ), "forward() dispatch did not use batch-invariant path"
