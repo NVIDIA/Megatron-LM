@@ -584,7 +584,8 @@ class TestMuPOptimizerTypeHandling:
 
         assert len(overrides) == 1
         assert any(
-            "muon_scale_mode=spectral" in rec.message
+            "Both MuP and muon_scale_mode=spectral are enabled." in rec.message
+            and "This configuration is supported" in rec.message
             and "--muon-scale-mode unit_rms_norm" in rec.message
             for rec in caplog.records
         )
@@ -615,7 +616,10 @@ class TestMuPOptimizerTypeHandling:
         )
 
         assert len(overrides) == 0
-        assert any("muon_scale_mode=spectral" in rec.message for rec in caplog.records)
+        assert any(
+            "Both MuP and muon_scale_mode=spectral are enabled." in rec.message
+            for rec in caplog.records
+        )
 
 
 class TestMuPMTPLossScaling:
