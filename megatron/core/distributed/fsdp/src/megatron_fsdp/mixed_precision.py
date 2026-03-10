@@ -381,7 +381,7 @@ def quantize_nvfp4_param_shard(
 ):
     """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
 
-    This function wraps Transformer Engine's cast_master_weights_to_nvfp4, which handles:
+    This function wraps Transformer Engine's quantize_master_weights, which handles:
     - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
     - Partial casting with nibble-accurate updates
     - Coordinated amax reduction across data parallel group
@@ -399,16 +399,16 @@ def quantize_nvfp4_param_shard(
         )
 
     try:
-        from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4
+        from transformer_engine.pytorch.tensor.utils import quantize_master_weights
     except ImportError:
         raise RuntimeError(
-            "cast_master_weights_to_nvfp4 not available in this Transformer Engine version"
+            "quantize_master_weights not available in this Transformer Engine version"
         )
 
     if len(model_params) == 0:
         return
 
-    # # Debug: print what we're passing to cast_master_weights_to_nvfp4
+    # # Debug: print what we're passing to quantize_master_weights
     # print(f"\n[FP4_UTILS DEBUG] quantize_nvfp4_param_shard called with {len(model_params)} params")
     # for i, (mp, main_p, offset) in enumerate(zip(model_params, main_params, start_offsets)):
     #     mp_shape = tuple(mp.shape) if hasattr(mp, 'shape') else 'N/A'
@@ -423,7 +423,7 @@ def quantize_nvfp4_param_shard(
     if fsdp_shard_model_params is not None:
         args.append(fsdp_shard_model_params)
 
-    cast_master_weights_to_nvfp4(*args)
+    quantize_master_weights(*args)
 
 
 def nvfp4_set_raw_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
