@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -87,6 +88,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
+    "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
     "expert_model_parallel_size": 4,
@@ -148,6 +150,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_state_dim": 128,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_layer_num": None,
+    "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
     "moe_apply_probs_on_input": False,
@@ -211,6 +216,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "num_microbatches_with_partial_activation_checkpoints": None,
     "num_moe_experts": 128,
     "num_query_groups": 2,
+    "num_residual_streams": 4,
     "output_layer_init_method": {},
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
@@ -478,6 +484,7 @@ class TestMambaMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 
