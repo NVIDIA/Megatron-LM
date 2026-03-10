@@ -1365,26 +1365,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert smallest_cuda_graph_dimensions.prefill_req_count == 0
 
         N = smallest_cuda_graph_dimensions.decode_req_count
+        tokens_per_request = self.num_speculative_tokens + 1
+        T = smallest_cuda_graph_dimensions.token_count  # N * tokens_per_request
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
-        # 1. Request counts and token count (decode-only: 1 token per request).
+        # 1. Request counts and token count.
+        #    With speculative decoding each decode request has (num_speculative_tokens + 1) tokens.
         self.total_request_count = N
-        self.active_token_count = N
+        self.active_token_count = T
         self.num_prefill_requests = 0
 
         # 2. Per-request state consumed by mha_metadata.update().
-        self.request_query_lengths[0:N].fill_(1)
+        self.request_query_lengths[0:N].fill_(tokens_per_request)
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
-        self.token_to_block_idx[0:N] = dummy_block_idx
-        self.token_to_local_position_within_kv_block[0:N] = 0
+        self.token_to_block_idx[0:T] = dummy_block_idx
+        self.token_to_local_position_within_kv_block[0:T] = 0
 
         if self.is_hybrid_model:
             # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
-            self.token_to_request_idx[0:N] = torch.arange(
-                0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+            self.token_to_request_idx[0:T] = torch.repeat_interleave(
+                torch.arange(
+                    0,
+                    N,
+                    device=self.token_to_request_idx.device,
+                    dtype=self.token_to_request_idx.dtype,
+                ),
+                tokens_per_request,
             )
 
             # 5. Mamba state: allocate slots for dummy requests.

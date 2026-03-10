@@ -122,6 +122,8 @@ class TextGenerationController:
         self._accepted_tokens_per_request = None
         # MTP tensor will be allocated later when num_speculative_tokens is set by the engine
         self._sampled_mtp_tokens_cuda = None
+        # Last accepted sequence indices for serial MTP computation
+        self._last_accepted_seq_indices = None
 
         # Keep track of request metadata.
         self._request_metadata: Dict[str, Tensor] = {}
@@ -624,29 +626,19 @@ class TextGenerationController:
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
-            # [1, seq_len, vocab_size] (logits)
-            # [num_speculative_tokens, seq_len, vocab_size] (mtp_logits)
+            # logits shape: [1, seq_len, vocab_size]
 
-        if self.num_speculative_tokens > 0:
-            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            assert hasattr(unwrapped_model, '_mtp_logits_cache'), "MTP logits cache not found"
-            mtp_logits = unwrapped_model._mtp_logits_cache
-            expected_mtp_logits_length, _, vocab_size = mtp_logits.shape
-            assert (
-                expected_mtp_logits_length == self.num_mtp_heads
-            ), f"MTP logits length mismatch. Expected mtp logits length {self.num_mtp_heads}, got {expected_mtp_logits_length}"
-            mtp_logits = mtp_logits[: self.num_speculative_tokens]
-
-            logits = torch.cat(
-                [logits, mtp_logits], dim=0
-            )  # [num_speculative_tokens + 1, seq_len_or_required, vocab_size]
+        # Note: When speculative decoding is active (num_speculative_tokens > 0),
+        # the model skips MTP computation during the forward pass. MTP logits
+        # will be computed serially after verification to ensure they are
+        # conditioned on verified tokens only.
 
         if self.model_is_pipeline_parallel:
             if context.config.materialize_only_last_token_logits:
                 logits_seq_len = active_request_count
             else:
                 logits_seq_len = input_ids.shape[1]
-            logits_shape = [self.num_speculative_tokens + 1, logits_seq_len, self.vocab_size]
+            logits_shape = [1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
@@ -793,6 +785,105 @@ class TextGenerationController:
                     ]
                 )
 
+    def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
+        """Sample tokens from 2D logits using existing sampling parameters.
+
+        Args:
+            logits_2d (Tensor): Logits of shape [num_requests, vocab_size].
+
+        Returns:
+            Tensor: Sampled tokens of shape [num_requests].
+        """
+        spec_token_list = []
+        indices_list = []
+        for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
+            request_indices_tensor = torch.tensor(
+                request_indices, device=logits_2d.device, dtype=torch.long
+            )
+            spec_token_list.append(
+                self._torch_sampling_func(logits_2d[request_indices_tensor, :], temp, top_k, top_p)
+            )
+            indices_list.append(request_indices_tensor)
+
+        spec_tokens = torch.empty(logits_2d.shape[0], device=logits_2d.device, dtype=torch.int64)
+        for tokens, indices in zip(spec_token_list, indices_list):
+            spec_tokens[indices] = tokens
+        return spec_tokens
+
+    def _compute_serial_mtp_and_sample(self):
+        """Compute MTP logits serially after verification and sample speculative tokens.
+
+        This ensures that MTP predictions are always conditioned on verified tokens.
+        Each MTP depth receives the correctly sampled token from the previous depth
+        (or the base token for depth 0) rather than stale speculative tokens from
+        the previous step.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+
+        # On non-last pipeline stages, the model won't have decoder hidden states.
+        has_mtp = is_pipeline_last_stage(self.pp_group) and hasattr(
+            unwrapped_model, '_decoder_hidden_states_cache'
+        )
+
+        if has_mtp:
+            # Get decoder hidden states at last accepted positions.
+            hidden_states = unwrapped_model._decoder_hidden_states_cache
+            last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
+            # Shape: [active_request_count, 1, hidden_size]
+        else:
+            last_accepted_hidden = None
+
+        # Compute position IDs for the next tokens.
+        # After rewind, request_kv_length_offsets has been adjusted. The actual
+        # KV cache length is: adjusted_offset + (1 + num_speculative_tokens).
+        # The next position to predict starts at that cache length.
+        adjusted_offsets = context.request_kv_length_offsets[active_slice]
+        base_position = adjusted_offsets + (1 + self.num_speculative_tokens)
+
+        # Start with the freshly sampled base token.
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
+        current_hidden = last_accepted_hidden if has_mtp else None
+
+        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        for depth in range(num_depths):
+            position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
+            token_ids = next_token_ids.unsqueeze(0)  # [1, active_request_count]
+
+            mtp_logits_2d = None
+            if has_mtp:
+                current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                    hidden_states=current_hidden,
+                    next_token_ids=token_ids,
+                    position_ids=position_ids,
+                    depth=depth,
+                )
+                # mtp_logits: [active_request_count, 1, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
+
+            # Broadcast MTP logits across pipeline stages.
+            if self.model_is_pipeline_parallel:
+                mtp_logits_2d = broadcast_from_last_pipeline_stage(
+                    [active_request_count, self.vocab_size],
+                    dtype=self.model_config.params_dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
+                )
+
+            # Sample speculative token using the same sampling parameters.
+            spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
+            self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
+
+            # Use sampled token as input for the next depth.
+            next_token_ids = spec_tokens
+
+        # Clean up cached hidden states.
+        if has_mtp:
+            del unwrapped_model._decoder_hidden_states_cache
+
     def _get_required_logit_indices(
         self,
         request_in_prefill_status_tensor: Tensor,
@@ -873,6 +964,8 @@ class TextGenerationController:
         mtp_output_tokens_jumbled_list = []
         token_order_list = []
 
+        has_mtp_logits = required_mtp_logits is not None
+
         for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
             request_indices_tensor = torch.tensor(
                 request_indices, device=token_to_request_index.device
@@ -883,12 +976,13 @@ class TextGenerationController:
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
-            mtp_logits_slice = required_mtp_logits[:, required_indices, :]
-            num_spec, num_reqs, vocab = mtp_logits_slice.shape
-            sampled_mtp = self._torch_sampling_func(
-                mtp_logits_slice.reshape(num_spec * num_reqs, vocab), temp, top_k, top_p
-            )
-            mtp_output_tokens_jumbled_list.append(sampled_mtp.reshape(num_spec, num_reqs))
+            if has_mtp_logits:
+                mtp_logits_slice = required_mtp_logits[:, required_indices, :]
+                num_spec, num_reqs, vocab = mtp_logits_slice.shape
+                sampled_mtp = self._torch_sampling_func(
+                    mtp_logits_slice.reshape(num_spec * num_reqs, vocab), temp, top_k, top_p
+                )
+                mtp_output_tokens_jumbled_list.append(sampled_mtp.reshape(num_spec, num_reqs))
             token_order_list.append(required_indices)
 
         output_tokens_jumbled = torch.cat(output_tokens_jumbled_list, dim=0)
@@ -901,11 +995,13 @@ class TextGenerationController:
         # Rearrange output tokens from sampling_bucket request order back to input ids order
         output_tokens[token_order] = output_tokens_jumbled
 
-        mtp_output_tokens_jumbled = torch.cat(
-            mtp_output_tokens_jumbled_list, dim=1
-        )  # Shape [num_speculative_tokens, total_tokens]
-        mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
-        mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
+        mtp_output_tokens = None
+        if has_mtp_logits:
+            mtp_output_tokens_jumbled = torch.cat(
+                mtp_output_tokens_jumbled_list, dim=1
+            )  # Shape [num_speculative_tokens, total_tokens]
+            mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
+            mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
 
         return output_tokens, mtp_output_tokens, repeats
 
@@ -1024,11 +1120,13 @@ class TextGenerationController:
         required_logits = logits.squeeze(0)[
             required_logit_indices, :
         ]  # Shape [num_required, vocab_size]
-        required_mtp_logits = mtp_logits[
-            :, required_logit_indices, :
-        ]  # Shape [num_speculative_tokens, num_required, vocab_size]
+        required_mtp_logits = None
+        if mtp_logits is not None:
+            required_mtp_logits = mtp_logits[
+                :, required_logit_indices, :
+            ]  # Shape [num_speculative_tokens, num_required, vocab_size]
 
-        # Sample tokens from logits and MTP logits.
+        # Sample tokens from logits (and MTP logits if provided).
         output_tokens, mtp_output_tokens, repeats = self._sample_speculative_logits(
             required_logits, required_mtp_logits, request_in_prefill_status_tensor
         )
@@ -1047,12 +1145,19 @@ class TextGenerationController:
             )
         )
 
-        # Store the final sampled tokens and MTP tokens for the next forward pass.
+        # Store the final sampled tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
-        self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
-            :, last_one_indices
-        ]
+
+        # Store MTP tokens if they were computed inline (non-serial path).
+        if mtp_output_tokens is not None:
+            self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
+                :, last_one_indices
+            ]
+
+        # Store the last accepted positions in the packed sequence for serial
+        # MTP computation after verification.
+        self._last_accepted_seq_indices = required_logit_indices[last_one_indices]
 
         # Extract accepted tokens and counts for decode requests.
         # For prefill it is always set to 1. For decode, the first token is always accepted,
@@ -1300,7 +1405,9 @@ class TextGenerationController:
             model_config = get_model_config(unwrapped_model)
             if model_config.transformer_impl == "inference_optimized":
                 context.maybe_initialize_symmetric_memory()
-            return self.inference_wrapped_model.dummy_forward()
+            self.inference_wrapped_model.dummy_forward()
+            self._dummy_serial_mtp_forward()
+            return
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
@@ -1316,8 +1423,77 @@ class TextGenerationController:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
 
+        # Disable MoE padding for MTP computation
+        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            set_decode_expert_padding(unwrapped_model, False)
+
+        # When speculative decoding is active, the real EP ranks perform serial
+        # MTP forward passes after the main forward pass. MTP layers may contain
+        # MoE sublayers (inherited from the decoder spec), which require EP
+        # all-to-all collectives. The dummy rank must participate in these
+        # collectives to avoid a hang.
+        self._dummy_serial_mtp_forward()
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
+
+    def _dummy_serial_mtp_forward(self):
+        """Run dummy MTP forward passes to participate in EP collectives.
+
+        When speculative decoding is active and MTP layers contain MoE sublayers
+        (inherited from the decoder layer spec), each serial MTP step triggers
+        EP all-to-all collectives. The dummy EP rank must issue matching
+        collective calls so the real ranks do not hang.
+
+        This mirrors the structure of ``_compute_serial_mtp_and_sample``:
+        - On the last PP stage (where MTP resides): run ``compute_mtp_single_step``
+          with dummy tensors so the MoE all-to-all is executed.
+        - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
+          that the real ranks also perform.
+        """
+        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+            return
+        if self.model_config.expert_model_parallel_size <= 1:
+            return
+
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+
+        is_last_stage = is_pipeline_last_stage(self.pp_group)
+        has_mtp = is_last_stage and hasattr(unwrapped_model, 'mtp')
+        if not has_mtp and not self.model_is_pipeline_parallel:
+            # No MTP on this rank and no PP broadcast to participate in.
+            return
+
+        device = torch.cuda.current_device()
+        dtype = self.model_config.params_dtype
+        hidden_size = self.model_config.hidden_size
+        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+
+        dummy_hidden = None
+        if has_mtp:
+            # Minimal dummy tensors — just enough to drive the MTP layer forward
+            # so that the MoE all-to-all collectives are issued.
+            dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
+            dummy_token_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+            dummy_position_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+
+        for depth in range(num_depths):
+            mtp_logits_2d = None
+            if has_mtp:
+                dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                    hidden_states=dummy_hidden,
+                    next_token_ids=dummy_token_ids,
+                    position_ids=dummy_position_ids,
+                    depth=depth,
+                )
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [1, vocab_size]
+
+            # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
+            if self.model_is_pipeline_parallel:
+                broadcast_from_last_pipeline_stage(
+                    [1, self.vocab_size], dtype=dtype, tensor=mtp_logits_2d, pp_group=self.pp_group
+                )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -1427,13 +1603,9 @@ class TextGenerationController:
         if config.moe_enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-        logits_and_mtp_logits = self._dynamic_step_forward_logits(input_ids, position_ids)
-        mtp_logits = None
-        if logits_and_mtp_logits.shape[0] > 1:
-            logits = logits_and_mtp_logits[:1]  # [1, seq_len, vocab_size]
-            mtp_logits = logits_and_mtp_logits[1:]  # [num_speculative_tokens, seq_len, vocab_size]
-        else:
-            logits = logits_and_mtp_logits
+        # Forward pass produces only base logits. When speculative decoding is
+        # active, MTP logits are computed serially after verification.
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()
@@ -1455,8 +1627,19 @@ class TextGenerationController:
         self._dynamic_step_sample_bookkeeping()
 
         if self.num_speculative_tokens > 0:
-            self._dynamic_step_sample_logits_and_verify_tokens(logits, mtp_logits, input_ids)
+            # Phase 1: Verify speculative tokens using base logits only.
+            # MTP logits are NOT passed here; they will be computed serially.
+            self._dynamic_step_sample_logits_and_verify_tokens(logits, None, input_ids)
+            # Phase 2: Rewind KV cache for rejected tokens.
             self._rewind_kv_cache()
+
+            # Disable MoE padding for MTP computation
+            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
+            # Phase 3: Compute MTP serially with correct (verified) inputs.
+            self._compute_serial_mtp_and_sample()
         else:
             self._dynamic_step_sample_logits(logits)
 

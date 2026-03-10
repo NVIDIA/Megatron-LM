@@ -590,11 +590,20 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        # Check if speculative decoding is active. When it is, MTP must be
+        # computed *after* verification so that it is conditioned on verified
+        # tokens rather than stale speculative tokens from the previous step.
+        is_spec_decode = (
+            in_inference_mode
+            and hasattr(inference_context, 'num_speculative_tokens')
+            and inference_context.num_speculative_tokens > 0
+        )
+
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess:
+        if mtp_in_postprocess and not is_spec_decode:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -618,13 +627,18 @@ class GPTModel(LanguageModule):
             # The new process_mtp_loss function doesn't handle mtp_logits_cache,
             # so we manually generate and cache MTP logits when in inference mode.
             if in_inference_mode:
-                hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
-                    hidden_states=hidden_states,
-                    mtp_num_layers=self.config.mtp_num_layers,
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
+                if is_spec_decode:
+                    # Cache decoder hidden states for serial MTP computation
+                    # after speculative token verification.
+                    self._decoder_hidden_states_cache = hidden_states
+                else:
+                    hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
+                        hidden_states=hidden_states,
+                        mtp_num_layers=self.config.mtp_num_layers,
+                        output_layer=self.output_layer,
+                        output_weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
@@ -697,6 +711,49 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: int,
+        runtime_gather_output: bool = True,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int): MTP depth index (0-indexed).
+            runtime_gather_output (bool): Whether to gather output across TP.
+
+        Returns:
+            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
+        """
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(
+            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+
+        return mtp_hidden, logits
 
     def build_schedule_plan(
         self,
