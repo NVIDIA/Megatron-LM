@@ -17,18 +17,15 @@ To check existing remotes: `git remote -v`
 
 **The name of the origin will be required later!**
 
-**2. Obtain a pipeline trigger token:**
+**2. Obtain a personal access token:**
 
-1. Open the internal GitLab project in your browser.
-2. Go to **Settings → CI/CD → Pipeline trigger tokens**.
-3. Click **Add new token**, give it a description, and click **Create**.
-4. Copy the generated token (starts with `glptt-`).
-5. Store it in your environment to avoid passing it on every invocation:
-
-Reach out to @mcore-ci in case you don't have access to the settings page.
+1. Open your internal GitLab profile: **User menu → Edit profile → Access tokens**.
+2. Click **Add new token**, give it a description, set an expiry, and select the **`api`** scope.
+3. Click **Create personal access token** and copy the generated token (starts with `glpat-`).
+4. Store it in your environment to avoid passing it on every invocation:
 
 ```bash
-export GITLAB_TRIGGER_TOKEN=glptt-<your-token>
+export GITLAB_TOKEN=glpat-<your-token>
 ```
 
 **Tip: Store this in your .env or .bashrc file**
@@ -38,7 +35,7 @@ export GITLAB_TRIGGER_TOKEN=glptt-<your-token>
 ```bash
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \
-  [--trigger-token glptt-<your-token>] \
+  [--access-token glpat-<your-token>] \
   [--functional-test-scope mr] \
   [--functional-test-repeat 5] \
   [--functional-test-cases all] \
@@ -48,7 +45,7 @@ python tools/trigger_internal_ci.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--gitlab-origin` | *(required)* | Git remote name for the internal GitLab |
-| `--trigger-token` | `$GITLAB_TRIGGER_TOKEN` | Pipeline trigger token |
+| `--access-token` | `$GITLAB_TOKEN` | Personal access token with `api` scope |
 | `--functional-test-scope` | `mr` | `FUNCTIONAL_TEST_SCOPE` pipeline variable |
 | `--functional-test-repeat` | `5` | `FUNCTIONAL_TEST_REPEAT` pipeline variable |
 | `--functional-test-cases` | `all` | `FUNCTIONAL_TEST_CASES` pipeline variable |
