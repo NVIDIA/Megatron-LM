@@ -778,6 +778,39 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    def _handle_failed_request(self, request_id: int):
+        """Handle a failed request by sending the reply immediately.
+
+        The request is added to failed_request_ids so that the next bookkeeping pass can return it.
+        """
+        entry = self.requests[request_id]
+        request = entry.record[-1]
+
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} failed to be added to the engine due to errors."
+            )
+
+        request.add_event_fail()
+        self.failed_request_ids.append(request_id)
+
+        # Send the reply immediately, because it may never get a chance to be sent again.
+        if self.use_coordinator and self.is_mp_coordinator:
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [entry.record.serialize()]],
+                use_bin_type=True,
+            )
+            self.socket_for_receiving_requests.send(payload)
+        elif not self.use_coordinator:
+            if request.prompt is None:
+                request.prompt = self.controller.tokenizer.detokenize(
+                    request.prompt_tokens.tolist()
+                )
+            request.generated_text = self.controller.tokenizer.detokenize(
+                request.generated_tokens
+            )
+        entry.future.set_result(entry.record)
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
@@ -857,11 +890,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
-            self.failed_request_ids.append(request_id)
-            if self.rank == 0:
-                warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
-                )
+            self._handle_failed_request(request_id)
 
         return self.requests[request_id].future
 
@@ -1495,14 +1524,14 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
 
-        # Failed requests.
+        # Failed requests. Status and events were already set in _handle_failed_request;
+        # here we just clean up the entry and include it in finished_request_records.
         for failed_request_id in self.failed_request_ids:
             failed_entry = self.requests.pop(failed_request_id)
-            failed_request = failed_entry.record[-1]
-            failed_request.status = Status.FAILED
-            failed_request.add_event_fail()
             finished_request_records.append(failed_entry.record)
-            failed_entry.future.set_result(failed_entry.record)
+            assert failed_entry.future.done(), (
+                f"Failed request {failed_request_id} future has not been properly resolved."
+            )
         self.failed_request_ids.clear()
         range_pop()
 
@@ -1523,14 +1552,19 @@ class DynamicInferenceEngine(AbstractEngine):
             range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
-        if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
-            range_push("coordinator_communication")
-            payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
-                use_bin_type=True,
-            )
-            self.socket_for_receiving_requests.send(payload)
-            range_pop()
+        # Failed request replies were already sent in _handle_failed_request.
+        if self.use_coordinator and self.is_mp_coordinator:
+            records_to_send = [
+                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+            ]
+            if records_to_send:
+                range_push("coordinator_communication")
+                payload = msgpack.packb(
+                    [Headers.ENGINE_REPLY.value, [r.serialize() for r in records_to_send]],
+                    use_bin_type=True,
+                )
+                self.socket_for_receiving_requests.send(payload)
+                range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
