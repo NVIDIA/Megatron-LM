@@ -782,6 +782,7 @@ class MambaMixer(MegatronModule):
         )
 
         # Compute short convolution
+        xBC_pre_conv = None
         if conv_state is not None and is_dynamic_batching:
             assert batch_indices is not None
 

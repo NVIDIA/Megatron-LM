@@ -1,5 +1,6 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_state.py
+# Adapted from:
+#   https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_state.py
 # Adapted from vLLM project (Apache-2.0).
 
 import torch
@@ -15,14 +16,14 @@ except:
 if TRITON3:
 
     @triton.jit
-    def softplus(dt):
+    def softplus(dt):  # pylint: disable=C0116
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1), dt)
         return dt
 
 else:
 
     @triton.jit
-    def softplus(dt):
+    def softplus(dt):  # pylint: disable=C0116
         dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
         return dt
 
@@ -554,7 +555,10 @@ def chunk_state_varlen(
     last_chunk_indices=None,
     cu_chunk_seqlens=None,
 ):
-    """Compute per-sequence final SSM state from chunk states (correct when sequences share chunks)."""
+    """Compute per-sequence final SSM state from chunk states.
+
+    Correct when sequences share chunks.
+    """
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import math
 import unittest
 from unittest.mock import MagicMock
@@ -126,28 +128,26 @@ class TestMambaDynamicInference(unittest.TestCase):
     def test_ssm_prefill_padding_isolation(self):
         """
         Tests that ssm_prefill only updates states for the real request
-        and outputs zeros for padding tokens.
+        and that padding request states remain untouched.
+
+        _ssm_prefill expects inputs pre-stripped to real tokens only
+        (stripping is done by _dynamic_inference_prefill). This test
+        passes only the real tokens and verifies that only the active
+        request's state is modified.
         """
         num_requests = 48
         real_seq_len = 6
-        total_tokens = 63
 
-        # Inputs
+        # Inputs: only real tokens (padding is stripped upstream)
         dim_inputs = self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads
-        zxBCdt = torch.randn(total_tokens, 1, dim_inputs, device=self.device, dtype=torch.float32)
+        zxBCdt = torch.randn(real_seq_len, 1, dim_inputs, device=self.device, dtype=torch.float32)
 
-        # Metadata
-        seq_idx = torch.full((total_tokens,), -1, dtype=torch.int32, device=self.device)
-        seq_idx[:real_seq_len] = 0
-        seq_idx = seq_idx.unsqueeze(0)
+        # Metadata: single real request
+        seq_idx = torch.zeros((1, real_seq_len), dtype=torch.int32, device=self.device)
 
-        cu_seqlens = torch.full(
-            (num_requests + 1,), real_seq_len, dtype=torch.int32, device=self.device
-        )
-        cu_seqlens[0] = 0
+        cu_seqlens = torch.tensor([0, real_seq_len], dtype=torch.int32, device=self.device)
 
-        batch_indices = torch.full((num_requests,), -1, dtype=torch.long, device=self.device)
-        batch_indices[0] = 0
+        batch_indices = torch.tensor([0], dtype=torch.long, device=self.device)
 
         # States
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
@@ -165,17 +165,10 @@ class TestMambaDynamicInference(unittest.TestCase):
             seq_idx=seq_idx,
             cu_seqlens=cu_seqlens,
             batch_indices=batch_indices,
-            return_varlen_states=True,
         )
 
-        # Assertions
-        real_output = output[0:real_seq_len]
-        padding_output = output[real_seq_len:]
-
-        self.assertTrue(
-            torch.allclose(padding_output, torch.zeros_like(padding_output)),
-            "Output for padding tokens should be 0",
-        )
+        # Output should have real_seq_len tokens
+        self.assertEqual(output.shape[0], real_seq_len)
         self.assertTrue(conv_state[0].abs().max() > 0, "Real request conv_state should be modified")
 
         # Verify isolation of padding states
@@ -190,7 +183,6 @@ class TestMambaDynamicInference(unittest.TestCase):
             torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
             "SSM states for padding requests (indices 1 to N-1) should remain 0",
         )
-        print("Prefill Test Passed!")
 
 
 if __name__ == '__main__':

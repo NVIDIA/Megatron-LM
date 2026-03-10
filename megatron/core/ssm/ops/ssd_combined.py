@@ -1,10 +1,10 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
+# Adapted from:
+#   https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 # Adapted from vLLM project (Apache-2.0).
 
 import torch
 import triton
-from einops import rearrange
 from packaging import version
 
 from .ssd_bmm import _bmm_chunk_fwd
@@ -16,6 +16,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
 def is_int_pow_2(n):
+    """Return True if n is a positive integer power of 2."""
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
 
 
@@ -109,18 +110,16 @@ def _mamba_chunk_scan_combined_fwd(
     # - When a new seq_idx is detected, we will stop passing the prev_state
     #   and switch accordingly to the init_state corresponding to the new seq_idx.
     states = _state_passing_fwd(
-        rearrange(states, "... p n -> ... (p n)"),
+        states.flatten(-2),  # ... p n -> ... (p n)
         dA_cumsum,  # (nheads, nchunks, chunk_size)
         cu_chunk_seqlens,
         initial_states=(
-            rearrange(initial_states, "... p n -> ... (p n)")
-            if initial_states is not None
-            else None
+            initial_states.flatten(-2) if initial_states is not None else None
         ),  # (batch, nheads, headdim*dstate)
         seq_idx=seq_idx,
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
     )
-    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+    states = states.unflatten(-1, (-1, dstate))
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms
     CB = _bmm_chunk_fwd(C, B, chunk_size, cu_chunk_seqlens, output_dtype=torch.float32)
