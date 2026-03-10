@@ -315,10 +315,9 @@ class TestStopWordSpeculativeDecoding:
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300]]
         )
-        assert (
-            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=2)
-            is True
-        )
+        assert self._check_stop_words_for_request_post_append(
+            request, num_speculative_tokens=2
+        ) == (True, 0)
         assert request.generated_tokens == [100, 200, 300]
 
     def test_speculative_stop_word_in_middle_truncates(self):
@@ -328,10 +327,9 @@ class TestStopWordSpeculativeDecoding:
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300, 400], stop_word_ids=[[200]]
         )
-        assert (
-            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=3)
-            is True
-        )
+        assert self._check_stop_words_for_request_post_append(
+            request, num_speculative_tokens=3
+        ) == (True, 2)
         assert request.generated_tokens == [100, 200]
 
     def test_speculative_multi_token_stop_word_in_middle_truncates(self):
@@ -341,10 +339,9 @@ class TestStopWordSpeculativeDecoding:
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300, 400, 500], stop_word_ids=[[200, 300]]
         )
-        assert (
-            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=4)
-            is True
-        )
+        assert self._check_stop_words_for_request_post_append(
+            request, num_speculative_tokens=4
+        ) == (True, 2)
         assert request.generated_tokens == [100, 200, 300]
 
     def test_speculative_stop_word_not_found(self):
@@ -352,10 +349,9 @@ class TestStopWordSpeculativeDecoding:
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300, 400], stop_word_ids=[[999]]
         )
-        assert (
-            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=3)
-            is False
-        )
+        assert self._check_stop_words_for_request_post_append(
+            request, num_speculative_tokens=3
+        ) == (False, 0)
         assert request.generated_tokens == [100, 200, 300, 400]
 
     def test_speculative_stop_word_one_trailing_token(self):
@@ -364,10 +360,9 @@ class TestStopWordSpeculativeDecoding:
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200]]
         )
-        assert (
-            self._check_stop_words_for_request_post_append(request, num_speculative_tokens=2)
-            is True
-        )
+        assert self._check_stop_words_for_request_post_append(
+            request, num_speculative_tokens=2
+        ) == (True, 1)
         assert request.generated_tokens == [100, 200]
 
 
