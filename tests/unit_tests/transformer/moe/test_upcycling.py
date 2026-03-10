@@ -34,6 +34,8 @@ from megatron.training.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import transformer_engine  # noqa: F401
+
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 
     HAVE_TE = True

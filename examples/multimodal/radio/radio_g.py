@@ -18,6 +18,8 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.typed_torch import not_none
 
 try:
+    import transformer_engine  # noqa: F401
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -28,6 +30,7 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    HAVE_TE = False
     (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -35,7 +38,6 @@ except ImportError:
         TENorm,
         TERowParallelLinear,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 try:
     import apex
