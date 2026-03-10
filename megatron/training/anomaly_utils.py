@@ -39,6 +39,7 @@ class TrainingAnomalyMonitor:
         self.flush_interval = max(1, int(getattr(args, "anomaly_flush_interval", 10)))
         self.max_buffer_size = max(1, int(getattr(args, "anomaly_buffer_size", 64)))
         self.output_path = str(getattr(args, "anomaly_output_file", "anomaly_events.jsonl"))
+        self.anomaly_start_iter = int(getattr(args, "anomaly_start_iter", 0))
 
         self.loss_history: deque[float] = deque(maxlen=self.loss_window)
         self.grad_history: deque[float] = deque(maxlen=self.loss_window)
@@ -88,7 +89,7 @@ class TrainingAnomalyMonitor:
             )
         )
 
-        if loss_is_anomaly or grad_is_anomaly:
+        if iteration >= self.anomaly_start_iter and (loss_is_anomaly or grad_is_anomaly):
             info = {
                 "step_id": int(iteration),
                 "loss": loss,
