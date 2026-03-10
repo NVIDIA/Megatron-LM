@@ -30,6 +30,7 @@ class MegatronGenerate(Resource):
     def __init__(self, engine, args):
         self.engine = engine
         self.args = args
+        self.verbose = getattr(args, 'inference_flask_server_logging', False)
 
     def put(self):
         """Handle generation request."""
@@ -76,7 +77,7 @@ class MegatronGenerate(Resource):
         if "temperature" in request.get_json():
             temperature = request.get_json()["temperature"]
             if not (isinstance(temperature, (int, float))):
-                return "temperature must be a positive number less than or equal to 1000.0"
+                return "temperature must be a positive number less than or equal to 100.0"
             if not (0.0 < temperature <= 100.0):
                 return "temperature must be a positive number less than or equal to 100.0"
 
@@ -156,12 +157,6 @@ class MegatronGenerate(Resource):
             if random_seed < 0:
                 return "random_seed must be a positive integer"
 
-        no_log = False
-        if "no_log" in request.get_json():
-            no_log = request.get_json()["no_log"]
-            if not isinstance(no_log, bool):
-                return "no_log must be a boolean value"
-
         stop_token = 50256
         if "stop_token" in request.get_json():
             stop_token = request.get_json()["stop_token"]
@@ -176,7 +171,7 @@ class MegatronGenerate(Resource):
 
         with LOCK:  # Need to get lock to keep multiple threads from hitting code
 
-            if not no_log:
+            if self.verbose:
                 logging.info(f"request IP: {str(request.remote_addr)}")
                 logging.info(json.dumps(request.get_json()))
                 logging.info(f"start time: {datetime.datetime.now()}")

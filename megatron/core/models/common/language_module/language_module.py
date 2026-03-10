@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
@@ -176,13 +177,39 @@ class LanguageModule(MegatronModule):
         This function initalizes word embeddings in the final stage when we are
         using pipeline parallelism and sharing word embeddings, and sets up param
         attributes on the embedding and output layers.
+
+        Parameter attributes set:
+        - `is_embedding_or_output_parameter`: True for embedding + output layer weights.
+          Used by decoupled_lr, Muon optimizer, and other Megatron features.
+        - `is_embedding_parameter`: True for MuP "embedding-class" parameters.
+          Used by MuP for table-8 style optimizer grouping (base LR/eps for vector-like params).
         """
 
-        # Set `is_embedding_or_output_parameter` attribute.
-        if self.pre_process:
+        # Mark embedding and output layer for decoupled_lr and other features.
+        # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
+        if self.pre_process and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
-        if self.post_process and self.output_layer.weight is not None:
+        if (
+            self.post_process
+            and hasattr(self, 'output_layer')
+            and self.output_layer.weight is not None
+        ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
+
+        # Mark embedding-class parameters for MuP optimizer grouping.
+        # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
+        # hidden matrix-like params use width-scaled LR/eps.
+        mtp_process = getattr(self, 'mtp_process', False)
+        if self.config.use_mup and (self.pre_process or mtp_process) and hasattr(self, 'embedding'):
+            for param in self.embedding.parameters():
+                param.is_embedding_parameter = True
+        if (
+            self.config.use_mup
+            and self.post_process
+            and hasattr(self, 'output_layer')
+            and self.output_layer.weight is not None
+        ):
+            self.output_layer.weight.is_embedding_parameter = True
 
         # If share_embeddings_and_output_weights is True, we need to maintain duplicated
         # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
@@ -222,6 +249,9 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # Keep optimizer grouping consistent for tied embedding/output copies.
+            if self.config.use_mup:
+                weight.is_embedding_parameter = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
@@ -239,7 +269,7 @@ class LanguageModule(MegatronModule):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
-            if self._is_in_embd_group():
+            if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.cuda()
                 torch.distributed.all_reduce(weight.data, group=self.embd_group)
@@ -254,13 +284,40 @@ class LanguageModule(MegatronModule):
             )
             LanguageModule.embedding_warning_printed = True
 
-    def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the emedding weight or output logit weights when share embedding and output weights set to True.
+    def _scale_logits(self, logits: Tensor) -> Tensor:
+        """Apply MuP output scaling to logits.
+
+        When MuP is enabled, scales logits by mup_output_mult (auto-set to 1/width_mult
+        if left at default) to keep output variance stable across widths.
+
+        Args:
+            logits (Tensor): Raw logits from the output layer.
 
         Returns:
-            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
+            Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
+                    otherwise unchanged logits.
         """
-        if self.pre_process:
+        if not self.config.use_mup:
+            return logits
+        if self.config.mup_output_mult != 1.0:
+            return logits * self.config.mup_output_mult
+        return logits
+
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Gets the embedding weight or output logit weights when share embedding and output weights set to True
+          or when use Multi-Token Prediction (MTP).
+
+        Returns:
+            Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
+        """
+        if self.pre_process or getattr(self, 'mtp_process', False):
+            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
+            # So there will be both embedding layer and output layer in the mtp process stage.
+            # When share_embeddings_and_output_weights is True, the embedding weight is the
+            # canonical shared weight and is passed to the output layer during forward.
+            assert hasattr(
+                self, 'embedding'
+            ), f"embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
@@ -293,6 +350,21 @@ class LanguageModule(MegatronModule):
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
 
+        # Multi-Token Prediction (MTP) needs embedding layer in mtp process stage.
+        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
+        # embedding layer in the mtp process stage and tie it to the embedding in the pre
+        # processing stage.
+        # Note: MTP loss is computed at post_process stage, so the output_layer on mtp_process
+        # rank doesn't need special tying - it's not used for loss computation.
+        if getattr(self, 'mtp_process', False) and not self.pre_process:
+            emb_weight = self.embedding.word_embeddings.weight
+            tie_word_embeddings_state_dict(
+                sharded_state_dict,
+                emb_weight,
+                first_stage_word_emb_key,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata

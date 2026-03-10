@@ -12,6 +12,7 @@ from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from typing_extensions import override
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -1121,6 +1122,14 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             param_groups += optimizer.param_groups
         return param_groups
+
+    @override
+    def get_parameters(self) -> List[torch.nn.Parameter]:
+        """Get list of parameters wrapped in all chained optimizers."""
+        params = []
+        for optimizer in self.chained_optimizers:
+            params.extend(optimizer.get_parameters())
+        return params
 
     @property
     def state(self) -> ProxyDict:

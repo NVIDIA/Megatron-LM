@@ -8,6 +8,7 @@ from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.mamba.mamba_layer_specs import mamba_inference_stack_spec
 
+
 def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building MAMBA model ...')
     if config is None:
@@ -15,8 +16,10 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
     assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
 
     if config.transformer_impl == "inference_optimized":
-        mamba_stack_spec = mamba_inference_stack_spec 
-        assert not config.inference_fuse_tp_communication, "inference_fuse_tp_communication is not supported for Mamba"
+        mamba_stack_spec = mamba_inference_stack_spec
+        assert (
+            not config.inference_fuse_tp_communication
+        ), "inference_fuse_tp_communication is not supported for Mamba"
     elif args.spec is not None:
         mamba_stack_spec = import_module(args.spec)
     else:
@@ -27,10 +30,8 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         mamba_stack_spec=mamba_stack_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
+        hybrid_layer_pattern=args.hybrid_layer_pattern,
         pre_process=pre_process,
-        hybrid_attention_ratio=args.hybrid_attention_ratio,
-        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-        hybrid_override_pattern=args.hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
@@ -39,6 +40,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         pg_collection=pg_collection,
+        vp_stage=vp_stage,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

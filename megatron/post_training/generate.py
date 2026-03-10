@@ -19,6 +19,7 @@ def simple_generate(
     osl: int = 32,
     eos_token_id: List[int] = [],
     disable_tqdm: bool = False,
+    calibration_mode: bool = False,
 ):
     """A simple generate function without using KV-cache."""
     model.eval()
@@ -64,20 +65,23 @@ def simple_generate(
         else:
             tokens = input_ids
 
-        list_of_logits = get_forward_backward_func()(
+        logits_and_extras = get_forward_backward_func()(
             forward_step_func=_forward_step_func,
             data_iterator=[{"tokens": tokens}],
             model=model,
             num_microbatches=1,
             seq_length=tokens.shape[-1],
-            micro_batch_size=1,
+            micro_batch_size=tokens.shape[0],
             decoder_seq_length=tokens.shape[-1],
             forward_only=True,
             collect_non_loss_data=True,
         )
 
+        if calibration_mode:
+            continue  # avoid unnecessary computation
+
         if mpu.is_pipeline_last_stage():
-            logits = gather_from_tensor_model_parallel_region(list_of_logits[0])
+            logits = gather_from_tensor_model_parallel_region(logits_and_extras[0])
             eager_ids = logits[:, input_ids.shape[-1] - 1, :].argmax(dim=-1, keepdim=True).detach()
         else:
             eager_ids = None

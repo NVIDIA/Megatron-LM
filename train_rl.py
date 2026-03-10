@@ -22,9 +22,11 @@ from megatron.rl.rl_utils import (
     load_packed_data_by_index,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
@@ -32,7 +34,6 @@ stimer = StragglerDetector()
 import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
-
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
@@ -258,11 +259,22 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=tokens.shape[1],
-            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-            device=tokens.device,
-        )
+        if args.rl_use_sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
@@ -277,7 +289,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
+            model_to_use, tokens, position_ids, no_grad=False,
+            packed_seq_params=packed_seq_params
         )
 
         if not is_pipeline_last_stage():
@@ -378,7 +391,7 @@ if __name__ == "__main__":
     def _model_builder(
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
-        if getattr(args, "is_hybrid_model", False):
+        if is_hybrid_model(args):
             return mamba_builder(
                 args,
                 pre_process,
