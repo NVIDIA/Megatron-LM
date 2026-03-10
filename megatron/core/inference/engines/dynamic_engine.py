@@ -1449,15 +1449,6 @@ class DynamicInferenceEngine(AbstractEngine):
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
 
-        # Commit Mamba intermediate states after forward pass
-        if (
-            not is_decode_only
-            and self.context.is_hybrid_model
-            and hasattr(self.context, 'max_mamba_cache_slots')
-            and self.context.max_mamba_cache_slots > 0
-        ):
-            self.context.commit_mamba_intermediate_states()
-
         range_pop()
 
         if (

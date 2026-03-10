@@ -244,9 +244,10 @@ class TestMambaPrefixCachingE2E:
         return [prompt_0, prompt_1, prompt_2, prompt_3, prompt_4]
 
     def _build_engine(self, model, mamba_config, enable_prefix_caching,
-                      buffer_size_gb=0.5, prefix_caching_mamba_gb=0.05):
+                      buffer_size_gb=0.5, prefix_caching_mamba_gb=0.05,
+                      request_rounder=4):
         """Build context + wrapper + controller + engine."""
-        set_rounder(4)
+        set_rounder(request_rounder)
 
         inference_config_kwargs = dict(
             max_sequence_length=MAX_SEQ_LEN,
@@ -748,3 +749,314 @@ class TestMambaPrefixCachingE2E:
             f"pc=on prefill: expected {NUM_GROUPS * 2008}, got {on_prefill}"
         )
         assert on_prefill < off_prefill
+
+    # =====================================================================
+    # Edge case: block-aligned EOS + cached logit zero-prefill
+    # =====================================================================
+
+    def _create_block_aligned_prompts(self):
+        """Build 4 prompts with block-aligned lengths for EOS path testing.
+
+        A: 256 tokens — exactly 1 block, block-aligned EOS
+        B: 256 tokens — identical to A, cached logit zero-prefill
+        C: 512 tokens — exactly 2 blocks, extends A's prefix
+        D: 512 tokens — identical to C, cached logit zero-prefill
+        """
+        device = torch.cuda.current_device()
+        seg_0 = torch.arange(8000, 8256, dtype=torch.int64, device=device)
+        seg_1 = torch.arange(8256, 8512, dtype=torch.int64, device=device)
+
+        prompt_A = seg_0.clone()                       # 256
+        prompt_B = seg_0.clone()                       # 256 (identical to A)
+        prompt_C = torch.cat([seg_0, seg_1])           # 512
+        prompt_D = torch.cat([seg_0, seg_1])           # 512 (identical to C)
+
+        assert len(prompt_A) == 256
+        assert len(prompt_B) == 256
+        assert len(prompt_C) == 512
+        assert len(prompt_D) == 512
+
+        return [prompt_A, prompt_B, prompt_C, prompt_D]
+
+    def _run_eos_pc_off(self, model, mamba_config, prompts):
+        """Run block-aligned prompts with pc=off."""
+        engine = self._build_engine(model, mamba_config, enable_prefix_caching=False)
+
+        for i, prompt in enumerate(prompts):
+            req = self._make_request(i, prompt, enable_prefix_caching=False)
+            engine._add_request(req)
+
+        finished = {}
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = list(merged.generated_tokens)
+
+        return finished, engine.context.lifetime_prefill_token_count
+
+    def _run_eos_pc_on(self, model, mamba_config, prompts):
+        """Run block-aligned prompts with pc=on, per-step assertions.
+
+        Scheduling with pending_block_hashes coordination:
+          - step 1: A scheduled (B, C, D deferred: h0 pending)
+          - step 2: B + C co-scheduled (D deferred: h1 pending from C)
+          - step 3: D scheduled
+
+        Verifies:
+          - Block-aligned EOS caching (dynamic_context.py:1224-1232):
+            prompt_len is an exact multiple of block_size, so Mamba state
+            is cached via store_mamba_state_for_block_from_live instead of
+            intermediate extraction.
+          - Cached logit zero-prefill: when all blocks match (identical
+            prompts, block-aligned), effective_chunk_length == 0 and the
+            cached block boundary logit is used directly.
+          - Identical prompts: all hashes match, no new mamba entries.
+        """
+        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
+        alloc = engine.context.block_allocator
+        ctx = engine.context
+
+        reqs = {}
+        for i, prompt in enumerate(prompts):
+            reqs[i] = self._make_request(i, prompt, enable_prefix_caching=True)
+
+        for i in range(4):
+            engine._add_request(reqs[i])
+
+        step = 0
+        finished = {}
+        prev_prefill = 0
+
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            step += 1
+            step_prefill = ctx.lifetime_prefill_token_count - prev_prefill
+            prev_prefill = ctx.lifetime_prefill_token_count
+
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = list(merged.generated_tokens)
+
+            if step == 1:
+                # A: 256 tokens, no mamba matches. EOS path fires
+                # (last_aligned_abs = 256 == prompt_len) and caches block 0
+                # via store_mamba_state_for_block_from_live. No intermediate
+                # extraction: last_aligned_rel = 256 - 0 = 256, seq_len = 256,
+                # 256 < 256 is false → filtered.
+                assert reqs[0]._mamba_num_matched_blocks == 0, (
+                    f"step 1: expected 0 mamba matches, got {reqs[0]._mamba_num_matched_blocks}"
+                )
+                assert len(alloc.mamba_hash_to_block_id) == 1, (
+                    f"step 1: expected 1 mamba entry, got {len(alloc.mamba_hash_to_block_id)}"
+                )
+                assert reqs[0].precomputed_block_hashes[0] in alloc.mamba_hash_to_block_id
+                assert step_prefill == 256, (
+                    f"step 1: expected 256 prefill tokens, got {step_prefill}"
+                )
+
+            elif step == 2:
+                # B: 1 mamba match, skip = 256 == chunk_length → effective == 0,
+                #   uses cached logit (zero redundant computation)
+                assert reqs[1]._mamba_num_matched_blocks == 1, (
+                    f"step 2 B: expected 1 mamba match, got {reqs[1]._mamba_num_matched_blocks}"
+                )
+                # C: 1 mamba match. skip = min(1*256, 512) = 256, effective = 256
+                assert reqs[2]._mamba_num_matched_blocks == 1, (
+                    f"step 2 C: expected 1 mamba match, got {reqs[2]._mamba_num_matched_blocks}"
+                )
+                # Block 1 cached via C's EOS path (512 == 512, block-aligned)
+                assert len(alloc.mamba_hash_to_block_id) == 2, (
+                    f"step 2: expected 2 mamba entries, got {len(alloc.mamba_hash_to_block_id)}"
+                )
+                assert reqs[2].precomputed_block_hashes[1] in alloc.mamba_hash_to_block_id
+                # B contributes 0 tokens (cached logit), C contributes 256
+                assert step_prefill == 0 + 256, (
+                    f"step 2: expected 256 prefill tokens, got {step_prefill}"
+                )
+
+            elif step == 3:
+                # D: 2 mamba matches, skip = 512 == chunk_length → effective == 0,
+                #   uses cached logit (zero redundant computation)
+                assert reqs[3]._mamba_num_matched_blocks == 2, (
+                    f"step 3 D: expected 2 mamba matches, got {reqs[3]._mamba_num_matched_blocks}"
+                )
+                # No new mamba entries (D's blocks already cached by A + C)
+                assert len(alloc.mamba_hash_to_block_id) == 2, (
+                    f"step 3: expected 2 mamba entries, got {len(alloc.mamba_hash_to_block_id)}"
+                )
+                assert step_prefill == 0, (
+                    f"step 3: expected 0 prefill tokens, got {step_prefill}"
+                )
+
+        return finished, ctx.lifetime_prefill_token_count
+
+    @torch.inference_mode()
+    def test_mamba_block_aligned_eos_e2e(self):
+        """Verify block-aligned EOS caching, cached logit zero-prefill, and identical prompts.
+
+        Exercises code paths not covered by the main e2e test:
+        - Block-aligned EOS path (dynamic_context.py:1224-1232): prompt_len is
+          an exact multiple of block_size, so Mamba state is cached via
+          store_mamba_state_for_block_from_live (copy from live buffer) instead
+          of intermediate extraction.
+        - Cached logit zero-prefill: when all blocks match (identical prompts,
+          block-aligned), effective_chunk_length == 0 and the cached block
+          boundary logit is used directly, achieving zero redundant computation.
+        - Identical prompts: every block hash matches, no new mamba entries.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._create_block_aligned_prompts()
+
+        off_outputs, off_prefill = self._run_eos_pc_off(model, mamba_config, prompts)
+        on_outputs, on_prefill = self._run_eos_pc_on(model, mamba_config, prompts)
+
+        for req_id in range(4):
+            assert off_outputs[req_id] == on_outputs[req_id], (
+                f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
+            )
+
+        # pc=off: 256 + 256 + 512 + 512 = 1536
+        # pc=on: 256 + (0+256) + 0 = 512
+        #   step 1: A = 256 (seed, no matches)
+        #   step 2: B = 0 (1 mamba match, cached logit, zero prefill)
+        #         + C = 256 (1 mamba match, skip 256, effective 256)
+        #   step 3: D = 0 (2 mamba matches, cached logit, zero prefill)
+        assert off_prefill == 1536, f"pc=off prefill: expected 1536, got {off_prefill}"
+        assert on_prefill == 512, f"pc=on prefill: expected 512, got {on_prefill}"
+        assert on_prefill < off_prefill
+
+    # =====================================================================
+    # Edge case: LRU eviction invalidates mamba state
+    # =====================================================================
+
+    def _create_eviction_prompts(self):
+        """Build 3 prompts for LRU eviction testing.
+
+        E: 300 tokens — seed request, caches block 0 mamba state
+        F: 300 tokens — disjoint prefix, forces eviction of E's cached block
+        G: 300 tokens — identical to E, verifies eviction effect
+        """
+        device = torch.cuda.current_device()
+        prompt_E = torch.arange(8000, 8300, dtype=torch.int64, device=device)
+        prompt_F = torch.arange(8300, 8600, dtype=torch.int64, device=device)
+        prompt_G = torch.arange(8000, 8300, dtype=torch.int64, device=device)  # identical to E
+
+        for p in [prompt_E, prompt_F, prompt_G]:
+            assert len(p) == 300
+
+        return [prompt_E, prompt_F, prompt_G]
+
+    @torch.inference_mode()
+    def test_mamba_lru_eviction_e2e(self):
+        """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block.
+
+        Exercises dynamic_block_allocator.py:280-286: when KV blocks are evicted
+        (via _deregister_blocks), blocks with cached Mamba state are also removed
+        from mamba_hash_to_block_id and their cache slots freed via
+        invalidate_mamba_state_for_block.
+
+        Uses a tiny KV buffer (3 blocks total, 2 usable, request_rounder=1) so
+        that a single completed request's cached block fills the only available
+        cache slot, and the next disjoint request forces LRU eviction.
+
+        Each 300-token request uses 2 blocks: 1 full (256 tokens, registered
+        with hash) + 1 partial (44 tokens, unregistered, returned to free pool
+        on release). Only the full block occupies a cache slot.
+
+        Flow:
+          E runs alone → caches block 0 mamba state (1 cached, 1 free)
+          F runs alone → needs 2 blocks, only 1 free → evicts E's cached
+            block (oldest LRU), which triggers invalidate_mamba_state_for_block
+          G runs alone (identical to E) → no KV match, no mamba match,
+            full prefill despite being an identical prompt
+        """
+        skip_if_mamba_sequence_packing_not_available()
+
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._create_eviction_prompts()
+
+        # Use a tiny buffer: 0.002 GB → 3 total blocks (2 usable) for this
+        # model. request_rounder=1 so max_requests = (3-1) // 1 = 2.
+        engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=True,
+            buffer_size_gb=0.002, prefix_caching_mamba_gb=0.05,
+            request_rounder=1,
+        )
+        alloc = engine.context.block_allocator
+        ctx = engine.context
+
+        assert alloc.total_count == 3, (
+            f"expected 3 total blocks for eviction test, got {alloc.total_count} "
+            f"(adjust buffer_size_gb)"
+        )
+        assert ctx.max_requests >= 1, (
+            f"max_requests={ctx.max_requests}, need at least 1"
+        )
+
+        finished = {}
+
+        def _run_one(req_id, prompt):
+            # Use num_tokens_to_generate=2 so the request survives the prefill
+            # step. With =1, the request finishes during prefill before
+            # commit_mamba_intermediate_states runs (it's called after
+            # update_requests in the engine), so mamba state is never cached.
+            req = self._make_request(
+                req_id, prompt, enable_prefix_caching=True, num_tokens_to_generate=2,
+            )
+            engine._add_request(req)
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = list(merged.generated_tokens)
+            return req
+
+        # --- E: seed request, no matches ---
+        req_E = _run_one(0, prompts[0])
+        h_E0 = req_E.precomputed_block_hashes[0]
+        assert h_E0 in alloc.mamba_hash_to_block_id, "E's block 0 should have mamba state"
+        assert h_E0 in alloc.kv_hash_to_block_id, "E's block 0 should be in KV cache"
+        assert len(alloc.mamba_hash_to_block_id) == 1
+        # 1 cached full block + 1 free (partial returned to pool)
+        assert alloc.total_avail == 1, (
+            f"expected 1 free block after E (partial returned), got {alloc.total_avail}"
+        )
+
+        # --- F: disjoint prefix, forces eviction of E's cached block ---
+        req_F = _run_one(1, prompts[1])
+        h_F0 = req_F.precomputed_block_hashes[0]
+        assert h_F0 in alloc.mamba_hash_to_block_id
+
+        # E's block was evicted via _deregister_blocks → invalidate_mamba_state_for_block
+        assert h_E0 not in alloc.kv_hash_to_block_id, (
+            "E's KV hash should be evicted"
+        )
+        assert h_E0 not in alloc.mamba_hash_to_block_id, (
+            "E's mamba hash should be invalidated by _deregister_blocks"
+        )
+        assert len(alloc.mamba_hash_to_block_id) == 1
+
+        # --- G: identical to E, but E's state was evicted ---
+        req_G = _run_one(2, prompts[2])
+
+        # No mamba match despite identical prompt (mamba hash evicted)
+        assert req_G._mamba_num_matched_blocks == 0, (
+            f"G should have 0 mamba matches after eviction, "
+            f"got {req_G._mamba_num_matched_blocks}"
+        )
+
+        # G re-cached block 0's mamba state
+        assert h_E0 in alloc.mamba_hash_to_block_id, (
+            "G should re-register E's block 0 mamba hash"
+        )
+
+        # E and G have the same prompt, both computed from scratch with
+        # greedy decoding (top_k=1), so their outputs must match
+        assert finished[0] == finished[2], (
+            f"E tokens {finished[0]} != G tokens {finished[2]}"
+        )

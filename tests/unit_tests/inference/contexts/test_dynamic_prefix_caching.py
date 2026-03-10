@@ -248,8 +248,8 @@ class TestPrefillTokenSavings(PrefixCachingTestBase):
         )
         disabled_total = ctx_off.lifetime_prefill_token_count
 
-        # Enabled: 4*bs + 1 (min guard). Disabled: 4*bs + 4*bs.
-        assert enabled_total == bs * 4 + 1
+        # Enabled: 4*bs + 0 (zero-redundant, cached logit). Disabled: 4*bs + 4*bs.
+        assert enabled_total == bs * 4
         assert disabled_total == bs * 4 * 2
         assert enabled_total < disabled_total
 
@@ -270,12 +270,13 @@ class TestPrefillTokenSavings(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_full_match_adds_single_token(self):
-        """Prompt exactly N*bs, fully matched: multiple dependent requests each get query_length == 1.
+        """Prompt exactly N*bs, fully matched: multiple dependent requests each get query_length == 0.
 
-        When a block-aligned prompt fully matches a cached prefix, the chunk_length - 1
-        guard causes only N-1 tokens to be skipped, re-processing the last token. Multiple
-        such requests all map their single token to the same position in the shared block
-        (a benign race writing identical values).
+        When a block-aligned prompt fully matches a cached prefix, all tokens are
+        skipped (zero-redundant). The cached logit from the last matched block is
+        used directly instead of running any tokens through the model. Multiple
+        such requests all get effective_chunk_length == 0 and contribute no tokens
+        to the batch.
         """
         ctx = self._ctx()
         bs = ctx.block_size_tokens
@@ -292,30 +293,19 @@ class TestPrefillTokenSavings(PrefixCachingTestBase):
             ctx.add_request(self._req(ctx, prompt.clone(), request_id=i + 2))
 
             req_idx = i + 1
-            token_start = tokens_after_first + i
-            token_end = tokens_after_first + i + 1
 
-            # Each dependent adds exactly 1 token
-            assert ctx.request_query_lengths[req_idx].item() == 1
+            # Each dependent adds exactly 0 tokens (zero-redundant cached logit)
+            assert ctx.request_query_lengths[req_idx].item() == 0
 
-            # That single token maps to the same shared block as req0's last block
-            assert ctx.token_to_block_idx[token_start].item() == first_blocks[-1]
-
-            # Position within that block is bs - 1 (last position)
-            assert ctx.token_to_local_position_within_kv_block[token_start].item() == bs - 1
-
-            # The input token value matches req0's last token
-            assert ctx.token_to_input_ids[token_start].item() == prompt[-1].item()
-
-        # Total tokens: 1 per dependent request
-        assert ctx.active_token_count - tokens_after_first == num_dependents
+        # Total tokens: 0 per dependent request
+        assert ctx.active_token_count - tokens_after_first == 0
 
         # All matched blocks have ref count == 1 (first) + num_dependents
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 1 + num_dependents
 
-        # Lifetime count: full prefill for req0 + 1 token per dependent
-        assert ctx.lifetime_prefill_token_count == bs * num_blocks + num_dependents
+        # Lifetime count: full prefill for req0 + 0 tokens per dependent
+        assert ctx.lifetime_prefill_token_count == bs * num_blocks
 
     @pytest.mark.internal
     def test_no_match_adds_full_prompt(self):
@@ -1167,11 +1157,11 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert prefix_skip == 0
         assert eff_chunk == len(prompt)
 
-    # ----- Zero-chunk guard -----
+    # ----- Cached logit zero prefill -----
 
     @pytest.mark.internal
-    def test_zero_chunk_guard(self):
-        """When all blocks match (block-aligned), back off by 1 to avoid zero chunk."""
+    def test_cached_logit_zero_prefill(self):
+        """When all blocks match (block-aligned), effective_chunk_length == 0 and cached logit hash is set."""
         ctx = self._mamba_ctx()
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3)  # block-aligned
@@ -1194,10 +1184,39 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             req2, len(prompt)
         )
         assert len(matched) == 3
-        # Without guard: skip would be 3*bs == len(prompt) → zero chunk
-        # With guard: skip backs off by 1
-        assert prefix_skip == len(prompt) - 1
-        assert eff_chunk == 1
+        # No zero-chunk guard: skip covers entire chunk
+        assert prefix_skip == 3 * bs
+        assert eff_chunk == 0
+        assert req2._mamba_num_matched_blocks == 3
+
+    @pytest.mark.internal
+    def test_cached_logit_zero_prefill_kv_only(self):
+        """KV-only: block-aligned all-match gives effective_chunk_length == 0 with cached logit hash set."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 3)  # block-aligned
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Cache a fake logit for the last block
+        last_block_hash = req1.precomputed_block_hashes[2]
+        fake_logit = torch.randn(16, device=torch.cuda.current_device())
+        alloc.cache_block_logit(last_block_hash, fake_logit)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, len(prompt)
+        )
+        assert len(matched) == 3
+        assert prefix_skip == 3 * bs
+        assert eff_chunk == 0
+
+        # add_request should set _cached_logit_hash
+        ctx.add_request(req2)
+        current_id = ctx.total_request_count - 1
+        assert ctx._cached_logit_hash[current_id] == last_block_hash
 
     # ----- Intermediate offset computation -----
 
@@ -1466,3 +1485,239 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx._allocate_mamba_cache_slot(block_ids[0])
         assert ctx.mamba_cache_free_count == initial_free - 3
         assert ctx.has_mamba_state_for_block(block_ids[0])
+
+
+# =========================================================================
+# Class 11: TestMixedCachedAndFreshPrefill
+# =========================================================================
+
+
+class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
+    """Tests for mixed batches containing both zero-query (cached logit) and
+    normal prefill requests alongside decode requests.
+
+    Verifies that last_token_logits, calculate_log_probs, and token bookkeeping
+    work correctly when some requests have effective_chunk_length == 0.
+    """
+
+    def _mamba_ctx(self, *, prefix_caching_mamba_gb=0.01, block_size_tokens=256, **kwargs):
+        """Create a hybrid context with Mamba prefix caching enabled."""
+        from megatron.core.inference.config import MambaInferenceStateConfig
+
+        params_dtype = torch.float32
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list=["*", "M", "*", "M"],
+            conv_states_shape=(4, 8),
+            ssm_states_shape=(4, 16),
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+        )
+
+        defaults = dict(
+            buffer_size_gb=0.1,
+            max_sequence_length=4096,
+            rounder=64,
+            enable_prefix_caching=True,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        )
+        defaults.update(kwargs)
+
+        DynamicInferenceContext.ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
+
+        transformer_config = TransformerConfig(
+            params_dtype=params_dtype,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            hidden_size=16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_cpu_initialization=True,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=defaults["max_sequence_length"],
+            buffer_size_gb=defaults["buffer_size_gb"],
+            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
+            block_size_tokens=block_size_tokens,
+            max_tokens=defaults.get("max_tokens"),
+            mamba_inference_state_config=mamba_config,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+            enable_prefix_caching=defaults["enable_prefix_caching"],
+            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
+            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+        )
+        return DynamicInferenceContext(
+            model_config=transformer_config, inference_config=inference_config
+        )
+
+    def _setup_mixed_batch(self, model_type):
+        """Set up a mixed batch: req0 (decode), reqs 1-4 (mixed cached/fresh prefill).
+
+        Step 1: add req0 (block-aligned prompt), cache its block boundary logit,
+                 simulate transition to decode.
+        Step 2: add reqs 1-4 where req1,req3 are identical to req0 (cached,
+                 effective_chunk_length == 0) and req2,req4 are different (fresh,
+                 full prefill).
+
+        Returns (ctx, bs, fake_logit, block_hash).
+        """
+        if model_type == "gpt":
+            ctx = self._ctx(block_size_tokens=32)
+        else:
+            ctx = self._mamba_ctx(block_size_tokens=256)
+        bs = ctx.block_size_tokens
+
+        # Step 1: add req0 (1 block, block-aligned)
+        prompt0 = self._prompt(bs)
+        req0 = self._req(ctx, prompt0.clone())
+        ctx.add_request(req0)
+
+        # Cache block boundary logit for req0's block.
+        # vocab_size must exceed max token ID: prompt0 uses 0..bs-1,
+        # req2/req4 use offset..offset+bs-1 (offsets 50, 40).
+        vocab_size = bs + 50
+        fake_logit = torch.randn(vocab_size, device=torch.cuda.current_device())
+        block_hash = req0.precomputed_block_hashes[0]
+        ctx.block_allocator.cache_block_logit(block_hash, fake_logit)
+
+        # For hybrid models, register the Mamba hash so reqs 1,3 can match
+        if model_type == "hybrid":
+            block_id = ctx.block_allocator.kv_hash_to_block_id[block_hash]
+            ctx.block_allocator.register_mamba_block_hash(block_id, block_hash)
+
+        # Simulate transition to decode for req0
+        ctx.request_kv_length_offsets[0] += bs
+        ctx.request_query_lengths[0] = 1
+        ctx.request_last_kv_block_offset[0] = 0  # (bs - 1 + 1) % bs = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = 1
+        # Set up decode token arrays
+        ctx.token_to_input_ids[0] = 42  # arbitrary decode token
+        ctx.token_to_pos_ids[0] = bs
+        ctx.token_to_request_idx[0] = 0
+
+        # Step 2: add reqs 1-4
+        # req1, req3: identical to req0 → will match, effective_chunk_length == 0
+        # req2, req4: different → no match, full prefill
+        req1 = self._req(ctx, prompt0.clone(), request_id=2)
+        req2 = self._req(ctx, self._prompt(bs, offset=50), request_id=3)
+        req3 = self._req(ctx, prompt0.clone(), request_id=4)
+        req4 = self._req(ctx, self._prompt(bs, offset=40), request_id=5)
+
+        # For hybrid models, set _mamba_num_matched_blocks (normally done by engine)
+        if model_type == "hybrid":
+            req1._mamba_num_matched_blocks = 1  # matches req0's block
+            req2._mamba_num_matched_blocks = 0  # different prompt, no match
+            req3._mamba_num_matched_blocks = 1  # matches req0's block
+            req4._mamba_num_matched_blocks = 0  # different prompt, no match
+
+        ctx.add_request(req1)
+        ctx.add_request(req2)
+        ctx.add_request(req3)
+        ctx.add_request(req4)
+
+        return ctx, bs, fake_logit, block_hash
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    def test_mixed_batch_query_lengths(self, model_type):
+        """Verify query lengths: decode=1, cached=0, fresh=bs."""
+        ctx, bs, _, _ = self._setup_mixed_batch(model_type)
+
+        assert ctx.request_query_lengths[0].item() == 1   # req0: decode
+        assert ctx.request_query_lengths[1].item() == 0   # req1: cached
+        assert ctx.request_query_lengths[2].item() == bs   # req2: fresh
+        assert ctx.request_query_lengths[3].item() == 0   # req3: cached
+        assert ctx.request_query_lengths[4].item() == bs   # req4: fresh
+
+        # Total active tokens: 1 (decode) + 0 + bs + 0 + bs = 1 + 2*bs
+        assert ctx.active_token_count == 1 + 2 * bs
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    def test_mixed_batch_cached_logit_hash(self, model_type):
+        """Verify _cached_logit_hash is set for cached requests and -1 for others."""
+        ctx, _, _, block_hash = self._setup_mixed_batch(model_type)
+
+        assert ctx._cached_logit_hash[0] == -1           # req0: decode
+        assert ctx._cached_logit_hash[1] == block_hash   # req1: cached
+        assert ctx._cached_logit_hash[2] == -1            # req2: fresh
+        assert ctx._cached_logit_hash[3] == block_hash   # req3: cached
+        assert ctx._cached_logit_hash[4] == -1            # req4: fresh
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    def test_mixed_batch_last_token_logits(self, model_type):
+        """Verify last_token_logits returns forward-pass logits for non-zero
+        requests and cached logits for zero-query requests."""
+        ctx, bs, fake_logit, _ = self._setup_mixed_batch(model_type)
+        vocab_size = fake_logit.shape[0]
+
+        # Build fake forward-pass logits: shape [1, active_token_count, vocab_size]
+        # Tokens: 1 (req0 decode) + bs (req2 fresh) + bs (req4 fresh) = 1 + 2*bs
+        logits = torch.randn(
+            1, ctx.active_token_count, vocab_size, device=torch.cuda.current_device()
+        )
+
+        result = ctx.last_token_logits(logits)
+        assert result.shape == (5, vocab_size)
+
+        # Non-zero requests: cumsum of [1, bs, bs] = [1, 1+bs, 1+2*bs], -1 = [0, bs, 2*bs]
+        assert torch.equal(result[0], logits[0, 0, :])           # req0 decode
+        assert torch.equal(result[1], fake_logit)                 # req1 cached
+        assert torch.equal(result[2], logits[0, bs, :])           # req2 fresh
+        assert torch.equal(result[3], fake_logit)                 # req3 cached
+        assert torch.equal(result[4], logits[0, 2 * bs, :])      # req4 fresh
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    def test_mixed_batch_calculate_log_probs(self, model_type):
+        """Verify calculate_log_probs handles zero-query requests correctly.
+
+        Zero-query requests should get empty log prob lists. Non-zero requests
+        should get correct log probs without index collisions.
+        """
+        ctx, bs, fake_logit, _ = self._setup_mixed_batch(model_type)
+        vocab_size = fake_logit.shape[0]  # bs + 50
+        active_count = ctx.active_token_count  # 1 + 2*bs
+
+        # Build fake logits: [1, active_token_count, vocab_size]
+        logits = torch.randn(1, active_count, vocab_size, device=torch.cuda.current_device())
+
+        # Build fake sampled tokens (one per active request)
+        new_tokens = torch.randint(0, vocab_size, (5,), device=torch.cuda.current_device())
+
+        log_probs_list, log_probs_tensor = ctx.calculate_log_probs(logits, new_tokens)
+
+        # Should have 5 entries (one per active request)
+        assert len(log_probs_list) == 5
+
+        # req0 (decode, q=1): 1 log prob
+        assert len(log_probs_list[0]) == 1
+
+        # req1 (cached, q=0): empty
+        assert len(log_probs_list[1]) == 0
+
+        # req2 (fresh, q=bs): bs log probs
+        assert len(log_probs_list[2]) == bs
+
+        # req3 (cached, q=0): empty
+        assert len(log_probs_list[3]) == 0
+
+        # req4 (fresh, q=bs): bs log probs
+        assert len(log_probs_list[4]) == bs
+
+        # Verify no index collision: the last log prob for req2 should correspond
+        # to new_tokens[2] (not overwritten by req3's new_tokens[3]).
+        log_probs_full = torch.nn.functional.log_softmax(logits.squeeze(0).float(), dim=-1)
+        # Position of req2's last token: cumsum of non-zero [1, bs, bs] = [1, 1+bs, 1+2*bs],
+        # -1 = [0, bs, 2*bs]. req2's last token is at position bs.
+        expected_log_prob_req2_last = log_probs_full[bs, new_tokens[2]].item()
+        actual_log_prob_req2_last = log_probs_list[2][-1]
+        assert abs(expected_log_prob_req2_last - actual_log_prob_req2_last) < 1e-5, (
+            f"req2 last log prob mismatch: expected {expected_log_prob_req2_last}, "
+            f"got {actual_log_prob_req2_last}"
+        )

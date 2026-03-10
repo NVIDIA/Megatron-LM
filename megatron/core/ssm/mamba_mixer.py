@@ -552,7 +552,54 @@ class MambaMixer(MegatronModule):
         )
 
         padded_token_count = zxBCdt.shape[0]
+
+        # All prefill requests have 0 tokens (fully covered by cached blocks,
+        # zero-redundant prefix caching). No computation needed; return a
+        # padded zero tensor so tensor_merge shape expectations are satisfied.
+        if real_token_count == 0:
+            y_zero = torch.zeros(
+                padded_token_count, 1, self.d_inner_local_tp,
+                dtype=zxBCdt.dtype, device=zxBCdt.device,
+            )
+            if intermediate_token_offsets is not None:
+                return y_zero, [None] * real_prefill_count
+            return y_zero
+
         zxBCdt = zxBCdt[:real_token_count]
+
+        # Filter out zero-length sequences (zero-query requests with cached
+        # logits). Passing them to _ssm_prefill would cause
+        # causal_conv1d_varlen_states / tensor_masked_update to overwrite
+        # their correctly-restored conv/SSM state with garbage from a
+        # zero-length segment.
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        nonzero_mask = seq_lengths > 0
+        has_zero_len_seqs = not nonzero_mask.all()
+
+        if has_zero_len_seqs:
+            nonzero_lengths = seq_lengths[nonzero_mask]
+            cu_seqlens = torch.cat([
+                torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+                torch.cumsum(nonzero_lengths, 0),
+            ])
+            batch_indices = batch_indices[nonzero_mask]
+            if seq_idx is not None:
+                seq_idx_vals = []
+                offset = 0
+                for i in range(real_prefill_count):
+                    slen = seq_lengths[i].item()
+                    if nonzero_mask[i]:
+                        seq_idx_vals.append(
+                            torch.full((slen,), offset, dtype=seq_idx.dtype, device=seq_idx.device)
+                        )
+                        offset += 1
+                seq_idx = torch.cat(seq_idx_vals).unsqueeze(0) if seq_idx_vals else None
+            if intermediate_token_offsets is not None:
+                intermediate_token_offsets = [
+                    intermediate_token_offsets[i]
+                    for i in range(real_prefill_count)
+                    if nonzero_mask[i]
+                ]
 
         result = self._ssm_prefill(
             zxBCdt,
@@ -566,6 +613,18 @@ class MambaMixer(MegatronModule):
 
         if intermediate_token_offsets is not None:
             y_prefill, intermediate_states = result
+            # Re-expand intermediate states to include None for filtered-out
+            # zero-length requests so indices match the caller's expectation.
+            if has_zero_len_seqs:
+                expanded = []
+                nz_idx = 0
+                for i in range(real_prefill_count):
+                    if nonzero_mask[i]:
+                        expanded.append(intermediate_states[nz_idx])
+                        nz_idx += 1
+                    else:
+                        expanded.append(None)
+                intermediate_states = expanded
         else:
             y_prefill = result
             intermediate_states = None
