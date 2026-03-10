@@ -27,6 +27,16 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
 )
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+
+except ImportError:
+    HAVE_TE = False
+    TELinear, set_save_original_input = None, None
+
 
 class SharedExpertMLP(MLP):
     """
@@ -76,19 +86,8 @@ class SharedExpertMLP(MLP):
                 config.recompute_granularity == 'selective'
                 and "shared_experts" in config.recompute_modules
             )
-            if not shared_experts_recompute:
-                try:
-                    HAVE_TE = True
-                    from megatron.core.extensions.transformer_engine import (
-                        TELinear,
-                        set_save_original_input,
-                    )
-                except ImportError:
-                    HAVE_TE = False
-                    TELinear, set_save_original_input = None, None
-
-                if HAVE_TE and isinstance(self.linear_fc1, TELinear):
-                    set_save_original_input(self.linear_fc1)
+            if not shared_experts_recompute and HAVE_TE and isinstance(self.linear_fc1, TELinear):
+                set_save_original_input(self.linear_fc1)
 
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module
