@@ -287,6 +287,7 @@ class RolloutStats:
     mean_inf_prob: None | float
     policy_epoch: list[list[int]]
     kv_cache_epoch: list[list[int]]
+    completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
 
 
@@ -763,6 +764,7 @@ def compute_group_stats(
     num_turns = [] # num_turns per traj
     all_policy_epoch = []
     all_kv_cache_epoch = []
+    all_completed_epochs = []
     all_num_evictions = []
     for group in rollouts:
         group_rewards = []
@@ -771,6 +773,7 @@ def compute_group_stats(
         group_num_turns = []
         group_policy_epoch = []
         group_kv_epoch = []
+        group_completed_epochs = []
         group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
@@ -794,9 +797,11 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             group_policy_epoch.append(min(s for turn in rollout.policy_epoch for s in turn))
             group_kv_epoch.append(min(s for turn in rollout.kv_cache_epoch for s in turn))
+            group_completed_epochs.extend(max(turn) for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
+        all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
@@ -827,6 +832,7 @@ def compute_group_stats(
         mean_inf_prob=None,
         policy_epoch=all_policy_epoch,
         kv_cache_epoch=all_kv_cache_epoch,
+        completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
     )
     return stats
@@ -842,6 +848,7 @@ def prep_wandb_metrics(
         advantages: List[float],
         policy_epoch: List[List[int]],
         kv_cache_epoch: List[List[int]],
+        completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
@@ -859,6 +866,7 @@ def prep_wandb_metrics(
         advantages: Flattened list of advantages.
         policy_epoch: Grouped list of per-rollout min policy epoch stamps.
         kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
@@ -923,6 +931,7 @@ def prep_wandb_metrics(
             'min_kv_cache_staleness': min(true_kv_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
+            'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
     }
     if example_group:
         if tokenizer is None:
@@ -983,12 +992,13 @@ def maybe_log_training_metrics(
     advantages = group_stats.advantages
     policy_epoch = group_stats.policy_epoch
     kv_cache_epoch = group_stats.kv_cache_epoch
+    completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, num_evictions=num_evictions,
-        current_iteration=current_iteration)
+        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
+        num_evictions=num_evictions, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1009,6 +1019,7 @@ def maybe_log_training_metrics(
             advantages=env_advantages,
             policy_epoch=env_stats(policy_epoch, env_idx),
             kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
+            completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
