@@ -313,6 +313,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_layer_map, gdn_layer_map, attention_layer_map, _, _ = (
                 get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
             )
+
+            if len(gdn_layer_map) > 0:
+                raise NotImplementedError("GDN layers are not supported for inference.")
+
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | mamba_layer_map | gdn_layer_map
