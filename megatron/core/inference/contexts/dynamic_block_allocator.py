@@ -196,7 +196,9 @@ class BlockAllocator:
                 # entry to preserve for reuse (e.g., partial blocks at the end of
                 # a request). Return them directly to the free pool so they are not
                 # leaked.
-                unreg_mask = (self.block_ref_counts[blocks] == 0) & (self.block_hashes[blocks] == -1)
+                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
+                    self.block_hashes[blocks] == -1
+                )
                 if unreg_mask.any():
                     unreg_blocks = blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()

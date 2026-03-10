@@ -999,7 +999,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             logging.warning(
                 "Mamba cache budget (%.3f GB) too small for even 1 slot "
                 "(need %.3f GB per slot). Mamba caching disabled.",
-                mamba_gb, per_slot_bytes / 1024**3,
+                mamba_gb,
+                per_slot_bytes / 1024**3,
             )
             return
 
@@ -1008,32 +1009,29 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Block <-> slot mappings
         num_blocks = self.block_allocator.total_count
-        self.block_to_mamba_slot = torch.full(
-            (num_blocks,), -1, dtype=torch.int32, device=device,
-        )
-        self.mamba_slot_to_block = torch.full(
-            (max_slots,), -1, dtype=torch.int32, device=device,
-        )
+        self.block_to_mamba_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
+        self.mamba_slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device=device)
 
         # Free slot pool (stack)
-        self.mamba_cache_free_slots = torch.arange(
-            max_slots, dtype=torch.int32, device=device,
-        )
+        self.mamba_cache_free_slots = torch.arange(max_slots, dtype=torch.int32, device=device)
         self.mamba_cache_free_count = max_slots
 
         # State tensors
         self.mamba_cache_conv_states = torch.zeros(
             (self.num_mamba_layers, max_slots) + self.mamba_conv_states_shape,
-            dtype=self.mamba_conv_states_dtype, device=device,
+            dtype=self.mamba_conv_states_dtype,
+            device=device,
         )
         self.mamba_cache_ssm_states = torch.zeros(
             (self.num_mamba_layers, max_slots) + self.mamba_ssm_states_shape,
-            dtype=self.mamba_ssm_states_dtype, device=device,
+            dtype=self.mamba_ssm_states_dtype,
+            device=device,
         )
 
         logging.info(
             "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
-            max_slots, max_slots * per_slot_bytes / 1024**3,
+            max_slots,
+            max_slots * per_slot_bytes / 1024**3,
             per_slot_bytes / 1024,
         )
 
@@ -1069,8 +1067,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             The freed slot index.
         """
         # Find blocks that have mamba slots and ref_count == 0
-        has_slot_mask = self.block_to_mamba_slot[:self.block_allocator.total_count] >= 0
-        ref_zero_mask = self.block_allocator.block_ref_counts[:self.block_allocator.total_count] == 0
+        has_slot_mask = self.block_to_mamba_slot[: self.block_allocator.total_count] >= 0
+        ref_zero_mask = (
+            self.block_allocator.block_ref_counts[: self.block_allocator.total_count] == 0
+        )
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
@@ -1096,7 +1096,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return slot
 
     def store_mamba_state_for_block_from_tensors(
-        self, block_id: int, layer_idx: int, ssm_state: Tensor, conv_state: Tensor,
+        self, block_id: int, layer_idx: int, ssm_state: Tensor, conv_state: Tensor
     ) -> None:
         """Write provided state tensors to a cache slot for a specific layer.
 
@@ -1111,9 +1111,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.mamba_cache_ssm_states[layer_idx, slot].copy_(ssm_state)
         self.mamba_cache_conv_states[layer_idx, slot].copy_(conv_state)
 
-    def store_mamba_state_for_block_from_live(
-        self, block_id: int, request_idx: int,
-    ) -> None:
+    def store_mamba_state_for_block_from_live(self, block_id: int, request_idx: int) -> None:
         """Copy all layers from live per-request buffer to cache slot.
 
         Used for block-aligned EOS case where the final kernel state
@@ -1221,7 +1219,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_ids_for_offsets.append(bid)
 
         self._mamba_intermediate_offsets[current_id] = offsets if offsets else None
-        self._mamba_intermediate_block_ids[current_id] = block_ids_for_offsets if block_ids_for_offsets else None
+        self._mamba_intermediate_block_ids[current_id] = (
+            block_ids_for_offsets if block_ids_for_offsets else None
+        )
 
         # Block-aligned EOS: prompt_len is exactly block-aligned
         if last_aligned_abs == prompt_len and prompt_len > 0:
@@ -1266,7 +1266,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return result if has_any else None
 
     def buffer_mamba_intermediate_states(
-        self, mamba_layer_idx: int, intermediate_states_per_request: list,
+        self, mamba_layer_idx: int, intermediate_states_per_request: list
     ) -> None:
         """Buffer intermediate states from a single Mamba layer's forward pass.
 
@@ -1944,8 +1944,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.block_to_mamba_slot.fill_(-1)
             self.mamba_slot_to_block.fill_(-1)
             self.mamba_cache_free_slots = torch.arange(
-                self.max_mamba_cache_slots, dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                self.max_mamba_cache_slots, dtype=torch.int32, device=torch.cuda.current_device()
             )
             self.mamba_cache_free_count = self.max_mamba_cache_slots
             self._mamba_intermediate_buffer.clear()
@@ -2022,9 +2021,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             for i in torch.where(zero_mask)[0].tolist():
                 block_hash = self._cached_logit_hash[paused + i]
                 cached_logit = self.block_allocator.get_cached_block_logit(block_hash)
-                assert cached_logit is not None, (
-                    f"No cached logit for block hash {block_hash}"
-                )
+                assert cached_logit is not None, f"No cached logit for block hash {block_hash}"
                 cached_parts.append(cached_logit.unsqueeze(0))
                 if vocab_size is None:
                     vocab_size = cached_logit.size(-1)
@@ -2036,7 +2033,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Scatter into result tensor in correct order
         all_indices = torch.cat(result_indices)
         all_logits = torch.cat(result_parts, dim=0)
-        result = torch.empty(active_count, vocab_size, device=all_logits.device, dtype=all_logits.dtype)
+        result = torch.empty(
+            active_count, vocab_size, device=all_logits.device, dtype=all_logits.dtype
+        )
         result[all_indices] = all_logits
         return result
 
@@ -2066,7 +2065,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Compute token_start for each prefill request via cumulative sum
         # of query lengths for all active requests
-        query_lengths = self.request_query_lengths[paused:self.total_request_count]
+        query_lengths = self.request_query_lengths[paused : self.total_request_count]
         cu_lengths = torch.cumsum(query_lengths, dim=0)
 
         for prefill_idx in range(prefill_count):
@@ -2145,11 +2144,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_skip_tokens = 0
 
         # Hybrid models with Mamba caching: skip based on Mamba match count
-        if self.is_hybrid_model and hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
+        if (
+            self.is_hybrid_model
+            and hasattr(self, 'max_mamba_cache_slots')
+            and self.max_mamba_cache_slots > 0
+        ):
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
-            assert num_mamba_matched <= num_matched, (
-                f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
-            )
+            assert (
+                num_mamba_matched <= num_matched
+            ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
             if num_mamba_matched > 0 and block_aligned:
                 prefix_skip_tokens = min(num_mamba_matched * self.block_size_tokens, chunk_length)
             else:
@@ -2416,11 +2419,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Track cached logit hash for zero-query prefix caching
         if effective_chunk_length == 0 and self.enable_prefix_caching:
             # All tokens covered by cached blocks, use cached logit from last matched block
-            if self.is_hybrid_model and hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
+            if (
+                self.is_hybrid_model
+                and hasattr(self, 'max_mamba_cache_slots')
+                and self.max_mamba_cache_slots > 0
+            ):
                 num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
-                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[num_mamba_matched - 1]
+                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[
+                    num_mamba_matched - 1
+                ]
             else:
-                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[num_matched_blocks - 1]
+                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[
+                    num_matched_blocks - 1
+                ]
         else:
             self._cached_logit_hash[current_id] = -1
 
@@ -2434,7 +2445,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Restore Mamba state from last consecutive cached block
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             restored = False
-            if num_mamba_matched > 0 and hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
+            if (
+                num_mamba_matched > 0
+                and hasattr(self, 'max_mamba_cache_slots')
+                and self.max_mamba_cache_slots > 0
+            ):
                 restore_block_id = matched_block_ids[num_mamba_matched - 1]
                 restored = self.restore_mamba_state_from_block(
                     self.total_request_count, restore_block_id
@@ -2445,10 +2460,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Compute intermediate offsets for state extraction during forward pass
             # Skip when effective_chunk_length == 0 (all-cached, no forward pass needed)
-            if effective_chunk_length > 0 and hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
+            if (
+                effective_chunk_length > 0
+                and hasattr(self, 'max_mamba_cache_slots')
+                and self.max_mamba_cache_slots > 0
+            ):
                 self._compute_and_store_mamba_offsets(
-                    req, current_id, prefix_skip_tokens, chunk_length,
-                    num_matched_blocks, matched_block_ids, overall_required_blocks,
+                    req,
+                    current_id,
+                    prefix_skip_tokens,
+                    chunk_length,
+                    num_matched_blocks,
+                    matched_block_ids,
+                    overall_required_blocks,
                 )
 
         self.active_token_count += effective_chunk_length
@@ -2537,7 +2561,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Clear intermediate offset entries for released requests
         if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
-            idx_list = request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
+            idx_list = (
+                request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
+            )
             for idx in idx_list:
                 self._mamba_intermediate_offsets[idx] = None
                 self._mamba_intermediate_block_ids[idx] = None

@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import unittest
+
 import torch
 
 try:
     from megatron.core.ssm.ops.ssd_chunk_scan import _chunk_scan_fwd
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
@@ -30,20 +32,50 @@ class TestChunkScanFwd(unittest.TestCase):
 
     def test_chunk_scan_fwd_shape_and_inplace_out(self):
         cb = torch.randn(
-            self.nchunks, self.ngroups, self.chunk_size, self.chunk_size,
-            device=self.device, dtype=torch.float32,
+            self.nchunks,
+            self.ngroups,
+            self.chunk_size,
+            self.chunk_size,
+            device=self.device,
+            dtype=torch.float32,
         )
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        dt = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        C = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        states = torch.randn(self.nchunks, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
-        out = torch.zeros(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        dt = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        dA_cumsum = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        C = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        states = torch.randn(
+            self.nchunks,
+            self.nheads,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        out = torch.zeros(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
 
         _chunk_scan_fwd(
-            cb, x, dt, dA_cumsum, C, states,
-            self.cu_chunk_seqlens, out, self.seq_idx,
-            D=None, z=None, initial_states=None,
+            cb,
+            x,
+            dt,
+            dA_cumsum,
+            C,
+            states,
+            self.cu_chunk_seqlens,
+            out,
+            self.seq_idx,
+            D=None,
+            z=None,
+            initial_states=None,
         )
 
         self.assertEqual(out.shape, (self.seqlen, self.nheads, self.headdim))
@@ -53,42 +85,104 @@ class TestChunkScanFwd(unittest.TestCase):
 
     def test_chunk_scan_fwd_with_D(self):
         cb = torch.randn(
-            self.nchunks, self.ngroups, self.chunk_size, self.chunk_size,
-            device=self.device, dtype=torch.float32,
+            self.nchunks,
+            self.ngroups,
+            self.chunk_size,
+            self.chunk_size,
+            device=self.device,
+            dtype=torch.float32,
         )
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        dt = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        C = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        states = torch.randn(self.nchunks, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
-        out = torch.zeros(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        dt = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        dA_cumsum = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        C = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        states = torch.randn(
+            self.nchunks,
+            self.nheads,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        out = torch.zeros(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
         D = torch.ones(self.nheads, self.headdim, device=self.device, dtype=torch.float32)
 
         _chunk_scan_fwd(
-            cb, x, dt, dA_cumsum, C, states,
-            self.cu_chunk_seqlens, out, self.seq_idx,
-            D=D, z=None, initial_states=None,
+            cb,
+            x,
+            dt,
+            dA_cumsum,
+            C,
+            states,
+            self.cu_chunk_seqlens,
+            out,
+            self.seq_idx,
+            D=D,
+            z=None,
+            initial_states=None,
         )
 
         self.assertFalse(torch.isnan(out).any())
 
     def test_chunk_scan_fwd_with_z(self):
         cb = torch.randn(
-            self.nchunks, self.ngroups, self.chunk_size, self.chunk_size,
-            device=self.device, dtype=torch.float32,
+            self.nchunks,
+            self.ngroups,
+            self.chunk_size,
+            self.chunk_size,
+            device=self.device,
+            dtype=torch.float32,
         )
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        z = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        dt = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32)
-        C = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        states = torch.randn(self.nchunks, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
-        out = torch.zeros(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        z = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        dt = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        dA_cumsum = torch.randn(
+            self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        C = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        states = torch.randn(
+            self.nchunks,
+            self.nheads,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        out = torch.zeros(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
 
         _chunk_scan_fwd(
-            cb, x, dt, dA_cumsum, C, states,
-            self.cu_chunk_seqlens, out, self.seq_idx,
-            D=None, z=z, initial_states=None,
+            cb,
+            x,
+            dt,
+            dA_cumsum,
+            C,
+            states,
+            self.cu_chunk_seqlens,
+            out,
+            self.seq_idx,
+            D=None,
+            z=z,
+            initial_states=None,
         )
 
         self.assertFalse(torch.isnan(out).any())

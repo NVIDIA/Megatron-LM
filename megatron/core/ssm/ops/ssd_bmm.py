@@ -15,9 +15,7 @@ import triton.language as tl
             num_warps=8,
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
-            num_stages=4,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4
         ),
         triton.Config(
             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
@@ -25,34 +23,22 @@ import triton.language as tl
             num_warps=4,
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-            num_stages=4,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-            num_stages=4,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
-            num_stages=4,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
-            num_stages=5,
-            num_warps=2,
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-            num_stages=5,
-            num_warps=2,
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2
         ),
         triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-            num_stages=4,
-            num_warps=2,
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=2
         ),
     ],
     key=["chunk_size", "K", "IS_CAUSAL"],
@@ -115,14 +101,12 @@ def _bmm_chunk_fwd_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(
             a_ptrs,
-            mask=(offs_m[:, None] < chunk_size_limit)
-            & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         ).to(dot_dtype)
         b = tl.load(
             b_ptrs,
-            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
-            & (offs_n[None, :] < chunk_size_limit),
+            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit),
             other=0.0,
         ).to(dot_dtype)
         acc += tl.dot(a, b)
@@ -135,11 +119,7 @@ def _bmm_chunk_fwd_kernel(
     out = acc.to(out_ptr.dtype.element_ty)
     out_ptr += pid_c * stride_out_chunk + pid_h * stride_out_head
     out_ptrs = out_ptr + (stride_outm * offs_m[:, None] + offs_n[None, :] * stride_outn)
-    tl.store(
-        out_ptrs,
-        out,
-        mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size),
-    )
+    tl.store(out_ptrs, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
 
 
 def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None):
@@ -164,17 +144,11 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
     nchunks = len(cu_chunk_seqlens) - 1
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
-    out = torch.empty(
-        (nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype
-    )
+    out = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
     dot_dtype = (
         tl.bfloat16
         if a.dtype == torch.bfloat16 or b.dtype == torch.bfloat16
-        else (
-            tl.float16
-            if a.dtype == torch.float16 or b.dtype == torch.float16
-            else tl.float32
-        )
+        else (tl.float16 if a.dtype == torch.float16 or b.dtype == torch.float16 else tl.float32)
     )
     grid = lambda META: (
         triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])

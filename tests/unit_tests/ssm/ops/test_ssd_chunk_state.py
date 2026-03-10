@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import unittest
+
 import torch
 
 try:
@@ -9,6 +10,7 @@ try:
         _chunk_state_fwd,
         chunk_state_varlen,
     )
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
@@ -31,9 +33,7 @@ class TestChunkCumsumFwd(unittest.TestCase):
         dt = torch.randn(self.seqlen, self.nheads, device=self.device, dtype=torch.float32)
         A = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
 
-        dA_cumsum, dt_out = _chunk_cumsum_fwd(
-            dt, A, self.chunk_size, self.cu_chunk_seqlens
-        )
+        dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, self.chunk_size, self.cu_chunk_seqlens)
 
         nchunks = self.cu_chunk_seqlens.shape[0] - 1
         self.assertEqual(dA_cumsum.shape, (self.nheads, nchunks, self.chunk_size))
@@ -47,8 +47,13 @@ class TestChunkCumsumFwd(unittest.TestCase):
         A = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
 
         dA_cumsum, dt_out = _chunk_cumsum_fwd(
-            dt, A, self.chunk_size, self.cu_chunk_seqlens,
-            dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
+            dt,
+            A,
+            self.chunk_size,
+            self.cu_chunk_seqlens,
+            dt_bias=None,
+            dt_softplus=False,
+            dt_limit=(0.0, float("inf")),
         )
 
         nchunks = self.cu_chunk_seqlens.shape[0] - 1
@@ -94,10 +99,16 @@ class TestChunkStateFwd(unittest.TestCase):
         self.cu_chunk_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device=self.device)
 
     def test_chunk_state_fwd_shape(self):
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        B = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        B = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
         dt = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
+        dA_cumsum = torch.randn(
+            self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32
+        )
 
         states = _chunk_state_fwd(B, x, dt, dA_cumsum, self.cu_chunk_seqlens)
 
@@ -126,14 +137,27 @@ class TestChunkStateVarlen(unittest.TestCase):
         self.last_chunk_indices = torch.tensor([0, 1], dtype=torch.int64, device=self.device)
 
     def test_chunk_state_varlen_shape(self):
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        B = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        B = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
         dt = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
-        chunk_states = torch.randn(2, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
+        dA_cumsum = torch.randn(
+            self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        chunk_states = torch.randn(
+            2, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32
+        )
 
         states = chunk_state_varlen(
-            B, x, dt, dA_cumsum, self.cu_seqlens, chunk_states,
+            B,
+            x,
+            dt,
+            dA_cumsum,
+            self.cu_seqlens,
+            chunk_states,
             last_chunk_indices=self.last_chunk_indices,
             cu_chunk_seqlens=self.cu_chunk_seqlens,
         )
@@ -142,15 +166,35 @@ class TestChunkStateVarlen(unittest.TestCase):
         self.assertFalse(torch.isnan(states).any())
 
     def test_chunk_state_varlen_with_initial_states(self):
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
-        B = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
+        B = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
         dt = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32)
-        chunk_states = torch.randn(2, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
-        initial_states = torch.randn(self.batch, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32)
+        dA_cumsum = torch.randn(
+            self.nheads, 2, self.chunk_size, device=self.device, dtype=torch.float32
+        )
+        chunk_states = torch.randn(
+            2, self.nheads, self.headdim, self.dstate, device=self.device, dtype=torch.float32
+        )
+        initial_states = torch.randn(
+            self.batch,
+            self.nheads,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         states = chunk_state_varlen(
-            B, x, dt, dA_cumsum, self.cu_seqlens, chunk_states,
+            B,
+            x,
+            dt,
+            dA_cumsum,
+            self.cu_seqlens,
+            chunk_states,
             initial_states=initial_states,
             last_chunk_indices=self.last_chunk_indices,
             cu_chunk_seqlens=self.cu_chunk_seqlens,

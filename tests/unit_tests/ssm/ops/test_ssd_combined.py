@@ -1,13 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import unittest
+
 import torch
 
 try:
-    from megatron.core.ssm.ops.ssd_combined import (
-        is_int_pow_2,
-        mamba_chunk_scan_combined_varlen,
-    )
+    from megatron.core.ssm.ops.ssd_combined import is_int_pow_2, mamba_chunk_scan_combined_varlen
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
@@ -20,7 +19,7 @@ class TestIsIntPow2(unittest.TestCase):
 
     def test_powers_of_two(self):
         for exp in range(12):
-            n = 2 ** exp
+            n = 2**exp
             self.assertTrue(is_int_pow_2(n), f"2^{exp}={n} should be power of 2")
 
     def test_non_powers_of_two(self):
@@ -57,12 +56,20 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
         self.seq_idx = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
 
     def test_mamba_chunk_scan_combined_varlen_shape_and_no_nan(self):
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
         dt = torch.randn(self.seqlen, self.nheads, device=self.device, dtype=torch.float32)
         A = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
-        B = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        C = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        out = torch.empty(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        B = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        C = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        out = torch.empty(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
 
         varlen_states = mamba_chunk_scan_combined_varlen(
             x=x,
@@ -83,14 +90,22 @@ class TestMambaChunkScanCombinedVarlen(unittest.TestCase):
         self.assertFalse(torch.isnan(varlen_states).any(), "varlen_states should have no NaN")
 
     def test_mamba_chunk_scan_combined_varlen_with_D_and_dt_bias(self):
-        x = torch.randn(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        x = torch.randn(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
         dt = torch.randn(self.seqlen, self.nheads, device=self.device, dtype=torch.float32)
         A = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
-        B = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        C = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        B = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        C = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
         D = torch.ones(self.nheads, self.headdim, device=self.device, dtype=torch.float32)
         dt_bias = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
-        out = torch.empty(self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        out = torch.empty(
+            self.seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
 
         varlen_states = mamba_chunk_scan_combined_varlen(
             x=x,
@@ -161,7 +176,9 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         A = torch.randn(self.nheads, device=self.device, dtype=torch.float32)
         B = torch.randn(seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
         C = torch.randn(seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        out = torch.empty(seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32)
+        out = torch.empty(
+            seqlen, self.nheads, self.headdim, device=self.device, dtype=torch.float32
+        )
         return x, dt, A, B, C, out
 
     def test_intermediate_states_shape_and_no_nan(self):
@@ -169,13 +186,19 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         seqlen = 64  # 4 chunks of 16
         nchunks = seqlen // self.chunk_size
         x, dt, A, B, C, out = self._make_inputs(seqlen)
-        cu_chunk_seqlens = torch.arange(0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device)
+        cu_chunk_seqlens = torch.arange(
+            0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device
+        )
         last_chunk_indices = torch.tensor([nchunks - 1], dtype=torch.int64, device=self.device)
         seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=self.device)
         intermediate_chunk_indices = torch.tensor([0, 1, 2], dtype=torch.int64, device=self.device)
 
         result = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
@@ -196,14 +219,20 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         seqlen = 64  # 4 chunks
         nchunks = seqlen // self.chunk_size
         x, dt, A, B, C, out = self._make_inputs(seqlen)
-        cu_chunk_seqlens = torch.arange(0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device)
+        cu_chunk_seqlens = torch.arange(
+            0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device
+        )
         last_chunk_indices = torch.tensor([nchunks - 1], dtype=torch.int64, device=self.device)
         seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=self.device)
 
         # Run with return_intermediate_states=True to get all states
         out1 = torch.empty_like(out)
         all_states = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
@@ -217,7 +246,11 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         intermediate_chunk_indices = torch.tensor(indices, dtype=torch.int64, device=self.device)
         out2 = torch.empty_like(out)
         final_states, intermediate_states = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
@@ -229,7 +262,8 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         # Intermediate states should match the corresponding all_states entries
         for i, chunk_idx in enumerate(indices):
             torch.testing.assert_close(
-                intermediate_states[i], all_states[chunk_idx],
+                intermediate_states[i],
+                all_states[chunk_idx],
                 msg=f"intermediate state at index {i} (chunk {chunk_idx}) does not match",
             )
 
@@ -244,8 +278,9 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         x, dt, A, B, C, out = self._make_inputs(total_len)
 
         # cu_chunk_seqlens: seq1 has chunks at [0, 16, 32], seq2 at [32, 48, 64, 80]
-        boundaries = list(range(0, seq1_len + 1, self.chunk_size)) + \
-                     list(range(seq1_len + self.chunk_size, total_len + 1, self.chunk_size))
+        boundaries = list(range(0, seq1_len + 1, self.chunk_size)) + list(
+            range(seq1_len + self.chunk_size, total_len + 1, self.chunk_size)
+        )
         cu_chunk_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=self.device)
         nchunks = len(boundaries) - 1  # 5 chunks total
         # Last chunk for seq1 is chunk 1, for seq2 is chunk 4
@@ -259,7 +294,11 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         # Also get full states for comparison
         out_full = torch.empty_like(out)
         all_states = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
@@ -270,7 +309,11 @@ class TestIntermediateStateExtraction(unittest.TestCase):
 
         out2 = torch.empty_like(out)
         final_states, intermediate_states = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
@@ -291,12 +334,18 @@ class TestIntermediateStateExtraction(unittest.TestCase):
         seqlen = 32
         nchunks = seqlen // self.chunk_size
         x, dt, A, B, C, out = self._make_inputs(seqlen)
-        cu_chunk_seqlens = torch.arange(0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device)
+        cu_chunk_seqlens = torch.arange(
+            0, seqlen + 1, self.chunk_size, dtype=torch.int32, device=self.device
+        )
         last_chunk_indices = torch.tensor([nchunks - 1], dtype=torch.int64, device=self.device)
         seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=self.device)
 
         result = mamba_chunk_scan_combined_varlen(
-            x=x, dt=dt, A=A, B=B, C=C,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,

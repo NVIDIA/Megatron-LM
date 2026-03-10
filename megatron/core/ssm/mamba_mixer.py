@@ -481,7 +481,10 @@ class MambaMixer(MegatronModule):
 
             intermediate_offsets = context.get_mamba_intermediate_offsets()
             result = self._dynamic_inference_prefill(
-                zxBCdt_prefill, context, conv_state, ssm_state,
+                zxBCdt_prefill,
+                context,
+                conv_state,
+                ssm_state,
                 intermediate_token_offsets=intermediate_offsets,
             )
             if isinstance(result, tuple):
@@ -545,11 +548,7 @@ class MambaMixer(MegatronModule):
         cu_seqlens = metadata.cu_seqlens[: real_prefill_count + 1]
         batch_indices = metadata.batch_indices_prefill[:real_prefill_count]
         real_token_count = cu_seqlens[-1].item()
-        seq_idx = (
-            metadata.seq_idx[:, :real_token_count]
-            if metadata.seq_idx is not None
-            else None
-        )
+        seq_idx = metadata.seq_idx[:, :real_token_count] if metadata.seq_idx is not None else None
 
         padded_token_count = zxBCdt.shape[0]
 
@@ -558,8 +557,11 @@ class MambaMixer(MegatronModule):
         # padded zero tensor so tensor_merge shape expectations are satisfied.
         if real_token_count == 0:
             y_zero = torch.zeros(
-                padded_token_count, 1, self.d_inner_local_tp,
-                dtype=zxBCdt.dtype, device=zxBCdt.device,
+                padded_token_count,
+                1,
+                self.d_inner_local_tp,
+                dtype=zxBCdt.dtype,
+                device=zxBCdt.device,
             )
             if intermediate_token_offsets is not None:
                 return y_zero, [None] * real_prefill_count
@@ -578,10 +580,12 @@ class MambaMixer(MegatronModule):
 
         if has_zero_len_seqs:
             nonzero_lengths = seq_lengths[nonzero_mask]
-            cu_seqlens = torch.cat([
-                torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
-                torch.cumsum(nonzero_lengths, 0),
-            ])
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+                    torch.cumsum(nonzero_lengths, 0),
+                ]
+            )
             batch_indices = batch_indices[nonzero_mask]
             if seq_idx is not None:
                 seq_idx_vals = []
@@ -632,9 +636,7 @@ class MambaMixer(MegatronModule):
         # Pad output back to padded token count. The caller (residual add,
         # tensor_merge) expects the output to match the padded input shape.
         if y_prefill.shape[0] < padded_token_count:
-            y_prefill = F.pad(
-                y_prefill, (0, 0, 0, 0, 0, padded_token_count - y_prefill.shape[0])
-            )
+            y_prefill = F.pad(y_prefill, (0, 0, 0, 0, 0, padded_token_count - y_prefill.shape[0]))
 
         if intermediate_states is not None:
             return y_prefill, intermediate_states

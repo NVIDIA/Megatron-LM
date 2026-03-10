@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import unittest
+
 import torch
 
 try:
     from megatron.core.ssm.ops.ssd_state_passing import _state_passing_fwd
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
@@ -50,14 +52,12 @@ class TestStatePassingFwd(unittest.TestCase):
             self.nheads, self.nchunks, self.chunk_size, device=self.device, dtype=torch.float32
         )
         seq_idx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=self.device)
-        initial_states = torch.randn(2, self.nheads, self.dim, device=self.device, dtype=torch.float32)
+        initial_states = torch.randn(
+            2, self.nheads, self.dim, device=self.device, dtype=torch.float32
+        )
 
         out = _state_passing_fwd(
-            states,
-            dA_cumsum,
-            self.cu_chunk_seqlens,
-            seq_idx,
-            initial_states=initial_states,
+            states, dA_cumsum, self.cu_chunk_seqlens, seq_idx, initial_states=initial_states
         )
 
         self.assertEqual(out.shape, (self.nchunks, self.nheads, self.dim))
@@ -73,7 +73,9 @@ class TestStatePassingFwd(unittest.TestCase):
         seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=self.device)
 
         states = torch.randn(nchunks, nheads, dim, device=self.device, dtype=torch.float32)
-        dA_cumsum = torch.randn(nheads, nchunks, chunk_size, device=self.device, dtype=torch.float32)
+        dA_cumsum = torch.randn(
+            nheads, nchunks, chunk_size, device=self.device, dtype=torch.float32
+        )
 
         out = _state_passing_fwd(states, dA_cumsum, cu_chunk_seqlens, seq_idx)
 

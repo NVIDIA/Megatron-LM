@@ -1130,9 +1130,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
 
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, len(prompt)
-        )
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3, "should find 3 KV matching blocks"
         assert prefix_skip == bs, "skip limited to Mamba match (1 block)"
         assert eff_chunk == len(prompt) - bs
@@ -1150,9 +1148,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 0
 
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, len(prompt)
-        )
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3
         assert prefix_skip == 0
         assert eff_chunk == len(prompt)
@@ -1180,9 +1176,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 3
 
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, len(prompt)
-        )
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3
         # No zero-chunk guard: skip covers entire chunk
         assert prefix_skip == 3 * bs
@@ -1206,9 +1200,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         alloc.cache_block_logit(last_block_hash, fake_logit)
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, len(prompt)
-        )
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3
         assert prefix_skip == 3 * bs
         assert eff_chunk == 0
@@ -1251,8 +1243,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         # Simulate add_request offset computation
         ctx._compute_and_store_mamba_offsets(
-            req2, 1, prefix_skip, chunk_length,
-            len(matched), [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
+            req2,
+            1,
+            prefix_skip,
+            chunk_length,
+            len(matched),
+            [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
             overall_req_blocks,
         )
 
@@ -1627,11 +1623,11 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         """Verify query lengths: decode=1, cached=0, fresh=bs."""
         ctx, bs, _, _ = self._setup_mixed_batch(model_type)
 
-        assert ctx.request_query_lengths[0].item() == 1   # req0: decode
-        assert ctx.request_query_lengths[1].item() == 0   # req1: cached
-        assert ctx.request_query_lengths[2].item() == bs   # req2: fresh
-        assert ctx.request_query_lengths[3].item() == 0   # req3: cached
-        assert ctx.request_query_lengths[4].item() == bs   # req4: fresh
+        assert ctx.request_query_lengths[0].item() == 1  # req0: decode
+        assert ctx.request_query_lengths[1].item() == 0  # req1: cached
+        assert ctx.request_query_lengths[2].item() == bs  # req2: fresh
+        assert ctx.request_query_lengths[3].item() == 0  # req3: cached
+        assert ctx.request_query_lengths[4].item() == bs  # req4: fresh
 
         # Total active tokens: 1 (decode) + 0 + bs + 0 + bs = 1 + 2*bs
         assert ctx.active_token_count == 1 + 2 * bs
@@ -1642,11 +1638,11 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         """Verify _cached_logit_hash is set for cached requests and -1 for others."""
         ctx, _, _, block_hash = self._setup_mixed_batch(model_type)
 
-        assert ctx._cached_logit_hash[0] == -1           # req0: decode
-        assert ctx._cached_logit_hash[1] == block_hash   # req1: cached
-        assert ctx._cached_logit_hash[2] == -1            # req2: fresh
-        assert ctx._cached_logit_hash[3] == block_hash   # req3: cached
-        assert ctx._cached_logit_hash[4] == -1            # req4: fresh
+        assert ctx._cached_logit_hash[0] == -1  # req0: decode
+        assert ctx._cached_logit_hash[1] == block_hash  # req1: cached
+        assert ctx._cached_logit_hash[2] == -1  # req2: fresh
+        assert ctx._cached_logit_hash[3] == block_hash  # req3: cached
+        assert ctx._cached_logit_hash[4] == -1  # req4: fresh
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
@@ -1666,11 +1662,11 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert result.shape == (5, vocab_size)
 
         # Non-zero requests: cumsum of [1, bs, bs] = [1, 1+bs, 1+2*bs], -1 = [0, bs, 2*bs]
-        assert torch.equal(result[0], logits[0, 0, :])           # req0 decode
-        assert torch.equal(result[1], fake_logit)                 # req1 cached
-        assert torch.equal(result[2], logits[0, bs, :])           # req2 fresh
-        assert torch.equal(result[3], fake_logit)                 # req3 cached
-        assert torch.equal(result[4], logits[0, 2 * bs, :])      # req4 fresh
+        assert torch.equal(result[0], logits[0, 0, :])  # req0 decode
+        assert torch.equal(result[1], fake_logit)  # req1 cached
+        assert torch.equal(result[2], logits[0, bs, :])  # req2 fresh
+        assert torch.equal(result[3], fake_logit)  # req3 cached
+        assert torch.equal(result[4], logits[0, 2 * bs, :])  # req4 fresh
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal

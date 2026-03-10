@@ -6,6 +6,7 @@ import unittest
 
 try:
     from megatron.core.ssm import ops as ssm_ops
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False

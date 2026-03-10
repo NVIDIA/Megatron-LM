@@ -127,9 +127,7 @@ class MambaMetadata:
                 )
 
             if padded_prefill_count > real_prefill_count:
-                self._batch_indices_prefill_buffer[
-                    real_prefill_count:padded_prefill_count
-                ] = -1
+                self._batch_indices_prefill_buffer[real_prefill_count:padded_prefill_count] = -1
 
             self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
 
@@ -172,7 +170,6 @@ class MambaMetadata:
             self._device_decode_prefill_buffer[0] = real_decode_count
             self._device_decode_prefill_buffer[1] = real_prefill_count
             self.device_decode_prefill = self._device_decode_prefill_buffer
-
 
     def allocate_slot(self) -> Optional[int]:
         """

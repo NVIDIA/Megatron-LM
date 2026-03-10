@@ -3,17 +3,13 @@
 # Adapted from vLLM project (Apache-2.0).
 
 import torch
+import triton
 from einops import rearrange
 from packaging import version
 
-import triton
-
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import (
-    _chunk_cumsum_fwd,
-    _chunk_state_fwd,
-)
+from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -48,7 +44,11 @@ def _mamba_chunk_scan_combined_fwd(
     seqlen, nheads, headdim = x.shape
     _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
-    assert B.shape == (seqlen, ngroups, dstate), f"B.shape={B.shape} != ({seqlen}, {ngroups}, {dstate})"
+    assert B.shape == (
+        seqlen,
+        ngroups,
+        dstate,
+    ), f"B.shape={B.shape} != ({seqlen}, {ngroups}, {dstate})"
     assert dt.shape == (seqlen, nheads)
     assert A.shape == (nheads,)
     assert C.shape == B.shape
@@ -62,9 +62,7 @@ def _mamba_chunk_scan_combined_fwd(
         B = B.contiguous()
     if C.stride(-1) != 1:
         C = C.contiguous()
-    if (
-        x.stride(-1) != 1 and x.stride(0) != 1
-    ):  # Either M or K dimension should be contiguous
+    if x.stride(-1) != 1 and x.stride(0) != 1:  # Either M or K dimension should be contiguous
         x = x.contiguous()
     if (
         z is not None and z.stride(-1) != 1 and z.stride(0) != 1
@@ -102,9 +100,7 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(
-        B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True
-    )
+    states = _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -116,9 +112,11 @@ def _mamba_chunk_scan_combined_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,  # (nheads, nchunks, chunk_size)
         cu_chunk_seqlens,
-        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None
-        else None,  # (batch, nheads, headdim*dstate)
+        initial_states=(
+            rearrange(initial_states, "... p n -> ... (p n)")
+            if initial_states is not None
+            else None
+        ),  # (batch, nheads, headdim*dstate)
         seq_idx=seq_idx,
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
     )

@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import unittest
+
 import torch
 
 try:
     from megatron.core.ssm.ops.ssd_bmm import _bmm_chunk_fwd
+
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
     HAVE_SSD_OPS = False
@@ -26,8 +28,12 @@ class TestBmmChunkFwd(unittest.TestCase):
 
     def test_bmm_chunk_fwd_shape(self):
         # a: (seqlen, ngroups, k), b: (seqlen, ngroups, k) -> out: (nchunks, ngroups, chunk_size, chunk_size)
-        a = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        b = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        a = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        b = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
 
         out = _bmm_chunk_fwd(
             a, b, self.chunk_size, self.cu_chunk_seqlens, causal=True, output_dtype=torch.float32
@@ -39,8 +45,12 @@ class TestBmmChunkFwd(unittest.TestCase):
 
     def test_bmm_chunk_fwd_vs_torch_per_chunk(self):
         """Compare first chunk with explicit C^T @ B for that chunk."""
-        a = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        b = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        a = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        b = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
 
         out = _bmm_chunk_fwd(
             a, b, self.chunk_size, self.cu_chunk_seqlens, causal=False, output_dtype=torch.float32
@@ -50,14 +60,18 @@ class TestBmmChunkFwd(unittest.TestCase):
         # Relaxed tolerances: Triton block-wise reduction order can differ from torch;
         # atol is the main check (max abs diff was ~0.008 in practice).
         for g in range(self.ngroups):
-            a_chunk = a[0:16, g, :].contiguous()   # (16, dstate)
-            b_chunk = b[0:16, g, :].contiguous()   # (16, dstate)
+            a_chunk = a[0:16, g, :].contiguous()  # (16, dstate)
+            b_chunk = b[0:16, g, :].contiguous()  # (16, dstate)
             expected = torch.mm(a_chunk, b_chunk.T)  # (16, 16)
             torch.testing.assert_close(out[0, g], expected, rtol=1.0, atol=0.02)
 
     def test_bmm_chunk_fwd_causal_vs_non_causal_shape(self):
-        a = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
-        b = torch.randn(self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32)
+        a = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
+        b = torch.randn(
+            self.seqlen, self.ngroups, self.dstate, device=self.device, dtype=torch.float32
+        )
 
         out_causal = _bmm_chunk_fwd(a, b, self.chunk_size, self.cu_chunk_seqlens, causal=True)
         out_noncausal = _bmm_chunk_fwd(a, b, self.chunk_size, self.cu_chunk_seqlens, causal=False)

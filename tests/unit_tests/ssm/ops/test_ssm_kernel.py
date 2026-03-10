@@ -1,16 +1,19 @@
+import math
 import unittest
 from unittest.mock import MagicMock
+
 import torch
 import torch.nn as nn
-import math
 
 # Assume the provided class is in mamba_mixer.py
 from megatron.core.ssm.mamba_mixer import MambaMixer
+
 
 class MockContextParallel:
     """
     Mocks the MambaContextParallel helper.
     """
+
     def __init__(self, d_inner, ngroups, nheads, d_state, device):
         self.d_inner_local_tpcp = d_inner
         self.ngroups_local_tpcp = ngroups
@@ -28,20 +31,34 @@ class MockContextParallel:
         self.conv1d_layer = nn.Conv1d(
             in_channels=self.conv1d_weight.shape[0],
             out_channels=self.conv1d_weight.shape[0],
-            kernel_size=4, groups=self.conv1d_weight.shape[0], padding=3
+            kernel_size=4,
+            groups=self.conv1d_weight.shape[0],
+            padding=3,
         ).to(device)
 
-    def get_A_log(self): return self.A_log
-    def get_D(self): return self.D
-    def get_dt_bias(self): return self.dt_bias
-    def get_conv1d_weight(self): return self.conv1d_weight
-    def get_conv1d_bias(self): return self.conv1d_bias
+    def get_A_log(self):
+        return self.A_log
+
+    def get_D(self):
+        return self.D
+
+    def get_dt_bias(self):
+        return self.dt_bias
+
+    def get_conv1d_weight(self):
+        return self.conv1d_weight
+
+    def get_conv1d_bias(self):
+        return self.conv1d_bias
 
     def conv1d(self, x):
         return self.conv1d_layer(x)
 
-    def pre_conv_ssm(self, x): return x
-    def post_conv_ssm(self, x): return x
+    def pre_conv_ssm(self, x):
+        return x
+
+    def post_conv_ssm(self, x):
+        return x
 
 
 class TestMambaDynamicInference(unittest.TestCase):
@@ -78,7 +95,7 @@ class TestMambaDynamicInference(unittest.TestCase):
             ngroups=self.ngroups,
             nheads=self.nheads,
             d_state=self.d_state,
-            device=self.device
+            device=self.device,
         )
 
         # --- Setup for ssm_decode ---
@@ -90,9 +107,13 @@ class TestMambaDynamicInference(unittest.TestCase):
         # Create real parameters for ssm_decode to access
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.mixer.conv1d = nn.Conv1d(
-            in_channels=conv_dim, out_channels=conv_dim,
-            kernel_size=self.d_conv, groups=conv_dim, padding=self.d_conv - 1,
-            bias=True, device=self.device
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=self.d_conv,
+            groups=conv_dim,
+            padding=self.d_conv - 1,
+            bias=True,
+            device=self.device,
         )
         self.mixer.dt_bias = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
@@ -120,7 +141,9 @@ class TestMambaDynamicInference(unittest.TestCase):
         seq_idx[:real_seq_len] = 0
         seq_idx = seq_idx.unsqueeze(0)
 
-        cu_seqlens = torch.full((num_requests + 1,), real_seq_len, dtype=torch.int32, device=self.device)
+        cu_seqlens = torch.full(
+            (num_requests + 1,), real_seq_len, dtype=torch.int32, device=self.device
+        )
         cu_seqlens[0] = 0
 
         batch_indices = torch.full((num_requests,), -1, dtype=torch.long, device=self.device)
@@ -129,32 +152,44 @@ class TestMambaDynamicInference(unittest.TestCase):
         # States
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         conv_state = torch.zeros(num_requests, conv_dim, self.d_conv, device=self.device)
-        ssm_state = torch.zeros(num_requests, self.nheads, self.headdim, self.d_state, device=self.device)
+        ssm_state = torch.zeros(
+            num_requests, self.nheads, self.headdim, self.d_state, device=self.device
+        )
 
         # Run
         self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
         output = self.mixer._ssm_prefill(
-            zxBCdt=zxBCdt, conv_state=conv_state, ssm_state=ssm_state,
-            seq_idx=seq_idx, cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices, return_varlen_states=True
+            zxBCdt=zxBCdt,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            batch_indices=batch_indices,
+            return_varlen_states=True,
         )
 
         # Assertions
         real_output = output[0:real_seq_len]
         padding_output = output[real_seq_len:]
 
-        self.assertTrue(torch.allclose(padding_output, torch.zeros_like(padding_output)),
-                        "Output for padding tokens should be 0")
+        self.assertTrue(
+            torch.allclose(padding_output, torch.zeros_like(padding_output)),
+            "Output for padding tokens should be 0",
+        )
         self.assertTrue(conv_state[0].abs().max() > 0, "Real request conv_state should be modified")
 
         # Verify isolation of padding states
         remaining_conv_states = conv_state[1:num_requests]
         remaining_ssm_states = ssm_state[1:num_requests]
 
-        self.assertTrue(torch.allclose(remaining_conv_states, torch.zeros_like(remaining_conv_states)),
-                        "Conv states for padding requests (indices 1 to N-1) should remain 0")
-        self.assertTrue(torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
-                        "SSM states for padding requests (indices 1 to N-1) should remain 0")
+        self.assertTrue(
+            torch.allclose(remaining_conv_states, torch.zeros_like(remaining_conv_states)),
+            "Conv states for padding requests (indices 1 to N-1) should remain 0",
+        )
+        self.assertTrue(
+            torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
+            "SSM states for padding requests (indices 1 to N-1) should remain 0",
+        )
         print("Prefill Test Passed!")
 
 
