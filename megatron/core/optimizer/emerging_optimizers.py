@@ -59,8 +59,8 @@ class EmergingOptimizerEntry:
     """
 
     optimizer_cls: type
-    config_to_kwargs: Callable
     init_state_fn: Callable
+    config_to_kwargs: Callable | None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -170,7 +170,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             params,
             lr,
             momentum,
-            use_nesterov=nesterov,
+            nesterov=nesterov,
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
@@ -232,9 +232,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def _eopt_init_state_fn(opt, config=None):
     """Initialize emerging optimizer state for torch_dist checkpoint format."""
     for group in opt.param_groups:
-        for p in group['params']:
-            if len(opt.state[p]) == 0:
-                opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
+        opt._init_group(group)
 
 
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
@@ -303,6 +301,7 @@ if HAVE_EMERGING_OPTIMIZERS:
         _EMERGING_OPTIMIZERS[eopt_name] = EmergingOptimizerEntry(
             optimizer_cls=registry.get_optimizer_cls(eopt_name),
             init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=None,
             default_param_overrides={
                 ParamKey(
                     predicate=ParamPredicate(
