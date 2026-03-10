@@ -1,17 +1,18 @@
 ENV_VARS:
+  NCCL_IB_SL: 1
+  NCCL_IB_TIMEOUT: 19
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  NCCL_P2P_NET_CHUNKSIZE: 2097152
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   NON_DETERMINSTIC_RESULTS: 1
-  NVTE_NORM_FWD_USE_CUDNN: 1
-  NVTE_NORM_BWD_USE_CUDNN: 1
-  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-  USE_MNNVL: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
-  --tensor-model-parallel-size: 4
-  --pipeline-model-parallel-size: 2
+  --tensor-model-parallel-size: 8
+  --pipeline-model-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
@@ -38,6 +39,7 @@ MODEL_ARGS:
   --apply-layernorm-1p: true
   --untie-embeddings-and-output-weights: true
   --position-embedding-type: rope
+  --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 0.5
   --squared-relu: true
   --num-layers: 32
