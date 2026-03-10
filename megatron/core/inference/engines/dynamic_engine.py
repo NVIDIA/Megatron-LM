@@ -262,6 +262,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -1510,6 +1511,37 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
+        # Stamp tokens produced this step with the current generation epoch.
+        # This covers both still-active and just-finished/failed requests.
+        if self._generation_epoch is not None and step_result is not None:
+            it = self._generation_epoch
+            records = (
+                [self.requests[rid].record for rid in active_request_ids]
+                + finished_request_records
+            )
+            for record in records:
+                request = record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                for attr in ('policy_epoch', 'kv_cache_epoch'):
+                    tensor = getattr(request, attr)
+                    if tensor is None:
+                        setattr(
+                            request, attr,
+                            torch.full((total,), it, dtype=torch.int32, device='cpu'),
+                        )
+                    elif len(tensor) < total:
+                        setattr(
+                            request, attr,
+                            torch.cat((
+                                tensor,
+                                torch.full(
+                                    (total - len(tensor),), it,
+                                    dtype=tensor.dtype, device=tensor.device,
+                                ),
+                            ), dim=0),
+                        )
+
         range_pop()
 
         # Detokenize all finished requests if not using
@@ -1765,9 +1797,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
 
-        # First pass: add all requests and detect staleness increments.
+        # First pass: add requests and update generation epoch.
         # Control signals are queued for the second pass.
-        has_staleness_increment = False
+        new_generation_epoch = None
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1777,16 +1809,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
-            elif header == Headers.INCREMENT_STALENESS:
-                has_staleness_increment = True
+            elif header == Headers.SET_GENERATION_EPOCH:
+                new_generation_epoch = data[1]
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
 
-        if has_staleness_increment:
-            waiting = set(self.waiting_request_ids)
-            for request_id, entry in self.requests.items():
-                entry.record.increment_staleness(policy_only=request_id in waiting)
+        if new_generation_epoch is not None:
+            self._generation_epoch = new_generation_epoch
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

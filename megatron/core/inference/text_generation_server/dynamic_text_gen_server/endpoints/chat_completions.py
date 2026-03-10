@@ -250,8 +250,8 @@ try:
                 ),
                 "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else finish_reason,
             }
-            choice_data["policy_staleness"] = result["policy_staleness"]
-            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )

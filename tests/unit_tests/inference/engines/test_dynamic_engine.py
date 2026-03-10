@@ -1869,7 +1869,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
     @torch.inference_mode()
     def test_staleness_tracking(self, use_checkpoint):
-        """Test that staleness is correct tracked.
+        """Test that training-iteration stamps are correctly tracked.
         The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
         """
         PROMPT_LEN = 8
@@ -1902,26 +1902,40 @@ class TestDynamicInferenceEngine:
                 )
             )
 
+        # Steps without a generation epoch set — no stamps.
+        engine.step_modern()
+        for entry in engine.requests.values():
+            assert entry.record[-1].policy_epoch is None
+            assert entry.record[-1].kv_cache_epoch is None
+
+        # Generation epoch 0: stamps all tokens produced so far and going forward.
+        engine._generation_epoch = 0
+        for _ in range(2):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+            assert (ps == 0).all()
+            assert (ks == 0).all()
+
+        # Generation epoch 1: new tokens get 1, existing keep 0.
+        engine._generation_epoch = 1
         for _ in range(3):
             engine.step_modern()
 
         for entry in engine.requests.values():
-            assert len(entry.record[-1].generated_tokens) == 3
-            assert entry.record[-1].policy_staleness is None
-            assert entry.record[-1].kv_cache_staleness is None
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
+            assert (ps[: PROMPT_LEN + 3] == 0).all()
+            assert (ps[PROMPT_LEN + 3 :] == 1).all()
+            assert (ks[: PROMPT_LEN + 3] == 0).all()
+            assert (ks[PROMPT_LEN + 3 :] == 1).all()
 
-        # Increment staleness.
-        for entry in engine.requests.values():
-            entry.record.increment_staleness()
-
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_staleness
-            ks = entry.record[-1].kv_cache_staleness
-            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-            assert (ps == 1).all()
-            assert (ks == 1).all()
-
-        # Simulate RECOMPUTE
+        # Simulate RECOMPUTE — checkpoint clears kv_cache so _stamp_records
+        # will recreate it fresh when the request next generates tokens.
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
@@ -1931,41 +1945,10 @@ class TestDynamicInferenceEngine:
                 entry.record[-1].event_add_engine = event_add_engine
 
             for entry in engine.requests.values():
-                ps = entry.record[-1].policy_staleness
-                ks = entry.record[-1].kv_cache_staleness
-                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-                assert (ps == 1).all()
-                assert (ks == 0).all()
+                assert entry.record[-1].kv_cache_epoch is None
 
-        for _ in range(3):
-            engine.step_modern()
-
-        # Increment staleness.
-        for entry in engine.requests.values():
-            entry.record.increment_staleness()
-
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_staleness
-            ks = entry.record[-1].kv_cache_staleness
-            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
-            assert (ps[: PROMPT_LEN + 3] == 2).all()
-            assert (ps[PROMPT_LEN + 3 :] == 1).all()
-            if use_checkpoint:
-                assert (ks == 1).all()
-            else:
-                assert (ks[: PROMPT_LEN + 3] == 2).all()
-                assert (ks[PROMPT_LEN + 3 :] == 1).all()
-
-        if use_checkpoint:
-            for entry in engine.requests.values():
-                old_req = entry.record[-1]
-                event_add_engine = old_req.event_add_engine
-                entry.record.checkpoint()
-                entry.record[-1].event_add_engine = event_add_engine
-
-            for entry in engine.requests.values():
-                ks = entry.record[-1].kv_cache_staleness
-                assert (ks == 0).all()
+        # Generation epoch 2: generate remaining tokens.
+        engine._generation_epoch = 2
 
         finished_records = []
         while engine.has_unfinished_requests():
@@ -1975,27 +1958,25 @@ class TestDynamicInferenceEngine:
         for record in finished_records:
             merged = record.merge()
 
-            assert merged.policy_staleness is not None
-            assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
-            assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
-            assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-            assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
+            assert merged.policy_epoch is not None
+            assert merged.policy_epoch.shape == (PROMPT_LEN + NUM_TOKENS,)
+            assert (merged.policy_epoch[: PROMPT_LEN + 3] == 0).all()
+            assert (merged.policy_epoch[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+            assert (merged.policy_epoch[PROMPT_LEN + 6 :] == 2).all()
 
-            assert merged.kv_cache_staleness is not None
-            assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            assert merged.kv_cache_epoch is not None
+            assert merged.kv_cache_epoch.shape == (PROMPT_LEN + NUM_TOKENS,)
             if use_checkpoint:
-                assert (merged.kv_cache_staleness == 0).all()
+                # KV cache was cleared by checkpoint; _stamp_records recreated
+                # it at epoch 2 (when the first post-checkpoint step ran).
+                assert (merged.kv_cache_epoch == 2).all()
             else:
-                assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
-                assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-                assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
+                assert (merged.kv_cache_epoch[: PROMPT_LEN + 3] == 0).all()
+                assert (merged.kv_cache_epoch[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+                assert (merged.kv_cache_epoch[PROMPT_LEN + 6 :] == 2).all()
 
-        # Verify evicted requests don't have their policy staleness incremented.
+        # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]
         record.checkpoint()
-        pre_ps = record[-1].policy_staleness.clone()
-
-        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
-
-        assert (record[-1].policy_staleness == pre_ps + 1).all()
-        assert (record[-1].kv_cache_staleness == 0).all()
+        assert (record[-1].policy_epoch == merged.policy_epoch).all()
+        assert record[-1].kv_cache_epoch is None
