@@ -69,6 +69,7 @@ MODEL_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --swiglu
+    --normalization RMSNorm
     --init-method-std 0.0134
     --attention-backend fused
     --apply-layernorm-1p 

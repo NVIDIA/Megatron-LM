@@ -3,7 +3,6 @@
 import re
 import traceback
 
-from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 try:
@@ -25,8 +24,6 @@ class MathAgent(RewardOnlyAgent):
     def __init__(self,
         format_reward: float = 0.0,
         answer_format: str = "tagged",
-        assistant_suffix: str = "Assistant: Let me solve this step by step.\n<think>",
-        chat_mode: bool = False,
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
         **kwargs):
@@ -36,9 +33,6 @@ class MathAgent(RewardOnlyAgent):
                 even if the answer is incorrect or is missing the end-of-text token.
             answer_format (str): Which answer format is expected: "tagged" for <answer> tags,
                 or "boxed" for \boxed{} LaTeX formatting.
-            assistant_suffix (str): The suffix string included in the assistant's response, typically to
-                guide the assistant's output format and "persona". For example, "Let me solve this step by step."
-            chat_mode (bool): If True, agent operates in a chat (conversational) context.
             negative_reward (float): Reward assigned for a clearly incorrect or unparseable answer.
             partial_end_reward (float): Reward when the answer is correct but an expected end token is not matched exactly.
             **kwargs: Additional arguments for the base RewardOnlyAgent.
@@ -49,8 +43,6 @@ class MathAgent(RewardOnlyAgent):
 
         self.format_reward = format_reward
         self.answer_format = answer_format
-        self.assistant_suffix = assistant_suffix
-        self.chat_mode = chat_mode
         self.negative_reward = negative_reward
         self.partial_end_reward = partial_end_reward
 
@@ -61,7 +53,7 @@ class MathAgent(RewardOnlyAgent):
         """
         # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)
         matched_format = None
-        end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>"]
+        end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>", "<|eot_id|>"]
 
         # Only an answer immediately followed by a known end token yields 1.0 reward.
         answer_tag_pattern = r'<answer>(.*?)</answer>'
@@ -134,12 +126,6 @@ class MathAgent(RewardOnlyAgent):
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 
-        if self.chat_mode:
-            prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
-        else:
-            prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
-    The question will be a word math problem. Show your work in <think> </think> tags. 
-    {answer_format}
-    User: {kwargs[problem_key]}
-    {self.assistant_suffix}"""
+        prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
+
         return prefix

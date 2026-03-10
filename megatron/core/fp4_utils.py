@@ -88,83 +88,6 @@ def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("FP4 dequantization requires Transformer Engine >= 2.7.0.dev0")
 
 
-def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
-    """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
-    if len(shape) == 0:
-        return shape
-    assert shape[-1] % 2 == 0, "NVFP4 requires inner dimension divisible by 2"
-    packed = list(shape)
-    packed[-1] = packed[-1] // 2
-    return torch.Size(packed)
-
-
-def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: torch.Tensor) -> None:
-    """Replace NVFP4 tensor's rowwise raw data with a new uint8 storage view.
-
-    Copies existing bytes into the new buffer, then swaps the underlying pointer.
-    """
-    if not is_nvfp4tensor(fp4_tensor):
-        raise ValueError("modify_nvfp4_rowwise_storage expects an NVFP4 tensor")
-    # Access TE's internal storage fields
-    old_rowwise = getattr(fp4_tensor, "_rowwise_data", None)
-    if old_rowwise is None:
-        raise RuntimeError("NVFP4 tensor is missing rowwise data to replace")
-    assert (
-        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
-    ), "Rowwise NVFP4 storage must be uint8"
-    # Preserve existing values and then swap storage
-    new_rowwise_data.detach().copy_(old_rowwise)
-    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
-
-def quantize_nvfp4_param_shard(
-    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
-):
-    """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
-
-    This function wraps Transformer Engine's cast_master_weights_to_nvfp4, which handles:
-    - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
-    - Partial casting with nibble-accurate updates
-    - Coordinated amax reduction across data parallel group
-
-    Args:
-        model_params: List of NVFP4 model parameters (NVFP4Tensor).
-        main_params: List of FP32 master weights (shards).
-        start_offsets: List of starting offsets in the full model weight for each shard.
-        data_parallel_group: Distributed group for amax reduction.
-        fsdp_shard_model_params: Optional list of FSDP sharded model params.
-    """
-    if not HAVE_TE_FP4_TENSOR_CLASS:
-        raise RuntimeError(
-            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
-        )
-
-    try:
-        from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4
-    except ImportError:
-        raise RuntimeError(
-            "cast_master_weights_to_nvfp4 not available in this Transformer Engine version"
-        )
-
-    if len(model_params) == 0:
-        return
-
-    # # Debug: print what we're passing to cast_master_weights_to_nvfp4
-    # print(f"\n[FP4_UTILS DEBUG] quantize_nvfp4_param_shard called with {len(model_params)} params")
-    # for i, (mp, main_p, offset) in enumerate(zip(model_params, main_params, start_offsets)):
-    #     mp_shape = tuple(mp.shape) if hasattr(mp, 'shape') else 'N/A'
-    #     main_shape = tuple(main_p.shape) if main_p is not None else 'None'
-    #     print(f"[FP4_UTILS DEBUG]   [{i}] model_param shape={mp_shape}, main_param shape={main_shape}, offset={offset}")
-    #     if i == 0:  # Just show first param details
-    #         print(f"[FP4_UTILS DEBUG]   [{i}] model_param type={type(mp).__name__}")
-    #         if hasattr(mp, '_rowwise_data'):
-    #             print(f"[FP4_UTILS DEBUG]   [{i}] _rowwise_data shape={mp._rowwise_data.shape}")
-
-    args = [model_params, main_params, start_offsets, data_parallel_group]
-    if fsdp_shard_model_params is not None:
-        args.append(fsdp_shard_model_params)
-
-    cast_master_weights_to_nvfp4(*args)
-
 if HAVE_TE:
     from megatron.core import parallel_state
 
@@ -173,8 +96,9 @@ if HAVE_TE:
         if is_te_min_version("2.7.0.dev0"):
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
-                    # Disable RHT and stochastic rounding for debugging
-                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
+                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(
+                        fp8_dpa=config.fp8_dot_product_attention
+                    )
                 except AttributeError:
                     raise ValueError(
                         """NVFP4BlockScaling recipe is not available in this version of 
@@ -234,10 +158,6 @@ if HAVE_TE:
                     in inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
                     context_args["recipe"] = fp4_recipe
-                if "preserve_high_precision_init_val" in (
-                    inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
-                ):
-                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp4_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
         return fp4_context

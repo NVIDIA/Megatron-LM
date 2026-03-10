@@ -35,7 +35,7 @@ class BlendedMegatronDatasetConfig:
     """
 
     multiple_validation_sets: Optional[bool] = None
-    """Whether the validation split should be treated as multiple seperate datasets."""
+    """Whether the validation split should be treated as multiple separated datasets."""
 
     full_validation: Optional[bool] = None
     """Whether to run a full epoch of validation each time validation occurs."""

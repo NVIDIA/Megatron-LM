@@ -163,6 +163,59 @@ def test_bucket_sizes(
     Utils.destroy_model_parallel()
 
 
+def test_param_to_index_alignment_with_padding():
+    """Ensure bucket-local param offsets honor padding when DistOpt pads params."""
+    Utils.initialize_model_parallel()
+
+    # With input_dim=4, output_dim=4:
+    #   - weight: 4*4 = 16 elements
+    #   - bias: 4 elements
+    # Since 16 % 64 != 0, the bias must be padded away from the weight,
+    # making padding observable.
+    input_dim = 4
+    output_dim = 4
+    model, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_layers=1,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,  # single bucket
+        use_distributed_optimizer=True,  # enforces 64-element alignment
+        overlap_grad_reduce=True,
+        average_in_collective=False,
+    )
+
+    bucket = param_and_grad_buffer.buckets[0]
+    naive_offset = 0
+    padding_observed = False
+
+    for param in bucket.params_list:
+        global_start, global_end, _ = param_and_grad_buffer.param_index_map[param]
+        expected_local_start = global_start - bucket.offset
+        expected_local_end = global_end - bucket.offset
+        local_start, local_end = bucket.param_to_index[param]
+
+        # param_to_index should match the padded offsets used in the global buffer.
+        assert (local_start, local_end) == (expected_local_start, expected_local_end)
+
+        # At least one param should have been padded relative to naive packing.
+        if local_start != naive_offset:
+            padding_observed = True
+        naive_offset = local_end
+
+        # Verify the slice retrieved via param_to_index matches param.data view.
+        param_slice = bucket.param_data.view(-1)[local_start:local_end]
+        torch.testing.assert_close(param_slice, param.data.view(-1))
+
+    assert padding_observed, (
+        "Expected padding to be applied between params. "
+        "Ensure model dimensions are chosen such that param sizes are not multiples of 64."
+    )
+
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
@@ -320,3 +373,94 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
             ), "Expected all_reduce NOT to be called when force_all_reduce=False"
 
     Utils.destroy_model_parallel()
+
+
+class TestFreeOverlapBuffers:
+    """Tests for free_overlap_buffers() which releases GPU memory before async checkpoint saves."""
+
+    @staticmethod
+    def _make_model():
+        """Create a DDP-wrapped model with overlap_param_gather enabled."""
+        Utils.initialize_model_parallel()
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=None,
+        )
+        module = TestModel(
+            input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
+        ).bfloat16()
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=module,
+        )
+        return model
+
+    def test_bucket_group_clears_buffers(self):
+        """free_overlap_buffers on a bucket group should None-out per-bucket layerwise buffers."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            # Simulate buffers that would be allocated by start_param_sync.
+            for bucket in bg.buckets:
+                bucket.layerwise_gather_list = [torch.empty(8), torch.empty(8)]
+                bucket._layerwise_src_buffer = torch.empty(16)
+
+            bg.free_overlap_buffers()
+
+            for bucket in bg.buckets:
+                assert (
+                    bucket.layerwise_gather_list is None
+                ), "layerwise_gather_list should be None after free_overlap_buffers"
+                assert (
+                    bucket._layerwise_src_buffer is None
+                ), "_layerwise_src_buffer should be None after free_overlap_buffers"
+
+        Utils.destroy_model_parallel()
+
+    def test_bucket_group_waits_on_pending_handle(self):
+        """free_overlap_buffers should wait() on any pending param_gather_handle."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            mock_handle = mock.MagicMock()
+            bg.param_gather_handle = mock_handle
+
+            bg.free_overlap_buffers()
+
+            mock_handle.wait.assert_called_once()
+            assert (
+                bg.param_gather_handle is None
+            ), "param_gather_handle should be None after free_overlap_buffers"
+
+        Utils.destroy_model_parallel()
+
+    def test_bucket_group_noop_when_no_buffers(self):
+        """free_overlap_buffers should be safe to call when no buffers are allocated."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            assert bg.param_gather_handle is None
+            for bucket in bg.buckets:
+                assert bucket.layerwise_gather_list is None
+                assert bucket._layerwise_src_buffer is None
+
+            # Should not raise.
+            bg.free_overlap_buffers()
+
+        Utils.destroy_model_parallel()
+
+    def test_ddp_free_overlap_buffers_delegates(self):
+        """DDP.free_overlap_buffers should call free_overlap_buffers on all bucket groups."""
+        model = self._make_model()
+
+        with mock.patch.object(type(model.bucket_groups[0]), 'free_overlap_buffers') as mock_free:
+            model.free_overlap_buffers()
+            assert mock_free.call_count == len(
+                model.bucket_groups + model.expert_parallel_bucket_groups
+            ), "free_overlap_buffers should be called on every bucket group"
+
+        Utils.destroy_model_parallel()

@@ -3,6 +3,7 @@
 import inspect
 import os
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -121,7 +123,6 @@ def test_get_mlp_module_spec_interface():
         "num_experts": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "moe_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "fp8": inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        "moe_use_legacy_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "use_te_op_fuser": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
@@ -130,7 +131,6 @@ def test_get_mlp_module_spec_interface():
         "num_experts": None,
         "moe_grouped_gemm": False,
         "fp8": None,
-        "moe_use_legacy_grouped_gemm": False,
         "use_te_op_fuser": False,
     }
 
@@ -392,14 +392,18 @@ class TestGPTWithDynamicInference:
         config = self.gpt_model.config
 
         inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_sequence_length=self.gpt_model.module.max_sequence_length,
-            buffer_size_gb=1.0,
-            block_size_tokens=256,
-            materialize_only_last_token_logits=False,
+            model_config=TransformerConfig(
+                params_dtype=config.params_dtype,
+                num_layers=config.num_layers,
+                kv_channels=config.hidden_size // config.num_attention_heads,
+                num_attention_heads=config.num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=self.gpt_model.module.max_sequence_length,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+            ),
         )
 
         # Add a request with 10 tokens. Since 10 is not a multiple of 64,
@@ -443,3 +447,41 @@ class TestGPTWithDynamicInference:
 
         # Assert that all padding logits are zero.
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+def test_get_transformer_layer_spec_forwards_use_te_activation_func():
+    """Test that _get_transformer_layer_spec forwards use_te_activation_func.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/2770
+    The --use-te-activation-func flag was silently ignored for non-MoE GPT
+    models because _get_transformer_layer_spec did not forward the parameter
+    to get_gpt_layer_with_transformer_engine_spec.
+    """
+    mock_config = MagicMock()
+    mock_config.use_te_activation_func = True
+    mock_config.use_kitchen = False
+    mock_config.use_kitchen_attention = False
+    mock_config.kitchen_attention_backend = "sdpa"
+
+    mock_args = MagicMock()
+    mock_args.num_experts = None
+    mock_args.moe_grouped_gemm = False
+    mock_args.qk_layernorm = False
+    mock_args.multi_latent_attention = False
+    mock_args.experimental_attention_variant = None
+    mock_args.moe_use_legacy_grouped_gemm = False
+    mock_args.qk_l2_norm = False
+
+    with (
+        patch('gpt_builders.get_args', return_value=mock_args),
+        patch('gpt_builders.get_gpt_layer_with_transformer_engine_spec') as mock_spec_fn,
+    ):
+        from gpt_builders import _get_transformer_layer_spec
+
+        _get_transformer_layer_spec(use_te=True, config=mock_config)
+
+        mock_spec_fn.assert_called_once()
+        _, call_kwargs = mock_spec_fn.call_args
+        assert (
+            call_kwargs.get('use_te_activation_func') is True
+        ), "use_te_activation_func must be forwarded from config"

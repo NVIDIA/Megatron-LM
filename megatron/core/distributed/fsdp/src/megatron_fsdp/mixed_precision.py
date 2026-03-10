@@ -14,6 +14,7 @@
 
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import List, Optional, Tuple
 import enum
@@ -550,26 +551,35 @@ def _meta_device_param_dtype(
 
 def _dtype_size(dtype: torch.dtype) -> int:
     """
-    Get the size of the dtype.
+    Get the size of the dtype. Note that many data-types un-common to ML
+    or not supported by NCCL communication (e.g. CFloat) are listed here
+    for mixed-precision coverage and to avoid allocating a dummy Tensor.
+
     Args:
         dtype (torch.dtype): The dtype to get the size of.
     Returns:
         int: The size of the dtype.
     """
-    if dtype == torch.float16 or dtype == torch.bfloat16:
+    if dtype == torch.float16 or dtype == torch.bfloat16 or dtype == torch.int16:
         return 2
-    elif dtype == torch.float32 or dtype == torch.int32:
+    elif dtype == torch.float32 or dtype == torch.int32 or dtype == torch.complex32:
         return 4
-    elif dtype == torch.int64:
+    elif dtype == torch.float64 or dtype == torch.int64 or dtype == torch.complex64:
         return 8
-    elif dtype == torch.uint8:
+    elif dtype == torch.uint8 or dtype == torch.int8:
         return 1
     elif dtype in ["nvfp8", "nvfp8_t"]:
         return 1
     elif dtype == "nvfp4":
         return 0.5
     else:
-        raise ValueError(f"Unsupported dtype: {dtype}")
+        try:
+            # Allocate an empty Tensor on-the-fly to check the size.
+            # Non-ideal fall-back option before sizing the new dtype.
+            # Why does torch.dtype not support this without alloc?
+            return torch.empty((), dtype=dtype).element_size()
+        except:
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def get_quantized_model_init_context_cls():
@@ -582,3 +592,33 @@ def get_quantized_model_init_context_cls():
             f"Verify TransformerEngine is installed (TE_INSTALLED={HAVE_TE})."
         )
     return QUANTIZED_MODEL_INIT_CLASS
+
+
+@dataclass(frozen=True)
+class MixedPrecisionPolicy:
+    """Megatron-FSDP Mixed Precision Dataclass"""
+
+    main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    main_grads_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to torch.float32.
+    """
+
+    grad_comm_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support
+      FP32 reduction even though we have BF16 input and output communication buffers.
+      If set to None, the main_grads_dtype is used. Defaults to torch.float32. If using
+      `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating
+      `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.
+    """

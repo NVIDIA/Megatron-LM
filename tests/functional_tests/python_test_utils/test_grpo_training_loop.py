@@ -84,9 +84,8 @@ def test_grpo_training_loop(
     with open(model_config_path, 'r') as f:
         model_config = yaml.safe_load(f)
         metrics = model_config["METRICS"]
-        if "THROUGHPUT_TEST_PARAMS" in model_config:
-            throughput_test_params = model_config["THROUGHPUT_TEST_PARAMS"]
-            start_step = throughput_test_params["--start_step"]
+        if "ENV_VARS" in model_config and "THROUGHPUT_START_STEP" in model_config["ENV_VARS"]:
+            start_step = model_config["ENV_VARS"]["THROUGHPUT_START_STEP"]
         else:
             start_step = 1
 
