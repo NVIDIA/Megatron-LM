@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     grouped_gemm_batch_invariant,
     is_batch_invariant_mode_enabled,
@@ -399,9 +400,9 @@ class TestInferenceGroupedMLPBatchInvariant:
             TEColumnParallelGroupedLinear,
             TERowParallelGroupedLinear,
         )
+        from megatron.core.process_groups_config import ProcessGroupCollection
         from megatron.core.transformer.mlp import MLPSubmodules
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-        from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         self.num_experts = 4
@@ -431,9 +432,16 @@ class TestInferenceGroupedMLPBatchInvariant:
             linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )
 
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'ep', 'expt_tp', 'expt_dp']
+        )
+
         self.mlp = (
             InferenceGroupedMLP(
-                num_local_experts=self.num_experts, config=self.config, submodules=submodules
+                num_local_experts=self.num_experts,
+                config=self.config,
+                submodules=submodules,
+                pg_collection=pg_collection,
             )
             .cuda()
             .eval()
@@ -557,3 +565,473 @@ class TestInferenceGroupedMLPBatchInvariant:
         assert torch.equal(
             out_direct, out_dispatch
         ), "forward() dispatch did not use batch-invariant path"
+
+
+# ============================================================================
+# Expert parallel integration tests (multi-GPU)
+# ============================================================================
+
+
+def _build_inference_grouped_mlp(num_moe_experts, hidden_size, dtype, pg_collection):
+    """Helper to build an InferenceGroupedMLP with the given config and process groups."""
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
+    from megatron.core.transformer.mlp import MLPSubmodules
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    num_local_experts = num_moe_experts // ep_size
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        num_moe_experts=num_moe_experts,
+        expert_model_parallel_size=ep_size,
+        use_cpu_initialization=False,
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=False,
+        bf16=True,
+        params_dtype=dtype,
+        moe_router_load_balancing_type="sinkhorn",
+        moe_router_topk=1,
+        moe_grouped_gemm=True,
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+    )
+
+    submodules = MLPSubmodules(
+        linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+    )
+
+    mlp = (
+        InferenceGroupedMLP(
+            num_local_experts=num_local_experts,
+            config=config,
+            submodules=submodules,
+            pg_collection=pg_collection,
+        )
+        .cuda()
+        .eval()
+    )
+    return mlp, config, num_local_experts
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_te_min_version("1.9.0.dev0")),
+    reason="Requires CUDA and TE >= 1.9.0.dev0 for TEGroupedLinear",
+)
+class TestInferenceGroupedMLPExpertParallel:
+    """Test the batch-invariant path with expert parallelism (EP > 1).
+
+    These tests require multiple GPUs and validate that each EP rank
+    independently computes correct batch-invariant results for its
+    local subset of experts.
+    """
+
+    def setup_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, expert_model_parallel_size=2
+        )
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(42)
+
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+
+        self.pg_collection = get_default_pg_collection()
+        self.num_moe_experts = 8
+        self.hidden_size = 128
+        self.dtype = torch.bfloat16
+        self.ep_size = parallel_state.get_expert_model_parallel_world_size()
+        self.ep_rank = parallel_state.get_expert_model_parallel_rank()
+
+        self.mlp, self.config, self.num_local_experts = _build_inference_grouped_mlp(
+            self.num_moe_experts, self.hidden_size, self.dtype, self.pg_collection
+        )
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_ep_local_expert_correctness(self):
+        """Each EP rank's batch-invariant forward should match the TE forward
+        for its local experts."""
+        from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+        torch.manual_seed(100 + self.ep_rank)
+        tokens_per_expert = torch.tensor(
+            [8, 6, 10, 4], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            out_te, _ = TEGroupedMLP.forward(
+                self.mlp, hidden_states, tokens_per_expert, probs
+            )
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out_bi, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        torch.testing.assert_close(out_bi, out_te, atol=1e-1, rtol=1e-1)
+
+    @pytest.mark.internal
+    def test_ep_batch_invariance(self):
+        """Batch invariance should hold independently on each EP rank:
+        permuting local expert order produces identical per-token outputs."""
+        torch.manual_seed(200 + self.ep_rank)
+        num_local = self.num_local_experts
+        tokens_per_expert = torch.randint(
+            4, 17, (num_local,), device="cuda", dtype=torch.int64
+        )
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        # Run 1: original order
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out1, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        # Run 2: permute local expert order
+        perm = torch.randperm(num_local)
+        offsets = torch.zeros(num_local + 1, dtype=torch.int64)
+        offsets[1:] = tokens_per_expert.cpu().cumsum(0)
+
+        perm_chunks = [
+            hidden_states[offsets[e] : offsets[e + 1]] for e in perm.tolist()
+        ]
+        perm_hidden = torch.cat(perm_chunks, dim=0)
+        perm_tpe = tokens_per_expert[perm]
+
+        orig_fc1 = self.mlp._fc1_weight.data.clone()
+        orig_fc2 = self.mlp._fc2_weight.data.clone()
+        self.mlp._fc1_weight.data.copy_(orig_fc1[perm])
+        self.mlp._fc2_weight.data.copy_(orig_fc2[perm])
+
+        perm_probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out2_perm, _ = self.mlp._triton_batch_invariant_forward(
+                    perm_hidden, perm_tpe, perm_probs
+                )
+
+        # Restore weights
+        self.mlp._fc1_weight.data.copy_(orig_fc1)
+        self.mlp._fc2_weight.data.copy_(orig_fc2)
+
+        # Un-permute outputs
+        perm_offsets = torch.zeros(num_local + 1, dtype=torch.int64)
+        perm_offsets[1:] = perm_tpe.cpu().cumsum(0)
+
+        out2_chunks = [
+            out2_perm[perm_offsets[i] : perm_offsets[i + 1]]
+            for i in range(num_local)
+        ]
+        reordered = [None] * num_local
+        for i in range(num_local):
+            reordered[perm[i].item()] = out2_chunks[i]
+        out2 = torch.cat(reordered, dim=0)
+
+        assert torch.equal(out1, out2), (
+            f"EP rank {self.ep_rank}: batch invariance violated, "
+            f"max diff = {(out1 - out2).abs().max().item()}"
+        )
+
+    @pytest.mark.internal
+    def test_ep_determinism_across_runs(self):
+        """Multiple runs on each EP rank must produce bitwise-identical results."""
+        torch.manual_seed(300 + self.ep_rank)
+        tokens_per_expert = torch.tensor(
+            [6, 10, 8, 12], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        results = []
+        for _ in range(5):
+            with torch.no_grad():
+                with set_batch_invariant_mode(True):
+                    out, _ = self.mlp._triton_batch_invariant_forward(
+                        hidden_states, tokens_per_expert, probs
+                    )
+            results.append(out.clone())
+
+        for i in range(1, len(results)):
+            assert torch.equal(results[0], results[i]), (
+                f"EP rank {self.ep_rank}: run 0 vs run {i}, "
+                f"max diff = {(results[0] - results[i]).abs().max().item()}"
+            )
+
+    @pytest.mark.internal
+    def test_ep_dispatch_uses_batch_invariant_path(self):
+        """forward() should dispatch to the batch-invariant Triton path on each
+        EP rank when batch_invariant_mode is enabled."""
+        torch.manual_seed(400 + self.ep_rank)
+        tokens_per_expert = torch.tensor(
+            [4, 4, 4, 4], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out_direct, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        self.mlp.training = False
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out_dispatch, _ = self.mlp.forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        assert torch.equal(out_direct, out_dispatch), (
+            f"EP rank {self.ep_rank}: forward() dispatch did not use "
+            f"batch-invariant path"
+        )
+
+    @pytest.mark.internal
+    def test_ep_ranks_produce_independent_results(self):
+        """Verify that EP ranks with different local experts produce different
+        outputs for the same input tokens (sanity check that expert weights
+        are actually partitioned)."""
+        torch.manual_seed(500)
+        tokens_per_expert = torch.tensor(
+            [8, 8, 8, 8], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                local_out, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        # Gather outputs from all EP ranks to rank 0
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        gathered = [torch.zeros_like(local_out) for _ in range(self.ep_size)]
+        torch.distributed.all_gather(gathered, local_out, group=ep_group)
+
+        # Each rank should produce different outputs (different local expert weights)
+        if self.ep_rank == 0:
+            for i in range(1, self.ep_size):
+                assert not torch.equal(gathered[0], gathered[i]), (
+                    f"EP rank 0 and rank {i} produced identical outputs — "
+                    f"experts may not be properly partitioned"
+                )
+
+    @pytest.mark.internal
+    def test_ep_empty_local_experts(self):
+        """Each EP rank should handle zero tokens for some local experts gracefully."""
+        torch.manual_seed(600 + self.ep_rank)
+        # Create tokens_per_expert with some zeros
+        tokens_per_expert = torch.zeros(
+            self.num_local_experts, device="cuda", dtype=torch.int64
+        )
+        # Assign tokens to only the first local expert
+        tokens_per_expert[0] = 16
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        assert out.shape == (total_tokens, self.hidden_size)
+        assert not torch.isnan(out).any(), "NaN in output with sparse token assignment"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_te_min_version("1.9.0.dev0")),
+    reason="Requires CUDA and TE >= 1.9.0.dev0 for TEGroupedLinear",
+)
+class TestInferenceGroupedMLPExpertParallelWithTP:
+    """Test the batch-invariant path with combined expert and tensor parallelism
+    (EP=2, TP=2, requiring 4 GPUs)."""
+
+    def setup_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, expert_model_parallel_size=2
+        )
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(42)
+
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+
+        self.pg_collection = get_default_pg_collection()
+        self.num_moe_experts = 8
+        self.hidden_size = 128
+        self.dtype = torch.bfloat16
+        self.ep_size = parallel_state.get_expert_model_parallel_world_size()
+        self.ep_rank = parallel_state.get_expert_model_parallel_rank()
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+        self.mlp, self.config, self.num_local_experts = _build_inference_grouped_mlp(
+            self.num_moe_experts, self.hidden_size, self.dtype, self.pg_collection
+        )
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_tp_ep_local_expert_correctness(self):
+        """With TP=2, EP=2: each rank's batch-invariant forward should match TE."""
+        from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+        torch.manual_seed(100 + self.ep_rank)
+        tokens_per_expert = torch.tensor(
+            [8, 6, 10, 4], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            out_te, _ = TEGroupedMLP.forward(
+                self.mlp, hidden_states, tokens_per_expert, probs
+            )
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out_bi, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        torch.testing.assert_close(out_bi, out_te, atol=1e-1, rtol=1e-1)
+
+    @pytest.mark.internal
+    def test_tp_ep_batch_invariance(self):
+        """With TP=2, EP=2: batch invariance should hold on each rank."""
+        torch.manual_seed(200 + self.ep_rank)
+        num_local = self.num_local_experts
+        tokens_per_expert = torch.randint(
+            4, 17, (num_local,), device="cuda", dtype=torch.int64
+        )
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out1, _ = self.mlp._triton_batch_invariant_forward(
+                    hidden_states, tokens_per_expert, probs
+                )
+
+        # Permute local expert order
+        perm = torch.randperm(num_local)
+        offsets = torch.zeros(num_local + 1, dtype=torch.int64)
+        offsets[1:] = tokens_per_expert.cpu().cumsum(0)
+
+        perm_chunks = [
+            hidden_states[offsets[e] : offsets[e + 1]] for e in perm.tolist()
+        ]
+        perm_hidden = torch.cat(perm_chunks, dim=0)
+        perm_tpe = tokens_per_expert[perm]
+
+        orig_fc1 = self.mlp._fc1_weight.data.clone()
+        orig_fc2 = self.mlp._fc2_weight.data.clone()
+        self.mlp._fc1_weight.data.copy_(orig_fc1[perm])
+        self.mlp._fc2_weight.data.copy_(orig_fc2[perm])
+
+        perm_probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            with set_batch_invariant_mode(True):
+                out2_perm, _ = self.mlp._triton_batch_invariant_forward(
+                    perm_hidden, perm_tpe, perm_probs
+                )
+
+        self.mlp._fc1_weight.data.copy_(orig_fc1)
+        self.mlp._fc2_weight.data.copy_(orig_fc2)
+
+        perm_offsets = torch.zeros(num_local + 1, dtype=torch.int64)
+        perm_offsets[1:] = perm_tpe.cpu().cumsum(0)
+
+        out2_chunks = [
+            out2_perm[perm_offsets[i] : perm_offsets[i + 1]]
+            for i in range(num_local)
+        ]
+        reordered = [None] * num_local
+        for i in range(num_local):
+            reordered[perm[i].item()] = out2_chunks[i]
+        out2 = torch.cat(reordered, dim=0)
+
+        assert torch.equal(out1, out2), (
+            f"TP+EP rank (ep={self.ep_rank}): batch invariance violated, "
+            f"max diff = {(out1 - out2).abs().max().item()}"
+        )
+
+    @pytest.mark.internal
+    def test_tp_ep_determinism(self):
+        """With TP=2, EP=2: repeated runs must be bitwise-identical."""
+        torch.manual_seed(300 + self.ep_rank)
+        tokens_per_expert = torch.tensor(
+            [6, 10, 8, 12], device="cuda", dtype=torch.int64
+        )[: self.num_local_experts]
+        total_tokens = tokens_per_expert.sum().item()
+        hidden_states = torch.randn(
+            total_tokens, self.hidden_size, device="cuda", dtype=self.dtype
+        )
+        probs = torch.ones(total_tokens, device="cuda", dtype=torch.float32)
+
+        results = []
+        for _ in range(5):
+            with torch.no_grad():
+                with set_batch_invariant_mode(True):
+                    out, _ = self.mlp._triton_batch_invariant_forward(
+                        hidden_states, tokens_per_expert, probs
+                    )
+            results.append(out.clone())
+
+        for i in range(1, len(results)):
+            assert torch.equal(results[0], results[i]), (
+                f"TP+EP rank (ep={self.ep_rank}): run 0 vs run {i}, "
+                f"max diff = {(results[0] - results[i]).abs().max().item()}"
+            )
