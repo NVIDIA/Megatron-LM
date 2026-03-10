@@ -157,6 +157,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
                     )
                 else:
                     assert False, "unexpected layer_type"
