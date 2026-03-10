@@ -1934,8 +1934,8 @@ class TestDynamicInferenceEngine:
             assert (ks[: PROMPT_LEN + 3] == 0).all()
             assert (ks[PROMPT_LEN + 3 :] == 1).all()
 
-        # Simulate RECOMPUTE — checkpoint clears kv_cache so _stamp_records
-        # will recreate it fresh when the request next generates tokens.
+        # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
+        # stamping logic will recreate it fresh when the request next generates tokens.
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
@@ -1967,7 +1967,7 @@ class TestDynamicInferenceEngine:
             assert merged.kv_cache_epoch is not None
             assert merged.kv_cache_epoch.shape == (PROMPT_LEN + NUM_TOKENS,)
             if use_checkpoint:
-                # KV cache was cleared by checkpoint; _stamp_records recreated
+                # KV cache was cleared by checkpoint; stamping logic recreated
                 # it at epoch 2 (when the first post-checkpoint step ran).
                 assert (merged.kv_cache_epoch == 2).all()
             else:

@@ -608,9 +608,9 @@ class DynamicInferenceRequestRecord:
         # Carry forward policy_epoch as-is.
         policy_epoch = old_request.policy_epoch
 
-        # Reset kv_cache_epoch to None — the KV cache is recomputed fresh
-        # after checkpoint, so _stamp_records will create a new tensor stamped
-        # with the generation epoch at which recomputation actually occurs.
+        # Reset kv_cache_epoch to None: the KV cache is recomputed fresh
+        # after checkpoint, so the engine's stamping logic will create a new
+        # tensor stamped with the epoch at which recomputation actually occurs.
         kv_cache_epoch = None
 
         # New prompt (concatenate prompt + generated tokens).

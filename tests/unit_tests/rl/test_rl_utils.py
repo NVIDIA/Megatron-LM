@@ -318,7 +318,6 @@ class TestRLUtils:
             problem_id="2",
             policy_epoch=[[0, 0, 0]],
             kv_cache_epoch=[[0, 0, 0]],
-
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -330,7 +329,6 @@ class TestRLUtils:
             problem_id="2",
             policy_epoch=[[0, 0, 0, 0]],
             kv_cache_epoch=[[0, 0, 0, 0]],
-
             num_evictions=[0],
         )
 
@@ -352,7 +350,6 @@ class TestRLUtils:
             problem_id="2",
             policy_epoch=[[0, 0, 0, 0]],
             kv_cache_epoch=[[0, 0, 0, 0]],
-
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -364,7 +361,6 @@ class TestRLUtils:
             problem_id="2",
             policy_epoch=[[0, 0, 0, 0]],
             kv_cache_epoch=[[0, 0, 0, 0]],
-
             num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -401,7 +397,6 @@ class TestRLUtils:
             problem_id="1",
             policy_epoch=[[0, 0, 0, 0]] * num_turns,
             kv_cache_epoch=[[0, 0, 0, 0]] * num_turns,
-
             num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
@@ -413,7 +408,6 @@ class TestRLUtils:
             problem_id="2",
             policy_epoch=[[0, 0, 0, 0, 0]] * num_turns,
             kv_cache_epoch=[[0, 0, 0, 0, 0]] * num_turns,
-
             num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
@@ -425,7 +419,6 @@ class TestRLUtils:
             problem_id="3",
             policy_epoch=[[0, 0, 0]] * num_turns,
             kv_cache_epoch=[[0, 0, 0]] * num_turns,
-
             num_evictions=[0] * num_turns,
         )
 

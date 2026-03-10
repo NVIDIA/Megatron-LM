@@ -1516,10 +1516,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # This covers both still-active and just-finished/failed requests.
         if self._generation_epoch is not None and step_result is not None:
             it = self._generation_epoch
-            records = (
-                [self.requests[rid].record for rid in active_request_ids]
-                + finished_request_records
-            )
+            records = [
+                self.requests[rid].record for rid in active_request_ids
+            ] + finished_request_records
             for record in records:
                 request = record[-1]
                 total = len(request.prompt_tokens) + len(request.generated_tokens)
@@ -1527,19 +1526,24 @@ class DynamicInferenceEngine(AbstractEngine):
                     tensor = getattr(request, attr)
                     if tensor is None:
                         setattr(
-                            request, attr,
-                            torch.full((total,), it, dtype=torch.int32, device='cpu'),
+                            request, attr, torch.full((total,), it, dtype=torch.int32, device='cpu')
                         )
                     elif len(tensor) < total:
                         setattr(
-                            request, attr,
-                            torch.cat((
-                                tensor,
-                                torch.full(
-                                    (total - len(tensor),), it,
-                                    dtype=tensor.dtype, device=tensor.device,
+                            request,
+                            attr,
+                            torch.cat(
+                                (
+                                    tensor,
+                                    torch.full(
+                                        (total - len(tensor),),
+                                        it,
+                                        dtype=tensor.dtype,
+                                        device=tensor.device,
+                                    ),
                                 ),
-                            ), dim=0),
+                                dim=0,
+                            ),
                         )
 
         range_pop()
