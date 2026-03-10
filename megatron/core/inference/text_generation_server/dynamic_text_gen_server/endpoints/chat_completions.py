@@ -7,6 +7,7 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import DynamicInferenceEventType
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -139,7 +140,30 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format OpenAI Response ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        for i, record in enumerate(batch_results):
+            last_request = record.requests[-1]
+            if last_request.failed():
+                error_events = [
+                    e for e in last_request.events
+                    if e.type in (
+                        DynamicInferenceEventType.ERROR_NONTRANSIENT,
+                        DynamicInferenceEventType.ERROR_TRANSIENT,
+                    )
+                ]
+                error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return Response(
+                f"Inference request(s) failed: {error_detail}",
+                status=400,
+            )
+
+        # --- 5. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
