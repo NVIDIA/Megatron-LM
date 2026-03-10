@@ -204,18 +204,19 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
 
         assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
 
         if self.num_speculative_tokens > 0:
             assert (
-                not inference_config.materialize_only_last_token_logits
-            ), "Speculative decoding requires materialize_only_last_token_logits to be False"
-            assert (
                 self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-
-        self.controller._init_mtp_sampling_tensor()
+            assert (
+                not self.materialize_only_last_token_logits
+            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
 
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
@@ -223,9 +224,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.materialize_only_last_token_logits = (
-            inference_config.materialize_only_last_token_logits
-        )
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -297,6 +295,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         self.resume_request_ids = None
+
+        # Speculative decoding acceptance tracking.
+        self._spec_tokens_proposed = 0
+        self._spec_tokens_accepted = 0
+        self._spec_steps = 0
 
         # Prefix caching coordination state.
         self._prefix_coordination_waits = 0
@@ -991,6 +994,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # empty lists for each request, so the zip produces the correct number of iterations
         accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
 
+        if self.num_speculative_tokens > 0 and accepted_tokens is not None:
+            self._spec_steps += 1
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
@@ -999,13 +1005,26 @@ class DynamicInferenceEngine(AbstractEngine):
             if not isinstance(tokens, list):
                 tokens = [tokens]
 
+            request: DynamicInferenceRequest = self.get_request(request_id)
+
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
                 tokens = accepted_tokens + tokens
 
             request: DynamicInferenceRequest = self.get_request(request_id)
-            num_stop_word_trim = 0
+            # Track acceptance statistics for logging (decode requests only).
+            # Prefill requests don't propose speculative tokens, so including
+            # them would inflate the proposed count and deflate the rate.
+            # A request in its first generation step (empty generated_tokens)
+            # was in prefill this step.
+            if len(request.generated_tokens) > 0:
+                self._spec_tokens_proposed += self.num_speculative_tokens
+                self._spec_tokens_accepted += len(accepted_tokens)
+
+            num_stop_word_trim = 0                
             if request_id != self.context.chunked_prefill_request_id:
+
+
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -1018,7 +1037,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         - len(request.generated_tokens)
                     ]
                 if request_id not in self.stop_word_being_finished_ids:
-
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
                     first_event_in_step = None
@@ -1251,7 +1269,10 @@ class DynamicInferenceEngine(AbstractEngine):
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
-        been appended to request.generated_tokens.
+        been appended to request.generated_tokens. In the speculative decoding case,
+        multiple tokens may have been appended at once. If a stop word is found in the
+        middle of the speculative tokens, the trailing tokens after the stop word are
+        truncated from generated_tokens.
 
         With speculative decoding, multiple tokens are appended at once. The stop word
         may end before the last appended token, leaving extra tokens that must be
@@ -1637,6 +1658,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
+            # Add speculative decoding acceptance metrics.
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+                metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
+                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
             else:
@@ -1686,9 +1715,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
+                    spec_rate,
+                    self._spec_tokens_accepted,
+                    self._spec_tokens_proposed,
+                    self._spec_steps,
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
+
+            # Reset speculative decoding accumulators after both wandb and console logging.
+            if self.num_speculative_tokens > 0:
+                self._spec_tokens_proposed = 0
+                self._spec_tokens_accepted = 0
+                self._spec_steps = 0
 
         return {
             "active_request_ids": active_request_ids,

@@ -10,268 +10,6 @@ import triton.language as tl
 
 
 @triton.jit
-def _roll_circular_buffer_kernel(
-    in_ptr,
-    out_ptr,
-    cu_seqlens_ptr,
-    B: tl.constexpr,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    stride_in_b,
-    stride_in_d,
-    stride_in_w,
-    stride_out_b,
-    stride_out_d,
-    stride_out_w,
-    BLOCK_W: tl.constexpr,
-):
-    # We map a 1D grid over B * D
-    pid = tl.program_id(0)
-    b = pid // D
-    d = pid % D
-
-    # 1. Load sequence lengths to calculate shift
-    seqlen_start = tl.load(cu_seqlens_ptr + b)
-    seqlen_end = tl.load(cu_seqlens_ptr + b + 1)
-    seqlen = seqlen_end - seqlen_start
-
-    shift = seqlen % W
-
-    # 2. Setup standard W offsets
-    w_offsets = tl.arange(0, BLOCK_W)
-    mask = w_offsets < W
-
-    # 3. Calculate gathered indices
-    # NOTE: Triton/C++ modulo operator truncates towards zero for negative numbers.
-    # Because shift < W, (w_offsets - shift) is at least -W + 1.
-    # Adding W ensures the dividend is strictly positive, giving the correct wrapping behavior.
-    src_w_offsets = (w_offsets - shift + W) % W
-
-    # 4. Compute memory pointers
-    in_offsets = in_ptr + (b * stride_in_b) + (d * stride_in_d) + (src_w_offsets * stride_in_w)
-    out_offsets = out_ptr + (b * stride_out_b) + (d * stride_out_d) + (w_offsets * stride_out_w)
-
-    # 5. Load and Store
-    vals = tl.load(in_offsets, mask=mask)
-    tl.store(out_offsets, vals, mask=mask)
-
-
-def roll_conv_varlen_states(
-    conv_varlen_states: torch.Tensor, cu_seqlens: torch.Tensor
-) -> torch.Tensor:
-    """
-    Rolls the convolution states into a circular buffer layout based on sequence lengths.
-    """
-    B, D, W = conv_varlen_states.shape
-    out = torch.empty_like(conv_varlen_states)
-
-    # Next power of 2 for block size (e.g. W=4 -> BLOCK_W=4)
-    BLOCK_W = triton.next_power_of_2(W)
-
-    # Grid of size B * D
-    grid = lambda meta: (B * D,)
-
-    _roll_circular_buffer_kernel[grid](
-        conv_varlen_states,
-        out,
-        cu_seqlens,
-        B,
-        D,
-        W,
-        conv_varlen_states.stride(0),
-        conv_varlen_states.stride(1),
-        conv_varlen_states.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        BLOCK_W=BLOCK_W,
-    )
-
-    return out
-
-
-@triton.jit
-def _gather_conv_state_kernel(
-    conv_state_ptr,
-    batch_indices_ptr,
-    cache_seqlens_ptr,
-    out_ptr,
-    stride_cs_b,
-    stride_cs_d,
-    stride_cs_w,
-    stride_out_b,
-    stride_out_d,
-    stride_out_w,
-    D: tl.constexpr,
-    state_len: tl.constexpr,
-    d_conv: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    b = pid // D
-    d = pid % D
-
-    # Load batch map
-    req_idx = tl.load(batch_indices_ptr + b)
-
-    # Check for padding/invalid batch index
-    if req_idx < 0:
-        w_offsets = tl.arange(0, BLOCK_W)
-        mask = w_offsets < (d_conv - 1)
-        out_offsets = out_ptr + (b * stride_out_b) + (d * stride_out_d) + (w_offsets * stride_out_w)
-        # Store 0.0 to prevent NaNs/garbage data from propagating
-        tl.store(out_offsets, 0.0, mask=mask)
-        return
-
-    # Load sequence length
-    seq_len = tl.load(cache_seqlens_ptr + b)
-
-    w_offsets = tl.arange(0, BLOCK_W)
-    mask = w_offsets < (d_conv - 1)
-
-    # Calculate circular buffer index.
-    # We add state_len before modulo to prevent negative values in C++ modulo
-    # when seq_len < d_conv - 1.
-    val = seq_len - d_conv + 1 + w_offsets
-    gather_indices = (val + state_len) % state_len
-
-    # Calculate memory offsets
-    cs_offsets = (
-        conv_state_ptr
-        + (req_idx * stride_cs_b)
-        + (d * stride_cs_d)
-        + (gather_indices * stride_cs_w)
-    )
-    out_offsets = out_ptr + (b * stride_out_b) + (d * stride_out_d) + (w_offsets * stride_out_w)
-
-    valid_mask = mask & (val >= 0)
-    data = tl.load(cs_offsets, mask=valid_mask, other=0.0)
-    tl.store(out_offsets, data, mask=mask)
-
-
-def gather_conv_state(
-    conv_state: torch.Tensor, batch_indices: torch.Tensor, cache_seqlens: torch.Tensor, d_conv: int
-) -> torch.Tensor:
-    """Reads the last (d_conv - 1) tokens from the circular convolution state."""
-    B = batch_indices.shape[0]
-    D = conv_state.shape[1]
-    state_len = conv_state.shape[2]
-
-    out = torch.empty((B, D, d_conv - 1), device=conv_state.device, dtype=conv_state.dtype)
-    BLOCK_W = triton.next_power_of_2(d_conv - 1)
-
-    grid = lambda meta: (B * D,)
-    _gather_conv_state_kernel[grid](
-        conv_state,
-        batch_indices,
-        cache_seqlens,
-        out,
-        conv_state.stride(0),
-        conv_state.stride(1),
-        conv_state.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        D,
-        state_len,
-        d_conv,
-        BLOCK_W=BLOCK_W,
-    )
-    return out
-
-
-@triton.jit
-def _scatter_conv_state_kernel(
-    conv_state_ptr,
-    batch_indices_ptr,
-    cache_seqlens_ptr,
-    xBC_tail_ptr,
-    stride_cs_b,
-    stride_cs_d,
-    stride_cs_w,
-    stride_xBC_b,
-    stride_xBC_d,
-    stride_xBC_w,
-    D: tl.constexpr,
-    state_len: tl.constexpr,
-    chunk_len: tl.constexpr,
-    copy_len: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    b = pid // D
-    d = pid % D
-
-    # Load batch map
-    req_idx = tl.load(batch_indices_ptr + b)
-
-    # Check for padding/invalid batch index and safely return
-    if req_idx < 0:
-        return
-
-    # Load sequence length
-    seq_len = tl.load(cache_seqlens_ptr + b)
-
-    w_offsets = tl.arange(0, BLOCK_W)
-    mask = w_offsets < copy_len
-
-    # seq_len >= 0 and chunk_len >= copy_len, so this is guaranteed to be >= 0.
-    update_indices = (seq_len + chunk_len - copy_len + w_offsets) % state_len
-
-    # Calculate memory offsets
-    xBC_offsets = (
-        xBC_tail_ptr + (b * stride_xBC_b) + (d * stride_xBC_d) + (w_offsets * stride_xBC_w)
-    )
-    cs_offsets = (
-        conv_state_ptr
-        + (req_idx * stride_cs_b)
-        + (d * stride_cs_d)
-        + (update_indices * stride_cs_w)
-    )
-
-    data = tl.load(xBC_offsets, mask=mask)
-    tl.store(cs_offsets, data, mask=mask)
-
-
-def scatter_conv_state(
-    conv_state: torch.Tensor,
-    xBC: torch.Tensor,
-    batch_indices: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-):
-    """Writes the newest chunk of tokens into the circular convolution state."""
-    state_len = conv_state.shape[2]
-    chunk_len = xBC.shape[-1]
-
-    # We only need to retain at most the last `state_len` tokens of the chunk
-    copy_len = min(chunk_len, state_len)
-    xBC_tail = xBC[..., -copy_len:]
-
-    B, D, _ = xBC_tail.shape
-    state_len = conv_state.shape[2]
-    BLOCK_W = triton.next_power_of_2(copy_len)
-
-    grid = lambda meta: (B * D,)
-    _scatter_conv_state_kernel[grid](
-        conv_state,
-        batch_indices,
-        cache_seqlens,
-        xBC_tail,
-        conv_state.stride(0),
-        conv_state.stride(1),
-        conv_state.stride(2),
-        xBC_tail.stride(0),
-        xBC_tail.stride(1),
-        xBC_tail.stride(2),
-        D,
-        state_len,
-        chunk_len,
-        copy_len,
-        BLOCK_W=BLOCK_W,
-    )
-
-
-@triton.jit
 def causal_conv1d_update_kernel(
     x_ptr,
     x_b_stride,
@@ -296,7 +34,6 @@ def causal_conv1d_update_kernel(
     out_s_stride,
     out_c_stride,
     conv_state_indices_ptr,
-    cache_seqlens_ptr,
     batch,
     seq_len,
     dim,
@@ -304,7 +41,6 @@ def causal_conv1d_update_kernel(
     WIDTH: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    IS_CIRCULAR: tl.constexpr,
     HAS_STATE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
@@ -368,12 +104,6 @@ def causal_conv1d_update_kernel(
     x_val_2 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
     x_val_3 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
 
-    # If circular, we only need to read the base cache sequence length once
-    if IS_CIRCULAR:
-        base_cache_seqlen = tl.load(cache_seqlens_ptr + batch_id)
-    else:
-        base_cache_seqlen = None
-
     # Loop over the sequence dimension (e.g., speculative tokens)
     for s in range(seq_len):
         x_ptrs = x_ptr + batch_id * x_b_stride + s * x_s_stride + channel_offsets * x_c_stride
@@ -381,60 +111,33 @@ def causal_conv1d_update_kernel(
             out_ptr + batch_id * out_b_stride + s * out_s_stride + channel_offsets * out_c_stride
         )
 
-        if not IS_CIRCULAR:
-            # Load the last (WIDTH - 1) elements to use them BEFORE they are overwritten
-            # by the shift
-            if WIDTH >= 2:
-                x_val_0 = tl.load(
-                    conv_state_ptrs + (state_len - WIDTH + 1) * conv_state_l_stride, mask=mask
-                ).to(tl.float32)
-            if WIDTH >= 3:
-                x_val_1 = tl.load(
-                    conv_state_ptrs + (state_len - WIDTH + 2) * conv_state_l_stride, mask=mask
-                ).to(tl.float32)
-            if WIDTH >= 4:
-                x_val_2 = tl.load(
-                    conv_state_ptrs + (state_len - WIDTH + 3) * conv_state_l_stride, mask=mask
-                ).to(tl.float32)
+        # Load the last (WIDTH - 1) elements to use them BEFORE they are overwritten
+        # by the shift
+        if WIDTH >= 2:
+            x_val_0 = tl.load(
+                conv_state_ptrs + (state_len - WIDTH + 1) * conv_state_l_stride, mask=mask
+            ).to(tl.float32)
+        if WIDTH >= 3:
+            x_val_1 = tl.load(
+                conv_state_ptrs + (state_len - WIDTH + 2) * conv_state_l_stride, mask=mask
+            ).to(tl.float32)
+        if WIDTH >= 4:
+            x_val_2 = tl.load(
+                conv_state_ptrs + (state_len - WIDTH + 3) * conv_state_l_stride, mask=mask
+            ).to(tl.float32)
 
-            # Shift the linear state buffer left by 1
-            i = 0
-            while i < state_len - 1:
-                val = tl.load(conv_state_ptrs + (i + 1) * conv_state_l_stride, mask=mask)
-                tl.store(conv_state_ptrs + i * conv_state_l_stride, val, mask=mask)
-                i += 1
-        else:
-            cache_seqlen = base_cache_seqlen + s
-            update_idx = cache_seqlen % state_len
-            read_idx = update_idx - (WIDTH - 1)
-            read_idx = tl.where(read_idx < 0, read_idx + state_len, read_idx)
-
-            if WIDTH >= 2:
-                state_val = tl.load(conv_state_ptrs + read_idx * conv_state_l_stride, mask=mask)
-                x_val_0 = state_val.to(tl.float32)
-                read_idx = tl.where(
-                    read_idx + 1 >= state_len, read_idx + 1 - state_len, read_idx + 1
-                )
-            if WIDTH >= 3:
-                state_val = tl.load(conv_state_ptrs + read_idx * conv_state_l_stride, mask=mask)
-                x_val_1 = state_val.to(tl.float32)
-                read_idx = tl.where(
-                    read_idx + 1 >= state_len, read_idx + 1 - state_len, read_idx + 1
-                )
-            if WIDTH >= 4:
-                state_val = tl.load(conv_state_ptrs + read_idx * conv_state_l_stride, mask=mask)
-                x_val_2 = state_val.to(tl.float32)
+        # Shift the linear state buffer left by 1
+        i = 0
+        while i < state_len - 1:
+            val = tl.load(conv_state_ptrs + (i + 1) * conv_state_l_stride, mask=mask)
+            tl.store(conv_state_ptrs + i * conv_state_l_stride, val, mask=mask)
+            i += 1
 
         # Process the single token for the current sequence step
         x_val = tl.load(x_ptrs, mask=mask)
 
-        # Store the new token in the state buffer
-        if not IS_CIRCULAR:
-            tl.store(conv_state_ptrs + (state_len - 1) * conv_state_l_stride, x_val, mask=mask)
-        else:
-            cache_seqlen = base_cache_seqlen + s
-            update_idx = cache_seqlen % state_len
-            tl.store(conv_state_ptrs + update_idx * conv_state_l_stride, x_val, mask=mask)
+        # Store the new token at the end of the linear state buffer
+        tl.store(conv_state_ptrs + (state_len - 1) * conv_state_l_stride, x_val, mask=mask)
 
         # Write out to the intermediate state buffer if requested
         if HAS_INT_STATE:
@@ -481,7 +184,6 @@ def causal_conv1d_update(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     silu_activation: bool,
-    cache_seqlens: torch.Tensor | None,
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -504,12 +206,6 @@ def causal_conv1d_update(
         bias = x  # Dummy pointer
         bias_stride = 0
         has_bias = False
-
-    if cache_seqlens is not None:
-        is_circular = True
-    else:
-        cache_seqlens = x  # Dummy pointer
-        is_circular = False
 
     if conv_state_indices is not None:
         has_state_indices = True
@@ -560,7 +256,6 @@ def causal_conv1d_update(
         out.stride(1),
         out.stride(2),
         conv_state_indices,
-        cache_seqlens,
         batch,
         seq_len,
         dim,
@@ -568,7 +263,6 @@ def causal_conv1d_update(
         WIDTH=width,
         BLOCK_DIM=BLOCK_DIM,
         HAS_BIAS=has_bias,
-        IS_CIRCULAR=is_circular,
         HAS_STATE_INDICES=has_state_indices,
         HAS_INT_STATE=has_int_state,
         SILU_ACTIVATION=silu_activation == "silu",

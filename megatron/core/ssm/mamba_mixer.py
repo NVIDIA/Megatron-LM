@@ -25,12 +25,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.causal_conv1d_triton import (
-    causal_conv1d_update,
-    gather_conv_state,
-    roll_conv_varlen_states,
-    scatter_conv_state,
-)
+from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -433,11 +428,12 @@ class MambaMixer(MegatronModule):
         # Grab standard states
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
-        # Only fetch intermediate SSM state for speculative decoding
+        # Fetch intermediate states for speculative decoding
+        # (just buffers, existing data is overwritten)
+        int_conv_state = None
         int_ssm_state = None
         if context.num_speculative_tokens > 0:
-            # We ignore the conv intermediate state since we use the expanded circular buffer
-            _, int_ssm_state = context.mamba_states_cache(
+            int_conv_state, int_ssm_state = context.mamba_states_cache(
                 self.layer_number - self.pp_layer_offset, intermediate=True
             )
 
@@ -468,8 +464,8 @@ class MambaMixer(MegatronModule):
                 conv_state,
                 ssm_state,
                 batch_indices=context.mamba_metadata.batch_indices_decode,
+                intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
-                cache_seqlens=context.mamba_metadata.cache_seqlens_decode,
             )
 
             # Flatten back to [N*S, 1, d] to match merge logic
@@ -550,7 +546,6 @@ class MambaMixer(MegatronModule):
                 ssm_state=ssm_state,
                 batch_indices=metadata.batch_indices_chunked_prefill,
                 is_chunked_prefill=True,
-                cache_seqlens=metadata.cache_seqlens_chunked_prefill,
             )
 
             # Update zxBCdt to contain the remaining slice for regular prefill
@@ -651,7 +646,7 @@ class MambaMixer(MegatronModule):
                 _check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
-            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+            seq_idx = packed_seq_params.seq_idx
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
@@ -680,36 +675,6 @@ class MambaMixer(MegatronModule):
 
         return y
 
-    def _create_packed_seq_idx(self, packed_seq_params: PackedSeqParams, total_tokens: int):
-        """
-        If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
-        (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
-        [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
-        which is [0]*(5-0) + [1]*(7-5) + [2]*(11-7) + [3]*(16-11)
-        In the above example, there are three sequences in the pack.
-        In general, the output has an additional sequence index (e.g. 0, 1, 2, 3) so that any tokens
-        beyond the last padded input sequence are accounted for as an extra sequence. However, If
-        cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
-        included.
-        """
-        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
-        if packed_seq_params.cu_seqlens_q_padded is not None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-        else:
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-        total_tokens_tensor = torch.tensor(
-            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-        )
-        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
-        # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
-        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-        # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
-        seq_idx = torch.repeat_interleave(
-            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
-        )
-        seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
-        return seq_idx
-
     def _ssm_prefill(
         self,
         zxBCdt: torch.Tensor,
@@ -720,7 +685,6 @@ class MambaMixer(MegatronModule):
         return_varlen_states: bool = False,
         batch_indices: Optional[torch.Tensor] = None,
         is_chunked_prefill: bool = False,
-        cache_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference prefill step.
@@ -764,17 +728,12 @@ class MambaMixer(MegatronModule):
         # Compute short convolution
         initial_conv_state = None
         if conv_state is not None and is_dynamic_batching:
-            # Extract linear states (newest token is at state_len - 1)
-            state_len = conv_state.shape[-1]
+            # xBC should have shape (b l d) for causal_conv1d_varlen_states
+            assert batch_indices is not None
             conv_varlen_states = causal_conv1d_varlen_states(
-                xBC.squeeze(0), cu_seqlens, state_len=state_len
+                xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
-
-            # Roll into circular buffer layout expected by decode using fused Triton kernel
-            conv_varlen_states_circular = roll_conv_varlen_states(conv_varlen_states, cu_seqlens)
-
-            # Update state
-            tensor_masked_update(conv_state, batch_indices, conv_varlen_states_circular)
+            tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
             # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
@@ -783,19 +742,13 @@ class MambaMixer(MegatronModule):
             # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
             assert batch_indices is not None
-            assert cache_seqlens is not None
-            state_len = conv_state.shape[-1]
-
-            xBC = xBC.transpose(1, 2)
-
-            # Read last (d_conv - 1) tokens from the circular buffer
-            initial_conv_state = gather_conv_state(
-                conv_state, batch_indices, cache_seqlens, self.d_conv
+            initial_conv_state = (
+                conv_state[batch_indices, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
             )
-            initial_conv_state = initial_conv_state.permute(0, 2, 1).contiguous().transpose(1, 2)
-
-            # Scatter tail back into the main buffer using fused Triton kernel
-            scatter_conv_state(conv_state, xBC, batch_indices, cache_seqlens)
+            xBC = xBC.transpose(1, 2)
+            tensor_masked_update(
+                conv_state, batch_indices, F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
+            )
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
@@ -918,8 +871,8 @@ class MambaMixer(MegatronModule):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
+        intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
-        cache_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -931,9 +884,10 @@ class MambaMixer(MegatronModule):
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
-            intermediate_ssm_state: Optional buffer for storing sequence steps in SSM state.
-            cache_seqlens: Optional tensor representing cache sequence length for circular
-                buffering.
+            intermediate_conv_state: Optional buffer for storing conv state at each
+                sequence step (for speculative decoding rollback).
+            intermediate_ssm_state: Optional buffer for storing SSM state at each
+                sequence step (for speculative decoding rollback).
 
         Returns:
             The output tensor of shape (b, s, d).
@@ -976,8 +930,8 @@ class MambaMixer(MegatronModule):
                 weight.to(conv_state.dtype),
                 self.conv1d.bias.to(conv_state.dtype),
                 self.activation,
-                cache_seqlens=cache_seqlens,
                 conv_state_indices=batch_indices,
+                intermediate_conv_states=intermediate_conv_state,
             ).to(xBC_dtype)
 
         x, B, C = torch.split(

@@ -280,6 +280,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_heads_per_partition = 1
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        assert self.num_speculative_tokens < inference_config.block_size_tokens, (
+            f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
+            f"block_size_tokens ({inference_config.block_size_tokens})"
+        )
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -362,7 +366,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
             mamba_states_memory_per_request *= self.num_mamba_layers
-            mamba_states_memory_per_request *= self.num_speculative_tokens + 1
+            if self.num_speculative_tokens > 0:
+                # Add memory for intermediate conv and SSM states
+                intermediate_memory_per_request = (
+                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                )
+                intermediate_memory_per_request *= self.num_mamba_layers
+                intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -615,10 +627,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
             )
-            expanded_conv_shape = list(self.mamba_conv_states_shape)
-            expanded_conv_shape[-1] += self.num_speculative_tokens
             self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests, *expanded_conv_shape),
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -628,6 +638,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
             if self.num_speculative_tokens > 0:
+                self.mamba_intermediate_conv_states = torch.empty(
+                    (
+                        self.num_mamba_layers,
+                        self.max_requests,
+                        self.num_speculative_tokens + 1,
+                        *self.mamba_conv_states_shape,
+                    ),
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
                 self.mamba_intermediate_ssm_states = torch.empty(
                     (
                         self.num_mamba_layers,
@@ -652,6 +672,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.mamba_ssm_states, device="cpu"
                 ).pin_memory()
                 if self.num_speculative_tokens > 0:
+                    self._offloadable_tensor_names.add("mamba_intermediate_conv_states")
+                    self._offloadable_cpu_backups["mamba_intermediate_conv_states"] = (
+                        torch.empty_like(
+                            self.mamba_intermediate_conv_states, device="cpu"
+                        ).pin_memory()
+                    )
                     self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
                     self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
                         torch.empty_like(
@@ -986,7 +1012,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
-            conv_state = None
+            conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
             ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
         else:
             conv_state = self.mamba_conv_states[mamba_layer_number]
@@ -1339,26 +1365,37 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert smallest_cuda_graph_dimensions.prefill_req_count == 0
 
         N = smallest_cuda_graph_dimensions.decode_req_count
+        tokens_per_request = self.num_speculative_tokens + 1
+        T = smallest_cuda_graph_dimensions.token_count  # N * tokens_per_request
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
-        # 1. Request counts and token count (decode-only: 1 token per request).
+        # 1. Request counts and token count.
+        #    With speculative decoding each decode request has (num_speculative_tokens + 1) tokens.
         self.total_request_count = N
-        self.active_token_count = N
+        self.active_token_count = T
         self.num_prefill_requests = 0
 
         # 2. Per-request state consumed by mha_metadata.update().
-        self.request_query_lengths[0:N].fill_(1)
+        self.request_query_lengths[0:N].fill_(tokens_per_request)
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
-        self.token_to_block_idx[0:N] = dummy_block_idx
-        self.token_to_local_position_within_kv_block[0:N] = 0
+        self.token_to_block_idx[0:T] = dummy_block_idx
+        self.token_to_local_position_within_kv_block[0:T] = (
+            torch.arange(T, device=self.token_to_block_idx.device) % tokens_per_request
+        )
 
         if self.is_hybrid_model:
             # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
-            self.token_to_request_idx[0:N] = torch.arange(
-                0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+            self.token_to_request_idx[0:T] = torch.repeat_interleave(
+                torch.arange(
+                    0,
+                    N,
+                    device=self.token_to_request_idx.device,
+                    dtype=self.token_to_request_idx.dtype,
+                ),
+                tokens_per_request,
             )
 
             # 5. Mamba state: allocate slots for dummy requests.
@@ -1512,7 +1549,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
-                request_kv_length_offsets_view,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
@@ -1571,6 +1607,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = 0
         self.padded_active_request_count = 0
         self.paused_tokens = None
+        self.paused_speculative_tokens = None
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
@@ -2032,6 +2069,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
 
+        if new_speculative_tokens is not None:
+            # new_speculative_tokens has request dimension as second dimension,
+            # so swap on transposed view
+            tensor_swap(new_speculative_tokens.t(), src_idxs, dst_idxs)
+
         for metadata_tensor in self.request_metadata.values():
             tensor_swap(metadata_tensor, src_idxs, dst_idxs)
 
@@ -2075,10 +2117,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.free_slots(request_indexes)
 
     def resume_paused_requests(
-        self,
-        active_request_count: int,
-        newly_paused_request_ids: torch.Tensor,
-        next_tokens: torch.Tensor,
+        self, active_request_count: int, newly_paused_request_ids: torch.Tensor
     ) -> tuple[int, torch.Tensor]:
         """Resume as many paused requests as we have space for in the active buffer.
 
@@ -2096,7 +2135,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
-            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count].clone()
+            # Clone not needed: flip() makes a copy.
+            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
             # Flip counts before cumsum, since paused requests are resumed from
             # the right-most index, so we must count resumed blocks starting from
             # the right side.
@@ -2161,7 +2201,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         return active_request_count, newly_paused_request_ids
 
     def evict_overflow_paused_requests(
-        self, active_request_count: int, next_tokens: torch.Tensor
+        self,
+        active_request_count: int,
+        next_tokens: torch.Tensor,
+        new_speculative_tokens: Optional[torch.Tensor] = None,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Evict requests that overflow the paused buffer.
 
@@ -2216,6 +2259,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         evict_request_idxs = torch.arange(
             evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
         )
+        # Clone needed: subsequent release_memory_blocks_from_request_indexes and
+        # _swap_book_keeping_tensors calls mutate self.request_ids in place.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
         # Release memory.
@@ -2250,7 +2295,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Swap evicted and active requests.
         self._swap_book_keeping_tensors(
-            src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
+            src_idxs=src_idxs,
+            dst_idxs=dst_idxs,
+            next_tokens=next_tokens,
+            new_speculative_tokens=new_speculative_tokens,
         )
 
         # Update tracking vars.
@@ -2364,7 +2412,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count != 0:
             assert self.paused_tokens is not None
             next_tokens = torch.cat((self.paused_tokens, new_tokens))
-            if new_speculative_tokens is not None:
+            if new_speculative_tokens is not None and self.paused_speculative_tokens is not None:
                 new_speculative_tokens = torch.cat(
                     (self.paused_speculative_tokens, new_speculative_tokens), dim=1
                 )
@@ -2489,19 +2537,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         # for resumed requests, but we need the OLD block for tokens that don't cross.
         prev_last_block_ids = None
         if self.num_speculative_tokens > 0:
+            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
+            # (assigns new block IDs), but we need the old values later to determine
+            # which block tokens should go to when they don't cross a block boundary.
             prev_last_block_ids = self.request_last_kv_block_id.clone()
 
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids, next_tokens
+            active_request_count, newly_paused_request_ids
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
+        evict_request_ids = self.evict_overflow_paused_requests(
+            active_request_count, next_tokens, new_speculative_tokens
+        )
 
         # 6.c. Resume any additional requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids, next_tokens
+            active_request_count, newly_paused_request_ids
         )
 
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
@@ -2520,8 +2573,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
+            # Clone needed: next_tokens is a shared buffer that will be overwritten in
+            # the next iteration; paused_tokens must persist independently.
             self.paused_tokens = next_tokens[: self.paused_request_count].clone()
             if new_speculative_tokens is not None:
+                # Clone needed: same reason as paused_tokens above.
                 self.paused_speculative_tokens = new_speculative_tokens[
                     :, : self.paused_request_count
                 ].clone()
@@ -2538,6 +2594,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_generated_tokens
         )
 
+        # Clone needed: old_offsets is reused later to compute raw_positions
+        # for block-boundary detection. The write-back on the next line overwrites the
+        # underlying tensor, so without clone the boundary-crossing logic would see the
+        # new offsets instead of the pre-update values.
         old_offsets = self.request_last_kv_block_offset[
             self.paused_request_count : self.total_request_count
         ].clone()
@@ -2546,7 +2606,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             old_offsets + num_generated_tokens
         ) % self.block_size_tokens
 
-        # ================================================================
         self.active_token_count = active_request_count * num_generated_tokens
         sampled_tokens = next_tokens[self.paused_request_count : self.total_request_count]
 
@@ -2600,6 +2659,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
         raw_positions = (
             old_offsets[:, None]
+            + 1  # Offset by 1 because old_offsets points to the LAST token
             + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]
         )
         #
@@ -2642,8 +2702,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Start with current (new) block for all
             # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
             # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
-            block_idx = (
-                current_block_ids[:, None].expand(-1, num_generated_tokens).clone()
+            # No clone needed: expand() returns a read-only view, and downstream
+            # torch.where() and .flatten() both return new tensors without in-place mutation.
+            block_idx = current_block_ids[:, None].expand(
+                -1, num_generated_tokens
             )  # [active_count, N]
 
             # For requests that have crossing, tokens BEFORE boundary use prev block

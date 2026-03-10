@@ -383,8 +383,9 @@ class CUDAGraphBatchDimensionBuilder:
                 cuda_graph_max_tokens = max_tokens
 
             assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
-                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests "
-                f"({max_requests}). This is required for correctly syncing EP ranks: "
+                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests *"
+                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)}). "
+                "This is required for correctly syncing EP ranks: "
                 f"prefill and decode graph pools must have the same token count granularity."
             )
 

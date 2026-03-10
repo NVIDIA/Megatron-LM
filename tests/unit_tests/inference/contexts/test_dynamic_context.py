@@ -61,6 +61,7 @@ class TestDynamicContext:
         layer_type_list=None,
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
+        num_speculative_tokens=0,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -94,6 +95,7 @@ class TestDynamicContext:
                 ),
                 block_size_tokens=block_size_tokens,
                 max_tokens=max_tokens,
+                num_speculative_tokens=num_speculative_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
@@ -1416,8 +1418,9 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     @pytest.mark.parametrize("num_cuda_graphs", [-1, 16, 32])
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 3])
     def test_add_dummy_requests_for_expert_parallel_step_matches_slow_path(
-        self, is_hybrid_model: bool, num_cuda_graphs: int
+        self, is_hybrid_model: bool, num_cuda_graphs: int, num_speculative_tokens: int
     ):
         """The fast path (add_dummy_requests_for_expert_parallel_step) must leave
         the same observable state as the slow path
@@ -1441,10 +1444,12 @@ class TestDynamicContext:
                 else None
             ),
             num_cuda_graphs=num_cuda_graphs,
+            num_speculative_tokens=num_speculative_tokens,
         )
 
         smallest = min(ctx.cuda_graph_batch_dimensions_list)
         N = smallest.decode_req_count
+        T = smallest.token_count  # N * (num_speculative_tokens + 1)
         assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
 
         # --- slow path (reference) ---
@@ -1456,10 +1461,10 @@ class TestDynamicContext:
         slow_request_query_lengths = ctx.request_query_lengths[:N].clone()
         slow_request_kv_length_offsets = ctx.request_kv_length_offsets[:N].clone()
         slow_request_to_kv_block_ids_col0 = ctx.request_to_kv_block_ids[:N, 0].clone()
-        slow_token_to_block_idx = ctx.token_to_block_idx[:N].clone()
-        slow_token_to_local_pos = ctx.token_to_local_position_within_kv_block[:N].clone()
+        slow_token_to_block_idx = ctx.token_to_block_idx[:T].clone()
+        slow_token_to_local_pos = ctx.token_to_local_position_within_kv_block[:T].clone()
         if is_hybrid_model:
-            slow_token_to_request_idx = ctx.token_to_request_idx[:N].clone()
+            slow_token_to_request_idx = ctx.token_to_request_idx[:T].clone()
             slow_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N].clone()
 
         # --- reset and run fast path ---
@@ -1478,13 +1483,13 @@ class TestDynamicContext:
 
         # 3. Token-level state
         dummy_block_idx = ctx.block_allocator.dummy_block_idx
-        assert torch.all(ctx.token_to_block_idx[:N] == dummy_block_idx)
-        assert torch.equal(ctx.token_to_block_idx[:N], slow_token_to_block_idx)
-        assert torch.equal(ctx.token_to_local_position_within_kv_block[:N], slow_token_to_local_pos)
+        assert torch.all(ctx.token_to_block_idx[:T] == dummy_block_idx)
+        assert torch.equal(ctx.token_to_block_idx[:T], slow_token_to_block_idx)
+        assert torch.equal(ctx.token_to_local_position_within_kv_block[:T], slow_token_to_local_pos)
 
         if is_hybrid_model:
             # 4. token_to_request_idx
-            assert torch.equal(ctx.token_to_request_idx[:N], slow_token_to_request_idx)
+            assert torch.equal(ctx.token_to_request_idx[:T], slow_token_to_request_idx)
 
             # 5. Mamba state slots allocated (indices may differ, but must be valid and unique)
             fast_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N]
@@ -1531,7 +1536,7 @@ class TestDynamicContext:
         inference_config = InferenceConfig(
             max_sequence_length=128,
             buffer_size_gb=0.01,
-            block_size_tokens=32,
+            block_size_tokens=256,
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1584,9 +1589,9 @@ class TestDynamicContext:
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
         inference_config = InferenceConfig(
-            max_sequence_length=128,
-            buffer_size_gb=0.01,
-            block_size_tokens=4,  # Small block size to force boundary crossing
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=256,  # FA2-compatible block size to force boundary crossing
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1601,9 +1606,11 @@ class TestDynamicContext:
         ctx.request_query_lengths[0] = 1
         ctx.request_kv_block_counts[0] = 1
 
-        # Request is at offset 2. Adding 3 tokens (1 sampled + 2 spec) will cross boundary (2+3 = 5 > 4).
-        ctx.request_kv_length_offsets[0] = 2
-        ctx.request_last_kv_block_offset[0] = 2
+        # Length is 254, meaning existing tokens are at indices 0..253.
+        # The last inserted token was at offset 253.
+        # Adding 3 tokens places them at offsets 254, 255, and 256 (crosses block size of 256).
+        ctx.request_kv_length_offsets[0] = 254
+        ctx.request_last_kv_block_offset[0] = 253
 
         # Allocate one initial block manually
         blocks = ctx.block_allocator.allocate_memory_blocks(1)
@@ -1655,9 +1662,9 @@ class TestDynamicContext:
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
         inference_config = InferenceConfig(
-            max_sequence_length=128,
-            buffer_size_gb=0.01,
-            block_size_tokens=16,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=256,
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1670,11 +1677,11 @@ class TestDynamicContext:
         ctx.request_ids[:2] = torch.tensor([10, 11])
         ctx.request_query_lengths[:2] = 1
 
-        # Request 0 is at offset 14. Adding 1 sampled + 2 spec = 3 tokens will push it to 17,
-        # which is >= block_size_tokens (16). It will require a new block.
+        # Request 0 is at offset 254. Adding 1 sampled + 2 spec = 3 tokens will push it to 257,
+        # which is >= block_size_tokens (256). It will require a new block.
         # Request 1 is at offset 5. It will not require a new block.
-        ctx.request_kv_length_offsets[:2] = torch.tensor([14, 5])
-        ctx.request_last_kv_block_offset[:2] = torch.tensor([14, 5])
+        ctx.request_kv_length_offsets[:2] = torch.tensor([254, 5])
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([254, 5])
         ctx.request_kv_block_counts[:2] = 1
 
         # Allocate blocks
@@ -1715,6 +1722,110 @@ class TestDynamicContext:
         assert torch.equal(
             ctx.paused_speculative_tokens[:, 0], torch.tensor([991, 992], device='cuda')
         )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_speculative_tokens_less_than_block_size_assert(self):
+        self._setup_model_parallel_group(1, 1)
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=256,
+            num_speculative_tokens=256,
+            unified_memory_level=0,
+        )
+        with pytest.raises(
+            AssertionError, match="num_speculative_tokens.*must be < block_size_tokens"
+        ):
+            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_swap_book_keeping_tensors_with_speculative_tokens(self):
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=256,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        ctx.request_ids[:2] = torch.tensor([10, 11])
+        next_tokens = torch.tensor([99, 100], device='cuda')
+        new_speculative_tokens = torch.tensor([[991, 1001], [992, 1002]], device='cuda')
+
+        ctx._swap_book_keeping_tensors(
+            src_idxs=torch.tensor([0]),
+            dst_idxs=torch.tensor([1]),
+            next_tokens=next_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        assert torch.equal(ctx.request_ids[:2], torch.tensor([11, 10], device='cuda'))
+        assert torch.equal(next_tokens[:2], torch.tensor([100, 99], device='cuda'))
+        assert torch.equal(
+            new_speculative_tokens[:, :2], torch.tensor([[1001, 991], [1002, 992]], device='cuda')
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_with_finished_requests_and_speculative_tokens(self):
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=32,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        # Setup 3 active requests: req0 (active), req1 (finished), req2 (active)
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 3
+        ctx.request_ids[:3] = torch.tensor([10, 11, 12])
+        ctx.request_query_lengths[:3] = 1
+        ctx.request_kv_length_offsets[:3] = torch.tensor([5, 8, 12])
+        ctx.request_last_kv_block_offset[:3] = torch.tensor([5, 8, 12])
+        ctx.request_to_kv_block_ids[:3, 0] = torch.tensor([0, 1, 2])
+        ctx.request_last_kv_block_id[:3] = torch.tensor([0, 1, 2])
+        ctx.request_kv_block_counts[:3] = 1
+
+        active_requests_mask = torch.tensor([1, 0, 1], device='cuda')
+        new_tokens = torch.tensor([99, 100, 101], device='cuda')
+        new_speculative_tokens = torch.tensor([[991, 1001, 1011], [992, 1002, 1012]], device='cuda')
+
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # req1 is finished. req2 moves to req1's position.
+        assert ctx.total_request_count == 2
+        assert torch.equal(
+            ctx.request_ids[:2], torch.tensor([10, 12], device='cuda', dtype=torch.int32)
+        )
+
+        # Check interleaving for req0 and req2
+        # req0: [99, 991, 992]
+        # req2: [101, 1011, 1012]
+        expected_tokens = torch.tensor([99, 991, 992, 101, 1011, 1012], device='cuda')
+        assert torch.equal(ctx.token_to_input_ids[:6], expected_tokens)
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1776,6 +1887,79 @@ class TestDynamicContext:
             + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_chunked_prefill_swap_with_speculative_tokens(self):
+        """Test that swapping a chunked prefill request to the end of the buffer
+        correctly brings along the 2D speculative tokens for the other decode requests.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=32,
+            num_speculative_tokens=2,
+            enable_chunked_prefill=True,
+            unified_memory_level=0,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        # Setup 2 active requests in the WRONG order (violating the invariant)
+        # Index 0: Chunked Prefill Request (ID 42)
+        # Index 1: Standard Decode Request (ID 99)
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 2
+
+        ctx.chunked_prefill_request_id = 42
+        ctx.request_ids[:2] = torch.tensor([42, 99])
+
+        # Status: 1 = Prefill, 0 = Decode
+        ctx.request_in_prefill_status_tensor[:2] = torch.tensor([1, 0])
+        ctx.request_query_lengths[:2] = 1
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 20])
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([10, 20])
+        ctx.request_to_kv_block_ids[:2, 0] = torch.tensor([0, 1])
+        ctx.request_last_kv_block_id[:2] = torch.tensor([0, 1])
+        ctx.request_kv_block_counts[:2] = 1
+
+        active_requests_mask = torch.tensor([1, 1], device='cuda')
+
+        # New base tokens: [100 (for prefill), 200 (for decode)]
+        new_tokens = torch.tensor([100, 200], device='cuda')
+
+        # New spec tokens: Col 0 for prefill (dummy), Col 1 for decode (real draft tokens)
+        new_speculative_tokens = torch.tensor([[101, 201], [102, 202]], device='cuda')
+
+        # Trigger update_requests.
+        # It must detect ID 42 is at index 0, and swap it with index 1.
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # 1. Verify the IDs were swapped successfully
+        assert torch.equal(
+            ctx.request_ids[:2], torch.tensor([99, 42], dtype=torch.int32, device='cuda')
+        )
+
+        # 2. Verify the Decode request (now at Index 0) correctly flattened its
+        #    base token (200) AND its specific speculative tokens (201, 202).
+        # 3. Verify the Prefill request (now at Index 1) flattened its tokens (100, 101, 102).
+        expected_flattened_tokens = torch.tensor(
+            [200, 201, 202, 100, 101, 102],  # Decode request (ID 99)  # Prefill request (ID 42)
+            device='cuda',
+        )
+
+        assert torch.equal(
+            ctx.token_to_input_ids[:6], expected_flattened_tokens
+        ), "Speculative tokens were not correctly swapped alongside the chunked prefill request!"
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1896,6 +2080,8 @@ class TestDynamicContext:
             num_speculative_tokens=2,
             enable_prefix_caching=True,
             unified_memory_level=0,
+            max_requests=512,
+            max_tokens=512,
         )
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
@@ -1952,6 +2138,8 @@ class TestDynamicContext:
             num_speculative_tokens=2,
             enable_prefix_caching=True,
             unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
         )
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
@@ -1987,14 +2175,15 @@ class TestDynamicContext:
         # Set up request 0 for decode at offset that will cross block boundary.
         # Place at offset (block_size - 1) in last block so adding 3 tokens crosses.
         ctx.request_kv_length_offsets[0] = bs * 2 - 1  # one token from end of block 1
-        ctx.request_last_kv_block_offset[0] = bs - 1
+        # The local offset of index 6 is (6 % bs)
+        ctx.request_last_kv_block_offset[0] = bs - 2
         ctx.request_query_lengths[0] = 1
         ctx.request_in_prefill_status_tensor[0] = 0
         ctx.active_token_count = 2
 
-        active_mask = torch.tensor([1, 0], device='cuda', dtype=torch.int32)
-        new_tokens = torch.tensor([50], device='cuda')
-        new_spec = torch.tensor([[51], [52]], device='cuda')
+        active_mask = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
+        new_tokens = torch.tensor([50, 50], device='cuda')
+        new_spec = torch.tensor([[51, 51], [52, 52]], device='cuda')
 
         ctx.update_requests(
             active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
@@ -2128,3 +2317,284 @@ class TestDynamicContext:
         )
         _, _, kv_available = ctx.check_availability(req2)
         assert kv_available, "Matched blocks should not require pool allocation"
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prefix_match_exact_block_boundary(self):
+        """Test prefix matching when the shared prefix is an exact multiple of the block size."""
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            enable_prefix_caching=True,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        bs = ctx.block_size_tokens
+
+        # req1: 32 tokens (exactly 2 complete blocks)
+        prompt1 = torch.arange(bs * 2, device='cuda')
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+        ctx.add_request(req1)
+
+        # req2: 35 tokens (first 32 tokens match req1)
+        prompt2 = torch.arange(bs * 2 + 3, device='cuda')
+        req2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+        ctx.add_request(req2)
+
+        # req2 should have 3 blocks total
+        assert ctx.request_kv_block_counts[1].item() == 3
+
+        # The first 2 blocks should be shared
+        assert ctx.request_to_kv_block_ids[1, 0].item() == ctx.request_to_kv_block_ids[0, 0].item()
+        assert ctx.request_to_kv_block_ids[1, 1].item() == ctx.request_to_kv_block_ids[0, 1].item()
+
+        # The 3rd block should be a newly allocated pool block
+        assert ctx.request_to_kv_block_ids[1, 2].item() != ctx.request_to_kv_block_ids[0, 1].item()
+
+        # The offset points to the last token (index 34). In the 3rd block (indices 32-47), 34 is at offset 2.
+        assert ctx.request_last_kv_block_offset[1].item() == 2
+
+        # Effective query length should be 3 (35 total - 32 skipped)
+        assert ctx.request_query_lengths[1].item() == 3
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_eviction_with_shared_prefix_blocks(self):
+        """Test that evicting a request drops ref counts correctly without destroying shared blocks."""
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            enable_prefix_caching=True,
+            unified_memory_level=0,
+            paused_buffer_size_gb=0.0,  # 0 paused capacity to force immediate eviction
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        bs = ctx.block_size_tokens
+        prompt = torch.arange(bs * 2, device='cuda')
+
+        # Add req1 and req2 with identical prompts
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+        ctx.add_request(req1)
+
+        req2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+        ctx.add_request(req2)
+
+        shared_b0 = ctx.request_to_kv_block_ids[0, 0].item()
+        shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
+
+        # Both blocks should be safely shared with ref count 2
+        assert ctx.block_allocator.block_ref_counts[shared_b0].item() == 2
+
+        # Mock the state to make req1 paused and req2 active
+        ctx.paused_request_count = 1
+        ctx.total_request_count = 2
+        ctx.request_ids[0] = 1
+        ctx.request_ids[1] = 2
+        ctx.request_kv_block_counts[0] = 2
+        ctx.request_kv_block_counts[1] = 2
+
+        # Exhaust the active block allocator
+        ctx.block_allocator.total_avail = 0
+
+        # Trigger the eviction logic
+        # next_tokens must be sized to total_request_count (1 paused + 1 active = 2)
+        next_tokens = torch.tensor([50, 51], device='cuda')
+        evicted_ids = ctx.evict_overflow_paused_requests(
+            active_request_count=1, next_tokens=next_tokens
+        )
+
+        # req1 should be successfully evicted
+        assert evicted_ids is not None
+        assert evicted_ids[0].item() == 1
+
+        # req2 remains active, so the shared blocks should drop to a ref count of 1
+        assert ctx.block_allocator.block_ref_counts[shared_b0].item() == 1
+        assert ctx.block_allocator.block_ref_counts[shared_b1].item() == 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_oom_during_speculative_boundary_crossing(self):
+        """Test boundary crossing with speculative tokens pauses the request gracefully when KV cache is full, keeping other requests active."""
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        bs = ctx.block_size_tokens
+
+        # Setup 2 active requests.
+        # Request 0 is exactly 1 token away from its boundary (will OOM).
+        # Request 1 has plenty of space (will remain active).
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 2
+
+        ctx.request_ids[:2] = torch.tensor([10, 11], device='cuda')
+        ctx.request_query_lengths[:2] = 1
+        ctx.request_kv_block_counts[:2] = 1
+
+        # Request 0 offset is 15. Adding 1 sampled + 2 spec = 3 tokens crosses the boundary (16).
+        # Request 1 offset is 5. Adding 3 tokens = 8 (does not cross).
+        ctx.request_kv_length_offsets[:2] = torch.tensor(
+            [bs - 1, 5], device='cuda', dtype=torch.int32
+        )
+        ctx.request_last_kv_block_offset[:2] = torch.tensor(
+            [bs - 1, 5], device='cuda', dtype=torch.int32
+        )
+
+        blocks = ctx.block_allocator.allocate_memory_blocks(2)
+        ctx.request_to_kv_block_ids[0, 0] = blocks[0]
+        ctx.request_to_kv_block_ids[1, 0] = blocks[1]
+        ctx.request_last_kv_block_id[:2] = blocks
+
+        # Force OOM condition (no blocks left in the active pool)
+        ctx.block_allocator.total_avail = 0
+        ctx.block_allocator.paused_count = 100  # Prevent immediate eviction out of the system
+
+        active_mask = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
+        new_tokens = torch.tensor([99, 88], device='cuda')
+        new_spec = torch.tensor([[100, 200], [101, 201]], device='cuda')
+
+        # Run update requests
+        ctx.update_requests(
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
+        )
+
+        # Request 0 should detect OOM, fail to allocate a new block, and pause.
+        # Request 1 remains active, so active_request_count goes 2 -> 1, avoiding the deadlock assert.
+        assert ctx.paused_request_count == 1
+        assert ctx.total_request_count == 2
+
+        # Request 1 generated 3 tokens (1 sampled + 2 spec)
+        assert ctx.active_token_count == 3
+
+        # Tokens must be cached in the paused buffers so Request 0 can resume cleanly later
+        assert ctx.paused_tokens is not None
+        assert ctx.paused_tokens[0].item() == 99
+
+        assert ctx.paused_speculative_tokens is not None
+        assert ctx.paused_speculative_tokens[0, 0].item() == 100
+        assert ctx.paused_speculative_tokens[1, 0].item() == 101
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_chunked_prefill_meets_prefix_caching(self):
+        """Test that chunks in a chunked-prefill pipeline properly hit the prefix cache mid-flight."""
+        self._setup_model_parallel_group(1, 1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+        bs = ctx.block_size_tokens
+        prompt = torch.arange(128, device='cuda')
+
+        # Cache req1 (fully processed)
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+        ctx.add_request(req1)
+        req1_blocks = [ctx.request_to_kv_block_ids[0, i].item() for i in range(4)]
+
+        # Start chunked prefill for req2.
+        req2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=bs,
+            enable_prefix_caching=True,
+        )
+
+        # Add the first chunk (64 tokens)
+        req2.finished_chunk_token_count = 0
+        ctx.chunked_prefill_request_id = 2
+        ctx.add_request(req2, chunk_length=64)
+
+        # Assert the first chunk perfectly matched the first 2 cached blocks
+        assert ctx.request_to_kv_block_ids[1, 0].item() == req1_blocks[0]
+        assert ctx.request_to_kv_block_ids[1, 1].item() == req1_blocks[1]
+        assert ctx.request_kv_block_counts[1].item() == 2
+
+        # Simulate update_requests completing the chunk
+        ctx.active_token_count += 1
+        ctx.request_in_prefill_status_tensor[1] = 0
+
+        # Add the second chunk (64 tokens)
+        req2.finished_chunk_token_count = 64
+        ctx.add_request(req2, chunk_length=64)
+
+        # It should correctly discover the remaining prefix blocks despite being mid-prefill
+        assert ctx.request_to_kv_block_ids[1, 2].item() == req1_blocks[2]
+        assert ctx.request_to_kv_block_ids[1, 3].item() == req1_blocks[3]
+        assert ctx.request_kv_block_counts[1].item() == 4
+
+        # Verify block references updated appropriately
+        assert ctx.block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
+        assert ctx.block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
