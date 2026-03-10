@@ -98,7 +98,10 @@ class WeightedMultiTask(
                 )
             )
 
-        return cls(agent_configs)
+        instance = cls(agent_configs)
+        if parallel_generation_tasks is not None:
+            instance.parallel_generation_tasks = parallel_generation_tasks
+        return instance
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -199,7 +202,7 @@ class WeightedMultiTask(
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
-                    generation_batch_size=request.generation_batch_size,
+                    generation_batch_size=num_groups,
                     enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
