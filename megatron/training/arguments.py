@@ -2171,7 +2171,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
                        help='Scale mode for Muon optimizer. With MuP, set '
-                       '--muon-scale-mode unit_rms_norm for MuP-principled scaling, '
+                       '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
