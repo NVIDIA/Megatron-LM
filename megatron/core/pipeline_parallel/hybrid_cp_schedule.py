@@ -50,7 +50,11 @@ class BalancedCPScheduler:
         The number is rounded up to the next power of 2 to match the available
         hybrid context parallel process group sizes.
         """
-        return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
+        # HACK: HARDCODE MINIMUM CP SIZE TO 8 (TP8CP8 == EP64)
+        # CP8TP8 keeps comms within NVLink for Blackwell
+        # This is sufficient to get most of the benefits of HybridCP
+        # Also avoids Expert ranks going out of sync
+        return max(8, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
 
     def make_buckets_equal(
         self,
