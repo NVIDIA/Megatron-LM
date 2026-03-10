@@ -261,7 +261,7 @@ class CUDAGraphBatchDimensionBuilder:
             if rounded not in cuda_graph_token_counts:
                 cuda_graph_token_counts.append(rounded)
             val //= 2
-            if val < rounder:
+            if val < 1:
                 break
 
         # Ensure cuda_graph_max_tokens is always included
@@ -277,7 +277,7 @@ class CUDAGraphBatchDimensionBuilder:
         while len(cuda_graph_token_counts) > num_cuda_graphs:
             cuda_graph_token_counts.pop(-2)
 
-        assert len(cuda_graph_token_counts) == num_cuda_graphs
+        assert len(cuda_graph_token_counts) <= num_cuda_graphs
         assert cuda_graph_max_tokens in cuda_graph_token_counts
 
         return cuda_graph_token_counts
