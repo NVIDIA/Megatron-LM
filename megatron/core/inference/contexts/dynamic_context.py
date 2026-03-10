@@ -1382,7 +1382,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
-        self.token_to_local_position_within_kv_block[0:T] = 0
+        self.token_to_local_position_within_kv_block[0:T] = (
+            torch.arange(T, device=self.token_to_block_idx.device) % tokens_per_request
+        )
 
         if self.is_hybrid_model:
             # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.

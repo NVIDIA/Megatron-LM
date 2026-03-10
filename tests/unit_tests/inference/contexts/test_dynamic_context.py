@@ -1536,7 +1536,7 @@ class TestDynamicContext:
         inference_config = InferenceConfig(
             max_sequence_length=128,
             buffer_size_gb=0.01,
-            block_size_tokens=32,
+            block_size_tokens=256,
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1589,9 +1589,9 @@ class TestDynamicContext:
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
         inference_config = InferenceConfig(
-            max_sequence_length=128,
-            buffer_size_gb=0.01,
-            block_size_tokens=4,  # Small block size to force boundary crossing
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=256,  # FA2-compatible block size to force boundary crossing
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1606,11 +1606,11 @@ class TestDynamicContext:
         ctx.request_query_lengths[0] = 1
         ctx.request_kv_block_counts[0] = 1
 
-        # Length is 2, meaning existing tokens are at indices 0 and 1.
-        # The last inserted token was at offset 1.
-        # Adding 3 tokens places them at offsets 2, 3, and 4 (crosses block size of 4).
-        ctx.request_kv_length_offsets[0] = 2
-        ctx.request_last_kv_block_offset[0] = 1
+        # Length is 254, meaning existing tokens are at indices 0..253.
+        # The last inserted token was at offset 253.
+        # Adding 3 tokens places them at offsets 254, 255, and 256 (crosses block size of 256).
+        ctx.request_kv_length_offsets[0] = 254
+        ctx.request_last_kv_block_offset[0] = 253
 
         # Allocate one initial block manually
         blocks = ctx.block_allocator.allocate_memory_blocks(1)
@@ -1662,9 +1662,9 @@ class TestDynamicContext:
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
         inference_config = InferenceConfig(
-            max_sequence_length=128,
-            buffer_size_gb=0.01,
-            block_size_tokens=16,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=256,
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
@@ -1677,11 +1677,11 @@ class TestDynamicContext:
         ctx.request_ids[:2] = torch.tensor([10, 11])
         ctx.request_query_lengths[:2] = 1
 
-        # Request 0 is at offset 14. Adding 1 sampled + 2 spec = 3 tokens will push it to 17,
-        # which is >= block_size_tokens (16). It will require a new block.
+        # Request 0 is at offset 254. Adding 1 sampled + 2 spec = 3 tokens will push it to 257,
+        # which is >= block_size_tokens (256). It will require a new block.
         # Request 1 is at offset 5. It will not require a new block.
-        ctx.request_kv_length_offsets[:2] = torch.tensor([14, 5])
-        ctx.request_last_kv_block_offset[:2] = torch.tensor([14, 5])
+        ctx.request_kv_length_offsets[:2] = torch.tensor([254, 5])
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([254, 5])
         ctx.request_kv_block_counts[:2] = 1
 
         # Allocate blocks
@@ -1733,8 +1733,8 @@ class TestDynamicContext:
         inference_config = InferenceConfig(
             max_sequence_length=128,
             buffer_size_gb=0.01,
-            block_size_tokens=16,
-            num_speculative_tokens=16,
+            block_size_tokens=256,
+            num_speculative_tokens=256,
             unified_memory_level=0,
         )
         with pytest.raises(
@@ -1753,7 +1753,7 @@ class TestDynamicContext:
         inference_config = InferenceConfig(
             max_sequence_length=128,
             buffer_size_gb=0.01,
-            block_size_tokens=32,
+            block_size_tokens=256,
             num_speculative_tokens=2,
             unified_memory_level=0,
         )
