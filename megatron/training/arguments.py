@@ -2304,6 +2304,9 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+    group.add_argument('--rl-use-responses-api', action='store_true', default=False,
+                        help='Use the OpenAI Responses API (async submit+poll) instead of '
+                             'Chat Completions for RL inference requests.')
     return parser
 
 def _add_training_args(parser):
