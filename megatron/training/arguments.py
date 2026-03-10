@@ -586,20 +586,15 @@ def validate_args(args, defaults={}):
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
     if args.hybrid_layer_pattern is not None:
-        # Derive num_layers from pattern
+        # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
+        # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
-        if args.num_layers is not None:
-            if used_hybrid_override_pattern:
-                assert args.num_layers == num_layers_in_pattern, (
-                    f'--num-layers ({args.num_layers}) does not match the number of layers '
-                    f'derived from --hybrid-override-pattern ({num_layers_in_pattern}). '
-                    f'Please correct --num-layers or the pattern.'
-                )
-            else:
-                assert False, (
-                    'If --hybrid-layer-pattern is specified, --num-layers should not be specified. '
-                    'The number of layers is derived from the pattern.'
-                )
+        if args.num_layers is not None and args.num_layers != num_layers_in_pattern:
+            warn_rank_0(
+                f'--hybrid-layer-pattern is set; ignoring --num-layers ({args.num_layers}) and '
+                f'using the layer count derived from the pattern ({num_layers_in_pattern}).',
+                args.rank,
+            )
         args.num_layers = num_layers_in_pattern
 
         # first/last pipeline num layers are incompatible with pipe-separated patterns
@@ -2304,6 +2299,9 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+    group.add_argument('--rl-inference-parsers', nargs='*', default=[],
+                       help='List of response parsers to enable for RL inference '
+                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
     return parser
 
 def _add_training_args(parser):
