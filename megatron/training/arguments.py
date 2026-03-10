@@ -1437,9 +1437,6 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
-        if args.muon_scale_mode is None:
-            args.muon_scale_mode = 'spectral'
-
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
