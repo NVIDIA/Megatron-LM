@@ -20,6 +20,9 @@ class MimoModelConfig:
             Dictionary mapping modality names to their special token IDs.
             For example, {"vision": -200, "audio":32000}, these represent placeholders
             in the input_ids to insert the modality embeddings at the correct positions.
+        kv_format (str):
+            Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
+            Default is "sbhd".
     """
 
     warnings.warn(
@@ -32,3 +35,4 @@ class MimoModelConfig:
     language_model_spec: ModuleSpec = field(default_factory=ModuleSpec)
     modality_submodules_spec: Dict[str, ModuleSpec] = field(default_factory=dict)
     special_token_ids: Dict[str, int] = field(default_factory=dict)
+    kv_format: str = "sbhd"
