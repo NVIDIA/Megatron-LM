@@ -1688,10 +1688,12 @@ class ParamAndGradBuffer:
             )
             # Select the communicator groups to register FSDP buffers.
             self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            #TODO: need to enable registration for all comm groups for the best performance
-            # Currernlty we are not supporting symmetric registration for other groups.
-            # For now, we only allow to register buffer to other groups when symmetric
-            # registration is disabled. We will support it in the future.
+            # TODO(@youngeunkwon0405, @cspades): Need to enable NCCL UBR for all comm
+            # groups for optimal performance. Currently not supporting symmetric
+            # registration for all other groups unless symmetric registration is disabled,
+            # i.e. only the main / backward AG group is registered with NCCL.
+            # Possibly caused by NCCL registration order, DP-Inner / NVLink communication
+            # groups should be registered before DP-Outer / IB communication groups.
             if self.ddp_config.disable_symmetric_registration:
                 if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
                     # Expert-DP group when using EP
