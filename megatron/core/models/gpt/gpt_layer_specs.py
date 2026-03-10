@@ -110,7 +110,7 @@ def get_gpt_layer_with_inference_submodules(
             else backend.column_parallel_linear()
         )
         return TransformerLayerSubmodules(
-            input_layernorm=backend.layer_norm(),
+            input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -244,7 +244,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             else backend.column_parallel_linear()
         )
         return TransformerLayerSubmodules(
-            input_layernorm=backend.layer_norm(),
+            input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -261,7 +261,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         )
@@ -284,7 +284,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
@@ -345,10 +345,10 @@ def get_gpt_layer_local_submodules(
         backend = LocalSpecProvider()
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
-        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False)
+        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
         qk_norm = backend.layer_norm(rms_norm=True, for_qk=True)
     else:
-        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False)
+        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False, has_residual=True)
         qk_norm = backend.layer_norm(rms_norm=False, for_qk=True)
 
     if fp8 is not None:
