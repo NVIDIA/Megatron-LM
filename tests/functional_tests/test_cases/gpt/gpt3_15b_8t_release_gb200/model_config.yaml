@@ -4,6 +4,7 @@ ENV_VARS:
   NON_DETERMINSTIC_RESULTS: 1
   NVTE_NORM_FWD_USE_CUDNN: 1
   NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_FUSED_ATTN: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   USE_MNNVL: 1
 TEST_TYPE: "release"
@@ -12,9 +13,11 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 4
   --pipeline-model-parallel-size: 2
+  --num-layers-per-virtual-pipeline-stage: 8
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
+  --tp-comm-overlap: true
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true
@@ -24,6 +27,8 @@ MODEL_ARGS:
   --global-batch-size: 1152
   --train-samples: 19531250
   --manual-gc: true
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: te
   # Transformer Engine args
   --transformer-impl: transformer_engine
   # Data args
