@@ -758,3 +758,143 @@ class TestEngineScheduling(PrefixCachingTestBase):
         assert ctx.total_request_count == 1
         assert len(engine.waiting_request_ids) == 1
         assert engine._prefix_coordination_waits == 1
+
+
+# =========================================================================
+# Class 9: TestHybridModelMemoryOnly (4 tests)
+# =========================================================================
+
+
+class TestHybridModelMemoryOnly(PrefixCachingTestBase):
+    """Hybrid models disable prefill skipping but still share blocks for memory savings."""
+
+    def _hybrid_ctx(self, **kwargs):
+        """Create a context with a hybrid (Transformer + Mamba) model config."""
+        from megatron.core.inference.config import MambaInferenceStateConfig
+
+        params_dtype = torch.float32
+
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list=["*", "M", "*", "M"],
+            conv_states_shape=(4, 8),
+            ssm_states_shape=(4, 16),
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+        )
+
+        defaults = dict(
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_sequence_length=512,
+            rounder=64,
+            enable_prefix_caching=True,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        )
+        defaults.update(kwargs)
+
+        DynamicInferenceContext.ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
+        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
+
+        transformer_config = TransformerConfig(
+            params_dtype=params_dtype,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            hidden_size=16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_cpu_initialization=True,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=defaults["max_sequence_length"],
+            buffer_size_gb=defaults["buffer_size_gb"],
+            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
+            block_size_tokens=defaults["block_size_tokens"],
+            max_tokens=defaults.get("max_tokens"),
+            mamba_inference_state_config=mamba_config,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+            enable_prefix_caching=defaults["enable_prefix_caching"],
+            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
+        )
+        return DynamicInferenceContext(
+            model_config=transformer_config, inference_config=inference_config
+        )
+
+    @pytest.mark.internal
+    def test_no_prefill_skipping_for_hybrid_model(self):
+        """prefix_skip_tokens == 0 and effective_chunk_length == chunk_length even when blocks match."""
+        ctx = self._hybrid_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)
+
+        assert ctx.is_hybrid_model
+
+        # First request: registers blocks.
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Second request: blocks match, but hybrid model forces no skipping.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        (matched, num_from_pool, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
+            req2, len(prompt)
+        )
+        assert len(matched) == 3, "should find 3 matching blocks"
+        assert prefix_skip == 0, "hybrid model must not skip prefill tokens"
+        assert eff_chunk == len(prompt), "effective chunk must equal full prompt length"
+
+    @pytest.mark.internal
+    def test_matched_blocks_reused_saving_memory(self):
+        """Second hybrid request reuses matched blocks (fewer allocated from pool)."""
+        ctx = self._hybrid_ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        avail_after_first = alloc.total_avail
+
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        avail_after_second = alloc.total_avail
+
+        # Second request should not consume any additional blocks from pool.
+        assert avail_after_second == avail_after_first
+
+    @pytest.mark.internal
+    def test_ref_counts_incremented_for_matched_blocks(self):
+        """Matched blocks have ref_count == 2 after two hybrid requests share them."""
+        ctx = self._hybrid_ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        first_blocks = self._block_ids(ctx, 0, 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        for bid in first_blocks:
+            assert alloc.block_ref_counts[bid].item() == 2
+
+    @pytest.mark.internal
+    def test_all_prompt_tokens_in_context(self):
+        """All prompt tokens are processed (not skipped) for hybrid model requests."""
+        ctx = self._hybrid_ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+
+        # First request registers blocks.
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+        tokens_after_first = ctx.active_token_count
+
+        # Second request: even with matching blocks, all tokens must be processed.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(req2)
+
+        # All prompt tokens from req2 should be active (none skipped).
+        assert ctx.active_token_count - tokens_after_first == len(prompt)
+
+        # KV offset should be 0 (no prefix skip).
+        assert ctx.request_kv_length_offsets[1].item() == 0
