@@ -100,7 +100,6 @@ dev = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -124,7 +123,6 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -183,7 +181,6 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
-    "nv-grouped-gemm",
     "flash_mla",
     "mamba-ssm",
     "transformer-engine",
