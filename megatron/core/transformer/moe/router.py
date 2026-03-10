@@ -443,9 +443,14 @@ class TopKRouter(Router):
             fused=self.config.moe_router_fusion,
         )
 
+        # `global_aux_loss` uses DP-aggregated tokens_per_expert, while router probs remain
+        # local to each rank. Scale only by DP so the coefficient matches aux_loss semantics.
+        dp_size = self.tp_dp_cp_group.size() // self.tp_cp_group.size()
+        global_aux_loss = global_aux_loss * dp_size
+
         probs = self.attach_and_log_load_balancing_loss(
             probs,
-            global_aux_loss_coeff,
+            global_aux_loss_coeff * dp_size,
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
@@ -457,7 +462,7 @@ class TopKRouter(Router):
     def attach_and_log_load_balancing_loss(
         self,
         activation: torch.Tensor,
-        aux_loss_coeff: float,
+        normalize_scale: float,
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
@@ -468,7 +473,8 @@ class TopKRouter(Router):
 
         Args:
             activation (torch.Tensor): Activation tensor to attach the aux loss to.
-            aux_loss_coeff (float): Coefficient for the aux loss.
+            normalize_scale (float): Scale factor to normalize aux_loss for logging.
+                The logged value is `aux_loss / normalize_scale`.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
@@ -502,22 +508,17 @@ class TopKRouter(Router):
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
-            aux_loss / aux_loss_coeff,
+            aux_loss / normalize_scale,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
             needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
-            # Scale the aux_loss by the number of tokens.
-            # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
-            # After commit 02648000, Megatron started using the number of total tokens to scale
-            # gradients under the argument of calculate_per_token_loss,
-            # which scales both the main_loss gradient and aux_loss gradient by
-            # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
-            # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
-            # Use valid_token_count (excluding padding) if provided, otherwise use total tokens.
+            # Match the non-per-token aux_loss baseline by converting the local mean-style
+            # aux loss to the TP/CP-wide token sum before final per-token normalization.
             num_tokens = valid_token_count if valid_token_count is not None else activation.shape[0]
+            num_tokens = num_tokens * self.tp_cp_group.size()
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * num_tokens)
         else:
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
@@ -541,15 +542,9 @@ class TopKRouter(Router):
             moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
             z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
             if self.calculate_per_token_loss:
-                # The expected final scaling for z_loss gradients is
-                # 1/(num_micro_batches * dp_size).
-                # After commit 02648000, Megatron started using the number of total tokens
-                # to scale gradients under the argument of calculate_per_token_loss,
-                # which scales both the main_loss gradient and z_loss gradient by
-                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
-                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
-                # Count valid tokens: sum of inverted mask (False -> True = valid)
+                # Keep z_loss on the same scale as the non-per-token baseline.
                 num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                num_tokens = num_tokens * self.tp_cp_group.size()
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)

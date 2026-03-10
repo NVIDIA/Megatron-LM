@@ -472,6 +472,73 @@ class TestRouterAuxLoss:
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
+    def test_global_aux_loss_gradient_scale(self, tp_size, ep_size, cp_size):
+        """Test that global_aux_loss produces the same router gradient as aux_loss
+        when all DP ranks receive identical input.
+
+        See: https://github.com/NVIDIA/Megatron-LM/issues/3672
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(42)
+
+        aux_loss_router = self.new_router(
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        ).cuda()
+        global_aux_loss_router = self.new_router(
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        ).cuda()
+
+        # Set identical weights
+        with torch.no_grad():
+            global_aux_loss_router.weight.copy_(aux_loss_router.weight)
+
+        # Create identical input across all DP ranks using a fixed seed
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            (32, 1, aux_loss_router.config.hidden_size),
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+        )
+
+        # Forward + backward for aux_loss router (zero out main grad, isolate aux loss grad)
+        clear_aux_losses_tracker()
+        aux_loss_router.weight.grad = None
+        scores1, _ = aux_loss_router(hidden_states)
+        scores1.backward(torch.zeros_like(scores1))
+        grad1 = aux_loss_router.weight.grad.clone()
+
+        # Forward + backward for global_aux_loss router
+        clear_aux_losses_tracker()
+        global_aux_loss_router.weight.grad = None
+        scores2, _ = global_aux_loss_router(hidden_states)
+        scores2.backward(torch.zeros_like(scores2))
+        grad2 = global_aux_loss_router.weight.grad.clone()
+
+        assert torch.equal(grad1, grad2), (
+            f"global_aux_loss gradient should match aux_loss gradient with identical input. "
+            f"Max diff: {(grad1 - grad2).abs().max().item()}"
+        )
+        clear_aux_losses_tracker()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
     def test_combined_aux_loss(self, tp_size, ep_size, cp_size):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
