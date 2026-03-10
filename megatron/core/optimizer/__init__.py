@@ -162,10 +162,9 @@ def get_mup_config_overrides(
                 logger,
                 logging.WARNING,
                 "Both MuP and muon_scale_mode=spectral are enabled. "
-                "This configuration is supported, but Muon-managed matrix parameters will "
-                "continue using spectral Muon scaling instead of MuP-principled "
-                "unit_rms_norm scaling. To use MuP-principled Muon scaling, explicitly "
-                "set --muon-scale-mode unit_rms_norm.",
+                "Muon-managed matrix parameters will continue using spectral Muon scaling. "
+                "Set --muon-scale-mode unit_rms_norm to use unit_rms_norm scaling for "
+                "Muon-managed matrices with MuP.",
             )
 
     if mup_width_mult == 1.0:

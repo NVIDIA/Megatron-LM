@@ -585,7 +585,6 @@ class TestMuPOptimizerTypeHandling:
         assert len(overrides) == 1
         assert any(
             "Both MuP and muon_scale_mode=spectral are enabled." in rec.message
-            and "This configuration is supported" in rec.message
             and "--muon-scale-mode unit_rms_norm" in rec.message
             for rec in caplog.records
         )
