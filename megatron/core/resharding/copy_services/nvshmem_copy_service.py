@@ -17,12 +17,13 @@ logger = logging.getLogger(__name__)
 class NVSHMEMCopyService(CopyService):
     """CopyService implementation backed by NVSHMEM RemoteCopyService."""
 
-    def __init__(self):
+    def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
 
-        self.rank = dist.get_rank()
-        self._remote = RemoteCopyService()
+        self._group = group
+        self.rank = group.rank() if group is not None else dist.get_rank()
+        self._remote = RemoteCopyService(group=group)
         # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
 
@@ -162,10 +163,11 @@ class NVSHMEMCopyService(CopyService):
             self._local_recv_ops.clear()
 
         # 2) Execute remote schedule (if any remote sends/recvs were registered).
-        if not self._remote.send_requests and not self._remote.receive_requests:
-            logger.info("NVSHMEMCopyService: no remote requests; local copies complete")
-            return
-
+        # NOTE: ALL ranks must call schedule() and run() because they contain collective
+        # operations that require all ranks to participate:
+        #  - schedule() has dist.all_gather_object() (torch distributed collective)
+        #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
+        # This is critical for non-collocated refit where some ranks may have no work.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()

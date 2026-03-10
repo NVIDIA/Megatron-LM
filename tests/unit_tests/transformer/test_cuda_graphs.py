@@ -23,6 +23,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
+from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -37,6 +38,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -327,6 +329,7 @@ class TestLLaVACudaGraph:
         # Get layer specs
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
+        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         # Set vision model type
@@ -472,12 +475,13 @@ class TestParallelMambaBlockCudagraphs:
         def get_pg_collection():
             return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-        def get_mamba_block(hybrid_override_pattern):
+        def get_mamba_block(hybrid_layer_pattern):
+            layer_type_list = validate_segment_layers(hybrid_layer_pattern)
             transformer_config = TransformerConfig(
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 # Need to specify num_attention_heads and num_layers or TransformerConfig
                 # will generate errors.
-                num_layers=len(hybrid_override_pattern),
+                num_layers=len(layer_type_list),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
@@ -486,11 +490,12 @@ class TestParallelMambaBlockCudagraphs:
             return MambaStack(
                 transformer_config,
                 modules,
-                hybrid_override_pattern=hybrid_override_pattern,
+                layer_type_list=layer_type_list,
+                pp_layer_offset=0,
                 pg_collection=get_pg_collection(),
             )
 
-        self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
+        self.mamba_block = get_mamba_block(hybrid_layer_pattern="M-M*-")
         self.transformer_config = self.mamba_block.config
 
     def teardown_method(self, method):

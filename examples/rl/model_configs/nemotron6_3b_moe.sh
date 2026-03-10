@@ -58,7 +58,6 @@ MODEL_OPTIONS="\
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
-  --rl-offload-optimizer-during-inference \
   --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
@@ -104,7 +103,7 @@ MODEL_OPTIONS="\
   --tiktoken-pattern v2 \
   --tokenizer-type TikTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
-  --dist-ckpt-strictness log_unexpected
+  --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \
   --ckpt-fully-parallel-load \
@@ -118,5 +117,4 @@ MODEL_OPTIONS="\
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
-  --no-load-rng \
-  "
+  --no-load-rng "

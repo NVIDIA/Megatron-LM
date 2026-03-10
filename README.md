@@ -5,8 +5,8 @@ Megatron-LM and Megatron Core
 
 <h4>GPU-optimized library for training transformer models at scale</h4>
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/Megatron-Core/developer-guide/latest/index.html)
-[![version](https://img.shields.io/badge/release-0.12.0-green)](./CHANGELOG.md)
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+[![version](https://img.shields.io/badge/release-0.15.0-green)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
 
 <div align="left">
@@ -22,23 +22,29 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
 
 
-## Quick Start
+## Getting Started
 
-Install Megatron Core with pip:
+**Install from PyPI:**
 
-1. Install Megatron Core with required dependencies:
+```bash
+uv pip install megatron-core
+```
 
-    ```bash
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
+**Or clone and install from source:**
 
-2. Clone repository for examples:
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+uv pip install -e .
+```
 
-    ```bash
-    git clone https://github.com/NVIDIA/Megatron-LM.git
-    cd Megatron-LM
-    pip install --no-build-isolation .[mlm,dev]
-    ```
+> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
+
+For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
+
+- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
+- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
+- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 
 # Latest News
@@ -60,8 +66,6 @@ Install Megatron Core with pip:
 - **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
 
 </details>
-
-
 
 
 # Project Structure
@@ -88,7 +92,6 @@ Megatron-LM/
 ├── tests/                       # Comprehensive test suite
 └── docs/                        # Documentation
 ```
-
 
 
 # Performance Benchmarking
@@ -127,19 +130,16 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 ![Strong scaling](images/strong_scaling.png)
 
 
-
-
-
-
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
+
 
 # Resources
 
 ## Getting Help
 
-- 📖 **[Documentation](https://docs.nvidia.com/Megatron-Core/)** - Official documentation
+- 📖 **[Documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** - Official documentation
 - 🐛 **[Issues](https://github.com/NVIDIA/Megatron-LM/issues)** - Bug reports and feature requests
 
 ## Contributing
@@ -151,7 +151,7 @@ We ❤️ contributions! Ways to contribute:
 - 📝 **Improve docs** - Make Megatron Core more accessible
 - 🔧 **Submit PRs** - Contribute code improvements
 
-**→ [Contributing Guide](./CONTRIBUTING.md)**
+**→ [Contributing Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)**
 
 ## Citation
 

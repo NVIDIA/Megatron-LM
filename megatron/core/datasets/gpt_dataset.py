@@ -50,9 +50,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
-    context_parallel_size: int = 1
-    """Option to enable context parallelism"""
-
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
@@ -340,7 +337,7 @@ class GPTDataset(MegatronDataset):
             sample_parts.append(
                 self.dataset.get(
                     self.document_index[doc_index_beg],
-                    offset=doc_index_beg_offset,
+                    offset=int(doc_index_beg_offset),
                     length=doc_index_end_offset
                     - doc_index_beg_offset
                     + self.config.add_extra_token_to_sequence,
@@ -361,7 +358,7 @@ class GPTDataset(MegatronDataset):
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
                 sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=offset, length=length)
+                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )
         assert len(document_ids) == len(
             sample_parts

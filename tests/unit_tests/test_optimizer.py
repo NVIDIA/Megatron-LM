@@ -529,6 +529,136 @@ def test_precision_aware_optimizer(
     test_optim.load_state_dict(state_dict)
 
 
+@pytest.mark.parametrize("use_precision_aware", [True, False])
+def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
+    """Test that save/load of distributed optimizer handles non-tensor state entries.
+
+    Optimizers may store non-tensor entries (e.g. `found_inf: bool`) in the per-parameter
+    state dict. The distrib_optimizer's _get_main_param_and_optimizer_states and
+    _set_main_param_and_optimizer_states must skip these to avoid crashes when calling
+    tensor operations (.copy_(), get_unscaled_state, set_scaled_state) on non-tensors.
+
+    Tests both the precision-aware path (TE FusedAdam with scaled states) and the
+    non-precision-aware path (standard optimizer with .copy_()).
+    """
+    if use_precision_aware:
+        try:
+            from transformer_engine.pytorch.optimizers import FusedAdam
+        except ImportError:
+            pytest.skip("TE FusedAdam not available")
+
+        import inspect
+
+        adam_args = inspect.signature(FusedAdam).parameters
+        arg_names = [
+            "master_weight_dtype",
+            "exp_avg_dtype",
+            "exp_avg_sq_dtype",
+            "use_decoupled_grad",
+        ]
+        for name in arg_names:
+            if name not in adam_args:
+                pytest.skip("TE FusedAdam does not support precision-aware args")
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=use_precision_aware,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a training step to populate optimizer state
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Access the underlying distrib_optimizer
+    distrib_optim = optim.chained_optimizers[0]
+    if use_precision_aware:
+        assert distrib_optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    # Inject non-tensor entries into optimizer state (simulates found_inf, etc.)
+    inner_optimizer = distrib_optim.optimizer
+    for param in inner_optimizer.state:
+        inner_optimizer.state[param]['found_inf'] = False
+        inner_optimizer.state[param]['non_tensor_int'] = 42
+
+    # Test 1: _get_main_param_and_optimizer_states should skip non-tensor entries
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    for k, v in tensors.items():
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor value for key '{k}': {type(v)}"
+
+    # Test 2: Full save/load roundtrip via dp_reshardable path
+    saved_state = distrib_optim.get_parameter_state_dp_reshardable()
+
+    # Verify saved state doesn't contain non-tensor entries (except metadata keys)
+    metadata_keys = {"per_bucket_numel", "per_bucket_numel_unpadded"}
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    for k, v in param_dict.items():
+                        if k in ('gbuf_local_start', 'gbuf_local_end', 'padding'):
+                            continue
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor in saved state key '{k}': {type(v)}"
+
+    # Test 3: load_parameter_state_from_dp_reshardable should not crash
+    # Add 'padding' key required by the load path (normally added by fully_reshardable save)
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['padding'] = False
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
+
+    # Test 4: Inject non-tensor entries directly into the saved state and verify load handles them
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['found_inf'] = False
+                    param_dict['step_count'] = 42
+
+    # This should not crash - non-tensor entries should be skipped
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
 def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):

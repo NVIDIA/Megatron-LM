@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from examples.inference.gpt.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
@@ -27,6 +28,22 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 # pylint: disable=line-too-long
 
 logging.basicConfig(level=logging.INFO, force=True)
+
+
+async def suspend_resume_cycle(client, engine, args, futures):
+    """Wait for all in-flight requests, then suspend/train/resume."""
+    await asyncio.gather(*futures)
+
+    client.pause_engines()
+    await engine.wait_until(EngineState.PAUSED)
+    client.suspend_engines()
+    await engine.wait_until(EngineState.SUSPENDED)
+    if args.suspend_timeout > 0:
+        await asyncio.sleep(args.suspend_timeout)
+    client.resume_engines()
+    await engine.wait_until(EngineState.RESUMED)
+    client.unpause_engines()
+    await engine.wait_until(EngineState.RUNNING)
 
 
 async def main(
@@ -46,40 +63,30 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
     # leaving inference_coordinator_port as None will find a free port automatically.
+    args = get_args()
+
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
+        coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
 
-    args = get_args()
-
-    # Test suspend/resume intervals.
-    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
-        # Since the client doesn't directly call engine.async_step here, we test
-        # the suspend-resume system ~4 times.
-        suspend_resume_interval = max(1, len(requests) // 4)
-        suspend_idxs = set(
-            range(suspend_resume_interval, len(requests) + 1, suspend_resume_interval)
-        )
-        resume_idxs = set(
-            min(len(requests), i + suspend_resume_interval // 2) for i in suspend_idxs
-        )
-    else:
-        suspend_idxs = set()
-        resume_idxs = set()
+    # All ranks agree on the number of suspend/resume cycles from args.
+    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
 
     # Create client and run example.
     if dist.get_rank() == 0:
         client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
-        await client.start()
+        client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
             request.time_arrival = request.time_offset + base_arrival_time
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")
-        # time.sleep(20)
+        next_suspend_at = args.suspend_resume_interval or 0
+        cycles_done = 0
+
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -95,11 +102,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    # Test suspend/resume.
-                    if num_requests_added in suspend_idxs:
-                        client.suspend_engines()
-                    if num_requests_added in resume_idxs:
-                        client.resume_engines()
+                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                        await suspend_resume_cycle(client, engine, args, futures)
+                        cycles_done += 1
+                        next_suspend_at += args.suspend_resume_interval
 
             else:
                 # Add deterministic number of requests (generally used for debugging).
@@ -113,11 +119,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    # Test suspend/resume.
-                    if num_requests_added in suspend_idxs:
-                        client.suspend_engines()
-                    if num_requests_added in resume_idxs:
-                        client.resume_engines()
+                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                        await suspend_resume_cycle(client, engine, args, futures)
+                        cycles_done += 1
+                        next_suspend_at += args.suspend_resume_interval
 
             if num_requests_added == num_requests_total:
                 break
@@ -126,6 +131,13 @@ async def main(
 
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+    else:
+        # Non-rank-0: match the suspend/resume cycles that rank 0 drives.
+        for _ in range(num_suspend_resume_cycles):
+            await engine.wait_until(EngineState.PAUSED)
+            await engine.wait_until(EngineState.SUSPENDED)
+            await engine.wait_until(EngineState.RESUMED)
+            await engine.wait_until(EngineState.RUNNING)
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -145,6 +157,9 @@ async def main(
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)
+                if req.routing_indices is not None:
+                    result_dict["routing_indices"] = req.routing_indices.tolist()
+                                
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
@@ -169,14 +184,19 @@ async def main(
                     )
                 )
 
-        # kill the engines and suspend the client
-        # Right now, we can only call stop when all requests are done.
-        # Todo: Make this explicit in the Client class....
-        await client.stop_engines()
-        client.stop()
+        # Pause before stopping: STOP requires PAUSED or SUSPENDED state.
+        client.pause_engines()
 
-    # once the stop signal eventually makes its way to each GPU, the engines will stop.
-    await asyncio.gather(engine.engine_loop_task)
+    await engine.wait_until(EngineState.PAUSED)
+
+    if dist.get_rank() == 0:
+        client.stop_engines()
+
+    await engine.wait_until(EngineState.STOPPED)
+
+    if dist.get_rank() == 0:
+        client.shutdown_coordinator()
+        client.stop()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 
 
@@ -206,9 +226,7 @@ if __name__ == "__main__":
 
         model = get_model_for_inference()
 
-        requests = (
-            build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
-        )
+        requests = build_requests(args, tokenizer, sampling_params)
 
         engine = get_dynamic_inference_engine(model=model)
 
