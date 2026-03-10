@@ -78,11 +78,14 @@ class SharedExpertMLP(MLP):
             )
             if not shared_experts_recompute:
                 try:
-                    HAVE_TE = True
+                    import transformer_engine  # pylint: disable=unused-import
+
                     from megatron.core.extensions.transformer_engine import (
                         TELinear,
                         set_save_original_input,
                     )
+
+                    HAVE_TE = True
                 except ImportError:
                     HAVE_TE = False
                     TELinear, set_save_original_input = None, None

@@ -52,6 +52,8 @@ except:
 
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,

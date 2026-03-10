@@ -17,6 +17,8 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.typed_torch import not_none
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
