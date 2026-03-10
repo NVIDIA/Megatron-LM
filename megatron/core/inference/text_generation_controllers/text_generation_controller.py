@@ -1309,6 +1309,201 @@ class TextGenerationController:
             only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
 
+    def _dynamic_step_calculate_log_probs_speculative(
+        self, logits: Tensor
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs from logits for speculative decoding.
+
+        For decode requests, computes log probs for each accepted speculative token
+        and the newly sampled token using the main model logits. For prefill requests,
+        handles prompt log probs the same way as non-speculative decoding.
+
+        The main model logits at position j predict the token at position j+1. So:
+        - log_prob(accepted_token[j]) comes from logits at position j
+        - log_prob(newly_sampled_token) comes from logits at position accepted_count
+
+        Args:
+            logits (Tensor): The main model logits [1, seq_len, vocab_size].
+
+        Returns:
+            Tuple of (log_probs_list, log_probs_tensor):
+                log_probs_list: List of lists, one per active request, containing
+                    log probs for the tokens emitted in this step.
+                log_probs_tensor: Full log_softmax tensor for top-n computation.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
+            context.paused_request_count : context.total_request_count
+        ]
+        request_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        logits_squeezed = logits.squeeze(0).float()
+        log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+
+        log_probs_list_decode = []
+
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            decode_log_probs = log_probs_tensor[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1, -1
+            )
+            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+
+            # Build a [num_decode, num_spec+1] token ID matrix for gathering.
+            # Columns 0..num_spec-1 hold accepted speculative tokens (clamped to 0
+            # where rejected, since those positions will be masked out).
+            # At column accepted_count[i], place the newly sampled token.
+            gather_tokens = torch.zeros(
+                num_decode_requests,
+                self.num_speculative_tokens + 1,
+                device=logits.device,
+                dtype=torch.long,
+            )
+            gather_tokens[:, : self.num_speculative_tokens] = self._accepted_tokens_per_request[
+                :num_decode_requests
+            ].clamp(min=0)
+            gather_tokens[
+                torch.arange(num_decode_requests, device=logits.device), accepted_counts
+            ] = self._sampled_tokens_cuda[:num_decode_requests]
+
+            # Gather: [num_decode, num_spec+1]
+            gathered_log_probs = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
+
+            log_probs_list_decode = [
+                gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
+                for i in range(num_decode_requests)
+            ]
+
+        log_probs_list_prefill = []
+        if num_prefill_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_log_probs = log_probs_tensor[decode_len:]
+
+            prefill_token_ids = context.token_to_input_ids[
+                decode_len : context.active_token_count
+            ].roll(-1, 0)
+            prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
+            new_token_idx = prefill_query_lengths.cumsum(0) - 1
+            prefill_new_tokens = self._sampled_tokens_cuda[num_decode_requests:active_request_count]
+            prefill_token_ids[new_token_idx] = prefill_new_tokens
+
+            prefill_token_count = context.active_token_count - decode_len
+            seq_idx = torch.arange(prefill_token_count, device=logits.device)
+            selected_log_probs = prefill_log_probs[seq_idx, prefill_token_ids]
+
+            prefill_log_probs_split = selected_log_probs.cpu().split(
+                prefill_query_lengths.tolist(), dim=0
+            )
+            log_probs_list_prefill = [lp.tolist() for lp in prefill_log_probs_split]
+
+        log_probs_list = log_probs_list_decode + log_probs_list_prefill
+
+        return log_probs_list, log_probs_tensor
+
+    def _dynamic_step_calculate_top_n_logprobs_speculative(
+        self, log_probs_tensor: Tensor
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Calculate top-n log probs for speculative decoding.
+
+        For decode requests, computes top-n at each position that produced an
+        emitted token (accepted speculative positions + the newly sampled position).
+        For prefill requests, behaves identically to the non-speculative path.
+
+        Args:
+            log_probs_tensor (Tensor): Pre-computed log_softmax tensor from
+                _dynamic_step_calculate_log_probs_speculative.
+
+        Returns:
+            A dictionary mapping request_idx to list of (top_n_values, top_n_indices)
+            tuples, one per emitted token position.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
+            context.paused_request_count : context.total_request_count
+        ]
+        request_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        top_n_results = {}
+
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            decode_log_probs = log_probs_tensor[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1, -1
+            )
+            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            top_n_per_request = self._request_metadata["top_n_logprobs"][active_request_slice][
+                :num_decode_requests
+            ]
+            max_top_n = int(top_n_per_request.max().item())
+
+            if max_top_n > 0:
+
+                # Single batched topk on GPU: [num_decode, num_spec+1, max_top_n]
+                topk_results = torch.topk(decode_log_probs, k=max_top_n, dim=-1)
+
+                # Single CPU transfer instead of O(num_decode * num_spec) transfers
+                topk_values_cpu = topk_results.values.cpu()
+                topk_indices_cpu = topk_results.indices.cpu()
+
+                for i in range(num_decode_requests):
+                    top_n = int(top_n_per_request[i].item())
+                    if top_n > 0:
+                        num_valid = accepted_counts[i].item() + 1
+                        top_n_results[i] = [
+                            (topk_values_cpu[i, j, :top_n], topk_indices_cpu[i, j, :top_n])
+                            for j in range(num_valid)
+                        ]
+
+        if num_prefill_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_log_probs = log_probs_tensor[decode_len:]
+            prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
+            prefill_log_probs_per_request = prefill_log_probs.split(
+                prefill_query_lengths.tolist(), dim=0
+            )
+
+            for i in range(num_prefill_requests):
+                req_idx = num_decode_requests + i
+                top_n = int(
+                    self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item()
+                )
+                if top_n > 0:
+                    request_lp = prefill_log_probs_per_request[i]
+                    skip_prompt = bool(
+                        self._request_metadata["skip_prompt_log_probs"][req_idx].item()
+                    )
+
+                    if skip_prompt and request_lp.size(0) > 1:
+                        top_n_logits = torch.topk(request_lp[-1], k=top_n)
+                        top_n_results[req_idx] = [
+                            (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                        ]
+                    else:
+                        top_n_logits = torch.topk(request_lp, k=top_n, dim=-1)
+                        top_n_values_cpu = top_n_logits.values.cpu()
+                        top_n_indices_cpu = top_n_logits.indices.cpu()
+                        top_n_results[req_idx] = [
+                            (top_n_values_cpu[t], top_n_indices_cpu[t])
+                            for t in range(request_lp.size(0))
+                        ]
+
+        return top_n_results if top_n_results else None
+
     def _dynamic_step_calculate_top_n_logprobs(
         self, logits: Tensor, log_probs_tensor: Optional[Tensor] = None
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
@@ -1619,10 +1814,6 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-        if self.num_speculative_tokens > 0:
-            assert (
-                return_log_probs == False and return_top_n_logprobs == False
-            ), "Log probs and top n log probs are not supported with speculative tokens"
 
         self._dynamic_step_sample_bookkeeping()
 
@@ -1646,11 +1837,20 @@ class TextGenerationController:
         log_probs = None
         top_n_logprobs = None
         if return_log_probs or return_top_n_logprobs:
-            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
-            if return_top_n_logprobs:
-                top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
-                    logits, log_probs_tensor
+            if self.num_speculative_tokens > 0:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs_speculative(
+                    logits
                 )
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                        log_probs_tensor
+                    )
+            else:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                        logits, log_probs_tensor
+                    )
 
         if skip_bookkeeping:
             request_bookkeeping = {}
