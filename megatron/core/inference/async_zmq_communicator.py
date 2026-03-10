@@ -197,14 +197,27 @@ class AsyncZmqEndpoint:
     async def shutdown(self):
         """Stop background tasks and close all sockets."""
         self.is_shutdown = True
+
+        # Cancel recv and startup tasks immediately.
+        cancel_tasks = []
+        for attr in ('recv_task', 'startup_sends'):
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                cancel_tasks.append(task)
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
+
+        # Drain the send queue, then stop the send task.
         self._send_awaitables.shutdown()
+        send_task = getattr(self, 'send_task', None)
+        if send_task is not None and not send_task.done():
+            await asyncio.gather(send_task, return_exceptions=True)
+
+        # Close all sockets after tasks have exited.
         for s in self._sockets:
             if not s.closed:
                 s.close(linger=0)
-        tasks = [getattr(self, a, None) for a in ('recv_task', 'startup_sends', 'send_task')]
-        tasks = [t for t in tasks if t is not None and not t.done()]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     @trace_async_exceptions
     async def _send_task(self):
@@ -221,6 +234,9 @@ class AsyncZmqEndpoint:
                     logging.warning(
                         "ZMQ send failed, recipient unreachable (identity=%s)", identity
                     )
+                    self._send_awaitables.task_done()
+                elif self.is_shutdown:
+                    logging.debug("ZMQ send error during shutdown: %s", e)
                     self._send_awaitables.task_done()
                 else:
                     raise

@@ -9,7 +9,7 @@ class Headers(Enum):
     ENGINE_CONNECT = auto()
     CLIENT_CONNECT = auto()
     ACK = auto()
-    MICROBATCH = auto()
+    MESSAGES = auto()
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
     PAUSE = auto()

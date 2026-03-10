@@ -406,8 +406,8 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
-        microbatch_timeout: float = 0.001,
-        steps_before_microbatch: int = 1,
+        listening_timeout: float = 0.001,
+        steps_before_listen: int = 1,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -513,8 +513,8 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_group=self.pg_collection.mp,
             ep_group=self.pg_collection.ep,
             cond=self._cond,
-            microbatch_timeout=microbatch_timeout,
-            steps_before_microbatch=steps_before_microbatch,
+            listening_timeout=listening_timeout,
+            steps_before_listen=steps_before_listen,
         )
 
         # Start communication tasks now so ENGINE_CONNECT can be sent to the coordinator.

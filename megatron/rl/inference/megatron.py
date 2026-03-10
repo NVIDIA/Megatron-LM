@@ -166,6 +166,15 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
             stop_text_gen_server()
 
+            # Join the coordinator process (it should have exited from shutdown_coordinator).
+            proc = getattr(self._inference_engine, 'inference_coordinator_process', None)
+            if proc is not None:
+                proc.join(timeout=1)
+                if proc.is_alive():
+                    logging.warning("Coordinator process did not exit, terminating.")
+                    proc.terminate()
+                    proc.join()
+
     def increment_staleness(self):
         if dist.get_rank() == 0:
             self._client.increment_staleness()

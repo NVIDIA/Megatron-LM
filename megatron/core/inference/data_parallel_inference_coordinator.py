@@ -117,7 +117,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.next_request_id = 0
         self.tokenizer = tokenizer
         self.state = self.CoordinatorState.RUNNING
-        self._is_shutdown = False
+        self.is_shutdown = False
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -495,9 +495,9 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
 
     async def shutdown(self):
         """Stops the inference coordinator, performing any necessary cleanup operations."""
-        if self._is_shutdown:
+        if self.is_shutdown:
             return
-        self._is_shutdown = True
+        self.is_shutdown = True
         if self.schedule_output_path and self.schedule_records:
             schedule_data = {
                 "policy": self.prefix_caching_coordinator_policy.value,

@@ -102,15 +102,14 @@ class _DPCoordinator(AsyncZmqEndpoint):
 class _MPChannel(AsyncZmqEndpoint):
     """PUB/SUB channel for broadcasting batched messages to all MP ranks.
 
-    Leader (MP coordinator) sends batches via PUB from `schedule_requests`.
-    Followers listen via SUB, unpack the batch into `pending_messages`,
-    and signal `microbatch_processing_event`.
+    Leader (MP coordinator) sends batches via PUB from `schedule_requests`. Followers listen
+    via SUB, unpack the batch into `pending_messages`, and signal `messages_processing_event`.
     """
 
     def __init__(
         self,
         pending_messages: deque,
-        microbatch_processing_event: asyncio.Event,
+        messages_processing_event: asyncio.Event,
         cond: asyncio.Condition,
         *,
         process_group,
@@ -123,7 +122,7 @@ class _MPChannel(AsyncZmqEndpoint):
 
         self._is_leader = is_leader
         self._pending_messages = pending_messages
-        self._microbatch_processing_event = microbatch_processing_event
+        self._messages_processing_event = messages_processing_event
         self._cond = cond
 
     @trace_async_exceptions
@@ -136,7 +135,7 @@ class _MPChannel(AsyncZmqEndpoint):
                 _, header, batch = await self._irecv()
                 for header_int, data in batch:
                     self._pending_messages.append((Headers(header_int), data))
-                self._microbatch_processing_event.set()
+                self._messages_processing_event.set()
                 async with self._cond:
                     self._cond.notify_all()
             except asyncio.CancelledError:
@@ -265,22 +264,22 @@ class EngineCoordinatorClient:
         mp_group,
         ep_group,
         cond: asyncio.Condition,
-        microbatch_timeout: float = 0.001,
-        steps_before_microbatch: int = 1,
+        listening_timeout: float = 0.001,
+        steps_before_listen: int = 1,
     ):
         self.is_mp_coordinator = is_mp_coordinator
-        self.microbatch_timeout = microbatch_timeout
-        self.steps_before_microbatch = steps_before_microbatch
+        self.listening_timeout = listening_timeout
+        self.steps_before_listen = steps_before_listen
 
         # Shared mutable state consumed by endpoints and schedule_requests.
         self.pending_messages = deque()
-        self.microbatch_processing_event = asyncio.Event()
+        self.messages_processing_event = asyncio.Event()
 
         # Combined PUB/SUB channel for all MP ranks.
         # Leader (MP coordinator) binds PUB; followers connect SUB.
         self._mp_channel = _MPChannel(
             self.pending_messages,
-            self.microbatch_processing_event,
+            self.messages_processing_event,
             cond,
             process_group=mp_group,
             is_leader=is_mp_coordinator,
@@ -401,31 +400,34 @@ class EngineCoordinatorClient:
         This method is a collective operation that must be called by all ranks in an MP group.
         It does not block; idle-blocking is handled by the engine's `_cond`.
 
-        The synchronization uses a batched microbatch pattern:
+        The synchronization uses a batched message pattern:
         1.  Background `_DPCoordinator._recv_task` continuously receives
             messages from the coordinator and accumulates them in `pending_messages`.
         2.  When this method runs, the MP coordinator sends the accumulated
-            messages as a single `MICROBATCH` to all TP ranks via PUB.
+            messages as a single `MESSAGES` to all TP ranks via PUB.
         3.  Background `_MPChannel._recv_task` on follower ranks unpacks
-            the batch into `pending_messages` and sets `microbatch_processing_event`.
+            the batch into `pending_messages` and sets `messages_processing_event`.
         """
         # If the engine has active requests and is not at (step % N) == 0, return early.
         engine_idle = engine.state in (EngineState.PAUSED, EngineState.SUSPENDED)
-        count_trigger = (engine.context.step_count % self.steps_before_microbatch) == 0
+        count_trigger = (engine.context.step_count % self.steps_before_listen) == 0
         if not engine_idle and engine.has_unfinished_requests() and (not count_trigger):
             return
+
+        # Yield to the event loop so ZMQ recv tasks can process pending I/O.
+        await asyncio.sleep(self.listening_timeout)
 
         # MP coordinator: snapshot pending_messages and send as a single batch.
         if self.is_mp_coordinator:
             messages = list(self.pending_messages)
             self.pending_messages.clear()
             self._mp_channel._isend(
-                Headers.MICROBATCH, [(h.value, d) for h, d in messages]
+                Headers.MESSAGES, [(h.value, d) for h, d in messages]
             )
         else:
             # Followers: wait for the batch to arrive via _MPChannel._recv_task.
-            await self.microbatch_processing_event.wait()
-            self.microbatch_processing_event.clear()
+            await self.messages_processing_event.wait()
+            self.messages_processing_event.clear()
             messages = list(self.pending_messages)
             self.pending_messages.clear()
 
