@@ -34,11 +34,13 @@ from megatron.training.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+    import transformer_engine  # pylint: disable=unused-import
 
     HAVE_TE = True
+    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 except ImportError:
     HAVE_TE = False
+    TEColumnParallelGroupedLinear = None
 
 _SEED = 42
 
