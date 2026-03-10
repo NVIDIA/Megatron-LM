@@ -1132,10 +1132,6 @@ class TestDynamicInferenceEngine:
                         "when tp_size > 1."
                     )
                 )
-            if model_provider == "mamba":
-                pytest.skip(
-                    reason="Mamba model is not supported with the inference optimized transformer."
-                )
         if use_mla and transformer_impl == "local":
             pytest.skip(reason="MLA does not work with the local implementation.")
         if cache_mla_latent and not use_mla:
