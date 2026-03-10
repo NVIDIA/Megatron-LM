@@ -1072,6 +1072,7 @@ def pretrain(
             print_rank_0('training ...')
 
         iteration = 0
+        args.curr_iteration = iteration
         if args.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
@@ -1504,8 +1505,8 @@ def setup_model_and_optimizer(
     one_logger = get_one_logger()
 
     # Skip optimizer when not training. In RL inference-only mode (skip_train + perform_rl_step),
-    # --no-load-optim controls whether the optimizer is created (for memory testing) or skipped.
-    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
+    # --rl-skip-optimizer controls whether the optimizer is created (for memory testing) or skipped.
+    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.rl_skip_optimizer)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -1513,6 +1514,9 @@ def setup_model_and_optimizer(
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
+        # In RL inference-only mode, train_iters must still be set despite having no optimizer.
+        if args.perform_rl_step:
+            update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
@@ -2137,7 +2141,8 @@ def training_log(
                 wandb_writer.log({'iter-energy/gpu': energy}, iteration)
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
-        log_string += f' learning rate: {learning_rate:.6E} |'
+        if learning_rate is not None:
+            log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -2878,6 +2883,9 @@ def train(
         # It is similar to a PPO epoch.
 
         if args.perform_rl_step:
+            if optimizer is None:
+                # Release stale CUDA cached memory before inference.
+                torch.cuda.empty_cache()
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
                     model, inference_model, optimizer, iteration, ref_state_dict,
