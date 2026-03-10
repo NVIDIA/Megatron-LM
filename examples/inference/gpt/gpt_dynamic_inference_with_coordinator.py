@@ -30,6 +30,22 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 logging.basicConfig(level=logging.INFO, force=True)
 
 
+async def suspend_resume_cycle(client, engine, args, futures):
+    """Wait for all in-flight requests, then suspend/train/resume."""
+    await asyncio.gather(*futures)
+
+    client.pause_engines()
+    await engine.wait_until(EngineState.PAUSED)
+    client.suspend_engines()
+    await engine.wait_until(EngineState.SUSPENDED)
+    if args.suspend_timeout > 0:
+        await asyncio.sleep(args.suspend_timeout)
+    client.resume_engines()
+    await engine.wait_until(EngineState.RESUMED)
+    client.unpause_engines()
+    await engine.wait_until(EngineState.RUNNING)
+
+
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
@@ -55,20 +71,8 @@ async def main(
         coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
 
-    # Test suspend/resume intervals.
-    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
-        # Since the client doesn't directly call engine.async_step here, we test
-        # the suspend-resume system ~4 times.
-        suspend_resume_interval = max(1, len(requests) // 4)
-        suspend_idxs = set(
-            range(suspend_resume_interval, len(requests) + 1, suspend_resume_interval)
-        )
-        resume_idxs = set(
-            min(len(requests), i + suspend_resume_interval // 2) for i in suspend_idxs
-        )
-    else:
-        suspend_idxs = set()
-        resume_idxs = set()
+    # All ranks agree on the number of suspend/resume cycles from args.
+    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
 
     # Create client and run example.
     if dist.get_rank() == 0:
@@ -99,14 +103,7 @@ async def main(
                     num_requests_added += 1
 
                     if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
-                        client.pause_engines()
-                        await engine.wait_until(EngineState.PAUSED)
-                        client.suspend_engines()
-                        await engine.wait_until(EngineState.SUSPENDED)
-                        client.resume_engines()
-                        await engine.wait_until(EngineState.RESUMED)
-                        client.unpause_engines()
-                        await engine.wait_until(EngineState.RUNNING)
+                        await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
 
@@ -123,14 +120,7 @@ async def main(
                     num_requests_added += 1
 
                     if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
-                        client.pause_engines()
-                        await engine.wait_until(EngineState.PAUSED)
-                        client.suspend_engines()
-                        await engine.wait_until(EngineState.SUSPENDED)
-                        client.resume_engines()
-                        await engine.wait_until(EngineState.RESUMED)
-                        client.unpause_engines()
-                        await engine.wait_until(EngineState.RUNNING)
+                        await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
 

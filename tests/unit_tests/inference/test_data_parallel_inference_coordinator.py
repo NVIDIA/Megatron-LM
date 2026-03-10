@@ -72,6 +72,7 @@ class DummyContext:
 
     def __init__(self):
         self.active_cnt = 0
+        self.step_count = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -103,9 +104,8 @@ class DummyEngine(DynamicInferenceEngine):
 
         # State machine (mirrors dynamic_engine.py reset()).
         self.state = EngineState.RUNNING
-        for attr in self._STATE_EVENTS.values():
-            setattr(self, attr, asyncio.Event())
-        self.running.set()
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
         self.resume_request_ids = None
         self.use_coordinator = False
@@ -114,7 +114,6 @@ class DummyEngine(DynamicInferenceEngine):
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
-        self.step_count = 0
 
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
@@ -395,18 +394,18 @@ class TestCoordinator:
         def assert_state(eng, expected):
             """Assert engine state and all four event flags are consistent."""
             assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
-            assert eng.running.is_set() == (
+            assert eng._state_events[EngineState.RUNNING].is_set() == (
                 expected == EngineState.RUNNING
-            ), f"running.is_set()={eng.running.is_set()} for state={expected}"
-            assert eng.paused.is_set() == (
+            ), f"RUNNING.is_set()={eng._state_events[EngineState.RUNNING].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.PAUSED].is_set() == (
                 expected in PAUSED_FAMILY
-            ), f"paused.is_set()={eng.paused.is_set()} for state={expected}"
-            assert eng.suspended.is_set() == (
+            ), f"PAUSED.is_set()={eng._state_events[EngineState.PAUSED].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.SUSPENDED].is_set() == (
                 expected == EngineState.SUSPENDED
-            ), f"suspended.is_set()={eng.suspended.is_set()} for state={expected}"
-            assert eng.stopped.is_set() == (
+            ), f"SUSPENDED.is_set()={eng._state_events[EngineState.SUSPENDED].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.STOPPED].is_set() == (
                 expected == EngineState.STOPPED
-            ), f"stopped.is_set()={eng.stopped.is_set()} for state={expected}"
+            ), f"STOPPED.is_set()={eng._state_events[EngineState.STOPPED].is_set()} for state={expected}"
 
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
@@ -519,7 +518,7 @@ class TestCoordinator:
                 client.resume_engines()
                 await asyncio.wait_for(engine.wait_until(EngineState.RESUMED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
-                assert not engine.suspended.is_set()
+                assert not engine._state_events[EngineState.SUSPENDED].is_set()
 
                 # Engine processes requests after suspend/resume cycle.
                 client.unpause_engines()

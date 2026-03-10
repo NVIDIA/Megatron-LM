@@ -170,13 +170,13 @@ class DynamicInferenceEngine(AbstractEngine):
     """
 
     # Map stable states to their corresponding asyncio events.
-    _STATE_EVENTS = {
-        EngineState.RUNNING: 'running',
-        EngineState.PAUSED: 'paused',
-        EngineState.SUSPENDED: 'suspended',
-        EngineState.RESUMED: 'resumed',
-        EngineState.STOPPED: 'stopped',
-    }
+    _STATE_EVENTS = (
+        EngineState.RUNNING,
+        EngineState.PAUSED,
+        EngineState.SUSPENDED,
+        EngineState.RESUMED,
+        EngineState.STOPPED,
+    )
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -276,10 +276,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        for attr in self._STATE_EVENTS.values():
-            setattr(self, attr, asyncio.Event())
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
         self.state = EngineState.RUNNING
-        self.running.set()
+        self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
 
         self.resume_request_ids = None
@@ -297,10 +296,10 @@ class DynamicInferenceEngine(AbstractEngine):
         STOPPED) are supported.  Transient states (PAUSING, SUSPENDING,
         RESUMING, STOPPING) are not directly waitable.
         """
-        attr = self._STATE_EVENTS.get(state)
-        if attr is None:
+        event = self._state_events.get(state)
+        if event is None:
             raise ValueError(f"Cannot wait for transient state {state}")
-        await getattr(self, attr).wait()
+        await event.wait()
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -1796,7 +1795,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
                     self.state = EngineState.PAUSING
-                    self.running.clear()
+                    self._state_events[EngineState.RUNNING].clear()
                 # Any other state can safely ignore PAUSE.
 
             elif header == Headers.UNPAUSE:
@@ -1805,13 +1804,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
-                self.resumed.clear()
+                self._state_events[EngineState.RESUMED].clear()
                 self.suspend()
                 self.state = EngineState.SUSPENDING
 
             elif header == Headers.RESUME:
                 assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
-                self.suspended.clear()
+                self._state_events[EngineState.SUSPENDED].clear()
                 self.resume()
                 self.state = EngineState.RESUMING
 
@@ -1821,7 +1820,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     EngineState.SUSPENDED,
                 ), f"Received STOP in state {self.state}"
                 if self.state == EngineState.SUSPENDED:
-                    self.suspended.clear()
+                    self._state_events[EngineState.SUSPENDED].clear()
                 self.state = EngineState.STOPPING
 
             else:
@@ -1860,7 +1859,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.zmq_context.term()
 
         # Set the stopped state at the very end.
-        self.stopped.set()
+        self._state_events[EngineState.STOPPED].set()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1979,7 +1978,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         # All EP peers are PAUSING: pause immediately.
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
-                        self.paused.set()
+                        self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
@@ -2001,13 +2000,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 elif self.state == EngineState.UNPAUSING:
                     await self._world_barrier()
                     self.state = EngineState.RUNNING
-                    self.paused.clear()
-                    self.running.set()
+                    self._state_events[EngineState.PAUSED].clear()
+                    self._state_events[EngineState.RUNNING].set()
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
                     self.state = EngineState.SUSPENDED
-                    self.suspended.set()
+                    self._state_events[EngineState.SUSPENDED].set()
 
                 elif self.state == EngineState.SUSPENDED:
                     await asyncio.sleep(0.02)
@@ -2015,7 +2014,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 elif self.state == EngineState.RESUMING:
                     await self._world_barrier()
                     self.state = EngineState.PAUSED
-                    self.resumed.set()
+                    self._state_events[EngineState.RESUMED].set()
 
                 elif self.state == EngineState.STOPPING:
                     await self._world_barrier()

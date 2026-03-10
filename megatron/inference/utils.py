@@ -228,6 +228,12 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "system.",
     )
     group.add_argument(
+        "--suspend-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep while the engine is suspended (simulates a training step).",
+    )
+    group.add_argument(
         "--inference-repeat-n",
         type=int,
         default=1,
@@ -258,7 +264,6 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Path to write coordinator request scheduling decisions as JSON",
     )
-
     return parser
 
 
@@ -287,7 +292,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     if args.inference_dynamic_batching_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
-    mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+    mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+        model,
+        conv_states_dtype=args.mamba_inference_conv_states_dtype,
+        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
+    )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get inference logging configuration from args
