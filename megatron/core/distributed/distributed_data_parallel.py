@@ -236,7 +236,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
-            if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+            # Note: overlap_param_gather covers both the distributed optimizer and the
+            # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+            # without use_distributed_optimizer.
+            if self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -344,9 +347,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
-        self.use_forward_hook = (
-            self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather
-        )
+        # Note: overlap_param_gather covers both the distributed optimizer and the
+        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+        # without use_distributed_optimizer.
+        self.use_forward_hook = self.ddp_config.overlap_param_gather
         self.remove_forward_pre_hook_handles = {}
         if self.use_forward_hook:
             self.enable_forward_pre_hook()
@@ -490,10 +494,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 # in "finish_param_sync" stage after zeroing the shared gardient buffers.
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
+                        is_bf16_weight_bucket = False
                         for param in bucket.params:
+                            # Skip copying since bf16 weights in the mxfp8 model
+                            # are already mapped to param.data.
+                            if not is_float8tensor(param):
+                                is_bf16_weight_bucket = True
+                                break
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
                             param.data.copy_(param_slice.view(param.data.shape))
+                        if is_bf16_weight_bucket:
+                            continue
                         # All-gathered params are not needed after being copied to param.data.
                         # Zero out the param buffer (shared with grad buffer) for gradient
                         # accumulation. We cannot zero out the entire grad buffer because one grad
@@ -533,6 +545,11 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    def free_overlap_buffers(self):
+        """Free overlap param-gather GPU buffers across all bucket groups."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
