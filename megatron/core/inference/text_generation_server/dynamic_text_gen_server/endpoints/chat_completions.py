@@ -146,8 +146,10 @@ try:
             last_request = record.requests[-1]
             if last_request.failed():
                 error_events = [
-                    e for e in last_request.events
-                    if e.type in (
+                    e
+                    for e in last_request.events
+                    if e.type
+                    in (
                         DynamicInferenceEventType.ERROR_NONTRANSIENT,
                         DynamicInferenceEventType.ERROR_TRANSIENT,
                     )
@@ -158,10 +160,7 @@ try:
         if failed_errors:
             error_detail = "; ".join(failed_errors)
             logger.error(f"Inference request(s) failed: {error_detail}")
-            return Response(
-                f"Inference request(s) failed: {error_detail}",
-                status=400,
-            )
+            return Response(f"Inference request(s) failed: {error_detail}", status=400)
 
         # --- 5. Format OpenAI Response ---
         choices = []

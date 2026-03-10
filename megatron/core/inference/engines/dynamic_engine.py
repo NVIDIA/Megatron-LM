@@ -787,9 +787,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request = entry.record[-1]
 
         if self.rank == 0:
-            warnings.warn(
-                f"Request {request_id} failed to be added to the engine due to errors."
-            )
+            warnings.warn(f"Request {request_id} failed to be added to the engine due to errors.")
 
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
@@ -797,8 +795,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [entry.record.serialize()]],
-                use_bin_type=True,
+                [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
             )
             self.socket_for_receiving_requests.send(payload)
         elif not self.use_coordinator:
@@ -806,9 +803,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.prompt = self.controller.tokenizer.detokenize(
                     request.prompt_tokens.tolist()
                 )
-            request.generated_text = self.controller.tokenizer.detokenize(
-                request.generated_tokens
-            )
+            request.generated_text = self.controller.tokenizer.detokenize(request.generated_tokens)
         entry.future.set_result(entry.record)
 
     def _add_request(
@@ -1529,9 +1524,9 @@ class DynamicInferenceEngine(AbstractEngine):
         for failed_request_id in self.failed_request_ids:
             failed_entry = self.requests.pop(failed_request_id)
             finished_request_records.append(failed_entry.record)
-            assert failed_entry.future.done(), (
-                f"Failed request {failed_request_id} future has not been properly resolved."
-            )
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
         range_pop()
 

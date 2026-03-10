@@ -131,8 +131,10 @@ try:
             last_request = record.requests[-1]
             if last_request.failed():
                 error_events = [
-                    e for e in last_request.events
-                    if e.type in (
+                    e
+                    for e in last_request.events
+                    if e.type
+                    in (
                         DynamicInferenceEventType.ERROR_NONTRANSIENT,
                         DynamicInferenceEventType.ERROR_TRANSIENT,
                     )
