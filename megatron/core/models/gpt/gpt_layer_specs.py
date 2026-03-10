@@ -570,7 +570,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-            mla_down_proj_fusion=config.mla_down_proj_fusion,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -582,7 +582,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-            mla_down_proj_fusion=config.mla_down_proj_fusion,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
