@@ -648,7 +648,10 @@ class MLASelfAttention(MultiLatentAttention):
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
             if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
-                # k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                # kv_compressed: [s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                kv_compressed = gather_from_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
         if packed_seq_params is not None:
@@ -908,6 +911,8 @@ class MLASelfAttention(MultiLatentAttention):
 
         # Add head dimension
         k_pos_emb = k_pos_emb.unsqueeze(-2)
+        if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
         k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
 
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
