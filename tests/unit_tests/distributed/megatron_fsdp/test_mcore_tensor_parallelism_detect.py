@@ -4,11 +4,10 @@ import torch
 from torch import nn
 
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-    using_tensor_parallel,
-    is_mcore_tensor_parallel_duplicated,
     get_mcore_tensor_parallel_partition_dim,
+    is_mcore_tensor_parallel_duplicated,
+    using_tensor_parallel,
 )
 
 
@@ -129,12 +128,8 @@ def test_detect_parallelism_telayernormcolumnparallellinear_layernorm_params():
     module = TELayerNormColumnParallelLinear()
 
     # layer norm parameters should be replicated
-    assert (
-        fsdp._detect_parallelism_type("layer_norm_weight", module) == "replicated"
-    )
-    assert (
-        fsdp._detect_parallelism_type("layer_norm_bias", module) == "replicated"
-    )
+    assert fsdp._detect_parallelism_type("layer_norm_weight", module) == "replicated"
+    assert fsdp._detect_parallelism_type("layer_norm_bias", module) == "replicated"
 
     # non-layer-norm parameters should be column
     assert fsdp._detect_parallelism_type("weight", module) == "column"

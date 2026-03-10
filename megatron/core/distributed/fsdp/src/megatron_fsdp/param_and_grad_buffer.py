@@ -52,8 +52,8 @@ from .utils import (
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
-    using_tensor_parallel,
     log_single_rank,
+    using_tensor_parallel,
 )
 
 logger = logging.getLogger(__name__)
