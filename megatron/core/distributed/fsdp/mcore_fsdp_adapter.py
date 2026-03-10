@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import logging
-from contextlib import nullcontext
 import random
+from contextlib import nullcontext
 from typing import List, Optional
 
 try:
@@ -40,12 +40,12 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -61,6 +61,7 @@ except ImportError as import_megatron_fsdp_error:
 
 try:
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+
     HAVE_TE = True
 except:
     HAVE_TE = False
@@ -382,17 +383,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
             layer_no = module.layer_number if hasattr(module, "layer_number") else -1
             if module.config.fp8:
-                quantization_context = get_fp8_context(
-                    module.config,
-                    layer_no,
-                    is_init=True,
-                )
+                quantization_context = get_fp8_context(module.config, layer_no, is_init=True)
             elif module.config.fp4:
-                quantization_context = get_fp4_context(
-                    module.config,
-                    layer_no,
-                    is_init=True,
-                )
+                quantization_context = get_fp4_context(module.config, layer_no, is_init=True)
             else:
                 quantization_context = nullcontext()
 

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib.metadata import version
 from typing import List, Optional, Tuple
-import enum
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -395,9 +395,7 @@ def quantize_nvfp4_param_shard(
         fsdp_shard_model_params: Optional list of FSDP sharded model params.
     """
     if not HAVE_TE_FP4_TENSOR_CLASS:
-        raise RuntimeError(
-            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
-        )
+        raise RuntimeError("NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0")
 
     try:
         from transformer_engine.pytorch.tensor.utils import quantize_master_weights
@@ -495,27 +493,14 @@ def quantize(
         assert all(
             is_nvfp4tensor(p) for p in model_params
         ), "All model_params must be NVFP4 tensors"
-        quantize_nvfp4_param_shard(
-            model_params,
-            main_params,
-            start_offsets,
-            data_parallel_group,
-        )
+        quantize_nvfp4_param_shard(model_params, main_params, start_offsets, data_parallel_group)
     elif is_float8tensor(model_params[0]):
-        assert all(
-            is_float8tensor(p) for p in model_params
-        ), "All model_params must be FP8 tensors"
+        assert all(is_float8tensor(p) for p in model_params), "All model_params must be FP8 tensors"
         fp8_quantize(
-            model_params,
-            main_params,
-            start_offsets,
-            data_parallel_group,
-            fsdp_shard_model_params,
+            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
         )
     else:
-        raise ValueError(
-            "quantize function only supports FP8 or NVFP4 tensors in model_params"
-        )
+        raise ValueError("quantize function only supports FP8 or NVFP4 tensors in model_params")
 
 
 def _tensor_dtype(tensor: torch.Tensor) -> torch.dtype:
@@ -530,11 +515,7 @@ def _tensor_dtype(tensor: torch.Tensor) -> torch.dtype:
         return tensor.dtype
 
 
-def _meta_device_param_dtype(
-    module: torch.nn.Module,
-    name: str,
-    param: torch.Tensor,
-):
+def _meta_device_param_dtype(module: torch.nn.Module, name: str, param: torch.Tensor):
     if not HAVE_TE_FP8_TENSOR_CLASS:
         return param.dtype
 

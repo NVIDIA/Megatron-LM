@@ -8,6 +8,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.parallel_state as ps
 from megatron.core.enums import ModelType
 from megatron.core.fp4_utils import is_nvfp4tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -15,7 +16,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-import megatron.core.parallel_state as ps
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -91,6 +91,7 @@ class Utils:
             **kwargs,
         )
         Utils.inited = True
+
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
@@ -197,12 +198,7 @@ class TestFP4Param:
     ):
         """Test fp4_param with gpt_model."""
         args = self.create_test_args(
-            tp_size,
-            self.seq_length,
-            self.micro_batch_size,
-            inference,
-            fp4_param_gather,
-            **kwargs,
+            tp_size, self.seq_length, self.micro_batch_size, inference, fp4_param_gather, **kwargs
         )
 
         set_args(args)
@@ -253,7 +249,9 @@ class TestFP4Param:
         # Helper to collect master weights by name
         def _collect_master_weights(dop, model):
             master_weights = {}
-            if hasattr(dop, "model_float16_groups") and hasattr(dop, "shard_fp32_from_float16_groups"):
+            if hasattr(dop, "model_float16_groups") and hasattr(
+                dop, "shard_fp32_from_float16_groups"
+            ):
                 for mg, sg in zip(dop.model_float16_groups, dop.shard_fp32_from_float16_groups):
                     for model_param, shard_main in zip(mg, sg):
                         if shard_main is not None:
@@ -301,7 +299,7 @@ class TestFP4Param:
             if not inference:
                 dop = _get_dop(optimizer)
                 master_weights = _collect_master_weights(dop, gpt_model[0])
-                
+
                 if collect_grad_ref:
                     # Store master weights snapshot for comparison
                     grad_ref_out[f"__master_iter_{i}__"] = master_weights
@@ -325,8 +323,12 @@ class TestFP4Param:
                                 print(f"\n{'='*60}")
                                 print(f"[MASTER DEBUG] FIRST MISMATCH at iter {i}")
                                 print(f"[MASTER DEBUG]   param: {name}")
-                                print(f"[MASTER DEBUG]   total_diff={diff_count}/{flat_c.numel()} ({100*diff_count/flat_c.numel():.4f}%)")
-                                print(f"[MASTER DEBUG]   idx={idx0} got={flat_c[idx0].item():.10e} ref={flat_r[idx0].item():.10e}")
+                                print(
+                                    f"[MASTER DEBUG]   total_diff={diff_count}/{flat_c.numel()} ({100*diff_count/flat_c.numel():.4f}%)"
+                                )
+                                print(
+                                    f"[MASTER DEBUG]   idx={idx0} got={flat_c[idx0].item():.10e} ref={flat_r[idx0].item():.10e}"
+                                )
                                 print(f"{'='*60}\n")
                                 break
 
@@ -349,10 +351,7 @@ class TestFP4Param:
             torch.cuda.empty_cache()
             print("\n=== Running with fp4_param_gather=True (NVFP4) ===")
             loss_list, grad_ref = self._run_test_helper(
-                tp_size,
-                fp4_param_gather=True,
-                collect_grad_ref=True,
-                **kwargs,
+                tp_size, fp4_param_gather=True, collect_grad_ref=True, **kwargs
             )
             nvfp4_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
@@ -361,10 +360,7 @@ class TestFP4Param:
             torch.cuda.empty_cache()
             print("\n=== Running with fp4_param_gather=False (BF16) ===")
             loss_list_ref = self._run_test_helper(
-                tp_size,
-                fp4_param_gather=False,
-                grad_ref=grad_ref,
-                **kwargs,
+                tp_size, fp4_param_gather=False, grad_ref=grad_ref, **kwargs
             )
             bf16_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
@@ -372,7 +368,9 @@ class TestFP4Param:
             print("\n=== Memory Usage ===")
             print(f"NVFP4 peak memory: {nvfp4_peak_mb:.2f} MB")
             print(f"BF16 peak memory:  {bf16_peak_mb:.2f} MB")
-            print(f"Memory savings:    {bf16_peak_mb - nvfp4_peak_mb:.2f} MB ({100*(bf16_peak_mb - nvfp4_peak_mb)/bf16_peak_mb:.1f}%)")
+            print(
+                f"Memory savings:    {bf16_peak_mb - nvfp4_peak_mb:.2f} MB ({100*(bf16_peak_mb - nvfp4_peak_mb)/bf16_peak_mb:.1f}%)"
+            )
 
             # Debug: Compare first few iterations
             print("\n=== Loss Comparison ===")
@@ -451,4 +449,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"FAILED: {e}")
         raise
-

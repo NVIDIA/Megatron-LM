@@ -697,12 +697,7 @@ class TestMegatronFSDPE2E:
             ),
         ],
     )
-    def test_compatible_with_nd_parallel(
-        self,
-        ref_cache,
-        nd_topology,
-        spec_configs,
-    ):
+    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
         if "fp8_recipe" in spec_configs or "fp4_recipe" in spec_configs:
             major, minor = torch.cuda.get_device_capability()
             if major < 10:

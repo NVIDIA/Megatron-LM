@@ -19,7 +19,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
-from ..fp4_utils import is_nvfp4tensor, get_nvfp4_rowwise_packed_shape
 from ..fp8_utils import (
     is_float8tensor,
     is_mxfp8tensor,
@@ -878,8 +877,6 @@ class _ParamAndGradBuffer:
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
-            # Use full numel for buffer allocation (gradients need full precision).
-            # NVFP4 param storage is handled separately via _rowwise_data.
             this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
@@ -975,7 +972,6 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
-            
 
         self.grad_data_size = 0
         self.param_data_size = 0
@@ -991,25 +987,12 @@ class _ParamAndGradBuffer:
             # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
                 if self.param_data is not None:
-                    if is_nvfp4tensor(param):
-                        # NVFP4 2D: map only rowwise packed bytes (uint8) into the param buffer.
-                        # Buffer is allocated with full numel for gradients; we only use the
-                        # first half (packed size) for NVFP4 param storage.
-                        from ..fp4_utils import modify_nvfp4_rowwise_storage
-                        packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
-                        rowwise_bytes_view = self._get(
-                            packed_shape, param_start_index, buffer_type=BufferType.PARAM
-                        )
-                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
-                    elif is_float8tensor(param):
-                        new_param_data = self._get(
-                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                        )
+                    new_param_data = self._get(
+                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                    )
+                    if is_float8tensor(param):
                         modify_underlying_storage(param, new_param_data)
                     else:
-                        new_param_data = self._get(
-                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                        )
                         old_param_data = param.data
                         param.data = new_param_data
                         assert old_param_data._base is None
@@ -1128,7 +1111,7 @@ class _ParamAndGradBuffer:
             param_data=bucketed_param_data,
             grad_data=bucketed_grad_data,
             offset=start_index,
-            numel_unpadded=numel_unpadded,       
+            numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,

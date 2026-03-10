@@ -26,7 +26,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -34,18 +34,18 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .mixed_precision import (
     MixedPrecisionPolicy,
-    fp8_discard_transpose_cache,
-    get_nvfp4_rowwise_packed_shape,
-    quantize,
-    is_blockwise_float8tensor,
-    is_te_min_version,
-    is_nvfp4tensor,
-    get_raw_data,
-    set_raw_data,
-    _tensor_dtype,
     _dtype_size,
     _meta_device_param_dtype,
+    _tensor_dtype,
+    fp8_discard_transpose_cache,
+    get_nvfp4_rowwise_packed_shape,
     get_quantized_model_init_context_cls,
+    get_raw_data,
+    is_blockwise_float8tensor,
+    is_nvfp4tensor,
+    is_te_min_version,
+    quantize,
+    set_raw_data,
 )
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -652,6 +652,7 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
 
 class PoolExhaustedError(RuntimeError):
     """Raised when the FixedPoolAllocator runs out of free blocks."""
+
     pass
 
 
@@ -961,9 +962,15 @@ class DataParallelBuffer:
                 )
                 self.shard_bucket_index = ShardBucketIndex(
                     bucket_id=self.shard_bucket_index.bucket_id,
-                    global_data_index=int(self.shard_bucket_index.global_data_index * nvfp4_size_scale),
-                    local_data_index=int(self.shard_bucket_index.local_data_index * nvfp4_size_scale),
-                    bucket_data_index=int(self.shard_bucket_index.bucket_data_index * nvfp4_size_scale),
+                    global_data_index=int(
+                        self.shard_bucket_index.global_data_index * nvfp4_size_scale
+                    ),
+                    local_data_index=int(
+                        self.shard_bucket_index.local_data_index * nvfp4_size_scale
+                    ),
+                    bucket_data_index=int(
+                        self.shard_bucket_index.bucket_data_index * nvfp4_size_scale
+                    ),
                     size=int(self.shard_bucket_index.size * nvfp4_size_scale),
                 )
 
@@ -1145,11 +1152,7 @@ class DataParallelBuffer:
         # start of the item.
         return (start, end)
 
-    def locate_item_in_global_item(
-        self,
-        item_id: int,
-        shard_only: bool,
-    ) -> Tuple[int, int]:
+    def locate_item_in_global_item(self, item_id: int, shard_only: bool) -> Tuple[int, int]:
         """
         Return the coordinates of the slice of the item that is contained
         in this buffer shard. In other words, this returns the coordinates
@@ -1294,12 +1297,7 @@ class DataParallelBuffer:
 
         return self.data[start:end]
 
-    def get_item_from_bucket(
-        self,
-        bucket: Bucket,
-        item_id: int,
-        shard_only: bool = False,
-    ):
+    def get_item_from_bucket(self, bucket: Bucket, item_id: int, shard_only: bool = False):
         """
         Get Tensor item data from the given bucket specified by the item ID.
         """
@@ -1310,9 +1308,7 @@ class DataParallelBuffer:
         item = bucket.data[start_index:end_index]
 
         if shard_only:
-            item_slice = slice(*self.locate_item_in_global_item(
-                item_id, shard_only=True
-            ))
+            item_slice = slice(*self.locate_item_in_global_item(item_id, shard_only=True))
             item = item[item_slice]
 
         return item
@@ -1969,25 +1965,19 @@ class ParamAndGradBuffer:
         Perform bucket grouping consistency checks on the weight buffer,
         main weight buffer, and gradient buffer.
         """
+
         def assert_param_list_equal(
-            list1: List[torch.nn.Parameter], list2: List[torch.nn.Parameter],
+            list1: List[torch.nn.Parameter], list2: List[torch.nn.Parameter]
         ):
             assert len(list1) == len(
                 list2
             ), "Parameter lists must have the same number of parameters."
             for p1, p2 in zip(list1, list2):
-                assert p1 is p2, (
-                    "Parameter lists must have the same parameters in the same order."
-                )
+                assert p1 is p2, "Parameter lists must have the same parameters in the same order."
 
-        def assert_dp_buffer_index_equal(
-            buf1: DataParallelBuffer, buf2: DataParallelBuffer,
-        ):
+        def assert_dp_buffer_index_equal(buf1: DataParallelBuffer, buf2: DataParallelBuffer):
             k1, k2 = set(buf1.item_index_map), set(buf2.item_index_map)
-            assert k1 == k2, (
-                "Buffer must have the same item index keys."
-                f" Got {k1} and {k2}."
-            )
+            assert k1 == k2, "Buffer must have the same item index keys." f" Got {k1} and {k2}."
             for k in sorted(k1):
                 v1, v2 = buf1.item_index_map[k], buf2.item_index_map[k]
                 assert v1 == v2, (
@@ -2174,7 +2164,7 @@ class ParamAndGradBuffer:
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
-            should_create_transpose_weight_buffer = (param_dtype == "nvfp8_t")
+            should_create_transpose_weight_buffer = param_dtype == "nvfp8_t"
 
             # Check if the parameter group requires a grad buffer or main weight buffer.
             should_create_grad_buffer_or_main_weight_buffer = (
@@ -2526,8 +2516,9 @@ class ParamAndGradBuffer:
                     # Retrieve the newly allocated parameter data from the global bucket.
                     # Attach the bucket-allocated parameter data to the module parameter,
                     # to use the bucket-allocated data for autograd and NCCL.
-                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id)\
-                        .view(get_raw_data(p_local).shape)
+                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                        get_raw_data(p_local).shape
+                    )
                     if tbuf:
                         new_transpose_data = tbuf.get_item_from_bucket(
                             transpose_bucket, item_id
@@ -3040,7 +3031,7 @@ class ParamAndGradBuffer:
             for param in pg.params:
                 item_id = mbuf.param_idx[param]
                 if wbuf:
-                    use_wbuf_shard = (wbuf.is_data_distributed or mbuf.is_data_distributed)
+                    use_wbuf_shard = wbuf.is_data_distributed or mbuf.is_data_distributed
                     model_param = wbuf.get_item(item_id, shard_only=use_wbuf_shard)
                     if tbuf:
                         transpose_param = tbuf.get_item(item_id, shard_only=use_wbuf_shard)
@@ -3079,9 +3070,7 @@ class ParamAndGradBuffer:
                             mbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0]
                         )
                         b_model_param = wbuf.get_item_from_bucket(
-                            bucket,
-                            item_id,
-                            shard_only=use_wbuf_shard,
+                            bucket, item_id, shard_only=use_wbuf_shard
                         )
                         assert (
                             transpose_param is None
@@ -3106,7 +3095,8 @@ class ParamAndGradBuffer:
                     else:
                         shard_fp32_from_fp8.append(main_weight)
                         shard_offsets_in_fp8.append(
-                            wbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0])
+                            wbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0]
+                        )
                         shard_model_params.append([model_param, transpose_param])
                     continue
 
@@ -4196,12 +4186,7 @@ class ResetParametersContext:
     Context manager for resetting parameters for meta device initialization module.
     """
 
-    def __init__(
-        self,
-        module,
-        init_te_fp8_fp4_param_with_bf16=False,
-        with_cuda_rng_tracker=False,
-    ):
+    def __init__(self, module, init_te_fp8_fp4_param_with_bf16=False, with_cuda_rng_tracker=False):
         self.module = module
         self.init_te_fp8_fp4_param_with_bf16 = init_te_fp8_fp4_param_with_bf16
         self.with_cuda_rng_tracker = with_cuda_rng_tracker
