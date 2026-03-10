@@ -250,7 +250,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
 
         if mla_down_proj_fusion:
-            fuse_input_layernorm = (backend.column_parallel_layer_norm_linear() is not None)
+            fuse_input_layernorm = backend.column_parallel_layer_norm_linear() is not None
             input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
             down_proj_linear = (
                 backend.column_parallel_layer_norm_linear()
