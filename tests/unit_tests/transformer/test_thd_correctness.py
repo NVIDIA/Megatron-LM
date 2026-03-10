@@ -823,6 +823,27 @@ DYNAMIC_CP_TEST_CASES = [
             _A(2, [6, 7]),       # dp_cp_rank 7: pair with rank 6
         ],
     ),
+    # -------------------------------------------------------------------------
+    # Mixed: cp4 + cp2 + cp1 + cp1, baseline fixed cp=2.
+    # tp=1, cp=2, world_size=8 → dp_cp_size=8, dp_size=4
+    #   ranks 0-3: quad (cp=4), ranks 4-5: pair (cp=2), rank 6: solo, rank 7: solo
+    # -------------------------------------------------------------------------
+    DynamicCPTestCase(
+        "dcp_mixed_tp1_cp2",
+        1024, 16, 4, 4096,
+        [4007, 2003, 3989, 2053, 4091, 2017, 1013, 503],
+        tp_size=1, cp_size=2, sp_enabled=False,
+        dcp_assignments=[
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 0: quad with ranks 1,2,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 1: quad with ranks 0,2,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 2: quad with ranks 0,1,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 3: quad with ranks 0,1,2
+            _A(2, [4, 5]),           # dp_cp_rank 4: pair with rank 5
+            _A(2, [4, 5]),           # dp_cp_rank 5: pair with rank 4
+            _A(1, [6]),              # dp_cp_rank 6: solo
+            _A(1, [7]),              # dp_cp_rank 7: solo
+        ],
+    ),
 ]
 # fmt: on
 
