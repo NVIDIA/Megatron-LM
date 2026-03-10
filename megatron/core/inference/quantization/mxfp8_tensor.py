@@ -10,7 +10,7 @@ try:
 
     HAVE_FLASHINFER = True
 except ImportError:
-    HAVE_FLASHINFER = True
+    HAVE_FLASHINFER = False
 
 
 @dataclass

@@ -45,10 +45,10 @@ class GPUResourceManager:
         self.copy_stream = None
 
         # PyTorch stream wrappers
-        self.torch_pack_stream = None
-        self.torch_unpack_stream = None
-        self.torch_send_stream = None
-        self.torch_copy_stream = None
+        self.torch_pack_stream_wrapper = None
+        self.torch_unpack_stream_wrapper = None
+        self.torch_send_stream_wrapper = None
+        self.torch_copy_stream_wrapper = None
 
         # Stream name to PyTorch stream mapping
         self._torch_streams: Dict[str, torch.cuda.ExternalStream] = {}
@@ -131,17 +131,17 @@ class GPUResourceManager:
         _, send_stream_ptr = self.send_stream.__cuda_stream__()
         _, copy_stream_ptr = self.copy_stream.__cuda_stream__()
 
-        self.torch_pack_stream = torch.cuda.ExternalStream(pack_stream_ptr)
-        self.torch_unpack_stream = torch.cuda.ExternalStream(unpack_stream_ptr)
-        self.torch_send_stream = torch.cuda.ExternalStream(send_stream_ptr)
-        self.torch_copy_stream = torch.cuda.ExternalStream(copy_stream_ptr)
+        self.torch_pack_stream_wrapper = torch.cuda.ExternalStream(pack_stream_ptr)
+        self.torch_unpack_stream_wrapper = torch.cuda.ExternalStream(unpack_stream_ptr)
+        self.torch_send_stream_wrapper = torch.cuda.ExternalStream(send_stream_ptr)
+        self.torch_copy_stream_wrapper = torch.cuda.ExternalStream(copy_stream_ptr)
 
         # Build stream mapping
         self._torch_streams = {
-            "pack": self.torch_pack_stream,
-            "unpack": self.torch_unpack_stream,
-            "send": self.torch_send_stream,
-            "copy": self.torch_copy_stream,
+            "pack": self.torch_pack_stream_wrapper,
+            "unpack": self.torch_unpack_stream_wrapper,
+            "send": self.torch_send_stream_wrapper,
+            "copy": self.torch_copy_stream_wrapper,
         }
 
         logger.info("Stream mapping built")
