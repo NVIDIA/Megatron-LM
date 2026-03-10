@@ -2059,11 +2059,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
-        if new_speculative_tokens is not None:
-            # new_speculative_tokens has shape [num_spec, num_requests]; swap columns.
-            temp = new_speculative_tokens[:, src_idxs].clone()
-            new_speculative_tokens[:, src_idxs] = new_speculative_tokens[:, dst_idxs]
-            new_speculative_tokens[:, dst_idxs] = temp
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
