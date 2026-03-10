@@ -2010,7 +2010,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
             )
 
-    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+    def _swap_book_keeping_tensors(
+        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+    ):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
@@ -2020,6 +2022,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
+        if new_speculative_tokens is not None:
+            # new_speculative_tokens has shape [num_spec, num_requests]; swap columns.
+            temp = new_speculative_tokens[:, src_idxs].clone()
+            new_speculative_tokens[:, src_idxs] = new_speculative_tokens[:, dst_idxs]
+            new_speculative_tokens[:, dst_idxs] = temp
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
@@ -2506,6 +2513,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
                 dst_idxs=torch.tensor([self.total_request_count - 1]),
                 next_tokens=next_tokens,
+                new_speculative_tokens=new_speculative_tokens,
             )
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration

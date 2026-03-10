@@ -345,7 +345,7 @@ class TestDynamicInferenceEngine:
             if test_config.num_speculative_tokens > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
-                    config=transformer_config, spec=layer_spec, use_transformer_engine=use_te,
+                    config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
                 )
 
             # GPT model.
@@ -2185,7 +2185,9 @@ class TestDynamicInferenceEngine:
             0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
         )
 
-        for i, prompt in enumerate([shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]):
+        for i, prompt in enumerate(
+            [shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]
+        ):
             env.requests[i].prompt_tokens = prompt.clone()
 
         # Run all requests through the engine.

@@ -1004,6 +1004,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             request: DynamicInferenceRequest = self.get_request(request_id)
+            num_stop_word_trim = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1020,41 +1021,50 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
-                    # TODO : SHAN Should check and change the following for speculative tokens
-                    token = tokens[0]
+                    first_event_in_step = None
                     if self.track_generated_token_events:
-                        if block_allocator.enable_prefix_caching:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                                blocks_ref_count=blocks_ref_count,
-                            )
-                        else:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                            )
+                        for token in tokens:
+                            if block_allocator.enable_prefix_caching:
+                                evt = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                    blocks_ref_count=blocks_ref_count,
+                                )
+                            else:
+                                evt = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                )
+                            if first_event_in_step is None:
+                                first_event_in_step = evt
                     if is_first_token:
                         if self.track_generated_token_events:
-                            first_token_event = event_generated_token
+                            first_token_event = first_event_in_step
                         else:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
-                                payload={"token_id": token},
+                                payload={"token_id": tokens[0]},
                             )
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
                     if request.tpot is None:
                         request.tpot = []
-                    request.tpot.append(step_time)
+                    per_token_step_time = step_time / len(tokens)
+                    request.tpot.extend([per_token_step_time] * len(tokens))
 
-                # Check for stop words (after token is appended)
-                stop_word_hit = self._check_stop_words_for_request_post_append(request)
+                # Check for stop words (after token is appended).
+                # With speculative decoding, a stop word may end before the last
+                # appended token. The check truncates generated_tokens in-place and
+                # returns how many trailing tokens were removed so we can also trim
+                # the corresponding log probs below.
+                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
+                    request
+                )
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1079,6 +1089,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
+            # When a stop word was found mid-speculative-batch, trim log probs
+            # and top_n_logprobs to match the truncated generated_tokens.
+            if num_stop_word_trim > 0:
+                if request_log_probs is not None:
+                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+
             # Process log_probs if available (unified for both regular and chunked prefill)
             if request_log_probs is not None:
                 # Initialize lists if they don't exist
@@ -1102,8 +1120,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     # Handle skip_prompt_log_probs during prefill
                     # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token)
-                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
+                    # only process the last one (first generated token).
+                    # With speculative decoding, decode steps also produce multiple log probs
+                    # (one per accepted token + new sample), so we must check that this is
+                    # actually a prefill step (no generated log probs accumulated yet).
+                    is_prefill_log_probs = len(request.generated_log_probs) == 0
+                    if (
+                        request.sampling_params.skip_prompt_log_probs
+                        and len(request_log_probs) > 1
+                        and is_prefill_log_probs
+                    ):
                         # Only append the last log prob (first generated token) to generated_log_probs
                         request.generated_log_probs.append(request_log_probs[-1])
                     else:
@@ -1219,37 +1245,47 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
-    # TODO : We also might have to delete some tokens, if stop word hit in the middle (speculative case)
-    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
+    def _check_stop_words_for_request_post_append(
+        self, request: DynamicInferenceRequest
+    ) -> Tuple[bool, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
         been appended to request.generated_tokens.
 
+        With speculative decoding, multiple tokens are appended at once. The stop word
+        may end before the last appended token, leaving extra tokens that must be
+        trimmed. When this happens, generated_tokens is truncated in-place and the
+        number of trimmed tokens is returned so the caller can also trim log probs.
+
         Args:
             request: The request to check.
 
         Returns:
-            bool: True if the generated sequence ends with a stop word, False otherwise.
+            Tuple of (stop_word_hit, num_tokens_trimmed):
+                stop_word_hit: True if the generated sequence contains a stop word.
+                num_tokens_trimmed: Number of tokens removed from the end of
+                    generated_tokens (0 when the stop word is at the very end
+                    or when no stop word was found).
         """
-        # Check if request has stop words configured
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False
+            return False, 0
 
         generated_tokens = request.generated_tokens
 
-        # Check if the sequence ends with any stop word
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
-                # We do this regardless of stop_len because speculative decoding can append
-                # multiple tokens at once, meaning the stop word might end at any of those positions.
+                # Speculative decoding can append multiple tokens at once, so the stop
+                # word might end at any position within the newly appended tokens.
                 for i in range(self.num_speculative_tokens + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        return True
-        return False
+                        if i > 0:
+                            request.generated_tokens = request.generated_tokens[:-i]
+                        return True, i
+        return False, 0
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.

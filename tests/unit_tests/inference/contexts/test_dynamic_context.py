@@ -1997,9 +1997,7 @@ class TestDynamicContext:
         new_spec = torch.tensor([[51], [52]], device='cuda')
 
         ctx.update_requests(
-            active_requests_mask=active_mask,
-            new_tokens=new_tokens,
-            new_speculative_tokens=new_spec,
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
 
         # A new block should have been allocated for the boundary crossing.
