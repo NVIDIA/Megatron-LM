@@ -244,7 +244,7 @@ class AsyncCaller(ABC):
     @abstractmethod
     def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.debug(f"AsyncCaller: {_get_rank_or_unknown()}, Destroying Async Caller")
+        raise NotImplementedError
 
     def __del__(self):
         raise NotImplementedError("This should be implemented")
