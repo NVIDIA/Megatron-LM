@@ -160,14 +160,13 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers", "fast-hadamard-transform"]
+no_pypi_wheels = ["emerging_optimizers", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
     "nv-grouped-gemm",
-    "flash_mla",
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",

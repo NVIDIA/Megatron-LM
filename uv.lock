@@ -1545,11 +1545,6 @@ wheels = [
 ]
 
 [[package]]
-name = "flash-mla"
-version = "1.0.0+9edee0c"
-source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=9edee0c022cd0938148a18e334203b0aab43aa19#9edee0c022cd0938148a18e334203b0aab43aa19" }
-
-[[package]]
 name = "flashinfer-python"
 version = "0.5.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2725,7 +2720,6 @@ linting = [
 no-pypi-wheels = [
     { name = "emerging-optimizers" },
     { name = "fast-hadamard-transform" },
-    { name = "flash-mla" },
 ]
 test = [
     { name = "coverage" },
@@ -2832,7 +2826,6 @@ linting = [
 no-pypi-wheels = [
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
     { name = "fast-hadamard-transform", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
-    { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
 test = [
     { name = "coverage" },
