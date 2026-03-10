@@ -97,7 +97,6 @@ dev = [
     "flask[async]",
     "hypercorn",
     "openai",
-    "fast-hadamard-transform",
 ]
 
 lts = [
@@ -161,7 +160,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
