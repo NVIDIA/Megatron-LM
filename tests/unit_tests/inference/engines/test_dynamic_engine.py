@@ -1072,7 +1072,7 @@ class TestDynamicInferenceEngine:
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
         elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+            Utils.initialize_distributed()
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size
         if world_size < min_world_size:
@@ -2102,11 +2102,11 @@ class TestDynamicInferenceEngine:
         """
         test_config = DynamicEngineTestConfig(
             num_requests=1,
-            min_prompt_length=4,
-            max_prompt_length=4,
+            min_prompt_length=256,
+            max_prompt_length=256,
             num_tokens_to_generate=3,
             num_speculative_tokens=2,
-            context_block_size_tokens=4,  # Exactly matches prompt length
+            context_block_size_tokens=256,  # Exactly matches prompt length
             context_max_requests=16,
             model_provider="gpt",
             materialize_only_last_token_logits=False,
@@ -2496,15 +2496,12 @@ class TestDynamicInferenceEngine:
         # Very constrained memory environment to force pausing and eviction
         test_config = DynamicEngineTestConfig(
             num_requests=3,
-            min_prompt_length=16,
-            max_prompt_length=16,
-            num_tokens_to_generate=32,
-            context_block_size_tokens=16,
+            min_prompt_length=256,
+            max_prompt_length=256,
+            num_tokens_to_generate=512,
+            context_block_size_tokens=256,
             num_speculative_tokens=2,
-            # 40 KB translates to 3 blocks.
-            # 3 requests * 3 blocks per request (1 prompt + 2 gen) = 9 blocks needed.
-            # This guarantees we will run out of active memory mid-generation.
-            context_buffer_size_gb=0.00004,
+            context_buffer_size_gb=0.00064,  # 640 KB
             context_paused_buffer_size_gb=0.0,  # 0 paused buffer forces immediate eviction
             model_provider="gpt",
             materialize_only_last_token_logits=False,
@@ -2512,8 +2509,6 @@ class TestDynamicInferenceEngine:
         )
 
         env = self._build_test_env(test_config)
-
-        print(f"total block count = {env.engine.context.block_allocator.total_count}")
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
         hidden_size = unwrapped_model.config.hidden_size
@@ -2553,7 +2548,7 @@ class TestDynamicInferenceEngine:
         # Since paused_buffer_size is 0, any request that pauses will immediately
         # overflow the paused buffer and trigger an eviction.
         for request in env.requests:
-            request.sampling_params.num_tokens_to_generate = 32
+            request.sampling_params.num_tokens_to_generate = 512
             env.engine._add_request(request)
 
         eviction_occurred = False
@@ -2586,7 +2581,7 @@ class TestDynamicInferenceEngine:
                 merged_req.status == Status.COMPLETED
             ), f"Request {request_id} failed to complete."
             assert (
-                len(merged_req.generated_tokens) == 31
+                len(merged_req.generated_tokens) == 511
             ), f"Request {request_id} didn't generate expected tokens."
 
     @pytest.mark.internal
@@ -2602,25 +2597,25 @@ class TestDynamicInferenceEngine:
         """
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # Added manually below
-            min_prompt_length=8,
-            max_prompt_length=8,
+            min_prompt_length=256,
+            max_prompt_length=256,
             num_tokens_to_generate=4,
             num_speculative_tokens=2,
             enable_prefix_caching=True,  # Set at config level
-            context_block_size_tokens=8,  # Ensure exact 1 block per prompt
+            context_block_size_tokens=256,  # Ensure exact 1 block per prompt
             materialize_only_last_token_logits=False,
             model_provider="gpt",
-            context_max_tokens=512,
+            context_max_tokens=4096,
             context_max_requests=512,
         )
         env = self._build_test_env(test_config)
 
         # Create two pairs of requests with identical shared prefixes.
         shared_prompt_a = torch.randint(
-            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+            0, test_config.vocab_size - 1, (256,), dtype=torch.int64, device='cuda'
         )
         shared_prompt_b = torch.randint(
-            0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
+            0, test_config.vocab_size - 1, (256,), dtype=torch.int64, device='cuda'
         )
 
         prompts = [shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]
@@ -2630,7 +2625,7 @@ class TestDynamicInferenceEngine:
             env.engine.add_request(
                 request_id=i,
                 prompt=prompt.clone(),
-                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=99),
+                sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
             )
 
         # First, run schedule_waiting_requests and ONE step to allocate the prefill blocks.
@@ -2674,30 +2669,30 @@ class TestDynamicInferenceEngine:
         """
         test_config = DynamicEngineTestConfig(
             num_requests=0,
-            min_prompt_length=16,
-            max_prompt_length=16,
-            num_tokens_to_generate=4,
+            min_prompt_length=512,
+            max_prompt_length=512,
+            num_tokens_to_generate=128,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,  # Set at config level
-            context_block_size_tokens=8,
+            context_block_size_tokens=256,
             model_provider="gpt",
-            context_max_tokens=48,  # Force chunking
+            context_max_tokens=1536,  # Force chunking
             context_max_requests=48,
         )
         env = self._build_test_env(test_config)
 
         # Create identical prompts for all 4 requests
         shared_prompt = torch.randint(
-            0, test_config.vocab_size - 1, (16,), dtype=torch.int64, device='cuda'
+            0, test_config.vocab_size - 1, (512,), dtype=torch.int64, device='cuda'
         )
 
         for i in range(4):
             env.engine.add_request(
                 request_id=i,
                 prompt=shared_prompt.clone(),
-                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=99),
+                sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
             )
 
         while env.engine.has_unfinished_requests():
