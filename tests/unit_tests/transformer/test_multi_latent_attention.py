@@ -1627,12 +1627,8 @@ class TestFusedMLASelfAttention:
 
         self.fused_attention.cuda()
 
-        hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, config.hidden_size)
-        ).cuda()
-        attention_mask = torch.ones(
-            (1, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         output, bias = self.fused_attention(hidden_states, attention_mask)
 
@@ -1651,12 +1647,10 @@ class TestFusedMLASelfAttention:
 
         self.fused_attention.cuda().bfloat16()
 
-        hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, config.hidden_size)
-        ).cuda().bfloat16()
-        attention_mask = torch.ones(
-            (1, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        hidden_states = (
+            torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda().bfloat16()
+        )
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         output, bias = self.fused_attention(hidden_states, attention_mask)
 
@@ -1696,10 +1690,7 @@ class TestFusedMLAGradientFlow:
 
         config = self.transformer_config
         fused = FusedMLASelfAttention(
-            config,
-            get_fused_mla_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
+            config, get_fused_mla_submodules(), layer_number=1, attn_mask_type=AttnMaskType.causal
         )
         fused.cuda()
 
@@ -1714,7 +1705,9 @@ class TestFusedMLAGradientFlow:
         loss.backward()
 
         assert fused.linear_qkv_down_proj.weight.grad is not None
-        assert fused.linear_qkv_down_proj.weight.grad.shape == fused.linear_qkv_down_proj.weight.shape
+        assert (
+            fused.linear_qkv_down_proj.weight.grad.shape == fused.linear_qkv_down_proj.weight.shape
+        )
         assert hidden_states.grad is not None
 
 
@@ -1775,9 +1768,7 @@ class TestFusedMLALoadFromStateDict:
         q_w = unfused_sd['linear_q_down_proj.weight']
         kv_w = unfused_sd['linear_kv_down_proj.weight']
         expected_fused = torch.cat([q_w, kv_w], dim=0)
-        torch.testing.assert_close(
-            fused.linear_qkv_down_proj.weight.data, expected_fused
-        )
+        torch.testing.assert_close(fused.linear_qkv_down_proj.weight.data, expected_fused)
 
     def test_sharded_state_dict_splits_back(self):
         if not is_te_min_version("1.10.0"):
@@ -1791,15 +1782,15 @@ class TestFusedMLALoadFromStateDict:
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
-        assert any('linear_q_down_proj.weight' in k for k in sharded_sd), (
-            f"Expected linear_q_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
-        )
-        assert any('linear_kv_down_proj.weight' in k for k in sharded_sd), (
-            f"Expected linear_kv_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
-        )
-        assert not any('linear_qkv_down_proj.weight' in k for k in sharded_sd), (
-            f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
-        )
+        assert any(
+            'linear_q_down_proj.weight' in k for k in sharded_sd
+        ), f"Expected linear_q_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
+        assert any(
+            'linear_kv_down_proj.weight' in k for k in sharded_sd
+        ), f"Expected linear_kv_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
+        assert not any(
+            'linear_qkv_down_proj.weight' in k for k in sharded_sd
+        ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
 
 
 class TestFusedMLARequiresQLora:
