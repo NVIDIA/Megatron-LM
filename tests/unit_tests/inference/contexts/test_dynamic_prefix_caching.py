@@ -21,13 +21,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-# =========================================================================
-# Base class + helpers
-# =========================================================================
-
 
 class PrefixCachingTestBase:
-    """Base class with shared setup/teardown and helper methods."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(
@@ -37,6 +32,18 @@ class PrefixCachingTestBase:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _mamba_config():
+        from megatron.core.inference.config import MambaInferenceStateConfig
+
+        return MambaInferenceStateConfig(
+            layer_type_list=["*", "M", "*", "M"],
+            conv_states_shape=(4, 8),
+            ssm_states_shape=(4, 16),
+            conv_states_dtype=torch.float32,
+            ssm_states_dtype=torch.float32,
+        )
 
     def _ctx(
         self,
@@ -48,8 +55,9 @@ class PrefixCachingTestBase:
         enable_prefix_caching=True,
         max_tokens=None,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        mamba_config=None,
+        prefix_caching_mamba_gb=None,
     ):
-        """Create a DynamicInferenceContext with sensible test defaults."""
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
@@ -70,11 +78,12 @@ class PrefixCachingTestBase:
             paused_buffer_size_gb=0.2 * buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            mamba_inference_state_config=None,
+            mamba_inference_state_config=mamba_config,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
+            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -82,7 +91,6 @@ class PrefixCachingTestBase:
 
     @staticmethod
     def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
-        """Create a DynamicInferenceRequest with sensible defaults."""
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
@@ -93,17 +101,14 @@ class PrefixCachingTestBase:
 
     @staticmethod
     def _prompt(num_tokens, offset=0):
-        """Create a prompt tensor on CUDA."""
         return torch.arange(offset, offset + num_tokens, device=torch.cuda.current_device())
 
     @staticmethod
     def _block_ids(ctx, req_idx, n):
-        """Extract first n block IDs for a request as a list of ints."""
         return [ctx.request_to_kv_block_ids[req_idx][i].item() for i in range(n)]
 
 
 class _StubEngine(DynamicInferenceEngine):
-    """Lightweight engine subclass that skips full __init__ for unit testing."""
 
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
@@ -114,540 +119,291 @@ class _StubEngine(DynamicInferenceEngine):
         self.requests = {}
 
 
-# =========================================================================
-# Class 1: TestBlockSharingAndRefCounts (5 tests)
-# =========================================================================
-
-
-class TestBlockSharingAndRefCounts(PrefixCachingTestBase):
+class TestPrefixCachingCore(PrefixCachingTestBase):
 
     @pytest.mark.internal
-    def test_identical_prompts_share_all_blocks(self):
-        """N=10 identical requests use only K blocks, not N*K."""
+    def test_hash_computation(self):
+        # determinism and range
+        tokens = self._prompt(32)
+        h1 = compute_block_hashes_batched(tokens, 32)
+        h2 = compute_block_hashes_batched(tokens, 32)
+        assert h1 == h2 and len(h1) == 1 and 1 <= h1[0] <= HASH_PRIME
+        assert compute_block_hashes_batched(self._prompt(32, offset=1), 32)[0] != h1[0]
+
+        # parent chaining: 4 blocks of all-zero tokens produce distinct hashes
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        zeros = torch.zeros(bs * 4, device=torch.cuda.current_device(), dtype=torch.long)
+        hashes = compute_block_hashes_batched(zeros, bs)
+        assert len(hashes) == 4 and len(set(hashes)) == 4
+
+        # edge cases: short, empty, long
+        assert compute_block_hashes_batched(self._prompt(bs // 2), bs) == []
+        empty = torch.tensor([], device=torch.cuda.current_device(), dtype=torch.long)
+        assert compute_block_hashes_batched(empty, bs) == []
+        long_h = compute_block_hashes_batched(
+            torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long), bs
+        )
+        assert len(long_h) == 120 and all(v > 0 for v in long_h)
+
+    @pytest.mark.internal
+    def test_registration_and_discovery(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 3)
 
+        # blocks discoverable after add_request
+        prompt = self._prompt(bs * 2)
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        h0, h1 = req.precomputed_block_hashes
+        assert alloc.kv_hash_to_block_id.get(h0) == b0
+        assert alloc.kv_hash_to_block_id.get(h1) == b1
+        assert alloc.block_hashes[b0].item() == h0 and alloc.block_hashes[b1].item() == h1
+
+        # partial block not registered
+        ctx2 = self._ctx()
+        alloc2 = ctx2.block_allocator
+        ctx2.add_request(self._req(ctx2, self._prompt(bs + bs // 2)))
+        pb0, pb1 = self._block_ids(ctx2, 0, 2)
+        assert alloc2.block_hashes[pb0].item() != -1
+        assert alloc2.block_hashes[pb1].item() == -1
+
+        # decode does not register completed blocks
+        ctx3 = self._ctx()
+        alloc3 = ctx3.block_allocator
+        ctx3.add_request(self._req(ctx3, self._prompt(bs + (bs - 1))))
+        db0, db1 = self._block_ids(ctx3, 0, 2)
+        assert alloc3.block_hashes[db0].item() != -1 and alloc3.block_hashes[db1].item() == -1
+        active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
+        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
+        ctx3.update_requests(active_mask, new_tokens)
+        assert alloc3.block_hashes[db1].item() == -1
+
+        # second request finds registered blocks
+        ctx4 = self._ctx()
+        alloc4 = ctx4.block_allocator
+        p4 = self._prompt(bs * 3)
+        ctx4.add_request(self._req(ctx4, p4.clone()))
+        req2 = self._req(ctx4, p4.clone(), request_id=2)
+        for h in req2.precomputed_block_hashes:
+            assert h in alloc4.kv_hash_to_block_id
+
+    @pytest.mark.internal
+    def test_block_sharing_patterns(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # N=10 identical prompts share all blocks
+        prompt = self._prompt(bs * 3)
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 3)
         avail_after_first = alloc.total_avail
-
         for i in range(2, 11):
             ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
-
-        # Pool unchanged after 9 more requests
         assert alloc.total_avail == avail_after_first
-
-        # All share the same block IDs
         for req_idx in range(1, 10):
             assert self._block_ids(ctx, req_idx, 3) == first_blocks
-
-        # Ref counts == 10
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 10
 
-    @pytest.mark.internal
-    def test_divergent_suffix_shares_common_prefix(self):
-        """[A,B,C] + [A,B,D]: blocks 0-1 shared (ref=2), blocks 2,3 separate (ref=1)."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
+        # divergent suffix shares common prefix
+        ctx2 = self._ctx()
+        alloc2 = ctx2.block_allocator
+        p1 = self._prompt(bs * 3)
+        ctx2.add_request(self._req(ctx2, p1))
+        r1 = self._block_ids(ctx2, 0, 3)
+        p2 = p1.clone()
+        p2[bs * 2 :] += 1000
+        ctx2.add_request(self._req(ctx2, p2, request_id=2))
+        r2 = self._block_ids(ctx2, 1, 3)
+        assert r2[0] == r1[0] and r2[1] == r1[1] and r2[2] != r1[2]
+        assert alloc2.block_ref_counts[r1[0]].item() == 2
+        assert alloc2.block_ref_counts[r1[2]].item() == 1
 
-        prompt1 = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt1))
-        r1 = self._block_ids(ctx, 0, 3)
-
-        prompt2 = prompt1.clone()
-        prompt2[bs * 2 :] += 1000
-        ctx.add_request(self._req(ctx, prompt2, request_id=2))
-        r2 = self._block_ids(ctx, 1, 3)
-
-        assert r2[0] == r1[0] and r2[1] == r1[1], "Blocks 0,1 shared"
-        assert r2[2] != r1[2], "Block 2 separate"
-        assert alloc.block_ref_counts[r1[0]].item() == 2
-        assert alloc.block_ref_counts[r1[1]].item() == 2
-        assert alloc.block_ref_counts[r1[2]].item() == 1
-        assert alloc.block_ref_counts[r2[2]].item() == 1
-
-    @pytest.mark.internal
-    def test_broken_chain_stops_sharing(self):
-        """[X,W,Z] vs [X,Y,Z]: only block 0 shared due to parent chain break."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt1 = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt1))
-        r1 = self._block_ids(ctx, 0, 3)
-
-        prompt2 = prompt1.clone()
-        prompt2[bs : bs * 2] += 5000
-        ctx.add_request(self._req(ctx, prompt2, request_id=2))
-        r2 = self._block_ids(ctx, 1, 3)
-
-        assert r2[0] == r1[0], "Block 0 shared"
-        assert r2[1] != r1[1], "Block 1 NOT shared"
-        assert r2[2] != r1[2], "Block 2 NOT shared (hash chain broken)"
-        assert alloc.block_ref_counts[r1[0]].item() == 2
-        assert alloc.block_ref_counts[r1[1]].item() == 1
+        # broken chain stops sharing: [X,W,Z] vs [X,Y,Z]
+        ctx3 = self._ctx()
+        alloc3 = ctx3.block_allocator
+        p3a = self._prompt(bs * 3)
+        ctx3.add_request(self._req(ctx3, p3a))
+        r3a = self._block_ids(ctx3, 0, 3)
+        p3b = p3a.clone()
+        p3b[bs : bs * 2] += 5000
+        ctx3.add_request(self._req(ctx3, p3b, request_id=2))
+        r3b = self._block_ids(ctx3, 1, 3)
+        assert r3b[0] == r3a[0] and r3b[1] != r3a[1] and r3b[2] != r3a[2]
+        assert alloc3.block_ref_counts[r3a[0]].item() == 2
 
     @pytest.mark.internal
-    def test_disabled_means_no_sharing(self):
-        """enable_prefix_caching=False: identical prompts allocate separate blocks."""
-        ctx = self._ctx(enable_prefix_caching=False)
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone(), enable_prefix_caching=False))
-        r1 = set(self._block_ids(ctx, 0, 2))
-
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2, enable_prefix_caching=False))
-        r2 = set(self._block_ids(ctx, 1, 2))
-
-        assert r1.isdisjoint(r2)
-
-    @pytest.mark.internal
-    def test_disabled_allocator_has_no_caching_state(self):
-        """Disabled allocator lacks caching attrs; REF_ZERO lacks timestamps."""
-        ctx_disabled = self._ctx(enable_prefix_caching=False)
-        alloc_d = ctx_disabled.block_allocator
-        assert not hasattr(alloc_d, 'block_hashes')
-        assert not hasattr(alloc_d, 'kv_hash_to_block_id')
-        assert not hasattr(alloc_d, 'block_ref_counts')
-
-        ctx_rz = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
-        alloc_rz = ctx_rz.block_allocator
-        assert not hasattr(alloc_rz, 'block_timestamps')
-
-
-# =========================================================================
-# Class 2: TestPrefillTokenSavings (4 tests)
-# =========================================================================
-
-
-class TestPrefillTokenSavings(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_lifetime_prefill_count_with_vs_without(self):
-        """Enabled saves tokens vs disabled for two identical prompts."""
+    def test_prefill_token_savings(self):
         bs = 32
 
-        # Enabled
+        # enabled vs disabled
         ctx_on = self._ctx()
         prompt = self._prompt(bs * 4)
         ctx_on.add_request(self._req(ctx_on, prompt.clone()))
         ctx_on.add_request(self._req(ctx_on, prompt.clone(), request_id=2))
-        enabled_total = ctx_on.lifetime_prefill_token_count
-
-        # Disabled
         ctx_off = self._ctx(enable_prefix_caching=False)
         ctx_off.add_request(self._req(ctx_off, prompt.clone(), enable_prefix_caching=False))
         ctx_off.add_request(
             self._req(ctx_off, prompt.clone(), request_id=2, enable_prefix_caching=False)
         )
-        disabled_total = ctx_off.lifetime_prefill_token_count
+        assert ctx_on.lifetime_prefill_token_count == bs * 4
+        assert ctx_off.lifetime_prefill_token_count == bs * 4 * 2
 
-        # Enabled: 4*bs + 0 (zero-redundant, cached logit). Disabled: 4*bs + 4*bs.
-        assert enabled_total == bs * 4
-        assert disabled_total == bs * 4 * 2
-        assert enabled_total < disabled_total
+        # partial match reduces proportionally
+        ctx2 = self._ctx()
+        p2a = self._prompt(bs * 3)
+        ctx2.add_request(self._req(ctx2, p2a.clone()))
+        p2b = p2a.clone()
+        p2b[bs * 2 :] += 1000
+        ctx2.add_request(self._req(ctx2, p2b, request_id=2))
+        assert ctx2.lifetime_prefill_token_count == bs * 3 + bs
+
+        # full match: zero-redundant cached logit
+        ctx3 = self._ctx()
+        alloc3 = ctx3.block_allocator
+        p3 = self._prompt(bs * 3)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        tokens_after = ctx3.active_token_count
+        first_blocks = self._block_ids(ctx3, 0, 3)
+        for i in range(5):
+            ctx3.add_request(self._req(ctx3, p3.clone(), request_id=i + 2))
+            assert ctx3.request_query_lengths[i + 1].item() == 0
+        assert ctx3.active_token_count - tokens_after == 0
+        for bid in first_blocks:
+            assert alloc3.block_ref_counts[bid].item() == 6
+        assert ctx3.lifetime_prefill_token_count == bs * 3
+
+        # no match: full prompt added
+        ctx4 = self._ctx()
+        ctx4.add_request(self._req(ctx4, self._prompt(bs * 2)))
+        ctx4.add_request(self._req(ctx4, self._prompt(bs * 2, offset=9000), request_id=2))
+        assert ctx4.lifetime_prefill_token_count == bs * 2 + bs * 2
 
     @pytest.mark.internal
-    def test_partial_match_reduces_prefill_proportionally(self):
-        """First req fills 3 blocks, second matches 2 of 3, adds bs tokens."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        prompt1 = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt1.clone()))
-
-        prompt2 = prompt1.clone()
-        prompt2[bs * 2 :] += 1000
-        ctx.add_request(self._req(ctx, prompt2, request_id=2))
-
-        assert ctx.lifetime_prefill_token_count == bs * 3 + bs
-
-    @pytest.mark.internal
-    def test_full_match_adds_single_token(self):
-        """Prompt exactly N*bs, fully matched: multiple dependent requests each get query_length == 0.
-
-        When a block-aligned prompt fully matches a cached prefix, all tokens are
-        skipped (zero-redundant). The cached logit from the last matched block is
-        used directly instead of running any tokens through the model. Multiple
-        such requests all get effective_chunk_length == 0 and contribute no tokens
-        to the batch.
-        """
+    def test_block_allocation_with_prefix(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        num_blocks = 3
-        num_dependents = 5
-        prompt = self._prompt(bs * num_blocks)
 
+        # matched blocks not allocated from pool
+        prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
-        tokens_after_first = ctx.active_token_count
-        first_blocks = self._block_ids(ctx, 0, num_blocks)
+        first_blocks = self._block_ids(ctx, 0, 4)
+        avail = alloc.total_avail
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 1, 4) == first_blocks and alloc.total_avail == avail
 
-        for i in range(num_dependents):
-            ctx.add_request(self._req(ctx, prompt.clone(), request_id=i + 2))
+        # extended prompt allocates only new blocks
+        ctx2 = self._ctx()
+        alloc2 = ctx2.block_allocator
+        p2a = self._prompt(bs * 3)
+        ctx2.add_request(self._req(ctx2, p2a))
+        avail2 = alloc2.total_avail
+        p2b = torch.cat([p2a, self._prompt(bs * 2, offset=1000)])
+        ctx2.add_request(self._req(ctx2, p2b, request_id=2))
+        assert alloc2.total_avail == avail2 - 2
 
-            req_idx = i + 1
-
-            # Each dependent adds exactly 0 tokens (zero-redundant cached logit)
-            assert ctx.request_query_lengths[req_idx].item() == 0
-
-        # Total tokens: 0 per dependent request
-        assert ctx.active_token_count - tokens_after_first == 0
-
-        # All matched blocks have ref count == 1 (first) + num_dependents
-        for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 1 + num_dependents
-
-        # Lifetime count: full prefill for req0 + 0 tokens per dependent
-        assert ctx.lifetime_prefill_token_count == bs * num_blocks
-
-    @pytest.mark.internal
-    def test_no_match_adds_full_prompt(self):
-        """Different prefix: full chunk_length added to lifetime count."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=9000), request_id=2))
-
-        assert ctx.lifetime_prefill_token_count == bs * 2 + bs * 2
-
-
-# =========================================================================
-# Class 3: TestRefCountLifecycle (5 tests)
-# =========================================================================
-
-
-class TestRefCountLifecycle(PrefixCachingTestBase):
+        # check_availability accounts for prefix match
+        ctx3 = self._ctx(buffer_size_gb=0.01, rounder=1)
+        alloc3 = ctx3.block_allocator
+        p3 = self._prompt(ctx3.block_size_tokens * 2)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        while alloc3.total_avail > 0:
+            alloc3.allocate_memory_blocks(1)
+        _, _, kv_available = ctx3.check_availability(self._req(ctx3, p3.clone(), request_id=2))
+        assert kv_available
 
     @pytest.mark.internal
-    def test_lru_ref_decrement_preserves_cached_blocks(self):
-        """LRU mode: add 2, release both. Ref 2 -> 1 -> 0. Hash still in dict."""
+    def test_ref_count_lru(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
 
+        # decrement preserves cached blocks
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, b1 = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
-
         assert alloc.block_ref_counts[b0].item() == 2
-
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.kv_hash_to_block_id
-
+        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_ref_counts[b1].item() == 0
-        assert b0_hash in alloc.kv_hash_to_block_id, "LRU keeps cached blocks"
+        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash in alloc.kv_hash_to_block_id
 
-    @pytest.mark.internal
-    def test_lru_cached_blocks_reused_by_new_request(self):
-        """LRU mode: released blocks (ref=0, cached) reused by same-prefix request."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
+        # cached blocks reused by new request
+        ctx2 = self._ctx()
+        alloc2 = ctx2.block_allocator
+        p2 = self._prompt(bs * 2)
+        ctx2.add_request(self._req(ctx2, p2.clone()))
+        cb0, cb1 = self._block_ids(ctx2, 0, 2)
+        ctx2.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx2.total_request_count = 0
+        assert alloc2.block_ref_counts[cb0].item() == 0
+        ctx2.add_request(self._req(ctx2, p2.clone(), request_id=2))
+        assert self._block_ids(ctx2, 0, 2) == [cb0, cb1]
+        assert alloc2.block_ref_counts[cb0].item() == 1
 
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.total_request_count = 0
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.kv_hash_to_block_id
-
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 0, 2) == [b0, b1]
-        assert alloc.block_ref_counts[b0].item() == 1
-
-    @pytest.mark.internal
-    def test_lru_eviction_frees_oldest_cached_first(self):
-        """LRU mode, tiny buffer: create cached groups A, B. Fill memory. A evicted first."""
-        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        # Active request (protected)
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        active_blocks = ctx.request_to_kv_block_ids[0][:2].clone()
-
-        # Cached request (evictable)
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=5000), request_id=2))
-        cached_blocks = ctx.request_to_kv_block_ids[1][:2].clone()
-        cached_hash = alloc.block_hashes[cached_blocks[0].item()].item()
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        ctx.total_request_count = 1
-        assert alloc.block_ref_counts[cached_blocks[0].item()].item() == 0
-
-        # Fill remaining space to trigger eviction of cached blocks
+        # eviction frees oldest cached first
+        ctx3 = self._ctx(buffer_size_gb=0.01, rounder=1)
+        alloc3 = ctx3.block_allocator
+        ctx3.add_request(self._req(ctx3, self._prompt(bs * 2)))
+        active_blocks = ctx3.request_to_kv_block_ids[0][:2].clone()
+        ctx3.add_request(self._req(ctx3, self._prompt(bs * 2, offset=5000), request_id=2))
+        ctx3.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        ctx3.total_request_count = 1
         for i in range(20):
             try:
-                ctx.add_request(
-                    self._req(ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
+                ctx3.add_request(
+                    self._req(ctx3, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
                 )
             except Exception:
                 break
-
-        # Active blocks remain protected
         for bid in active_blocks:
-            assert alloc.block_ref_counts[bid.item()].item() == 1
+            assert alloc3.block_ref_counts[bid.item()].item() == 1
 
     @pytest.mark.internal
-    def test_refzero_deregisters_on_last_release(self):
-        """REF_ZERO: two reqs sharing prefix. Release both: hash removed, blocks returned."""
+    def test_ref_count_refzero(self):
+        bs = 32
+
+        # deregisters on last release
         ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
-        bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
-
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-
         b0, b1 = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
         avail_before = alloc.total_avail
-
-        # Release first: ref=1, hash persists
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.kv_hash_to_block_id
-
-        # Release second: ref=0, hash removed, blocks returned
+        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.kv_hash_to_block_id
-        assert alloc.block_hashes[b0].item() == -1
-        assert alloc.block_hashes[b1].item() == -1
+        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_hashes[b0].item() == -1 and alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
 
-    @pytest.mark.internal
-    def test_refzero_released_blocks_not_discoverable(self):
-        """REF_ZERO: after full release, same-prefix request gets fresh blocks."""
-        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        first_blocks = self._block_ids(ctx, 0, 2)
-
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.total_request_count = 0
-
-        # Hash lookup returns None, so new blocks allocated
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        new_blocks = self._block_ids(ctx, 0, 2)
-        assert alloc.block_ref_counts[new_blocks[0]].item() == 1
-        assert alloc.block_ref_counts[new_blocks[1]].item() == 1
+        # released blocks not discoverable
+        ctx2 = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        alloc2 = ctx2.block_allocator
+        p2 = self._prompt(bs * 2)
+        ctx2.add_request(self._req(ctx2, p2.clone()))
+        ctx2.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx2.total_request_count = 0
+        ctx2.add_request(self._req(ctx2, p2.clone(), request_id=2))
+        new_blocks = self._block_ids(ctx2, 0, 2)
+        assert alloc2.block_ref_counts[new_blocks[0]].item() == 1
 
 
-# =========================================================================
-# Class 4: TestHashComputation (3 tests)
-# =========================================================================
-
-
-class TestHashComputation(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_determinism_and_range(self):
-        """Same tokens -> same hashes. All in [1, HASH_PRIME]. Different tokens differ."""
-        tokens = self._prompt(32)
-        h1 = compute_block_hashes_batched(tokens, 32)
-        h2 = compute_block_hashes_batched(tokens, 32)
-        assert h1 == h2
-        assert len(h1) == 1
-        assert 1 <= h1[0] <= HASH_PRIME
-
-        h_diff = compute_block_hashes_batched(self._prompt(32, offset=1), 32)
-        assert h_diff[0] != h1[0]
-
-    @pytest.mark.internal
-    def test_parent_chaining_differentiates_position(self):
-        """4 blocks of all-zero tokens: all hashes distinct due to parent chaining."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        zeros = torch.zeros(bs * 4, device=torch.cuda.current_device(), dtype=torch.long)
-        hashes = compute_block_hashes_batched(zeros, bs)
-        assert len(hashes) == 4
-        assert len(set(hashes)) == 4
-
-    @pytest.mark.internal
-    def test_edge_cases(self):
-        """Short, empty, and long prompts produce expected hash counts."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        # Shorter than block_size -> empty
-        assert compute_block_hashes_batched(self._prompt(bs // 2), bs) == []
-
-        # Empty prompt -> empty
-        empty = torch.tensor([], device=torch.cuda.current_device(), dtype=torch.long)
-        assert compute_block_hashes_batched(empty, bs) == []
-
-        # 120-block prompt -> 120 positive hashes
-        long_prompt = torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long)
-        h = compute_block_hashes_batched(long_prompt, bs)
-        assert len(h) == 120
-        assert all(v > 0 for v in h)
-
-
-# =========================================================================
-# Class 5: TestRegistrationAndDiscovery (4 tests)
-# =========================================================================
-
-
-class TestRegistrationAndDiscovery(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_blocks_discoverable_after_add_request(self):
-        """After add_request, each block's hash maps to its block ID."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        req = self._req(ctx, prompt)
-        ctx.add_request(req)
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-
-        assert alloc.kv_hash_to_block_id.get(h0) == b0
-        assert alloc.kv_hash_to_block_id.get(h1) == b1
-        assert alloc.block_hashes[b0].item() == h0
-        assert alloc.block_hashes[b1].item() == h1
-
-    @pytest.mark.internal
-    def test_partial_block_not_registered(self):
-        """Prompt of bs + bs//2: first block registered, second block not."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt = self._prompt(bs + bs // 2)
-        ctx.add_request(self._req(ctx, prompt))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-
-        assert alloc.block_hashes[b0].item() != -1, "Complete block registered"
-        assert alloc.block_hashes[b1].item() == -1, "Partial block not registered"
-
-    @pytest.mark.internal
-    def test_decode_does_not_register_completed_blocks(self):
-        """Partial block stays unregistered after decode fills it (known limitation)."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt = self._prompt(bs + (bs - 1))
-        ctx.add_request(self._req(ctx, prompt))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-
-        assert alloc.block_hashes[b0].item() != -1
-        assert alloc.block_hashes[b1].item() == -1
-
-        # One decode step fills block 1
-        active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
-        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
-        ctx.update_requests(active_mask, new_tokens)
-
-        assert alloc.block_hashes[b1].item() == -1, "Decode does not register blocks"
-
-    @pytest.mark.internal
-    def test_second_request_finds_registered_blocks(self):
-        """After req1 registers 3 blocks, req2's hashes all resolve in kv_hash_to_block_id."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 3)
-
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        for h in req2.precomputed_block_hashes:
-            assert h in alloc.kv_hash_to_block_id, f"Hash {h} should be discoverable"
-
-
-# =========================================================================
-# Class 6: TestBlockAllocation (3 tests)
-# =========================================================================
-
-
-class TestBlockAllocation(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_matched_blocks_not_allocated_from_pool(self):
-        """Req1 allocates 4 blocks. Req2 same prefix: pool unchanged, same block IDs."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 4)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        first_blocks = self._block_ids(ctx, 0, 4)
-        avail_after_first = alloc.total_avail
-
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 1, 4) == first_blocks
-        assert alloc.total_avail == avail_after_first
-
-    @pytest.mark.internal
-    def test_extended_prompt_allocates_only_new_blocks(self):
-        """Req1: 3 blocks. Req2: 5 blocks (same first 3). Pool drops by exactly 2."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt1 = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt1))
-        avail_after_first = alloc.total_avail
-
-        prompt2 = torch.cat([prompt1, self._prompt(bs * 2, offset=1000)])
-        ctx.add_request(self._req(ctx, prompt2, request_id=2))
-        assert alloc.total_avail == avail_after_first - 2
-
-    @pytest.mark.internal
-    def test_check_availability_accounts_for_prefix_match(self):
-        """check_availability returns kv_cache_available=True when matched blocks cover need."""
-        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-
-        # Fill remaining pool
-        while alloc.total_avail > 0:
-            alloc.allocate_memory_blocks(1)
-
-        # New request with same prefix: all blocks matched, needs 0 from pool
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        _, _, kv_available = ctx.check_availability(req2)
-        assert kv_available, "Matched blocks don't need pool allocation"
-
-
-# =========================================================================
-# Class 7: TestEngineScheduling (6 tests)
-# =========================================================================
-
-
-class TestEngineScheduling(PrefixCachingTestBase):
+class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
 
     def _engine(self, ctx, **kwargs):
-        """Create a _StubEngine wrapping ctx."""
         return _StubEngine(ctx, **kwargs)
 
     def _add_to_waiting(self, engine, ctx, req):
-        """Register req with engine and put it in the waiting queue."""
         request_id = req.request_id
         engine.requests[request_id] = type(
             "Entry",
@@ -662,1058 +418,476 @@ class TestEngineScheduling(PrefixCachingTestBase):
         engine.waiting_request_ids.append(request_id)
 
     @pytest.mark.internal
-    def test_shared_prefix_defers_second_request(self):
-        """Two requests with shared prefix: first scheduled, second deferred."""
+    def test_disabled_mode(self):
+        # no sharing
+        ctx = self._ctx(enable_prefix_caching=False)
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone(), enable_prefix_caching=False))
+        r1 = set(self._block_ids(ctx, 0, 2))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2, enable_prefix_caching=False))
+        r2 = set(self._block_ids(ctx, 1, 2))
+        assert r1.isdisjoint(r2)
+
+        # no caching attrs on disabled allocator
+        alloc_d = ctx.block_allocator
+        assert not hasattr(alloc_d, 'block_hashes')
+        assert not hasattr(alloc_d, 'kv_hash_to_block_id')
+        assert not hasattr(alloc_d, 'block_ref_counts')
+
+        # REF_ZERO lacks timestamps
+        ctx_rz = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        assert not hasattr(ctx_rz.block_allocator, 'block_timestamps')
+
+    @pytest.mark.internal
+    def test_scheduling_deferral_and_resolution(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
         prompt = self._prompt(bs * 2)
 
+        # shared prefix defers second request
         req1 = self._req(ctx, prompt.clone())
         self._add_to_waiting(engine, ctx, req1)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
-
         engine.schedule_non_chunked_prefill()
         assert ctx.total_request_count == 1
-        assert len(engine.waiting_request_ids) == 1
-        assert engine.waiting_request_ids[0] == 2
+        assert len(engine.waiting_request_ids) == 1 and engine.waiting_request_ids[0] == 2
         assert engine._prefix_coordination_waits == 1
 
-    @pytest.mark.internal
-    def test_scheduler_skips_deferred_to_schedule_non_conflicting(self):
-        """req1+req2 share prefix A, req3 has prefix B. req1 and req3 scheduled, req2 deferred."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        engine = self._engine(ctx)
-
-        prompt_a = self._prompt(bs * 2)
-        prompt_b = self._prompt(bs * 2, offset=5000)
-
-        req1 = self._req(ctx, prompt_a.clone())
-        self._add_to_waiting(engine, ctx, req1)
-        req2 = self._req(ctx, prompt_a.clone(), request_id=2)
-        self._add_to_waiting(engine, ctx, req2)
-        req3 = self._req(ctx, prompt_b.clone(), request_id=3)
-        self._add_to_waiting(engine, ctx, req3)
-
+        # deferred request schedulable after registration (round 2)
         engine.schedule_non_chunked_prefill()
-        assert ctx.total_request_count == 2, "req1 and req3 scheduled"
-        assert len(engine.waiting_request_ids) == 1
-        assert engine.waiting_request_ids[0] == 2, "req2 deferred"
+        assert ctx.total_request_count == 2 and len(engine.waiting_request_ids) == 0
 
-    @pytest.mark.internal
-    def test_registered_prefix_allows_immediate_scheduling(self):
-        """Prefix already in context: second request scheduled without deferral."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        engine = self._engine(ctx)
-        prompt = self._prompt(bs * 2)
+        # skip deferred to schedule non-conflicting
+        ctx2 = self._ctx()
+        engine2 = self._engine(ctx2)
+        pa = self._prompt(bs * 2)
+        pb = self._prompt(bs * 2, offset=5000)
+        self._add_to_waiting(engine2, ctx2, self._req(ctx2, pa.clone()))
+        self._add_to_waiting(engine2, ctx2, self._req(ctx2, pa.clone(), request_id=2))
+        self._add_to_waiting(engine2, ctx2, self._req(ctx2, pb.clone(), request_id=3))
+        engine2.schedule_non_chunked_prefill()
+        assert ctx2.total_request_count == 2
+        assert len(engine2.waiting_request_ids) == 1 and engine2.waiting_request_ids[0] == 2
 
-        # Add first request directly to context (hashes registered)
-        ctx.add_request(self._req(ctx, prompt.clone()))
+        # registered prefix allows immediate scheduling
+        ctx3 = self._ctx()
+        engine3 = self._engine(ctx3)
+        p3 = self._prompt(bs * 2)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        self._add_to_waiting(engine3, ctx3, self._req(ctx3, p3.clone(), request_id=2))
+        engine3.schedule_non_chunked_prefill()
+        assert len(engine3.waiting_request_ids) == 0 and ctx3.total_request_count == 2
+        assert engine3._prefix_coordination_waits == 0
 
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        self._add_to_waiting(engine, ctx, req2)
-
-        engine.schedule_non_chunked_prefill()
-        assert len(engine.waiting_request_ids) == 0
-        assert ctx.total_request_count == 2
-        assert engine._prefix_coordination_waits == 0
+        # metrics track deferrals
+        ctx4 = self._ctx()
+        engine4 = self._engine(ctx4)
+        p4 = self._prompt(bs * 2)
+        assert engine4.get_prefix_coordination_metrics() == {"waits": 0}
+        self._add_to_waiting(engine4, ctx4, self._req(ctx4, p4.clone()))
+        self._add_to_waiting(engine4, ctx4, self._req(ctx4, p4.clone(), request_id=2))
+        engine4.schedule_non_chunked_prefill()
+        assert engine4.get_prefix_coordination_metrics() == {"waits": 1}
+        engine4.schedule_non_chunked_prefill()
+        assert engine4.get_prefix_coordination_metrics() == {"waits": 1}
+        assert len(engine4.waiting_request_ids) == 0
 
     @pytest.mark.internal
-    def test_deferred_request_schedulable_after_registration(self):
-        """Round 1: req1 scheduled, req2 deferred. Round 2: req2 scheduled."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        engine = self._engine(ctx)
-        prompt = self._prompt(bs * 2)
-
-        req1 = self._req(ctx, prompt.clone())
-        self._add_to_waiting(engine, ctx, req1)
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        self._add_to_waiting(engine, ctx, req2)
-
-        engine.schedule_non_chunked_prefill()
-        assert ctx.total_request_count == 1
-        assert len(engine.waiting_request_ids) == 1
-
-        # Round 2: hashes now registered from req1
-        engine.schedule_non_chunked_prefill()
-        assert ctx.total_request_count == 2
-        assert len(engine.waiting_request_ids) == 0
-
-    @pytest.mark.internal
-    def test_coordination_metrics_track_deferrals(self):
-        """get_prefix_coordination_metrics tracks waits correctly."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        engine = self._engine(ctx)
-        prompt = self._prompt(bs * 2)
-
-        assert engine.get_prefix_coordination_metrics() == {"waits": 0}
-
-        req1 = self._req(ctx, prompt.clone())
-        self._add_to_waiting(engine, ctx, req1)
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        self._add_to_waiting(engine, ctx, req2)
-
-        engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
-
-        # Second round: no new deferral
-        engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
-        assert len(engine.waiting_request_ids) == 0
-
-    @pytest.mark.internal
-    def test_chunked_prefill_defers_conflicting_request(self):
-        """Chunked prefill path has the same deferral logic."""
+    def test_chunked_prefill_deferral(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         engine = self._engine(ctx, enable_chunked_prefill=True)
         prompt = self._prompt(bs * 2)
-
-        req1 = self._req(ctx, prompt.clone())
-        self._add_to_waiting(engine, ctx, req1)
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        self._add_to_waiting(engine, ctx, req2)
-
+        self._add_to_waiting(engine, ctx, self._req(ctx, prompt.clone()))
+        self._add_to_waiting(engine, ctx, self._req(ctx, prompt.clone(), request_id=2))
         engine.schedule_chunked_prefill()
         assert ctx.total_request_count == 1
-        assert len(engine.waiting_request_ids) == 1
-        assert engine._prefix_coordination_waits == 1
-
-
-# =========================================================================
-# Class 9: TestHybridModelMemoryOnly (4 tests)
-# =========================================================================
-
-
-class TestHybridModelMemoryOnly(PrefixCachingTestBase):
-    """Hybrid models disable prefill skipping but still share blocks for memory savings."""
-
-    def _hybrid_ctx(self, **kwargs):
-        """Create a context with a hybrid (Transformer + Mamba) model config."""
-        from megatron.core.inference.config import MambaInferenceStateConfig
-
-        params_dtype = torch.float32
-
-        mamba_config = MambaInferenceStateConfig(
-            layer_type_list=["*", "M", "*", "M"],
-            conv_states_shape=(4, 8),
-            ssm_states_shape=(4, 16),
-            conv_states_dtype=params_dtype,
-            ssm_states_dtype=params_dtype,
-        )
-
-        defaults = dict(
-            buffer_size_gb=0.1,
-            block_size_tokens=32,
-            max_sequence_length=512,
-            rounder=64,
-            enable_prefix_caching=True,
-            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-        )
-        defaults.update(kwargs)
-
-        DynamicInferenceContext.ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
-
-        transformer_config = TransformerConfig(
-            params_dtype=params_dtype,
-            num_layers=4,
-            kv_channels=8,
-            num_attention_heads=2,
-            hidden_size=16,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            use_cpu_initialization=True,
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=defaults["max_sequence_length"],
-            buffer_size_gb=defaults["buffer_size_gb"],
-            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
-            block_size_tokens=defaults["block_size_tokens"],
-            max_tokens=defaults.get("max_tokens"),
-            mamba_inference_state_config=mamba_config,
-            use_flashinfer_fused_rope=None,
-            unified_memory_level=0,
-            enable_prefix_caching=defaults["enable_prefix_caching"],
-            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
-        )
-        return DynamicInferenceContext(
-            model_config=transformer_config, inference_config=inference_config
-        )
-
-    @pytest.mark.internal
-    def test_no_prefill_skipping_for_hybrid_model(self):
-        """prefix_skip_tokens == 0 and effective_chunk_length == chunk_length even when blocks match."""
-        ctx = self._hybrid_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)
-
-        assert ctx.is_hybrid_model
-
-        # First request: registers blocks.
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        # Second request: blocks match, but hybrid model forces no skipping.
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        (matched, num_from_pool, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, len(prompt)
-        )
-        assert len(matched) == 3, "should find 3 matching blocks"
-        assert prefix_skip == 0, "hybrid model must not skip prefill tokens"
-        assert eff_chunk == len(prompt), "effective chunk must equal full prompt length"
-
-    @pytest.mark.internal
-    def test_matched_blocks_reused_saving_memory(self):
-        """Second hybrid request reuses matched blocks (fewer allocated from pool)."""
-        ctx = self._hybrid_ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 3)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        avail_after_first = alloc.total_avail
-
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        avail_after_second = alloc.total_avail
-
-        # Second request should not consume any additional blocks from pool.
-        assert avail_after_second == avail_after_first
-
-    @pytest.mark.internal
-    def test_ref_counts_incremented_for_matched_blocks(self):
-        """Matched blocks have ref_count == 2 after two hybrid requests share them."""
-        ctx = self._hybrid_ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 3)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        first_blocks = self._block_ids(ctx, 0, 3)
-
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-
-        for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 2
-
-    @pytest.mark.internal
-    def test_all_prompt_tokens_in_context(self):
-        """All prompt tokens are processed (not skipped) for hybrid model requests."""
-        ctx = self._hybrid_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 2)
-
-        # First request registers blocks.
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-        tokens_after_first = ctx.active_token_count
-
-        # Second request: even with matching blocks, all tokens must be processed.
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        ctx.add_request(req2)
-
-        # All prompt tokens from req2 should be active (none skipped).
-        assert ctx.active_token_count - tokens_after_first == len(prompt)
-
-        # KV offset should be 0 (no prefix skip).
-        assert ctx.request_kv_length_offsets[1].item() == 0
-
-
-# =========================================================================
-# Class 10: TestMambaPrefixCaching (Mamba state caching + intermediate states)
-# =========================================================================
+        assert len(engine.waiting_request_ids) == 1 and engine._prefix_coordination_waits == 1
 
 
 class TestMambaPrefixCaching(PrefixCachingTestBase):
-    """Tests for Mamba prefix caching: cache infrastructure, two-map hash design,
-    coupled prefix matching, intermediate offsets, buffering/commit, zero-chunk
-    guard, and KV eviction invalidating Mamba state."""
 
-    def _mamba_ctx(self, *, prefix_caching_mamba_gb=0.01, block_size_tokens=256, **kwargs):
-        """Create a hybrid context with Mamba prefix caching enabled."""
-        from megatron.core.inference.config import MambaInferenceStateConfig
-
-        params_dtype = torch.float32
-
-        mamba_config = MambaInferenceStateConfig(
-            layer_type_list=["*", "M", "*", "M"],
-            conv_states_shape=(4, 8),
-            ssm_states_shape=(4, 16),
-            conv_states_dtype=params_dtype,
-            ssm_states_dtype=params_dtype,
-        )
-
+    def _mctx(self, **kwargs):
         defaults = dict(
-            buffer_size_gb=0.1,
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
             max_sequence_length=4096,
-            rounder=64,
-            enable_prefix_caching=True,
-            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         )
         defaults.update(kwargs)
-
-        DynamicInferenceContext.ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
-
-        transformer_config = TransformerConfig(
-            params_dtype=params_dtype,
-            num_layers=4,
-            kv_channels=8,
-            num_attention_heads=2,
-            hidden_size=16,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            use_cpu_initialization=True,
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=defaults["max_sequence_length"],
-            buffer_size_gb=defaults["buffer_size_gb"],
-            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
-            block_size_tokens=block_size_tokens,
-            max_tokens=defaults.get("max_tokens"),
-            mamba_inference_state_config=mamba_config,
-            use_flashinfer_fused_rope=None,
-            unified_memory_level=0,
-            enable_prefix_caching=defaults["enable_prefix_caching"],
-            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
-            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
-        )
-        return DynamicInferenceContext(
-            model_config=transformer_config, inference_config=inference_config
-        )
-
-    # ----- Cache infrastructure -----
+        return self._ctx(**defaults)
 
     @pytest.mark.internal
-    def test_mamba_cache_allocated(self):
-        """Mamba cache is allocated when prefix_caching_mamba_gb is set."""
-        ctx = self._mamba_ctx()
+    def test_hybrid_memory_only(self):
+        # hybrid model: no prefill skipping, but blocks reused for memory savings
+        ctx = self._ctx(mamba_config=self._mamba_config())
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 3)
+        assert ctx.is_hybrid_model
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+        first_blocks = self._block_ids(ctx, 0, 3)
+        avail = alloc.total_avail
+        tokens_after = ctx.active_token_count
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        # no prefill skipping
+        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
+
+        ctx.add_request(req2)
+        # blocks reused (pool unchanged), ref counts incremented
+        assert alloc.total_avail == avail
+        for bid in first_blocks:
+            assert alloc.block_ref_counts[bid].item() == 2
+        # all tokens processed (none skipped)
+        assert ctx.active_token_count - tokens_after == len(prompt)
+        assert ctx.request_kv_length_offsets[1].item() == 0
+
+    @pytest.mark.internal
+    def test_mamba_cache_lifecycle(self):
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+
+        # allocated when prefix_caching_mamba_gb is set
         assert ctx.max_mamba_cache_slots > 0
         assert ctx.mamba_cache_conv_states is not None
-        assert ctx.mamba_cache_ssm_states is not None
         assert ctx.mamba_cache_free_count == ctx.max_mamba_cache_slots
 
-    @pytest.mark.internal
-    def test_mamba_cache_not_allocated_when_none(self):
-        """Mamba cache is not allocated when prefix_caching_mamba_gb is None."""
-        ctx = self._mamba_ctx(prefix_caching_mamba_gb=None)
-        assert ctx.max_mamba_cache_slots == 0
+        # not allocated when None
+        ctx_none = self._mctx(prefix_caching_mamba_gb=None)
+        assert ctx_none.max_mamba_cache_slots == 0
 
-    @pytest.mark.internal
-    def test_store_and_restore_mamba_state(self):
-        """Store and restore Mamba state for a block round-trips correctly."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
+        # store and restore round-trips
         prompt = self._prompt(bs * 2)
-
         req = self._req(ctx, prompt.clone())
         ctx.add_request(req)
-
         block_id = ctx.request_to_kv_block_ids[0][0].item()
         slot = ctx._allocate_mamba_cache_slot(block_id)
-
-        # Write known data to cache
         for layer_idx in range(ctx.num_mamba_layers):
             ssm = torch.ones_like(ctx.mamba_cache_ssm_states[layer_idx, slot]) * (layer_idx + 1)
             conv = torch.ones_like(ctx.mamba_cache_conv_states[layer_idx, slot]) * (layer_idx + 10)
             ctx.store_mamba_state_for_block_from_tensors(block_id, layer_idx, ssm, conv)
-
         assert ctx.has_mamba_state_for_block(block_id)
-
-        # Add a second request and restore to it
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         ctx.add_request(req2)
-
-        restored = ctx.restore_mamba_state_from_block(1, block_id)
-        assert restored
-
+        assert ctx.restore_mamba_state_from_block(1, block_id)
         mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
         for layer_idx in range(ctx.num_mamba_layers):
             assert torch.allclose(
                 ctx.mamba_ssm_states[layer_idx, mamba_idx],
                 torch.ones_like(ctx.mamba_ssm_states[layer_idx, mamba_idx]) * (layer_idx + 1),
             )
-            assert torch.allclose(
-                ctx.mamba_conv_states[layer_idx, mamba_idx],
-                torch.ones_like(ctx.mamba_conv_states[layer_idx, mamba_idx]) * (layer_idx + 10),
-            )
+
+        # invalidate frees slot
+        ctx3 = self._mctx()
+        p3 = self._prompt(bs * 2)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        bid3 = ctx3.request_to_kv_block_ids[0][0].item()
+        ctx3._allocate_mamba_cache_slot(bid3)
+        assert ctx3.has_mamba_state_for_block(bid3)
+        free_before = ctx3.mamba_cache_free_count
+        ctx3.invalidate_mamba_state_for_block(bid3)
+        assert not ctx3.has_mamba_state_for_block(bid3) and ctx3.mamba_cache_free_count == free_before + 1
+
+        # slot reuse for same block
+        ctx4 = self._mctx()
+        ctx4.add_request(self._req(ctx4, self._prompt(bs * 2)))
+        bid4 = ctx4.request_to_kv_block_ids[0][0].item()
+        s1 = ctx4._allocate_mamba_cache_slot(bid4)
+        s2 = ctx4._allocate_mamba_cache_slot(bid4)
+        assert s1 == s2
+
+        # two-map hash design: kv and mamba maps are independent
+        ctx5 = self._mctx()
+        alloc5 = ctx5.block_allocator
+        p5 = self._prompt(bs * 3)
+        ctx5.add_request(self._req(ctx5, p5.clone()))
+        assert len(alloc5.kv_hash_to_block_id) == 3 and len(alloc5.mamba_hash_to_block_id) == 0
+        for bid in self._block_ids(ctx5, 0, 3)[:2]:
+            bh = alloc5.block_hashes[bid].item()
+            ctx5._allocate_mamba_cache_slot(bid)
+            alloc5.register_mamba_block_hash(bid, bh)
+        assert len(alloc5.kv_hash_to_block_id) == 3 and len(alloc5.mamba_hash_to_block_id) == 2
+
+        # find_mamba_match_count
+        ctx6 = self._mctx()
+        alloc6 = ctx6.block_allocator
+        p6 = self._prompt(bs * 4)
+        ctx6.add_request(self._req(ctx6, p6.clone()))
+        for bid in self._block_ids(ctx6, 0, 4)[:2]:
+            bh = alloc6.block_hashes[bid].item()
+            ctx6._allocate_mamba_cache_slot(bid)
+            alloc6.register_mamba_block_hash(bid, bh)
+        engine6 = _StubEngine(ctx6)
+        assert engine6._find_mamba_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
+        # no match when no mamba hashes registered
+        ctx7 = self._mctx()
+        ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
+        assert _StubEngine(ctx7)._find_mamba_match_count(self._req(ctx7, self._prompt(bs * 3), request_id=2)) == 0
+
+        # allocate, free, re-allocate
+        ctx8 = self._mctx()
+        ctx8.add_request(self._req(ctx8, self._prompt(bs * 3)))
+        bids8 = self._block_ids(ctx8, 0, 3)
+        initial_free = ctx8.mamba_cache_free_count
+        for bid in bids8:
+            ctx8._allocate_mamba_cache_slot(bid)
+        assert ctx8.mamba_cache_free_count == initial_free - 3
+        ctx8.invalidate_mamba_state_for_block(bids8[0])
+        assert ctx8.mamba_cache_free_count == initial_free - 2 and not ctx8.has_mamba_state_for_block(bids8[0])
+        ctx8._allocate_mamba_cache_slot(bids8[0])
+        assert ctx8.mamba_cache_free_count == initial_free - 3 and ctx8.has_mamba_state_for_block(bids8[0])
 
     @pytest.mark.internal
-    def test_invalidate_mamba_state(self):
-        """invalidate_mamba_state_for_block frees the slot and clears mappings."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 2)
-
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        block_id = ctx.request_to_kv_block_ids[0][0].item()
-        ctx._allocate_mamba_cache_slot(block_id)
-        assert ctx.has_mamba_state_for_block(block_id)
-
-        free_before = ctx.mamba_cache_free_count
-        ctx.invalidate_mamba_state_for_block(block_id)
-        assert not ctx.has_mamba_state_for_block(block_id)
-        assert ctx.mamba_cache_free_count == free_before + 1
-
-    @pytest.mark.internal
-    def test_mamba_cache_slot_reuse_for_same_block(self):
-        """Allocating a slot for a block that already has one returns the same slot."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 2)
-
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        block_id = ctx.request_to_kv_block_ids[0][0].item()
-        slot1 = ctx._allocate_mamba_cache_slot(block_id)
-        slot2 = ctx._allocate_mamba_cache_slot(block_id)
-        assert slot1 == slot2
-
-    # ----- Two-map hash design -----
-
-    @pytest.mark.internal
-    def test_two_map_hash_design(self):
-        """kv_hash_to_block_id and mamba_hash_to_block_id are independent maps."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt = self._prompt(bs * 3)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        # After add_request, KV hashes are registered but Mamba hashes are not
-        assert len(alloc.kv_hash_to_block_id) == 3
-        assert len(alloc.mamba_hash_to_block_id) == 0
-
-        # Register Mamba hashes for two blocks
-        block_ids = self._block_ids(ctx, 0, 3)
-        for bid in block_ids[:2]:
-            block_hash = alloc.block_hashes[bid].item()
-            ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        assert len(alloc.kv_hash_to_block_id) == 3
-        assert len(alloc.mamba_hash_to_block_id) == 2
-
-    # ----- Coupled prefix matching with skip token limits -----
-
-    @pytest.mark.internal
-    def test_mamba_match_limits_prefill_skip(self):
-        """prefix_skip_tokens is limited by Mamba match count, not KV match count."""
-        ctx = self._mamba_ctx()
+    def test_mamba_prefill_skip_and_zero_prefill(self):
+        # mamba match limits prefill skip
+        ctx = self._mctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-
         prompt = self._prompt(bs * 3)
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        # Register Mamba state for only the first block
-        block_ids = self._block_ids(ctx, 0, 3)
-        for bid in block_ids[:1]:
-            block_hash = alloc.block_hashes[bid].item()
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        for bid in self._block_ids(ctx, 0, 3)[:1]:
+            alloc.register_mamba_block_hash(bid, alloc.block_hashes[bid].item())
             ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        # Second request: all 3 KV blocks match, but only 1 Mamba block matches
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-
         (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
-        assert len(matched) == 3, "should find 3 KV matching blocks"
-        assert prefix_skip == bs, "skip limited to Mamba match (1 block)"
-        assert eff_chunk == len(prompt) - bs
+        assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
-    @pytest.mark.internal
-    def test_no_mamba_match_no_skip(self):
-        """When no Mamba blocks match, no tokens are skipped even with KV matches."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)
+        # no mamba match means no skip
+        ctx2 = self._mctx()
+        p2 = self._prompt(bs * 3)
+        ctx2.add_request(self._req(ctx2, p2.clone()))
+        req2b = self._req(ctx2, p2.clone(), request_id=2)
+        req2b._mamba_num_matched_blocks = 0
+        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
+        # zero prefill for hybrid (mamba-cached, block-aligned)
+        ctx3 = self._mctx()
+        p3 = self._prompt(bs * 3)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        alloc3 = ctx3.block_allocator
+        for bid in self._block_ids(ctx3, 0, 3):
+            alloc3.register_mamba_block_hash(bid, alloc3.block_hashes[bid].item())
+            ctx3._allocate_mamba_cache_slot(bid)
+        req3 = self._req(ctx3, p3.clone(), request_id=2)
+        req3._mamba_num_matched_blocks = 3
+        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        assert len(m3) == 3 and ps3 == 3 * bs and ec3 == 0
 
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 0
+        # zero prefill for KV-only (block-aligned, cached logit)
+        ctx4 = self._ctx()
+        bs4 = ctx4.block_size_tokens
+        alloc4 = ctx4.block_allocator
+        p4 = self._prompt(bs4 * 3)
+        req4a = self._req(ctx4, p4.clone())
+        ctx4.add_request(req4a)
+        last_hash = req4a.precomputed_block_hashes[2]
+        alloc4.cache_block_logit(last_hash, torch.randn(16, device=torch.cuda.current_device()))
+        req4b = self._req(ctx4, p4.clone(), request_id=2)
+        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == 0
+        ctx4.add_request(req4b)
+        assert ctx4._cached_logit_hash[ctx4.total_request_count - 1] == last_hash
 
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
-        assert len(matched) == 3
-        assert prefix_skip == 0
-        assert eff_chunk == len(prompt)
-
-    # ----- Cached logit zero prefill -----
-
-    @pytest.mark.internal
-    def test_cached_logit_zero_prefill(self):
-        """When all blocks match (block-aligned), effective_chunk_length == 0 and cached logit hash is set."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)  # block-aligned
-
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        # Register Mamba state for all blocks
-        block_ids = self._block_ids(ctx, 0, 3)
-        alloc = ctx.block_allocator
-        for bid in block_ids:
-            block_hash = alloc.block_hashes[bid].item()
-            ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 3
-
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
-        assert len(matched) == 3
-        # No zero-chunk guard: skip covers entire chunk
-        assert prefix_skip == 3 * bs
-        assert eff_chunk == 0
-        assert req2._mamba_num_matched_blocks == 3
-
-    @pytest.mark.internal
-    def test_cached_logit_zero_prefill_kv_only(self):
-        """KV-only: block-aligned all-match gives effective_chunk_length == 0 with cached logit hash set."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 3)  # block-aligned
-
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        # Cache a fake logit for the last block
-        last_block_hash = req1.precomputed_block_hashes[2]
-        fake_logit = torch.randn(16, device=torch.cuda.current_device())
-        alloc.cache_block_logit(last_block_hash, fake_logit)
-
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
-        assert len(matched) == 3
-        assert prefix_skip == 3 * bs
-        assert eff_chunk == 0
-
-        # add_request should set _cached_logit_hash
-        ctx.add_request(req2)
-        current_id = ctx.total_request_count - 1
-        assert ctx._cached_logit_hash[current_id] == last_block_hash
-
-    # ----- Intermediate offset computation -----
-
-    @pytest.mark.internal
-    def test_intermediate_offsets_kv_divergence(self):
-        """Intermediate offsets include KV divergence point when applicable."""
-        ctx = self._mamba_ctx(block_size_tokens=256)
-        bs = ctx.block_size_tokens
-
-        # Prompt: 4 blocks (block-aligned)
-        prompt = self._prompt(bs * 4)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        # Register Mamba state for first 2 blocks, KV for all 4
-        block_ids = self._block_ids(ctx, 0, 4)
-        alloc = ctx.block_allocator
-        for bid in block_ids[:2]:
-            block_hash = alloc.block_hashes[bid].item()
-            ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        # Second request: 4 KV match, 2 Mamba match
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 2
-        chunk_length = len(prompt)
-
-        # Compute prefix match to get skip tokens
-        (matched, _, _, overall_req_blocks, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, chunk_length
-        )
-
-        # Simulate add_request offset computation
-        ctx._compute_and_store_mamba_offsets(
-            req2,
-            1,
-            prefix_skip,
-            chunk_length,
-            len(matched),
-            [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
-            overall_req_blocks,
-        )
-
-        offsets = ctx._mamba_intermediate_offsets[1]
-        # KV divergence at abs=4*bs=1024, skip=2*bs=512, rel=512
-        # Last aligned at abs=4*bs=1024, skip=2*bs=512, rel=512
-        # But last_aligned == prompt_len (block-aligned), so last_aligned_rel == seq_len → excluded
-        # KV div: rel = (4*bs - 2*bs) = 2*bs = 512, seq_len = chunk_length - skip = 4*bs - (4*bs - 1) = 1
-        # Wait, with zero-chunk guard, skip = 4*bs - 1 = 1023...
-        # Let me check: since all blocks are mamba-matched and block-aligned, zero-chunk guard fires
-        # skip = 3*256 = 768 (only 2 mamba matched so skip = 2*256 = 512)
-        # Actually: mamba_matched = 2, so skip = 2*256 = 512, seq_len = 4*256 - 512 = 512
-        # kv_div_rel = 4*256 - 512 = 512 → == seq_len → excluded
-        # last_aligned_rel = 4*256 - 512 = 512 → == seq_len → excluded
-        # So no intermediate offsets, but EOS cache should be set (block-aligned)
-        assert offsets is None
-        assert ctx._mamba_eos_cache_block_id[1] is not None
-
-    @pytest.mark.internal
-    def test_intermediate_offsets_non_aligned_prompt(self):
-        """Non-aligned prompt produces last_aligned intermediate offset."""
-        ctx = self._mamba_ctx(block_size_tokens=256)
-        bs = ctx.block_size_tokens
-
-        # Prompt: 3.5 blocks (not block-aligned)
-        prompt_len = bs * 3 + bs // 2
-        prompt = self._prompt(prompt_len)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        # Register Mamba state for first 2 blocks
-        block_ids = self._block_ids(ctx, 0, 3)
-        alloc = ctx.block_allocator
-        for bid in block_ids[:2]:
-            block_hash = alloc.block_hashes[bid].item()
-            ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 2
-        chunk_length = len(prompt)
-
-        (matched, _, _, overall_req_blocks, prefix_skip, eff_chunk) = ctx._compute_prefix_match(
-            req2, chunk_length
-        )
-
-        # Create a block mapping for req2 that mirrors req1's blocks
-        # Need to actually add req2 to the context for block mappings to work
-        ctx.add_request(req2)
-
-        offsets = ctx._mamba_intermediate_offsets[1]
-        # skip = 2*bs = 512, seq_len = prompt_len - 512 = 256+128 = 384
-        # kv_div_abs = 3*bs = 768 (3 KV blocks matched), kv_div_rel = 768-512 = 256
-        # last_aligned_abs = 3*bs = 768, last_aligned_rel = 256
-        # Both are same: 256. Is 256 > 0 and < 384 and % 128 == 0? Yes.
-        # So one offset: [256]
-        if offsets is not None:
-            for o in offsets:
-                assert o > 0
-                assert o % 128 == 0
-        # No EOS cache (not block-aligned)
-        assert ctx._mamba_eos_cache_block_id[1] is None
-
-    @pytest.mark.internal
-    def test_eos_cache_set_for_block_aligned_prompt(self):
-        """Block-aligned prompts set _mamba_eos_cache_block_id."""
-        ctx = self._mamba_ctx(block_size_tokens=256)
-        bs = ctx.block_size_tokens
-
-        prompt = self._prompt(bs * 3)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        # No Mamba match, so skip=0 and all offsets are computed fresh
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 0
-        ctx.add_request(req2)
-
-        # Block-aligned prompt → EOS cache block ID should be set
-        assert ctx._mamba_eos_cache_block_id[1] is not None
-
-    # ----- KV eviction invalidating Mamba state -----
-
-    @pytest.mark.internal
-    def test_kv_eviction_invalidates_mamba(self):
-        """When KV blocks are evicted, their Mamba state is invalidated."""
-        ctx = self._mamba_ctx(
-            block_size_tokens=256,
+        # KV eviction invalidates mamba
+        ctx5 = self._mctx(
             prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
         )
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        prompt = self._prompt(bs * 2)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        # Register Mamba state for first block
-        block_id = ctx.request_to_kv_block_ids[0][0].item()
-        block_hash = alloc.block_hashes[block_id].item()
-        ctx._allocate_mamba_cache_slot(block_id)
-        alloc.register_mamba_block_hash(block_id, block_hash)
-
-        assert ctx.has_mamba_state_for_block(block_id)
-        assert block_hash in alloc.mamba_hash_to_block_id
-
-        # Release request, REF_ZERO deregisters immediately on last release
-        ctx.release_memory_blocks_from_request_indexes([0])
-
-        # After REF_ZERO eviction, both KV and Mamba state should be gone
-        assert not ctx.has_mamba_state_for_block(block_id)
-        assert block_hash not in alloc.mamba_hash_to_block_id
-
-    # ----- Intermediate state buffering and commit -----
+        alloc5 = ctx5.block_allocator
+        p5 = self._prompt(bs * 2)
+        ctx5.add_request(self._req(ctx5, p5.clone()))
+        bid5 = ctx5.request_to_kv_block_ids[0][0].item()
+        bh5 = alloc5.block_hashes[bid5].item()
+        ctx5._allocate_mamba_cache_slot(bid5)
+        alloc5.register_mamba_block_hash(bid5, bh5)
+        assert ctx5.has_mamba_state_for_block(bid5) and bh5 in alloc5.mamba_hash_to_block_id
+        ctx5.release_memory_blocks_from_request_indexes([0])
+        assert not ctx5.has_mamba_state_for_block(bid5) and bh5 not in alloc5.mamba_hash_to_block_id
 
     @pytest.mark.internal
-    def test_buffer_and_clear_intermediate_states(self):
-        """buffer_mamba_intermediate_states stores data, _clear clears it."""
-        ctx = self._mamba_ctx()
+    def test_mamba_intermediate_offsets(self):
+        bs = 256
 
-        # Buffer some dummy data
-        dummy_states = [None, ("ssm", "conv")]
-        ctx.buffer_mamba_intermediate_states(0, dummy_states)
-        ctx.buffer_mamba_intermediate_states(1, dummy_states)
-        assert len(ctx._mamba_intermediate_buffer) == 2
-
-        ctx._mamba_intermediate_buffer.clear()
-        assert len(ctx._mamba_intermediate_buffer) == 0
-
-    @pytest.mark.internal
-    def test_store_from_live_copies_all_layers(self):
-        """store_mamba_state_for_block_from_live copies all Mamba layers."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 2)
-
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        block_id = ctx.request_to_kv_block_ids[0][0].item()
-        ctx._allocate_mamba_cache_slot(block_id)
-
-        # Write known values to live buffer
-        mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
-        for layer in range(ctx.num_mamba_layers):
-            ctx.mamba_conv_states[layer, mamba_idx] = layer + 1.0
-            ctx.mamba_ssm_states[layer, mamba_idx] = layer + 100.0
-
-        ctx.store_mamba_state_for_block_from_live(block_id, 0)
-
-        # Verify cache has the same values
-        slot = ctx.block_to_mamba_slot[block_id].item()
-        for layer in range(ctx.num_mamba_layers):
-            assert torch.allclose(
-                ctx.mamba_cache_conv_states[layer, slot],
-                torch.full_like(ctx.mamba_cache_conv_states[layer, slot], layer + 1.0),
-            )
-            assert torch.allclose(
-                ctx.mamba_cache_ssm_states[layer, slot],
-                torch.full_like(ctx.mamba_cache_ssm_states[layer, slot], layer + 100.0),
-            )
-
-    # ----- Engine integration: _find_mamba_match_count -----
-
-    @pytest.mark.internal
-    def test_find_mamba_match_count(self):
-        """Engine's _find_mamba_match_count iterates from end and finds longest match."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
+        # KV divergence offsets
+        ctx = self._mctx(block_size_tokens=bs)
         prompt = self._prompt(bs * 4)
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
-
-        # Register Mamba state for blocks 0 and 1
-        block_ids = self._block_ids(ctx, 0, 4)
-        for bid in block_ids[:2]:
-            block_hash = alloc.block_hashes[bid].item()
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        alloc = ctx.block_allocator
+        for bid in self._block_ids(ctx, 0, 4)[:2]:
+            alloc.register_mamba_block_hash(bid, alloc.block_hashes[bid].item())
             ctx._allocate_mamba_cache_slot(bid)
-            alloc.register_mamba_block_hash(bid, block_hash)
-
-        engine = _StubEngine(ctx)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        count = engine._find_mamba_match_count(req2)
-        assert count == 2
+        req2._mamba_num_matched_blocks = 2
+        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        ctx._compute_and_store_mamba_offsets(
+            req2, 1, prefix_skip, len(prompt), len(matched),
+            [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
+            overall,
+        )
+        assert ctx._mamba_intermediate_offsets[1] is None
+        assert ctx._mamba_eos_cache_block_id[1] is not None
 
-    @pytest.mark.internal
-    def test_find_mamba_match_count_no_match(self):
-        """_find_mamba_match_count returns 0 when no Mamba hashes are registered."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)
+        # non-aligned prompt produces last_aligned intermediate offset
+        ctx2 = self._mctx(block_size_tokens=bs)
+        prompt_len = bs * 3 + bs // 2
+        p2 = self._prompt(prompt_len)
+        ctx2.add_request(self._req(ctx2, p2.clone()))
+        alloc2 = ctx2.block_allocator
+        for bid in self._block_ids(ctx2, 0, 3)[:2]:
+            alloc2.register_mamba_block_hash(bid, alloc2.block_hashes[bid].item())
+            ctx2._allocate_mamba_cache_slot(bid)
+        req2b = self._req(ctx2, p2.clone(), request_id=2)
+        req2b._mamba_num_matched_blocks = 2
+        ctx2.add_request(req2b)
+        offsets = ctx2._mamba_intermediate_offsets[1]
+        if offsets is not None:
+            for o in offsets:
+                assert o > 0 and o % 128 == 0
+        assert ctx2._mamba_eos_cache_block_id[1] is None
 
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
+        # block-aligned prompts set EOS cache block ID
+        ctx3 = self._mctx(block_size_tokens=bs)
+        p3 = self._prompt(bs * 3)
+        ctx3.add_request(self._req(ctx3, p3.clone()))
+        req3 = self._req(ctx3, p3.clone(), request_id=2)
+        req3._mamba_num_matched_blocks = 0
+        ctx3.add_request(req3)
+        assert ctx3._mamba_eos_cache_block_id[1] is not None
 
-        engine = _StubEngine(ctx)
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        count = engine._find_mamba_match_count(req2)
-        assert count == 0
+        # buffer and clear intermediate states
+        ctx4 = self._mctx()
+        dummy = [None, ("ssm", "conv")]
+        ctx4.buffer_mamba_intermediate_states(0, dummy)
+        ctx4.buffer_mamba_intermediate_states(1, dummy)
+        assert len(ctx4._mamba_intermediate_buffer) == 2
+        ctx4._mamba_intermediate_buffer.clear()
+        assert len(ctx4._mamba_intermediate_buffer) == 0
 
-    # ----- Mamba cache eviction -----
-
-    @pytest.mark.internal
-    def test_mamba_cache_eviction(self):
-        """Allocating and freeing Mamba cache slots works correctly."""
-        ctx = self._mamba_ctx()
-        bs = ctx.block_size_tokens
-
-        prompt = self._prompt(bs * 3)
-        req = self._req(ctx, prompt.clone())
-        ctx.add_request(req)
-
-        block_ids = self._block_ids(ctx, 0, 3)
-
-        # Allocate slots for 3 blocks
-        initial_free = ctx.mamba_cache_free_count
-        for bid in block_ids:
-            ctx._allocate_mamba_cache_slot(bid)
-
-        assert ctx.mamba_cache_free_count == initial_free - 3
-
-        # Invalidate one, verify it returns to the free pool
-        ctx.invalidate_mamba_state_for_block(block_ids[0])
-        assert ctx.mamba_cache_free_count == initial_free - 2
-        assert not ctx.has_mamba_state_for_block(block_ids[0])
-
-        # Re-allocate the freed slot to a new block
-        ctx._allocate_mamba_cache_slot(block_ids[0])
-        assert ctx.mamba_cache_free_count == initial_free - 3
-        assert ctx.has_mamba_state_for_block(block_ids[0])
-
-
-# =========================================================================
-# Class 11: TestMixedCachedAndFreshPrefill
-# =========================================================================
+        # store_from_live copies all layers
+        ctx5 = self._mctx()
+        p5 = self._prompt(ctx5.block_size_tokens * 2)
+        ctx5.add_request(self._req(ctx5, p5.clone()))
+        bid5 = ctx5.request_to_kv_block_ids[0][0].item()
+        ctx5._allocate_mamba_cache_slot(bid5)
+        mamba_idx = ctx5.mamba_metadata.request_to_mamba_state_idx[0].item()
+        for layer in range(ctx5.num_mamba_layers):
+            ctx5.mamba_conv_states[layer, mamba_idx] = layer + 1.0
+            ctx5.mamba_ssm_states[layer, mamba_idx] = layer + 100.0
+        ctx5.store_mamba_state_for_block_from_live(bid5, 0)
+        slot5 = ctx5.block_to_mamba_slot[bid5].item()
+        for layer in range(ctx5.num_mamba_layers):
+            assert torch.allclose(
+                ctx5.mamba_cache_conv_states[layer, slot5],
+                torch.full_like(ctx5.mamba_cache_conv_states[layer, slot5], layer + 1.0),
+            )
 
 
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
-    """Tests for mixed batches containing both zero-query (cached logit) and
-    normal prefill requests alongside decode requests.
-
-    Verifies that last_token_logits, calculate_log_probs, and token bookkeeping
-    work correctly when some requests have effective_chunk_length == 0.
-    """
-
-    def _mamba_ctx(self, *, prefix_caching_mamba_gb=0.01, block_size_tokens=256, **kwargs):
-        """Create a hybrid context with Mamba prefix caching enabled."""
-        from megatron.core.inference.config import MambaInferenceStateConfig
-
-        params_dtype = torch.float32
-        mamba_config = MambaInferenceStateConfig(
-            layer_type_list=["*", "M", "*", "M"],
-            conv_states_shape=(4, 8),
-            ssm_states_shape=(4, 16),
-            conv_states_dtype=params_dtype,
-            ssm_states_dtype=params_dtype,
-        )
-
-        defaults = dict(
-            buffer_size_gb=0.1,
-            max_sequence_length=4096,
-            rounder=64,
-            enable_prefix_caching=True,
-            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-        )
-        defaults.update(kwargs)
-
-        DynamicInferenceContext.ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.TOKEN_ROUNDER = defaults["rounder"]
-        DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
-
-        transformer_config = TransformerConfig(
-            params_dtype=params_dtype,
-            num_layers=4,
-            kv_channels=8,
-            num_attention_heads=2,
-            hidden_size=16,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            use_cpu_initialization=True,
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=defaults["max_sequence_length"],
-            buffer_size_gb=defaults["buffer_size_gb"],
-            paused_buffer_size_gb=0.2 * defaults["buffer_size_gb"],
-            block_size_tokens=block_size_tokens,
-            max_tokens=defaults.get("max_tokens"),
-            mamba_inference_state_config=mamba_config,
-            use_flashinfer_fused_rope=None,
-            unified_memory_level=0,
-            enable_prefix_caching=defaults["enable_prefix_caching"],
-            prefix_caching_eviction_policy=defaults["prefix_caching_eviction_policy"],
-            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
-        )
-        return DynamicInferenceContext(
-            model_config=transformer_config, inference_config=inference_config
-        )
 
     def _setup_mixed_batch(self, model_type):
-        """Set up a mixed batch: req0 (decode), reqs 1-4 (mixed cached/fresh prefill).
-
-        Step 1: add req0 (block-aligned prompt), cache its block boundary logit,
-                 simulate transition to decode.
-        Step 2: add reqs 1-4 where req1,req3 are identical to req0 (cached,
-                 effective_chunk_length == 0) and req2,req4 are different (fresh,
-                 full prefill).
-
-        Returns (ctx, bs, fake_logit, block_hash).
-        """
+        """Set up mixed batch: req0 (decode), reqs 1-4 (mixed cached/fresh prefill)."""
         if model_type == "gpt":
             ctx = self._ctx(block_size_tokens=32)
         else:
-            ctx = self._mamba_ctx(block_size_tokens=256)
+            ctx = self._ctx(
+                mamba_config=self._mamba_config(),
+                prefix_caching_mamba_gb=0.01,
+                block_size_tokens=256,
+                max_sequence_length=4096,
+            )
         bs = ctx.block_size_tokens
 
-        # Step 1: add req0 (1 block, block-aligned)
         prompt0 = self._prompt(bs)
         req0 = self._req(ctx, prompt0.clone())
         ctx.add_request(req0)
 
-        # Cache block boundary logit for req0's block.
-        # vocab_size must exceed max token ID: prompt0 uses 0..bs-1,
-        # req2/req4 use offset..offset+bs-1 (offsets 50, 40).
         vocab_size = bs + 50
         fake_logit = torch.randn(vocab_size, device=torch.cuda.current_device())
         block_hash = req0.precomputed_block_hashes[0]
         ctx.block_allocator.cache_block_logit(block_hash, fake_logit)
 
-        # For hybrid models, register the Mamba hash so reqs 1,3 can match
         if model_type == "hybrid":
             block_id = ctx.block_allocator.kv_hash_to_block_id[block_hash]
             ctx.block_allocator.register_mamba_block_hash(block_id, block_hash)
 
-        # Simulate transition to decode for req0
         ctx.request_kv_length_offsets[0] += bs
         ctx.request_query_lengths[0] = 1
-        ctx.request_last_kv_block_offset[0] = 0  # (bs - 1 + 1) % bs = 0
+        ctx.request_last_kv_block_offset[0] = 0
         ctx.num_prefill_requests = 0
         ctx.active_token_count = 1
-        # Set up decode token arrays
-        ctx.token_to_input_ids[0] = 42  # arbitrary decode token
+        ctx.token_to_input_ids[0] = 42
         ctx.token_to_pos_ids[0] = bs
         ctx.token_to_request_idx[0] = 0
 
-        # Step 2: add reqs 1-4
-        # req1, req3: identical to req0 → will match, effective_chunk_length == 0
-        # req2, req4: different → no match, full prefill
         req1 = self._req(ctx, prompt0.clone(), request_id=2)
         req2 = self._req(ctx, self._prompt(bs, offset=50), request_id=3)
         req3 = self._req(ctx, prompt0.clone(), request_id=4)
         req4 = self._req(ctx, self._prompt(bs, offset=40), request_id=5)
 
-        # For hybrid models, set _mamba_num_matched_blocks (normally done by engine)
         if model_type == "hybrid":
-            req1._mamba_num_matched_blocks = 1  # matches req0's block
-            req2._mamba_num_matched_blocks = 0  # different prompt, no match
-            req3._mamba_num_matched_blocks = 1  # matches req0's block
-            req4._mamba_num_matched_blocks = 0  # different prompt, no match
+            req1._mamba_num_matched_blocks = 1
+            req2._mamba_num_matched_blocks = 0
+            req3._mamba_num_matched_blocks = 1
+            req4._mamba_num_matched_blocks = 0
 
-        ctx.add_request(req1)
-        ctx.add_request(req2)
-        ctx.add_request(req3)
-        ctx.add_request(req4)
+        for r in [req1, req2, req3, req4]:
+            ctx.add_request(r)
 
         return ctx, bs, fake_logit, block_hash
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
-    def test_mixed_batch_query_lengths(self, model_type):
-        """Verify query lengths: decode=1, cached=0, fresh=bs."""
-        ctx, bs, _, _ = self._setup_mixed_batch(model_type)
-
-        assert ctx.request_query_lengths[0].item() == 1  # req0: decode
-        assert ctx.request_query_lengths[1].item() == 0  # req1: cached
-        assert ctx.request_query_lengths[2].item() == bs  # req2: fresh
-        assert ctx.request_query_lengths[3].item() == 0  # req3: cached
-        assert ctx.request_query_lengths[4].item() == bs  # req4: fresh
-
-        # Total active tokens: 1 (decode) + 0 + bs + 0 + bs = 1 + 2*bs
-        assert ctx.active_token_count == 1 + 2 * bs
-
-    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
-    @pytest.mark.internal
-    def test_mixed_batch_cached_logit_hash(self, model_type):
-        """Verify _cached_logit_hash is set for cached requests and -1 for others."""
-        ctx, _, _, block_hash = self._setup_mixed_batch(model_type)
-
-        assert ctx._cached_logit_hash[0] == -1  # req0: decode
-        assert ctx._cached_logit_hash[1] == block_hash  # req1: cached
-        assert ctx._cached_logit_hash[2] == -1  # req2: fresh
-        assert ctx._cached_logit_hash[3] == block_hash  # req3: cached
-        assert ctx._cached_logit_hash[4] == -1  # req4: fresh
-
-    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
-    @pytest.mark.internal
-    def test_mixed_batch_last_token_logits(self, model_type):
-        """Verify last_token_logits returns forward-pass logits for non-zero
-        requests and cached logits for zero-query requests."""
-        ctx, bs, fake_logit, _ = self._setup_mixed_batch(model_type)
+    def test_mixed_batch(self, model_type):
+        ctx, bs, fake_logit, block_hash = self._setup_mixed_batch(model_type)
         vocab_size = fake_logit.shape[0]
 
-        # Build fake forward-pass logits: shape [1, active_token_count, vocab_size]
-        # Tokens: 1 (req0 decode) + bs (req2 fresh) + bs (req4 fresh) = 1 + 2*bs
+        # query lengths: decode=1, cached=0, fresh=bs
+        assert ctx.request_query_lengths[0].item() == 1
+        assert ctx.request_query_lengths[1].item() == 0
+        assert ctx.request_query_lengths[2].item() == bs
+        assert ctx.request_query_lengths[3].item() == 0
+        assert ctx.request_query_lengths[4].item() == bs
+        assert ctx.active_token_count == 1 + 2 * bs
+
+        # cached_logit_hash
+        assert ctx._cached_logit_hash[0] == -1
+        assert ctx._cached_logit_hash[1] == block_hash
+        assert ctx._cached_logit_hash[2] == -1
+        assert ctx._cached_logit_hash[3] == block_hash
+        assert ctx._cached_logit_hash[4] == -1
+
+        # last_token_logits
         logits = torch.randn(
             1, ctx.active_token_count, vocab_size, device=torch.cuda.current_device()
         )
-
         result = ctx.last_token_logits(logits)
         assert result.shape == (5, vocab_size)
+        assert torch.equal(result[0], logits[0, 0, :])
+        assert torch.equal(result[1], fake_logit)
+        assert torch.equal(result[2], logits[0, bs, :])
+        assert torch.equal(result[3], fake_logit)
+        assert torch.equal(result[4], logits[0, 2 * bs, :])
 
-        # Non-zero requests: cumsum of [1, bs, bs] = [1, 1+bs, 1+2*bs], -1 = [0, bs, 2*bs]
-        assert torch.equal(result[0], logits[0, 0, :])  # req0 decode
-        assert torch.equal(result[1], fake_logit)  # req1 cached
-        assert torch.equal(result[2], logits[0, bs, :])  # req2 fresh
-        assert torch.equal(result[3], fake_logit)  # req3 cached
-        assert torch.equal(result[4], logits[0, 2 * bs, :])  # req4 fresh
-
-    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
-    @pytest.mark.internal
-    def test_mixed_batch_calculate_log_probs(self, model_type):
-        """Verify calculate_log_probs handles zero-query requests correctly.
-
-        Zero-query requests should get empty log prob lists. Non-zero requests
-        should get correct log probs without index collisions.
-        """
-        ctx, bs, fake_logit, _ = self._setup_mixed_batch(model_type)
-        vocab_size = fake_logit.shape[0]  # bs + 50
-        active_count = ctx.active_token_count  # 1 + 2*bs
-
-        # Build fake logits: [1, active_token_count, vocab_size]
-        logits = torch.randn(1, active_count, vocab_size, device=torch.cuda.current_device())
-
-        # Build fake sampled tokens (one per active request)
+        # calculate_log_probs
         new_tokens = torch.randint(0, vocab_size, (5,), device=torch.cuda.current_device())
-
-        log_probs_list, log_probs_tensor = ctx.calculate_log_probs(logits, new_tokens)
-
-        # Should have 5 entries (one per active request)
+        log_probs_list, _ = ctx.calculate_log_probs(logits, new_tokens)
         assert len(log_probs_list) == 5
-
-        # req0 (decode, q=1): 1 log prob
         assert len(log_probs_list[0]) == 1
-
-        # req1 (cached, q=0): empty
         assert len(log_probs_list[1]) == 0
-
-        # req2 (fresh, q=bs): bs log probs
         assert len(log_probs_list[2]) == bs
-
-        # req3 (cached, q=0): empty
         assert len(log_probs_list[3]) == 0
-
-        # req4 (fresh, q=bs): bs log probs
         assert len(log_probs_list[4]) == bs
 
-        # Verify no index collision: the last log prob for req2 should correspond
-        # to new_tokens[2] (not overwritten by req3's new_tokens[3]).
+        # no index collision
         log_probs_full = torch.nn.functional.log_softmax(logits.squeeze(0).float(), dim=-1)
-        # Position of req2's last token: cumsum of non-zero [1, bs, bs] = [1, 1+bs, 1+2*bs],
-        # -1 = [0, bs, 2*bs]. req2's last token is at position bs.
-        expected_log_prob_req2_last = log_probs_full[bs, new_tokens[2]].item()
-        actual_log_prob_req2_last = log_probs_list[2][-1]
-        assert abs(expected_log_prob_req2_last - actual_log_prob_req2_last) < 1e-5, (
-            f"req2 last log prob mismatch: expected {expected_log_prob_req2_last}, "
-            f"got {actual_log_prob_req2_last}"
-        )
+        expected = log_probs_full[bs, new_tokens[2]].item()
+        actual = log_probs_list[2][-1]
+        assert abs(expected - actual) < 1e-5
