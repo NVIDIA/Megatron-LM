@@ -146,12 +146,19 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
 
     use_mla: bool = False
+    cache_mla_latent: bool = False
 
     def __post_init__(self):
+        if self.use_mla and self.cache_mla_latent:
+            # Fix paged KV cache block size requirement (needs to be divisible by 256).
+            # Note, this doesn't work with FlashMLA, which requires a block size of exactly 64.
+            self.context_block_size_tokens = 256
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
-            assert self.num_tokens_to_generate is None or self.num_tokens_total is None
+            assert (
+                self.num_tokens_to_generate is None or self.num_tokens_total is None
+            ) and self.num_tokens_to_generate != self.num_tokens_total
             if self.num_tokens_to_generate is not None:
                 self.max_sequence_length = (
                     self.max_prompt_length
@@ -159,7 +166,6 @@ class DynamicEngineTestConfig:
                     + self.num_speculative_tokens
                 )
             else:
-                assert self.num_tokens_total is not None
                 self.max_sequence_length = self.num_tokens_total + self.num_speculative_tokens
 
         # Default paused buffer size.
@@ -302,7 +308,24 @@ class TestDynamicInferenceEngine:
         # Requests.
         requests = cls._build_requests(test_config)
 
-        transformer_config_cls = MLATransformerConfig if test_config.use_mla else TransformerConfig
+        # Values required for proper cache_mla_latent functioning
+        qk_head_dim = 128
+        qk_pos_emb_head_dim = 64
+        transformer_config_cls = (
+            partial(
+                MLATransformerConfig,
+                cache_mla_latents=test_config.cache_mla_latent,
+                qk_head_dim=qk_head_dim,
+                qk_pos_emb_head_dim=qk_pos_emb_head_dim,
+                # For cache_mla_latent, the following needs to hold:
+                # v_head_dim == qk_head_dim + qk_pos_emb_head_dim
+                v_head_dim=(
+                    (qk_head_dim + qk_pos_emb_head_dim) if test_config.cache_mla_latent else 128
+                ),
+            )
+            if test_config.use_mla
+            else TransformerConfig
+        )
 
         if test_config.model_provider == "gpt":
             # Transformer config.
@@ -1069,6 +1092,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
     @pytest.mark.parametrize("use_mla", [False, True])
+    @pytest.mark.parametrize("cache_mla_latent", [False, True])
     @torch.inference_mode()
     def test_parallel_inference(
         self,
@@ -1080,6 +1104,7 @@ class TestDynamicInferenceEngine:
         materialize_only_last_token_logits,
         transformer_impl,
         use_mla,
+        cache_mla_latent,
     ):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -1113,6 +1138,12 @@ class TestDynamicInferenceEngine:
                 )
         if use_mla and transformer_impl == "local":
             pytest.skip(reason="MLA does not work with the local implementation.")
+        if cache_mla_latent and not use_mla:
+            pytest.skip(reason="MLA latent caching requires MLA use.")
+        if use_mla and not cache_mla_latent:
+            pytest.skip(
+                reason="MLA use for dynamic inference currently requires `cache_mla_latents=True`."
+            )
 
         env = self._run_test(
             model_provider=model_provider,
@@ -1123,6 +1154,7 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             transformer_impl=transformer_impl,
             use_mla=use_mla,
+            cache_mla_latent=cache_mla_latent,
         )
 
     @pytest.mark.internal
