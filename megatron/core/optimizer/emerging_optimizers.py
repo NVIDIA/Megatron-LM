@@ -22,12 +22,15 @@ from megatron.core.utils import get_pg_size, log_single_rank
 from .optimizer_config import ParamKey, ParamPredicate
 
 try:
+    from emerging_optimizers import registry
     from emerging_optimizers.orthogonalized_optimizers import (
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
-    from emerging_optimizers.soap import SOAP
+
+    # It is necessary to import SOAP for the registry to work.
+    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -56,15 +59,20 @@ class EmergingOptimizerEntry:
     """
 
     optimizer_cls: type
-    init_state_fn: Callable
     config_to_kwargs: Callable
+    init_state_fn: Callable
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(default_factory=dict)
 
 
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
-    eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
+    if entry.config_to_kwargs is not None:
+        eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
+    else:
+        eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
+            eopt_name, config, model_chunks, pg_collection
+        )
     optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
@@ -221,8 +229,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return grad
 
 
-def _muon_init_state_fn(opt, config=None):
-    """Initialize Muon optimizer state for torch_dist checkpoint format."""
+def _eopt_init_state_fn(opt, config=None):
+    """Initialize emerging optimizer state for torch_dist checkpoint format."""
     for group in opt.param_groups:
         for p in group['params']:
             if len(opt.state[p]) == 0:
@@ -259,9 +267,11 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     return kwargs
 
 
-def _soap_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to SOAP constructor kwargs."""
-    kwargs = _kwargs_from_config(SOAP, "soap", config)
+def _default_adam_based_eopt_config_to_kwargs(
+    eopt_name, config, model_chunks, pg_collection
+) -> Dict[str, Any]:
+    """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
+    kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
     kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
     return kwargs
 
@@ -272,7 +282,7 @@ def _soap_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 _EMERGING_OPTIMIZERS = {
     'muon': EmergingOptimizerEntry(
         optimizer_cls=TensorParallelMuon,
-        init_state_fn=_muon_init_state_fn,
+        init_state_fn=_eopt_init_state_fn,
         config_to_kwargs=_muon_config_to_kwargs,
         default_param_overrides={
             ParamKey(
@@ -281,18 +291,23 @@ _EMERGING_OPTIMIZERS = {
                 )
             ): {'optimizer': 'adam'}
         },
-    ),
-    'soap': EmergingOptimizerEntry(
-        optimizer_cls=SOAP,
-        # TODO(skyw): soap doesn't support dist_ckpt. determine if we need init_state_fn.
-        init_state_fn=lambda opt, config=None: None,
-        config_to_kwargs=_soap_config_to_kwargs,
-        default_param_overrides={
-            ParamKey(
-                predicate=ParamPredicate(
-                    name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                )
-            ): {'optimizer': 'adam'}
-        },
-    ),
+    )
 }
+
+# Register soap with default config
+# TODO(skyw): register all emerging optimizers.
+if HAVE_EMERGING_OPTIMIZERS:
+    for eopt_name in ["soap"]:
+        if eopt_name in _EMERGING_OPTIMIZERS:
+            continue
+        _EMERGING_OPTIMIZERS[eopt_name] = EmergingOptimizerEntry(
+            optimizer_cls=registry.get_optimizer_cls(eopt_name),
+            init_state_fn=_eopt_init_state_fn,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
+            },
+        )
