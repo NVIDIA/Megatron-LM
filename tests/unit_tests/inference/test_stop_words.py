@@ -31,132 +31,146 @@ class TestStopWordDetection:
     """Test stop word detection logic."""
 
     def _check_stop_words_for_request_post_append(
-        self, request: MockDynamicInferenceRequest
-    ) -> bool:
+        self, request: MockDynamicInferenceRequest, num_speculative_tokens: int = 0
+    ) -> tuple:
         """
         Check if a request should stop due to stop words (after token is appended).
 
-        This mirrors the logic in DynamicInferenceEngine._check_stop_words_for_request_post_append
+        This mirrors the logic in DynamicInferenceEngine._check_stop_words_for_request_post_append.
+        Returns (stop_word_hit, num_tokens_trimmed).
         """
-        # Check if request has stop words configured
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False
+            return False, 0
 
         generated_tokens = request.generated_tokens
 
-        # Check if the sequence ends with any stop word
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
-                    return True
+                for i in range(num_speculative_tokens + 1):
+                    end_idx = -i if i > 0 else None
+                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
+                        if i > 0:
+                            request.generated_tokens = request.generated_tokens[:-i]
+                        return True, i
 
-        return False
+        return False, 0
 
     def test_no_stop_words_configured(self):
         """Test that requests without stop words configured don't trigger stop."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=None
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
+        assert trim == 0
 
     def test_empty_stop_words_list(self):
         """Test that empty stop words list doesn't trigger stop."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_single_token_stop_word_match(self):
         """Test detection of single-token stop word."""
-        # Stop word is token 300
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is True
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is True
+        assert trim == 0
+        assert request.generated_tokens == [100, 200, 300]
 
     def test_single_token_stop_word_no_match(self):
         """Test no detection when single-token stop word doesn't match."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[400]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_multi_token_stop_word_match(self):
         """Test detection of multi-token stop word."""
-        # Stop word is tokens [200, 300]
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200, 300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is True
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is True
+        assert trim == 0
 
     def test_multi_token_stop_word_no_match_partial(self):
         """Test no detection when only partial stop word matches."""
-        # Stop word is [200, 300], but generated ends with [100, 200]
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200], stop_word_ids=[[200, 300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_multi_token_stop_word_no_match_wrong_order(self):
         """Test no detection when tokens are present but in wrong order."""
-        # Stop word is [200, 300], but generated ends with [300, 200]
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 300, 200], stop_word_ids=[[200, 300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_multiple_stop_words_first_matches(self):
         """Test with multiple stop words where first one matches."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300], [400], [500]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is True
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is True
 
     def test_multiple_stop_words_second_matches(self):
         """Test with multiple stop words where second one matches."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 400], stop_word_ids=[[300], [400], [500]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is True
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is True
 
     def test_multiple_stop_words_none_match(self):
         """Test with multiple stop words where none match."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 600], stop_word_ids=[[300], [400], [500]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_stop_word_longer_than_generated(self):
         """Test that stop word longer than generated tokens doesn't crash."""
-        # Stop word is 5 tokens, but only 3 tokens generated
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[1, 2, 3, 4, 5]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_stop_word_exact_length_match(self):
         """Test stop word that matches entire generated sequence."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[100, 200, 300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is True
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is True
 
     def test_empty_generated_tokens(self):
         """Test with no generated tokens."""
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[], stop_word_ids=[[300]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
     def test_stop_word_in_middle_not_end(self):
         """Test that stop word in middle of sequence doesn't trigger (only end matters)."""
-        # Stop word is [200], which is in middle but not at end
         request = MockDynamicInferenceRequest(
             request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200]]
         )
-        assert self._check_stop_words_for_request_post_append(request) is False
+        hit, trim = self._check_stop_words_for_request_post_append(request)
+        assert hit is False
 
 
 class TestStopWordTrackingFlow:
