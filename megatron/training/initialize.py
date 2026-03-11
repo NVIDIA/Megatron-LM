@@ -337,11 +337,22 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
-        # Set flight recorder env vars if specified
-        if args.flight_recorder_dump_path is not None:
-            os.environ['TORCH_FR_DUMP_TEMP_FILE'] = args.flight_recorder_dump_path
-            os.environ['TORCH_NCCL_DEBUG_INFO_TEMP_FILE'] = args.flight_recorder_dump_path
+        # Set flight recorder env vars if specified.
+        # Priority: pre-existing environment variable > MLM argument.
+        # All vars follow the same setdefault semantics: if already set in the
+        # environment we warn and keep the user's value; otherwise we apply the
+        # value derived from the MLM argument / flag.
+        # The block is also triggered when either path env var is already set
+        # so that the remaining defaults are applied consistently.
+        _fr_path = (
+            args.flight_recorder_dump_path
+            or os.environ.get('TORCH_FR_DUMP_TEMP_FILE')
+            or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
+        )
+        if _fr_path is not None:
             _fr_env_defaults = {
+                'TORCH_FR_DUMP_TEMP_FILE': _fr_path,
+                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_path,
                 'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
                 'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
                 'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
@@ -356,14 +367,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     )
                 else:
                     os.environ[_var] = _default
-            _fr_all_vars = {
-                'TORCH_FR_DUMP_TEMP_FILE': os.environ['TORCH_FR_DUMP_TEMP_FILE'],
-                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': os.environ['TORCH_NCCL_DEBUG_INFO_TEMP_FILE'],
-                **{k: os.environ[k] for k in _fr_env_defaults},
-            }
             print_rank_0(
                 "Flight recorder env vars:\n"
-                + "\n".join(f"  {k}={v}" for k, v in _fr_all_vars.items())
+                + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
             )
 
         # Call the init process
