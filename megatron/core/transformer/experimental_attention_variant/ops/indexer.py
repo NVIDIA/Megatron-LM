@@ -17,25 +17,6 @@ def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     return scores
 
 
-def _pad_topk_results(index_score, topk_indices, requested_topk):
-    """Pad top-k outputs to requested width using -inf scores and -1 indices."""
-    current_topk = topk_indices.size(-1)
-    if current_topk >= requested_topk:
-        return index_score, topk_indices
-
-    padded_shape = topk_indices.shape[:-1] + (requested_topk,)
-    padded_scores = torch.full(
-        padded_shape, float("-inf"), dtype=index_score.dtype, device=index_score.device
-    )
-    padded_indices = torch.full(
-        padded_shape, -1, dtype=topk_indices.dtype, device=topk_indices.device
-    )
-    if current_topk > 0:
-        padded_scores[..., :current_topk] = index_score
-        padded_indices[..., :current_topk] = topk_indices
-    return padded_scores, padded_indices
-
-
 class IndexerFunction(torch.autograd.Function):
     """Autograd wrapper for fused tilelang indexer forward/backward."""
 
@@ -65,7 +46,6 @@ class IndexerFunction(torch.autograd.Function):
                 empty_shape = logits.shape[:-1] + (0,)
                 index_score = torch.empty(empty_shape, dtype=logits.dtype, device=logits.device)
                 topk_indices = torch.empty(empty_shape, dtype=torch.int32, device=logits.device)
-            index_score, topk_indices = _pad_topk_results(index_score, topk_indices, topk)
 
         index_score = pytorch_extract_topk_scores(logits, topk_indices)
 
