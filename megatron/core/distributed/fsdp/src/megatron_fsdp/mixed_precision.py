@@ -379,7 +379,7 @@ class MixedPrecisionPolicy:
       compute parameters specified by the user model. Defaults to torch.float32.
     """
 
-    grad_comm_dtype: Optional[torch.dtype] = torch.float32
+    grad_comm_dtype: Optional[torch.dtype] = torch.bfloat16
     """Data type for gradient gather / scatter communications. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
