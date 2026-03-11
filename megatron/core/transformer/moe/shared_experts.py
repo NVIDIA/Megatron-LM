@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -21,7 +22,6 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,

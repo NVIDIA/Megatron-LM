@@ -34,10 +34,11 @@ except ImportError:
     KitchenFlashAttention = MagicMock()
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from transformer_engine.pytorch.attention import (  # type: ignore[import-untyped]
         dot_product_attention,
     )
+
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
 else:
     from unittest.mock import MagicMock
 

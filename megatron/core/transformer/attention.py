@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -47,7 +48,6 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
-from megatron.core.extensions.transformer_engine import HAVE_TE
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,

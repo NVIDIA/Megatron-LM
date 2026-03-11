@@ -11,13 +11,13 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 

@@ -2,6 +2,7 @@
 import warnings
 from typing import Optional, Union
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import (
     BackendSpecProvider,
@@ -37,7 +38,6 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import copy_signature
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:

@@ -8,6 +8,7 @@ import torch.distributed
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -31,7 +32,6 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
     unwrap_model,
 )
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:

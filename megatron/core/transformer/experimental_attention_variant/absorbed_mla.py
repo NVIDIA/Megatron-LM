@@ -18,6 +18,7 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -31,7 +32,6 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module

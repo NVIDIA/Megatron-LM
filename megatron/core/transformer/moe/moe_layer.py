@@ -10,6 +10,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -31,7 +32,6 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import internal_api
 
 try:

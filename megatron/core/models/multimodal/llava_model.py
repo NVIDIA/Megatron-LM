@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.mamba import MambaModel
@@ -21,11 +22,11 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
     try:
         import transformer_engine_torch as tex
 

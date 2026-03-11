@@ -15,6 +15,7 @@ from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -38,7 +39,6 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_torch_min_version
 
 if HAVE_TE:

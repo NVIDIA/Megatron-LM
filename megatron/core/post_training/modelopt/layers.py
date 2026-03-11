@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 if HAVE_TE or TYPE_CHECKING:
     import transformer_engine as te  # type: ignore[import]
+
     from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 else:
     _get_extra_te_kwargs = None
