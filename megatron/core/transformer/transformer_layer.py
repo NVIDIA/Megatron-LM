@@ -573,7 +573,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-        off_interface = _get_off_interface()
+        off_interface = _get_offloading_interface()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -692,7 +692,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
-        off_interface = _get_off_interface()
+        off_interface = _get_offloading_interface()
 
         self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
