@@ -533,7 +533,6 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
-            set_generation_epoch_on_suspend=True,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -1798,7 +1797,6 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
-    set_generation_epoch_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1864,8 +1862,7 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-        if set_generation_epoch_on_suspend:
-            inference_interface.set_generation_epoch(get_args().curr_iteration)
+        inference_interface.set_generation_epoch(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -1873,8 +1870,6 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
-            if set_generation_epoch_on_suspend:
-                inference_interface.set_generation_epoch(get_args().curr_iteration)
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
