@@ -662,7 +662,7 @@ class _RegisterDelayedWgradForExperts(torch.autograd.Function):
         wgrad_stream.wait_event(event)
         with torch.cuda.stream(wgrad_stream):
             with torch.cuda.nvtx.range("delayed_expert_wgrad"):
-                module.backward_dw(routed_experts=True, shared_experts=True)
+                module.backward_dw(routed_experts=True, shared_experts=False)
             event.record(wgrad_stream)
 
         torch.cuda.current_stream().wait_event(event)
