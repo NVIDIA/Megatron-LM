@@ -45,6 +45,20 @@ class EngramConfig:
     hc_mult: int = 4
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
 
+    def __post_init__(self) -> None:
+        expected_vocab_sizes = self.max_ngram_size - 1
+        if len(self.engram_vocab_size) != expected_vocab_sizes:
+            raise ValueError(
+                "engram_vocab_size must provide one entry per n-gram size from 2 to "
+                f"{self.max_ngram_size}, but got {len(self.engram_vocab_size)} entries."
+            )
+        if self.n_head_per_ngram <= 0:
+            raise ValueError("n_head_per_ngram must be positive.")
+        if self.n_embed_per_ngram % self.n_head_per_ngram != 0:
+            raise ValueError("n_embed_per_ngram must be divisible by n_head_per_ngram.")
+        if any(layer_id < 1 for layer_id in self.engram_layer_ids):
+            raise ValueError("engram_layer_ids must be 1-based positive layer indices.")
+
 
 class CompressedTokenizer:
     """Normalizes tokens into a compressed vocabulary via unicode normalization.
@@ -123,6 +137,47 @@ def _find_next_prime(start: int, seen_primes: set) -> int:
         candidate += 1
 
 
+def _calculate_vocab_size_across_layers(
+    engram_vocab_size: List[int],
+    max_ngram_size: int,
+    n_head_per_ngram: int,
+    layer_ids: List[int],
+) -> Dict[int, List[List[int]]]:
+    seen_primes: set = set()
+    vocab_size_across_layers: Dict[int, List[List[int]]] = {}
+
+    for layer_id in layer_ids:
+        all_ngram_vocab_sizes: List[List[int]] = []
+        for ngram in range(2, max_ngram_size + 1):
+            current_ngram_heads_sizes: List[int] = []
+            vocab_size = engram_vocab_size[ngram - 2]
+            current_prime_search_start = vocab_size - 1
+
+            for _ in range(n_head_per_ngram):
+                found_prime = _find_next_prime(current_prime_search_start, seen_primes)
+                seen_primes.add(found_prime)
+                current_ngram_heads_sizes.append(found_prime)
+                current_prime_search_start = found_prime
+
+            all_ngram_vocab_sizes.append(current_ngram_heads_sizes)
+        vocab_size_across_layers[layer_id] = all_ngram_vocab_sizes
+
+    return vocab_size_across_layers
+
+
+def calculate_engram_vocab_size_across_layers(
+    engram_config: EngramConfig,
+) -> Dict[int, List[List[int]]]:
+    """Return deterministic per-layer hash vocab sizes for an Engram configuration."""
+
+    return _calculate_vocab_size_across_layers(
+        engram_vocab_size=engram_config.engram_vocab_size,
+        max_ngram_size=engram_config.max_ngram_size,
+        n_head_per_ngram=engram_config.n_head_per_ngram,
+        layer_ids=engram_config.engram_layer_ids,
+    )
+
+
 class NgramHashMapping:
     """Deterministic n-gram hash mapping for Engram.
 
@@ -172,26 +227,12 @@ class NgramHashMapping:
         self.vocab_size_across_layers = self._calculate_vocab_size_across_layers()
 
     def _calculate_vocab_size_across_layers(self) -> Dict[int, List[List[int]]]:
-        seen_primes: set = set()
-        vocab_size_across_layers: Dict[int, List[List[int]]] = {}
-
-        for layer_id in self.layer_ids:
-            all_ngram_vocab_sizes: List[List[int]] = []
-            for ngram in range(2, self.max_ngram_size + 1):
-                current_ngram_heads_sizes: List[int] = []
-                vocab_size = self.vocab_size_per_ngram[ngram - 2]
-                current_prime_search_start = vocab_size - 1
-
-                for _ in range(self.n_head_per_ngram):
-                    found_prime = _find_next_prime(current_prime_search_start, seen_primes)
-                    seen_primes.add(found_prime)
-                    current_ngram_heads_sizes.append(found_prime)
-                    current_prime_search_start = found_prime
-
-                all_ngram_vocab_sizes.append(current_ngram_heads_sizes)
-            vocab_size_across_layers[layer_id] = all_ngram_vocab_sizes
-
-        return vocab_size_across_layers
+        return _calculate_vocab_size_across_layers(
+            engram_vocab_size=self.vocab_size_per_ngram,
+            max_ngram_size=self.max_ngram_size,
+            n_head_per_ngram=self.n_head_per_ngram,
+            layer_ids=self.layer_ids,
+        )
 
     def _get_ngram_hashes(self, input_ids: np.ndarray, layer_id: int) -> np.ndarray:
         x = np.asarray(input_ids, dtype=np.int64)

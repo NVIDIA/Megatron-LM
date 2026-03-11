@@ -44,8 +44,6 @@ class EngramTransformerLayer(TransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         is_mtp_layer: bool = False,
-        add_layer_offset: bool = True,
-        pp_layer_offset: Optional[int] = None,
         engram_config: Optional[EngramConfig] = None,
         engram_vocab_size_across_layers: Optional[dict] = None,
     ):
@@ -57,8 +55,6 @@ class EngramTransformerLayer(TransformerLayer):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
             is_mtp_layer=is_mtp_layer,
-            add_layer_offset=add_layer_offset,
-            pp_layer_offset=pp_layer_offset,
         )
 
         self.engram: Optional[EngramModule] = None
@@ -172,11 +168,11 @@ class EngramGPTModel(GPTModel):
 
     def forward(
         self,
-        input_ids: Tensor,
+        input_ids: Optional[Tensor],
         position_ids: Tensor,
         attention_mask: Tensor,
-        decoder_input: Tensor = None,
-        labels: Tensor = None,
+        decoder_input: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
         inference_context=None,
         packed_seq_params=None,
         extra_block_kwargs: dict = None,
@@ -186,7 +182,7 @@ class EngramGPTModel(GPTModel):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        if self.pre_process:
+        if input_ids is not None:
             self._precompute_engram_hashes(input_ids)
 
         return super().forward(
