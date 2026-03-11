@@ -40,17 +40,6 @@ def _get_default_feature_dirs() -> List[str]:
     except Exception:
         pass
 
-    try:
-        import importlib
-        from pathlib import Path
-
-        nv_features_mod = importlib.import_module("nvdlfw_inspect.debug_features")
-        nv_features_dir = Path(nv_features_mod.__file__).parent
-        if nv_features_dir.exists():
-            feature_dirs.append(str(nv_features_dir))
-    except Exception:
-        pass
-
     return feature_dirs
 
 
