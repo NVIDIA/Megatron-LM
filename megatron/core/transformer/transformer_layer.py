@@ -46,6 +46,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=None)
+def _get_off_interface():
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface,
+    )
+
+    return FineGrainedActivationOffloadingInterface
+
+
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
@@ -559,9 +568,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_off_interface()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -683,9 +690,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_off_interface()
 
         self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
@@ -1002,9 +1007,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_off_interface()
 
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
@@ -1049,9 +1052,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the D2H transfer on offloading stream.
         if self.offload_module_in_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
+            off_interface = _get_off_interface()
 
             off_interface.forward_record()
         return tuple(cuda_graph_outputs)
@@ -1078,9 +1079,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.config.delay_offload_until_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
+            off_interface = _get_off_interface()
 
             off_interface.enter_replay()
 
@@ -1098,9 +1097,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The CPU is idle during the sync between graph replay and a2a comm,
         # so we use that time to execute the delayed offload operations.
         if self.config.delay_offload_until_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
+            off_interface = _get_off_interface()
 
             off_interface.flush_delayed_groups()
 
@@ -1527,9 +1524,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_off_interface()
 
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -1624,9 +1619,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_off_interface()
 
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -1748,9 +1741,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
         if self.offload_mlp_norm:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
+            off_interface = _get_off_interface()
 
             hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
 
