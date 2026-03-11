@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -134,11 +135,7 @@ try:
                 if isinstance(completed_request, dict)
                 else completed_request.serialize()
             )
-            # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in request_dict.items()
-            }
+            result = unwrap_serialized_tensors(request_dict)
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 

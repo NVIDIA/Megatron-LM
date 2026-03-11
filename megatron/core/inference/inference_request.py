@@ -46,6 +46,21 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def unwrap_serialized_tensors(serialized_request: dict) -> dict:
+    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+
+    Args:
+        serialized_request (dict): A dict produced by `serialize()`.
+
+    Returns:
+        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+    """
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in serialized_request.items()
+    }
+
+
 # class syntax
 class Status(Enum):
     """Enum for status"""

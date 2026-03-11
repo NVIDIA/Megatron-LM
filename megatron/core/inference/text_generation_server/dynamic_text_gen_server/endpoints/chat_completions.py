@@ -7,6 +7,7 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -148,10 +149,7 @@ try:
         for result_item in batch_results:
             result = result_item if isinstance(result_item, dict) else result_item.serialize()
 
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in result.items()
-            }
+            result = unwrap_serialized_tensors(result)
             prompt_tokens_out = result["prompt_tokens"]
             text_output = result["generated_text"]
             prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0

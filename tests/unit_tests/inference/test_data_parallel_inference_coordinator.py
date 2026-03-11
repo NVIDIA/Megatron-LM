@@ -135,6 +135,7 @@ class DummyEngine(DynamicInferenceEngine):
     ) -> asyncio.Future[DynamicInferenceRequestRecord]:
         """Dummy add_request."""
 
+        # Mock tokenization to prevent `prompt_tokens == None`.
         prompt_tokens = (
             torch.arange(len(prompt.split())) if isinstance(prompt, str) else torch.tensor(prompt)
         )
