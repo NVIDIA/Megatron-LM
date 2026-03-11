@@ -50,7 +50,7 @@ That model works well for element-wise optimizers, but it breaks down for method
 
 Megatron-Core addresses this with a layer-wise distributed optimizer. Instead of slicing every layer across all data-parallel ranks, full layers are assigned to different ranks so the preconditioner can be computed from complete layer tensors.
 
-![Comparison of distributed optimizers](./images/distributed-optimizer-comparison.png)
+<img src="./images/distributed-optimizer-comparison.png" alt="Comparison of distributed optimizers" width="700">
 
 Figure 1. Element-wise and layer-wise distributed optimizer layouts.
 
