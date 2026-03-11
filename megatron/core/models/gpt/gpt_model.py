@@ -600,7 +600,11 @@ class GPTModel(LanguageModule):
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
         if is_spec_decode is None:
-            is_spec_decode = in_inference_mode and inference_context.num_speculative_tokens > 0
+            is_spec_decode = (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+            )
 
         # logits and loss
         output_weight = None
