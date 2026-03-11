@@ -880,10 +880,6 @@ class TextGenerationController:
             # Use sampled token as input for the next depth.
             next_token_ids = spec_tokens
 
-        # Clean up cached hidden states.
-        if has_mtp:
-            del unwrapped_model._decoder_hidden_states_cache
-
     def _get_required_logit_indices(
         self,
         request_in_prefill_status_tensor: Tensor,
@@ -1655,7 +1651,7 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
 
         is_last_stage = is_pipeline_last_stage(self.pp_group)
-        has_mtp = is_last_stage and hasattr(unwrapped_model, 'mtp')
+        has_mtp = is_last_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
