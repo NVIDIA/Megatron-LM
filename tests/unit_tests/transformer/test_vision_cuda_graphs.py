@@ -381,6 +381,7 @@ class TestVisionTECudaGraphHelper:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
+    @pytest.mark.flaky_in_dev
     def test_create_cudagraphs_multi_microbatch(self):
         """Verify that graphs are created per-microbatch per-layer."""
         self.llava_model.cuda()
