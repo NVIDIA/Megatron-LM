@@ -1072,7 +1072,7 @@ class TestDynamicInferenceEngine:
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
         elif not torch.distributed.is_initialized():
-            Utils.initialize_distributed()
+            pytest.skip("Distributed not initialized")
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size
         if world_size < min_world_size:
@@ -1092,6 +1092,10 @@ class TestDynamicInferenceEngine:
                         "The inference optimized transformer requires sequence parallelism "
                         "when tp_size > 1."
                     )
+                )
+            if model_provider == "mamba":
+                pytest.skip(
+                    reason="Mamba model is not supported with the inference optimized transformer."
                 )
 
         env = self._run_test(
