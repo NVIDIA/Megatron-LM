@@ -6,6 +6,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -48,7 +49,7 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_and_grad_buffer import ParamLayout, _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
@@ -107,6 +108,94 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fully_sharded_model_space',
         'fsdp_dtensor',
     }
+
+    @classmethod
+    def compute_param_layout(
+        cls,
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+    ) -> ParamLayout:
+        """Compute how parameters should be laid out in the contiguous buffer.
+
+        Iterates params in reverse order (backprop order), applies 64-byte param
+        alignment, bucket-end padding for DP divisibility, and shared-embedding
+        bucket splitting.
+
+        Args:
+            params: List of parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: DistributedDataParallel config object.
+
+        Returns:
+            ParamLayout with the computed mapping.
+        """
+
+        def _pad(number_to_be_padded: int, divisor: int) -> int:
+            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
+        def _pad_end_of_bucket(bucket_end_index: int) -> int:
+            if ddp_config.pad_buckets_for_high_nccl_busbw:
+                bucket_size_divisor = math.lcm(data_parallel_world_size, 128, 2**16)
+            else:
+                bucket_size_divisor = math.lcm(data_parallel_world_size, 128)
+            return _pad(bucket_end_index, bucket_size_divisor)
+
+        def _pad_start_of_param(param_start_index: int) -> int:
+            return _pad(param_start_index, 64)
+
+        def _does_param_require_new_bucket(param):
+            return getattr(param, "shared_embedding", False)
+
+        param_index_map = {}
+        bucket_indices = []
+        per_bucket_numel_unpadded = []
+
+        param_start_index = 0
+        bucket_start_index = 0
+        bucket_params = set()
+        bucket_id = 0
+
+        def _update_bucket_metadata(param_end_index: int) -> int:
+            nonlocal bucket_start_index, bucket_params, bucket_id
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = _pad_end_of_bucket(param_end_index)
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            bucket_start_index = bucket_end_index
+            bucket_params = set()
+            bucket_id += 1
+            return bucket_end_index
+
+        for param in params[::-1]:
+            this_numel = param.data.nelement()
+            param_start_index = _pad_start_of_param(param_start_index)
+
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                param_start_index = _update_bucket_metadata(param_start_index)
+
+            param_end_index = param_start_index + this_numel
+            param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            bucket_params.add(param)
+
+            if (
+                bucket_size is not None
+                and (param_end_index - bucket_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                bucket_end_index = _update_bucket_metadata(param_end_index)
+                param_start_index = bucket_end_index
+            else:
+                param_start_index = param_end_index
+
+        if len(bucket_params) > 0:
+            _update_bucket_metadata(param_end_index)
+
+        return ParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+        )
 
     @classmethod
     def _build_model_gbuf_param_range_map(

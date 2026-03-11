@@ -11,6 +11,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import partition_buckets
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
@@ -46,8 +47,13 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
+    # Pass the optimizer class so the buffer uses the correct layout for dist optimizer.
+    optimizer_class = DistributedOptimizer if use_distributed_optimizer else None
     model = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        optimizer_class=optimizer_class,
     )
     assert len(model.buffers) == 1
     param_and_grad_buffer = model.buffers[0]
@@ -329,6 +335,8 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
     input_dim = 100
     output_dim = 100
     num_layers = 2
+    # Note: get_model_and_buffers now passes optimizer_class=DistributedOptimizer
+    # when use_distributed_optimizer=True.
     model, param_and_grad_buffer, _ = get_model_and_buffers(
         input_dim=input_dim,
         output_dim=output_dim,
