@@ -9,10 +9,11 @@ import uuid
 import warnings
 
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
+
+# pylint: disable=line-too-long
 
 
 def _get_field(obj, key, default=None):
@@ -101,7 +102,9 @@ def _sanitize_messages_for_template(messages):
                 function = call_copy.get("function")
                 if isinstance(function, dict):
                     function_copy = dict(function)
-                    function_copy["arguments"] = _coerce_arguments_mapping(function_copy.get("arguments", {}))
+                    function_copy["arguments"] = _coerce_arguments_mapping(
+                        function_copy.get("arguments", {})
+                    )
                     call_copy["function"] = function_copy
                 sanitized_tool_calls.append(call_copy)
             msg_copy["tool_calls"] = sanitized_tool_calls
@@ -135,11 +138,12 @@ def _sanitize_tools_for_template(tools):
         sanitized.append(tool_copy)
     return sanitized
 
+
 def _replace_prefix_tokens(
-    eos_token_id, 
+    eos_token_id,
     previous_turn_token_ids,
     retokeenized_previous_turn_token_ids,
-    current_turn_token_ids
+    current_turn_token_ids,
 ):
     """Replace the token ids that are associated with the previous turn with the actual tokens
     from the previous generation (rather than the ones from the chat template application)."""
@@ -160,7 +164,8 @@ def _replace_prefix_tokens(
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
-    
+
+
 try:
     import orjson
 
@@ -182,9 +187,7 @@ try:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
             prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(
-                message_text, tools=tools
-            )
+            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(new_info.get("tool_calls", []))
                 if not tools_requested:
@@ -214,9 +217,10 @@ try:
         messages = req.get("messages")
         chat_template_kwargs = req.get("chat_template_kwargs", {})
         if not isinstance(chat_template_kwargs, dict):
-            logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__)
-            chat_template_kwargs = {}\
-
+            logger.warning(
+                "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
+            )
+            chat_template_kwargs = {}
         # --- 1. Parse Messages ---
         if not messages:
             return Response("Missing 'messages' field", status=400)
@@ -243,8 +247,8 @@ try:
                     assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
                     warnings.warn(
-                        "Avoiding prefix retokenization." \
-                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation." \
+                        "Avoiding prefix retokenization."
+                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
                         " This may cause unexpected behavior if messages (including system messages) are altered between generations."
                     )
 
@@ -257,7 +261,9 @@ try:
 
                     # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
                     if last_assistant_message_idx is not None:
-                        messages_to_last_assistant_message = template_messages[: last_assistant_message_idx + 1]
+                        messages_to_last_assistant_message = template_messages[
+                            : last_assistant_message_idx + 1
+                        ]
 
                         # Get the templated tokenization of just the previous generation
                         retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
@@ -270,9 +276,14 @@ try:
 
                         # Replace the prefix tokens with the tokens from the previous generation
                         last_assistant_message = template_messages[last_assistant_message_idx]
-                        assert "prompt_token_ids" in last_assistant_message and "generation_token_ids" in last_assistant_message, \
-                            "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
-                        previous_turn_token_ids = last_assistant_message["prompt_token_ids"] + last_assistant_message["generation_token_ids"]
+                        assert (
+                            "prompt_token_ids" in last_assistant_message
+                            and "generation_token_ids" in last_assistant_message
+                        ), "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
+                        previous_turn_token_ids = (
+                            last_assistant_message["prompt_token_ids"]
+                            + last_assistant_message["generation_token_ids"]
+                        )
                         prompt_tokens = _replace_prefix_tokens(
                             eos_token_id,
                             previous_turn_token_ids,
@@ -370,9 +381,14 @@ try:
 
             if result["status"] == "FAILED":
                 if result["sampling_params"]["num_tokens_to_generate"] <= 0:
-                    return Response(f"Request {request_idx} failed due to context length overflow", status=400)
+                    return Response(
+                        f"Request {request_idx} failed due to context length overflow", status=400
+                    )
                 else:
-                    return Response(f"Request {request_idx} failed due to internal error {result["events"]}", status=500)
+                    return Response(
+                        f"Request {request_idx} failed due to internal error {result['events']}",
+                        status=500,
+                    )
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
@@ -434,7 +450,10 @@ try:
             return_log_probs = sampling_params.return_log_probs
 
             finish_reason = "tool_calls" if metadata.get("tool_calls", []) else "stop"
-            if len(result["generated_tokens"]) >= result["sampling_params"]["num_tokens_to_generate"]:
+            if (
+                len(result["generated_tokens"])
+                >= result["sampling_params"]["num_tokens_to_generate"]
+            ):
                 finish_reason = "length"
 
             choice_data = {
@@ -466,7 +485,9 @@ try:
 
             choices.append(choice_data)
             if choice_data["generation_log_probs"] is None:
-                print(f"Generation log probs is None for request:\n{json.dumps(result, indent=4)}", flush=True)
+                logger.warning(
+                    "Generation log probs is None for request:\n%s", json.dumps(result, indent=4)
+                )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
