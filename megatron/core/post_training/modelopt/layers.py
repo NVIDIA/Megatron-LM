@@ -21,6 +21,7 @@ if HAVE_TE or TYPE_CHECKING:
 
     from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 else:
+    te = None
     _get_extra_te_kwargs = None
 
 
