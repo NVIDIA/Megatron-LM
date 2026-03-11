@@ -576,11 +576,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Residual connection.
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -591,6 +586,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+
+        if isinstance(input_layernorm_output, tuple):
+            if len(input_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of input_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(input_layernorm_output)}"
+                )
+            input_layernorm_output, residual = input_layernorm_output
+        else:
+            residual = hidden_states
+
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -646,14 +655,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
-        # Residual connection.
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
 
+        if isinstance(pre_cross_attn_layernorm_output, tuple):
+            if len(pre_cross_attn_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_cross_attn_layernorm_output "
+                    f"is a tuple, it is expected to have 2 elements "
+                    f"(output, residual), but "
+                    f"got {len(pre_cross_attn_layernorm_output)}"
+                )
+            pre_cross_attn_layernorm_output, residual = pre_cross_attn_layernorm_output
+        else:
+            residual = hidden_states
+
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
@@ -728,13 +746,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
-        # Residual connection.
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            # Residual connection.
+            residual = hidden_states
+
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -1147,6 +1175,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if not self.is_moe_layer:
                     return residual, None, None, None
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
+                if isinstance(hidden_states, tuple):
+                    if len(hidden_states) != 2:
+                        raise ValueError(
+                            f"When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(hidden_states)}"
+                        )
+                    hidden_states, residual = hidden_states
+
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
@@ -1350,11 +1387,22 @@ class MoETransformerLayer(TransformerLayer):
         This method is isolated so it can be captured by `cudagraph_manager_router`.
         """
 
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            residual = hidden_states
+
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
         router_outputs = self.mlp(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )

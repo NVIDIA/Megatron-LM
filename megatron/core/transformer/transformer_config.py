@@ -446,6 +446,9 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_residual_rmsnorm: bool = False
+    """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
+
     ####################
     # activation recomputation
     ####################
@@ -1635,6 +1638,12 @@ class TransformerConfig(ModelParallelConfig):
                     "to True and use_te_activation_func to False."
                 )
 
+        if self.fused_residual_rmsnorm:
+            if self.normalization != "RMSNorm":
+                raise ValueError(
+                    "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
         if self.use_te_activation_func:
             if self.activation_func not in (F.gelu, F.silu, F.relu):
                 raise ValueError(
@@ -2250,6 +2259,11 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
+    """
 
     def __post_init__(self):
         super().__post_init__()

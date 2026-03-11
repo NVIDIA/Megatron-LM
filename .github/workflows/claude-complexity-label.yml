@@ -1,7 +1,7 @@
 name: Claude Complexity Label
 
 on:
-  pull_request:
+  pull_request_target:
     types: [ready_for_review]
 
 jobs:
@@ -27,6 +27,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.PAT }}
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
