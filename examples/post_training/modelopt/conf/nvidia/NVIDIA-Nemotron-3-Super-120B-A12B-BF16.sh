@@ -44,7 +44,7 @@ MODEL_ARGS=" \
     --init-method-std 0.014 \
     --position-embedding-type none \
     --squared-relu \
-    --num-layers 88 \
+    --hidden-size 4096 \
     --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 2 \
