@@ -783,8 +783,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         The request is added to failed_request_ids so that the next bookkeeping pass can return it.
         """
-        entry = self.requests[request_id]
-        request = entry.record[-1]
+        request_entry = self.requests[request_id]
+        request = request_entry.record[-1]
 
         if self.rank == 0:
             warnings.warn(f"Request {request_id} failed to be added to the engine due to errors.")
