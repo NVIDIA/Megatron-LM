@@ -737,9 +737,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._mamba_eos_cache_block_id: list = [None] * self.max_requests
         self._mamba_intermediate_buffer: dict = {}
 
-        # Per-request cached logit hash for zero-query prefix caching
-        self._cached_logit_hash: list = [-1] * self.max_requests
-
         # Reset tensor-related metadata.
         self.reset_metadata()
 
@@ -1203,13 +1200,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Compute relative offsets (relative to prefill start after skip)
         kv_div_rel = kv_div_abs - skip_tokens
         last_aligned_rel = last_aligned_abs - skip_tokens
+        penultimate_abs = (overall_required_blocks - 1) * self.block_size_tokens
+        penultimate_rel = penultimate_abs - skip_tokens
 
         # Determine chunk_size from mamba config (128 is the standard SSM kernel chunk size)
         chunk_size = 128
 
         # Build offset list: include if > 0, < seq_len, and % chunk_size == 0
         offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel]:
+        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
             if offset > 0 and offset < seq_len and offset % chunk_size == 0:
                 offsets_set.add(offset)
 
@@ -2002,131 +2001,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Last tokens of logits.
 
         Args:
-            logits (Tensor): Output logits of forward pass. Can be None when
-                all active requests use cached logits (active_token_count == 0).
+            logits (Tensor): Output logits of forward pass.
 
         Return:
             (Tensor) Last token logits.
         """
         paused = self.paused_request_count
         total = self.total_request_count
-        active_count = total - paused
         query_lengths = self.request_query_lengths[paused:total]
 
-        # Fast path: no zero-query requests
-        if not self.enable_prefix_caching or (query_lengths > 0).all():
-            assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
-            assert logits.size(1) == self.padded_active_token_count, (
-                f"logits.size(1) ({tuple(logits.shape)}) != "
-                f"padded_active_token_count ({self.padded_active_token_count})."
-            )
-            logits_2d = logits.squeeze(0)
-            last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
-            return logits_2d[last_token_idxs, :]
-
-        # Slow path: mix of forward-pass and cached-logit requests
-        vocab_size = logits.size(2) if logits is not None else None
-        logits_2d = logits.squeeze(0) if logits is not None else None
-
-        nonzero_mask = query_lengths > 0
-        result_parts = []
-        result_indices = []
-
-        if nonzero_mask.any():
-            assert logits_2d is not None
-            cumsum = torch.cumsum(query_lengths[nonzero_mask], 0) - 1
-            forward_logits = logits_2d[cumsum]
-            nonzero_indices = torch.where(nonzero_mask)[0]
-            result_parts.append(forward_logits)
-            result_indices.append(nonzero_indices)
-            vocab_size = forward_logits.size(-1)
-
-        zero_mask = ~nonzero_mask
-        if zero_mask.any():
-            cached_parts = []
-            for i in torch.where(zero_mask)[0].tolist():
-                block_hash = self._cached_logit_hash[paused + i]
-                cached_logit = self.block_allocator.get_cached_block_logit(block_hash)
-                assert cached_logit is not None, f"No cached logit for block hash {block_hash}"
-                cached_parts.append(cached_logit.unsqueeze(0))
-                if vocab_size is None:
-                    vocab_size = cached_logit.size(-1)
-            cached_logits = torch.cat(cached_parts, dim=0)
-            zero_indices = torch.where(zero_mask)[0]
-            result_parts.append(cached_logits)
-            result_indices.append(zero_indices)
-
-        # Scatter into result tensor in correct order
-        all_indices = torch.cat(result_indices)
-        all_logits = torch.cat(result_parts, dim=0)
-        result = torch.empty(
-            active_count, vocab_size, device=all_logits.device, dtype=all_logits.dtype
+        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
+        assert logits.size(1) == self.padded_active_token_count, (
+            f"logits.size(1) ({tuple(logits.shape)}) != "
+            f"padded_active_token_count ({self.padded_active_token_count})."
         )
-        result[all_indices] = all_logits
-        return result
-
-    def cache_block_boundary_logits(self, logits: Tensor) -> None:
-        """Cache logits at block boundaries for zero-redundant prefix caching.
-
-        Called after the forward pass, before sampling. For each prefill request,
-        extracts the logit at the last token of every completed block that falls
-        within the processed token range and stores it in the block allocator.
-
-        Args:
-            logits: The full logits tensor from the forward pass, shape
-                [1, padded_active_token_count, vocab_size].
-        """
-        if not self.enable_prefix_caching:
-            return
-
-        prefill_count = self.num_prefill_requests
-        if prefill_count == 0:
-            return
-
         logits_2d = logits.squeeze(0)
-        paused = self.paused_request_count
-        active_start = paused
-        decode_count = self.total_request_count - paused - prefill_count
-        prefill_start = active_start + decode_count
-
-        # Compute token_start for each prefill request via cumulative sum
-        # of query lengths for all active requests
-        query_lengths = self.request_query_lengths[paused : self.total_request_count]
-        cu_lengths = torch.cumsum(query_lengths, dim=0)
-
-        for prefill_idx in range(prefill_count):
-            ctx_idx = prefill_start + prefill_idx
-            q_len = query_lengths[decode_count + prefill_idx].item()
-            if q_len == 0:
-                continue  # zero-query request, no logits to cache
-
-            kv_offset = self.request_kv_length_offsets[ctx_idx].item()
-            # token_start = cumsum up to this request minus its own length
-            cu_idx = decode_count + prefill_idx
-            token_end_in_logits = cu_lengths[cu_idx].item()
-            token_start = token_end_in_logits - q_len
-
-            # Find block boundaries within the processed range
-            # Block k ends at absolute position (k+1) * block_size - 1
-            # Relative offset in chunk: (k+1) * block_size - 1 - kv_offset
-            block_count = self.request_kv_block_counts[ctx_idx].item()
-            for k in range(block_count):
-                block_end_abs = (k + 1) * self.block_size_tokens - 1
-                rel_offset = block_end_abs - kv_offset
-                if rel_offset < 0 or rel_offset >= q_len:
-                    continue
-
-                block_id = self.request_to_kv_block_ids[ctx_idx][k].item()
-                if block_id < 0:
-                    continue
-                block_hash = self.block_allocator.block_hashes[block_id].item()
-                if block_hash <= 0:
-                    continue
-
-                # Only cache if not already cached
-                if self.block_allocator.get_cached_block_logit(block_hash) is None:
-                    logit_vec = logits_2d[token_start + rel_offset].clone()
-                    self.block_allocator.cache_block_logit(block_hash, logit_vec)
+        last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
+        return logits_2d[last_token_idxs, :]
 
     def _compute_prefix_match(
         self, req: DynamicInferenceRequest, chunk_length: int
@@ -2165,7 +2056,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         block_aligned = finished % self.block_size_tokens == 0
         if num_matched > 0 and block_aligned:
-            prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length)
+            prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
         else:
             prefix_skip_tokens = 0
 
@@ -2180,7 +2071,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_mamba_matched <= num_matched
             ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
             if num_mamba_matched > 0 and block_aligned:
-                prefix_skip_tokens = min(num_mamba_matched * self.block_size_tokens, chunk_length)
+                raw_skip = num_mamba_matched * self.block_size_tokens
+                if raw_skip >= chunk_length:
+                    # Back off to previous block with cached Mamba state
+                    mamba_map = self.block_allocator.mamba_hash_to_block_id
+                    backed_off_blocks = 0
+                    for j in range(num_mamba_matched - 2, -1, -1):
+                        if req.precomputed_block_hashes[j] in mamba_map:
+                            backed_off_blocks = j + 1
+                            break
+                    prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
+                else:
+                    prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
         elif self.is_hybrid_model:
@@ -2442,25 +2344,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Range 2: newly allocated (non-matched) blocks that are now complete
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
-        # Track cached logit hash for zero-query prefix caching
-        if effective_chunk_length == 0 and self.enable_prefix_caching:
-            # All tokens covered by cached blocks, use cached logit from last matched block
-            if (
-                self.is_hybrid_model
-                and hasattr(self, 'max_mamba_cache_slots')
-                and self.max_mamba_cache_slots > 0
-            ):
-                num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
-                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[
-                    num_mamba_matched - 1
-                ]
-            else:
-                self._cached_logit_hash[current_id] = req.precomputed_block_hashes[
-                    num_matched_blocks - 1
-                ]
-        else:
-            self._cached_logit_hash[current_id] = -1
-
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
@@ -2468,15 +2351,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
-            # Restore Mamba state from last consecutive cached block
-            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            # Restore Mamba state from the block corresponding to prefix_skip_tokens
+            restore_block_count = prefix_skip_tokens // self.block_size_tokens
             restored = False
             if (
-                num_mamba_matched > 0
+                restore_block_count > 0
                 and hasattr(self, 'max_mamba_cache_slots')
                 and self.max_mamba_cache_slots > 0
             ):
-                restore_block_id = matched_block_ids[num_mamba_matched - 1]
+                restore_block_id = matched_block_ids[restore_block_count - 1]
                 restored = self.restore_mamba_state_from_block(
                     self.total_request_count, restore_block_id
                 )
@@ -2485,12 +2368,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
 
             # Compute intermediate offsets for state extraction during forward pass
-            # Skip when effective_chunk_length == 0 (all-cached, no forward pass needed)
-            if (
-                effective_chunk_length > 0
-                and hasattr(self, 'max_mamba_cache_slots')
-                and self.max_mamba_cache_slots > 0
-            ):
+            if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
                 self._compute_and_store_mamba_offsets(
                     req,
                     current_id,
@@ -3101,15 +2979,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count : self.total_request_count
         ]
 
-        # Handle zero-query requests (prefix caching: fully cached blocks).
-        # Only non-zero requests contribute tokens to active_token_ids.
-        nonzero_mask = active_query_lengths > 0
-        if nonzero_mask.all():
-            new_token_idx = active_query_lengths.cumsum(0) - 1
-            active_token_ids[new_token_idx] = new_tokens
-        else:
-            nonzero_cumsum = torch.cumsum(active_query_lengths[nonzero_mask], 0) - 1
-            active_token_ids[nonzero_cumsum] = new_tokens[nonzero_mask]
+        new_token_idx = active_query_lengths.cumsum(0) - 1
+        active_token_ids[new_token_idx] = new_tokens
 
         # Extract the log probs for only the selected tokens.
         # (sequence_length x vocab_size) -> (sequence_length)

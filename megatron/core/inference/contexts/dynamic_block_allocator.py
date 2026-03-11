@@ -63,9 +63,6 @@ class BlockAllocator:
             # Mamba state hash-to-block mapping: only blocks with cached Mamba state
             self.mamba_hash_to_block_id: Dict[int, int] = {}
 
-            # Per-block logit cache: hash → [vocab_size] GPU tensor
-            self.block_hash_to_logit: Dict[int, Tensor] = {}
-
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
                 (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
@@ -237,7 +234,6 @@ class BlockAllocator:
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
             self.mamba_hash_to_block_id.clear()
-            self.block_hash_to_logit.clear()
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -292,12 +288,6 @@ class BlockAllocator:
             maxlen=0,
         )
 
-        # Remove cached logits for deregistered blocks
-        if self.block_hash_to_logit:
-            logit_keys = keys_to_delete & self.block_hash_to_logit.keys()
-            if logit_keys:
-                deque(map(self.block_hash_to_logit.pop, logit_keys), maxlen=0)
-
         # Also deregister from mamba hash map and invalidate mamba cache
         if self.mamba_hash_to_block_id:
             mamba_keys = keys_to_delete & self.mamba_hash_to_block_id.keys()
@@ -339,26 +329,6 @@ class BlockAllocator:
         """
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         return cached_mask.sum()
-
-    def cache_block_logit(self, block_hash: int, logit: Tensor) -> None:
-        """Store a logit tensor for a registered block.
-
-        Args:
-            block_hash: The block's hash value.
-            logit: The logit tensor at the block boundary, shape [vocab_size].
-        """
-        self.block_hash_to_logit[block_hash] = logit
-
-    def get_cached_block_logit(self, block_hash: int) -> Optional[Tensor]:
-        """Retrieve a cached logit tensor for a block.
-
-        Args:
-            block_hash: The block's hash value.
-
-        Returns:
-            The cached logit tensor, or None if not cached.
-        """
-        return self.block_hash_to_logit.get(block_hash)
 
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.

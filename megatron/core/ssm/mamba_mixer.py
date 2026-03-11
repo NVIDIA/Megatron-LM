@@ -542,30 +542,10 @@ class MambaMixer(MegatronModule):
             return None
 
         # Use precomputed metadata (no .item() calls, no stripping).
-        # Zero-length sequences have batch_indices=-1 (set in update()),
-        # so tensor_masked_update skips them and their conv/SSM state
-        # is preserved from prefix caching restoration.
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
         real_token_count = metadata.real_prefill_token_count
         seq_idx = metadata.seq_idx
-
-        padded_token_count = zxBCdt.shape[0]
-
-        # All prefill requests have 0 tokens (fully covered by cached blocks,
-        # zero-redundant prefix caching). No computation needed; return a
-        # padded zero tensor so tensor_merge shape expectations are satisfied.
-        if real_token_count == 0:
-            y_zero = torch.zeros(
-                padded_token_count,
-                1,
-                self.d_inner_local_tp,
-                dtype=zxBCdt.dtype,
-                device=zxBCdt.device,
-            )
-            if intermediate_token_offsets is not None:
-                return y_zero, [None] * real_prefill_count
-            return y_zero
 
         # Pass full padded tensor — SSM kernel uses cu_chunk_seqlens for
         # boundaries and never accesses tokens beyond the last boundary.
@@ -594,10 +574,6 @@ class MambaMixer(MegatronModule):
 
         if intermediate_token_offsets is not None:
             y_prefill, intermediate_states = result
-            # No re-expansion needed: zero-length seqs are not filtered,
-            # so intermediate_states already has real_prefill_count entries
-            # with None for zero-length sequences (their offset lists are
-            # empty, so per_request_intermediate_counts[i] == 0).
         else:
             y_prefill = result
             intermediate_states = None
@@ -814,8 +790,6 @@ class MambaMixer(MegatronModule):
                 for r in range(num_requests):
                     start = cu_seqlens[r].item()
                     end = cu_seqlens[r + 1].item()
-                    if end <= start:
-                        continue
                     # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
                     xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
                     init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)

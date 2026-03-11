@@ -116,7 +116,6 @@ class MambaMetadata:
         # Python-side precomputed values
         self.real_prefill_token_count = 0
         self.cu_seqlens_list = [0]
-        self.has_zero_len_seqs = False
 
     def update(
         self,
@@ -214,16 +213,6 @@ class MambaMetadata:
             self.real_prefill_token_count = (
                 cu_seqlens_real[real_prefill_count] if real_prefill_count > 0 else 0
             )
-
-            # Detect zero-length seqs and mark their batch_indices as -1.
-            # tensor_masked_update already skips -1 indices, so the forward pass
-            # won't overwrite their correctly-restored conv/SSM state.
-            self.has_zero_len_seqs = False
-            for i in range(real_prefill_count):
-                if cu_seqlens_real[i + 1] == cu_seqlens_real[i]:
-                    self._batch_indices_prefill_buffer[i] = -1
-                    self.has_zero_len_seqs = True
-            # View already reflects buffer modifications (it's a slice, not a copy)
 
             # Build cu_chunk_seqlens, last_chunk_indices, seq_idx_for_varlen.
             # Covers all padded sequences (real + padding). Each sequence is

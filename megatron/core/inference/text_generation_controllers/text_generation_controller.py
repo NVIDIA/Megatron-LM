@@ -930,55 +930,6 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
-    def _build_all_cached_logits(self, context, active_request_count):
-        """Build per-request logits from cached block boundary logits.
-
-        Used when all active requests have effective_chunk_length == 0
-        (all tokens covered by cached blocks, no forward pass needed).
-
-        Args:
-            context: The dynamic inference context.
-            active_request_count: Number of active requests.
-
-        Returns:
-            Tensor of shape [active_request_count, vocab_size].
-        """
-        # Initialize attention state for zero-token batch so batch_dimensions
-        # and padded counts are set correctly for update_requests
-        context.initialize_attention_state()
-
-        paused = context.paused_request_count
-        parts = []
-        for i in range(active_request_count):
-            block_hash = context._cached_logit_hash[paused + i]
-            cached = context.block_allocator.get_cached_block_logit(block_hash)
-            assert cached is not None, f"No cached logit for hash {block_hash}"
-            parts.append(cached.unsqueeze(0))
-        return torch.cat(parts, dim=0)
-
-    def _sample_from_last_token_logits(self, last_token_logits: Tensor):
-        """Sample tokens from pre-extracted last-token logits.
-
-        Same logic as _dynamic_step_sample_logits but takes last_token_logits
-        directly instead of extracting them from full forward-pass logits.
-
-        Args:
-            last_token_logits: Tensor of shape [active_request_count, vocab_size].
-        """
-        if self._sampling_backend == "torch":
-            token_list = []
-            indices_list = []
-
-            for indices, temp, top_k, top_p in self._torch_sampling_buckets:
-                token_list.append(
-                    self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
-                )
-                indices_list.append(torch.tensor(indices))
-
-            sampled_tokens = torch.cat(token_list, dim=0)
-            sampled_indices = torch.cat(indices_list, dim=0)
-            self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
-
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -1004,64 +955,45 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
-        # All-cached batch: all active requests have cached logits, no forward pass needed
-        if context.active_token_count == 0 and active_request_count > 0:
-            last_token_logits = self._build_all_cached_logits(context, active_request_count)
-            routing_indices_per_request = None
-            cuda_graph_request_count = None
-            logits = None
-            return_log_probs = False
-            return_top_n_logprobs = False
+        input_ids, position_ids = self._dynamic_step_context_init()
 
-            await asyncio.sleep(0)
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
 
-            self._dynamic_step_sample_bookkeeping()
-            # Sample directly from cached logits (bypass _dynamic_step_sample_logits
-            # which expects padded forward-pass logits)
-            self._sample_from_last_token_logits(last_token_logits)
-        else:
-            input_ids, position_ids = self._dynamic_step_context_init()
+        # Enable routing recording before forward pass if routing replay is enabled
+        config = self.inference_wrapped_model.model.config
+        if config.moe_enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            cuda_graph_request_count = (
-                context.padded_active_request_count if context.is_decode_only() else None
-            )
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            # Enable routing recording before forward pass if routing replay is enabled
-            config = self.inference_wrapped_model.model.config
-            if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        # Commit Mamba intermediate states before update_requests, which
+        # may swap request indices. The Python lists tracking EOS block IDs
+        # and intermediate offsets are not swapped along with tensors, so
+        # commit must run while indices are still valid.
+        if (
+            context.is_hybrid_model
+            and hasattr(context, 'max_mamba_cache_slots')
+            and context.max_mamba_cache_slots > 0
+        ):
+            context.commit_mamba_intermediate_states()
 
-            logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        # Collect routing indices per request (must be done before context transitions)
+        routing_indices_per_request = self._router_record_bookkeeping()
 
-            # Cache block boundary logits for zero-redundant prefix caching
-            context.cache_block_boundary_logits(logits)
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
+        await asyncio.sleep(0)
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if (
-                context.is_hybrid_model
-                and hasattr(context, 'max_mamba_cache_slots')
-                and context.max_mamba_cache_slots > 0
-            ):
-                context.commit_mamba_intermediate_states()
-
-            # Collect routing indices per request (must be done before context transitions)
-            routing_indices_per_request = self._router_record_bookkeeping()
-
-            # This is the best place to yield control back to event loop.
-            # At this point we have enqueued FW pass GPU kernels asynchronously.
-            # While they are running, we can do other useful CPU work.
-            # Note: This can be moved further ahead if sampling can be made
-            # asynchronous.
-            # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-            # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-            await asyncio.sleep(0)
-
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-            self._dynamic_step_sample_bookkeeping()
-            self._dynamic_step_sample_logits(logits)
+        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        self._dynamic_step_sample_bookkeeping()
+        self._dynamic_step_sample_logits(logits)
 
         log_probs = None
         top_n_logprobs = None

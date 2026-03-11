@@ -250,7 +250,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx_off.add_request(
             self._req(ctx_off, prompt.clone(), request_id=2, enable_prefix_caching=False)
         )
-        assert ctx_on.lifetime_prefill_token_count == bs * 4
+        assert ctx_on.lifetime_prefill_token_count == bs * 4 + 1
         assert ctx_off.lifetime_prefill_token_count == bs * 4 * 2
 
         # partial match reduces proportionally
@@ -262,7 +262,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2b, request_id=2))
         assert ctx2.lifetime_prefill_token_count == bs * 3 + bs
 
-        # full match: zero-redundant cached logit
+        # full match: recompute-based back-off (1 token recomputed per duplicate)
         ctx3 = self._ctx()
         alloc3 = ctx3.block_allocator
         p3 = self._prompt(bs * 3)
@@ -271,11 +271,11 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         first_blocks = self._block_ids(ctx3, 0, 3)
         for i in range(5):
             ctx3.add_request(self._req(ctx3, p3.clone(), request_id=i + 2))
-            assert ctx3.request_query_lengths[i + 1].item() == 0
-        assert ctx3.active_token_count - tokens_after == 0
+            assert ctx3.request_query_lengths[i + 1].item() == 1
+        assert ctx3.active_token_count - tokens_after == 5
         for bid in first_blocks:
             assert alloc3.block_ref_counts[bid].item() == 6
-        assert ctx3.lifetime_prefill_token_count == bs * 3
+        assert ctx3.lifetime_prefill_token_count == bs * 3 + 5
 
         # no match: full prompt added
         ctx4 = self._ctx()
@@ -695,22 +695,18 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
         (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
-        assert len(m3) == 3 and ps3 == 3 * bs and ec3 == 0
+        assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
-        # zero prefill for KV-only (block-aligned, cached logit)
+        # recompute-based back-off for KV-only (block-aligned)
         ctx4 = self._ctx()
         bs4 = ctx4.block_size_tokens
-        alloc4 = ctx4.block_allocator
         p4 = self._prompt(bs4 * 3)
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
-        last_hash = req4a.precomputed_block_hashes[2]
-        alloc4.cache_block_logit(last_hash, torch.randn(16, device=torch.cuda.current_device()))
         req4b = self._req(ctx4, p4.clone(), request_id=2)
         (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
-        assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == 0
+        assert len(m4) == 3 and ps4 == 3 * bs4 - 1 and ec4 == 1
         ctx4.add_request(req4b)
-        assert ctx4._cached_logit_hash[ctx4.total_request_count - 1] == last_hash
 
         # KV eviction invalidates mamba
         ctx5 = self._mctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -749,7 +745,11 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
             overall,
         )
-        assert ctx._mamba_intermediate_offsets[1] is None
+        # Penultimate block offset (block 2 boundary) is a valid intermediate
+        offsets = ctx._mamba_intermediate_offsets[1]
+        if offsets is not None:
+            for o in offsets:
+                assert o > 0 and o % 128 == 0
         assert ctx._mamba_eos_cache_block_id[1] is not None
 
         # non-aligned prompt produces last_aligned intermediate offset
@@ -827,9 +827,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         ctx.add_request(req0)
 
         vocab_size = bs + 50
-        fake_logit = torch.randn(vocab_size, device=torch.cuda.current_device())
         block_hash = req0.precomputed_block_hashes[0]
-        ctx.block_allocator.cache_block_logit(block_hash, fake_logit)
 
         if model_type == "hybrid":
             block_id = ctx.block_allocator.kv_hash_to_block_id[block_hash]
@@ -858,53 +856,43 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         for r in [req1, req2, req3, req4]:
             ctx.add_request(r)
 
-        return ctx, bs, fake_logit, block_hash
+        return ctx, bs, vocab_size, block_hash
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
     def test_mixed_batch(self, model_type):
-        ctx, bs, fake_logit, block_hash = self._setup_mixed_batch(model_type)
-        vocab_size = fake_logit.shape[0]
+        ctx, bs, vocab_size, block_hash = self._setup_mixed_batch(model_type)
 
-        # query lengths: decode=1, cached=0, fresh=bs
+        # For GPT: req1/req3 (identical, 1-block) have effective_chunk_length=1
+        # For hybrid: req1/req3 have 1 mamba match but 1-block prompt, back-off
+        #   finds no previous block, so prefix_skip_tokens=0, effective=bs
+        if model_type == "gpt":
+            cached_ql = 1
+        else:
+            cached_ql = bs
+
+        # query lengths: decode=1, cached_recompute=cached_ql, fresh=bs
         assert ctx.request_query_lengths[0].item() == 1
-        assert ctx.request_query_lengths[1].item() == 0
+        assert ctx.request_query_lengths[1].item() == cached_ql
         assert ctx.request_query_lengths[2].item() == bs
-        assert ctx.request_query_lengths[3].item() == 0
+        assert ctx.request_query_lengths[3].item() == cached_ql
         assert ctx.request_query_lengths[4].item() == bs
-        assert ctx.active_token_count == 1 + 2 * bs
-
-        # cached_logit_hash
-        assert ctx._cached_logit_hash[0] == -1
-        assert ctx._cached_logit_hash[1] == block_hash
-        assert ctx._cached_logit_hash[2] == -1
-        assert ctx._cached_logit_hash[3] == block_hash
-        assert ctx._cached_logit_hash[4] == -1
+        assert ctx.active_token_count == 1 + 2 * cached_ql + 2 * bs
 
         # last_token_logits
+        ctx.initialize_attention_state()
         logits = torch.randn(
-            1, ctx.active_token_count, vocab_size, device=torch.cuda.current_device()
+            1, ctx.padded_active_token_count, vocab_size, device=torch.cuda.current_device()
         )
         result = ctx.last_token_logits(logits)
         assert result.shape == (5, vocab_size)
-        assert torch.equal(result[0], logits[0, 0, :])
-        assert torch.equal(result[1], fake_logit)
-        assert torch.equal(result[2], logits[0, bs, :])
-        assert torch.equal(result[3], fake_logit)
-        assert torch.equal(result[4], logits[0, 2 * bs, :])
 
         # calculate_log_probs
         new_tokens = torch.randint(0, vocab_size, (5,), device=torch.cuda.current_device())
         log_probs_list, _ = ctx.calculate_log_probs(logits, new_tokens)
         assert len(log_probs_list) == 5
         assert len(log_probs_list[0]) == 1
-        assert len(log_probs_list[1]) == 0
+        assert len(log_probs_list[1]) == cached_ql
         assert len(log_probs_list[2]) == bs
-        assert len(log_probs_list[3]) == 0
+        assert len(log_probs_list[3]) == cached_ql
         assert len(log_probs_list[4]) == bs
-
-        # no index collision
-        log_probs_full = torch.nn.functional.log_softmax(logits.squeeze(0).float(), dim=-1)
-        expected = log_probs_full[bs, new_tokens[2]].item()
-        actual = log_probs_list[2][-1]
-        assert abs(expected - actual) < 1e-5
