@@ -231,6 +231,17 @@ def get_valid_token_dispatcher_types():
         return ["alltoall"]
 
 
+def get_valid_flex_dispatcher_backends():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
+
+    if HAVE_HYBRIDEP:
+        return ["hybridep"]
+    elif HAVE_DEEP_EP:
+        return ["deepep"]
+    else:
+        return [None]
+
+
 def get_valid_fp8_flags():
     from megatron.core.enums import Fp8Recipe
 

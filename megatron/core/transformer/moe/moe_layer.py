@@ -283,6 +283,14 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
+        # Delay wgrad computation for TE grouped GEMM
+        self._delayed_wgrad_event: Optional[torch.cuda.Event] = None
+        self._delayed_wgrad_stream: Optional[torch.cuda.Stream] = None
+        self._process_expert_grads_fn = None
+        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+            self._delayed_wgrad_event = torch.cuda.Event()
+            self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
+
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher and state.
 
@@ -373,6 +381,8 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
+        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+            hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
@@ -411,6 +421,10 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
+        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+            hidden_states = _RecordExpertDgradCompletion.apply(
+                self._delayed_wgrad_event, hidden_states
+            )
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -584,3 +598,77 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
+
+    def register_process_expert_grads_fn(self, fn):
+        """Register a callback to process expert gradients after delayed wgrad computation.
+
+        This is used by FSDP to defer the reduce-scatter of expert parameter
+        gradients until the delayed wgrad computation has completed.
+
+        Args:
+            fn: A callable that processes expert gradients (e.g., triggers
+                FSDP reduce-scatter for expert parameters).
+        """
+        self._process_expert_grads_fn = fn
+
+
+class _RecordExpertDgradCompletion(torch.autograd.Function):
+    """Autograd function that records a CUDA event when expert data gradients finish.
+
+    Placed in the forward graph just before the expert computation so that during
+    the backward pass, when the expert dgrad completes, we record an event. The
+    subsequent ``_RegisterDelayedWgradForExperts`` waits on this event before
+    launching the delayed wgrad computation on a separate CUDA stream.
+    """
+
+    @staticmethod
+    def forward(ctx, event: torch.cuda.Event, *inputs):
+        """Forward pass that stores the event and passes through inputs unchanged."""
+        ctx.event = event
+        return inputs[0] if len(inputs) == 1 else inputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass that records the event when expert dgrad completes."""
+        ctx.event.record(torch.cuda.current_stream())
+        ctx.event = None
+        return (None,) + grad_outputs
+
+
+class _RegisterDelayedWgradForExperts(torch.autograd.Function):
+    """Autograd function that orchestrates delayed wgrad computation for MoE experts.
+
+    Placed in the forward graph at the dispatch boundary. During the backward pass,
+    this function:
+      1. Records an event on the current (backward) stream to signal the dgrad is done.
+      2. Executes the delayed wgrad computation on a dedicated CUDA stream.
+      3. Waits for the wgrad computation to complete.
+      4. Invokes the registered gradient processing callback (e.g., FSDP reduce-scatter).
+    """
+
+    @staticmethod
+    def forward(ctx, module: MoELayer, *inputs):
+        """Forward pass that stores the MoE module and passes through inputs unchanged."""
+        ctx.module = module
+        return inputs[0] if len(inputs) == 1 else inputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass that executes delayed wgrad computation on a separate stream."""
+        module = ctx.module
+        event = module._delayed_wgrad_event
+        wgrad_stream = module._delayed_wgrad_stream
+
+        wgrad_stream.wait_event(event)
+        with torch.cuda.stream(wgrad_stream):
+            with torch.cuda.nvtx.range("delayed_expert_wgrad"):
+                module.backward_dw(routed_experts=True, shared_experts=True)
+            event.record(wgrad_stream)
+
+        torch.cuda.current_stream().wait_event(event)
+
+        if module._process_expert_grads_fn is not None:
+            module._process_expert_grads_fn()
+
+        ctx.module = None
+        return (None,) + grad_outputs
