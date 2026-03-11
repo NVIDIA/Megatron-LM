@@ -337,6 +337,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
+        # Set flight recorder env vars if specified
+        if args.flight_recorder_dump_path is not None:
+            os.environ['TORCH_FR_DUMP_TEMP_FILE'] = args.flight_recorder_dump_path
+            os.environ['TORCH_NCCL_DEBUG_INFO_TEMP_FILE'] = args.flight_recorder_dump_path
+            os.environ['TORCH_NCCL_TRACE_BUFFER_SIZE'] = str(args.flight_recorder_trace_buffer_size)
+            os.environ['TORCH_NCCL_DUMP_ON_TIMEOUT'] = str(int(args.flight_recorder_dump_on_timeout))
+            os.environ['TORCH_INCLUDE_STACK_TRACE'] = str(int(args.flight_recorder_include_stack_trace))
+            os.environ['TORCH_INCLUDE_ONLY_ACTIVE'] = str(int(args.flight_recorder_include_only_active))
+            os.environ['TORCH_NCCL_EXTRA_DUMP_ON_EXEC'] = str(int(args.flight_recorder_extra_dump_on_exec))
+
         # Call the init process
         init_process_group_kwargs = {
             'backend': args.distributed_backend,
