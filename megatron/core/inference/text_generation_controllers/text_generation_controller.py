@@ -1601,7 +1601,14 @@ class TextGenerationController:
             if model_config.transformer_impl == "inference_optimized":
                 context.maybe_initialize_symmetric_memory()
             self.inference_wrapped_model.dummy_forward()
+
+            # Disable MoE padding for MTP computation
+            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
             self._dummy_serial_mtp_forward()
+
             return
 
         # attempt to use cuda-graph if possible
