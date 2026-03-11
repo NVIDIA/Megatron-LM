@@ -1415,12 +1415,15 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    if args.skip_train and not args.no_load_optim:
+    # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
+    # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
+    if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
-    if args.rl_skip_optimizer and args.rl_offload_optimizer_during_inference:
+    if args.skip_train and args.perform_rl_step and args.no_load_optim and args.rl_offload_optimizer_during_inference:
         assert False, \
-            '--rl-skip-optimizer and --rl-offload-optimizer-during-inference are incompatible.'
+            '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
+            '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
     # Muon optimizer check
     if 'muon' in args.optimizer:
@@ -2225,9 +2228,6 @@ def _add_rl_args(parser):
                        help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
-    group.add_argument('--rl-skip-optimizer', action=argparse.BooleanOptionalAction, default=False,
-                       help='Skip optimizer creation in RL inference-only mode (--skip-train --perform-rl-step). '
-                            'Saves GPU memory by not allocating optimizer state.')
     group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
                        choices=['persist', 'offload', 'recompute'],
                        help='KV cache management mode during RL training: '

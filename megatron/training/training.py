@@ -1505,8 +1505,9 @@ def setup_model_and_optimizer(
     one_logger = get_one_logger()
 
     # Skip optimizer when not training. In RL inference-only mode (skip_train + perform_rl_step),
-    # --rl-skip-optimizer controls whether the optimizer is created (for memory testing) or skipped.
-    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.rl_skip_optimizer)
+    # --no-load-optim controls whether the optimizer is skipped (saving memory) or created
+    # (required for --rl-offload-optimizer-during-inference).
+    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
