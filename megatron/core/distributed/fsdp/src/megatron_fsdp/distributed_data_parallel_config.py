@@ -36,6 +36,10 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    fp4_param: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp4."""
+
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
