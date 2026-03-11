@@ -1447,7 +1447,8 @@ def compute_dsa_indexer_loss(
     # index_mask [b, sq, sk]
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device
-    ).scatter_(-1, topk_indices, 0)
+    )
+    _scatter_topk_into_index_mask(index_mask, topk_indices, seq_chunk_size=256)
 
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
@@ -1669,8 +1670,22 @@ def fused_qk_topk_naive(
     # Select top-k indices
     # =========================================
     topk_k = min(index_topk, sk)
-    # [batch, seqlen, index_topk]
-    topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+    if topk_k > 0:
+        topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+    else:
+        topk_indices = torch.empty(
+            index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
+        )
+    if topk_k < index_topk:
+        padded_topk_indices = torch.full(
+            index_scores.shape[:-1] + (index_topk,),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        if topk_k > 0:
+            padded_topk_indices[..., :topk_k] = topk_indices
+        topk_indices = padded_topk_indices
 
     return index_scores, topk_indices
 
@@ -1789,7 +1804,8 @@ def bwd_fused_indexer_loss_naive(
     # index_mask [b, sq, sk]
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device
-    ).scatter_(-1, topk_indices, 0)
+    )
+    _scatter_topk_into_index_mask(index_mask, topk_indices, seq_chunk_size=256)
 
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]

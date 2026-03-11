@@ -6,11 +6,34 @@ from .tilelang_indexer_fwd import indexer_fwd_interface
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     """Gather top-k logits and mask invalid (-1) entries with -inf."""
-    valid_mask = topk_indices != -1
-    safe_indices = topk_indices.clamp(min=0).to(torch.int64)
+    if logits.size(dim) == 0:
+        return torch.full(
+            topk_indices.shape, float("-inf"), dtype=logits.dtype, device=logits.device
+        )
+    valid_mask = (topk_indices >= 0) & (topk_indices < logits.size(dim))
+    safe_indices = topk_indices.clamp(min=0, max=logits.size(dim) - 1).to(torch.int64)
     scores = torch.gather(logits, dim=dim, index=safe_indices)
     scores = torch.where(valid_mask, scores, float("-inf"))
     return scores
+
+
+def _pad_topk_results(index_score, topk_indices, requested_topk):
+    """Pad top-k outputs to requested width using -inf scores and -1 indices."""
+    current_topk = topk_indices.size(-1)
+    if current_topk >= requested_topk:
+        return index_score, topk_indices
+
+    padded_shape = topk_indices.shape[:-1] + (requested_topk,)
+    padded_scores = torch.full(
+        padded_shape, float("-inf"), dtype=index_score.dtype, device=index_score.device
+    )
+    padded_indices = torch.full(
+        padded_shape, -1, dtype=topk_indices.dtype, device=topk_indices.device
+    )
+    if current_topk > 0:
+        padded_scores[..., :current_topk] = index_score
+        padded_indices[..., :current_topk] = topk_indices
+    return padded_scores, padded_indices
 
 
 class IndexerFunction(torch.autograd.Function):
@@ -33,9 +56,16 @@ class IndexerFunction(torch.autograd.Function):
             index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True
         )
         if topk_indices is None:
-            index_score, topk_indices = torch.topk(logits, topk, dim=-1)
-            topk_indices = topk_indices.to(torch.int32)
-            topk_indices = topk_indices.masked_fill(index_score == -torch.inf, -1)
+            effective_topk = min(topk, logits.size(-1))
+            if effective_topk > 0:
+                index_score, topk_indices = torch.topk(logits, effective_topk, dim=-1)
+                topk_indices = topk_indices.to(torch.int32)
+                topk_indices = topk_indices.masked_fill(index_score == -torch.inf, -1)
+            else:
+                empty_shape = logits.shape[:-1] + (0,)
+                index_score = torch.empty(empty_shape, dtype=logits.dtype, device=logits.device)
+                topk_indices = torch.empty(empty_shape, dtype=torch.int32, device=logits.device)
+            index_score, topk_indices = _pad_topk_results(index_score, topk_indices, topk)
 
         index_score = pytorch_extract_topk_scores(logits, topk_indices)
 
