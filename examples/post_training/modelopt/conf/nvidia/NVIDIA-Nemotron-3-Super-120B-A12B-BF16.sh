@@ -36,7 +36,7 @@ MODEL_ARGS=" \
     --is-hybrid-model \
     --mamba-num-heads 128 \
     --mamba-head-dim 64 \
-    --hybrid-override-pattern MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME \
+    --hybrid-layer-pattern MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME \
     \
     --use-mcore-models \
     --untie-embeddings-and-output-weights \
@@ -45,7 +45,6 @@ MODEL_ARGS=" \
     --position-embedding-type none \
     --squared-relu \
     --num-layers 88 \
-    --hidden-size 4096 \
     --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 2 \
