@@ -789,13 +789,14 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.rank == 0:
             warnings.warn(f"Request {request_id} failed to be added to the engine due to errors.")
 
+        request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                [Headers.ENGINE_REPLY.value, [request_entry.record.serialize()]], use_bin_type=True
             )
             self.socket_for_receiving_requests.send(payload)
         elif not self.use_coordinator:
@@ -803,8 +804,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.prompt = self.controller.tokenizer.detokenize(
                     request.prompt_tokens.tolist()
                 )
-            request.generated_text = self.controller.tokenizer.detokenize(request.generated_tokens)
-        entry.future.set_result(entry.record)
+            if request.generated_tokens:
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
+            else:
+                request.generated_text = ""
+        request_entry.future.set_result(request_entry.record)
 
     def _add_request(
         self, request: DynamicInferenceRequest
