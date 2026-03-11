@@ -73,6 +73,9 @@ class DummyContext:
     def __init__(self):
         self.active_cnt = 0
         self.step_count = 0
+        self.block_size_tokens = 64
+        self.enable_prefix_caching = False
+        self.prefix_caching_coordinator_policy = None
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
