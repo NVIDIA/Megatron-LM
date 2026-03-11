@@ -2385,6 +2385,7 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
@@ -2398,6 +2399,7 @@ try:
                 cu_seqlens=cu_seqlens,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
+                interleaved=interleaved,
             )
         else:
             assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
@@ -2559,3 +2561,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

@@ -884,13 +884,6 @@ def validate_args(args, defaults={}):
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
 
-    # Support for variable sequence lengths across batches/microbatches.
-    # set it if the dataloader supports generation of variable sequence lengths
-    # across batches/microbatches. Due to additional communication overhead
-    # during pipeline parallelism, it should not be set if sequence length
-    # is constant during training.
-    args.variable_seq_lengths = False
-
     # Iteration-based training.
     if args.train_iters:
         # If we use iteration-based training, make sure the
@@ -1060,6 +1053,11 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+
+    if args.sequence_packing_scheduler is not None:
+        assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+            f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
+            f'must be >= single sequence max length ({args.seq_length})'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1332,12 +1330,23 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Muon optimizer check
-    if 'muon' in args.optimizer:
+    # Muon / emerging optimizer check
+    if args.optimizer in ('muon', 'dist_muon'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
+
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
+
         # TODO: remove these checks once we support them
         assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
         assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
@@ -2255,7 +2264,9 @@ def _add_training_args(parser):
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],
-                       help='Optimizer function')
+                       help='Optimizer function. '
+                            'Note: dist_muon is deprecated; use --optimizer muon '
+                            'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
@@ -3068,4 +3079,8 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--sft-mock-dataset-config-json', type=str, default=None, 
+                       help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
+                       'If not specified and --mock-data is set, defaults to a lognormal distribution with '
+                       'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.')
     return parser
