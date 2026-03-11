@@ -31,6 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import internal_api
 
 try:
@@ -49,14 +50,10 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TELinear, te_checkpoint = None, None
 
 
 class RouterInterface(Protocol):

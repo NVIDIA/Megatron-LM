@@ -28,11 +28,10 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -42,9 +41,7 @@ try:
     from megatron.core.transformer.heterogeneous.linear_replacements import (
         TELayerNormColumnParallelLinearGathered,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -52,7 +49,6 @@ except ImportError:
         TERowParallelLinear,
         TELayerNormColumnParallelLinearGathered,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 

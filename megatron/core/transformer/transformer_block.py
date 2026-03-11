@@ -35,13 +35,7 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
-
-try:
-    import transformer_engine.pytorch as te  # pylint: disable=unused-import
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
 try:
     import apex  # pylint: disable=unused-import

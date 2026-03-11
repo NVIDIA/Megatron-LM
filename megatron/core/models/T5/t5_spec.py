@@ -15,10 +15,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -26,9 +25,7 @@ try:
         TENorm,
         TERowParallelLinear,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -36,7 +33,6 @@ except ImportError:
         TENorm,
         TERowParallelLinear,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 try:
     import apex  # pylint: disable=unused-import

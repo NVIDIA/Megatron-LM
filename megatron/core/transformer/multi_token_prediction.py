@@ -28,6 +28,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -50,14 +51,10 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding_causal,
 ]
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TESpecProvider = None
 
 
 def tie_word_embeddings_state_dict(

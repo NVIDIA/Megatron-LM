@@ -31,15 +31,12 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
     unwrap_model,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from tests.unit_tests.test_utilities import Utils
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-except ImportError:
-    HAVE_TE = False
+else:
     TEColumnParallelGroupedLinear = None
 
 _SEED = 42

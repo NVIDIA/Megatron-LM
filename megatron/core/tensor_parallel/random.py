@@ -21,18 +21,16 @@ from megatron.core.parallel_state import (
     get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
+if HAVE_TE:
     from transformer_engine.pytorch.distributed import activation_recompute_forward
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
-
-    HAVE_TE = True
-except ModuleNotFoundError:
-    HAVE_TE = False
+else:
+    activation_recompute_forward, FP8GlobalStateManager, fp8_autocast = None, None, None
 
 
 # Default name for the model parallel rng tracker.

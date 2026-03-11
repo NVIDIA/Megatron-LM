@@ -39,14 +39,11 @@ from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-except ImportError:
-    HAVE_TE = False
+else:
     TEColumnParallelGroupedLinear = None
 
 _SEED = 42

@@ -38,18 +38,13 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_torch_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
-
-    HAVE_TE = True
-
-except ImportError:
-
-    HAVE_TE = False
+else:
+    Fp8Padding, Fp8Unpadding = None, None
 
 try:
     import flashinfer.fused_moe as fused_moe

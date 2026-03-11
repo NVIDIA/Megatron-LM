@@ -16,11 +16,9 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -28,8 +26,7 @@ try:
         TENorm,
         TERowParallelLinear,
     )
-except ImportError:
-    HAVE_TE = False
+else:
     (
         TEColumnParallelLinear,
         TEDotProductAttention,

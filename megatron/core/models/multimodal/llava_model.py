@@ -21,23 +21,25 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    from megatron.core.utils import is_te_min_version
+else:
+    TEDotProductAttention = None
 
-    HAVE_TE = True
+if HAVE_TE:
     try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except:
+    except ImportError:
+        tex = None
         HAVE_TEX = False
-except:
-    HAVE_TE = False
+else:
+    tex = None
+    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.

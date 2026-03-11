@@ -17,18 +17,9 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
-
-# Check if Transformer Engine is installed
-HAVE_TE = False
-try:
-    import transformer_engine  # pylint: disable=W0611
-
-    HAVE_TE = True
-except (ImportError, ModuleNotFoundError):
-    # Transformer Engine not found
-    pass
 
 try:
     from packaging.version import Version as PkgVersion

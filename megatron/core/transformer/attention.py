@@ -47,6 +47,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
@@ -97,17 +98,13 @@ except:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
         set_save_original_input,
     )
-except ImportError:
-    HAVE_TE = False
+else:
     SplitAlongDim, TELinear, set_save_original_input = None, None, None
 
 try:

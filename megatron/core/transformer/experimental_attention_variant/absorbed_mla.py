@@ -31,6 +31,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -46,18 +47,15 @@ except ImportError:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,
         set_save_original_input,
     )
     from megatron.core.post_training.modelopt.layers import Linear
-
-    HAVE_TE = True
-except ImportError:
+else:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
-    HAVE_TE = False
 
 
 @dataclass

@@ -37,17 +37,14 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import copy_signature
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import is_te_min_version
 
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TEFusedMLP, TENorm, TESpecProvider = None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider

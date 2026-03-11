@@ -13,16 +13,13 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import divide
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TELayerNormColumnParallelLinear = None
 
 
 def _gather_from_tensor_parallel_region(x: Tensor, config: TransformerConfig) -> Tensor:

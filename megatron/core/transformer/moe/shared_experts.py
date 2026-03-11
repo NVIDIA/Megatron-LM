@@ -21,20 +21,16 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
-
-except ImportError:
-    HAVE_TE = False
+else:
     TELinear, set_save_original_input = None, None
 
 
