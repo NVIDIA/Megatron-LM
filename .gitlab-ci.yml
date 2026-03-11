@@ -29,8 +29,11 @@ workflow:
       auto_cancel:
         on_new_commit: none
 
-    # For manual pipelines
+    # For manual pipelines (GitLab UI)
     - if: $CI_PIPELINE_SOURCE == "web"
+
+    # For pipelines created via the REST API (personal access token)
+    - if: $CI_PIPELINE_SOURCE == "api"
 
     # For trigger pipelines
     - if: $CI_PIPELINE_SOURCE == "trigger"
