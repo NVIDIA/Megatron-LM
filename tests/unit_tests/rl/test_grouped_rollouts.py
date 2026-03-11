@@ -13,16 +13,16 @@ from megatron.rl.inference import ReturnsRaw
 class MockGenerator(GroupedRolloutGenerator):
     """Mock generator with configurable per-call delays."""
 
-    def __init__(self, env_id="test", slow_first=0, **kwargs):
+    def __init__(self, env_id="test", num_slow_calls=0, **kwargs):
         super().__init__(**kwargs)
         self.env_id = env_id
-        self.slow_first = slow_first
+        self.num_slow_calls = num_slow_calls
         self._call_count = 0
 
     async def group_rollout(self, request):
         idx = self._call_count
         self._call_count += 1
-        if idx < self.slow_first:
+        if idx < self.num_slow_calls:
             await asyncio.sleep(0.03)
         return [
             Rollout(
@@ -42,7 +42,7 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "slow_first, streaming, generation_batch_size, expected_count, expected_batch_ids",
+        "num_slow_calls, streaming, generation_batch_size, expected_count, expected_batch_ids",
         [
             pytest.param(0, False, 1, 8, None, id="non_batched"),
             pytest.param(4, False, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
@@ -50,9 +50,9 @@ class TestGroupedRollouts:
         ],
     )
     async def test_get_grouped_rollouts(
-        self, slow_first, streaming, generation_batch_size, expected_count, expected_batch_ids
+        self, num_slow_calls, streaming, generation_batch_size, expected_count, expected_batch_ids
     ):
-        gen = MockGenerator(parallel_generation_tasks=8, slow_first=slow_first)
+        gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
         request = GroupedRolloutRequest(
             num_groups=4,
             rollouts_per_group=1,
@@ -104,6 +104,7 @@ class TestGroupedRollouts:
             groups.append(group)
 
         assert len(groups) == 4
+        # WeightedMultiTask MUST interleave groups round-robin according to GCD of weights.
         assert [g[0].env_id for g in groups] == ["a", "a", "a", "b"]
         for sub_req in captured:
             assert sub_req.generation_batch_size == sub_req.num_groups
