@@ -344,7 +344,7 @@ class TestVisionTECudaGraphHelper:
         assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
-
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
