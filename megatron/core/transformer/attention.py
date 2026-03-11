@@ -914,6 +914,13 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+
+        # here we need to set the right cp group for dynamic-cp
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1218,6 +1225,7 @@ class Attention(MegatronModule, ABC):
             )
         nvtx_range_pop(suffix="linear_proj")
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     @jit_fuser
