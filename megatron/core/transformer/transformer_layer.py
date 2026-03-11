@@ -47,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 @functools.lru_cache(maxsize=None)
-def _get_off_interface():
+def _get_offloading_interface():
+    """Get the offloading interface for fine-grained activation offloading."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )
@@ -1007,7 +1008,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        off_interface = _get_off_interface()
+        off_interface = _get_offloading_interface()
 
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
@@ -1052,7 +1053,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the D2H transfer on offloading stream.
         if self.offload_module_in_cuda_graph:
-            off_interface = _get_off_interface()
+            off_interface = _get_offloading_interface()
 
             off_interface.forward_record()
         return tuple(cuda_graph_outputs)
@@ -1079,7 +1080,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.config.delay_offload_until_cuda_graph:
-            off_interface = _get_off_interface()
+            off_interface = _get_offloading_interface()
 
             off_interface.enter_replay()
 
@@ -1097,7 +1098,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The CPU is idle during the sync between graph replay and a2a comm,
         # so we use that time to execute the delayed offload operations.
         if self.config.delay_offload_until_cuda_graph:
-            off_interface = _get_off_interface()
+            off_interface = _get_offloading_interface()
 
             off_interface.flush_delayed_groups()
 
@@ -1524,7 +1525,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        off_interface = _get_off_interface()
+        off_interface = _get_offloading_interface()
 
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -1619,7 +1620,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
-        off_interface = _get_off_interface()
+        off_interface = _get_offloading_interface()
 
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -1741,7 +1742,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
         if self.offload_mlp_norm:
-            off_interface = _get_off_interface()
+            off_interface = _get_offloading_interface()
 
             hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
 
