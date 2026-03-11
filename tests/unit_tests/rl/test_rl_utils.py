@@ -905,6 +905,8 @@ class TestRLUtils:
         # Per-rollout min iteration stamps (2 rollouts in group 1, 2 in group 2)
         policy_epoch = [[4, 2], [5, 0]]
         kv_cache_epoch = [[4, 3], [5, 1]]
+        # Per-turn max epoch stamps (when each turn completed)
+        completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
         current_iteration = 6
         metrics = rl_utils.prep_wandb_metrics(
@@ -916,6 +918,7 @@ class TestRLUtils:
             advantages,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            completed_epochs=completed_epochs,
             num_evictions=num_evictions,
             current_iteration=current_iteration,
         )
@@ -943,3 +946,5 @@ class TestRLUtils:
         assert metrics["min_kv_cache_staleness"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
+        # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
+        assert metrics["mean_completion_gap"] == 2.5
