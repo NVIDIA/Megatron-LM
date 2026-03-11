@@ -26,10 +26,6 @@ from megatron.core.utils import deprecate_inference_params, is_te_min_version, l
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-else:
-    TEDotProductAttention = None
-
-if HAVE_TE:
     try:
         import transformer_engine_torch as tex
 
@@ -38,6 +34,7 @@ if HAVE_TE:
         tex = None
         HAVE_TEX = False
 else:
+    TEDotProductAttention = None
     tex = None
     HAVE_TEX = False
 
