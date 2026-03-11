@@ -12,7 +12,7 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 - **[Spectral Descent: Orthogonalizing Momentum via Newton-Schulz Iteration](spectral-descent-orthogonalizing-momentum/spectral-descent-orthogonalizing-momentum.md)**
 
-  A discussion of Muon and related higher-order optimizers in Megatron-Core, including layer-wise distributed optimization, tensor-parallel Newton-Schulz execution modes, and performance results on NVIDIA GB300 systems.
+  A discussion of Muon and related higher-order optimizers in Megatron Core, including layer-wise distributed optimizers, tensor parallel Newton-Schulz execution modes, and performance results on NVIDIA GB300.
 
 ## Contributing
 
