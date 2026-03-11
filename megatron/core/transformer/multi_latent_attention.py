@@ -487,6 +487,40 @@ class MultiLatentAttention(Attention):
         up_k_weight = kv_up_weight[:, : self.config.qk_head_dim, :].contiguous()
         up_v_weight = kv_up_weight[:, self.config.qk_head_dim :, :].contiguous()
 
+        def _normalize_kv_latent_for_absorption(kv_latent: torch.Tensor) -> torch.Tensor:
+            """Match the normalization semantics of linear_kv_up_proj before absorption."""
+            if not hasattr(linear_kv_up_proj, "layer_norm_weight"):
+                return kv_latent
+
+            weight = linear_kv_up_proj.layer_norm_weight
+            bias = getattr(linear_kv_up_proj, "layer_norm_bias", None)
+            eps = float(linear_kv_up_proj.eps)
+            zero_centered_gamma = bool(getattr(linear_kv_up_proj, "zero_centered_gamma", False))
+            weight_eff = weight + 1.0 if zero_centered_gamma else weight
+            src_dtype = kv_latent.dtype
+            kv_latent_fp32 = kv_latent.float()
+            weight_fp32 = weight_eff.float()
+            bias_fp32 = bias.float() if bias is not None else None
+
+            if self.config.normalization == "LayerNorm":
+                normalized = torch.nn.functional.layer_norm(
+                    kv_latent_fp32,
+                    (kv_latent_fp32.size(-1),),
+                    weight=weight_fp32,
+                    bias=bias_fp32,
+                    eps=eps,
+                )
+            elif self.config.normalization == "RMSNorm":
+                rms = torch.rsqrt(kv_latent_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)
+                normalized = kv_latent_fp32 * rms * weight_fp32
+                if bias_fp32 is not None:
+                    normalized = normalized + bias_fp32
+            else:
+                raise RuntimeError(
+                    f"Unsupported normalization for DSA absorbed path: {self.config.normalization}"
+                )
+            return normalized.to(dtype=src_dtype)
+
         def _align_kv_latent_seq_len(kv_latent: torch.Tensor, target_seqlen: int) -> torch.Tensor:
             """Align kv_latent sequence length with absorbed key/query sequence length."""
             if kv_latent.size(0) == target_seqlen:
@@ -518,6 +552,7 @@ class MultiLatentAttention(Attention):
                     f"Unsupported kv_compressed ndim={kv_compressed.ndim} for DSA absorbed path."
                 )
             kv_latent = _align_kv_latent_seq_len(kv_latent, target_seqlen=key.size(0))
+            kv_latent = _normalize_kv_latent_for_absorption(kv_latent)
             k_pos = key[:, :, 0, self.config.qk_head_dim :].contiguous()
             key = torch.cat([kv_latent, k_pos], dim=-1).unsqueeze(2).contiguous()
             value = None
@@ -538,6 +573,7 @@ class MultiLatentAttention(Attention):
                     f"{kv_compressed.ndim} for packed DSA absorbed path."
                 )
             kv_latent = _align_kv_latent_seq_len(kv_latent, target_seqlen=key.size(0))
+            kv_latent = _normalize_kv_latent_for_absorption(kv_latent)
             k_pos = key[:, 0, self.config.qk_head_dim :].contiguous()
             key = torch.cat([kv_latent, k_pos], dim=-1).unsqueeze(1).contiguous()
             value = None

@@ -1676,16 +1676,6 @@ def fused_qk_topk_naive(
         topk_indices = torch.empty(
             index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
         )
-    if topk_k < index_topk:
-        padded_topk_indices = torch.full(
-            index_scores.shape[:-1] + (index_topk,),
-            -1,
-            dtype=topk_indices.dtype,
-            device=topk_indices.device,
-        )
-        if topk_k > 0:
-            padded_topk_indices[..., :topk_k] = topk_indices
-        topk_indices = padded_topk_indices
 
     return index_scores, topk_indices
 
