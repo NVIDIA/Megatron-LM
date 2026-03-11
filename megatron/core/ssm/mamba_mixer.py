@@ -613,6 +613,7 @@ class MambaMixer(MegatronModule):
             cu_seqlens=cu_seqlens,
             batch_indices=batch_indices,
             intermediate_token_offsets=intermediate_token_offsets,
+            use_triton_conv1d=context.use_triton_conv1d,
         )
 
         if intermediate_token_offsets is not None:
@@ -741,6 +742,7 @@ class MambaMixer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_token_offsets: Optional[List[List[int]]] = None,
+        use_triton_conv1d: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
         """
         Performs SSM computation for inference prefill step.
@@ -803,32 +805,45 @@ class MambaMixer(MegatronModule):
             conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
             conv_bias = self.cp.get_conv1d_bias()
 
-            # causal_conv1d_fn cannot accept both seq_idx and
-            # initial_states simultaneously. Using seq_idx with packed sequences
-            # zeroes the conv state at sequence boundaries instead of using the
-            # cached initial states. We must loop over requests individually,
-            # passing initial_states per-request with channels-last layout.
-            num_requests = cu_seqlens.shape[0] - 1
             xBC_pre_conv = xBC if intermediate_token_offsets is not None else None
-            xBC_parts = []
-            for r in range(num_requests):
-                start = cu_seqlens[r].item()
-                end = cu_seqlens[r + 1].item()
-                if end <= start:
-                    continue
-                # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
-                xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
-                init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)
-                init_r = init_r.permute(0, 2, 1).contiguous().transpose(1, 2)  # channels-last
-                xBC_r = causal_conv1d_fn(
-                    x=xBC_r,
+            if use_triton_conv1d:
+                from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+
+                xBC_out = causal_conv1d_varlen_fn(
+                    x=xBC.squeeze(0).contiguous(),
                     weight=conv_weight,
                     bias=conv_bias,
+                    cu_seqlens=cu_seqlens,
+                    initial_states=initial_conv_states,
                     activation=self.activation,
-                    initial_states=init_r,
                 )
-                xBC_parts.append(xBC_r.transpose(1, 2).contiguous())  # (1, L, C)
-            xBC = torch.cat(xBC_parts, dim=1)  # (1, total_tokens, conv_dim)
+                xBC = xBC_out.unsqueeze(0)
+            else:
+                # causal_conv1d_fn cannot accept both seq_idx and
+                # initial_states simultaneously. Using seq_idx with packed sequences
+                # zeroes the conv state at sequence boundaries instead of using the
+                # cached initial states. We must loop over requests individually,
+                # passing initial_states per-request with channels-last layout.
+                num_requests = cu_seqlens.shape[0] - 1
+                xBC_parts = []
+                for r in range(num_requests):
+                    start = cu_seqlens[r].item()
+                    end = cu_seqlens[r + 1].item()
+                    if end <= start:
+                        continue
+                    # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
+                    xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
+                    init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)
+                    init_r = init_r.permute(0, 2, 1).contiguous().transpose(1, 2)  # channels-last
+                    xBC_r = causal_conv1d_fn(
+                        x=xBC_r,
+                        weight=conv_weight,
+                        bias=conv_bias,
+                        activation=self.activation,
+                        initial_states=init_r,
+                    )
+                    xBC_parts.append(xBC_r.transpose(1, 2).contiguous())  # (1, L, C)
+                xBC = torch.cat(xBC_parts, dim=1)  # (1, total_tokens, conv_dim)
         else:
             # Non-dynamic-batching path (static batching / training fallback)
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()

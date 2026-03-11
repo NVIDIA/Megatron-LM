@@ -251,6 +251,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
+        self.use_triton_conv1d = inference_config.use_triton_conv1d
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0

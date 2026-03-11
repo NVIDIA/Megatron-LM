@@ -18,10 +18,15 @@ class TestOpsPackagePublicAPI(unittest.TestCase):
 
     def test_all_exported(self):
         self.assertIn("mamba_chunk_scan_combined_varlen", ssm_ops.__all__)
+        self.assertIn("causal_conv1d_varlen_fn", ssm_ops.__all__)
 
     def test_mamba_chunk_scan_combined_varlen_importable(self):
         self.assertTrue(hasattr(ssm_ops, "mamba_chunk_scan_combined_varlen"))
         self.assertTrue(callable(ssm_ops.mamba_chunk_scan_combined_varlen))
+
+    def test_causal_conv1d_varlen_fn_importable(self):
+        self.assertTrue(hasattr(ssm_ops, "causal_conv1d_varlen_fn"))
+        self.assertTrue(callable(ssm_ops.causal_conv1d_varlen_fn))
 
 
 if __name__ == "__main__":
