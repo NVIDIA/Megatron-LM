@@ -44,8 +44,8 @@ class TestGroupedRollouts:
     @pytest.mark.parametrize(
         "slow_first, streaming, generation_batch_size, expected_count, expected_batch_ids",
         [
-            pytest.param(0, False, 1, 4, None, id="non_batched"),
-            pytest.param(4, False, 2, 4, [0, 0, 1, 1], id="batched_submission_order"),
+            pytest.param(0, False, 1, 8, None, id="non_batched"),
+            pytest.param(4, False, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
             pytest.param(0, True, 1, 10, None, id="streaming"),
         ],
     )
@@ -106,6 +106,6 @@ class TestGroupedRollouts:
         assert len(groups) == 4
         assert [g[0].env_id for g in groups] == ["a", "a", "a", "b"]
         for sub_req in captured:
-            assert sub_req.generation_batch_size == request.generation_batch_size
+            assert sub_req.generation_batch_size == sub_req.num_groups
             assert sub_req.enforce_order == request.enforce_order
             assert sub_req.streaming == request.streaming
