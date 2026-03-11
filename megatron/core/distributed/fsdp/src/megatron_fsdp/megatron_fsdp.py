@@ -100,10 +100,6 @@ def _maybe_setup_delayed_wgrad_for_experts(module, process_post_backward_gradien
     if not getattr(module.config, 'delay_wgrad_compute_for_te_grouped_gemm', False):
         return
 
-    expert_params = list(module.mlp.experts.parameters())
-    for p in expert_params:
-        p._fsdp_delay_grad_reduce = True
-
     def _make_process_expert_grads(mlp_module):
         def _process_expert_grads():
             params = list(mlp_module.experts.parameters())
@@ -111,8 +107,10 @@ def _maybe_setup_delayed_wgrad_for_experts(module, process_post_backward_gradien
 
         return _process_expert_grads
 
-    if module.mlp._process_expert_grads_fn is not None:
-        return
+    expert_params = list(module.mlp.experts.parameters())
+    for p in expert_params:
+        p._fsdp_delay_grad_reduce = True
+
     module.mlp.register_process_expert_grads_fn(_make_process_expert_grads(module.mlp))
 
 
@@ -762,7 +760,10 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-            _maybe_setup_delayed_wgrad_for_experts(module, _process_post_backward_gradients)
+
+            # Set post backward hook for TE grouped gemm if enabled comm overlap
+            if getattr(module.mlp, '_process_expert_grads_fn') is None:
+                _maybe_setup_delayed_wgrad_for_experts(module, _process_post_backward_gradients)
             return args, kwargs
 
         @torch.compiler.disable

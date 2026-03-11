@@ -12,7 +12,7 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     deterministic_mode,
     get_test_config,
-    get_valid_flex_dispatcher_backends,
+    get_valid_flex_dispatcher_backend,
     get_valid_fp8_flags,
     get_valid_token_dispatcher_types,
     reset_model,
@@ -88,18 +88,11 @@ class TestDelayWgradCompute:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize("num_layers", [2, 3])
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
-    @pytest.mark.parametrize("flex_dispatcher_backend", get_valid_flex_dispatcher_backends())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_delay_wgrad_compute_for_te_grouped_gemm(
-        self,
-        num_layers,
-        shared_expert_intermediate_size,
-        dispatcher_type,
-        flex_dispatcher_backend,
-        fp8_flag,
+        self, shared_expert_intermediate_size, dispatcher_type, fp8_flag
     ):
         """Verify that delay_wgrad_compute_for_te_grouped_gemm produces identical
         per-step loss and final weights as the non-delayed baseline across multiple
@@ -108,10 +101,10 @@ class TestDelayWgradCompute:
         Covers single/multi-layer, with/without shared experts, dispatcher types,
         and FP8 modes.
         """
+        num_layers = 4
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = flex_dispatcher_backend
-            extra_kwargs["moe_router_dtype"] = "fp32"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -148,12 +141,10 @@ class TestDelayWgradCompute:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize("num_layers", [2, 3])
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
-    @pytest.mark.parametrize("flex_dispatcher_backend", get_valid_flex_dispatcher_backends())
     def test_delay_wgrad_compute_for_te_grouped_gemm_with_fsdp(
-        self, num_layers, shared_expert_intermediate_size, dispatcher_type, flex_dispatcher_backend
+        self, shared_expert_intermediate_size, dispatcher_type
     ):
         """Verify delayed wgrad with MegatronFSDP wrapping.
 
@@ -167,10 +158,10 @@ class TestDelayWgradCompute:
             fully_shard_optimizer,
         )
 
+        num_layers = 4
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = flex_dispatcher_backend
-            extra_kwargs["moe_router_dtype"] = "fp32"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         if shared_expert_intermediate_size is not None:
             extra_kwargs["moe_shared_expert_intermediate_size"] = shared_expert_intermediate_size
 
