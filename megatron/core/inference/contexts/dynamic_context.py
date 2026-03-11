@@ -2049,7 +2049,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 chunk_length,
             )
 
-        matched_block_ids, _ = self._find_matching_prefix_blocks(
+        matched_block_ids, _ = self._find_kv_match_count(
             req, already_allocated_blocks, overall_required_blocks
         )
         num_matched = len(matched_block_ids)
@@ -2122,7 +2122,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_cache_available = self.block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
-    def _find_matching_prefix_blocks(
+    def _find_kv_match_count(
         self, req: DynamicInferenceRequest, start_block: int, end_block: int
     ) -> tuple[list[int], int]:
         """Find cached blocks matching a range of the prompt using precomputed hashes.
@@ -2337,7 +2337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.block_allocator.register_block_hashes(block_ids_to_hash, block_hashes_slice)
+                self.block_allocator.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

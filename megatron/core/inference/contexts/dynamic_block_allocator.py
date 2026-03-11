@@ -242,7 +242,7 @@ class BlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Args:
