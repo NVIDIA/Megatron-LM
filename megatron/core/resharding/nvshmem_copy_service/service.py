@@ -21,6 +21,7 @@ try:
 except ImportError:
     HAVE_NVSHMEM = False
 
+import torch
 import torch.cuda.nvtx as nvtx
 
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
@@ -116,6 +117,12 @@ class RemoteCopyService:
 
         # Allocate double-buffered send/recv slots
         self.buffer_manager.allocate()
+        # The .zero_() calls inside allocate() go to the default CUDA stream.
+        # Sync it now so the zeros are fully committed before any NVShmem
+        # operations (which bypass CUDA streams via RDMA) touch the buffers.
+        # Without this, a still-running zero() can race with the first
+        # nvshmem.core.put() and overwrite received data.
+        torch.cuda.synchronize()
 
         # Barrier to ensure all PEs complete buffer allocation before proceeding
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
@@ -143,10 +150,10 @@ class RemoteCopyService:
             self.gpu_resources.unpack_stream,
             self.gpu_resources.send_stream,
             self.gpu_resources.copy_stream,
-            self.gpu_resources.torch_pack_stream,
-            self.gpu_resources.torch_unpack_stream,
-            self.gpu_resources.torch_send_stream,
-            self.gpu_resources.torch_copy_stream,
+            self.gpu_resources.torch_pack_stream_wrapper,
+            self.gpu_resources.torch_unpack_stream_wrapper,
+            self.gpu_resources.torch_send_stream_wrapper,
+            self.gpu_resources.torch_copy_stream_wrapper,
         )
 
         # Synchronize all NVSHMEM streams before returning
