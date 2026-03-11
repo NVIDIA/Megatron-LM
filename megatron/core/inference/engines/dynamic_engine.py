@@ -1147,19 +1147,24 @@ class DynamicInferenceEngine(AbstractEngine):
                     tensor = getattr(request, attr)
                     if tensor is None:
                         setattr(
-                            request, attr,
-                            torch.full((total,), it, dtype=torch.int32, device='cpu'),
+                            request, attr, torch.full((total,), it, dtype=torch.int32, device='cpu')
                         )
                     elif len(tensor) < total:
                         setattr(
-                            request, attr,
-                            torch.cat((
-                                tensor,
-                                torch.full(
-                                    (total - len(tensor),), it,
-                                    dtype=tensor.dtype, device=tensor.device,
+                            request,
+                            attr,
+                            torch.cat(
+                                (
+                                    tensor,
+                                    torch.full(
+                                        (total - len(tensor),),
+                                        it,
+                                        dtype=tensor.dtype,
+                                        device=tensor.device,
+                                    ),
                                 ),
-                            ), dim=0),
+                                dim=0,
+                            ),
                         )
 
         # Handle evicted requests.
