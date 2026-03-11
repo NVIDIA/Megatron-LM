@@ -265,7 +265,7 @@ class ModelParallelConfig:
     """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
     When enabled with FSDP, the expert weight gradients are computed on a separate
     CUDA stream after the data gradients finish, allowing overlap of wgrad compute
-    with the backward pass of earlier layers. The FSDP gradient reduce-scatter for
+    with EP A2A communication. The FSDP gradient reduce-scatter for
     expert parameters is deferred until the delayed wgrad computation completes.
     This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
     """
