@@ -52,6 +52,10 @@ class TransformerLayerSchedulePlan:
     mlp = None
     moe_combine = None
     mtp_post_process = None
+    # Optional per-layer FSDP parameter release callbacks, wired when
+    # FSDP optim_grads_params is used with the EP overlap schedule.
+    on_forward_done = None
+    on_backward_done = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
@@ -241,6 +245,8 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
                 f_input = f_layer.mtp_post_process.forward(f_input)
+            if f_layer.on_forward_done is not None:
+                f_layer.on_forward_done(f_layer.layer)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
@@ -249,6 +255,8 @@ class TransformerLayerSchedulePlan:
         # for overlapping with the p2p comm
         if b_layer is not None and not is_last_layer_in_bwd:
             b_layer.attn.backward_dw()
+            if b_layer.on_backward_done is not None:
+                b_layer.on_backward_done(b_layer.layer)
 
         return f_input, b_grad
 
@@ -520,6 +528,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if b_num_layers > 0:
             assert b_layer is not None
             b_layer.attn.backward_dw()
+            if b_layer.on_backward_done is not None:
+                b_layer.on_backward_done(b_layer.layer)
             b_layer.release_state()
 
         # post process forward
