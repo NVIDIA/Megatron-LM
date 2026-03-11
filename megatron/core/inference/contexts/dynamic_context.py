@@ -319,7 +319,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | mamba_layer_map | gdn_layer_map
+            self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
