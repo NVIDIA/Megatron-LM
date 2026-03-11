@@ -1542,16 +1542,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
+        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -1589,8 +1590,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
 
-        if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(hidden_states, name="attn_norm")
+        hidden_states = attn_norm_manager.group_offload(hidden_states)
 
         # Cross-attention (no hyper connection support).
         residual = hidden_states
@@ -1641,16 +1641,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
+        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
@@ -1741,10 +1742,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
-        if self.offload_mlp_norm:
-            off_interface = _get_offloading_interface()
-
-            hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
+        hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
