@@ -183,9 +183,6 @@ override-dependencies = [
     "triton; sys_platform == 'never'",
 ]
 
-[tool.uv.extra-build-dependencies]
-fast-hadamard-transform = ["torch"]
-
 [tool.uv.sources]
 
 flash_mla = [
