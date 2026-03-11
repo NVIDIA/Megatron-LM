@@ -135,10 +135,14 @@ class DummyEngine(DynamicInferenceEngine):
     ) -> asyncio.Future[DynamicInferenceRequestRecord]:
         """Dummy add_request."""
 
+        prompt_tokens = (
+            torch.arange(len(prompt.split())) if isinstance(prompt, str) else torch.tensor(prompt)
+        )
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
                     prompt=prompt,
+                    prompt_tokens=prompt_tokens,
                     request_id=request_id,
                     sampling_params=sampling_params,
                     status=Status.WAITING_IN_QUEUE,
@@ -361,8 +365,8 @@ class TestCoordinator:
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
             await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
@@ -383,11 +387,12 @@ class TestCoordinator:
             inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
         )
 
+        client = None
         try:
             if torch.distributed.get_rank() == 0:
                 # Test deserialize=True
                 client = InferenceClient(dp_addr, deserialize=True)
-                await client.start()
+                client.start()
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)
                     for prompt, params in requests
@@ -399,7 +404,7 @@ class TestCoordinator:
 
                 # Test deserialize=False (default)
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)
                     for prompt, params in requests
@@ -407,15 +412,8 @@ class TestCoordinator:
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
                 for result in results:
                     assert isinstance(result, dict)
-                client.stop()
         finally:
-            if torch.distributed.get_rank() == 0:
-                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
-            try:
-                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine.engine_loop_task.cancel()
+            await cleanup_engine(engine, client)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -495,8 +493,8 @@ class TestCoordinator:
                 # Submit and complete requests while running.
                 futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests while RUNNING, then PAUSE before they drain.
                 # These must survive the PAUSE (not be drained during PAUSING).
@@ -530,8 +528,8 @@ class TestCoordinator:
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 all_queued = pre_pause_futures + paused_futures
                 results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
                 assert_state(engine, EngineState.RUNNING)
 
                 # Engine processes new requests normally after unpause.
@@ -539,8 +537,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Suspend.
                 client.pause_engines()
@@ -575,8 +573,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests that will be cancelled on STOP.
                 client.pause_engines()
