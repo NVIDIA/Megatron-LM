@@ -198,7 +198,7 @@ class AsyncZmqEndpoint:
         """Stop background tasks and close all sockets."""
         self.is_shutdown = True
 
-        # Cancel recv and startup tasks immediately.
+        # Cancel recv and startup tasks.
         cancel_tasks = []
         for attr in ('recv_task', 'startup_sends'):
             task = getattr(self, attr, None)

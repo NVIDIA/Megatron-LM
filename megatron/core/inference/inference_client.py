@@ -75,9 +75,7 @@ class InferenceClient(AsyncZmqEndpoint):
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
                     completed_request = DynamicInferenceRequestRecord.deserialize(reply)
-                    completion_future.get_loop().call_soon_threadsafe(
-                        completion_future.set_result, completed_request
-                    )
+                    completion_future.set_result(completed_request)
                 elif header == Headers.ACK:
                     pass  # Coordinator acknowledged our connect; no action needed.
             except asyncio.CancelledError:

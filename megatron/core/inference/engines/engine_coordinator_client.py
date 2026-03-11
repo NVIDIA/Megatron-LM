@@ -21,6 +21,7 @@ import asyncio
 import struct
 from collections import deque
 
+import msgpack
 import torch
 from torch.cuda.nvtx import range_pop, range_push
 
@@ -78,7 +79,7 @@ class _DPCoordinator(AsyncZmqEndpoint):
         """Receive from the coordinator and accumulate in pending_messages."""
         while True:
             try:
-                _, header, data = await self._irecv()
+                _, header, data = await self._irecv(deserialize=False)
                 if header in self._CONTROL_HEADERS:
                     if self._world_channel is not None and self._world_channel._is_leader:
                         self._world_channel.notify_has_signal(header)
@@ -264,7 +265,7 @@ class EngineCoordinatorClient:
         mp_group,
         ep_group,
         cond: asyncio.Condition,
-        listening_timeout: float = 0.001,
+        listening_timeout: float = 0,
         steps_before_listen: int = 1,
     ):
         self.is_mp_coordinator = is_mp_coordinator
@@ -401,10 +402,9 @@ class EngineCoordinatorClient:
         It does not block; idle-blocking is handled by the engine's `_cond`.
 
         The synchronization uses a batched message pattern:
-        1.  Background `_DPCoordinator._recv_task` continuously receives
-            messages from the coordinator and accumulates them in `pending_messages`.
-        2.  When this method runs, the MP coordinator sends the accumulated
-            messages as a single `MESSAGES` to all TP ranks via PUB.
+        1.  Background `_DPCoordinator._recv_task` continuously receives messages from the
+            coordinator and stores them in `pending_messages` without deserialization.
+        2.  The MP coordinator sends the accumulated messages as a single `MESSAGES` to TP ranks.
         3.  Background `_MPChannel._recv_task` on follower ranks unpacks
             the batch into `pending_messages` and sets `messages_processing_event`.
         """
@@ -443,12 +443,12 @@ class EngineCoordinatorClient:
                 else:
                     pending_signals.append(sig)
 
-        # Process batch. SUBMIT_REQUEST (data plane) always flows here.
+        # Process batch. Data is raw msgpack bytes — deserialize at consumption.
         # Control signals only arrive here as fallback for world_size == 1.
         has_new_requests = False
-        for header, message in messages:
+        for header, raw_data in messages:
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = message
+                request_id, prompt, sampling_params = msgpack.unpackb(raw_data, raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 range_push("add_request")
                 engine.add_request(request_id, prompt, sampling_params)

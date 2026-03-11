@@ -131,6 +131,9 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.schedule_records = [] if schedule_output_path else None
         self.identity_to_rank_index = {}
 
+        # Set by shutdown() to signal the entrypoint to exit the event loop.
+        self._shutdown_event = asyncio.Event()
+
     def get_next_data_parallel_rank(self):
         """
         Selects the next data parallel rank using round-robin scheduling.
@@ -148,12 +151,18 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
+        # Clamp round-robin index so it doesn't skip an engine after removal.
+        n = len(self.identities_of_data_parallel_ranks)
+        if n > 0:
+            self._round_robin_idx = self._round_robin_idx % n
+        else:
+            self._round_robin_idx = 0
         for rank_info in self.hash_to_rank_info.values():
             rank_info.pop(identity, None)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
-            len(self.identities_of_data_parallel_ranks),
+            n,
         )
 
     def compute_request_hashes(self, prompt):
@@ -268,7 +277,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                     # Rebuild rank index mapping now that all engines are known.
                     sorted_ids = sorted(self.identities_of_data_parallel_ranks)
                     self.identity_to_rank_index = {
-                        identity: idx for idx, identity in enumerate(sorted_ids)
+                        ident: idx for idx, ident in enumerate(sorted_ids)
                     }
                     self.is_running.set()
                     if self.ready_event is not None:
@@ -486,7 +495,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         loop = get_asyncio_loop()
         coordinator.start(loop=loop)
         try:
-            loop.run_forever()
+            loop.run_until_complete(coordinator._shutdown_event.wait())
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
         finally:
@@ -509,4 +518,4 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 json.dump(schedule_data, f, indent=2)
         await super().shutdown()
         self._ctx.term()
-        asyncio.get_event_loop().stop()
+        self._shutdown_event.set()

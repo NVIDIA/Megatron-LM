@@ -406,7 +406,7 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
-        listening_timeout: float = 0.001,
+        listening_timeout: float = 0,
         steps_before_listen: int = 1,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.

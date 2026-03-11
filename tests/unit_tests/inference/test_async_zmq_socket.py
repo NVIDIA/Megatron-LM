@@ -139,7 +139,7 @@ class TestAsyncZmqEndpoint:
     # -- Send queue behavior tests --
 
     async def test_send_drains_queue(self, push_pull):
-        """Send queue drains all queued sends then exits on shutdown."""
+        """Send queue drains and delivers multiple sends in order."""
         sender, receiver = push_pull
 
         n = 5
@@ -155,10 +155,9 @@ class TestAsyncZmqEndpoint:
         assert received == list(range(n))
 
     async def test_shutdown_empty(self):
-        """shutdown() on an endpoint with no pending sends exits cleanly."""
+        """shutdown() on an endpoint with an empty send queue exits cleanly."""
         ep = AsyncZmqEndpoint("PUSH", bind=True)
         ep.start()
-        # Give send queue time to block on get().
         await asyncio.sleep(0.01)
         await asyncio.wait_for(ep.shutdown(), timeout=2.0)
 
@@ -168,20 +167,16 @@ class TestAsyncZmqEndpoint:
         router.start()
 
         # Send to a non-existent identity -- ROUTER_MANDATORY makes this fail
-        # with EHOSTUNREACH.
+        # with EHOSTUNREACH.  The send task catches it and logs a warning.
         router._isend(Headers.ACK, identity=b"nonexistent")
 
-        # Give send queue time to process the failing send.
-        await asyncio.sleep(0.1)
-
-        # If EHOSTUNREACH wasn't handled, the send task would have crashed.
         await asyncio.wait_for(router.shutdown(), timeout=2.0)
 
     async def test_shutdown_preserves_pending(self):
-        """A pending send completes before shutdown finishes.
+        """A send issued before shutdown() is delivered to the receiver.
 
-        This is the DISCONNECT-before-sentinel guarantee: _isend(DISCONNECT)
-        followed by shutdown() means the DISCONNECT send is processed first.
+        shutdown() drains the send queue before closing sockets, so the
+        message is fully sent before the sender shuts down.
         """
         sender = AsyncZmqEndpoint("PUSH", bind=True)
         receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
