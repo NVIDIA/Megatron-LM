@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import json
 import logging
 import time
 import traceback
@@ -55,6 +56,19 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
 
+        # The OpenAI spec sends tool_call arguments as a JSON string, but
+        # Jinja chat templates iterate over them with |items, requiring a dict.
+        for msg in messages:
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", tc)
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
         try:
             prompt_tokens = tokenizer.apply_chat_template(
                 messages,
@@ -104,17 +118,15 @@ try:
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
+            max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(
-                    int(max_tokens)
-                    if ((max_tokens := req.get("max_tokens", None)) is not None)
-                    else None
-                ),
+                num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
             )
@@ -211,6 +223,21 @@ try:
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
+            gen_length = result.get("generated_length") or len(result.get("generated_tokens", []))
+            max_gen = result.get("sampling_params", {})
+            if isinstance(max_gen, dict):
+                max_gen = max_gen.get("num_tokens_to_generate", None)
+            elif hasattr(max_gen, "num_tokens_to_generate"):
+                max_gen = max_gen.num_tokens_to_generate
+            else:
+                max_gen = None
+            if metadata.get("tool_calls", []):
+                finish_reason = "tool_calls"
+            elif max_gen is not None and gen_length >= max_gen:
+                finish_reason = "length"
+            else:
+                finish_reason = "stop"
+
             choice_data = {
                 "index": request_idx,
                 "message": message,
@@ -221,7 +248,7 @@ try:
                 "logprobs": (
                     {"content": logprobs_content} if sampling_params.return_log_probs else None
                 ),
-                "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else "stop",
+                "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else finish_reason,
             }
             choice_data["policy_staleness"] = result["policy_staleness"]
             choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
