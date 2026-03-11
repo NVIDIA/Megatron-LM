@@ -880,6 +880,10 @@ class TextGenerationController:
             # Use sampled token as input for the next depth.
             next_token_ids = spec_tokens
 
+        # Clean up cached hidden states.
+        if has_mtp:
+            del unwrapped_model._decoder_hidden_states_cache
+
     def _get_required_logit_indices(
         self,
         request_in_prefill_status_tensor: Tensor,
