@@ -2091,6 +2091,35 @@ def pad_or_truncate_thd_tensors(
     padding_token_id: int,
     padding_label_id: int,
 ):
+    """Pad or truncate THD-format (Token-Head-Dim packed) tensors to a fixed sequence length.
+
+    For SFT with packed sequences, the total number of tokens across all sub-sequences
+    in a sample may not match the target sequence length. This function either:
+      - Truncates: clips input_ids, labels, and cu_seqlens/cu_seqlens_padded so that
+        the total token count equals ``sequence_length``. Sub-sequences that extend
+        beyond the boundary are dropped, and a final cumulative length entry is appended.
+      - Pads: extends input_ids and labels with padding tokens to reach
+        ``sequence_length``, and updates the last entry of cu_seqlens (and
+        cu_seqlens_padded if present) accordingly.
+
+    All input tensors are expected to be 1-D (no batch dimension).
+
+    Args:
+        input_ids (torch.Tensor): 1-D token IDs for the packed sample.
+        labels (torch.Tensor): 1-D label IDs for the packed sample.
+        cu_seqlens (torch.Tensor): 1-D cumulative sequence lengths (int32), starting
+            at 0 and ending at the total token count.
+        cu_seqlens_padded (torch.Tensor | None): 1-D cumulative sequence lengths after
+            CP padding (from ``pad_thd_sequences_for_cp``), or None when CP is disabled.
+        sequence_length (int): Target total token count (i.e., ``max_seq_len``).
+        padding_token_id (int): Token ID used for padding input_ids.
+        padding_label_id (int): Label ID used for padding labels (typically -100 or similar
+            ignore index).
+
+    Returns:
+        Tuple of (input_ids, labels, cu_seqlens, cu_seqlens_padded), all adjusted to
+        ``sequence_length``.
+    """
     if input_ids.shape[0] > sequence_length: # Truncate
         input_ids = input_ids[:sequence_length]
         labels = labels[:sequence_length]
@@ -2122,7 +2151,37 @@ def pad_or_truncate_thd_tensors(
     return input_ids, labels, cu_seqlens, cu_seqlens_padded 
 
 def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_size: int, sp: bool, padding_token_id: int, padding_label_id: int, max_seq_len: int):
-    """Preprocess SFT batch."""
+    """Preprocess an SFT batch on TP rank 0 before broadcasting to other TP ranks.
+
+    Performs the following preprocessing steps (only on ``tp_rank == 0``):
+      1. Pads individual sub-sequences for CP divisibility via
+         ``pad_thd_sequences_for_cp`` (when ``cp_size > 1``), producing
+         ``cu_seqlens_padded``.
+      2. Pads or truncates the packed sample to exactly ``max_seq_len`` tokens.
+      3. Creates a loss mask that zeros out padding tokens and prompt tokens.
+      4. Computes per-segment position IDs from cumulative sequence lengths.
+      5. Computes ``max_seqlen`` (the length of the longest sub-sequence).
+
+    After this function, all sequence tensors have shape ``[1, max_seq_len]``
+    (with a batch dimension), while ``cu_seqlens``, ``cu_seqlens_padded``, and
+    ``max_seqlen`` remain 1-D.
+
+    Args:
+        batch (Dict[str, Any]): Raw batch from the dataloader containing at minimum
+            'tokens', 'labels', and 'cu_seqlens' (each with a leading batch dim of 1).
+        tp_rank (int): Tensor-parallel rank. Preprocessing is only done on rank 0.
+        cp_size (int): Context-parallel world size.
+        tp_size (int): Tensor-parallel world size.
+        sp (bool): Whether sequence parallelism is enabled.
+        padding_token_id (int): Token ID used for input padding.
+        padding_label_id (int): Label ID used for prompt/padding masking (e.g., -100).
+        max_seq_len (int): Target sequence length for the batch.
+
+    Returns:
+        Dict[str, Any]: Preprocessed batch dict with keys 'tokens', 'labels',
+        'loss_mask', 'position_ids', 'cu_seqlens', 'cu_seqlens_padded', and
+        'max_seqlen'.
+    """
     if tp_rank == 0:
         # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
         ### 1. Create cu_seqlens_padded if CP is enabled
@@ -2190,6 +2249,52 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
 ########################
 
 def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_hybrid_cp: bool, create_attention_mask_in_dataloader: bool, broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
+    """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
+
+    TP rank 0 holds the fully preprocessed batch (from the dataloader or from
+    ``preprocess_sft_batch`` when SFT is enabled). This function broadcasts 
+    every required tensor to the remaining TP ranks so that all ranks hold 
+    identical data before the forward pass. The set of tensors broadcast depends 
+    on the pipeline stage and whether SFT / hybrid-CP modes are active.
+
+    For SFT and hybrid-CP, variable-length metadata (``cu_seqlens``,
+    ``cu_seqlens_padded``) is broadcast using a length-prefixed protocol: TP
+    rank 0 first sends the numel, then the tensor itself, so receivers can
+    allocate the correct buffer size.
+
+    For hybrid-CP, the sequence length may differ per micro-batch (since it
+    depends on `local_cp_size`), so the actual sequence length is broadcast
+    before allocating receive buffers on non-zero TP ranks.
+
+    Args:
+        batch (dict[str, torch.Tensor]): The batch dict. On TP rank 0 this
+            contains the actual data; on other ranks it is ignored (receive
+            buffers are allocated internally).
+        is_sft (bool): Whether this is an SFT (supervised fine-tuning) run
+            using THD packed sequences.
+        is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
+        create_attention_mask_in_dataloader (bool): Whether the dataloader
+            creates an explicit attention mask tensor.
+        broadcast_src_rank (int): Global rank of the broadcast source (TP rank 0).
+        broadcast_group (torch.distributed.ProcessGroup): The TP process group
+            used for broadcasting.
+        cp_size (int): Context-parallel world size.
+        tp_rank (int): This rank's position within the TP group.
+        micro_batch_size (int): Micro-batch size (number of samples).
+        seq_length (int): Sequence length used for allocating receive buffers
+            (ignored under hybrid-CP where it is broadcast dynamically).
+        mtp_on_this_rank (bool): Whether Multi-Token Prediction layers are
+            active on this rank (affects which tensors are needed).
+        pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
+        is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
+        is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch dict with all tensors populated on
+        every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
+        'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
+        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+    """
     # TODO(asolergi-nv): Enable PP wit sft
 
     def _broadcast(item):
@@ -2389,6 +2494,28 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, is_h
 ########################
 
 def get_sft_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup):
+    """Partition an SFT packed-sequence batch across context-parallel ranks using THD indexing.
+
+    For SFT workloads the batch contains multiple variable-length sub-sequences
+    packed contiguously (THD format). This function uses Transformer Engine's
+    ``thd_get_partitioned_indices`` to compute the token indices assigned to the
+    current CP rank and gathers only those tokens from every sequence-dimension
+    tensor in the batch.
+
+    Metadata keys ('attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
+    'max_seqlen', 'local_cp_size', 'hybrid_cp_group') are left unchanged
+    because TE's attention kernels consume them directly.
+
+    Args:
+        batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
+            ``[micro_batch_size, seq_length, ...]``.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel process
+            group.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch with sequence-dimension tensors
+        index-selected to this CP rank's partition.
+    """
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
@@ -2399,31 +2526,48 @@ def get_sft_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group: torc
             cp_size,
             cp_rank,
         )
-        for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', 'hybrid_cp_group'}:
-                continue
-            batch[key] = data.index_select(1, index)
+        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        for key in SEQUENCE_KEYS:
+            if batch.get(key) is not None:
+                batch[key] = batch[key].index_select(1, index)
     return batch
 
 def get_pretrain_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup):
-    # With causal masking, each token only attends to its prior tokens. Simply split
-    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
-    # at the end of sequence have bigger workload than others. To address this issue,
-    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
-    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
-    # that we can get balanced workload among GPUs in a context parallel group.
-    # Determine CP topology either from provided group or from current context parallel state
+    """Partition a pretraining batch across context-parallel ranks with load-balanced chunking.
+
+    With causal masking, each token only attends to its prior tokens. Simply splitting
+    the sequence into CP chunks can result in severe load imbalance, as chunks at the
+    end of the sequence have bigger workloads than earlier ones. To address this, the
+    sequence is split into ``2 * cp_size`` chunks and assigned in a zigzag pattern:
+    for CP=2 the 4 chunks are assigned as (chunk_0, chunk_3) -> GPU 0 and
+    (chunk_1, chunk_2) -> GPU 1, balancing the workload across the CP group.
+
+    Only the sequence-dimension tensors ('tokens', 'labels', 'loss_mask',
+    'position_ids') are partitioned along ``seq_dim=1``. The 'attention_mask',
+    if present, is partitioned along ``seq_dim=2``. All other keys (metadata,
+    None-valued entries) are left unchanged.
+
+    Args:
+        batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
+            ``[micro_batch_size, seq_length, ...]``.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel process
+            group.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch with sequence-dimension tensors
+        sliced to this CP rank's zigzag partition.
+    """
 
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    KEYS_TO_SKIP = {'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', 'hybrid_cp_group'}
+    SEQUENCE_KEYS = {'tokens': 1, 'labels': 1, 'loss_mask': 1, 'position_ids': 1, 'attention_mask': 2}
 
     if cp_size > 1:
-        for key, val in batch.items():
-            if key in KEYS_TO_SKIP or val is None:
+        for key, seq_dim in SEQUENCE_KEYS.items():
+            val = batch.get(key)
+            if val is None:
                 continue
-            seq_dim = 1 if key != 'attention_mask' else 2
             val = val.view(
                 *val.shape[0:seq_dim],
                 2 * cp_size,
@@ -2443,14 +2587,33 @@ def get_pretrain_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group:
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any], is_hybrid_cp: bool, cp_group: Optional[torch.distributed.ProcessGroup] = None, hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None
 ):
-    """Slice batch input along sequence dimension into multiple chunks,
-    which are parallelized across GPUs in a context parallel group.
+    """Dispatch batch partitioning across context-parallel ranks.
+
+    Routes to the appropriate CP partitioning strategy based on the batch
+    contents and parallelism mode:
+      - **SFT (packed sequences)**: When ``cu_seqlens`` is present and
+        ``is_hybrid_cp`` is False, delegates to ``get_sft_batch_on_this_cp_rank``
+        which uses THD index-based partitioning.
+      - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
+        True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
+        and delegates to ``get_pretrain_batch_on_this_cp_rank`` with that group.
+      - **Pretraining**: When ``cu_seqlens`` is None, delegates to
+        ``get_pretrain_batch_on_this_cp_rank`` with zigzag load-balanced
+        chunking.
 
     Args:
-        batch (Dict[str, Any]): Input batch tensors.
-        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
-            If provided, uses this group's size and rank. Otherwise, falls back to
-            the current context-parallel settings from parallel_state.
+        batch (Dict[str, Any]): Input batch tensors. Must contain a
+            'cu_seqlens' key (may be None for pretraining).
+        is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
+            process group used for SFT and pretraining CP partitioning.
+        hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
+            Factory function that returns a hybrid CP process group for a given
+            ``group_size``. Required when ``is_hybrid_cp`` is True.
+
+    Returns:
+        Dict[str, Any]: The batch with sequence-dimension tensors partitioned
+        to this CP rank.
     """
 
     if batch["cu_seqlens"] is not None: # NOTE(asolergi-nv): SFT & HybridCP case
