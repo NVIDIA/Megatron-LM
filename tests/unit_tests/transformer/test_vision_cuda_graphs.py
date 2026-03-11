@@ -284,6 +284,7 @@ class TestVisionTECudaGraphHelper:
         assert helper.vision_model is not None, "Should find vision_model"
         assert helper.num_layers == self.vision_num_layers
         assert len(helper.callables) == self.vision_num_layers
+        assert helper.capture_ran() is False
         assert helper.graphs_created() is False
 
     def test_init_no_vision_model_warns(self):
@@ -297,6 +298,7 @@ class TestVisionTECudaGraphHelper:
         )
         assert helper.vision_model is None
         assert len(helper.callables) == 0
+        assert helper.capture_ran() is False
         assert helper.graphs_created() is False
 
     # -- _get_sample_arguments tests --
@@ -549,6 +551,7 @@ class TestVisionTECudaGraphHelperPP2:
         helper = self._make_helper(num_microbatches=4)
         assert helper.vision_model is None
         assert len(helper.callables) == 0
+        assert not helper.capture_ran()
         assert not helper.graphs_created()
 
     def test_pp2_num_microbatches_preserved(self):

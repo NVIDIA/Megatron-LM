@@ -2219,7 +2219,7 @@ class TECudaGraphHelper:
         """
         assert not self._capture_ran, "CUDA Graph capture has already been run."
 
-        torch.distributed.barrier()
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
         if FREEZE_GC:
@@ -2255,7 +2255,7 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        torch.distributed.barrier()
+        torch.cuda.synchronize()
         self._reset_after_capture()
         if FREEZE_GC:
             gc.unfreeze()
@@ -2605,6 +2605,11 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     * _finish_capturing wraps captured graphs to filter None values that arise
       from vision encoder layers returning (output, None), and skips cleanup
       that is handled by the LM decoder helper.
+
+    Note:
+        With pipeline parallelism > 1, only the first pipeline stage typically
+        has vision layers. Ranks without vision layers can safely skip calling
+        create_cudagraphs() or will gracefully return with no graphs created.
 
     Args:
         model: The full model (list of model chunks) containing vision_model.
