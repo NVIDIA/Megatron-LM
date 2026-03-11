@@ -73,8 +73,8 @@ else:
         TELinear,
         Linear,
         set_save_original_input,
-    ) = (None, None, None, None, None)
-    split_te_layernorm_column_parallel_linear = None
+        split_te_layernorm_column_parallel_linear,
+    ) = (None, None, None, None, None, None)
 
 
 @dataclass
