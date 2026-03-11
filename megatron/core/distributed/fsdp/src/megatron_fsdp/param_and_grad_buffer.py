@@ -868,6 +868,7 @@ class DataParallelBuffer:
         is_data_distributed: bool,
         bucket_id: int,
         dtype: Optional[torch.dtype] = None,
+        param_dtype: Union[str, torch.dtype, None] = None,
         device: Optional[torch.device] = None,
         data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_rank: Optional[int] = None,
@@ -879,8 +880,53 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
-        use_nvfp4_raw_data: bool = False,
     ) -> None:
+        """
+        Initialize the DataParallelBuffer.
+
+        Args:
+            ddp_config:
+                DistributedDataParallel configuration used to build indices.
+            params:
+                Parameters whose storage is represented in this buffer.
+            is_data_distributed:
+                If True, the buffer represents only a shard of the bucket; otherwise
+                it contains the full bucket on every rank.
+            bucket_id:
+                Integer ID used to identify this bucket in allocators.
+            dtype:
+                Storage dtype for this buffer. Defaults to params' dtype.
+            param_dtype:
+                Logical parameter dtype (e.g., "nvfp4", fp8) if storage differs
+                from logical dtype (used for quantized storage layouts).
+            device:
+                Device on which buffer storage is allocated.
+            data_parallel_group:
+                ProcessGroup for data-parallel communication.
+            dp_rank:
+                Override data-parallel rank (used in hybrid FSDP cases where the
+                rank in `data_parallel_group` differs from global rank).
+            temporary_bucket_allocator:
+                Allocator used for transient communication buckets.
+            is_transpose_buffer:
+                If True, this buffer stores data in transposed form for efficiency.
+            gradient_scaling_factor:
+                Optional scaling factor applied to gradients associated with
+                this buffer (if used by the caller).
+            chunk_size_factor:
+                Controls how items are chunked into the bucket index.
+            mem_alloc_context:
+                Optional context manager used by the allocator when creating
+                temporary buckets (e.g., CUDA graph or custom allocator scope).
+            item_index_map:
+                Precomputed mapping from item_id -> TensorItemIndex. If provided,
+                `bucket_index` and `shard_bucket_index` must also be provided.
+            bucket_index:
+                Precomputed BucketIndex describing the full bucket layout.
+            shard_bucket_index:
+                Precomputed ShardBucketIndex describing this rank's shard layout.
+        """
+
         self.ddp_config = ddp_config
         self.params = params
         _param_dtype = {p.dtype for p in self.params}
@@ -909,7 +955,7 @@ class DataParallelBuffer:
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
-        self.use_nvfp4_raw_data = use_nvfp4_raw_data
+        self.param_dtype = param_dtype
 
         # Setup the item index map, bucket index, and shard bucket index from
         # the provided arguments, or build them if not provided.
@@ -942,7 +988,7 @@ class DataParallelBuffer:
                     chunk_size_factor=chunk_size_factor,
                 )
             )
-            if use_nvfp4_raw_data:
+            if param_dtype == "nvfp4":
                 # Adjust the bucket and shard sizes to account for NVFP4 storage.
                 nvfp4_size_scale = 0.5  # NVFP4 uses 0.5 bytes per element.
                 for item_id in self.item_index_map:
@@ -1995,7 +2041,7 @@ class ParamAndGradBuffer:
             if wbuf and (mbuf or gbuf):
                 ref_buf = mbuf if mbuf else gbuf
                 assert_param_list_equal(wbuf.params, ref_buf.params)
-                if wbuf.use_nvfp4_raw_data:
+                if wbuf.param_dtype == "nvfp4":
                     for item_id, param in enumerate(wbuf.params):
                         name = self.param_to_name[param]
                         w_data = wbuf.get_item(item_id, shard_only=True)
@@ -2153,10 +2199,10 @@ class ParamAndGradBuffer:
             )
             # Designate buffer data-types for compute parameters and main gradients.
             if param_dtype in ["nvfp8", "nvfp8_t", "nvfp4"]:
-                param_dtype = torch.uint8
+                param_buf_dtype = torch.uint8
                 main_grads_dtype = torch.bfloat16
             else:
-                param_dtype = param_dtype
+                param_buf_dtype = param_dtype
                 main_grads_dtype = param_dtype
             # Use a custom main gradient data-type.
             if self.mp_policy.main_grads_dtype is not None:
@@ -2179,7 +2225,8 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
                     and model_wbuf_dp_group.size() > 1,
-                    dtype=param_dtype,
+                    dtype=param_buf_dtype,
+                    param_dtype=param_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding
                     # the optimizer state in HFSDP, else just DP-Shard when
@@ -2190,7 +2237,6 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
-                    use_nvfp4_raw_data=(param_dtype == "nvfp4"),
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2199,7 +2245,8 @@ class ParamAndGradBuffer:
                         group.params,
                         is_data_distributed=is_model_weight_buffer_distributed
                         and main_buf_dp_group.size() > 1,
-                        dtype=param_dtype,
+                        dtype=param_buf_dtype,
+                        param_dtype=param_dtype,
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
@@ -2222,6 +2269,7 @@ class ParamAndGradBuffer:
                     is_data_distributed=is_main_weight_buffer_distributed
                     and main_buf_dp_group.size() > 1,
                     dtype=self.mp_policy.main_params_dtype,
+                    param_dtype=self.mp_policy.main_params_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     bucket_id=group_id,
@@ -2242,6 +2290,7 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
                     dtype=main_grads_dtype,
+                    param_dtype=param_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding
                     # the optimizer state in HFSDP, else just DP-Shard when
@@ -2269,6 +2318,7 @@ class ParamAndGradBuffer:
                     is_data_distributed=is_main_weight_buffer_distributed
                     and hsdp_buf_dp_group.size() > 1,
                     dtype=wbuf.dtype,
+                    param_dtype=param_dtype,
                     device=wbuf.device,
                     data_parallel_group=hsdp_buf_dp_group,
                     is_transpose_buffer=False,
@@ -2305,6 +2355,7 @@ class ParamAndGradBuffer:
                         is_data_distributed=is_grad_buffer_distributed
                         and hsdp_buf_dp_group.size() > 1,
                         dtype=gbuf.dtype,
+                        param_dtype=param_dtype,
                         device=gbuf.device,
                         data_parallel_group=hsdp_buf_dp_group,
                         is_transpose_buffer=False,
@@ -2353,6 +2404,7 @@ class ParamAndGradBuffer:
                     is_data_distributed=is_grad_buffer_distributed and fsdp_group.size() > 1,
                     # Set allocation to grad_comm_dtype, or default to param(.grad).dtype.
                     dtype=self.mp_policy.grad_comm_dtype,
+                    param_dtype=param_dtype,
                     device=gbuf.device,
                     data_parallel_group=fsdp_group,
                     is_transpose_buffer=False,
@@ -2366,7 +2418,7 @@ class ParamAndGradBuffer:
 
         reset_context_args = dict(
             init_te_fp8_fp4_param_with_bf16=(
-                self.ddp_config.fp8_param_gather or self.ddp_config.fp4_param_gather
+                self.ddp_config.fp8_param_gather or self.ddp_config.fp4_param
             )
         )
         module_reset_flag = {}
@@ -2864,12 +2916,12 @@ class ParamAndGradBuffer:
 
                 # NOTE: megatron_fsdp_slice is used to solve the SwiGLU TP dist-ckpt problem in
                 # MCore.
-                mbuf = pg.model_weight_buffer
+                wbuf = pg.model_weight_buffer
                 # NVFP4 use main weight buffer
-                if mbuf and mbuf.use_nvfp4_raw_data:
-                    mbuf = pg.main_weight_buffer
-                if mbuf:
-                    _start, _end = mbuf._get_item_slice_in_shard(item_id)
+                if wbuf and wbuf.param_dtype == "nvfp4":
+                    wbuf = pg.main_weight_buffer
+                if wbuf:
+                    _start, _end = wbuf._get_item_slice_in_shard(item_id)
                     setattr(dist_param, "megatron_fsdp_slice", slice(_start, _end))
 
                 dist_param.reset_attribute()
