@@ -18,7 +18,7 @@ This discussion summarizes NVIDIA support for Muon and related optimizer work, w
 
 ## Performance on NVIDIA Platforms
 
-Table 1 summarizes training throughput for Kimi-K2 and Qwen3 30B with Muon and AdamW on NVIDIA GB300 systems. With the techniques described below, Muon training throughput remains close to AdamW. If Muon-specific Newton-Schulz matrix multiplications are counted, measured MFU is higher with Muon.
+Table 1 summarizes training throughput for Kimi-K2 and Qwen3 30B with Muon and AdamW on NVIDIA GB300 systems. With the techniques described below, Muon training throughput remains close to AdamW. If Muon-specific Newton-Schulz matrix multiplications are counted, the measured MFU is higher with Muon.
 
 The measurements below used 256 GB300 GPUs with `PP4DP64EP64` for Kimi-K2 and 8 GB300 GPUs with `DP8EP8` for Qwen3 30B.
 
@@ -33,7 +33,7 @@ Detailed experimental settings and reproduction steps are included in the [Get S
 
 ## Enabling Technologies for Large-Scale Training
 
-Higher-order optimizers such as Muon improve training efficiency, but deploying them at scale introduces real systems challenges. Preconditioning based on Newton-Schulz iteration or eigen-decomposition raises both compute cost and memory use. Mixed-precision training and gradient accumulation can introduce numerical issues, and scaling synchronized orthogonalized updates across thousands of GPUs can add significant communication overhead.
+Higher-order optimizers such as Muon improve training efficiency, but deploying them at scale introduces real systems challenges. Preconditioning based on Newton-Schulz iteration or eigen-decomposition increases both compute cost and memory use. Mixed-precision training and gradient accumulation can introduce numerical issues, and scaling synchronized orthogonalized updates across thousands of GPUs can add significant communication overhead.
 
 The techniques below balance generality, throughput, and implementation complexity. They are useful not only for Muon, but also for optimizers such as SOAP and other preconditioner-heavy methods.
 
@@ -58,7 +58,7 @@ One consequence of the layer-wise design is variable-sized communication. Differ
 
 ## Distributed Newton-Schulz
 
-Tensor parallelism (TP) introduces another challenge. TP shards weight matrices across GPUs, so no single device holds the full tensor. Muon's orthogonalization step, however, requires access to the entire momentum matrix. That means TP-aware handling is required to compute orthogonalized updates correctly and efficiently.
+Tensor parallelism (TP) introduces an additional challenge. TP shards weight matrices across GPUs, so no single device holds the full tensor. Muon's orthogonalization step, however, requires access to the entire momentum matrix. That means TP-aware handling is required to compute orthogonalized updates correctly and efficiently.
 
 Megatron-Core supports multiple approaches in [`megatron/core/optimizer/muon.py`](https://github.com/NVIDIA/Megatron-LM/blob/dev/megatron/core/optimizer/muon.py):
 
@@ -120,7 +120,7 @@ Muon is integrated into the Megatron-Core `dev` branch, including the Muon optim
 
 ## Conclusion
 
-Higher-order optimizers such as Muon are becoming increasingly important for efficient LLM training. By combining layer-wise distributed optimization, TP-aware Newton-Schulz execution modes, and follow-on optimizations such as communication hiding and SYRK-based acceleration, Megatron-Core makes these methods practical at the scale required for next-generation training runs.
+Higher-order optimizers such as Muon are becoming increasingly important for efficient LLM training. By combining layer-wise distributed optimization, TP-aware Newton-Schulz execution modes, and additional optimizations such as communication hiding and SYRK-based acceleration, Megatron-Core makes these methods practical at the scale required for next-generation training runs.
 
 ## Resources
 
@@ -128,4 +128,4 @@ Higher-order optimizers such as Muon are becoming increasingly important for eff
 2. [Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers)
 3. [Megatron-Bridge performance scripts](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/scripts/performance)
 4. [Second-order optimization for neural networks: arXiv:1802.09568](https://arxiv.org/abs/1802.09568)
-5. [Further higher-order optimization work: arXiv:2309.06497](https://arxiv.org/abs/2309.06497)
+5. [Further higher-order optimization research: arXiv:2309.06497](https://arxiv.org/abs/2309.06497)
