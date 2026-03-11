@@ -627,6 +627,7 @@ class TELinear(te.pytorch.Linear):
 
         # if is_te_min_version("2.10.0"):
         if is_te_min_version("2.10.0") and ps_group is not None:
+            self.etp_size = get_pg_size(ps_group)
             extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
         super().__init__(
@@ -833,6 +834,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         # if is_te_min_version("2.10.0"):
         if is_te_min_version("2.10.0") and ps_group is not None:
+            self.etp_size = get_pg_size(ps_group)
             extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
         self.stride = stride
@@ -943,7 +945,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"ETP={self.etp_size})" if hasattr(self, "etp_size") else ")"
         )
 
     def backward_dw(self):
@@ -1055,7 +1058,8 @@ class TEColumnParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"ETP={self.etp_size})" if hasattr(self, "etp_size") else ")"
         )
 
     def backward_dw(self):
@@ -1161,7 +1165,8 @@ class TERowParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"ETP={self.etp_size})" if hasattr(self, "etp_size") else ")"
         )
 
     def backward_dw(self):
@@ -1566,6 +1571,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             # if is_te_min_version("2.10.0"):
             if is_te_min_version("2.10.0") and ps_group is not None:
+                self.etp_size = get_pg_size(ps_group)
                 extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
             super().__init__(
@@ -1844,6 +1850,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             if self.config.delay_wgrad_compute:
                 super().backward_dw()
+
+        def __repr__(self):
+            return (
+                f"{type(self).__name__}(per expert(["
+                f"in={self.in_features}, out={self.out_features}]) "
+                f"X num_gemms={self.num_gemms}, "
+                f"bias={self.use_bias}, TP={self.tp_size}, "
+                f"ETP={self.etp_size})" if hasattr(self, "etp_size") else ")"
+            )
+
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
