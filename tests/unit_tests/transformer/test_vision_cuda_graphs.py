@@ -406,7 +406,8 @@ class TestVisionTECudaGraphHelper:
             micro_batch_size=self.micro_batch_size,
         )
         helper.create_cudagraphs()
-        assert not helper.graphs_created()
+        assert helper.capture_ran()  # Capture process ran
+        assert not helper.graphs_created()  # But no graphs were created
 
     def test_delete_cudagraphs_before_create_asserts(self):
         """delete_cuda_graphs before creation should raise AssertionError."""
@@ -610,7 +611,8 @@ class TestVisionTECudaGraphHelperPP2:
 
         helper = self._make_helper(num_microbatches=4)
         helper.create_cudagraphs()
-        assert not helper.graphs_created()
+        assert helper.capture_ran()  # Capture process ran
+        assert not helper.graphs_created()  # But no graphs were created
 
 
 if __name__ == "__main__":
