@@ -119,6 +119,8 @@ def causal_conv1d_varlen_fn(
     cu_seqlens: torch.Tensor,
     initial_states: torch.Tensor = None,
     activation: str = "silu",
+    precomputed_seq_idx: torch.Tensor = None,
+    precomputed_seq_start: torch.Tensor = None,
 ) -> torch.Tensor:
     """Depthwise causal 1D convolution over packed variable-length sequences.
 
@@ -134,6 +136,12 @@ def causal_conv1d_varlen_fn(
         initial_states: Per-request initial conv states of shape
             (num_requests, conv_dim, d_conv - 1). If None, uses zeros.
         activation: Activation function, must be "silu".
+        precomputed_seq_idx: Precomputed per-token request ID of shape
+            (total_tokens,). If provided, skips repeat_interleave (CUDA
+            graph compatible). Padding tokens should use 0 as sentinel.
+        precomputed_seq_start: Precomputed per-token request start position
+            of shape (total_tokens,). Must be provided together with
+            precomputed_seq_idx.
 
     Returns:
         Output tensor of shape (total_tokens, conv_dim).
@@ -148,14 +156,18 @@ def causal_conv1d_varlen_fn(
 
     out = torch.empty_like(x)
 
-    # Precompute per-token seq_idx and seq_start from cu_seqlens.
-    # seq_idx[t] = request ID for token t
-    # seq_start[t] = start position of the request containing token t
-    seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    seq_idx = torch.repeat_interleave(
-        torch.arange(num_requests, device=x.device, dtype=torch.int32), seq_lengths
-    )
-    seq_start = torch.repeat_interleave(cu_seqlens[:-1], seq_lengths).to(torch.int32)
+    # Use precomputed per-token metadata if provided (CUDA graph compatible),
+    # otherwise compute from cu_seqlens via repeat_interleave.
+    if precomputed_seq_idx is not None:
+        assert precomputed_seq_start is not None
+        seq_idx = precomputed_seq_idx
+        seq_start = precomputed_seq_start
+    else:
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(num_requests, device=x.device, dtype=torch.int32), seq_lengths
+        )
+        seq_start = torch.repeat_interleave(cu_seqlens[:-1], seq_lengths).to(torch.int32)
 
     has_initial_states = initial_states is not None
     if not has_initial_states:
@@ -163,7 +175,8 @@ def causal_conv1d_varlen_fn(
         is_stride_req = 1
         is_stride_dim = 1
     else:
-        assert initial_states.shape == (num_requests, conv_dim, d_conv - 1)
+        if precomputed_seq_idx is None:
+            assert initial_states.shape == (num_requests, conv_dim, d_conv - 1)
         is_stride_req = initial_states.stride(0)
         is_stride_dim = initial_states.stride(1)
 

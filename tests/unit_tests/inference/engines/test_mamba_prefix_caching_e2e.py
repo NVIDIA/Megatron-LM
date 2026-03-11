@@ -102,7 +102,7 @@ class TestMambaPrefixCachingE2E:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _create_model(self):
+    def _create_model(self, num_cuda_graphs=None):
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=3,
@@ -110,7 +110,7 @@ class TestMambaPrefixCachingE2E:
             mamba_num_heads=16,
             num_attention_heads=16,
             use_cpu_initialization=True,
-            cuda_graph_impl="none",
+            cuda_graph_impl="local" if num_cuda_graphs else "none",
             inference_rng_tracker=True,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
@@ -176,6 +176,7 @@ class TestMambaPrefixCachingE2E:
         prefix_caching_mamba_gb=0.05,
         request_rounder=4,
         use_triton_conv1d=False,
+        num_cuda_graphs=None,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -187,6 +188,7 @@ class TestMambaPrefixCachingE2E:
             enable_prefix_caching=enable_prefix_caching,
             unified_memory_level=0,
             use_triton_conv1d=use_triton_conv1d,
+            num_cuda_graphs=num_cuda_graphs,
         )
         if enable_prefix_caching:
             inference_config_kwargs.update(
@@ -208,7 +210,12 @@ class TestMambaPrefixCachingE2E:
         )
         _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
         CudaGraphManager.global_mempool = None
+        for module in model.modules():
+            if isinstance(module, CudaGraphManager):
+                module.cudagraph_runners.clear()
+                module.inference_cudagraphs_lookup_table.clear()
         return DynamicInferenceEngine(controller, context)
 
     def _make_request(self, req_id, prompt, enable_pc, num_tokens=NUM_TOKENS_TO_GENERATE):
@@ -346,7 +353,9 @@ class TestMambaPrefixCachingE2E:
 
         return finished, ctx.lifetime_prefill_token_count
 
-    def _run_multi_pc_on(self, model, mamba_config, all_prompts, use_triton_conv1d=False):
+    def _run_multi_pc_on(
+        self, model, mamba_config, all_prompts, use_triton_conv1d=False, num_cuda_graphs=None
+    ):
         """Run 4 groups with prefix caching enabled, verifying per-step state."""
         engine = self._build_engine(
             model,
@@ -355,6 +364,7 @@ class TestMambaPrefixCachingE2E:
             buffer_size_gb=2.0,
             prefix_caching_mamba_gb=0.2,
             use_triton_conv1d=use_triton_conv1d,
+            num_cuda_graphs=num_cuda_graphs,
         )
         alloc = engine.context.block_allocator
         ctx = engine.context
@@ -418,12 +428,13 @@ class TestMambaPrefixCachingE2E:
             ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
 
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
-    def test_mamba_prefix_caching_multi_group_e2e(self, use_triton_conv1d):
+    def test_mamba_prefix_caching_multi_group_e2e(self, use_triton_conv1d, num_cuda_graphs):
         """Verify multi-group prefix caching with 4 independent groups."""
         skip_if_mamba_sequence_packing_not_available()
-        model = self._create_model()
+        model = self._create_model(num_cuda_graphs=num_cuda_graphs)
         mamba_config = MambaInferenceStateConfig.from_model(model)
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
@@ -434,11 +445,16 @@ class TestMambaPrefixCachingE2E:
             False,
             num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
             use_triton_conv1d=use_triton_conv1d,
+            num_cuda_graphs=num_cuda_graphs,
             buffer_size_gb=2.0,
             prefix_caching_mamba_gb=0.2,
         )
         on_outputs, on_prefill = self._run_multi_pc_on(
-            model, mamba_config, all_prompts, use_triton_conv1d=use_triton_conv1d
+            model,
+            mamba_config,
+            all_prompts,
+            use_triton_conv1d=use_triton_conv1d,
+            num_cuda_graphs=num_cuda_graphs,
         )
 
         # verify per-group outputs match independent runs
@@ -451,6 +467,7 @@ class TestMambaPrefixCachingE2E:
                 base_req_id=g * 5,
                 num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
                 use_triton_conv1d=use_triton_conv1d,
+                num_cuda_graphs=num_cuda_graphs,
             )
             for lid in range(5):
                 rid = g * 5 + lid

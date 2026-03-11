@@ -10,16 +10,22 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
-    def __init__(self, max_requests: int, max_tokens: int):
+    def __init__(self, max_requests: int, max_tokens: int, chunk_size: int = 128):
         """
         Initializes the Mamba slot allocator.
 
         Args:
             max_requests (int): The maximum number of concurrent requests.
+            max_tokens (int): The maximum number of tokens.
+            chunk_size (int): The chunk size used by the SSM Triton kernels.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
+        self.chunk_size = chunk_size
         self.device = torch.cuda.current_device()
+
+        # Maximum possible chunks across all batch configurations
+        self.max_chunks = max_tokens // chunk_size + max_requests
 
         # Map from requests to slots in the static Mamba state buffer
         self.request_to_mamba_state_idx = torch.full(
@@ -51,6 +57,25 @@ class MambaMetadata:
             (2,), dtype=torch.int32, device=self.device
         )
 
+        # SSM chunk boundaries for varlen kernel
+        self._cu_chunk_seqlens_buffer = torch.zeros(
+            self.max_chunks + 1, dtype=torch.int32, device=self.device
+        )
+
+        # Index of the last chunk per sequence
+        self._last_chunk_indices_buffer = torch.zeros(
+            max_requests, dtype=torch.int32, device=self.device
+        )
+
+        # Request ID per chunk
+        self._seq_idx_for_varlen_buffer = torch.zeros(
+            self.max_chunks, dtype=torch.int32, device=self.device
+        )
+
+        # Conv1d per-token metadata (request ID and request start position)
+        self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
+        self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
+
         # Allocator for Mamba state slots
         self.mamba_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
@@ -80,6 +105,18 @@ class MambaMetadata:
         self.cu_seqlens = None
         self.seq_idx = None
         self.device_decode_prefill = None
+
+        # SSM/conv1d precomputed views
+        self.cu_chunk_seqlens = None
+        self.last_chunk_indices = None
+        self.seq_idx_for_varlen = None
+        self.conv_seq_idx = None
+        self.conv_seq_start = None
+
+        # Python-side precomputed values
+        self.real_prefill_token_count = 0
+        self.cu_seqlens_list = [0]
+        self.has_zero_len_seqs = False
 
     def update(
         self,
@@ -165,6 +202,98 @@ class MambaMetadata:
                 last_val
             )
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
+
+            # --- Precompute SSM and conv1d metadata for CUDA graph compatibility ---
+            # All values the forward pass needs are computed here (before CUDA graph
+            # capture/replay) so that the forward pass has no .item() calls or
+            # data-dependent control flow.
+
+            # Transfer cu_seqlens to CPU for Python-side precomputation
+            cu_seqlens_real = self._cu_seqlens_buffer[: real_prefill_count + 1].tolist()
+            self.cu_seqlens_list = cu_seqlens_real
+            self.real_prefill_token_count = (
+                cu_seqlens_real[real_prefill_count] if real_prefill_count > 0 else 0
+            )
+
+            # Detect zero-length seqs and mark their batch_indices as -1.
+            # tensor_masked_update already skips -1 indices, so the forward pass
+            # won't overwrite their correctly-restored conv/SSM state.
+            self.has_zero_len_seqs = False
+            for i in range(real_prefill_count):
+                if cu_seqlens_real[i + 1] == cu_seqlens_real[i]:
+                    self._batch_indices_prefill_buffer[i] = -1
+                    self.has_zero_len_seqs = True
+            # View already reflects buffer modifications (it's a slice, not a copy)
+
+            # Build cu_chunk_seqlens, last_chunk_indices, seq_idx_for_varlen.
+            # Covers all padded sequences (real + padding). Each sequence is
+            # subdivided into chunks of at most chunk_size tokens. Zero-length
+            # sequences get a single zero-length chunk.
+            cu_seqlens_all = self._cu_seqlens_buffer[: padded_prefill_count + 1].tolist()
+            chunk_size = self.chunk_size
+            chunk_boundaries = [0]
+            last_chunk_idx_list = []
+            chunk_to_seq_list = []
+
+            for i in range(padded_prefill_count):
+                start = cu_seqlens_all[i]
+                end = cu_seqlens_all[i + 1]
+                pos = start + chunk_size
+                while pos < end:
+                    chunk_boundaries.append(pos)
+                    chunk_to_seq_list.append(i)
+                    pos += chunk_size
+                chunk_boundaries.append(end)
+                chunk_to_seq_list.append(i)
+                last_chunk_idx_list.append(len(chunk_boundaries) - 2)
+
+            # Pad to fixed size for CUDA graph compatibility
+            padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count
+            last_boundary = chunk_boundaries[-1]
+            while len(chunk_boundaries) < padded_max_chunks + 1:
+                chunk_boundaries.append(last_boundary)
+            while len(chunk_to_seq_list) < padded_max_chunks:
+                chunk_to_seq_list.append(0)
+
+            # Fill GPU buffers
+            n_cu = padded_max_chunks + 1
+            self._cu_chunk_seqlens_buffer[:n_cu].copy_(
+                torch.tensor(chunk_boundaries[:n_cu], dtype=torch.int32)
+            )
+            self.cu_chunk_seqlens = self._cu_chunk_seqlens_buffer[:n_cu]
+
+            self._last_chunk_indices_buffer[:padded_prefill_count].copy_(
+                torch.tensor(last_chunk_idx_list, dtype=torch.int32)
+            )
+            self.last_chunk_indices = self._last_chunk_indices_buffer[:padded_prefill_count]
+
+            self._seq_idx_for_varlen_buffer[:padded_max_chunks].copy_(
+                torch.tensor(chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32)
+            )
+            self.seq_idx_for_varlen = self._seq_idx_for_varlen_buffer[:padded_max_chunks]
+
+            # Build conv1d per-token metadata (request ID and request start position)
+            real_tokens = self.real_prefill_token_count
+            if real_tokens > 0:
+                conv_seq_idx_list = []
+                conv_seq_start_list = []
+                for i in range(real_prefill_count):
+                    start = cu_seqlens_real[i]
+                    length = cu_seqlens_real[i + 1] - start
+                    conv_seq_idx_list.extend([i] * length)
+                    conv_seq_start_list.extend([start] * length)
+                self._conv_seq_idx_buffer[:real_tokens].copy_(
+                    torch.tensor(conv_seq_idx_list, dtype=torch.int32)
+                )
+                self._conv_seq_start_buffer[:real_tokens].copy_(
+                    torch.tensor(conv_seq_start_list, dtype=torch.int32)
+                )
+            if padded_token_count > real_tokens:
+                self._conv_seq_idx_buffer[real_tokens:padded_token_count] = 0
+                self._conv_seq_start_buffer[real_tokens:padded_token_count] = 0
+
+            self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
+            self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = real_decode_count

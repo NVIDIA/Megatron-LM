@@ -252,6 +252,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
         self.use_triton_conv1d = inference_config.use_triton_conv1d
+        self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
@@ -307,6 +308,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
+            self.mamba_chunk_size = mamba_inference_state_config.chunk_size
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -695,7 +697,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                chunk_size=self.mamba_chunk_size,
             )
 
         # Allocate large non-graphed buffers.
@@ -1854,6 +1858,26 @@ class DynamicInferenceContext(BaseInferenceContext):
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
             )
 
+            # Auto-enable Triton conv1d for CUDA graph steps. The per-request
+            # conv loop launches a variable number of kernels with .item()
+            # calls, which is incompatible with CUDA graph capture/replay.
+            if self._using_cuda_graph_this_step:
+                self._use_triton_conv1d_this_step = True
+            else:
+                self._use_triton_conv1d_this_step = self.use_triton_conv1d
+
+            # Fall back to eager mode when intermediate Mamba states need to
+            # be extracted. Intermediate state extraction uses Python loops
+            # with variable-size tensors and .item() calls that cannot be
+            # captured in a CUDA graph. First unique prompts (which need
+            # intermediate states) run eager; subsequent duplicates and
+            # decode steps use CUDA graphs.
+            if self._using_cuda_graph_this_step:
+                intermediate_offsets = self.get_mamba_intermediate_offsets()
+                if intermediate_offsets is not None:
+                    self._using_cuda_graph_this_step = False
+                    self._use_triton_conv1d_this_step = self.use_triton_conv1d
+
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
                 self.moe_routing_metadata.enable_static_buffer_recording()
@@ -1920,6 +1944,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
+        self._use_triton_conv1d_this_step = self.use_triton_conv1d
         self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0

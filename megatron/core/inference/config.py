@@ -39,6 +39,9 @@ class MambaInferenceStateConfig:
     ssm_states_dtype: torch.dtype
     """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
 
+    chunk_size: int = 128
+    """The chunk size used by the SSM Triton kernels."""
+
     @classmethod
     def from_model(
         cls,
@@ -59,12 +62,18 @@ class MambaInferenceStateConfig:
                 conv_states_dtype = model.config.params_dtype
             if ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
+            chunk_size = 128
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    chunk_size = layer.mixer.chunk_size
+                    break
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
+                chunk_size=chunk_size,
             )
         return None
 
