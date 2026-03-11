@@ -91,13 +91,13 @@ def _maybe_setup_delayed_wgrad_for_experts(module, process_post_backward_gradien
             (``_process_post_backward_gradients``) to be called after the delayed
             wgrad computation finishes.
     """
-    try:
-        if not (isinstance(module, TransformerLayer) and module.is_moe_layer):
-            return
-    except NameError:
+    if not (isinstance(module, TransformerLayer) and module.is_moe_layer):
         return
 
     if not getattr(module.config, 'delay_wgrad_compute_for_te_grouped_gemm', False):
+        return
+
+    if getattr(module.mlp, '_process_expert_grads_fn', None) is not None:
         return
 
     def _make_process_expert_grads(mlp_module):
@@ -762,8 +762,7 @@ class MegatronFSDP(torch.nn.Module):
             )
 
             # Set post backward hook for TE grouped gemm if enabled comm overlap
-            if getattr(module.mlp, '_process_expert_grads_fn') is None:
-                _maybe_setup_delayed_wgrad_for_experts(module, _process_post_backward_gradients)
+            _maybe_setup_delayed_wgrad_for_experts(module, _process_post_backward_gradients)
             return args, kwargs
 
         @torch.compiler.disable
