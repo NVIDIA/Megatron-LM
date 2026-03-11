@@ -1024,8 +1024,3 @@ class TestTextGenerationController:
                 assert (
                     expected == actual
                 ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
-
-
-
-
-

@@ -370,4 +370,3 @@ class TestMatchGraphConfigWithEP:
         result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
         assert result is None, "All-reduce max from oversized rank should cause no match"
-

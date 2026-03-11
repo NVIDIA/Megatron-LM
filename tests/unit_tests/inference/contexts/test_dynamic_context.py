@@ -1523,21 +1523,3 @@ class TestDynamicContext:
 
         # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
         assert dynamic_context.num_attention_heads_per_partition == 1
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

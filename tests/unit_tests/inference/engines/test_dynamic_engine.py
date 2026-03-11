@@ -2018,12 +2018,3 @@ class TestDynamicInferenceEngine:
 
         assert (record[-1].policy_staleness == pre_ps + 1).all()
         assert (record[-1].kv_cache_staleness == 0).all()
-
-
-
-
-
-
-
-
-
