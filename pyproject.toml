@@ -93,7 +93,7 @@ dev = [
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
+    "emerging_optimizers; python_version >= '3.12'",
     "flask[async]",
     "hypercorn",
     "openai",
@@ -116,7 +116,7 @@ lts = [
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
+    "emerging_optimizers; python_version >= '3.12'",
 ]
 
 [dependency-groups]
@@ -160,7 +160,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["emerging_optimizers", "fast-hadamard-transform"]
+no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
