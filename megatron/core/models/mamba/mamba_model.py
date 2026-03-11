@@ -135,6 +135,7 @@ class MambaModel(LanguageModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                ps_group=self.pg_collection.ps,
             )
 
         if self.position_embedding_type == 'rope':
@@ -191,6 +192,7 @@ class MambaModel(LanguageModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                ps_group=self.pg_collection.ps,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:

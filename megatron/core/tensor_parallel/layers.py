@@ -42,6 +42,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
+from megatron.core.etp_utils import ETPEmbeddingWeight
 
 _grad_accum_fusion_available = True
 try:
@@ -52,6 +53,7 @@ except ImportError:
 try:
     import transformer_engine  # pylint: disable=unused-import
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import wrap_module_params_etp
 
     HAVE_TE = True
 except ImportError:
@@ -218,6 +220,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
@@ -267,6 +270,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
+        self.ps_size = 1
+        if ps_group is not None:
+            wrap_module_params_etp(self, ["weight"], ps_group)
+            self.ps_size = ps_group.size()
+
     def forward(self, input_):
         """Forward.
 
@@ -281,12 +289,17 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
+
+        weight = self.weight
+        if self.ps_size > 1:
+            weight = ETPEmbeddingWeight.apply(self.weight)
+
         # Get the embeddings.
         if self.deterministic_mode:
-            output_parallel = self.weight[masked_input]
+            output_parallel = weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
@@ -446,6 +459,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        ps_size,
     ):
         """Forward."""
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
@@ -453,6 +467,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             main_grad = None
         ctx.save_for_backward(input, weight)
+
+        if ps_size > 1:
+            weight = weight.all_gather_and_prefetch(fwd=True)
+
         # We can't save main_grad in save_for_backward as this module would be
         # reused across layers like MTP logits. So, to prevent in-place modification
         # checks we save the tensor in ctx.
@@ -464,6 +482,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
+        ctx.ps_size = ps_size
 
         if sequence_parallel:
             dim_size = list(input.size())
@@ -487,6 +506,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         input, weight = ctx.saved_tensors
         main_grad = ctx.main_grad
         use_bias = ctx.use_bias
+
+        # ETP: re-gather weight for dgrad
+        if ctx.ps_size > 1:
+            sharded_weight = weight
+            weight = sharded_weight.all_gather_and_prefetch_bwd()
+            etp_fuse_wgrad = ctx.gradient_accumulation_fusion
+            ctx.gradient_accumulation_fusion = False
+        else:
+            etp_fuse_wgrad = False
+
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
         handle = None
@@ -604,16 +633,22 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
+        # ETP: reduce-scatter wgrad
+        if ctx.ps_size > 1 and grad_weight is not None:
+            grad_weight = sharded_weight.wgrad_reduce_scatter(
+                grad_weight, etp_fuse_wgrad
+            )
+
         if ctx.sequence_parallel:
             handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
+            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None)
 
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -626,6 +661,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ps_size: int = 1,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -702,6 +738,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        ps_size,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -796,6 +833,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -866,6 +904,12 @@ class ColumnParallelLinear(torch.nn.Module):
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
             self.weight = None
+
+        self.ps_size = 1
+        if ps_group is not None:
+            wrap_module_params_etp(self, ["weight"], ps_group)
+            self.ps_size = ps_group.size()
+            
 
         if bias:
             if config.use_cpu_initialization:
@@ -1015,6 +1059,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 else None
             ),
             tp_group=self.tp_group,
+            ps_size=self.ps_size,
         )
 
         gather_output = self.gather_output
@@ -1120,6 +1165,7 @@ class RowParallelLinear(torch.nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(RowParallelLinear, self).__init__()
 
@@ -1191,6 +1237,11 @@ class RowParallelLinear(torch.nn.Module):
                     is_expert=self.is_expert,
                 )
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        
+        self.ps_size = 1
+        if ps_group is not None:
+            wrap_module_params_etp(self, ["weight"], ps_group)
+            self.ps_size = ps_group.size()
 
         if bias:
             if config.use_cpu_initialization:
@@ -1264,6 +1315,7 @@ class RowParallelLinear(torch.nn.Module):
             sequence_parallel=False,
             tp_group=None,
             grad_output_buffer=None,
+            ps_size=self.ps_size,
         )
 
         # All-reduce across all the partitions.

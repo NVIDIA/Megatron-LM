@@ -35,6 +35,7 @@ class LanguageModelEmbedding(MegatronModule):
         num_tokentypes: int = 0,
         scatter_to_sequence_parallel: bool = True,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ps_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
 
@@ -60,6 +61,7 @@ class LanguageModelEmbedding(MegatronModule):
             reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
             tp_group=self.tp_group,
+            ps_group=ps_group
         )
 
         # Position embedding (serial).
