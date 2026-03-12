@@ -13,7 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.pipeline_parallel.utils import set_streams
+from megatron.core.pipeline_parallel.utils import reset_streams, set_streams
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import float16_to_fp32
@@ -68,6 +68,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        reset_streams()
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
