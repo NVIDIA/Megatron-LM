@@ -2068,7 +2068,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (int) Index of the chunked prefill request, or -1 if none exists.
         """
-        return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+        if self.chunked_prefill_request_id == -1:
+            return -1
+
+        # Only search up to self.total_request_count since the chunked prefill request
+        # may not be scheduled in this iteration.
+        matches = torch.where(
+            self.request_ids[: self.total_request_count] == self.chunked_prefill_request_id
+        )[0]
+        if len(matches) > 0:
+            return matches[0].item()
+        return -1
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
@@ -2353,7 +2363,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = (
             0  # TODO : Check how this works with chunked prefill
         )
-        if self.chunked_prefill_request_id != -1:
+        if self.get_index_of_chunked_prefill_request() != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
@@ -2448,10 +2458,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
 
-            if self.chunked_prefill_request_id != -1:
+            if (chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request()) != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
                 active_requests_requiring_new_block[
-                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                    chunked_prefill_request_idx - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
             else:
                 max_allowed_active = min(
@@ -2542,9 +2552,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.
-        if self.chunked_prefill_request_id != -1:
+        if (chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request()) != -1:
             self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                src_idxs=torch.tensor([chunked_prefill_request_idx]),
                 dst_idxs=torch.tensor([self.total_request_count - 1]),
                 next_tokens=next_tokens,
                 new_speculative_tokens=new_speculative_tokens,
