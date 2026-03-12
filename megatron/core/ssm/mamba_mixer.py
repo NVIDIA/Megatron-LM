@@ -821,6 +821,8 @@ class MambaMixer(MegatronModule):
                 for r in range(num_requests):
                     start = cu_seqlens[r].item()
                     end = cu_seqlens[r + 1].item()
+                    if start == end:
+                        continue
                     # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
                     xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
                     init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)

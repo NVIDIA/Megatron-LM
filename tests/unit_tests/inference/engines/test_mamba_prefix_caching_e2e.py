@@ -262,7 +262,7 @@ class TestMambaPrefixCachingE2E:
         bid = alloc.kv_hash_to_block_id.get(block_hash)
         return 0 if bid is None else alloc.block_ref_counts[bid].item()
 
-    def _assert_step(self, step, reqs_by_group, alloc, step_prefill, num_groups):
+    def _assert_step(self, step, reqs_by_group, alloc, step_prefill, num_groups, ctx=None):
         """Shared per-step verification for single-group and multi-group runs."""
         G = num_groups
         if step == 1:
@@ -346,7 +346,7 @@ class TestMambaPrefixCachingE2E:
                 finished[merged.request_id] = list(merged.generated_tokens)
 
             if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
-                self._assert_step(step, reqs_by_group, alloc, step_prefill, 1)
+                self._assert_step(step, reqs_by_group, alloc, step_prefill, 1, ctx)
             if step == 3 and not req3_added:
                 engine._add_request(reqs[3])
                 req3_added = True
@@ -398,7 +398,7 @@ class TestMambaPrefixCachingE2E:
                 finished[merged.request_id] = list(merged.generated_tokens)
 
             if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
-                self._assert_step(step, reqs, alloc, step_prefill, NUM_GROUPS)
+                self._assert_step(step, reqs, alloc, step_prefill, NUM_GROUPS, ctx)
             if step == 3 and not req3_added:
                 for g in range(NUM_GROUPS):
                     engine._add_request(reqs[g][3])
@@ -531,26 +531,27 @@ class TestMambaPrefixCachingE2E:
                 )
                 assert step_prefill == 256
             elif step == 2:
-                # B: cached logit zero-prefill. C: 1 mamba match, skip 256, effective 256
+                # B: 1 mamba match but raw_skip >= chunk_length, back off to 0 blocks, full recompute (256)
+                # C: 1 mamba match, skip 256, effective 256
                 assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
                 assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
                 assert (
                     reqs[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
                 )
-                assert step_prefill == 256  # B=0 + C=256
+                assert step_prefill == 512  # B=256 (back-off recompute) + C=256
             elif step == 3:
-                # D: 2 mamba matches, cached logit zero-prefill
+                # D: 2 mamba matches, raw_skip >= chunk_length, back off to block 0, skip 256, effective 256
                 assert reqs[3]._mamba_num_matched_blocks == 2, f"step 3 D"
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
-                assert step_prefill == 0
+                assert step_prefill == 256
 
         return finished, ctx.lifetime_prefill_token_count
 
     @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
     def test_mamba_block_aligned_eos_e2e(self, use_triton_conv1d):
-        """Verify block-aligned EOS caching and cached logit zero-prefill."""
+        """Verify block-aligned EOS caching and recompute-based back-off."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
@@ -567,7 +568,7 @@ class TestMambaPrefixCachingE2E:
             assert (
                 off_outputs[req_id] == on_outputs[req_id]
             ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
-        assert off_prefill == 1536 and on_prefill == 512 and on_prefill < off_prefill
+        assert off_prefill == 1536 and on_prefill == 1024 and on_prefill < off_prefill
 
     def _create_eviction_prompts(self):
         device = torch.cuda.current_device()
