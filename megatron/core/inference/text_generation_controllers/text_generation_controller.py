@@ -762,7 +762,7 @@ class TextGenerationController:
             context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
 
             # Release the blocks back to the allocator
-            context.block_allocator.release_memory_blocks(blocks_to_release)
+            context.kv_block_allocator.release_memory_blocks(blocks_to_release)
 
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
