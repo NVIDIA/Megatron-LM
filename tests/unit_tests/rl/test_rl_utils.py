@@ -316,8 +316,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_epoch=[[0, 0, 0]],
-            kv_cache_epoch=[[0, 0, 0]],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -327,8 +327,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_epoch=[[0, 0, 0, 0]],
-            kv_cache_epoch=[[0, 0, 0, 0]],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
 
@@ -348,8 +348,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
-            policy_epoch=[[0, 0, 0, 0]],
-            kv_cache_epoch=[[0, 0, 0, 0]],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -359,8 +359,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
-            policy_epoch=[[0, 0, 0, 0]],
-            kv_cache_epoch=[[0, 0, 0, 0]],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -395,8 +395,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
-            policy_epoch=[[0, 0, 0, 0]] * num_turns,
-            kv_cache_epoch=[[0, 0, 0, 0]] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
@@ -406,8 +406,8 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
-            policy_epoch=[[0, 0, 0, 0, 0]] * num_turns,
-            kv_cache_epoch=[[0, 0, 0, 0, 0]] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
@@ -417,8 +417,8 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
-            policy_epoch=[[0, 0, 0]] * num_turns,
-            kv_cache_epoch=[[0, 0, 0]] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
 

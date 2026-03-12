@@ -1916,9 +1916,7 @@ class TestDynamicInferenceEngine:
         for entry in engine.requests.values():
             ps = entry.record[-1].policy_epoch
             ks = entry.record[-1].kv_cache_epoch
-            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-            assert (ps == 0).all()
-            assert (ks == 0).all()
+            assert ps == ks == [(0, 0)]
 
         # Generation epoch 1: new tokens get 1, existing keep 0.
         engine._generation_epoch = 1
@@ -1928,11 +1926,7 @@ class TestDynamicInferenceEngine:
         for entry in engine.requests.values():
             ps = entry.record[-1].policy_epoch
             ks = entry.record[-1].kv_cache_epoch
-            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
-            assert (ps[: PROMPT_LEN + 3] == 0).all()
-            assert (ps[PROMPT_LEN + 3 :] == 1).all()
-            assert (ks[: PROMPT_LEN + 3] == 0).all()
-            assert (ks[PROMPT_LEN + 3 :] == 1).all()
+            assert ps == ks == [(0, 0), (PROMPT_LEN + 3, 1)]
 
         # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
         # stamping logic will recreate it fresh when the request next generates tokens.
@@ -1958,25 +1952,17 @@ class TestDynamicInferenceEngine:
         for record in finished_records:
             merged = record.merge()
 
-            assert merged.policy_epoch is not None
-            assert merged.policy_epoch.shape == (PROMPT_LEN + NUM_TOKENS,)
-            assert (merged.policy_epoch[: PROMPT_LEN + 3] == 0).all()
-            assert (merged.policy_epoch[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-            assert (merged.policy_epoch[PROMPT_LEN + 6 :] == 2).all()
+            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 3, 1), (PROMPT_LEN + 6, 2)]
 
-            assert merged.kv_cache_epoch is not None
-            assert merged.kv_cache_epoch.shape == (PROMPT_LEN + NUM_TOKENS,)
             if use_checkpoint:
                 # KV cache was cleared by checkpoint; stamping logic recreated
                 # it at epoch 2 (when the first post-checkpoint step ran).
-                assert (merged.kv_cache_epoch == 2).all()
+                assert merged.kv_cache_epoch == [(0, 2)]
             else:
-                assert (merged.kv_cache_epoch[: PROMPT_LEN + 3] == 0).all()
-                assert (merged.kv_cache_epoch[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-                assert (merged.kv_cache_epoch[PROMPT_LEN + 6 :] == 2).all()
+                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 3, 1), (PROMPT_LEN + 6, 2)]
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]
         record.checkpoint()
-        assert (record[-1].policy_epoch == merged.policy_epoch).all()
+        assert record[-1].policy_epoch == merged.policy_epoch
         assert record[-1].kv_cache_epoch is None

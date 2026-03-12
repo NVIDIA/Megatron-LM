@@ -1140,8 +1140,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
             # Stamp this request with the current generation epoch.
-            if self._generation_epoch is not None:
-                self._stamp_generation_epoch(request, self._generation_epoch)
+            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
+            total = len(request.prompt_tokens) + len(request.generated_tokens)
+            if (epoch := self._generation_epoch) is not None and total > 0:
+                boundary = (total - 1, epoch)
+                if request.policy_epoch is None:
+                    request.policy_epoch = [(0, epoch)]
+                elif request.policy_epoch[-1][1] != epoch:
+                    request.policy_epoch.append(boundary)
+                if request.kv_cache_epoch is None:
+                    request.kv_cache_epoch = [(0, epoch)]
+                elif request.kv_cache_epoch[-1][1] != epoch:
+                    request.kv_cache_epoch.append(boundary)
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1164,25 +1174,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_being_finished_ids.clear()
 
         return active_request_ids, finished_request_records
-
-    @staticmethod
-    def _stamp_generation_epoch(request: DynamicInferenceRequest, epoch: int):
-        """Extend policy_epoch and kv_cache_epoch tensors to cover all current tokens."""
-        total = len(request.prompt_tokens) + len(request.generated_tokens)
-
-        if (t := request.policy_epoch) is not None:
-            request.policy_epoch = torch.cat(
-                (t, torch.full((total - len(t),), epoch, dtype=t.dtype, device=t.device)), dim=0
-            )
-        else:
-            request.policy_epoch = torch.full((total,), epoch, dtype=torch.int32, device='cpu')
-
-        if (t := request.kv_cache_epoch) is not None:
-            request.kv_cache_epoch = torch.cat(
-                (t, torch.full((total - len(t),), epoch, dtype=t.dtype, device=t.device)), dim=0
-            )
-        else:
-            request.kv_cache_epoch = torch.full((total,), epoch, dtype=torch.int32, device='cpu')
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.

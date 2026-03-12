@@ -343,8 +343,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
-    policy_epoch: Optional[torch.Tensor] = None
-    kv_cache_epoch: Optional[torch.Tensor] = None
+    policy_epoch: Optional[list[tuple[int, int]]] = None
+    kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps

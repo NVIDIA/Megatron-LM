@@ -794,9 +794,11 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_epoch.append(min(s for turn in rollout.policy_epoch for s in turn))
-            group_kv_epoch.append(min(s for turn in rollout.kv_cache_epoch for s in turn))
-            group_completed_epochs.extend(max(turn) for turn in rollout.policy_epoch)
+            assert rollout.policy_epoch, "Rollout has no policy_epoch data"
+            assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
+            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
+            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
