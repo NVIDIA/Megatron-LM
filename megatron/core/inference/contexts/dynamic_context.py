@@ -1707,8 +1707,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         finished = req.finished_chunk_token_count
         already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
+        # +1 accounts for the decode token that follows this chunk: after the
+        # chunk is processed, the bookkeeping produces a decode token at
+        # position (finished + chunk_length).  When chunk tokens exactly fill
+        # the last block, that decode token lands in the *next* block.  The
+        # chunked-prefill request is excluded from the normal new-block-pause
+        # path (to keep it schedulable), so we must pre-allocate that block here.
         overall_required_blocks = (
-            finished + chunk_length + self.block_size_tokens - 1
+            finished + chunk_length + 1 + self.block_size_tokens - 1
         ) // self.block_size_tokens
 
         # Fast path: skip all prefix matching when disabled.
