@@ -7,19 +7,19 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 
 try:
-    import cuda.bindings.driver as cuda  # type: ignore
+    import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     import torch
     import torch.distributed as dist
-    import triton  # type: ignore
+    import triton
     from cutlass.cute.runtime import from_dlpack
 
     import megatron.core.fusions.linear_cross_entropy.utils as utils
-    from megatron.core.fusions.linear_cross_entropy.blackwell import (
+    from megatron.core.fusions.linear_cross_entropy.hopper import (
         bwd_partial_dlogits as bwd_partial_dlogits,
     )
-    from megatron.core.fusions.linear_cross_entropy.blackwell import fwd_mainloop as fwd_mainloop
+    from megatron.core.fusions.linear_cross_entropy.hopper import fwd_mainloop as fwd_mainloop
     from megatron.core.fusions.linear_cross_entropy.triton import kernels as triton_kernels
 
     @dataclass
@@ -85,11 +85,11 @@ try:
         assert hidden.is_cuda and weight.is_cuda and labels.is_cuda
         assert weight.device == hidden.device and labels.device == hidden.device
 
-        # hidden could be [batch, seqlen, dim] or [seqlen, batch, dim] or [tokens, dim]
+        # hidden: [batch, seqlen, dim] or [seqlen, batch, dim] or [tokens, dim]
         assert hidden.dim() == 2 or hidden.dim() == 3
-        # weight must be [vocab_size, dim]
+        # weight: [vocab_size, dim]
         assert weight.dim() == 2
-        # labels could be [batch, seqlen] or [seqlen, batch] or [tokens]
+        # labels: [batch, seqlen] or [seqlen, batch] or [tokens]
         assert (hidden.dim() == 2 and labels.dim() == 1) or (
             hidden.dim() == 3 and labels.dim() == 2
         )
@@ -120,6 +120,7 @@ try:
         num_tokens, dim = hidden_view.shape
         vocab_size, _ = weight.shape
 
+        # Initialize config on first call
         if not _get_fwd_config()._initialized:
             _get_fwd_config()._dedicated_stream = torch.cuda.Stream(hidden.device)
             _get_fwd_config()._dedicated_events = [torch.cuda.Event() for _ in range(2)]
@@ -128,11 +129,10 @@ try:
         REDUCTION = utils.str_to_reduction_enum(reduction)
         # declare logprobs
         if REDUCTION == utils.EntropyReductionEnum.kNone:
-            logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
-            if in_tp_mode:
-                logprobs.zero_()
+            logprobs = torch.zeros((num_tokens,), device=hidden.device, dtype=torch.float32)
         else:
             logprobs = torch.zeros((), device=hidden.device, dtype=torch.float32)
+
         # declare auxiliary tensors
         maximum = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
         accumulate = torch.empty_like(maximum, dtype=torch.float32)
@@ -142,30 +142,33 @@ try:
             and accumulate.is_contiguous()
             and num_valid_tokens.is_contiguous()
         )
-        # declare intermediate tensors
-        # NOTE: this is a parameter for tuning
+
+        # Intermediate tensors for vocab splits
         num_splits = (
             vocab_size + _get_fwd_config()._vocab_per_split - 1
         ) // _get_fwd_config()._vocab_per_split
-        _max = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
-        _accu = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
+
+        _max = torch.full(
+            (num_tokens, num_splits), float('-inf'), device=hidden.device, dtype=torch.float32
+        )
+        _accu = torch.zeros((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
         if REDUCTION == utils.EntropyReductionEnum.kNone:
             _logprobs = logprobs
         else:
-            _logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
-            if in_tp_mode:
-                _logprobs.zero_()
+            _logprobs = torch.zeros((num_tokens,), device=hidden.device, dtype=torch.float32)
         assert _max.is_contiguous() and _accu.is_contiguous() and _logprobs.is_contiguous()
 
         triton_kernels.get_num_valid_tokens[(1,)](
             num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens
         )
 
-        # need to compile the kernel for the first time
+        # Pack tensors for CuTe
         hidden_packed = from_dlpack(
             hidden_view.detach(), assumed_align=16
         ).mark_compact_shape_dynamic(mode=0)
-        weight_packed = from_dlpack(weight.detach(), assumed_align=16)
+        weight_packed = from_dlpack(weight.detach(), assumed_align=16).mark_compact_shape_dynamic(
+            mode=0
+        )
         labels_packed = from_dlpack(
             labels_view.detach(), assumed_align=8
         ).mark_compact_shape_dynamic(mode=0)
@@ -235,7 +238,7 @@ try:
                 maximum,
                 maximum.stride(0),
                 accumulate,
-                maximum.stride(0),
+                accumulate.stride(0),
                 _logprobs,
                 _logprobs.stride(0),
                 logprobs,
@@ -275,10 +278,10 @@ try:
                 accumulate,
                 maximum.stride(0),
             )
-            # reduce accumulate
+            # Reduce accumulate
             dist.all_reduce(accumulate, op=dist.ReduceOp.SUM, group=tp_group)
 
-            # update logprobs
+            # Update logprobs
             torch.cuda.current_stream().wait_event(_get_fwd_config()._dedicated_events[1])
             triton_kernels.forward_tp_epilogue_update_logprobs[grid](
                 num_tokens,
@@ -350,7 +353,6 @@ try:
         d_weight = torch.empty_like(weight)
         assert d_hidden.is_contiguous() and d_weight.is_contiguous()
 
-        # FIXME: implement different backward methods
         _backward_method = _get_bwd_config()._backward_method
         if _backward_method == utils.BackwardMethodEnum.kDlogitsSplitN:
             vocab_per_split = _get_bwd_config()._vocab_per_split
