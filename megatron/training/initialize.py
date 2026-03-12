@@ -83,9 +83,6 @@ def initialize_megatron(
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
 
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker()
-
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
@@ -97,6 +94,9 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
     def state_save_func():
@@ -336,6 +336,41 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         # Set to non-default stream for cudagraph capturing.
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
+
+        # Set flight recorder env vars if specified.
+        # Priority: pre-existing environment variable > MLM argument.
+        # All vars follow the same setdefault semantics: if already set in the
+        # environment we warn and keep the user's value; otherwise we apply the
+        # value derived from the MLM argument / flag.
+        # The block is also triggered when either path env var is already set
+        # so that the remaining defaults are applied consistently.
+        _fr_path = (
+            args.flight_recorder_dump_path
+            or os.environ.get('TORCH_FR_DUMP_TEMP_FILE')
+            or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
+        )
+        if _fr_path is not None:
+            _fr_env_defaults = {
+                'TORCH_FR_DUMP_TEMP_FILE': _fr_path,
+                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_path,
+                'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
+                'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
+                'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
+                'TORCH_INCLUDE_ONLY_ACTIVE': str(int(args.flight_recorder_include_only_active)),
+                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(int(args.flight_recorder_extra_dump_on_exec)),
+            }
+            for _var, _default in _fr_env_defaults.items():
+                if _var in os.environ:
+                    warn_rank_0(
+                        f"Flight recorder: environment variable {_var} is already set to "
+                        f"'{os.environ[_var]}'; ignoring config value '{_default}'."
+                    )
+                else:
+                    os.environ[_var] = _default
+            print_rank_0(
+                "Flight recorder env vars:\n"
+                + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
+            )
 
         # Call the init process
         init_process_group_kwargs = {
