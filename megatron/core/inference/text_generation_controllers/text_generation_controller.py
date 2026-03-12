@@ -1640,6 +1640,7 @@ class TextGenerationController:
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
+    @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
         """Run dummy MTP forward passes to participate in EP collectives.
 
