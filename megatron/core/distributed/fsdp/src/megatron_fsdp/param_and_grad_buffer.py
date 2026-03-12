@@ -1299,7 +1299,7 @@ class DataParallelBuffer:
             # Get the coordinates of the slice of the item that is contained in this shard.
             slice_start, slice_end = self._get_item_slice_in_shard(item_id)
             # Flatten the item data and get the slice of the item to place in the shard.
-            item_data = item_data.flatten()[slice_start:slice_end]
+            item_data = item_data.data.flatten()[slice_start:slice_end]
         # Get the local coordinates of the slice of this buffer's shard that
         # intersects the specified item tensor.
         local_index_start, local_index_end = self._get_item_local_index(item_id)
@@ -1307,7 +1307,7 @@ class DataParallelBuffer:
         # slice of this buffer's shard that intersects the specified item tensor.
         shard = self.data[local_index_start:local_index_end]
         if shard.numel() > 0:
-            shard.data.copy_(item_data.flatten())
+            shard.data.copy_(item_data.data.flatten())
 
     def get_item(self, item_id: int, shard_only: bool = False) -> torch.Tensor:
         """
@@ -2290,7 +2290,6 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
                     dtype=main_grads_dtype,
-                    param_dtype=param_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding
                     # the optimizer state in HFSDP, else just DP-Shard when

@@ -679,7 +679,7 @@ class TestMegatronFSDPE2E:
                     fsdp_double_buffer=True,
                     fp4_recipe="nvfp4",
                     fp4="e2m1",
-                    fp4_param_gather=True,
+                    fp4_param=True,
                     bf16=True,
                     recompute_granularity="full",
                     recompute_method="uniform",
@@ -706,7 +706,7 @@ class TestMegatronFSDPE2E:
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             distopt_args = dict(use_distributed_optimizer=True, **spec_configs)
-            distopt_args.update(fp8_param_gather=False, fp4_param_gather=False)
+            distopt_args.update(fp8_param_gather=False, fp4_param=False)
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(**distopt_args)
 
         outputs = TestMegatronFSDPE2E._training_loop(
