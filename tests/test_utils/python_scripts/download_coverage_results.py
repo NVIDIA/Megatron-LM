@@ -60,7 +60,10 @@ def main(pipeline_id: int):
                 continue
 
             os.unlink(file_name)
-            iteration_dir = sorted((pathlib.Path("tmp") / "results").glob("iteration=*"), key=lambda p: int(p.name.split("=")[1]))[-1]
+            iteration_dir = sorted(
+                (pathlib.Path("tmp") / "results").glob("iteration=*"),
+                key=lambda p: int(p.name.split("=")[1]),
+            )[-1]
             restart_dir = sorted(os.listdir(iteration_dir))[-1]
             coverage_report_source = list(
                 glob.glob(

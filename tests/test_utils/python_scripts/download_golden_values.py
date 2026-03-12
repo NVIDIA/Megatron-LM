@@ -68,15 +68,18 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 continue
 
             os.unlink(file_name)
-            iteration_dir = sorted((pathlib.Path("tmp") / "results").glob("iteration=*"), key=lambda p: int(p.name.split("=")[1]))[-1]
+            iteration_dir = sorted(
+                (pathlib.Path("tmp") / "results").glob("iteration=*"),
+                key=lambda p: int(p.name.split("=")[1]),
+            )[-1]
             restart_dir = sorted(os.listdir(iteration_dir))[-1]
             job_name_hyphenated = job.name.replace("_", "-").lower()
             assets_basic_dir = iteration_dir / f"{restart_dir}" / "assets" / "basic"
             golden_values_sources = list(
-                (assets_basic_dir / f"{job_name_hyphenated}-{environment.replace('_', '-')}").glob("g*.json")
-            ) or list(
-                (assets_basic_dir / job_name_hyphenated).glob("g*.json")
-            )
+                (assets_basic_dir / f"{job_name_hyphenated}-{environment.replace('_', '-')}").glob(
+                    "g*.json"
+                )
+            ) or list((assets_basic_dir / job_name_hyphenated).glob("g*.json"))
 
             if len(golden_values_sources) < 1:
                 logger.info(
