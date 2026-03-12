@@ -1253,11 +1253,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Check if we should call the local cudagraph path.
         """
         # Training and validation mode CUDA graphs
-        if (
-            hasattr(self, 'cudagraph_manager')
-            and kwargs.get('inference_context') is None
-            and (self.training or _CudagraphGlobalRecord.cudagraph_created)
-        ):
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif not self.training and (

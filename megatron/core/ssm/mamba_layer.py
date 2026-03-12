@@ -192,11 +192,7 @@ class MambaLayer(GraphableMegatronModule):
         Check if we should call the local cudagraph path.
         """
         # Training and validation mode CUDA graphs
-        if (
-            hasattr(self, 'cudagraph_manager')
-            and kwargs.get('inference_context') is None
-            and (self.training or _CudagraphGlobalRecord.cudagraph_created)
-        ):
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
             return True
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')
