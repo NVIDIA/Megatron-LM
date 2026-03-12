@@ -1,0 +1,87 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  # Megatron core
+  --use-mcore-models: true
+  --transformer-impl: inference_optimized
+  --bf16: true
+  --micro-batch-size: 1
+  --deterministic-mode: true
+  --attention-backend: flash
+
+  # Architecture (DeepSeek 16B-based)
+  --num-layers: 8
+  --hidden-size: 2048
+  --ffn-hidden-size: 10944
+  --num-attention-heads: 16
+  --kv-channels: 128
+  --max-position-embeddings: 4096
+  --position-embedding-type: rope
+  --rotary-base: 1000000
+  --normalization: RMSNorm
+  --swiglu: true
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+
+  # MLA (randomly initialized — not from checkpoint)
+  --multi-latent-attention: true
+  --cache-mla-latents: true
+  --q-lora-rank: 1536
+  --kv-lora-rank: 512
+  --qk-head-dim: 128
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 192
+  --rotary-scaling-factor: 40
+  --mscale: 1.0
+  --mscale-all-dim: 1.0
+  --qk-layernorm: true
+
+  # MoE
+  --num-experts: 64
+  --moe-ffn-hidden-size: 1408
+  --moe-shared-expert-intermediate-size: 2816
+  --moe-router-topk: 6
+  --moe-router-score-function: sigmoid
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+
+  # Parallelism
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --sequence-parallel: true
+
+  # Inference
+  --inference-max-seq-length: 4096
+  --max-tokens-to-oom: 3600000
+  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-max-requests-override: 8
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 8
+  --termination-id: -1
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+
+  # Checkpoint + tokenizer
+  --auto-detect-ckpt-format: true
+  --no-load-optim: true
+  --dist-ckpt-strictness: log_unexpected
+  --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+
+  # Prompts
+  --prompts: "Time travel to 2008, where we find the global financial crisis unfolding. Banks are failing, markets are crashing, and governments are scrambling to respond."
+METRICS:
+  - "generated_tokens"
+  - "logprobs"
