@@ -1553,26 +1553,45 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
-    def test_chunked_prefill_with_log_probs(self):
+    def test_chunked_prefill_with_log_probs(
+        self, materialize_only_last_token_logits: bool, skip_prompt_log_probs: bool
+    ):
         """
-        Test that chunked prefill correctly handles log probs with materialize_only_last_token_logits.
-        This verifies that intermediate log probs are properly discarded during chunked prefill.
+        Test that chunked prefill correctly handles log probs across all branches
+        of the log-prob accumulation logic.
         When materialize_only_last_token_logits=True, skip_prompt_log_probs must be True.
         """
+        if materialize_only_last_token_logits and not skip_prompt_log_probs:
+            with pytest.raises(AssertionError, match="only last token logits are materialized"):
+                self._run_test(
+                    num_requests=1,
+                    min_prompt_length=1200,
+                    max_prompt_length=1200,
+                    num_tokens_to_generate=8,
+                    materialize_only_last_token_logits=True,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    model_provider="gpt",
+                    context_block_size_tokens=256,
+                    context_max_tokens=1000,
+                    enable_chunked_prefill=True,
+                )
+            return
+
         prompt_length = 1200
         num_tokens_to_generate = 8
 
-        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True
-        # This is the only valid combination for chunked prefill with last-token-only logits
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
             max_prompt_length=prompt_length,
             num_tokens_to_generate=num_tokens_to_generate,
-            materialize_only_last_token_logits=True,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             return_log_probs=True,
-            skip_prompt_log_probs=True,
+            skip_prompt_log_probs=skip_prompt_log_probs,
             model_provider="gpt",
             context_block_size_tokens=256,
             context_max_tokens=1000,
@@ -1593,11 +1612,17 @@ class TestDynamicInferenceEngine:
                 f"generated log probs, got {len(request.generated_log_probs)}"
             )
 
-            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
-            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
-                f"Request {request.request_id}: prompt_log_probs should be empty when "
-                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
-            )
+            if skip_prompt_log_probs:
+                assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                    f"Request {request.request_id}: prompt_log_probs should be empty when "
+                    f"skip_prompt_log_probs=True, but got "
+                    f"{len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
+                )
+            else:
+                assert len(request.prompt_log_probs) == prompt_length - 1, (
+                    f"Request {request.request_id}: Expected {prompt_length - 1} "
+                    f"prompt log probs, got {len(request.prompt_log_probs)}"
+                )
 
             # Validate each generated log prob
             for i, log_prob in enumerate(request.generated_log_probs):
