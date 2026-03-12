@@ -93,6 +93,150 @@ Megatron-LM/
 └── docs/                        # Documentation
 ```
 
+### Megatron-LM: Reference Implementation
+
+**Reference implementation** that includes Megatron Core plus everything needed to train models.
+
+**Best for:**
+
+- **Training state-of-the-art foundation models** at scale with cutting-edge performance on latest NVIDIA hardware
+- **Research teams** exploring new architectures and training techniques
+- **Learning distributed training** concepts and best practices
+- **Quick experimentation** with proven model configurations
+
+**What you get:**
+
+- Pre-configured training scripts for GPT, LLama, DeepSeek, Qwen, and more.
+- End-to-end examples from data prep to evaluation
+- Research-focused tools and utilities
+
+### Megatron Core: Composable Library
+
+**Composable library** with GPU-optimized building blocks for custom training frameworks.
+
+**Best for:**
+
+- **Framework developers** building on top of modular and optimized components
+- **Research teams** needing custom training loops, optimizers, or data pipelines
+- **ML engineers** requiring fault-tolerant training pipelines
+
+**What you get:**
+
+- Composable transformer building blocks (attention, MLP, etc.)
+- Advanced parallelism strategies (TP, PP, DP, EP, CP)
+- Pipeline schedules and distributed optimizers
+- Mixed precision support (FP16, BF16, FP8)
+- GPU-optimized kernels and memory management
+- High-performance dataloaders and dataset utilities
+- Model architectures (LLaMA, Qwen, GPT, Mixtral, Mamba, etc.)
+
+## Ecosystem Libraries
+
+**Libraries used by Megatron Core:**
+
+- **[Megatron Energon](https://github.com/NVIDIA/Megatron-Energon)** 📣 **NEW!** - Multi-modal data loader (text, images, video, audio) with distributed loading and dataset blending
+- **[Transformer Engine](https://github.com/NVIDIA/TransformerEngine)** - Optimized kernels and FP8 mixed precision support
+- **[Resiliency Extension (NVRx)](https://github.com/NVIDIA/nvidia-resiliency-ext)** - Fault tolerant training with failure detection and recovery
+
+**Libraries using Megatron Core:**
+
+- **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Training library with bidirectional Hugging Face ↔ Megatron checkpoint conversion, flexible training loops, and production-ready recipes
+- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)** - Scalable toolkit for efficient reinforcement learning with RLHF, DPO, and other post-training methods
+- **[NeMo Framework](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html)** - Enterprise framework with cloud-native support and end-to-end examples
+- **[TensorRT Model Optimizer (ModelOpt)](https://github.com/NVIDIA/TensorRT-Model-Optimizer)** - Model optimization toolkit for quantization, pruning, distillation, speculative decoding, and more. Checkout end-to-end examples in [examples/post_training/modelopt](./examples/post_training/modelopt/).
+
+**Compatible with:** [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
+
+# Installation
+
+## 🐳 Docker (Recommended)
+
+We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
+
+**Note:** The NGC PyTorch container constraints the python environment globally via `PIP_CONSTRAINT`. In the following examples we will unset the variable.
+
+This container comes with all dependencies pre-installed with compatible versions and optimized configurations for NVIDIA GPUs:
+
+- PyTorch (latest stable version)
+- CUDA, cuDNN, NCCL (latest stable versions)
+- Support for FP8 on NVIDIA Hopper, Ada, and Blackwell GPUs
+- For best performance, use NVIDIA Turing GPU architecture generations and later
+
+```bash
+# Run container with mounted directories
+docker run --runtime --nvidia --gpus all -it --rm \
+  -v /path/to/megatron:/workspace/megatron \
+  -v /path/to/dataset:/workspace/dataset \
+  -v /path/to/checkpoints:/workspace/checkpoints \
+  -e PIP_CONSTRAINT= \
+  nvcr.io/nvidia/pytorch:25.04-py3
+```
+
+## Pip Installation
+
+Megatron Core offers support for two NGC PyTorch containers:
+
+- `dev`: Moving head that supports the most recent upstream dependencies
+- `lts`: Long-term support of NGC PyTorch 24.01
+
+Both containers can be combined with `mlm` which adds package dependencies for Megatron-LM on top of Megatron Core.
+
+```bash
+# Install the latest release dependencies
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+pip install --no-build-isolation megatron-core[dev]
+# For running an M-LM application:
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+pip install --no-build-isolation megatron-core[mlm,dev]
+```
+
+```bash
+# Install packages for LTS support NGC PyTorch 24.01
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+pip install --no-build-isolation megatron-core[lts]
+# For running an M-LM application:
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+pip install --no-build-isolation megatron-core[mlm,lts]
+```
+
+For a version of Megatron Core with only torch, run:
+
+```bash
+pip install megatron-core
+```
+
+### Optional MoE Dependencies
+
+For Mixture of Experts (MoE) training with the legacy Grouped GEMM support:
+
+```bash
+pip install --no-build-isolation megatron-core[moe]
+```
+
+**Note:** 
+1. The `nv-grouped-gemm` package requires:
+- CUDA toolkit (nvcc) with CUTLASS headers
+- On Ubuntu/Debian: `apt-get install libcutlass-dev`
+- GPU with compute capability >= 8.0
+
+2. We recommend installing Transformer Engine (>=1.9) for more comprehensive grouped gemm support.
+The legacy grouped gemm will only be used when
+    - `--moe-grouped-gemm` is specified and
+    - TE (>= 1.9) is not available or `--moe-use-legacy-grouped-gemm` is specified
+
+## System Requirements
+
+### Hardware Requirements
+
+- **FP8 Support**: NVIDIA Hopper, Ada, Blackwell GPUs
+- **Recommended**: NVIDIA Turing architecture or later
+
+### Software Requirements
+
+- **CUDA/cuDNN/NCCL**: Latest stable versions
+- **PyTorch**: Latest stable version
+- **Transformer Engine**: Latest stable version
+- **Python**: 3.12 recommended
 
 # Performance Benchmarking
 
