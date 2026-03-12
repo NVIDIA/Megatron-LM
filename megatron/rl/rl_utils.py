@@ -33,6 +33,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
@@ -1079,16 +1080,17 @@ def prepare_trajectories(
     # Track counts for each environment ID
     env_id_counts = Counter()
 
-    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
+    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>', '<SPECIAL_999>']
 
     if tokenizer.library == "huggingface":
+        tokenizer : HuggingFaceTokenizer
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
-                if pad_token in tokenizer.vocab:
+                if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
                     log_single_rank(
                         logger, logging.INFO, f"Updating tokenizer pad token to {pad_token}"
                     )
-                    tokenizer._tokenizer.pad_token_id = tokenizer.vocab[pad_token]
+                    tokenizer._tokenizer.pad_token = pad_token
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
