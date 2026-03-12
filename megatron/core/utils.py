@@ -2085,6 +2085,7 @@ def is_submodule(module, parent_module, strict=True):
 def pad_or_truncate_thd_tensors(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
+    loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     sequence_length: int,
@@ -2095,10 +2096,11 @@ def pad_or_truncate_thd_tensors(
 
     For SFT with packed sequences, the total number of tokens across all sub-sequences
     in a sample may not match the target sequence length. This function either:
-      - Truncates: clips input_ids, labels, and cu_seqlens/cu_seqlens_padded so that
-        the total token count equals ``sequence_length``. Sub-sequences that extend
-        beyond the boundary are dropped, and a final cumulative length entry is appended.
-      - Pads: extends input_ids and labels with padding tokens to reach
+      - Truncates: clips input_ids, labels, loss_mask, and cu_seqlens/cu_seqlens_padded
+        so that the total token count equals ``sequence_length``. Sub-sequences that
+        extend beyond the boundary are dropped, and a final cumulative length entry is
+        appended.
+      - Pads: extends input_ids, labels, and loss_mask with padding values to reach
         ``sequence_length``, and updates the last entry of cu_seqlens (and
         cu_seqlens_padded if present) accordingly.
 
@@ -2107,6 +2109,7 @@ def pad_or_truncate_thd_tensors(
     Args:
         input_ids (torch.Tensor): 1-D token IDs for the packed sample.
         labels (torch.Tensor): 1-D label IDs for the packed sample.
+        loss_mask (torch.Tensor): 1-D loss mask for the packed sample (1 = train, 0 = mask).
         cu_seqlens (torch.Tensor): 1-D cumulative sequence lengths (int32), starting
             at 0 and ending at the total token count.
         cu_seqlens_padded (torch.Tensor | None): 1-D cumulative sequence lengths after
@@ -2117,12 +2120,13 @@ def pad_or_truncate_thd_tensors(
             ignore index).
 
     Returns:
-        Tuple of (input_ids, labels, cu_seqlens, cu_seqlens_padded), all adjusted to
-        ``sequence_length``.
+        Tuple of (input_ids, labels, loss_mask, cu_seqlens, cu_seqlens_padded), all
+        adjusted to ``sequence_length``.
     """
     if input_ids.shape[0] > sequence_length: # Truncate
         input_ids = input_ids[:sequence_length]
         labels = labels[:sequence_length]
+        loss_mask = loss_mask[:sequence_length]
         # NOTE(asolergi-nv): Truncate cu_seqlens
         # Find the largest index such that cu_seqlens[index] <= sequence_length
         idx = (cu_seqlens < sequence_length).nonzero(as_tuple=True)[0]
@@ -2143,12 +2147,13 @@ def pad_or_truncate_thd_tensors(
     else: # Pad
         input_ids = torch.cat([input_ids, torch.full((sequence_length - input_ids.shape[0],), padding_token_id, dtype=input_ids.dtype, device=input_ids.device)])
         labels = torch.cat([labels, torch.full((sequence_length - labels.shape[0],), padding_label_id, dtype=labels.dtype, device=labels.device)])
+        loss_mask = torch.cat([loss_mask, torch.zeros(sequence_length - loss_mask.shape[0], dtype=loss_mask.dtype, device=loss_mask.device)])
         cu_seqlens = torch.cat([cu_seqlens[:-1], cu_seqlens.new_tensor([sequence_length])])
         # NOTE(asolergi-nv): Pad cu_seqlens_padded if CP
         if cu_seqlens_padded is not None:
             cu_seqlens_padded = torch.cat([cu_seqlens_padded[:-1], cu_seqlens_padded.new_tensor([sequence_length])])
-    
-    return input_ids, labels, cu_seqlens, cu_seqlens_padded 
+
+    return input_ids, labels, loss_mask, cu_seqlens, cu_seqlens_padded
 
 def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_size: int, sp: bool, padding_token_id: int, padding_label_id: int, max_seq_len: int):
     """Preprocess an SFT batch on TP rank 0 before broadcasting to other TP ranks.
@@ -2186,12 +2191,12 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
         # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
         ### 1. Create cu_seqlens_padded if CP is enabled
         ### 2. Pad or truncate tensors if necessary
-        ### 3. Create loss mask
+        ### 3. Process loss mask
         ### 4. Create position ids
         ### 5. Create max_seqlen
         # From this point, all tensors have shape [1, sequence_length] (Except for cu_seqlens, cu_seqlens_padded and max_seqlen)
 
-        tokens, labels, cu_seqlens = batch["tokens"].squeeze(0), batch["labels"].squeeze(0), batch["cu_seqlens"].squeeze(0) # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension, so we need to remove it since TE expects cu_seqlens to be 1D
+        tokens, labels, loss_mask, cu_seqlens = batch["tokens"].squeeze(0), batch["labels"].squeeze(0), batch["loss_mask"].squeeze(0), batch["cu_seqlens"].squeeze(0) # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension, so we need to remove it since TE expects cu_seqlens to be 1D
 
         # NOTE(asolergi-nv): This is performed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L393C5-L408C77
         # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
@@ -2210,17 +2215,20 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
                     padding_token_id=padding_token_id,
                     padding_label_id=padding_label_id,
                 )
+            # NOTE(asolergi-nv): Pad loss_mask for CP divisibility (reuse TE's padding with 0 for masked positions)
+            _, loss_mask, _ = pad_thd_sequences_for_cp(
+                    loss_mask,
+                    loss_mask,
+                    cu_seqlens,
+                    divisibility_factor,
+                    padding_token_id=0,
+                    padding_label_id=0,
+                )
             cu_seqlens_padded = cu_seqlens_padded.to(torch.int32) # NOTE(asolergi-nv): pad_thd_sequences_for_cp uses torch.cumsum which promotes int32 cu_seqlens_padded to int64
         else:
             cu_seqlens_padded = None
 
-        tokens, labels, cu_seqlens, cu_seqlens_padded = pad_or_truncate_thd_tensors(tokens, labels, cu_seqlens, cu_seqlens_padded, max_seq_len, padding_token_id, padding_label_id)
-
-        # Loss mask.
-        loss_mask = torch.ones(max_seq_len, dtype=torch.float32)
-        loss_mask[labels == padding_token_id] = 0.0  # NOTE(asolergi-nv): Mask paddings
-        loss_mask[labels == padding_label_id] = 0.0  # NOTE(asolergi-nv): Mask prompts 
-        # print(f"Trained tokens: {sum(loss_mask)} ({sum(loss_mask) / max_seq_len * 100:.2f}%), padding tokens: {sum(tokens == padding_token_id)} ({sum(tokens == padding_token_id) / max_seq_len * 100:.2f}%)")
+        tokens, labels, loss_mask, cu_seqlens, cu_seqlens_padded = pad_or_truncate_thd_tensors(tokens, labels, loss_mask, cu_seqlens, cu_seqlens_padded, max_seq_len, padding_token_id, padding_label_id)
 
         # Position ids.
         seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]

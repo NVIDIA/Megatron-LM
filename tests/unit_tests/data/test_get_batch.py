@@ -71,8 +71,9 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
         lengths.append(l)
         total += l
 
-    assert sum(lengths) < max_seq_length, f"Sum of lengths {sum(lengths)} is greater than max_seq_length {max_seq_length}"
-    text = torch.randint(0, 10000, (1, sum(lengths) + 1), dtype=torch.int64)
+    num_real_tokens = sum(lengths)
+    assert num_real_tokens < max_seq_length, f"Sum of lengths {num_real_tokens} is greater than max_seq_length {max_seq_length}"
+    text = torch.randint(0, 10000, (1, num_real_tokens + 1), dtype=torch.int64)
     tokens = text[:, :-1].contiguous()
     labels = text[:, 1:].contiguous()
 
@@ -81,8 +82,9 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
         torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32),
     ))
 
-    batch = {"tokens": tokens, "labels": labels, "cu_seqlens": cu_seqlens}
-    return iter([batch])
+    loss_mask = torch.ones((1, num_real_tokens), dtype=torch.float)
+    batch = {"tokens": tokens, "labels": labels, "loss_mask": loss_mask, "cu_seqlens": cu_seqlens}
+    return iter([batch]), num_real_tokens
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -96,8 +98,9 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     initialize_test_environment(tp_size, cp_size, seq_length, micro_batch_size=1, global_batch_size=global_batch_size, sft=True)
 
     data_iterator = None
+    num_real_tokens = 0
     if mpu.get_tensor_model_parallel_rank() == 0:
-        data_iterator = create_sft_data_iterator(seq_length)
+        data_iterator, num_real_tokens = create_sft_data_iterator(seq_length)
 
     (
         attention_mask,
@@ -155,6 +158,93 @@ def test_sft_batch(tp_size, cp_size, seq_length):
         assert cu_seqlens_padded[0].item() == 0
         assert cu_seqlens_padded[-1].item() == seq_length
         assert cu_seqlens_padded.shape == cu_seqlens.shape
+
+        # Compute the divisibility factor (mirrors preprocess_sft_batch logic)
+        sp = tp_size > 1
+        divisibility_factor = cp_size * 2
+        if tp_size > 1 and sp:
+            divisibility_factor *= tp_size
+
+        # Compute the segment lengths from cu_seqlens and cu_seqlens_padded
+        orig_seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        padded_seg_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        num_segments = len(orig_seg_lengths)
+
+        # cu_seqlens_padded: every segment must be divisible by divisibility_factor
+        for i, seg_len in enumerate(padded_seg_lengths):
+            assert seg_len.item() % divisibility_factor == 0, (
+                f"Padded segment {i} length {seg_len.item()} not divisible by {divisibility_factor}"
+            )
+
+        # cu_seqlens_padded segments >= cu_seqlens segments (padding only adds tokens).
+        # The last segment is excluded because pad_or_truncate_thd_tensors replaces
+        # the final entry of both cu_seqlens and cu_seqlens_padded with seq_length.
+        # Since cu_seqlens_padded[-2] >= cu_seqlens[-2] (from CP padding), the last
+        # padded segment (seq_length - cu_seqlens_padded[-2]) can be smaller than the
+        # last original segment (seq_length - cu_seqlens[-2]).
+        for i in range(num_segments - 1):
+            assert padded_seg_lengths[i].item() >= orig_seg_lengths[i].item(), (
+                f"Segment {i}: padded length {padded_seg_lengths[i].item()} < original length {orig_seg_lengths[i].item()}"
+            )
+
+        # loss_mask: must be binary (0.0 or 1.0)
+        assert ((loss_mask == 0.0) | (loss_mask == 1.0)).all(), "loss_mask must be binary"
+
+        # Intra-sample CP padding validation: for each padded segment on this
+        # CP rank, verify that position_ids and loss_mask are consistent with
+        # the padding introduced by pad_thd_sequences_for_cp.
+        cp_rank = mpu.get_context_parallel_rank()
+        per_rank_seg_lens = (padded_seg_lengths // cp_size).tolist()
+
+        offset = 0
+        for i in range(num_segments):
+            seg_len = per_rank_seg_lens[i]
+            if seg_len == 0:
+                continue
+            seg_pos = position_ids[0, offset:offset + seg_len]
+            seg_loss = loss_mask[0, offset:offset + seg_len]
+
+            # position_ids within each segment's CP partition must be contiguous
+            # (stride 1) starting at cp_rank * seg_len (THD partitioning
+            # assigns the r-th contiguous chunk of each padded segment to rank r)
+            expected_start = cp_rank * seg_len
+            expected_pos = torch.arange(
+                expected_start, expected_start + seg_len,
+                dtype=torch.int64, device=seg_pos.device,
+            )
+            assert torch.equal(seg_pos, expected_pos), (
+                f"Segment {i}: expected position_ids [{expected_start}, "
+                f"{expected_start + seg_len}) but got "
+                f"[{seg_pos[0].item()}, ..., {seg_pos[-1].item()}] on CP rank {cp_rank}"
+            )
+
+            # For non-last segments, cu_seqlens entries are unchanged by
+            # pad_or_truncate_thd_tensors, so orig_seg_lengths[i] is the true
+            # sub-sequence length.  This lets us make precise assertions:
+            #   position_id >= orig_len  =>  intra-sample CP padding  =>  loss_mask == 0
+            #   position_id <  orig_len  =>  real token               =>  loss_mask == 1
+            # (The last segment absorbs end-of-sequence padding so its
+            # orig_seg_lengths entry is inflated -- skip the precise check.)
+            if i < num_segments - 1:
+                orig_len = orig_seg_lengths[i].item()
+                padding_mask = seg_pos >= orig_len
+                if padding_mask.any():
+                    assert (seg_loss[padding_mask] == 0.0).all(), (
+                        f"Segment {i}: intra-sample padding tokens (pos >= {orig_len}) "
+                        f"must have loss_mask=0, CP rank {cp_rank}"
+                    )
+                real_mask = seg_pos < orig_len
+                if real_mask.any():
+                    assert (seg_loss[real_mask] == 1.0).all(), (
+                        f"Segment {i}: real tokens (pos < {orig_len}) "
+                        f"must have loss_mask=1, CP rank {cp_rank}"
+                    )
+
+            offset += seg_len
+
+        assert offset == seq_len_per_rank, (
+            f"Total per-rank offset {offset} != expected {seq_len_per_rank}"
+        )
     else:
         assert cu_seqlens_padded is None
 

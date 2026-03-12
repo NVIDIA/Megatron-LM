@@ -29,6 +29,10 @@ class ChatTemplateConfig:
     end_str: str
     think_start_str: str
     think_end_str: str
+    tool_call_start_str: str
+    tool_call_end_str: str
+    tool_response_start_str: str
+    tool_response_end_str: str
 
 @dataclass
 class Nemotron3ChatTemplateConfig(ChatTemplateConfig):
@@ -38,6 +42,10 @@ class Nemotron3ChatTemplateConfig(ChatTemplateConfig):
     end_str: str = "<|im_end|>\n"
     think_start_str: str = "<think>"
     think_end_str: str = "</think>"
+    tool_call_start_str: str = "<tool_call>\n"
+    tool_call_end_str: str = "</tool_call>\n"
+    tool_response_start_str: str = "<tool_response>\n"
+    tool_response_end_str: str = "</tool_response>\n"
 
 
 @dataclass
@@ -47,12 +55,9 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
     train_on_thinking_traces: bool = True
     """If False, mask thinking traces from the completitions"""
-    
-    #completitions_start_tokens: List[int]
-    """The tokens that indicate the start of a completition"""
 
-    #completitions_end_tokens: List[int]
-    """The tokens that indicate the end of a completition"""
+    train_on_tool_calls: bool = True
+    """If True, include tool call content in the loss computation"""
 
     chat_template_config: ChatTemplateConfig = field(default_factory=Nemotron3ChatTemplateConfig)
 
@@ -60,6 +65,9 @@ class SFTDatasetConfig(GPTDatasetConfig):
     end_tokens: List[int] = field(init=False, default=None)
     think_start_id: int = field(init=False, default=None)
     think_end_id: int = field(init=False, default=None)
+    tool_call_start_tokens: List[int] = field(init=False, default=None)
+    tool_call_end_tokens: List[int] = field(init=False, default=None)
+    tool_response_start_tokens: List[int] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -67,6 +75,10 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
         assert not self.train_on_thinking_traces or self.train_on_assistant_responses_only, (
             "train_on_assistant_responses_only must be True when train_on_thinking_traces is True"
+        )
+
+        assert not self.train_on_tool_calls or self.train_on_assistant_responses_only, (
+            "train_on_assistant_responses_only must be True when train_on_tool_calls is True"
         )
 
         assert not self.train_on_assistant_responses_only or self.chat_template_config is not None, (
@@ -82,6 +94,9 @@ class SFTDatasetConfig(GPTDatasetConfig):
             self.end_tokens = self.tokenizer.encode(self.chat_template_config.end_str, add_special_tokens=False)
             self.think_start_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_start_str)
             self.think_end_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_end_str)
+            self.tool_call_start_tokens = self.tokenizer.encode(self.chat_template_config.tool_call_start_str, add_special_tokens=False)
+            self.tool_call_end_tokens = self.tokenizer.encode(self.chat_template_config.tool_call_end_str, add_special_tokens=False)
+            self.tool_response_start_tokens = self.tokenizer.encode(self.chat_template_config.tool_response_start_str, add_special_tokens=False)
 
 
 class SFTDataset(MegatronDataset):
@@ -163,28 +178,28 @@ class SFTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
-        tokens, labels, lengths = self._query_document_sample_shuffle_indices(idx)
+        tokens, loss_mask, lengths = self._query_document_sample_shuffle_indices(idx)
 
         tokens = torch.from_numpy(tokens).long()
+        loss_mask = torch.from_numpy(loss_mask).float()
         cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(torch.from_numpy(lengths), dim = 0))).to(torch.int32) # NOTE(asolergi-nv): torch.cumsum promotes int32 to int64
-        
-        # TODO(asolergi-nv): Create labels, remember self.config.train_on_completitions_only
 
         return {
             'tokens': tokens[:-1].contiguous(),
             'labels': tokens[1:].contiguous(),
+            'loss_mask': loss_mask[:-1].contiguous(),
             'cu_seqlens': cu_seqlens,
         }
     def _query_document_sample_shuffle_indices(
         self, idx: int
-    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
         """Get the text (token ids) and document ids for a given index
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
+            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The text ids, loss mask, and document ids
         """
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
@@ -206,12 +221,23 @@ class SFTDataset(MegatronDataset):
             
             sample = self.dataset.get(self.document_index[i])
             if self.config.train_on_assistant_responses_only:
-                segments = extract_segments(sample.tolist(), self.config.role_start_tokens, self.config.end_tokens, self.config.think_start_id, self.config.think_end_id)
+                segments = extract_segments(
+                    sample.tolist(),
+                    self.config.role_start_tokens,
+                    self.config.end_tokens,
+                    self.config.think_start_id,
+                    self.config.think_end_id,
+                    self.config.tool_call_start_tokens,
+                    self.config.tool_call_end_tokens,
+                    self.config.tool_response_start_tokens,
+                )
                 loss_mask = numpy.zeros(sample.shape[0], dtype=numpy.int64)
                 for seg in segments:
                     if seg["role"] == "assistant":
                         loss_mask[seg["start"]:seg["end"]] = 1
                     elif seg["role"] == "reasoning" and self.config.train_on_thinking_traces:
+                        loss_mask[seg["start"]:seg["end"]] = 1
+                    elif seg["role"] == "tool_call" and self.config.train_on_tool_calls:
                         loss_mask[seg["start"]:seg["end"]] = 1
             else:
                 loss_mask = numpy.ones(sample.shape[0], dtype=numpy.int64)
@@ -537,7 +563,58 @@ def find_subsequence(sequence, subsequence, start=0):
             return i
     return -1
 
-def extract_segments(tokenized_conversation, role_start_tokens, end_tokens, think_start_id, think_end_id):
+def _split_tool_calls(tokens, offset, tool_call_start_tokens, tool_call_end_tokens):
+    """Split a token sequence into assistant text and tool_call sub-segments.
+
+    Whitespace-only (\n) assistant fragments between </think> and <tool_call>
+    are dropped so we don't produce meaningless segments.
+    """
+    NL_TOKEN = tool_call_start_tokens[-1]  # \n token is the last token in the start marker
+    tc_start_len = len(tool_call_start_tokens)
+    tc_end_len = len(tool_call_end_tokens)
+    result = []
+    pos = 0
+    while pos < len(tokens):
+        tc_start = find_subsequence(tokens, tool_call_start_tokens, pos)
+
+        if tc_start == -1:
+            if pos < len(tokens):
+                result.append({"role": "assistant", "tokens": tokens[pos:], "start": offset + pos, "end": offset + len(tokens)})
+            break
+
+        # Assistant content before tool_call (skip if whitespace-only)
+        if tc_start > pos:
+            frag = tokens[pos:tc_start]
+            if not all(t == NL_TOKEN for t in frag):
+                result.append({"role": "assistant", "tokens": frag, "start": offset + pos, "end": offset + tc_start})
+
+        content_start = tc_start + tc_start_len
+        tc_end = find_subsequence(tokens, tool_call_end_tokens, content_start)
+
+        if tc_end == -1:
+            result.append({"role": "tool_call", "tokens": tokens[content_start:], "start": offset + content_start, "end": offset + len(tokens)})
+            break
+
+        result.append({"role": "tool_call", "tokens": tokens[content_start:tc_end], "start": offset + content_start, "end": offset + tc_end})
+        pos = tc_end + tc_end_len
+
+    # Drop trailing whitespace-only assistant fragments
+    if result and result[-1]["role"] == "assistant" and all(t == NL_TOKEN for t in result[-1]["tokens"]):
+        result.pop()
+
+    return result
+
+
+def extract_segments(
+    tokenized_conversation,
+    role_start_tokens,
+    end_tokens,
+    think_start_id,
+    think_end_id,
+    tool_call_start_tokens,
+    tool_call_end_tokens,
+    tool_response_start_tokens,
+):
     markers = []
     for role, start_tokens in role_start_tokens.items():
         pos = 0
@@ -559,6 +636,12 @@ def extract_segments(tokenized_conversation, role_start_tokens, end_tokens, thin
             content_end = end_pos
         content_tokens = tokenized_conversation[content_start:content_end]
 
+        # Check if this user turn is actually a tool response
+        tr_start_len = len(tool_response_start_tokens)
+        if role == "user" and len(content_tokens) >= tr_start_len and content_tokens[:tr_start_len] == tool_response_start_tokens:
+            segments.append({"role": "tool_response", "tokens": content_tokens, "start": content_start, "end": content_end})
+            continue
+
         if role == "assistant":
             think_start_idx = None
             think_end_idx = None
@@ -576,9 +659,15 @@ def extract_segments(tokenized_conversation, role_start_tokens, end_tokens, thin
                     abs_start = content_start + think_start_idx + 1
                     abs_end = content_start + think_end_idx
                     segments.append({"role": "reasoning", "tokens": reasoning_tokens, "start": abs_start, "end": abs_end})
+                # Split the response part by tool calls
                 if response_tokens:
                     abs_start = content_start + think_end_idx + 1
-                    segments.append({"role": "assistant", "tokens": response_tokens, "start": abs_start, "end": content_end})
+                    segments.extend(_split_tool_calls(response_tokens, abs_start, tool_call_start_tokens, tool_call_end_tokens))
+                continue
+
+            # No think tags — split entire content by tool calls
+            if find_subsequence(content_tokens, tool_call_start_tokens) != -1:
+                segments.extend(_split_tool_calls(content_tokens, content_start, tool_call_start_tokens, tool_call_end_tokens))
                 continue
 
         segments.append({"role": role, "tokens": content_tokens, "start": content_start, "end": content_end})
