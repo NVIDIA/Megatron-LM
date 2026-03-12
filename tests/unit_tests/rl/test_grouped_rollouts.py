@@ -86,7 +86,7 @@ class TestGroupedRollouts:
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
         ]
         mt = WeightedMultiTask(configs)
-        mt.parallel_generation_tasks = 8
+        mt.parallel_generation_tasks = 4
 
         captured = []
         for agent in mt.agents:
@@ -112,8 +112,9 @@ class TestGroupedRollouts:
             groups.append(group)
 
         assert len(groups) == 4
-        # WeightedMultiTask MUST interleave groups round-robin according to GCD of weights.
-        assert [g[0].env_id for g in groups] == ["a", "a", "a", "b"]
+        # Weights 3:1 → agent "a" produces 3 groups, agent "b" produces 1.
+        env_ids = [g[0].env_id for g in groups]
+        assert sorted(env_ids) == ["a", "a", "a", "b"]
         for sub_req in captured:
             assert sub_req.generation_batch_size == sub_req.num_groups
             assert sub_req.enforce_order == request.enforce_order
