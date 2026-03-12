@@ -5,6 +5,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_mod
 '''
 
 import math
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -455,3 +456,174 @@ class TestMimoModel:
         # Test checkpoint state dict
         checkpoint_dict = mimo_model.state_dict_for_save_checkpoint()
         assert len(checkpoint_dict) > 0
+
+    def test_pipeline_model_parallel_assertion(self):
+        """Test that MimoModel raises AssertionError when pipeline_model_parallel_size > 1."""
+        lm_config_pp2 = TransformerConfig(
+            num_layers=2,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_model_spec_pp2 = ModuleSpec(
+            module=GPTModel,
+            params={
+                "config": lm_config_pp2,
+                "transformer_layer_spec": language_layer_spec,
+                "vocab_size": self.vocab_size,
+                "max_sequence_length": self.seq_len,
+                "pre_process": True,
+                "post_process": True,
+            },
+        )
+        mimo_config = MimoModelConfig(
+            language_model_spec=language_model_spec_pp2,
+            modality_submodules_spec={},
+            special_token_ids=self.special_token_ids,
+        )
+
+        with pytest.raises(AssertionError, match="Pipeline parallelism is not supported"):
+            MimoModel(mimo_config)
+
+    def test_partition_adapter_none_by_default(self):
+        """Test that partition_adapter is None with default config (no CP/SP)."""
+        mimo_model = get_vlm_mimo_model(
+            self.hidden_size,
+            self.vocab_size,
+            self.seq_len,
+            self.img_h,
+            self.img_w,
+            self.patch_dim,
+            self.special_token_ids,
+        )
+        # TransformerConfig defaults: context_parallel_size=1, sequence_parallel=False
+        assert mimo_model.partition_adapter is None
+
+    def test_forward_with_packing_kwargs(self):
+        """Test that packing_kwargs builds PackedSeqParams with qkv_format='thd' and int32 seqlens."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        input_ids = torch.randint(
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=device
+        )
+        position_ids = (
+            torch.arange(self.seq_len, device=device).unsqueeze(0).expand(self.batch_size, -1)
+        )
+
+        mimo_model = get_vlm_mimo_model(
+            self.hidden_size,
+            self.vocab_size,
+            self.seq_len,
+            self.img_h,
+            self.img_w,
+            self.patch_dim,
+            self.special_token_ids,
+        )
+        mimo_model = mimo_model.to(device)
+
+        # cu_seqlens covering full batch: [0, seq_len, 2*seq_len]
+        cu_seqlens = torch.tensor(
+            [0, self.seq_len, 2 * self.seq_len], dtype=torch.int64, device=device
+        )
+        packing_kwargs = {"cu_seqlens_q": cu_seqlens.clone(), "cu_seqlens_kv": cu_seqlens.clone()}
+
+        # Mock get_text_embeddings and align_embeddings_by_token_positions to avoid full forward
+        text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=device)
+        combined_emb = torch.zeros(self.seq_len, self.batch_size, self.hidden_size, device=device)
+
+        # Capture packed_seq_params via a side_effect on language_model.forward.
+        # Direct assignment (mimo_model.language_model = MagicMock()) is rejected by
+        # PyTorch because language_model is a registered nn.Module child.
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured['packed_seq_params'] = kwargs.get('packed_seq_params')
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=device)
+
+        with (
+            patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb),
+            patch.object(
+                mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
+            ),
+            patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            mimo_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                modality_inputs=None,
+                packing_kwargs=packing_kwargs,
+            )
+
+        # Verify language model received a properly constructed PackedSeqParams
+        packed_seq_params = captured['packed_seq_params']
+
+        assert packed_seq_params is not None
+        assert isinstance(packed_seq_params, PackedSeqParams)
+        assert packed_seq_params.qkv_format == 'thd'
+        assert packed_seq_params.cu_seqlens_q.dtype == torch.int32
+        assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
+
+    def test_forward_with_partition_adapter(self):
+        """Test that partition_adapter.shard() is called and embeddings are transposed correctly."""
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        input_ids = torch.randint(
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=device
+        )
+        position_ids = (
+            torch.arange(self.seq_len, device=device).unsqueeze(0).expand(self.batch_size, -1)
+        )
+
+        mimo_model = get_vlm_mimo_model(
+            self.hidden_size,
+            self.vocab_size,
+            self.seq_len,
+            self.img_h,
+            self.img_w,
+            self.patch_dim,
+            self.special_token_ids,
+        )
+        mimo_model = mimo_model.to(device)
+
+        # Inject a mock partition adapter that halves the sequence dimension
+        sharded_seq_len = self.seq_len // 2
+        sharded_emb = torch.zeros(self.batch_size, sharded_seq_len, self.hidden_size, device=device)
+        mock_adapter = MagicMock()
+        mock_adapter.shard.return_value = (sharded_emb, None, None, None, None)
+        mimo_model.partition_adapter = mock_adapter
+
+        text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=device)
+        # align_embeddings_by_token_positions returns [S, B, H]
+        combined_emb = torch.zeros(self.seq_len, self.batch_size, self.hidden_size, device=device)
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured['decoder_input'] = kwargs.get('decoder_input')
+            return torch.zeros(self.batch_size, sharded_seq_len, self.vocab_size, device=device)
+
+        with (
+            patch.object(mimo_model, 'get_text_embeddings', return_value=text_emb),
+            patch.object(
+                mimo_model, 'align_embeddings_by_token_positions', return_value=combined_emb
+            ),
+            patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+
+        # shard() should have been called once
+        mock_adapter.shard.assert_called_once()
+
+        # The embeddings passed to shard() must be [B, S, H] (transposed from [S, B, H])
+        shard_kwargs = mock_adapter.shard.call_args[1]
+        assert shard_kwargs['embeddings'].shape == (self.batch_size, self.seq_len, self.hidden_size)
+
+        # The language model decoder_input must be [S/cp, B, H] (re-transposed after shard)
+        assert captured['decoder_input'].shape == (
+            sharded_seq_len,
+            self.batch_size,
+            self.hidden_size,
+        )
