@@ -570,9 +570,15 @@ def get_environment_rollouts(
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
         with nvtx_range("sync-rollouts"):
-            # Wait for Rollouts to be collected
-            # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
-            torch.distributed.broadcast_object_list(rollouts, src=0)
+            # Wait for Rollouts to be collected. Broadcast in small chunks to avoid
+            # pickling the entire `rollouts` list at once (which can cause large
+            # temporary allocations on rank 0).
+            for i in range(n_prompts):
+                group = rollouts[i] if rank == 0 else None
+                obj_list = [group]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                if rank != 0:
+                    rollouts[i] = obj_list[0]
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
