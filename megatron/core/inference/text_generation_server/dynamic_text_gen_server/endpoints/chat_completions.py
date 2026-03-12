@@ -230,7 +230,10 @@ try:
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            if hasattr(tokenizer, 'apply_chat_template'):
+            if (
+                hasattr(tokenizer, 'apply_chat_template')
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
                 prompt_tokens = tokenizer.apply_chat_template(
                     template_messages,
                     tokenize=True,
