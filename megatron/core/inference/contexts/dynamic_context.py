@@ -1390,7 +1390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 2. Per-request state consumed by mha_metadata.update().
         if N_decode > 0:
             self.request_query_lengths[0:N_decode].fill_(tokens_per_request)
-            
+
         # Prefill requests: distribute remaining tokens evenly.
         if N_prefill > 0:
             prefill_tokens = T - (N_decode * tokens_per_request)
@@ -1406,17 +1406,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
-        
+
         decode_tokens_total = N_decode * tokens_per_request
         if decode_tokens_total > 0:
             self.token_to_local_position_within_kv_block[0:decode_tokens_total] = (
-                torch.arange(decode_tokens_total, device=self.token_to_block_idx.device) % tokens_per_request
+                torch.arange(decode_tokens_total, device=self.token_to_block_idx.device)
+                % tokens_per_request
             )
-            
+
         if N_prefill > 0:
             prefill_tokens_total = T - decode_tokens_total
             self.token_to_local_position_within_kv_block[decode_tokens_total:T] = (
-                torch.arange(prefill_tokens_total, device=self.token_to_block_idx.device) % self.block_size_tokens
+                torch.arange(prefill_tokens_total, device=self.token_to_block_idx.device)
+                % self.block_size_tokens
             )
 
         if self.is_hybrid_model:
@@ -1431,7 +1433,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     ),
                     tokens_per_request,
                 )
-                
+
             # Prefill tokens: distribute among prefill requests.
             if N_prefill > 0:
                 prefill_tokens = T - decode_tokens_total
@@ -1447,7 +1449,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx[0:N_total] = (
                 self.mamba_metadata.batch_allocate_slots(N_total)
             )
-    
+
     def initialize_attention_state(
         self,
         *,

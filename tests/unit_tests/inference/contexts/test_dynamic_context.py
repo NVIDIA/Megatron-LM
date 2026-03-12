@@ -1524,9 +1524,7 @@ class TestDynamicContext:
         )
 
         # Find a mixed (prefill + decode) graph from the list
-        mixed_graphs = [
-            g for g in ctx.cuda_graph_batch_dimensions_list if g.prefill_req_count > 0
-        ]
+        mixed_graphs = [g for g in ctx.cuda_graph_batch_dimensions_list if g.prefill_req_count > 0]
         if not mixed_graphs:
             pytest.skip("No mixed CUDA graphs available for this configuration")
 

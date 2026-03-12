@@ -326,11 +326,7 @@ class TestMambaMetadata:
 
         with pytest.raises(AssertionError, match="Mamba models require real prefill requests"):
             self._run_update_test(
-                metadata_context,
-                seq_lengths,
-                num_decode,
-                padded_dims,
-                enable_chunked_prefill=False,
+                metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
             )
 
     # -------------------------------------------------------------------------
