@@ -255,14 +255,14 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon / emerging optimizers.
+    # emerging optimizers.
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
-    muon_use_nesterov: bool = False
+    muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
@@ -279,6 +279,15 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    soap_shampoo_beta: float = 0.95
+    """The beta parameter for the Shampoo preconditioner."""
+
+    soap_precondition_frequency: int = 1
+    """The frequency of the Shampoo preconditioner."""
+
+    soap_use_kl_shampoo: bool = True
+    """Whether to use the KL-Shampoo preconditioner."""
 
     #######################
     # Distributed optimizer
