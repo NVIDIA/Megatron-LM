@@ -418,6 +418,11 @@ class TestCoordinator:
                     assert isinstance(result, dict)
         finally:
             await cleanup_engine(engine, client)
+            # Shut down the coordinator process launched by launch_inference_coordinator=True.
+            proc = getattr(engine, 'inference_coordinator_process', None)
+            if proc is not None and proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5.0)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
