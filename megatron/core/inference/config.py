@@ -228,6 +228,9 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    num_speculative_tokens: int = 0
+    """The number of speculative tokens to generate for decode steps."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

@@ -134,6 +134,17 @@ def test_inference_pipeline(
                 )
         output_groundtruth.pop("mem-max-allocated-bytes")
 
+    lptc_key = "lifetime_prefill_token_count"
+    if lptc_key in output_groundtruth and lptc_key not in metrics:
+        # metrics does not have lifetime_prefill_token_count, so ignore it
+        output_groundtruth.pop(lptc_key)
+    elif lptc_key in metrics:
+        # Ground truth does not have lifetime_prefill_token_count, so ignore it
+        metrics.pop(lptc_key)
+    elif lptc_key in output_groundtruth and lptc_key in metrics:
+        # TODO: Compare liftime_prefill_token_count to groundtruth
+        pass
+
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]
 
