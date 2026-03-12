@@ -11,7 +11,6 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -20,6 +19,16 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
+
+# Check if Transformer Engine is installed
+HAVE_TE = False
+try:
+    import transformer_engine  # pylint: disable=W0611
+
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):
+    # Transformer Engine not found
+    pass
 
 try:
     from packaging.version import Version as PkgVersion
