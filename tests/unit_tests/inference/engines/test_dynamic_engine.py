@@ -611,14 +611,14 @@ class TestDynamicInferenceEngine:
         ]
 
         mamba_expected_generated_tokens = [
-            [74, 72, 9, 59, 1, 70, 15, 89, 30, 52, 82, 70, 64, 16, 83, 5],
-            [25, 54, 28, 14, 87, 27, 60, 92, 28, 74, 8, 63, 60, 68, 87, 82],
-            [31, 21, 87, 25, 96, 13, 32, 49, 40, 54, 55, 68, 73, 2, 64, 96],
-            [72, 80, 35, 72, 77, 85, 98, 36, 4, 97, 37, 46, 79, 95, 83, 25],
-            [8, 80, 56, 4, 87, 1, 43, 98, 85, 7, 50, 38, 96, 99],
-            [9, 94, 36, 16, 87, 57, 25, 76, 98, 57, 91, 28, 18, 80, 88, 42],
-            [17, 5, 62, 66, 73, 11, 64, 92, 47, 86, 73, 72, 71, 97, 58, 68],
-            [1, 76, 15, 52, 32, 75, 66, 18, 90, 14, 67, 37, 94, 33, 66, 42],
+            [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
+            [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
+            [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
+            [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
+            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
+            [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
+            [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
+            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
         ]
 
         if model_provider == "gpt":
@@ -1760,14 +1760,14 @@ class TestDynamicInferenceEngine:
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
-            assert step_count == 22
+            assert step_count == 23
         else:
             assert max_requests < len(env.requests), (
                 f"Test is only useful if max_requests ({max_requests}) < "
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-            assert step_count == 34
+            assert step_count == 35
         assert context.block_allocator.active_count == 655
 
     @pytest.mark.internal
@@ -2613,6 +2613,7 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             context_max_tokens=4096,
             context_max_requests=512,
+            max_sequence_length=1024,
         )
         env = self._build_test_env(test_config)
 
