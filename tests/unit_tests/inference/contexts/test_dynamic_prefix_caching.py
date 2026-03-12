@@ -772,10 +772,14 @@ class TestHybridModelMemoryOnly(PrefixCachingTestBase):
         """Create a context with a hybrid (Transformer + Mamba) model config."""
         from megatron.core.inference.config import MambaInferenceStateConfig
 
+        params_dtype = torch.float32
+
         mamba_config = MambaInferenceStateConfig(
             layer_type_list=["*", "M", "*", "M"],
-            mamba_conv_states_shape=(4, 8),
-            mamba_ssm_states_shape=(4, 16),
+            conv_states_shape=(4, 8),
+            ssm_states_shape=(4, 16),
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
         )
 
         defaults = dict(
@@ -793,7 +797,7 @@ class TestHybridModelMemoryOnly(PrefixCachingTestBase):
         DynamicInferenceContext.REQUEST_ROUNDER = defaults["rounder"]
 
         transformer_config = TransformerConfig(
-            params_dtype=torch.float32,
+            params_dtype=params_dtype,
             num_layers=4,
             kv_channels=8,
             num_attention_heads=2,

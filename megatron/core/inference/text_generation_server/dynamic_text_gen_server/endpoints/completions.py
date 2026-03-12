@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -21,7 +21,7 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -217,4 +217,4 @@ try:
         return jsonify({"choices": choices})
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")

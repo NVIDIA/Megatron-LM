@@ -7,7 +7,7 @@ import logging
 import signal
 import socket
 from collections import deque
-from itertools import cycle
+from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
 
@@ -71,6 +71,14 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
+    class CoordinatorState(Enum):
+        """State machine for the coordinator."""
+
+        RUNNING = auto()
+        PAUSED = auto()
+        SUSPENDED = auto()
+        STOPPING = auto()
+
     def __init__(
         self,
         pipe_connection: Connection,
@@ -122,6 +130,8 @@ class DataParallelInferenceCoordinator:
         local_ip = socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
+        # Raise error if the other side of the connection has dropped.
+        self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         is_bound = False
         if inference_coordinator_port is not None:
             try:
@@ -161,15 +171,14 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks = deque(
                 sorted(self.identities_of_data_parallel_ranks)
             )
-        self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
-        self.data_parallel_pause_acks = set()
-        self.data_parallel_stop_acks = set()
+        self._round_robin_idx = 0
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
+        self.state = self.CoordinatorState.RUNNING
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -195,7 +204,36 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the next data parallel rank to receive a request.
         """
-        return next(self.data_parallel_rank_iterator)
+        identities = self.identities_of_data_parallel_ranks
+        if not identities:
+            raise RuntimeError("No engines connected")
+        idx = self._round_robin_idx % len(identities)
+        self._round_robin_idx = idx + 1
+        return identities[idx]
+
+    def _remove_engine(self, identity):
+        """Remove a disconnected engine from the routing pool."""
+        self.identities_of_data_parallel_ranks.remove(identity)
+        logging.warning(
+            "Coordinator: removed engine %s (now %d engines)",
+            identity,
+            len(self.identities_of_data_parallel_ranks),
+        )
+
+    def _send_to_engine(self, identity, payload):
+        """Send payload to an engine, removing it from the pool if unreachable.
+
+        Returns:
+            True if the send succeeded, False if the engine was unreachable and removed.
+        """
+        try:
+            self.router_socket.send_multipart([identity, payload])
+            return True
+        except zmq.error.ZMQError as e:
+            if e.errno == zmq.EHOSTUNREACH:
+                self._remove_engine(identity)
+                return False
+            raise
 
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
@@ -274,6 +312,13 @@ class DataParallelInferenceCoordinator:
         known_clients = set()
         while True:
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
+
+            # Allow for re-registration if connecting to a running coordinator.
+            if serialized_payload == b"":
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                continue
+
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
 
@@ -319,95 +364,95 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
+                payload = msgpack.packb(
+                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
+                    use_bin_type=True,
+                )
+
                 request_hashes = self.compute_request_hashes(prompt)
                 if (
                     self.prefix_caching_coordinator_policy
                     == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
                 ):
                     request_hashes = request_hashes[:1]
-                next_data_parallel_rank_identity = self.get_best_data_parallel_rank(request_hashes)
+
+                # Account for the fact that some engines may have died.
+                for _ in range(len(self.identities_of_data_parallel_ranks)):
+                    next_identity = self.get_best_data_parallel_rank(request_hashes)
+                    if self._send_to_engine(next_identity, payload):
+                        break
+                else:
+                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
+                    logging.error("Coordinator: no reachable engines for request %d", request_id)
+                    del self.request_id_to_client_id[request_id]
+                    del self.request_id_to_client_request_id[request_id]
+                    return
+
                 if request_hashes:
-                    self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
+                    self._update_rank_hashes(next_identity, request_hashes)
                 if self.schedule_records is not None:
                     self.schedule_records.append(
                         {
                             "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[
-                                next_data_parallel_rank_identity
-                            ],
+                            "rank_index": self.identity_to_rank_index[next_identity],
                             "num_hashes": len(request_hashes),
                         }
                     )
-                self.router_socket.send_multipart(
-                    [
-                        next_data_parallel_rank_identity,
-                        msgpack.packb(
-                            [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                            use_bin_type=True,
-                        ),
-                    ]
-                )
-            elif header in [
+
+            elif header in (
                 Headers.PAUSE,
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
                 Headers.INCREMENT_STALENESS,
                 Headers.STOP,
-            ]:
-                # control signals for the engine
-                # broadcast to all data parallel ranks
+            ):
+                # Start by checking the current state against the control signal.
                 if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
-                for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
-                    self.router_socket.send_multipart(
-                        [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
-                    )
-                if header == Headers.UNPAUSE:
-                    self.data_parallel_pause_acks = set()
-            elif header == Headers.PAUSE_ACK:
-                # control signal ack from the engine
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                assert sender_identity not in self.data_parallel_pause_acks
-                self.data_parallel_pause_acks.add(sender_identity)
-                # route to all clients only once we have gotten an ack from all data parallel ranks
-                if len(self.data_parallel_pause_acks) == self.data_parallel_size:
-                    for client_id in known_clients:
-                        self.router_socket.send_multipart(
-                            [
-                                client_id,
-                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
-                            ]
-                        )
-                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
-                        self.router_socket.send_multipart(
-                            [
-                                data_parallel_rank_id,
-                                msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True),
-                            ]
-                        )
-            elif header == Headers.STOP_ACK:
-                # control signal ack from the engine
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                assert sender_identity not in self.data_parallel_stop_acks
-                self.data_parallel_stop_acks.add(sender_identity)
-                # route to all clients only once we have gotten an ack from all data parallel ranks
-                if len(self.data_parallel_stop_acks) == self.data_parallel_size:
-                    for client_id in known_clients:
-                        self.router_socket.send_multipart(
-                            [
-                                client_id,
-                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
-                            ]
-                        )
-                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
-                        self.router_socket.send_multipart(
-                            [
-                                data_parallel_rank_id,
-                                msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True),
-                            ]
-                        )
-                    break  # Exit the main loop after STOP_ACKs have been processed.
+
+                if header == Headers.PAUSE:
+                    idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                    if self.state == self.CoordinatorState.RUNNING:
+                        self.state = self.CoordinatorState.PAUSED
+                    elif self.state in idem_states:
+                        # Already paused/suspended, ignore redundant PAUSE.
+                        continue
+                    else:
+                        logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
+                        continue
+                elif header == Headers.UNPAUSE:
+                    if self.state != self.CoordinatorState.PAUSED:
+                        logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
+                        continue
+                    self.state = self.CoordinatorState.RUNNING
+                elif header == Headers.SUSPEND:
+                    if self.state != self.CoordinatorState.PAUSED:
+                        logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
+                        continue
+                    self.state = self.CoordinatorState.SUSPENDED
+                elif header == Headers.RESUME:
+                    if self.state != self.CoordinatorState.SUSPENDED:
+                        logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
+                        continue
+                    self.state = self.CoordinatorState.PAUSED
+                elif header == Headers.STOP:
+                    good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                    if self.state not in good_states:
+                        logging.warning("Coordinator: ignoring STOP in state %s", self.state)
+                        continue
+                    self.state = self.CoordinatorState.STOPPING
+
+                # Broadcast the control signal if we're in a good state.
+                broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
+                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
+                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
+                # STOP affects engines; reset coordinator to RUNNING to allow future engines.
+                if header == Headers.STOP:
+                    self.state = self.CoordinatorState.RUNNING
+
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -430,6 +475,16 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
+
+            elif header == Headers.SHUTDOWN:
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring signal from unknown client.")
+                    continue
+                break
+
+            elif header == Headers.DISCONNECT:
+                if sender_identity in self.identities_of_data_parallel_ranks:
+                    self._remove_engine(sender_identity)
 
             else:
                 raise UnknownHeaderError(header)
