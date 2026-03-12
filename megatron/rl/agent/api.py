@@ -9,6 +9,7 @@ from typing import Generic, TypeVar
 import numpy as np
 from pydantic import BaseModel
 
+from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
@@ -188,7 +189,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.
-        grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
+        grouped_rollouts: asyncio_Queue[list[Rollout]] = asyncio_Queue(
             maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
@@ -243,11 +244,21 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
+        async def shutdown_queue_when_done():
+            """Wait for all workers to finish, then shut down the queue."""
+            await asyncio.gather(*tasks)
+            grouped_rollouts.shutdown()
+
+        shutdown_task = asyncio.create_task(shutdown_queue_when_done())
+
         try:
             next_batch_id = 0
             pending: dict[int, list[list[Rollout]]] = {}
-            while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                group = await grouped_rollouts.get()
+            while True:
+                try:
+                    group = await grouped_rollouts.get()
+                except asyncio_QueueShutDown:
+                    break
                 if request.enforce_order:
                     # Accumulate groups and enforce submission order across batches.
                     pending.setdefault(group[0].batch_id, []).append(group)
@@ -263,6 +274,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                     yield group
                     submission_gate.release()
         finally:
+            shutdown_task.cancel()
             for task in tasks:
                 task.cancel()
 
