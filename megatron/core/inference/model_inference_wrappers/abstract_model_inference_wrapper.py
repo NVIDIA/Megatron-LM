@@ -145,7 +145,23 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.inference_context.is_dynamic_batching()
             and self.inference_context.num_speculative_tokens > 0
         )
-        return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
+
+        # If the controller is running the graphed dummy_forward, it will run
+        # `_dynamic_step_forward_logits` instead. Setting this to False ensures that we
+        # will not try to match on a cudagraph when this is running eager.
+        self.inference_context._using_cuda_graph_this_step = False
+
+        # Pass inference_context so that transformer & mamba layers use the inference-mode
+        # cudagraph check (which gates on using_cuda_graph_this_step()) instead of
+        # the training-mode check (which unconditionally replays captured graphs
+        # when inference_context is not in kwargs).
+        return self.model(
+            tokens,
+            position_ids,
+            attention_mask,
+            inference_context=self.inference_context,
+            is_spec_decode=is_spec_decode,
+        )
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
