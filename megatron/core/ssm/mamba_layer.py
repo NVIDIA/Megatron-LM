@@ -191,6 +191,8 @@ class MambaLayer(GraphableMegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
+        from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+
         # Training and validation mode CUDA graphs
         if (
             hasattr(self, 'cudagraph_manager')
