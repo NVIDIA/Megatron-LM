@@ -1366,6 +1366,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1373,15 +1374,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
+            # To pass kwargs unique to specific DDP classes.
+            dp_init_kwargs = {}
+            if args.use_megatron_fsdp:
+                # Also pass the mixed-precision arguments for Megatron-FSDP only.
+                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+
             model = [
                 DP(
                     config=config,
                     ddp_config=ddp_config,
                     module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                    # model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication
+                    # for these model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -2129,7 +2138,7 @@ def training_log(
                 avg = total_loss_dict[key].item() / float(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
-                if avg > 0.0:
+                if avg >= 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
@@ -2242,6 +2251,10 @@ def save_checkpoint_and_time(
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
+    # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
+    if should_disable_forward_pre_hook(args):
+        force_param_sync(model)
+
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
     energy_monitor.pause()
@@ -2252,8 +2265,13 @@ def save_checkpoint_and_time(
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+    # Free overlap param-gather buffers and release cached GPU memory so
+    # that the async checkpoint worker process has enough GPU headroom for
+    # D2H tensor transfers.
+    for model_chunk in model:
+        if hasattr(model_chunk, 'free_overlap_buffers'):
+            model_chunk.free_overlap_buffers()
+    torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
@@ -3279,8 +3297,6 @@ def evaluate(
 
     rerun_state_machine.set_mode(rerun_mode)
 
-    rerun_state_machine.set_mode(rerun_mode)
-
     return total_loss_dict, collected_non_loss_data, False
 
 
@@ -3590,4 +3606,8 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
-    return not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    return (
+        not args.use_megatron_fsdp
+        and (args.use_distributed_optimizer or 'dist' in args.optimizer)
+        and args.overlap_param_gather
+    )
