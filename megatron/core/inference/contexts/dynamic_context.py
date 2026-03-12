@@ -1615,12 +1615,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         finished = req.finished_chunk_token_count
         already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
-        # +1 accounts for the decode token that follows this chunk: after the
-        # chunk is processed, the bookkeeping produces a decode token at
-        # position (finished + chunk_length).  When chunk tokens exactly fill
-        # the last block, that decode token lands in the *next* block.  The
-        # chunked-prefill request is excluded from the normal new-block-pause
-        # path (to keep it schedulable), so we must pre-allocate that block here.
+        # +1 reserves space for the decode token produced after this chunk.
+        # The chunked-prefill request is excluded from the normal
+        # pause-and-allocate path, so we must ensure the block is available.
         overall_required_blocks = (
             finished + chunk_length + 1 + self.block_size_tokens - 1
         ) // self.block_size_tokens
@@ -2333,10 +2330,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).byte()
 
             if self.chunked_prefill_request_id != -1:
-                # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                active_requests_requiring_new_block[
-                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
-                ] = 0  # chunked prefill should not be paused
+                chunked_idx = self.get_index_of_chunked_prefill_request()
+                chunked_active_idx = chunked_idx - self.paused_request_count
+                if active_requests_requiring_new_block[chunked_active_idx]:
+                    # The chunked request needs a new block but must not be
+                    # paused (pausing breaks the chunked-prefill scheduling
+                    # invariants). Allocate the block directly instead.
+                    new_block = self.block_allocator.allocate_memory_blocks(1)
+                    if new_block is not None and len(new_block) == 1:
+                        col = self.request_kv_block_counts[chunked_idx]
+                        self.request_to_kv_block_ids[chunked_idx, col] = new_block[0]
+                        self.request_kv_block_counts[chunked_idx] += 1
+                        self.request_last_kv_block_id[chunked_idx] = new_block[0]
+                active_requests_requiring_new_block[chunked_active_idx] = 0
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
