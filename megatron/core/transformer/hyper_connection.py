@@ -520,9 +520,12 @@ class HyperConnectionModule(MegatronModule):
         manager: 'CheckpointManager',
     ) -> Tensor:
         """
-        Checkpointed implementation of fused h_res, h_post and bda operations.
+        Checkpointed variant of _fused_h_res_h_post_bda_native.
 
-        Uses a single checkpoint wrapper around all operations for memory efficiency.
+        Wraps compute in CheckpointWithoutOutput for activation memory savings.
+        Cannot reuse _native directly because checkpoint requires all args to be
+        positional Tensors; tuple/Optional/scalar args are unpacked or captured
+        via closure instead.
 
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -537,43 +540,53 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output
         """
-        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
-        # Get BDA function (captured via closure)
-        bda_func = get_bias_dropout_add(training, fused)
-
-        # Unpack layer_output_with_bias to avoid tuple tensors in checkpoint args
         x, bias = layer_output_with_bias
-        has_bias = bias is not None
+        n = self.n
+        C = self.hidden_size
 
-        # Native wrapper that combines all operations without internal checkpointing.
-        # Non-tensor args (dropout_prob, has_bias) are captured via closure.
-        def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
-            # Step 1: Apply H_res to original residual
-            with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
-                mixed = self.apply_h_res(h_res, original_residual)
+        # Fast path: no dropout — use fused cuTile kernel (same as _native)
+        if dropout_prob == 0.0 or not training:
 
-            # Step 2: Apply H_post to x and bias
-            with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-                x_expanded = self._apply_h_post(x, h_post)
-                if has_bias:
-                    bias_expanded = self._apply_h_post(optional_bias[0], h_post)
-                else:
-                    bias_expanded = None
+            def _fused_wrapper(h_res, original_residual, h_post, x, *optional_bias):
+                s, b, _ = original_residual.shape
+                orig_reshaped = original_residual.view(s, b, n, C)
+                b_arg = optional_bias[0] if optional_bias else None
+                return fused_h_post_bda(h_res, orig_reshaped, h_post, x, b_arg).view(s, b, n * C)
 
-            # Step 3: Bias-dropout-add
-            with torch.cuda.nvtx.range("HyperConnection::bda"):
-                output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+            if bias is not None:
+                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x, bias)
+            else:
+                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x)
 
-            return output
-
-        # Use a single checkpoint wrapper for all operations
-        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-        if has_bias:
-            output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
+        # Slow path: dropout required — fused kernel does not support dropout,
+        # fall back to sequential apply_h_res + apply_h_post + bda
         else:
-            output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
+            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+
+            bda_func = get_bias_dropout_add(training, fused)
+            has_bias = bias is not None
+
+            def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
+                with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
+                    mixed = self.apply_h_res(h_res, original_residual)
+                with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
+                    x_expanded = self._apply_h_post(x, h_post)
+                    if has_bias:
+                        bias_expanded = self._apply_h_post(optional_bias[0], h_post)
+                    else:
+                        bias_expanded = None
+                with torch.cuda.nvtx.range("HyperConnection::bda"):
+                    output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+                return output
+
+            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+            if has_bias:
+                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
+            else:
+                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
 
         return output
 

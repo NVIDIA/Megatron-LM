@@ -40,9 +40,7 @@ RAND_LO, RAND_HI = -0.1, 0.1
 
 def _rand(*shape, **kwargs):
     """Uniform in [RAND_LO, RAND_HI] to keep magnitudes small for bf16 stability."""
-    return torch.empty(*shape, dtype=DTYPE, device=DEVICE, **kwargs).uniform_(
-        RAND_LO, RAND_HI
-    )
+    return torch.empty(*shape, dtype=DTYPE, device=DEVICE, **kwargs).uniform_(RAND_LO, RAND_HI)
 
 
 def _info():
@@ -54,6 +52,7 @@ def _info():
 # Pure-PyTorch differentiable references (used by both fwd AND bwd tests)
 # ============================================================================
 
+
 @torch.compile
 def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-8) -> Tensor:
     M = torch.exp(logits)
@@ -62,27 +61,24 @@ def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-8) -> Tensor:
         M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
     return M
 
+
 @torch.compile
 def _ref_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
+
 @torch.compile
 def _ref_h_post_bda(
-    h_res: Tensor,
-    orig_res: Tensor,
-    h_post: Tensor,
-    x: Tensor,
-    bias: Optional[Tensor],
+    h_res: Tensor, orig_res: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     s, b, n, C = orig_res.shape
-    mixed = torch.bmm(
-        h_res.view(s * b, n, n), orig_res.view(s * b, n, C)
-    ).view(s, b, n, C)
+    mixed = torch.bmm(h_res.view(s * b, n, n), orig_res.view(s * b, n, C)).view(s, b, n, C)
     x_exp = h_post.unsqueeze(-1) * x.unsqueeze(2)
     out = x_exp + mixed
     if bias is not None:
         out = out + h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
     return out
+
 
 @torch.compile
 def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-8):
@@ -198,13 +194,11 @@ class TestFusedHPostBDA:
             ("x", x_f.grad, x_r.grad),
         ]:
             torch.testing.assert_close(
-                gf, gr, atol=BWD_ATOL, rtol=BWD_RTOL,
-                msg=f"backward mismatch on {name}",
+                gf, gr, atol=BWD_ATOL, rtol=BWD_RTOL, msg=f"backward mismatch on {name}"
             )
         if with_bias:
             torch.testing.assert_close(
-                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
-                msg="backward mismatch on bias",
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
             )
 
 
@@ -239,12 +233,10 @@ class TestFusedProjRms:
         torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
-            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
-            msg="backward mismatch on x",
+            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
         )
         torch.testing.assert_close(
-            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
-            msg="backward mismatch on weight",
+            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
         )
 
 
@@ -283,15 +275,14 @@ class TestEndToEnd:
 
             h = r * proj
             h_pre = h[..., :n].sigmoid()
-            h_post = h[..., n: 2 * n].sigmoid() * 2
-            h_res_logits = h[..., 2 * n:]
+            h_post = h[..., n : 2 * n].sigmoid() * 2
+            h_res_logits = h[..., 2 * n :]
             h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters)
 
             aggregated = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
 
             output = fused_h_post_bda(
-                h_res, hs.view(s, b, n, C), h_post,
-                layer_out_data, layer_bias_data,
+                h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
             )
 
             loss = output.sum() + aggregated.sum()
@@ -309,15 +300,14 @@ class TestEndToEnd:
 
             h = r * proj
             h_pre = h[..., :n].sigmoid()
-            h_post = h[..., n: 2 * n].sigmoid() * 2
-            h_res_logits = h[..., 2 * n:]
+            h_post = h[..., n : 2 * n].sigmoid() * 2
+            h_res_logits = h[..., 2 * n :]
             h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
             output = _ref_h_post_bda(
-                h_res, hs.view(s, b, n, C), h_post,
-                layer_out_data, layer_bias_data,
+                h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
             )
 
             loss = output.sum() + aggregated.sum()
@@ -328,14 +318,15 @@ class TestEndToEnd:
         out_r, agg_r, grad_r = _run_ref()
 
         torch.testing.assert_close(
-            agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL,
-            msg="aggregated output mismatch",
+            agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated output mismatch"
         )
         torch.testing.assert_close(
-            out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL,
-            msg="h_post_bda output mismatch",
+            out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
         )
         torch.testing.assert_close(
-            grad_f, grad_r, atol=BWD_ATOL, rtol=BWD_RTOL,
+            grad_f,
+            grad_r,
+            atol=BWD_ATOL,
+            rtol=BWD_RTOL,
             msg=f"hidden_states grad mismatch (E2E backward), max diff: {grad_f.max() - grad_r.max()}",
         )

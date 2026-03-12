@@ -54,9 +54,7 @@ def is_cutile_available() -> bool:
 
 
 # -- Sinkhorn ----------------------------------------------------------------
-def _ref_sinkhorn_fwd(
-    input_logits: Tensor, num_iterations: int, eps: float = 1e-8
-) -> Tensor:
+def _ref_sinkhorn_fwd(input_logits: Tensor, num_iterations: int, eps: float = 1e-8) -> Tensor:
     M = torch.exp(input_logits)
     for _ in range(num_iterations):
         M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
@@ -88,9 +86,7 @@ def _ref_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-def _ref_h_aggregate_bwd(
-    grad_output: Tensor, x: Tensor, h_pre: Tensor
-) -> Tuple[Tensor, Tensor]:
+def _ref_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
     with torch.enable_grad():
         x_in = x.detach().requires_grad_(True)
         h_in = h_pre.detach().requires_grad_(True)
@@ -107,11 +103,7 @@ def _ref_h_aggregate_bwd(
 
 # -- H_post BDA --------------------------------------------------------------
 def _ref_h_post_bda_fwd(
-    h_res: Tensor,
-    original_residual: Tensor,
-    h_post: Tensor,
-    x: Tensor,
-    bias: Optional[Tensor],
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
@@ -179,12 +171,7 @@ def _ref_proj_rms_fwd(
 
 
 def _ref_proj_rms_bwd(
-    grad_proj: Tensor,
-    grad_r: Tensor,
-    x: Tensor,
-    weight: Tensor,
-    norm: Tensor,
-    eps: float = 1e-8,
+    grad_proj: Tensor, grad_r: Tensor, x: Tensor, weight: Tensor, norm: Tensor, eps: float = 1e-8
 ) -> Tuple[Tensor, Tensor]:
     M, K = x.shape
     inv_sqrt_k = 1.0 / math.sqrt(K)
@@ -230,24 +217,26 @@ if _CUTILE_AVAILABLE:
             M = M / (row_sum + eps)
             col_sum = ct.sum(M, axis=1, keepdims=True)
             M = M / (col_sum + eps)
-        ct.store(
-            out,
-            index=(pid, 0, 0),
-            tile=ct.reshape(M.astype(out.dtype), (TILE_SIZE, HC, HC)),
-        )
+        ct.store(out, index=(pid, 0, 0), tile=ct.reshape(M.astype(out.dtype), (TILE_SIZE, HC, HC)))
 
     @ct.kernel
     def _ct_sinkhorn_bwd_kernel(
-        grad_out, M_init, grad_inp, ws_M, ws_rs, ws_cs, eps,
-        HC: ConstInt, NUM_ITERS: ConstInt, TILE_SIZE: ConstInt,
+        grad_out,
+        M_init,
+        grad_inp,
+        ws_M,
+        ws_rs,
+        ws_cs,
+        eps,
+        HC: ConstInt,
+        NUM_ITERS: ConstInt,
+        TILE_SIZE: ConstInt,
     ):
         pid = ct.bid(0)
         M_base = pid * (2 * NUM_ITERS)
         v_base = pid * NUM_ITERS
 
-        M = ct.load(M_init, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(
-            ct.float32
-        )
+        M = ct.load(M_init, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(ct.float32)
         for t in range(NUM_ITERS):
             ct.store(ws_M, index=(M_base + 2 * t, 0, 0), tile=M)
             row_sum = ct.sum(M, axis=2, keepdims=True)
@@ -258,29 +247,19 @@ if _CUTILE_AVAILABLE:
             ct.store(ws_cs, index=(v_base + t, 0, 0), tile=col_sum)
             M = M / (col_sum + eps)
 
-        grad = ct.load(grad_out, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(
-            ct.float32
-        )
+        grad = ct.load(grad_out, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(ct.float32)
         for t_rev in range(NUM_ITERS):
             t = NUM_ITERS - 1 - t_rev
-            col_s = ct.load(
-                ws_cs, index=(v_base + t, 0, 0), shape=(TILE_SIZE, 1, HC)
-            )
+            col_s = ct.load(ws_cs, index=(v_base + t, 0, 0), shape=(TILE_SIZE, 1, HC))
             grad = grad / (col_s + eps)
             col_corr = ct.sum(grad * M, axis=1, keepdims=True)
             grad = grad - col_corr
-            M = ct.load(
-                ws_M, index=(M_base + 2 * t + 1, 0, 0), shape=(TILE_SIZE, HC, HC)
-            )
-            row_s = ct.load(
-                ws_rs, index=(v_base + t, 0, 0), shape=(TILE_SIZE, HC, 1)
-            )
+            M = ct.load(ws_M, index=(M_base + 2 * t + 1, 0, 0), shape=(TILE_SIZE, HC, HC))
+            row_s = ct.load(ws_rs, index=(v_base + t, 0, 0), shape=(TILE_SIZE, HC, 1))
             grad = grad / (row_s + eps)
             row_corr = ct.sum(grad * M, axis=2, keepdims=True)
             grad = grad - row_corr
-            M = ct.load(
-                ws_M, index=(M_base + 2 * t, 0, 0), shape=(TILE_SIZE, HC, HC)
-            )
+            M = ct.load(ws_M, index=(M_base + 2 * t, 0, 0), shape=(TILE_SIZE, HC, HC))
         grad = grad * M
         ct.store(grad_inp, index=(pid, 0, 0), tile=grad.astype(grad_inp.dtype))
 
@@ -288,88 +267,63 @@ if _CUTILE_AVAILABLE:
         input_logits: Tensor, num_iterations: int, eps: float = 1e-8
     ) -> Tensor:
         original_shape = input_logits.shape
-        original_dtype = input_logits.dtype
         hc = original_shape[-1]
-        inp = input_logits.reshape(-1, hc, hc).contiguous().to(torch.float32)
-        N_batch = inp.shape[0]
+        N_batch = input_logits.numel() // (hc * hc)
         TILE_SIZE = math.gcd(N_batch, 128)
-        out = torch.empty_like(inp)
+        out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=input_logits.device)
         ct.launch(
             torch.cuda.current_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
             _ct_sinkhorn_fwd_kernel,
-            (inp, out, eps, hc, num_iterations, TILE_SIZE),
+            (input_logits.view(N_batch, hc, hc), out, eps, hc, num_iterations, TILE_SIZE),
         )
-        out = out.reshape(original_shape)
-        if original_dtype != torch.float32:
-            out = out.to(original_dtype)
-        return out
+        return out.view(original_shape)
 
     def _cutile_sinkhorn_bwd(
-        grad_output: Tensor,
-        M_init: Tensor,
-        num_iterations: int,
-        eps: float = 1e-8,
+        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
     ) -> Tensor:
         original_shape = grad_output.shape
-        original_dtype = grad_output.dtype
         hc = original_shape[-1]
-        g = grad_output.reshape(-1, hc, hc).contiguous().to(torch.float32)
-        m = M_init.reshape(-1, hc, hc).contiguous().to(torch.float32)
-        N_batch = g.shape[0]
+        N_batch = grad_output.numel() // (hc * hc)
         TILE_SIZE = math.gcd(N_batch, 128)
+        dev = grad_output.device
         ws_M = torch.empty(
-            N_batch * 2 * num_iterations, hc, hc,
-            dtype=torch.float32, device=g.device,
+            N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev
         )
-        ws_rs = torch.empty(
-            N_batch * num_iterations, hc, 1,
-            dtype=torch.float32, device=g.device,
-        )
-        ws_cs = torch.empty(
-            N_batch * num_iterations, 1, hc,
-            dtype=torch.float32, device=g.device,
-        )
-        grad_input = torch.empty_like(m)
+        ws_rs = torch.empty(N_batch * num_iterations, hc, 1, dtype=torch.float32, device=dev)
+        ws_cs = torch.empty(N_batch * num_iterations, 1, hc, dtype=torch.float32, device=dev)
+        grad_input = torch.empty(N_batch, hc, hc, dtype=grad_output.dtype, device=dev)
         ct.launch(
             torch.cuda.current_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
             _ct_sinkhorn_bwd_kernel,
-            (g, m, grad_input, ws_M, ws_rs, ws_cs, eps, hc, num_iterations, TILE_SIZE),
+            (
+                grad_output.view(N_batch, hc, hc),
+                M_init.view(N_batch, hc, hc),
+                grad_input, ws_M, ws_rs, ws_cs,
+                eps, hc, num_iterations, TILE_SIZE,
+            ),
         )
-        grad_input = grad_input.reshape(original_shape)
-        if original_dtype != torch.float32:
-            grad_input = grad_input.to(original_dtype)
-        return grad_input
+        return grad_input.view(original_shape)
 
     # -- H_aggregate kernels -------------------------------------------------
 
     @ct.kernel
-    def _ct_h_agg_fwd_kernel(
-        x, h_pre, out, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt
-    ):
+    def _ct_h_agg_fwd_kernel(x, h_pre, out, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt):
         pid = ct.bid(0)
         num_tiles = ct.num_tiles(x, axis=2, shape=(TILE_M, N, TILE_C))
-        h_tile = ct.load(
-            h_pre, index=(pid, 0), shape=(TILE_M, N), padding_mode=PAD_ZERO
-        )
+        h_tile = ct.load(h_pre, index=(pid, 0), shape=(TILE_M, N), padding_mode=PAD_ZERO)
         h_tile = ct.expand_dims(h_tile, axis=2)
         for j in range(num_tiles):
-            x_tile = ct.load(
-                x, index=(pid, 0, j), shape=(TILE_M, N, TILE_C), padding_mode=PAD_ZERO
-            )
+            x_tile = ct.load(x, index=(pid, 0, j), shape=(TILE_M, N, TILE_C), padding_mode=PAD_ZERO)
             acc = ct.sum(x_tile * h_tile, axis=1).astype(ct.float32)
             ct.store(out, index=(pid, j), tile=acc.astype(out.dtype))
 
     @ct.kernel
-    def _ct_h_agg_bwd_kernel(
-        go, x, h_pre, gx, gh, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt
-    ):
+    def _ct_h_agg_bwd_kernel(go, x, h_pre, gx, gh, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt):
         pid = ct.bid(0)
         num_c_tiles = ct.num_tiles(go, axis=1, shape=(TILE_M, TILE_C))
-        h_tile = ct.load(
-            h_pre, index=(pid, 0), shape=(TILE_M, N), padding_mode=PAD_ZERO
-        )
+        h_tile = ct.load(h_pre, index=(pid, 0), shape=(TILE_M, N), padding_mode=PAD_ZERO)
         h_expanded = ct.expand_dims(h_tile, axis=2)
         gh_acc = ct.full((TILE_M, N), 0, dtype=ct.float32)
         for ct_idx in range(num_c_tiles):
@@ -378,8 +332,7 @@ if _CUTILE_AVAILABLE:
             )
             go_expanded = ct.expand_dims(go_tile, axis=1)
             x_tile = ct.load(
-                x, index=(pid, 0, ct_idx),
-                shape=(TILE_M, N, TILE_C), padding_mode=PAD_ZERO,
+                x, index=(pid, 0, ct_idx), shape=(TILE_M, N, TILE_C), padding_mode=PAD_ZERO
             )
             gx_tile = go_expanded * h_expanded
             ct.store(gx, index=(pid, 0, ct_idx), tile=gx_tile.astype(gx.dtype))
@@ -391,14 +344,12 @@ if _CUTILE_AVAILABLE:
         sb = s * b
         TILE_SIZE = math.gcd(sb, 4)
         TILE_C = math.gcd(C, 1024)
-        x_flat = x.view(sb, n, C).contiguous()
-        h_flat = h_pre.view(sb, n).contiguous()
         out = torch.empty(sb, C, dtype=x.dtype, device=x.device)
         ct.launch(
             torch.cuda.current_stream(),
             (math.ceil(sb / TILE_SIZE),),
             _ct_h_agg_fwd_kernel,
-            (x_flat, h_flat, out, n, TILE_SIZE, TILE_C),
+            (x.view(sb, n, C), h_pre.view(sb, n), out, n, TILE_SIZE, TILE_C),
         )
         return out.view(s, b, C)
 
@@ -409,16 +360,16 @@ if _CUTILE_AVAILABLE:
         sb = s * b
         TILE_C = math.gcd(C, 1024)
         TILE_M = math.gcd(sb, 4)
-        go = grad_output.view(sb, C).contiguous()
-        xf = x.view(sb, n, C).contiguous()
-        hf = h_pre.view(sb, n).contiguous()
         gx = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
         gh = torch.empty(sb, n, dtype=x.dtype, device=x.device)
         ct.launch(
             torch.cuda.current_stream(),
             (math.ceil(sb / TILE_M),),
             _ct_h_agg_bwd_kernel,
-            (go, xf, hf, gx, gh, n, TILE_M, TILE_C),
+            (
+                grad_output.view(sb, C), x.view(sb, n, C), h_pre.view(sb, n),
+                gx, gh, n, TILE_M, TILE_C,
+            ),
         )
         return gx.view(s, b, n, C), gh.view(s, b, n)
 
@@ -426,21 +377,17 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_hpb_fwd_kernel(
-        hr, orig, hp, x, out,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        hr, orig, hp, x, out, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
         pid = ct.bid(0)
         num_c_tiles = ct.num_tiles(x, axis=1, shape=(TILE_SIZE, TILE_C))
         hp_tile = ct.load(hp, index=(pid, 0), shape=(TILE_SIZE, N), padding_mode=PAD_ZERO)
         hp_2d = ct.reshape(hp_tile, (N, 1))
-        hr_tile = ct.load(
-            hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO
-        )
+        hr_tile = ct.load(hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO)
         hr_2d = ct.reshape(hr_tile, (N, N))
         for ct_idx in range(num_c_tiles):
             orig_tile = ct.load(
-                orig, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
             x_tile = ct.load(
@@ -453,27 +400,24 @@ if _CUTILE_AVAILABLE:
                     orig_2d, (j, 0), shape=(1, TILE_C)
                 )
             ct.store(
-                out, index=(pid, 0, ct_idx),
+                out,
+                index=(pid, 0, ct_idx),
                 tile=ct.reshape(out_2d, (TILE_SIZE, N, TILE_C)).astype(out.dtype),
             )
 
     @ct.kernel
     def _ct_hpb_fwd_bias_kernel(
-        hr, orig, hp, x, bias, out,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        hr, orig, hp, x, bias, out, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
         pid = ct.bid(0)
         num_c_tiles = ct.num_tiles(x, axis=1, shape=(TILE_SIZE, TILE_C))
         hp_tile = ct.load(hp, index=(pid, 0), shape=(TILE_SIZE, N), padding_mode=PAD_ZERO)
         hp_2d = ct.reshape(hp_tile, (N, 1))
-        hr_tile = ct.load(
-            hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO
-        )
+        hr_tile = ct.load(hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO)
         hr_2d = ct.reshape(hr_tile, (N, N))
         for ct_idx in range(num_c_tiles):
             orig_tile = ct.load(
-                orig, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
             x_tile = ct.load(
@@ -487,23 +431,31 @@ if _CUTILE_AVAILABLE:
                     orig_2d, (j, 0), shape=(1, TILE_C)
                 )
             ct.store(
-                out, index=(pid, 0, ct_idx),
+                out,
+                index=(pid, 0, ct_idx),
                 tile=ct.reshape(out_2d, (TILE_SIZE, N, TILE_C)).astype(out.dtype),
             )
 
     @ct.kernel
     def _ct_hpb_bwd_kernel(
-        go, hr, orig, hp, x,
-        g_hr, g_orig, g_hp, g_x,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        go,
+        hr,
+        orig,
+        hp,
+        x,
+        g_hr,
+        g_orig,
+        g_hp,
+        g_x,
+        N: ConstInt,
+        TILE_C: ConstInt,
+        TILE_SIZE: ConstInt,
     ):
         pid = ct.bid(0)
         num_c_tiles = ct.cdiv(go.shape[2], TILE_C)
         hp_tile = ct.load(hp, index=(pid, 0), shape=(TILE_SIZE, N))
         hp_2d = ct.reshape(hp_tile, (1, N))
-        hr_tile = ct.load(
-            hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO
-        )
+        hr_tile = ct.load(hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO)
         hr_2d = ct.reshape(hr_tile, (N, N))
         acc_g_hp_2d = ct.full((N, 1), 0, dtype=ct.float32)
         acc_g_hr_2d = ct.full((N, N), 0, dtype=ct.float32)
@@ -513,13 +465,11 @@ if _CUTILE_AVAILABLE:
             )
             x_2d = ct.reshape(x_tile, (1, TILE_C))
             go_tile = ct.load(
-                go, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             go_2d = ct.reshape(go_tile, (N, TILE_C))
             orig_tile = ct.load(
-                orig, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
             g_x_2d = ct.full((1, TILE_C), 0, dtype=hp.dtype)
@@ -528,43 +478,53 @@ if _CUTILE_AVAILABLE:
                 g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
-                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape(
-                    (N, 1)
-                ) * ct.extract(go_2d, (j, 0), shape=(1, TILE_C))
+                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1)) * ct.extract(
+                    go_2d, (j, 0), shape=(1, TILE_C)
+                )
             acc_g_hp_2d += ct.sum(go_2d * x_2d, axis=1, keepdims=True)
             acc_g_hr_2d += ct.sum(
                 ct.expand_dims(go_2d, axis=1) * ct.expand_dims(orig_2d, axis=0), axis=2
             )
             ct.store(
-                g_x, index=(pid, ct_idx),
+                g_x,
+                index=(pid, ct_idx),
                 tile=ct.reshape(g_x_2d, (TILE_SIZE, TILE_C)).astype(g_x.dtype),
             )
             ct.store(
-                g_orig, index=(pid, 0, ct_idx),
+                g_orig,
+                index=(pid, 0, ct_idx),
                 tile=ct.reshape(g_orig_2d, (TILE_SIZE, N, TILE_C)).astype(g_orig.dtype),
             )
         ct.store(
-            g_hp, index=(pid, 0),
-            tile=ct.reshape(acc_g_hp_2d, (TILE_SIZE, N)).astype(g_hp.dtype),
+            g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp_2d, (TILE_SIZE, N)).astype(g_hp.dtype)
         )
         ct.store(
-            g_hr, index=(pid, 0, 0),
+            g_hr,
+            index=(pid, 0, 0),
             tile=ct.reshape(acc_g_hr_2d, (TILE_SIZE, N, N)).astype(g_hr.dtype),
         )
 
     @ct.kernel
     def _ct_hpb_bwd_bias_kernel(
-        go, hr, orig, hp, x, bias,
-        g_hr, g_orig, g_hp, g_x,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        go,
+        hr,
+        orig,
+        hp,
+        x,
+        bias,
+        g_hr,
+        g_orig,
+        g_hp,
+        g_x,
+        N: ConstInt,
+        TILE_C: ConstInt,
+        TILE_SIZE: ConstInt,
     ):
         pid = ct.bid(0)
         num_c_tiles = ct.cdiv(go.shape[2], TILE_C)
         hp_tile = ct.load(hp, index=(pid, 0), shape=(TILE_SIZE, N))
         hp_2d = ct.reshape(hp_tile, (1, N))
-        hr_tile = ct.load(
-            hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO
-        )
+        hr_tile = ct.load(hr, index=(pid, 0, 0), shape=(TILE_SIZE, N, N), padding_mode=PAD_ZERO)
         hr_2d = ct.reshape(hr_tile, (N, N))
         acc_g_hp_2d = ct.full((N, 1), 0, dtype=ct.float32)
         acc_g_hr_2d = ct.full((N, N), 0, dtype=ct.float32)
@@ -572,20 +532,14 @@ if _CUTILE_AVAILABLE:
             x_tile = ct.load(
                 x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO
             )
-            bias_tile = ct.load(
-                bias, index=(ct_idx,), shape=(TILE_C,), padding_mode=PAD_ZERO
-            )
-            xb_2d = ct.reshape(x_tile, (1, TILE_C)) + ct.reshape(
-                bias_tile, (1, TILE_C)
-            )
+            bias_tile = ct.load(bias, index=(ct_idx,), shape=(TILE_C,), padding_mode=PAD_ZERO)
+            xb_2d = ct.reshape(x_tile, (1, TILE_C)) + ct.reshape(bias_tile, (1, TILE_C))
             go_tile = ct.load(
-                go, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             go_2d = ct.reshape(go_tile, (N, TILE_C))
             orig_tile = ct.load(
-                orig, index=(pid, 0, ct_idx),
-                shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO,
+                orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
             g_x_2d = ct.full((1, TILE_C), 0, dtype=hp.dtype)
@@ -594,58 +548,62 @@ if _CUTILE_AVAILABLE:
                 g_x_2d += ct.extract(hp_2d, (j, 0), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
-                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape(
-                    (N, 1)
-                ) * ct.extract(go_2d, (j, 0), shape=(1, TILE_C))
+                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1)) * ct.extract(
+                    go_2d, (j, 0), shape=(1, TILE_C)
+                )
             acc_g_hp_2d += ct.sum(go_2d * xb_2d, axis=1, keepdims=True)
             acc_g_hr_2d += ct.sum(
                 ct.expand_dims(go_2d, axis=1) * ct.expand_dims(orig_2d, axis=0), axis=2
             )
             ct.store(
-                g_x, index=(pid, ct_idx),
+                g_x,
+                index=(pid, ct_idx),
                 tile=ct.reshape(g_x_2d, (TILE_SIZE, TILE_C)).astype(g_x.dtype),
             )
             ct.store(
-                g_orig, index=(pid, 0, ct_idx),
+                g_orig,
+                index=(pid, 0, ct_idx),
                 tile=ct.reshape(g_orig_2d, (TILE_SIZE, N, TILE_C)).astype(g_orig.dtype),
             )
         ct.store(
-            g_hp, index=(pid, 0),
-            tile=ct.reshape(acc_g_hp_2d, (TILE_SIZE, N)).astype(g_hp.dtype),
+            g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp_2d, (TILE_SIZE, N)).astype(g_hp.dtype)
         )
         ct.store(
-            g_hr, index=(pid, 0, 0),
+            g_hr,
+            index=(pid, 0, 0),
             tile=ct.reshape(acc_g_hr_2d, (TILE_SIZE, N, N)).astype(g_hr.dtype),
         )
 
     def _cutile_h_post_bda_fwd(
-        h_res: Tensor,
-        original_residual: Tensor,
-        h_post: Tensor,
-        x: Tensor,
-        bias: Optional[Tensor],
+        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
         TILE_C = math.gcd(C, 1024)
         TILE_SIZE = math.gcd(sb, 1)
-        hr = h_res.view(sb, n, n).contiguous()
-        res = original_residual.view(sb, n, C).contiguous()
-        hp = h_post.view(sb, n).contiguous()
-        xf = x.view(sb, C).contiguous()
         out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         grid = (math.ceil(sb / TILE_SIZE),)
         if bias is not None:
             ct.launch(
-                torch.cuda.current_stream(), grid,
+                torch.cuda.current_stream(),
+                grid,
                 _ct_hpb_fwd_bias_kernel,
-                (hr, res, hp, xf, bias.contiguous(), out, n, TILE_C, TILE_SIZE),
+                (
+                    h_res.view(sb, n, n), original_residual.view(sb, n, C),
+                    h_post.view(sb, n), x.view(sb, C), bias,
+                    out, n, TILE_C, TILE_SIZE,
+                ),
             )
         else:
             ct.launch(
-                torch.cuda.current_stream(), grid,
+                torch.cuda.current_stream(),
+                grid,
                 _ct_hpb_fwd_kernel,
-                (hr, res, hp, xf, out, n, TILE_C, TILE_SIZE),
+                (
+                    h_res.view(sb, n, n), original_residual.view(sb, n, C),
+                    h_post.view(sb, n), x.view(sb, C),
+                    out, n, TILE_C, TILE_SIZE,
+                ),
             )
         return out.view(s, b, n, C)
 
@@ -661,11 +619,6 @@ if _CUTILE_AVAILABLE:
         sb = s * b
         TILE_C = math.gcd(C, 1024)
         TILE_SIZE = math.gcd(sb, 1)
-        go = grad_output.view(sb, n, C).contiguous()
-        hr = h_res.view(sb, n, n).contiguous()
-        res = original_residual.view(sb, n, C).contiguous()
-        hp = h_post.view(sb, n).contiguous()
-        xf = x.view(sb, C).contiguous()
         g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
         g_res = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         g_hp = torch.empty(sb, n, dtype=h_res.dtype, device=h_res.device)
@@ -673,18 +626,34 @@ if _CUTILE_AVAILABLE:
         grid = (sb,)
         if bias is not None:
             ct.launch(
-                torch.cuda.current_stream(), grid,
+                torch.cuda.current_stream(),
+                grid,
                 _ct_hpb_bwd_bias_kernel,
                 (
-                    go, hr, res, hp, xf, bias.contiguous(),
-                    g_hr, g_res, g_hp, g_x, n, TILE_C, TILE_SIZE,
+                    grad_output.view(sb, n, C),
+                    h_res.view(sb, n, n),
+                    original_residual.view(sb, n, C),
+                    h_post.view(sb, n),
+                    x.view(sb, C),
+                    bias,
+                    g_hr, g_res, g_hp, g_x,
+                    n, TILE_C, TILE_SIZE,
                 ),
             )
         else:
             ct.launch(
-                torch.cuda.current_stream(), grid,
+                torch.cuda.current_stream(),
+                grid,
                 _ct_hpb_bwd_kernel,
-                (go, hr, res, hp, xf, g_hr, g_res, g_hp, g_x, n, TILE_C, TILE_SIZE),
+                (
+                    grad_output.view(sb, n, C),
+                    h_res.view(sb, n, n),
+                    original_residual.view(sb, n, C),
+                    h_post.view(sb, n),
+                    x.view(sb, C),
+                    g_hr, g_res, g_hp, g_x,
+                    n, TILE_C, TILE_SIZE,
+                ),
             )
         g_bias = g_x.sum(dim=0) if bias is not None else None
         return (
@@ -708,9 +677,18 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_proj_rms_fwd_kernel(
-        A, B, PROJ, NORM, R,
-        M: int, N: int, K: int, eps: float,
-        TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt,
+        A,
+        B,
+        PROJ,
+        NORM,
+        R,
+        M: int,
+        N: int,
+        K: int,
+        eps: float,
+        TILE_M: ConstInt,
+        TILE_N: ConstInt,
+        TILE_K: ConstInt,
     ):
         tile_m_id = ct.bid(0)
         num_k_tiles = ct.cdiv(K, TILE_K)
@@ -718,17 +696,11 @@ if _CUTILE_AVAILABLE:
         sum_sq = ct.full((TILE_M, 1), 0.0, dtype=ct.float32)
         for tile_k_id in range(num_k_tiles):
             a_tile = ct.load(
-                A, index=(tile_m_id, tile_k_id),
-                shape=(TILE_M, TILE_K), padding_mode=PAD_ZERO,
+                A, index=(tile_m_id, tile_k_id), shape=(TILE_M, TILE_K), padding_mode=PAD_ZERO
             )
-            b_tile = ct.load(
-                B, index=(0, tile_k_id),
-                shape=(TILE_N, TILE_K), padding_mode=PAD_ZERO,
-            )
+            b_tile = ct.load(B, index=(0, tile_k_id), shape=(TILE_N, TILE_K), padding_mode=PAD_ZERO)
             acc = ct.mma(
-                a_tile.astype(ct.tfloat32),
-                b_tile.transpose().astype(ct.tfloat32),
-                acc=acc,
+                a_tile.astype(ct.tfloat32), b_tile.transpose().astype(ct.tfloat32), acc=acc
             )
             sum_sq += ct.sum(a_tile * a_tile, axis=1, keepdims=True)
         norm_tile = ct.sqrt(sum_sq)
@@ -740,62 +712,56 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_proj_rms_bwd_kernel(
-        A, B, NORM, DD, DR, DA, DB,
-        M: int, N: int, K: int,
-        TILE_SIZE_M: ConstInt, TILE_SIZE_N: ConstInt, TILE_SIZE_K: ConstInt,
+        A,
+        B,
+        NORM,
+        DD,
+        DR,
+        DA,
+        DB,
+        M: int,
+        N: int,
+        K: int,
+        TILE_SIZE_M: ConstInt,
+        TILE_SIZE_N: ConstInt,
+        TILE_SIZE_K: ConstInt,
     ):
         zero_pad = ct.PaddingMode.ZERO
         tile_k_id = ct.bid(0)
         NUM_M_TILES = ct.cdiv(M, TILE_SIZE_M)
         accumulator_db = ct.full((TILE_SIZE_K, TILE_SIZE_N), 0.0, dtype=ct.float32)
         for tile_m_id in range(NUM_M_TILES):
-            accumulator_da = ct.full(
-                (TILE_SIZE_M, TILE_SIZE_K), 0.0, dtype=ct.float32
-            )
+            accumulator_da = ct.full((TILE_SIZE_M, TILE_SIZE_K), 0.0, dtype=ct.float32)
             a_tile = ct.load(
-                A, index=(tile_m_id, tile_k_id),
-                shape=(TILE_SIZE_M, TILE_SIZE_K), padding_mode=zero_pad,
+                A,
+                index=(tile_m_id, tile_k_id),
+                shape=(TILE_SIZE_M, TILE_SIZE_K),
+                padding_mode=zero_pad,
             )
             norm_tile = ct.load(
-                NORM, index=(tile_m_id, 0),
-                shape=(TILE_SIZE_M, 1), padding_mode=zero_pad,
+                NORM, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=zero_pad
             )
             dr_tile = ct.load(
-                DR, index=(tile_m_id, 0),
-                shape=(TILE_SIZE_M, 1), padding_mode=zero_pad,
+                DR, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=zero_pad
             )
-            accumulator_da = accumulator_da + _ct_rms_dnorm(
-                a_tile, norm_tile, dr_tile, K
-            )
+            accumulator_da = accumulator_da + _ct_rms_dnorm(a_tile, norm_tile, dr_tile, K)
             b_tile = ct.load(
-                B, index=(0, tile_k_id),
-                shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad,
+                B, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad
             )
             dd_tile = ct.load(
-                DD, index=(tile_m_id, 0),
-                shape=(TILE_SIZE_M, TILE_SIZE_N), padding_mode=zero_pad,
+                DD, index=(tile_m_id, 0), shape=(TILE_SIZE_M, TILE_SIZE_N), padding_mode=zero_pad
             )
             dd_tile = ct.astype(dd_tile, ct.tfloat32)
-            accumulator_da = ct.mma(
-                dd_tile, b_tile.astype(ct.tfloat32), acc=accumulator_da
-            )
-            ct.store(
-                DA, index=(tile_m_id, tile_k_id),
-                tile=accumulator_da.astype(DA.dtype),
-            )
+            accumulator_da = ct.mma(dd_tile, b_tile.astype(ct.tfloat32), acc=accumulator_da)
+            ct.store(DA, index=(tile_m_id, tile_k_id), tile=accumulator_da.astype(DA.dtype))
             accumulator_db = ct.mma(
                 a_tile.transpose().astype(ct.tfloat32), dd_tile, acc=accumulator_db
             )
-        ct.store(
-            DB, index=(0, tile_k_id),
-            tile=accumulator_db.transpose().astype(DB.dtype),
-        )
+        ct.store(DB, index=(0, tile_k_id), tile=accumulator_db.transpose().astype(DB.dtype))
 
     @ct.kernel
     def _ct_proj_rms_bwd_small_k_kernel(
-        A, B, NORM, DD, DR, DA, DB,
-        M: int, N: int, K: int,
-        TILE_N_SIZE: ConstInt,
+        A, B, NORM, DD, DR, DA, DB, M: int, N: int, K: int, TILE_N_SIZE: ConstInt
     ):
         zero_pad = ct.PaddingMode.ZERO
         TILE_DB_SIZE_M = 128
@@ -804,17 +770,19 @@ if _CUTILE_AVAILABLE:
         NUM_K_TILES = ct.cdiv(K, TILE_DB_SIZE_K)
         if ct.bid(1) == 0:
             for tile_id in range(ct.bid(0), NUM_K_TILES, ct.num_blocks(0)):
-                accumulator_db = ct.full(
-                    (TILE_DB_SIZE_K, TILE_N_SIZE), 0.0, dtype=ct.float32
-                )
+                accumulator_db = ct.full((TILE_DB_SIZE_K, TILE_N_SIZE), 0.0, dtype=ct.float32)
                 for m_tile in range(NUM_M_TILES):
                     a_tile = ct.load(
-                        A, index=(m_tile, tile_id),
-                        shape=(TILE_DB_SIZE_M, TILE_DB_SIZE_K), padding_mode=zero_pad,
+                        A,
+                        index=(m_tile, tile_id),
+                        shape=(TILE_DB_SIZE_M, TILE_DB_SIZE_K),
+                        padding_mode=zero_pad,
                     )
                     dd_tile = ct.load(
-                        DD, index=(m_tile, 0),
-                        shape=(TILE_DB_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
+                        DD,
+                        index=(m_tile, 0),
+                        shape=(TILE_DB_SIZE_M, TILE_N_SIZE),
+                        padding_mode=zero_pad,
                     )
                     accumulator_db = ct.mma(
                         a_tile.transpose().astype(ct.tfloat32),
@@ -822,7 +790,8 @@ if _CUTILE_AVAILABLE:
                         acc=accumulator_db,
                     )
                 ct.store(
-                    DB, index=(0, tile_id),
+                    DB,
+                    index=(0, tile_id),
                     tile=accumulator_db.transpose().astype(DB.dtype),
                     allow_tma=False,
                 )
@@ -834,41 +803,38 @@ if _CUTILE_AVAILABLE:
             for tile_id in range(ct.bid(0), NUM_DA_TILES, ct.num_blocks(0)):
                 b_tile_idx = tile_id % NUM_DA_K_TILES
                 dd_tile_idx = tile_id // NUM_DA_K_TILES
-                accumulator_da = ct.full(
-                    (TILE_DA_SIZE_M, TILE_DA_SIZE_K), 0.0, dtype=ct.float32
-                )
+                accumulator_da = ct.full((TILE_DA_SIZE_M, TILE_DA_SIZE_K), 0.0, dtype=ct.float32)
                 a_tile = ct.load(
-                    A, index=(dd_tile_idx, b_tile_idx),
-                    shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K), padding_mode=zero_pad,
+                    A,
+                    index=(dd_tile_idx, b_tile_idx),
+                    shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K),
+                    padding_mode=zero_pad,
                 )
                 norm_tile = ct.load(
-                    NORM, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
+                    NORM, index=(dd_tile_idx, 0), shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad
                 )
                 dr_tile = ct.load(
-                    DR, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
+                    DR, index=(dd_tile_idx, 0), shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad
                 )
                 accumulator_da = accumulator_da + _ct_rms_dnorm(
                     a_tile.astype(ct.float32), norm_tile, dr_tile, K
                 )
                 b_tile = ct.load(
-                    B, index=(0, b_tile_idx),
-                    shape=(TILE_N_SIZE, TILE_DA_SIZE_K), padding_mode=zero_pad,
+                    B,
+                    index=(0, b_tile_idx),
+                    shape=(TILE_N_SIZE, TILE_DA_SIZE_K),
+                    padding_mode=zero_pad,
                 )
                 dd_tile = ct.load(
-                    DD, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
+                    DD,
+                    index=(dd_tile_idx, 0),
+                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE),
+                    padding_mode=zero_pad,
                 )
                 accumulator_da = ct.mma(
-                    dd_tile.astype(ct.tfloat32),
-                    b_tile.astype(ct.tfloat32),
-                    acc=accumulator_da,
+                    dd_tile.astype(ct.tfloat32), b_tile.astype(ct.tfloat32), acc=accumulator_da
                 )
-                ct.store(
-                    DA, index=(dd_tile_idx, b_tile_idx),
-                    tile=accumulator_da.astype(DA.dtype),
-                )
+                ct.store(DA, index=(dd_tile_idx, b_tile_idx), tile=accumulator_da.astype(DA.dtype))
 
     def _next_power_of_2(n: int) -> int:
         n -= 1
@@ -911,9 +877,6 @@ if _CUTILE_AVAILABLE:
     ) -> Tuple[Tensor, Tensor]:
         M, K = x.shape
         N = weight.shape[0]
-        if norm.dtype != torch.float32:
-            norm = norm.float()
-        grad_r = grad_r.float()
         da = torch.empty_like(x)
         db = torch.empty_like(weight)
         TILE_SIZE_N = _next_power_of_2(N)
@@ -927,8 +890,19 @@ if _CUTILE_AVAILABLE:
                 grid,
                 _ct_proj_rms_bwd_kernel,
                 (
-                    x, weight, norm, grad_proj, grad_r, da, db,
-                    M, N, K, TILE_SIZE_M, TILE_SIZE_N, TILE_SIZE_K,
+                    x,
+                    weight,
+                    norm,
+                    grad_proj,
+                    grad_r,
+                    da,
+                    db,
+                    M,
+                    N,
+                    K,
+                    TILE_SIZE_M,
+                    TILE_SIZE_N,
+                    TILE_SIZE_K,
                 ),
             )
         else:
@@ -939,8 +913,6 @@ if _CUTILE_AVAILABLE:
                 _ct_proj_rms_bwd_small_k_kernel,
                 (x, weight, norm, grad_proj, grad_r, da, db, M, N, K, TILE_SIZE_N),
             )
-        da = da.to(x.dtype)
-        db = db.to(weight.dtype)
         return da, db
 
 
@@ -988,9 +960,7 @@ class FusedSinkhornKnopp(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (M_init,) = ctx.saved_tensors
-        grad_input = _sinkhorn_bwd_fn(
-            grad_output, M_init, ctx.num_iterations, ctx.eps
-        )
+        grad_input = _sinkhorn_bwd_fn(grad_output, M_init, ctx.num_iterations, ctx.eps)
         return grad_input, None, None
 
 
@@ -1053,9 +1023,7 @@ class FusedProjRms(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_proj, grad_r):
         x, weight, norm = ctx.saved_tensors
-        grad_x, grad_weight = _proj_rms_bwd_fn(
-            grad_proj, grad_r, x, weight, norm, ctx.eps
-        )
+        grad_x, grad_weight = _proj_rms_bwd_fn(grad_proj, grad_r, x, weight, norm, ctx.eps)
         return grad_x, grad_weight, None
 
 
@@ -1064,9 +1032,7 @@ class FusedProjRms(torch.autograd.Function):
 # ============================================================================
 
 
-def fused_sinkhorn(
-    input_logits: Tensor, num_iterations: int, eps: float = 1e-8
-) -> Tensor:
+def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-8) -> Tensor:
     """Project logits to doubly stochastic matrix via Sinkhorn-Knopp.
 
     Args:
@@ -1094,11 +1060,7 @@ def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 
 
 def fused_h_post_bda(
-    h_res: Tensor,
-    original_residual: Tensor,
-    h_post: Tensor,
-    x: Tensor,
-    bias: Optional[Tensor],
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Fused H_res @ residual + H_post * (x + bias).
 
@@ -1115,9 +1077,7 @@ def fused_h_post_bda(
     return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
 
 
-def fused_proj_rms(
-    x: Tensor, weight: Tensor, eps: float = 1e-8
-) -> Tuple[Tensor, Tensor]:
+def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-8) -> Tuple[Tensor, Tensor]:
     """Fused projection + RMS normalization.
 
     Args:
