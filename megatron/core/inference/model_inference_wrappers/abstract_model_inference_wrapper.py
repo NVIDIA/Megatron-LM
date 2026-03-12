@@ -141,7 +141,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
         attention_mask = None
-        return self.model(tokens, position_ids, attention_mask)
+        is_spec_decode = (
+            self.inference_context.is_dynamic_batching()
+            and self.inference_context.num_speculative_tokens > 0
+        )
+        return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
