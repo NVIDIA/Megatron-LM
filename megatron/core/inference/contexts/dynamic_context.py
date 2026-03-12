@@ -1863,8 +1863,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = self._compute_prefix_match(
-            req, req.remaining_prompt_length
+        (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+            self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
         request_tokens_can_be_added = (
@@ -1920,7 +1920,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return [], 0
 
-    def add_request(self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None) -> None:
+    def add_request(
+        self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
+    ) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
@@ -2089,7 +2091,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.kv_block_allocator.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
+                self.kv_block_allocator.register_kv_block_hashes(
+                    block_ids_to_hash, block_hashes_slice
+                )
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

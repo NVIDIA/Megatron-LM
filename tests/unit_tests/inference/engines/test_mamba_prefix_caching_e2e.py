@@ -526,14 +526,18 @@ class TestMambaPrefixCachingE2E:
             if step == 1:
                 assert reqs[0]._mamba_num_matched_blocks == 0, f"step 1"
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
-                assert reqs[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert (
+                    reqs[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+                )
                 assert step_prefill == 256
             elif step == 2:
                 # B: cached logit zero-prefill. C: 1 mamba match, skip 256, effective 256
                 assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
                 assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
-                assert reqs[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert (
+                    reqs[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
+                )
                 assert step_prefill == 256  # B=0 + C=256
             elif step == 3:
                 # D: 2 mamba matches, cached logit zero-prefill
@@ -614,13 +618,18 @@ class TestMambaPrefixCachingE2E:
         # E: seed request
         req_E = _run_one(0, prompts[0])
         h_E0 = req_E.precomputed_block_hashes[0]
-        assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
+        assert (
+            h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
+        )
         assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
         assert req_F.precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
-        assert h_E0 not in alloc.kv_hash_to_block_id and h_E0 not in ctx.mamba_slot_allocator.hash_to_block_id
+        assert (
+            h_E0 not in alloc.kv_hash_to_block_id
+            and h_E0 not in ctx.mamba_slot_allocator.hash_to_block_id
+        )
         assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
 
         # G: identical to E, but E's state was evicted

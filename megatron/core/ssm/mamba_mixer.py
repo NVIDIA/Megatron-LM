@@ -503,7 +503,11 @@ class MambaMixer(MegatronModule):
             else:
                 zxBCdt_prefill = zxBCdt
 
-            intermediate_offsets = context.mamba_slot_allocator.get_intermediate_offsets() if context.mamba_slot_allocator is not None else None
+            intermediate_offsets = (
+                context.mamba_slot_allocator.get_intermediate_offsets()
+                if context.mamba_slot_allocator is not None
+                else None
+            )
             result = self._dynamic_inference_prefill(
                 zxBCdt_prefill,
                 context,
@@ -515,7 +519,9 @@ class MambaMixer(MegatronModule):
                 y_prefill, intermediate_states = result
                 mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
                 if context.mamba_slot_allocator is not None:
-                    context.mamba_slot_allocator.buffer_intermediate_states(mamba_layer_idx, intermediate_states)
+                    context.mamba_slot_allocator.buffer_intermediate_states(
+                        mamba_layer_idx, intermediate_states
+                    )
             else:
                 y_prefill = result
 
@@ -900,7 +906,9 @@ class MambaMixer(MegatronModule):
                     cumulative_chunks = 0
                     for i in range(num_real_seqs):
                         seq_len = seqlens[i + 1] - seqlens[i]
-                        num_chunks = max(1, (seq_len + self.mamba_chunk_size - 1) // self.mamba_chunk_size)
+                        num_chunks = max(
+                            1, (seq_len + self.mamba_chunk_size - 1) // self.mamba_chunk_size
+                        )
                         first_chunk_idx = cumulative_chunks
                         offsets = intermediate_token_offsets[i]
                         count = 0

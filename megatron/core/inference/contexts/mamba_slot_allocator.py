@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
@@ -61,9 +60,7 @@ class MambaSlotAllocator:
             device=device,
         )
         self.ssm_states = torch.zeros(
-            (num_mamba_layers, max_slots) + ssm_states_shape,
-            dtype=ssm_states_dtype,
-            device=device,
+            (num_mamba_layers, max_slots) + ssm_states_shape, dtype=ssm_states_dtype, device=device
         )
 
         # Hash-to-block mapping: only blocks with cached Mamba state

@@ -572,8 +572,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         block_id = ctx.request_to_kv_block_ids[0][0].item()
         slot = ctx.mamba_slot_allocator.allocate_slot(block_id)
         for layer_idx in range(ctx.num_mamba_layers):
-            ssm = torch.ones_like(ctx.mamba_slot_allocator.ssm_states[layer_idx, slot]) * (layer_idx + 1)
-            conv = torch.ones_like(ctx.mamba_slot_allocator.conv_states[layer_idx, slot]) * (layer_idx + 10)
+            ssm = torch.ones_like(ctx.mamba_slot_allocator.ssm_states[layer_idx, slot]) * (
+                layer_idx + 1
+            )
+            conv = torch.ones_like(ctx.mamba_slot_allocator.conv_states[layer_idx, slot]) * (
+                layer_idx + 10
+            )
             ctx.mamba_slot_allocator.store_from_tensors(block_id, layer_idx, ssm, conv)
         assert ctx.mamba_slot_allocator.has_state(block_id)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
@@ -657,8 +661,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             and not ctx8.mamba_slot_allocator.has_state(bids8[0])
         )
         ctx8.mamba_slot_allocator.allocate_slot(bids8[0])
-        assert ctx8.mamba_slot_allocator.free_count == initial_free - 3 and ctx8.mamba_slot_allocator.has_state(
-            bids8[0]
+        assert (
+            ctx8.mamba_slot_allocator.free_count == initial_free - 3
+            and ctx8.mamba_slot_allocator.has_state(bids8[0])
         )
 
     @pytest.mark.internal

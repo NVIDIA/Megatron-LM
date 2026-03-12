@@ -1470,7 +1470,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                            if (
+                                block_hash
+                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                            ):
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
@@ -1487,7 +1490,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                            if (
+                                block_hash
+                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                            ):
                                 pending_block_hashes.add(block_hash)
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
