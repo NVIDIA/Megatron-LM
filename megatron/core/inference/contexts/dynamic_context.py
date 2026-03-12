@@ -2359,10 +2359,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
-        # All request that were in prefill become decode requests
-        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = (
-            0  # TODO : Check how this works with chunked prefill
-        )
+        # All request that were in prefill become decode requests.
+        # For the chunked prefill request we will overwrite this the next time add_request
+        # is called on that request.
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
         if self.get_index_of_chunked_prefill_request() != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
