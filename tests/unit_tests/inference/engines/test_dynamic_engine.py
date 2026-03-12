@@ -1921,14 +1921,31 @@ class TestDynamicInferenceEngine:
                 )
             )
 
+        def set_epoch(epoch):
+            """Simulate receiving a SET_GENERATION_EPOCH signal."""
+            engine._generation_epoch = epoch
+            for entry in engine.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
+
         # Steps without a generation epoch set — no stamps.
         engine.step_modern()
         for entry in engine.requests.values():
             assert entry.record[-1].policy_epoch is None
             assert entry.record[-1].kv_cache_epoch is None
 
-        # Generation epoch 0: stamps all tokens produced so far and going forward.
-        engine._generation_epoch = 0
+        # Generation epoch 0: stamps all active requests at their current length.
+        set_epoch(0)
         for _ in range(2):
             engine.step_modern()
 
@@ -1937,18 +1954,18 @@ class TestDynamicInferenceEngine:
             ks = entry.record[-1].kv_cache_epoch
             assert ps == ks == [(0, 0)]
 
-        # Generation epoch 1: new tokens get 1, existing keep 0.
-        engine._generation_epoch = 1
+        # Generation epoch 1: boundary at current length, before next step.
+        set_epoch(1)
         for _ in range(3):
             engine.step_modern()
 
         for entry in engine.requests.values():
             ps = entry.record[-1].policy_epoch
             ks = entry.record[-1].kv_cache_epoch
-            assert ps == ks == [(0, 0), (PROMPT_LEN + 3, 1)]
+            assert ps == ks == [(0, 0), (PROMPT_LEN + 2, 1)]
 
         # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
-        # stamping logic will recreate it fresh when the request next generates tokens.
+        # stamping logic will recreate it fresh on the next epoch signal.
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
@@ -1960,8 +1977,8 @@ class TestDynamicInferenceEngine:
             for entry in engine.requests.values():
                 assert entry.record[-1].kv_cache_epoch is None
 
-        # Generation epoch 2: generate remaining tokens.
-        engine._generation_epoch = 2
+        # Generation epoch 2: stamp then generate remaining tokens.
+        set_epoch(2)
 
         finished_records = []
         while engine.has_unfinished_requests():
@@ -1971,14 +1988,13 @@ class TestDynamicInferenceEngine:
         for record in finished_records:
             merged = record.merge()
 
-            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 3, 1), (PROMPT_LEN + 6, 2)]
+            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
 
             if use_checkpoint:
-                # KV cache was cleared by checkpoint; stamping logic recreated
-                # it at epoch 2 (when the first post-checkpoint step ran).
+                # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
                 assert merged.kv_cache_epoch == [(0, 2)]
             else:
-                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 3, 1), (PROMPT_LEN + 6, 2)]
+                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]

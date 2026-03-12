@@ -812,6 +812,12 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             request.add_event_add_engine()  # Record when request enters engine
 
+            # Stamp new request with the current generation epoch.
+            if self._generation_epoch is not None:
+                epoch = self._generation_epoch
+                request.policy_epoch = [(0, epoch)]
+                request.kv_cache_epoch = [(0, epoch)]
+
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
@@ -1228,20 +1234,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.routing_indices = torch.cat(
                         [request.routing_indices, step_routing], dim=0
                     )
-
-            # Stamp this request with the current generation epoch.
-            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
-            total = len(request.prompt_tokens) + len(request.generated_tokens)
-            if (epoch := self._generation_epoch) is not None and total > 0:
-                boundary = (total - 1, epoch)
-                if request.policy_epoch is None:
-                    request.policy_epoch = [(0, epoch)]
-                elif request.policy_epoch[-1][1] != epoch:
-                    request.policy_epoch.append(boundary)
-                if request.kv_cache_epoch is None:
-                    request.kv_cache_epoch = [(0, epoch)]
-                elif request.kv_cache_epoch[-1][1] != epoch:
-                    request.kv_cache_epoch.append(boundary)
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1912,7 +1904,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
 
-        # First pass: add requests and update generation epoch.
+        # First pass: add requests.
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
@@ -1932,6 +1924,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if new_generation_epoch is not None:
             self._generation_epoch = new_generation_epoch
+            # Stamp all active requests with the new epoch.
+            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, new_generation_epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).
