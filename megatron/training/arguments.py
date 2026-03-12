@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
+    parser = _add_tensor_inspect_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -2119,6 +2120,19 @@ def _add_ft_package_args(parser):
                        'out-of-section timeouts. The first N iterations are excluded from '
                        'timeout monitoring as they can be significantly slower than steady-state. '
                        'Default: 5. Note: This feature is for Nvidia internal use only.')
+    return parser
+
+
+def _add_tensor_inspect_args(parser):
+    group = parser.add_argument_group(title='tensor_inspect')
+    group.add_argument('--tensor-inspect', action='store_true',
+                       help='Enable tensor inspection via NVIDIA DLFw Inspect.')
+    group.add_argument('--tensor-inspect-config', type=str, default=None,
+                       help='Path to YAML config for tensor inspection features.')
+    group.add_argument('--tensor-inspect-log-dir', type=str, default=None,
+                       help='Directory for tensor inspection logs.')
+    group.add_argument('--tensor-inspect-feature-dirs', type=str, nargs='+', default=None,
+                       help='Directories containing tensor inspection feature implementations.')
     return parser
 
 

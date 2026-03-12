@@ -171,6 +171,12 @@ from megatron.core.num_microbatches_calculator import (
 )
 
 from .async_utils import maybe_finalize_async_save
+from .tensor_inspect import (
+    initialize_tensor_inspect_pre_model,
+    finalize_tensor_inspect_post_model,
+    tensor_inspect_step,
+    tensor_inspect_end,
+)
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
@@ -920,6 +926,15 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    if getattr(args, 'tensor_inspect', False):
+        initialize_tensor_inspect_pre_model(
+            enabled=True,
+            config_file=args.tensor_inspect_config,
+            feature_dirs=args.tensor_inspect_feature_dirs,
+            log_dir=args.tensor_inspect_log_dir or args.save,
+            init_training_step=getattr(args, 'iteration', 0),
+        )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -1013,6 +1028,16 @@ def pretrain(
                 "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
+
+    if getattr(args, 'tensor_inspect', False):
+        finalize_tensor_inspect_post_model(
+            enabled=True,
+            model=model,
+            tensorboard_logger=get_tensorboard_writer(),
+            wandb_logger=get_wandb_writer(),
+            current_training_step=args.iteration,
+            include_context_parallel=True,
+        )
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -2894,6 +2919,10 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
+
+        if getattr(args, 'tensor_inspect', False):
+            tensor_inspect_step(enabled=True)
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3118,6 +3147,9 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    if getattr(args, 'tensor_inspect', False):
+        tensor_inspect_end(enabled=True)
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
