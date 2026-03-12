@@ -212,7 +212,10 @@ def setup_model_and_optimizer(
 
     if isinstance(optimizer, ChainedOptimizer):
         for opt in optimizer.chained_optimizers:
-            opt.init_state_fn(opt)
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
     else:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
@@ -308,7 +311,10 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         for opt in optimizer.chained_optimizers:
-            opt.init_state_fn(opt)
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:
