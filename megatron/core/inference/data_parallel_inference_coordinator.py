@@ -389,14 +389,12 @@ class DataParallelInferenceCoordinator:
                     return
 
                 if request_hashes:
-                    self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
+                    self._update_rank_hashes(next_identity, request_hashes)
                 if self.schedule_records is not None:
                     self.schedule_records.append(
                         {
                             "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[
-                                next_data_parallel_rank_identity
-                            ],
+                            "rank_index": self.identity_to_rank_index[next_identity],
                             "num_hashes": len(request_hashes),
                         }
                     )

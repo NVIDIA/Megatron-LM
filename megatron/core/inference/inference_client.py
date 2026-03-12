@@ -67,6 +67,11 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
+
+        # Prevent socket.send() from thread-blocking at >1000 concurrent requests
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0)
+
         socket.connect(inference_coordinator_address)
 
         self._loop = None
@@ -132,9 +137,7 @@ class InferenceClient:
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
                     completed_request = DynamicInferenceRequestRecord.deserialize(reply)
-                    completion_future.get_loop().call_soon_threadsafe(
-                        completion_future.set_result, completed_request
-                    )
+                    completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
