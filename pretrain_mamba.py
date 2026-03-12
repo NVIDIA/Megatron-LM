@@ -105,9 +105,6 @@ def get_batch(data_iterator, vp_stage=None):
             cu_seqlens_padded = cu_seqlens
 
         max_seqlen = batch.pop('max_seqlen', None)
-        # assert max_seqlen.dim() == 1
-        # # TODO(duncan): can this be kept as a 0-D tensor?
-        # batch['max_seqlen'] = int(max_seqlen[0].item())
 
     if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
         # total_tokens = batch['tokens'].size(1)
