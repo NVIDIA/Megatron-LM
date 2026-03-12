@@ -972,12 +972,8 @@ class TextGenerationController:
         # may swap request indices. The Python lists tracking EOS block IDs
         # and intermediate offsets are not swapped along with tensors, so
         # commit must run while indices are still valid.
-        if (
-            context.is_hybrid_model
-            and hasattr(context, 'max_mamba_cache_slots')
-            and context.max_mamba_cache_slots > 0
-        ):
-            context.commit_mamba_intermediate_states()
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()

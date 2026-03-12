@@ -38,7 +38,8 @@ from megatron.core.utils import get_pg_size, internal_api
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
-from .dynamic_block_allocator import BlockAllocator
+from .kv_block_allocator import KVBlockAllocator
+from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -449,7 +450,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
 
-        self.block_allocator = BlockAllocator(
+        self.kv_block_allocator = KVBlockAllocator(
             context=self,
             total_count=(
                 block_count if self.unified_memory_level == 0 else block_count + paused_block_count
@@ -475,7 +476,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
-            self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+            self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
 
             # Adjust max_requests for Mamba memory constraints if necessary
             if self.is_hybrid_model and mamba_max_requests < self.max_requests:
@@ -505,7 +506,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_graph_attn_metadata = {}
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.total_count,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -513,7 +514,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.total_count,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -567,8 +568,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         logging.info(
             "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
             % (
-                get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes),
-                self.block_allocator.active_count,
+                get_mem_size_str(self.kv_block_allocator.active_count * self.block_size_bytes),
+                self.kv_block_allocator.active_count,
             )
         )
 
@@ -578,7 +579,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.memory_buffer = torch.empty(
                 (
                     self.num_attention_layers,
-                    self.block_allocator.total_count,
+                    self.kv_block_allocator.total_count,
                     self.block_size_tokens,
                     self.kv_reduced_dim,
                 ),
@@ -590,7 +591,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (
                     2,  # key and value
                     self.num_attention_layers,
-                    self.block_allocator.total_count,
+                    self.kv_block_allocator.total_count,
                     self.block_size_tokens,
                     self.num_attention_heads_per_partition,
                     self.hidden_size_per_attention_head,
@@ -722,7 +723,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_mamba_states()
 
         # Allocate Mamba prefix cache if configured
-        self.max_mamba_cache_slots = 0
+        self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
         if (
             self.is_hybrid_model
             and self.config.prefix_caching_mamba_gb is not None
@@ -730,12 +731,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             and self.config.enable_prefix_caching
         ):
             self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
-
-        # Per-request intermediate state storage for Mamba prefix caching
-        self._mamba_intermediate_offsets: list = [None] * self.max_requests
-        self._mamba_intermediate_block_ids: list = [None] * self.max_requests
-        self._mamba_eos_cache_block_id: list = [None] * self.max_requests
-        self._mamba_intermediate_buffer: dict = {}
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1006,28 +1001,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             return
 
-        self.max_mamba_cache_slots = max_slots
-        device = torch.cuda.current_device()
-
-        # Block <-> slot mappings
-        num_blocks = self.block_allocator.total_count
-        self.block_to_mamba_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-        self.mamba_slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device=device)
-
-        # Free slot pool (stack)
-        self.mamba_cache_free_slots = torch.arange(max_slots, dtype=torch.int32, device=device)
-        self.mamba_cache_free_count = max_slots
-
-        # State tensors
-        self.mamba_cache_conv_states = torch.zeros(
-            (self.num_mamba_layers, max_slots) + self.mamba_conv_states_shape,
-            dtype=self.mamba_conv_states_dtype,
-            device=device,
+        self.mamba_slot_allocator = MambaSlotAllocator(
+            context=self,
+            max_slots=max_slots,
+            num_mamba_layers=self.num_mamba_layers,
+            conv_states_shape=self.mamba_conv_states_shape,
+            ssm_states_shape=self.mamba_ssm_states_shape,
+            conv_states_dtype=self.mamba_conv_states_dtype,
+            ssm_states_dtype=self.mamba_ssm_states_dtype,
         )
-        self.mamba_cache_ssm_states = torch.zeros(
-            (self.num_mamba_layers, max_slots) + self.mamba_ssm_states_shape,
-            dtype=self.mamba_ssm_states_dtype,
-            device=device,
+        self.kv_block_allocator.on_blocks_deregistered = (
+            self.mamba_slot_allocator.on_kv_blocks_deregistered
         )
 
         logging.info(
@@ -1036,319 +1020,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_slots * per_slot_bytes / 1024**3,
             per_slot_bytes / 1024,
         )
-
-    def _allocate_mamba_cache_slot(self, block_id: int) -> int:
-        """Get a free Mamba cache slot for a block, evicting if necessary.
-
-        Args:
-            block_id: The KV block ID to associate with this slot.
-
-        Returns:
-            The allocated slot index.
-        """
-        # Check if block already has a slot
-        existing = self.block_to_mamba_slot[block_id].item()
-        if existing >= 0:
-            return existing
-
-        # Try free pool
-        if self.mamba_cache_free_count > 0:
-            self.mamba_cache_free_count -= 1
-            slot = self.mamba_cache_free_slots[self.mamba_cache_free_count].item()
-        else:
-            slot = self._evict_lru_mamba_slot()
-
-        self.block_to_mamba_slot[block_id] = slot
-        self.mamba_slot_to_block[slot] = block_id
-        return slot
-
-    def _evict_lru_mamba_slot(self) -> int:
-        """Evict the least recently used Mamba cache slot.
-
-        Returns:
-            The freed slot index.
-        """
-        # Find blocks that have mamba slots and ref_count == 0
-        has_slot_mask = self.block_to_mamba_slot[: self.block_allocator.total_count] >= 0
-        ref_zero_mask = (
-            self.block_allocator.block_ref_counts[: self.block_allocator.total_count] == 0
-        )
-        candidates = has_slot_mask & ref_zero_mask
-        candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
-
-        if candidate_ids.numel() == 0:
-            raise RuntimeError("No evictable Mamba cache slots available")
-
-        # Pick block with oldest timestamp if LRU, otherwise just pick first
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-            timestamps = self.block_allocator.block_timestamps[candidate_ids]
-            evict_idx = candidate_ids[torch.argmin(timestamps)].item()
-        else:
-            evict_idx = candidate_ids[0].item()
-
-        slot = self.block_to_mamba_slot[evict_idx].item()
-        block_hash = self.block_allocator.block_hashes[evict_idx].item()
-
-        # Clean up mappings
-        self.block_to_mamba_slot[evict_idx] = -1
-        self.mamba_slot_to_block[slot] = -1
-        if block_hash > 0 and block_hash in self.block_allocator.mamba_hash_to_block_id:
-            del self.block_allocator.mamba_hash_to_block_id[block_hash]
-
-        return slot
-
-    def store_mamba_state_for_block_from_tensors(
-        self, block_id: int, layer_idx: int, ssm_state: Tensor, conv_state: Tensor
-    ) -> None:
-        """Write provided state tensors to a cache slot for a specific layer.
-
-        Args:
-            block_id: The KV block ID.
-            layer_idx: The Mamba layer index.
-            ssm_state: SSM state tensor to store.
-            conv_state: Conv state tensor to store.
-        """
-        slot = self.block_to_mamba_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no Mamba cache slot"
-        self.mamba_cache_ssm_states[layer_idx, slot].copy_(ssm_state)
-        self.mamba_cache_conv_states[layer_idx, slot].copy_(conv_state)
-
-    def store_mamba_state_for_block_from_live(self, block_id: int, request_idx: int) -> None:
-        """Copy all layers from live per-request buffer to cache slot.
-
-        Used for block-aligned EOS case where the final kernel state
-        is in the live buffer.
-
-        Args:
-            block_id: The KV block ID.
-            request_idx: The context request index.
-        """
-        slot = self.block_to_mamba_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no Mamba cache slot"
-        mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
-        self.mamba_cache_conv_states[:, slot].copy_(self.mamba_conv_states[:, mamba_idx])
-        self.mamba_cache_ssm_states[:, slot].copy_(self.mamba_ssm_states[:, mamba_idx])
-
-    def has_mamba_state_for_block(self, block_id: int) -> bool:
-        """Check if a block has cached Mamba state."""
-        return self.block_to_mamba_slot[block_id].item() >= 0
-
-    def restore_mamba_state_from_block(self, request_idx: int, block_id: int) -> bool:
-        """Copy all layers from cache slot to live request state.
-
-        Args:
-            request_idx: The context request index.
-            block_id: The KV block ID.
-
-        Returns:
-            True if state was restored, False if block has no cached state.
-        """
-        slot = self.block_to_mamba_slot[block_id].item()
-        if slot < 0:
-            return False
-        mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
-        self.mamba_conv_states[:, mamba_idx].copy_(self.mamba_cache_conv_states[:, slot])
-        self.mamba_ssm_states[:, mamba_idx].copy_(self.mamba_cache_ssm_states[:, slot])
-        return True
-
-    def invalidate_mamba_state_for_block(self, block_id: int) -> None:
-        """Free cache slot and clear mappings for a block.
-
-        Called when KV blocks are evicted/deregistered.
-
-        Args:
-            block_id: The KV block ID.
-        """
-        if not hasattr(self, 'block_to_mamba_slot'):
-            return
-        slot = self.block_to_mamba_slot[block_id].item()
-        if slot < 0:
-            return
-        self.block_to_mamba_slot[block_id] = -1
-        self.mamba_slot_to_block[slot] = -1
-        # Return slot to free pool
-        self.mamba_cache_free_slots[self.mamba_cache_free_count] = slot
-        self.mamba_cache_free_count += 1
-
-    def _compute_and_store_mamba_offsets(
-        self,
-        req: DynamicInferenceRequest,
-        current_id: int,
-        skip_tokens: int,
-        chunk_length: int,
-        num_matched_blocks: int,
-        matched_block_ids: list,
-        overall_required_blocks: int,
-    ) -> None:
-        """Compute intermediate state extraction offsets and store per-request.
-
-        Args:
-            req: The inference request.
-            current_id: Context request index.
-            skip_tokens: Number of tokens being skipped (mamba match).
-            chunk_length: Total chunk length before skipping.
-            num_matched_blocks: Number of KV-matched blocks.
-            matched_block_ids: List of matched KV block IDs.
-            overall_required_blocks: Total blocks needed for this request.
-        """
-        prompt_len = len(req.prompt_tokens)
-        num_kv_matched = num_matched_blocks
-        kv_div_abs = num_kv_matched * self.block_size_tokens
-        last_aligned_abs = (prompt_len // self.block_size_tokens) * self.block_size_tokens
-        seq_len = chunk_length - skip_tokens  # effective prefill length
-
-        # Compute relative offsets (relative to prefill start after skip)
-        kv_div_rel = kv_div_abs - skip_tokens
-        last_aligned_rel = last_aligned_abs - skip_tokens
-        penultimate_abs = (overall_required_blocks - 1) * self.block_size_tokens
-        penultimate_rel = penultimate_abs - skip_tokens
-
-        # Determine chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        chunk_size = 128
-
-        # Build offset list: include if > 0, < seq_len, and % chunk_size == 0
-        offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
-            if offset > 0 and offset < seq_len and offset % chunk_size == 0:
-                offsets_set.add(offset)
-
-        offsets = sorted(offsets_set)
-
-        # Map each offset back to block index and block ID
-        block_ids_for_offsets = []
-        for offset in offsets:
-            abs_token = skip_tokens + offset
-            block_idx = abs_token // self.block_size_tokens - 1
-            bid = self.request_to_kv_block_ids[current_id][block_idx].item()
-            block_ids_for_offsets.append(bid)
-
-        self._mamba_intermediate_offsets[current_id] = offsets if offsets else None
-        self._mamba_intermediate_block_ids[current_id] = (
-            block_ids_for_offsets if block_ids_for_offsets else None
-        )
-
-        # Block-aligned EOS: prompt_len is exactly block-aligned
-        if last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // self.block_size_tokens - 1
-            if last_block_idx >= 0:
-                eos_bid = self.request_to_kv_block_ids[current_id][last_block_idx].item()
-                self._mamba_eos_cache_block_id[current_id] = eos_bid
-            else:
-                self._mamba_eos_cache_block_id[current_id] = None
-        else:
-            self._mamba_eos_cache_block_id[current_id] = None
-
-    def get_mamba_intermediate_offsets(self) -> Optional[List[List[int]]]:
-        """Get intermediate token offsets for all prefill requests in the current batch.
-
-        Returns:
-            List of offset lists (one per prefill request), or None if no
-            request has intermediate offsets.
-        """
-        if self.max_mamba_cache_slots == 0:
-            return None
-
-        prefill_count = self.batch_dimensions.prefill_req_count
-        if prefill_count == 0:
-            return None
-
-        # Prefill requests are the last `prefill_count` active requests
-        active_start = self.paused_request_count
-        decode_count = self.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
-
-        result = []
-        has_any = False
-        for i in range(prefill_start, prefill_start + prefill_count):
-            offsets = self._mamba_intermediate_offsets[i]
-            if offsets is not None:
-                has_any = True
-                result.append(offsets)
-            else:
-                result.append([])
-
-        return result if has_any else None
-
-    def buffer_mamba_intermediate_states(
-        self, mamba_layer_idx: int, intermediate_states_per_request: list
-    ) -> None:
-        """Buffer intermediate states from a single Mamba layer's forward pass.
-
-        Args:
-            mamba_layer_idx: The Mamba layer index.
-            intermediate_states_per_request: Per-request list of
-                (ssm_states, conv_states) tuples or None.
-        """
-        self._mamba_intermediate_buffer[mamba_layer_idx] = intermediate_states_per_request
-
-    def commit_mamba_intermediate_states(self) -> None:
-        """Commit buffered intermediate states to the Mamba cache.
-
-        Called after the forward pass completes. For each prefill request:
-        - Intermediate states at kv_divergence/last_aligned: allocate cache slot,
-          write state, register hash in mamba_hash_to_block_id.
-        - Block-aligned EOS: copy final state from live buffer to cache slot.
-        """
-        prefill_count = self.batch_dimensions.prefill_req_count
-        if prefill_count == 0:
-            self._clear_mamba_intermediate_state()
-            return
-
-        active_start = self.paused_request_count
-        decode_count = self.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
-        has_buffer = bool(self._mamba_intermediate_buffer)
-
-        for req_batch_idx in range(prefill_count):
-            ctx_idx = prefill_start + req_batch_idx
-            offsets = self._mamba_intermediate_offsets[ctx_idx]
-            block_ids = self._mamba_intermediate_block_ids[ctx_idx]
-
-            # Commit intermediate states from forward pass
-            if offsets is not None and block_ids is not None and has_buffer:
-                for offset_idx in range(len(offsets)):
-                    bid = block_ids[offset_idx]
-                    slot = self._allocate_mamba_cache_slot(bid)
-
-                    # Write states from each mamba layer
-                    for layer_idx, states_list in self._mamba_intermediate_buffer.items():
-                        if states_list[req_batch_idx] is not None:
-                            ssm_states, conv_states = states_list[req_batch_idx]
-                            self.mamba_cache_ssm_states[layer_idx, slot].copy_(
-                                ssm_states[offset_idx]
-                            )
-                            self.mamba_cache_conv_states[layer_idx, slot].copy_(
-                                conv_states[offset_idx]
-                            )
-
-                    # Register in mamba hash map
-                    block_hash = self.block_allocator.block_hashes[bid].item()
-                    if block_hash > 0:
-                        self.block_allocator.register_mamba_block_hash(bid, block_hash)
-
-            # Handle block-aligned EOS: copy final state from live buffer
-            eos_bid = self._mamba_eos_cache_block_id[ctx_idx]
-            if eos_bid is not None:
-                slot = self._allocate_mamba_cache_slot(eos_bid)
-                self.store_mamba_state_for_block_from_live(eos_bid, ctx_idx)
-                block_hash = self.block_allocator.block_hashes[eos_bid].item()
-                if block_hash > 0:
-                    self.block_allocator.register_mamba_block_hash(eos_bid, block_hash)
-
-        self._clear_mamba_intermediate_state()
-
-    def _clear_mamba_intermediate_state(self) -> None:
-        """Clear all per-request intermediate state tracking."""
-        self._mamba_intermediate_buffer.clear()
-        prefill_count = self.batch_dimensions.prefill_req_count
-        if prefill_count > 0:
-            active_start = self.paused_request_count
-            decode_count = self.batch_dimensions.decode_req_count
-            prefill_start = active_start + decode_count
-            for i in range(prefill_start, prefill_start + prefill_count):
-                self._mamba_intermediate_offsets[i] = None
-                self._mamba_intermediate_block_ids[i] = None
-                self._mamba_eos_cache_block_id[i] = None
 
     def apply_fused_qk_rotary_emb(
         self, query: Tensor, key: Tensor, cos_sin_emb: Tensor, config: TransformerConfig
@@ -1545,7 +1216,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
             )
 
-        dummy_block_idx = self.block_allocator.dummy_block_idx
+        dummy_block_idx = self.kv_block_allocator.dummy_block_idx
         self.request_last_kv_block_id[request_slice] = dummy_block_idx
         self.request_last_kv_block_offset[request_slice] = torch.remainder(
             lengths_tensor - 1, self.block_size_tokens
@@ -1688,7 +1359,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert smallest_cuda_graph_dimensions.prefill_req_count == 0
 
         N = smallest_cuda_graph_dimensions.decode_req_count
-        dummy_block_idx = self.block_allocator.dummy_block_idx
+        dummy_block_idx = self.kv_block_allocator.dummy_block_idx
 
         # 1. Request counts and token count (decode-only: 1 token per request).
         self.total_request_count = N
@@ -1799,7 +1470,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.block_allocator.dummy_block_idx
+            self.kv_block_allocator.dummy_block_idx
         )
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.padded_active_token_count
@@ -1871,8 +1542,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # captured in a CUDA graph. First unique prompts (which need
             # intermediate states) run eager; subsequent duplicates and
             # decode steps use CUDA graphs.
-            if self._using_cuda_graph_this_step:
-                intermediate_offsets = self.get_mamba_intermediate_offsets()
+            if self._using_cuda_graph_this_step and self.mamba_slot_allocator is not None:
+                intermediate_offsets = self.mamba_slot_allocator.get_intermediate_offsets()
                 if intermediate_offsets is not None:
                     self._using_cuda_graph_this_step = False
                     self._use_triton_conv1d_this_step = self.use_triton_conv1d
@@ -1933,7 +1604,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
-        self.block_allocator.reset()
+        self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset step counter
@@ -1965,18 +1636,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_metadata()
 
         # Reset Mamba cache state
-        if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
-            self.block_to_mamba_slot.fill_(-1)
-            self.mamba_slot_to_block.fill_(-1)
-            self.mamba_cache_free_slots = torch.arange(
-                self.max_mamba_cache_slots, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.mamba_cache_free_count = self.max_mamba_cache_slots
-            self._mamba_intermediate_buffer.clear()
-            for i in range(self.max_requests):
-                self._mamba_intermediate_offsets[i] = None
-                self._mamba_intermediate_block_ids[i] = None
-                self._mamba_eos_cache_block_id[i] = None
+        if self.mamba_slot_allocator is not None:
+            self.mamba_slot_allocator.reset()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -2061,11 +1722,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_skip_tokens = 0
 
         # Hybrid models with Mamba caching: skip based on Mamba match count
-        if (
-            self.is_hybrid_model
-            and hasattr(self, 'max_mamba_cache_slots')
-            and self.max_mamba_cache_slots > 0
-        ):
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             assert (
                 num_mamba_matched <= num_matched
@@ -2074,7 +1731,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= chunk_length:
                     # Back off to previous block with cached Mamba state
-                    mamba_map = self.block_allocator.mamba_hash_to_block_id
+                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
                     backed_off_blocks = 0
                     for j in range(num_mamba_matched - 2, -1, -1):
                         if req.precomputed_block_hashes[j] in mamba_map:
@@ -2119,7 +1776,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_tokens_can_be_added = (
             self.active_token_count + effective_chunk_length <= self.max_tokens
         )
-        kv_cache_available = self.block_allocator.is_memory_available(num_blocks_from_pool)
+        kv_cache_available = self.kv_block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def _find_kv_match_count(
@@ -2155,7 +1812,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        kv_hash_to_block = self.block_allocator.kv_hash_to_block_id
+        kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
 
         # Find longest KV prefix by iterating block hashes from end.
         # Parent-chained hashes guarantee: if hash at position N exists,
@@ -2215,7 +1872,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
-            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_from_pool)
+            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
             if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
                 raise BlockOverflowError(req.request_id)
 
@@ -2224,9 +1881,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
-            self.block_allocator.block_ref_counts[matched_tensor] += 1
+            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.block_allocator.update_timestamps(matched_tensor)
+                self.kv_block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -2337,7 +1994,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.block_allocator.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
+                self.kv_block_allocator.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
@@ -2354,13 +2011,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
             restored = False
-            if (
-                restore_block_count > 0
-                and hasattr(self, 'max_mamba_cache_slots')
-                and self.max_mamba_cache_slots > 0
-            ):
+            if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
-                restored = self.restore_mamba_state_from_block(
+                restored = self.mamba_slot_allocator.restore_to_live(
                     self.total_request_count, restore_block_id
                 )
             if not restored:
@@ -2368,8 +2021,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
 
             # Compute intermediate offsets for state extraction during forward pass
-            if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
-                self._compute_and_store_mamba_offsets(
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.compute_and_store_offsets(
                     req,
                     current_id,
                     prefix_skip_tokens,
@@ -2450,7 +2103,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
+        self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
 
         # Reset the KV blocks for finished requests.
         # Note: do not use fill_() (or add_() and similar inplace ops) here.
@@ -2464,14 +2117,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests
-        if hasattr(self, 'max_mamba_cache_slots') and self.max_mamba_cache_slots > 0:
+        if self.mamba_slot_allocator is not None:
             idx_list = (
                 request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
             )
             for idx in idx_list:
-                self._mamba_intermediate_offsets[idx] = None
-                self._mamba_intermediate_block_ids[idx] = None
-                self._mamba_eos_cache_block_id[idx] = None
+                self.mamba_slot_allocator._intermediate_offsets[idx] = None
+                self.mamba_slot_allocator._intermediate_block_ids[idx] = None
+                self.mamba_slot_allocator._eos_cache_block_id[idx] = None
 
     def resume_paused_requests(
         self,
@@ -2494,7 +2147,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
         resume_request_count = 0
         if self.paused_request_count > 0:
-            active_block_count_avail = self.block_allocator.get_active_avail()
+            active_block_count_avail = self.kv_block_allocator.get_active_avail()
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
             # Flip counts before cumsum, since paused requests are resumed from
             # the right-most index, so we must count resumed blocks starting from
@@ -2512,7 +2165,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
                 torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-                self.block_allocator.total_avail,
+                self.kv_block_allocator.total_avail,
             )
 
         self.paused_request_count -= resume_request_count
@@ -2527,8 +2180,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == self.block_size_tokens - 1
             ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
 
-            assert resume_request_count <= self.block_allocator.total_avail
-            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
+            assert resume_request_count <= self.kv_block_allocator.total_avail
+            block_ids = self.kv_block_allocator.allocate_memory_blocks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
@@ -2570,7 +2223,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Overflow paused block count.
         overflow_paused_block_count = (
-            self.block_allocator.get_paused_used() - self.block_allocator.paused_count
+            self.kv_block_allocator.get_paused_used() - self.kv_block_allocator.paused_count
         )
 
         # Nothing to evict?
@@ -2581,7 +2234,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
         valid_paused_request_count = torch.nonzero(
-            paused_block_counts_cumsum <= self.block_allocator.paused_count
+            paused_block_counts_cumsum <= self.kv_block_allocator.paused_count
         ).numel()
         overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
 
@@ -3015,11 +2668,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             }
         """
         # Total usable blocks exclude the reserved dummy block.
-        total_blocks = max(self.block_allocator.total_count - 1, 1)
-        block_count_avail = int(self.block_allocator.total_avail)
+        total_blocks = max(self.kv_block_allocator.total_count - 1, 1)
+        block_count_avail = int(self.kv_block_allocator.total_avail)
 
         # Overall allocated blocks in the buffer right now.
-        allocated_blocks = (self.block_allocator.total_count - 1) - block_count_avail
+        allocated_blocks = (self.kv_block_allocator.total_count - 1) - block_count_avail
         allocated_blocks = int(max(0, allocated_blocks))
 
         # Active unique blocks referenced by current active requests only.

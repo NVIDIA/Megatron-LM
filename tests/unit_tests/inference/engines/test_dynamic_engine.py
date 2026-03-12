@@ -1747,7 +1747,7 @@ class TestDynamicInferenceEngine:
             )
             assert context.max_requests == 4
             assert step_count == 34
-        assert context.block_allocator.active_count == 655
+        assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal
     @pytest.mark.skipif(

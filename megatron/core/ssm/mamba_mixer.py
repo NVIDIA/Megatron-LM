@@ -479,7 +479,7 @@ class MambaMixer(MegatronModule):
             else:
                 zxBCdt_prefill = zxBCdt
 
-            intermediate_offsets = context.get_mamba_intermediate_offsets()
+            intermediate_offsets = context.mamba_slot_allocator.get_intermediate_offsets() if context.mamba_slot_allocator is not None else None
             result = self._dynamic_inference_prefill(
                 zxBCdt_prefill,
                 context,
@@ -490,7 +490,8 @@ class MambaMixer(MegatronModule):
             if isinstance(result, tuple):
                 y_prefill, intermediate_states = result
                 mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-                context.buffer_mamba_intermediate_states(mamba_layer_idx, intermediate_states)
+                if context.mamba_slot_allocator is not None:
+                    context.mamba_slot_allocator.buffer_intermediate_states(mamba_layer_idx, intermediate_states)
             else:
                 y_prefill = result
 

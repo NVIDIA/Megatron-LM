@@ -958,7 +958,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
-        block_allocator = self.context.block_allocator
+        block_allocator = self.context.kv_block_allocator
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
@@ -1223,7 +1223,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         if not req.precomputed_block_hashes:
             return 0
-        mamba_map = self.context.block_allocator.mamba_hash_to_block_id
+        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
         for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
             if req.precomputed_block_hashes[i] in mamba_map:
                 return i + 1
@@ -1244,8 +1244,7 @@ class DynamicInferenceEngine(AbstractEngine):
         mamba_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and hasattr(self.context, 'max_mamba_cache_slots')
-            and self.context.max_mamba_cache_slots > 0
+            and self.context.mamba_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1276,7 +1275,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1311,8 +1310,7 @@ class DynamicInferenceEngine(AbstractEngine):
         mamba_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and hasattr(self.context, 'max_mamba_cache_slots')
-            and self.context.max_mamba_cache_slots > 0
+            and self.context.mamba_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1359,7 +1357,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
+                            if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
@@ -1376,7 +1374,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
+                            if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
 
@@ -1468,10 +1466,10 @@ class DynamicInferenceEngine(AbstractEngine):
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
-            "total_active_block_count": self.context.block_allocator.active_count,
-            "total_paused_block_count": self.context.block_allocator.paused_count,
-            "total_active_used_blocks": self.context.block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.block_allocator.get_paused_used(),
+            "total_active_block_count": self.context.kv_block_allocator.active_count,
+            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}

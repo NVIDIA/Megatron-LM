@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import deque
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 from torch import Tensor
@@ -9,7 +9,7 @@ from torch import Tensor
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
 
-class BlockAllocator:
+class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
 
     This allocator is responsible for:
@@ -38,6 +38,7 @@ class BlockAllocator:
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
+        self.on_blocks_deregistered: Optional[Callable] = None
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -59,9 +60,6 @@ class BlockAllocator:
 
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
-
-            # Mamba state hash-to-block mapping: only blocks with cached Mamba state
-            self.mamba_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
@@ -233,7 +231,6 @@ class BlockAllocator:
 
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
-            self.mamba_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -255,15 +252,6 @@ class BlockAllocator:
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
-
-    def register_mamba_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block as having cached Mamba state.
-
-        Args:
-            block_id: The block ID.
-            block_hash: The block's hash value.
-        """
-        self.mamba_hash_to_block_id[block_hash] = block_id
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -288,15 +276,9 @@ class BlockAllocator:
             maxlen=0,
         )
 
-        # Also deregister from mamba hash map and invalidate mamba cache
-        if self.mamba_hash_to_block_id:
-            mamba_keys = keys_to_delete & self.mamba_hash_to_block_id.keys()
-            if mamba_keys:
-                deque(map(self.mamba_hash_to_block_id.pop, mamba_keys), maxlen=0)
-                # Invalidate mamba cache slots for evicted blocks
-                block_ids_list = block_ids.tolist()
-                for bid in block_ids_list:
-                    self.context.invalidate_mamba_state_for_block(bid)
+        # Notify Mamba slot allocator (if wired) to clean up its state
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1
