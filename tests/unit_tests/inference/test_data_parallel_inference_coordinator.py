@@ -382,18 +382,25 @@ class TestCoordinator:
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
-    async def test_deserialize_flag(self, initialize_model_parallel):
+    async def test_deserialize_flag(self, initialize_model_parallel, coordinator):
         """Test that the correct response type is returned based on the deserialize flag."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
         engine = DummyEngine()
         requests = self.build_requests(num_requests=2)
 
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
+        )
+
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
         )
 
         client = None
         try:
             if torch.distributed.get_rank() == 0:
+                await asyncio.sleep(0)
                 # Test deserialize=True
                 client = InferenceClient(dp_addr, deserialize=True)
                 client.start()
@@ -416,13 +423,13 @@ class TestCoordinator:
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
                 for result in results:
                     assert isinstance(result, dict)
+
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+                timeout=30.0,
+            )
         finally:
             await cleanup_engine(engine, client)
-            # Shut down the coordinator process launched by launch_inference_coordinator=True.
-            proc = getattr(engine, 'inference_coordinator_process', None)
-            if proc is not None and proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=5.0)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
