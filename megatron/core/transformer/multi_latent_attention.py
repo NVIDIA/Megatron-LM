@@ -167,6 +167,11 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        kv_channel_kwargs = (
+            dict(k_channels=self.q_head_dim, v_channels=self.config.v_head_dim)
+            if self.q_head_dim != self.config.v_head_dim
+            else {}
+        )
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -174,10 +179,9 @@ class MultiLatentAttention(Attention):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
+            **kv_channel_kwargs,
         )
 
         # Output.
@@ -714,6 +718,10 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
+            if self.config.sequence_parallel and kv_compressed.size(0) != k_pos_emb_squeezed.size(
+                0
+            ):
+                kv_compressed = gather_from_sequence_parallel_region(kv_compressed)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
 
             # Flag for whether to use absorption. We only use absorption
@@ -895,7 +903,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         # Seperated out the norm and linear
-        kv, _ = self.linear_kv_up_proj_linear(kv_compressed)
+        kv, _ = self.linear_kv_up_proj_linear(kv_compressed.contiguous())
 
         kv = kv.view(
             *kv.size()[:-1],

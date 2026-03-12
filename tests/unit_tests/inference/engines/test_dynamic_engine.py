@@ -317,10 +317,13 @@ class TestDynamicInferenceEngine:
                 cache_mla_latents=test_config.cache_mla_latent,
                 qk_head_dim=qk_head_dim,
                 qk_pos_emb_head_dim=qk_pos_emb_head_dim,
-                # For cache_mla_latent, the following needs to hold:
+                # When `cache_mla_latent=True` or `transformer_impl="local"`,
+                # the following needs to hold:
                 # v_head_dim == qk_head_dim + qk_pos_emb_head_dim
                 v_head_dim=(
-                    (qk_head_dim + qk_pos_emb_head_dim) if test_config.cache_mla_latent else 128
+                    (qk_head_dim + qk_pos_emb_head_dim)
+                    if test_config.cache_mla_latent or test_config.transformer_impl == "local"
+                    else 128
                 ),
             )
             if test_config.use_mla
@@ -1132,8 +1135,6 @@ class TestDynamicInferenceEngine:
                         "when tp_size > 1."
                     )
                 )
-        if use_mla and transformer_impl == "local":
-            pytest.skip(reason="MLA does not work with the local implementation.")
         if cache_mla_latent and not use_mla:
             pytest.skip(reason="MLA latent caching requires MLA use.")
         if use_mla and not cache_mla_latent:
