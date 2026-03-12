@@ -67,6 +67,9 @@ class TrainingConfig:
     exit_signal_handler_for_dataloader: bool = False
     """Use signal handler for dataloader workers"""
 
+    exit_signal_handler_for_training: bool = False
+    """Shutdown the training when SIGINT or SIGTERM received to avoid unclear traceback"""
+
     manual_gc: bool = False
     """Disable the threshold-based default garbage collector and trigger the garbage collection
     manually. Manual garbage collection helps to align the timing of the collection across ranks
