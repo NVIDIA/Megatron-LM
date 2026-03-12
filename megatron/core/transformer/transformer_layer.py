@@ -33,6 +33,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
     is_te_min_version,
+    is_torch_min_version,
     log_single_rank,
     make_viewless_tensor,
     nvtx_range_pop,
@@ -43,6 +44,16 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_offloading_interface():
+    """Get the offloading interface for fine-grained activation offloading."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface,
+    )
+
+    return FineGrainedActivationOffloadingInterface
 
 
 def get_transformer_layer_offset(
@@ -467,17 +478,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
-        self.offload_attn_norm = (
-            self.config.fine_grained_activation_offloading
-            and "attn_norm" in self.config.offload_modules
-            and not isinstance(self.input_layernorm, IdentityOp)
-        )
-        self.offload_mlp_norm = (
-            self.config.fine_grained_activation_offloading
-            and "mlp_norm" in self.config.offload_modules
-            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
-        )
 
+        self._set_offload_modules()
+        self.mlp_norm_manager = None
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
         # TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -566,9 +569,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_offloading_interface()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -578,14 +579,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         # Optional Input Layer norm
+        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     apply_module(self.input_layernorm), hidden_states
                 )
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
         using_fused_tp_inference_kernel = (not self.training) and (
@@ -635,10 +637,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
-        if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="attn_norm", forced_released_tensors=[residual]
-            )
+        hidden_states = attn_norm_manager.group_offload(
+            hidden_states, forced_released_tensors=[residual]
+        )
 
         # Residual connection.
         residual = hidden_states
@@ -690,18 +691,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_offloading_interface()
 
+        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     apply_module(self.pre_mlp_layernorm), hidden_states
                 )
         else:
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
 
         return pre_mlp_layernorm_output
@@ -821,9 +821,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -852,10 +849,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if self.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+        if self.mlp_norm_manager is not None:
+            hidden_states = self.mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
             )
+            self.mlp_norm_manager = None
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
@@ -1010,6 +1008,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        off_interface = _get_offloading_interface()
+
+        # Record the backward event on cuda graph stream in backward pass.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the H2D transfer on reload stream.
+        if self.offload_module_in_cuda_graph:
+            if len(args) > 0:
+                hidden_states = args[0]
+                hidden_states = off_interface.backward_record(hidden_states)
+                args = (hidden_states,) + args[1:]
+            else:
+                hidden_states = kwargs.pop("hidden_states")
+                hidden_states = off_interface.backward_record(hidden_states)
+                kwargs["hidden_states"] = hidden_states
         context = None
         if not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
@@ -1037,6 +1049,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
+        # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
+        if self.offload_module_in_cuda_graph:
+            off_interface = _get_offloading_interface()
+
+            off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -1060,7 +1079,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
+        if self.config.delay_offload_until_cuda_graph:
+            off_interface = _get_offloading_interface()
+
+            off_interface.enter_replay()
+
+        try:
+            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+        finally:
+            if self.config.delay_offload_until_cuda_graph:
+                off_interface.exit_replay()
+
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+        """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+
+        # Flush delayed offload groups from previous layers after graph replay.
+        # The CPU is idle during the sync between graph replay and a2a comm,
+        # so we use that time to execute the delayed offload operations.
+        if self.config.delay_offload_until_cuda_graph:
+            off_interface = _get_offloading_interface()
+
+            off_interface.flush_delayed_groups()
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
@@ -1265,6 +1305,83 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return super().__call__(*args, **kwargs)
 
+    def _set_offload_modules(self):
+        """Set the offload modules for the transformer layer."""
+        if self.config.fine_grained_activation_offloading:
+            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
+                self.input_layernorm, IdentityOp
+            )
+            self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
+            self.offload_core_attn = "core_attn" in self.config.offload_modules
+            self.offload_attn_proj = "attn_proj" in self.config.offload_modules
+            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
+                self.pre_mlp_layernorm, IdentityOp
+            )
+            self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
+            self.offload_moe_act = "moe_act" in self.config.offload_modules
+        else:
+            self.offload_attn_norm = False
+            self.offload_qkv_linear = False
+            self.offload_core_attn = False
+            self.offload_attn_proj = False
+            self.offload_mlp_norm = False
+            self.offload_expert_fc1 = False
+            self.offload_moe_act = False
+        # Check the compatibility of fine-grained activation offloading and cuda graph.
+        if self.config.fine_grained_activation_offloading:
+            if CudaGraphScope.attn in self.config.cuda_graph_scope:
+                self.offload_attn_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "attn_norm offloading is not supported with attn cudagraph. "
+                    "Disabling attn_norm offloading.",
+                )
+            mark_mlp_norm_offloading_not_supported = False
+            # For moe layer, mlp_norm offloading isn't supported with attn or moe_router cudagraph.
+            if self.is_moe_layer:
+                if (
+                    CudaGraphScope.attn in self.config.cuda_graph_scope
+                    or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                ):
+                    mark_mlp_norm_offloading_not_supported = True
+            # For non-moe layer, mlp_norm is the boundary of attn or mlp cudagraph.
+            # The only case where mlp_norm offloading is supported is when whole layer is captured.
+            elif (
+                CudaGraphScope.attn in self.config.cuda_graph_scope
+                and CudaGraphScope.mlp not in self.config.cuda_graph_scope
+            ) or (
+                CudaGraphScope.attn not in self.config.cuda_graph_scope
+                and CudaGraphScope.mlp in self.config.cuda_graph_scope
+            ):
+                mark_mlp_norm_offloading_not_supported = True
+            if mark_mlp_norm_offloading_not_supported:
+                self.offload_mlp_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "mlp_norm offloading is not supported with the current cudagraph scope. "
+                    "Disabling mlp_norm offloading.",
+                )
+        # Set the offload module in cuda graph flag.
+        self.offload_module_in_cuda_graph = False
+        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
+                self.offload_module_in_cuda_graph = True
+        if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
+            if self.offload_mlp_norm:
+                self.offload_module_in_cuda_graph = True
+        if self.offload_module_in_cuda_graph:
+            assert is_torch_min_version(
+                "2.9.0a0"
+            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
+            assert is_te_min_version(
+                "2.14.0"
+            ), "Offloading modules captured in cuda graph requires TE>=2.14.0."
+            assert (
+                self.config.cuda_graph_warmup_steps > 0
+            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
+
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
@@ -1408,9 +1525,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_offloading_interface()
 
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -1427,16 +1542,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
+        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -1474,8 +1590,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
 
-        if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(hidden_states, name="attn_norm")
+        hidden_states = attn_norm_manager.group_offload(hidden_states)
 
         # Cross-attention (no hyper connection support).
         residual = hidden_states
@@ -1505,9 +1620,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
+        off_interface = _get_offloading_interface()
 
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -1528,16 +1641,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
+        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
             )
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
@@ -1628,12 +1742,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
-        if self.offload_mlp_norm:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
-
-            hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
+        hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
