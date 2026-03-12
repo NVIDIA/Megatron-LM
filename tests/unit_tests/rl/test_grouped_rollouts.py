@@ -5,12 +5,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from megatron.rl.agent.api import GroupedRolloutGenerator, GroupedRolloutRequest, Rollout
+from megatron.rl.agent.api import (
+    GroupedRolloutGenerator,
+    GroupedRolloutRequest,
+    Rollout,
+    RolloutGenerator,
+)
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
 
 
-class MockGenerator(GroupedRolloutGenerator):
+class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     """Mock generator with configurable per-call delays."""
 
     def __init__(self, env_id="test", num_slow_calls=0, **kwargs):
@@ -18,6 +23,9 @@ class MockGenerator(GroupedRolloutGenerator):
         self.env_id = env_id
         self.num_slow_calls = num_slow_calls
         self._call_count = 0
+
+    async def rollout(self, request):
+        raise NotImplementedError
 
     async def group_rollout(self, request):
         idx = self._call_count
