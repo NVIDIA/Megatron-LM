@@ -63,8 +63,8 @@ class TransformerLayerSchedulePlan:
             event (torch.cuda.Event):
                 record CUDA event across multiple nodes on different streams for synchronization.
             chunk_state (ModelChunkState): model state shared in the model chunk.
-            comp_stream (torch.cuda.Stream): CUDA stream for computation.
-            comm_stream (torch.cuda.Stream): CUDA stream for communication.
+            comp_stream (Callable): Func that returns CUDA stream for computation.
+            comm_stream (Callable): Func that returns CUDA stream for communication.
             extra_args (dict): extra arguments for the layer.
 
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
@@ -317,9 +317,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self.post_process = None
         self.vp_stage = model.vp_stage
 
-        comp_stream = get_comp_stream()
-        comm_stream = get_comm_stream()
-
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
         self._model_chunk_state.position_ids = position_ids
@@ -338,18 +335,22 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # build preprocess
-        self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
+        self.pre_process = PreProcessNode(
+            model, self._model_chunk_state, self._event, get_comp_stream
+        )
 
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
-        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
+        self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)
+        self._build_layer_schedule_plan(
+            getattr(model, "mtp", None), get_comp_stream, get_comm_stream
+        )
 
         # build post process
         if model.post_process:
             self.post_process = PostProcessNode(
-                model, self._model_chunk_state, self._event, comp_stream
+                model, self._model_chunk_state, self._event, get_comp_stream
             )
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
