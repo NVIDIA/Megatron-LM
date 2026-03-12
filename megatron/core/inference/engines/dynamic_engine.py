@@ -884,7 +884,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
                 warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
+                    f"Request {request_id} failed to be added to the engine due to errors. "
+                    f"Prompt Tokens: {len(request.prompt_tokens)} "
+                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                    f"Max sequence length: {self.context.max_sequence_length} "
                 )
 
         return self.requests[request_id].future
@@ -1130,48 +1133,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
-                if (
-                    request_id == self.context.chunked_prefill_request_id
-                    and self.materialize_only_last_token_logits
-                ):
-                    request.prompt_log_probs = []
-                    request.generated_log_probs = []
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    # We only want decode log probs.
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
                 else:
+                    # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
                     total_accumulated = len(request.prompt_log_probs) + len(
                         request.generated_log_probs
                     )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
 
-                    # Handle skip_prompt_log_probs during prefill
-                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token).
-                    # With speculative decoding, decode steps also produce multiple log probs
-                    # (one per accepted token + new sample), so we must check that this is
-                    # actually a prefill step (no generated log probs accumulated yet).
-                    is_prefill_log_probs = len(request.generated_log_probs) == 0
-                    if (
-                        request.sampling_params.skip_prompt_log_probs
-                        and len(request_log_probs) > 1
-                        and is_prefill_log_probs
-                    ):
-                        # Only append the last log prob (first generated token) to generated_log_probs
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        # Vectorized approach: calculate split point and use list slicing
-                        if not request.sampling_params.skip_prompt_log_probs:
-                            # Calculate how many log probs go to prompt vs generated
-                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                            # Batch extend instead of individual appends
-                            if split_idx > 0:
-                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                            if split_idx < len(request_log_probs):
-                                request.generated_log_probs.extend(request_log_probs[split_idx:])
-                        else:
-                            # All log probs go to generated
-                            request.generated_log_probs.extend(request_log_probs)
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1638,7 +1623,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)

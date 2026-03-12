@@ -270,7 +270,9 @@ class MambaMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "partition_dim", 0)
             if self.config.perform_initialization:
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -295,6 +297,7 @@ class MambaMixer(MegatronModule):
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias = nn.Parameter(inv_dt)
             setattr(self.dt_bias, "tensor_model_parallel", True)
+            setattr(self.dt_bias, "partition_dim", 0)
 
             # A parameter
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
@@ -306,6 +309,7 @@ class MambaMixer(MegatronModule):
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
+            setattr(self.A_log, "partition_dim", 0)
 
         # D "skip" parameter
         self.D = nn.Parameter(
@@ -315,6 +319,7 @@ class MambaMixer(MegatronModule):
             )
         )  # Keep in fp32
         setattr(self.D, "tensor_model_parallel", True)
+        setattr(self.D, "partition_dim", 0)
 
         if self.rmsnorm:
             assert RMSNormGated is not None
@@ -327,6 +332,7 @@ class MambaMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
             setattr(self.norm.weight, "tensor_model_parallel", True)
+            setattr(self.norm.weight, "partition_dim", 0)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
