@@ -884,7 +884,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
                 warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
+                    f"Request {request_id} failed to be added to the engine due to errors. "
+                    f"Prompt Tokens: {len(request.prompt_tokens)} "
+                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                    f"Max sequence length: {self.context.max_sequence_length} "
                 )
 
         return self.requests[request_id].future
