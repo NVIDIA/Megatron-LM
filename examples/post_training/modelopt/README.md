@@ -34,6 +34,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ | - | - |
 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ✅ | - | ✅ | ✅ |
+| `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | ✅ | - | ✅ | ✅ |
 | `openai/gpt-oss-{20b, 120b}` | ✅ | **Online** | ✅ | ✅ |
 | `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
