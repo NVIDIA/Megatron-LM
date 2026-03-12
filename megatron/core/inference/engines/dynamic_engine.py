@@ -202,15 +202,28 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
+
+        assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
+
+        if self.num_speculative_tokens > 0:
+            assert (
+                self.num_speculative_tokens <= self.controller.num_mtp_heads
+            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+            assert (
+                not self.materialize_only_last_token_logits
+            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
+
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.materialize_only_last_token_logits = (
-            inference_config.materialize_only_last_token_logits
-        )
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -282,6 +295,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         self.resume_request_ids = None
+
+        # Speculative decoding acceptance tracking.
+        self._spec_tokens_proposed = 0
+        self._spec_tokens_accepted = 0
+        self._spec_steps = 0
 
         # Prefix caching coordination state.
         self._prefix_coordination_waits = 0
@@ -839,10 +857,16 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ) or (request.sampling_params.num_tokens_to_generate < 0):
+            logging.error(
+                f"{request_id=} Invalid number of tokens to generate. Prompt len: {len(request.prompt_tokens)}, tokens to generate: {request.sampling_params.num_tokens_to_generate}, max seq len: {self.context.max_sequence_length}."
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            logging.error(
+                f"{request_id=} Prompt is longer than context.max_tokens. Prompt tokens: {len(request.prompt_tokens)}, context.max_tokens: {self.context.max_tokens}, chunked_prefill: {self.enable_chunked_prefill}"
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
@@ -860,7 +884,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
                 warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
+                    f"Request {request_id} failed to be added to the engine due to errors. "
+                    f"Prompt Tokens: {len(request.prompt_tokens)} "
+                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                    f"Max sequence length: {self.context.max_sequence_length} "
                 )
 
         return self.requests[request_id].future
@@ -927,6 +954,7 @@ class DynamicInferenceEngine(AbstractEngine):
         evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
+        accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
@@ -939,7 +967,8 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids (torch.Tensor): A list of finished request ids
             evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
-            sample: (torch.Tensor): The newly generated tokens for each request
+            sample: Tensor: The newly generated token for each request
+            accepted_tokens: Tensor: The additional accepted tokens for each request
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
@@ -970,49 +999,100 @@ class DynamicInferenceEngine(AbstractEngine):
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
 
-        for req_idx, (request_id, token, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
+        # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
+        # empty lists for each request, so the zip produces the correct number of iterations
+        accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+
+        if self.num_speculative_tokens > 0 and accepted_tokens is not None:
+            self._spec_steps += 1
+
+        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+
+            # Ensure tokens is always a list for consistent handling
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+
             request: DynamicInferenceRequest = self.get_request(request_id)
+
+            if self.num_speculative_tokens > 0:
+                accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
+
+                # Track acceptance statistics for logging (decode requests only).
+                # Prefill requests don't propose speculative tokens, so including
+                # them would inflate the proposed count and deflate the rate.
+                # A request in its first generation step (empty generated_tokens)
+                # was in prefill this step.
+                if len(request.generated_tokens) > 0:
+                    self._spec_tokens_proposed += self.num_speculative_tokens
+                    self._spec_tokens_accepted += len(accepted_tokens)
+
+                # The order `accepted_tokens + tokens` is correct here.
+                # `accepted_tokens` contains the sequence of
+                # successfully verified draft tokens. `tokens` (from `sample`) is the
+                # brand new token generated by the target model based on that accepted prefix.
+                # Therefore, the newly sampled token must go at the end of the sequence.
+                tokens = accepted_tokens + tokens
+
+            num_stop_word_trim = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
+                # If the request already has more tokens, then we only append as much as is necessary
+                if (
+                    len(request.generated_tokens) + len(tokens)
+                    >= request.sampling_params.num_tokens_to_generate
+                ):
+                    tokens = tokens[
+                        : request.sampling_params.num_tokens_to_generate
+                        - len(request.generated_tokens)
+                    ]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
-                    request.generated_tokens.append(token)
+                    request.generated_tokens += tokens
+                    first_token_event = None
                     if self.track_generated_token_events:
-                        if block_allocator.enable_prefix_caching:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                                blocks_ref_count=blocks_ref_count,
-                            )
-                        else:
-                            event_generated_token = request.add_event_generated_token(
-                                token,
-                                blocks_total=block_allocator.total_count,
-                                blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_hashed_active,
-                            )
+                        for token in tokens:
+                            if block_allocator.enable_prefix_caching:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                    blocks_ref_count=blocks_ref_count,
+                                )
+                            else:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                )
+                            if first_token_event is None:
+                                first_token_event = event
                     if is_first_token:
-                        if self.track_generated_token_events:
-                            first_token_event = event_generated_token
-                        else:
+                        if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
-                                payload={"token_id": token},
+                                payload={"token_id": tokens[0]},
                             )
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
                     if request.tpot is None:
                         request.tpot = []
-                    request.tpot.append(step_time)
+                    per_token_step_time = step_time / len(tokens)
+                    request.tpot.extend([per_token_step_time] * len(tokens))
 
-                # Check for stop words (after token is appended)
-                stop_word_hit = self._check_stop_words_for_request_post_append(request)
+                # Check for stop words (after token is appended).
+                # With speculative decoding, a stop word may end before the last
+                # appended token. The check truncates generated_tokens in-place and
+                # returns how many trailing tokens were removed so we can also trim
+                # the corresponding log probs below.
+                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
+                    request
+                )
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1037,6 +1117,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
+            # When a stop word was found mid-speculative-batch, trim log probs
+            # and top_n_logprobs to match the truncated generated_tokens.
+            if num_stop_word_trim > 0:
+                if request_log_probs is not None:
+                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+
             # Process log_probs if available (unified for both regular and chunked prefill)
             if request_log_probs is not None:
                 # Initialize lists if they don't exist
@@ -1045,40 +1133,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
-                if (
-                    request_id == self.context.chunked_prefill_request_id
-                    and self.materialize_only_last_token_logits
-                ):
-                    request.prompt_log_probs = []
-                    request.generated_log_probs = []
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    # We only want decode log probs.
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
                 else:
+                    # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
                     total_accumulated = len(request.prompt_log_probs) + len(
                         request.generated_log_probs
                     )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
 
-                    # Handle skip_prompt_log_probs during prefill
-                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token)
-                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
-                        # Only append the last log prob (first generated token) to generated_log_probs
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        # Vectorized approach: calculate split point and use list slicing
-                        if not request.sampling_params.skip_prompt_log_probs:
-                            # Calculate how many log probs go to prompt vs generated
-                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                            # Batch extend instead of individual appends
-                            if split_idx > 0:
-                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                            if split_idx < len(request_log_probs):
-                                request.generated_log_probs.extend(request_log_probs[split_idx:])
-                        else:
-                            # All log probs go to generated
-                            request.generated_log_probs.extend(request_log_probs)
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1177,33 +1255,50 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
-    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
+    def _check_stop_words_for_request_post_append(
+        self, request: DynamicInferenceRequest
+    ) -> Tuple[bool, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
-        been appended to request.generated_tokens.
+        been appended to request.generated_tokens. In the speculative decoding case,
+        multiple tokens may have been appended at once. If a stop word is found in the
+        middle of the speculative tokens, the trailing tokens after the stop word are
+        truncated from generated_tokens.
+
+        With speculative decoding, multiple tokens are appended at once. The stop word
+        may end before the last appended token, leaving extra tokens that must be
+        trimmed. When this happens, generated_tokens is truncated in-place and the
+        number of trimmed tokens is returned so the caller can also trim log probs.
 
         Args:
             request: The request to check.
 
         Returns:
-            bool: True if the generated sequence ends with a stop word, False otherwise.
+            Tuple of (stop_word_hit, num_tokens_trimmed):
+                stop_word_hit: True if the generated sequence contains a stop word.
+                num_tokens_trimmed: Number of tokens removed from the end of
+                    generated_tokens (0 when the stop word is at the very end
+                    or when no stop word was found).
         """
-        # Check if request has stop words configured
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False
+            return False, 0
 
         generated_tokens = request.generated_tokens
 
-        # Check if the sequence ends with any stop word
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if generated_tokens[-stop_len:] == stop_word_ids:
-                    return True
-
-        return False
+                # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
+                # Speculative decoding can append multiple tokens at once, so the stop
+                # word might end at any position within the newly appended tokens.
+                for i in range(self.num_speculative_tokens + 1):
+                    end_idx = -i if i > 0 else None
+                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
+                        if i > 0:
+                            request.generated_tokens = request.generated_tokens[:-i]
+                        return True, i
+        return False, 0
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.
@@ -1469,6 +1564,7 @@ class DynamicInferenceEngine(AbstractEngine):
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
+            accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
@@ -1486,6 +1582,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 evict_request_ids,
                 step_time,
                 sample,
+                accepted_tokens,
                 log_probs,
                 top_n_logprobs,
                 routing_indices_per_request,
@@ -1526,7 +1623,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
@@ -1552,6 +1652,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     metrics[f'inference/{key}'] = float(value * 100.0)
                 else:
                     metrics[f'inference/{key}'] = value
+
+            # Add speculative decoding acceptance metrics.
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+                metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
+                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
@@ -1602,9 +1710,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
+                    spec_rate,
+                    self._spec_tokens_accepted,
+                    self._spec_tokens_proposed,
+                    self._spec_steps,
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
+
+            # Reset speculative decoding accumulators after both wandb and console logging.
+            if self.num_speculative_tokens > 0:
+                self._spec_tokens_proposed = 0
+                self._spec_tokens_accepted = 0
+                self._spec_steps = 0
 
         return {
             "active_request_ids": active_request_ids,

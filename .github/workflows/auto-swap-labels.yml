@@ -19,14 +19,14 @@ jobs:
   check-approval:
     runs-on: ubuntu-latest
     if: >-
-      github.repository == 'NVIDIA/Megatron-LM' &&
-      (
+      github.repository == 'NVIDIA/Megatron-LM' && (
         (github.event_name == 'pull_request_target' &&
          github.event.pull_request.base.ref == 'main' &&
          !github.event.pull_request.draft) ||
         (github.event_name == 'workflow_run' &&
          github.event.workflow_run.conclusion == 'success')
       )
+
     steps:
       - name: Get PR number from workflow_run
         id: get-pr
@@ -58,7 +58,7 @@ jobs:
 
       - name: Set up Python
         if: steps.pr.outputs.number
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
