@@ -367,7 +367,7 @@ products:
         scope: [weekly]
         platforms: [dgx_gb200]
 
-  - test_case: [deepseek_proxy_ep4]
+  - test_case: [deepseek_proxy_fsdp_tp2_fsdp2]
     products:
       - environment: [dev]
         scope: [mr, mr-github, weekly]

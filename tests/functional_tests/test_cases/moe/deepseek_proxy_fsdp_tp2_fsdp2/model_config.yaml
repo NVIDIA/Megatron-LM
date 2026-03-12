@@ -7,19 +7,29 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+
 MODEL_ARGS:
-  # Distributed args
+
+# Distributed args
   --distributed-timeout-minutes: 60
-  --tensor-model-parallel-size: 1
+  --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
-  --expert-model-parallel-size: 4
+  --expert-model-parallel-size: 1
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
   --attention-backend: unfused
-  # Training args
+
+  --num-distributed-optimizer-instances 1
+
+  # FSDP args
+  --use-megatron-fsdp: true
+  --data-parallel-sharding-strategy: "optim_grads_params"
+  --outer-dp-sharding-strategy: "no_shard"
+  
+# Training args
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
@@ -34,6 +44,7 @@ MODEL_ARGS:
   --manual-gc: true
   --manual-gc-interval: 100
   --transformer-impl: transformer_engine
+
   # Data args
   --seq-length: 1024
   --data-cache-path: ${DATA_CACHE_PATH}
@@ -41,6 +52,8 @@ MODEL_ARGS:
   --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
   --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
+
+
   # Network: 2 layers — first dense, second MoE
   --num-layers: 2
   --hidden-size: 512
