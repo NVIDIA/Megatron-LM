@@ -147,7 +147,7 @@ class MambaMixer(MegatronModule):
         dt_init_floor: The minimum value of the dt parameter after initialization.
         bias: Whether to use bias in the linear layers.
         conv_bias: Whether to use bias in the causal convolution.
-        chunk_size: The chunk size for the fused kernel.
+        mamba_chunk_size: The chunk size for the Mamba SSM fused kernel.
         use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
         layer_number: The layer number of this Mamba layer.
         pg_collection: The required process groups to use for tensor model parallel and context
@@ -174,7 +174,7 @@ class MambaMixer(MegatronModule):
         bias=False,
         conv_bias=True,
         # Fused kernel and sharding options
-        chunk_size=128,
+        mamba_chunk_size=128,
         layer_number=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
@@ -197,7 +197,7 @@ class MambaMixer(MegatronModule):
         self.D_has_hdim = D_has_hdim
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
-        self.chunk_size = chunk_size
+        self.mamba_chunk_size = mamba_chunk_size
         self.layer_number = layer_number
         self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
@@ -657,7 +657,7 @@ class MambaMixer(MegatronModule):
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            chunk_size=self.chunk_size,
+            chunk_size=self.mamba_chunk_size,
             activation=self.activation,
             headdim=None if self.D_has_hdim else self.headdim,
             ngroups=self.cp.ngroups_local_tpcp,
@@ -876,7 +876,7 @@ class MambaMixer(MegatronModule):
                     cumulative_chunks = 0
                     for i in range(num_real_seqs):
                         seq_len = seqlens[i + 1] - seqlens[i]
-                        num_chunks = max(1, (seq_len + self.chunk_size - 1) // self.chunk_size)
+                        num_chunks = max(1, (seq_len + self.mamba_chunk_size - 1) // self.mamba_chunk_size)
                         first_chunk_idx = cumulative_chunks
                         offsets = intermediate_token_offsets[i]
                         count = 0
@@ -885,11 +885,11 @@ class MambaMixer(MegatronModule):
                                 f"intermediate offset {offset} out of range for "
                                 f"sequence {i} with length {seq_len}"
                             )
-                            assert offset % self.chunk_size == 0, (
+                            assert offset % self.mamba_chunk_size == 0, (
                                 f"intermediate offset {offset} is not a multiple "
-                                f"of chunk_size {self.chunk_size}"
+                                f"of chunk_size {self.mamba_chunk_size}"
                             )
-                            chunk_idx = first_chunk_idx + (offset // self.chunk_size) - 1
+                            chunk_idx = first_chunk_idx + (offset // self.mamba_chunk_size) - 1
                             intermediate_chunk_indices_list.append(chunk_idx)
                             count += 1
                         per_request_intermediate_counts.append(count)
@@ -908,10 +908,10 @@ class MambaMixer(MegatronModule):
                     start = cu_seqlens[i].item()
                     end = cu_seqlens[i + 1].item()
                     first_chunk_idx = len(chunk_boundaries) - 1
-                    pos = start + self.chunk_size
+                    pos = start + self.mamba_chunk_size
                     while pos < end:
                         chunk_boundaries.append(pos)
-                        pos += self.chunk_size
+                        pos += self.mamba_chunk_size
                     chunk_boundaries.append(end)
                     last_chunk_indices_list.append(len(chunk_boundaries) - 2)
 
@@ -924,11 +924,11 @@ class MambaMixer(MegatronModule):
                                 f"intermediate offset {offset} out of range for "
                                 f"sequence {i} with length {seq_len}"
                             )
-                            assert offset % self.chunk_size == 0, (
+                            assert offset % self.mamba_chunk_size == 0, (
                                 f"intermediate offset {offset} is not a multiple "
-                                f"of chunk_size {self.chunk_size}"
+                                f"of chunk_size {self.mamba_chunk_size}"
                             )
-                            chunk_idx = first_chunk_idx + (offset // self.chunk_size) - 1
+                            chunk_idx = first_chunk_idx + (offset // self.mamba_chunk_size) - 1
                             intermediate_chunk_indices_list.append(chunk_idx)
                             count += 1
                         per_request_intermediate_counts.append(count)
@@ -952,7 +952,7 @@ class MambaMixer(MegatronModule):
                 A=A,
                 B=B,
                 C=C,
-                chunk_size=self.chunk_size,
+                chunk_size=self.mamba_chunk_size,
                 cu_chunk_seqlens=cu_chunk_seqlens,
                 last_chunk_indices=last_chunk_indices,
                 seq_idx=seq_idx_for_varlen,
@@ -1023,7 +1023,7 @@ class MambaMixer(MegatronModule):
                 A,
                 B,
                 C,
-                self.chunk_size,
+                self.mamba_chunk_size,
                 D=(
                     rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                     if self.D_has_hdim

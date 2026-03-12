@@ -872,7 +872,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
     def test_mixed_batch(self, model_type):
         ctx, bs, vocab_size, block_hash = self._setup_mixed_batch(model_type)
 
-        # For GPT: req1/req3 (identical, 1-block) have effective_chunk_length=1
+        # For GPT: req1/req3 (identical, 1-block) have effective_prefill_chunk_length=1
         # For hybrid: req1/req3 have 1 mamba match but 1-block prompt, back-off
         #   finds no previous block, so prefix_skip_tokens=0, effective=bs
         if model_type == "gpt":

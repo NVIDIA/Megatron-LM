@@ -1376,22 +1376,22 @@ class DynamicInferenceEngine(AbstractEngine):
                         for block_hash in req.precomputed_block_hashes:
                             if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
-                    chunk_length = self.context.max_tokens - self.context.active_token_count
+                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce this
                     # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
                     # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - chunk_length == 1 and chunk_length > 1:
-                        chunk_length -= 1
+                    if remaining_len - prefill_chunk_length == 1 and prefill_chunk_length > 1:
+                        prefill_chunk_length -= 1
 
-                    self.context.add_request(req, chunk_length=chunk_length)
+                    self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
-                    req.finished_chunk_token_count += chunk_length
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
+                    req.finished_chunk_token_count += prefill_chunk_length
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full

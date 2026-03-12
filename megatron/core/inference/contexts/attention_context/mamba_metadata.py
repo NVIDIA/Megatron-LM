@@ -10,22 +10,22 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
-    def __init__(self, max_requests: int, max_tokens: int, chunk_size: int = 128):
+    def __init__(self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128):
         """
         Initializes the Mamba slot allocator.
 
         Args:
             max_requests (int): The maximum number of concurrent requests.
             max_tokens (int): The maximum number of tokens.
-            chunk_size (int): The chunk size used by the SSM Triton kernels.
+            mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
-        self.chunk_size = chunk_size
+        self.mamba_chunk_size = mamba_chunk_size
         self.device = torch.cuda.current_device()
 
         # Maximum possible chunks across all batch configurations
-        self.max_chunks = max_tokens // chunk_size + max_requests
+        self.max_chunks = max_tokens // mamba_chunk_size + max_requests
 
         # Map from requests to slots in the static Mamba state buffer
         self.request_to_mamba_state_idx = torch.full(
@@ -216,10 +216,10 @@ class MambaMetadata:
 
             # Build cu_chunk_seqlens, last_chunk_indices, seq_idx_for_varlen.
             # Covers all padded sequences (real + padding). Each sequence is
-            # subdivided into chunks of at most chunk_size tokens. Zero-length
+            # subdivided into chunks of at most mamba_chunk_size tokens. Zero-length
             # sequences get a single zero-length chunk.
             cu_seqlens_all = self._cu_seqlens_buffer[: padded_prefill_count + 1].tolist()
-            chunk_size = self.chunk_size
+            chunk_size = self.mamba_chunk_size
             chunk_boundaries = [0]
             last_chunk_idx_list = []
             chunk_to_seq_list = []

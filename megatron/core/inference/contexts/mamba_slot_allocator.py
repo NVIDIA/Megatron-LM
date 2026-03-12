@@ -268,7 +268,7 @@ class MambaSlotAllocator:
         req,
         current_id: int,
         skip_tokens: int,
-        chunk_length: int,
+        prefill_chunk_length: int,
         num_matched_blocks: int,
         matched_block_ids: list,
         overall_required_blocks: int,
@@ -279,7 +279,7 @@ class MambaSlotAllocator:
             req: The inference request.
             current_id: Context request index.
             skip_tokens: Number of tokens being skipped (mamba match).
-            chunk_length: Total chunk length before skipping.
+            prefill_chunk_length: Total prefill chunk length before skipping.
             num_matched_blocks: Number of KV-matched blocks.
             matched_block_ids: List of matched KV block IDs.
             overall_required_blocks: Total blocks needed for this request.
@@ -289,7 +289,7 @@ class MambaSlotAllocator:
         num_kv_matched = num_matched_blocks
         kv_div_abs = num_kv_matched * ctx.block_size_tokens
         last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-        seq_len = chunk_length - skip_tokens  # effective prefill length
+        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
 
         # Compute relative offsets (relative to prefill start after skip)
         kv_div_rel = kv_div_abs - skip_tokens
@@ -297,13 +297,13 @@ class MambaSlotAllocator:
         penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
         penultimate_rel = penultimate_abs - skip_tokens
 
-        # Determine chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        chunk_size = 128
+        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
+        mamba_chunk_size = 128
 
-        # Build offset list: include if > 0, < seq_len, and % chunk_size == 0
+        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
         offsets_set = set()
         for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
-            if offset > 0 and offset < seq_len and offset % chunk_size == 0:
+            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)
