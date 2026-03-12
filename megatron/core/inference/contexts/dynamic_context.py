@@ -1836,7 +1836,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
-
         # If tensor state is deallocated, do not add request.
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
@@ -1844,9 +1843,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Chunk length.
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
-
-        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
-        is_chunked_prefill = req.finished_chunk_token_count > 0
 
         assert chunk_length > 0, "Chunk length is 0"
         assert (
@@ -1885,19 +1881,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_allocator.update_timestamps(matched_tensor)
 
-        # when a request already starts chunked prefill, it is exactly the last request in the current system
-        # (see dynamic_engine.py, schedule_chunked_prefill invariants)
-        # no need to update count, as it is already here
-        if is_chunked_prefill:
-            current_id = self.total_request_count - 1
-            # Overwrite the last token, which is the useless token from chunked prefill
-            chunked_prefill_offset = 1 + self.num_speculative_tokens
-            self.active_token_count -= chunked_prefill_offset
-            assert (
-                self.request_ids[current_id] == req.request_id
-            ), "Continuation current_id mismatch"
-        else:
-            current_id = self.total_request_count
+        # Note that we decremented the total_request_count for the chunked prefill request
+        # in update_requests, so setting current_id to the total_request_count will again
+        # make the last request the continuing chunked prefill request if one exists.
+        current_id = self.total_request_count
 
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
@@ -2002,7 +1989,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Range 2: newly allocated (non-matched) blocks that are now complete
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
-        if self.is_hybrid_model and not is_chunked_prefill:
+        if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
@@ -2015,7 +2002,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_token_count += effective_chunk_length
         self.lifetime_prefill_token_count += effective_chunk_length
-        self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
+        self.total_request_count += 1
         self.num_prefill_requests += 1
 
     def _move_book_keeping_tensors(
@@ -2357,7 +2344,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
-
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
@@ -2563,6 +2549,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 next_tokens=next_tokens,
                 new_speculative_tokens=new_speculative_tokens,
             )
+
+            # Explicitly decrement the active and total request counts here so that the chunked
+            # prefill request metadata is not updated. This will all be restored when the next
+            # chunk is added through add_request.
+            active_request_count -= 1
+            self.total_request_count -= 1
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         assert self.total_request_count == active_request_count + self.paused_request_count

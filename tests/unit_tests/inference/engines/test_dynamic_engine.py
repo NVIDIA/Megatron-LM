@@ -1328,12 +1328,10 @@ class TestDynamicInferenceEngine:
         assert 1 in active_ids
         assert 2 not in active_ids
         assert 3 not in active_ids
-        assert 2 in env.engine.waiting_request_ids
-        assert 3 in env.engine.waiting_request_ids
+        assert list(env.engine.waiting_request_ids) == [1, 2, 3]
 
-        # Verify that active token count == max tokens - 1
-        # The -1 is for the useless chunked prefill token
-        assert ctx.active_token_count == 51
+        # Verify that active token count == max tokens
+        assert ctx.active_token_count == 52
 
         # Verify that request 1 is the designated chunked prefill request
         assert ctx.chunked_prefill_request_id == 1
@@ -1388,9 +1386,8 @@ class TestDynamicInferenceEngine:
         assert 3 not in active_ids
         assert 3 in env.engine.waiting_request_ids
 
-        # Verify that active token count == max tokens - 1
-        # The -1 is for the useless chunked prefill token
-        assert ctx.active_token_count == 51
+        # Verify that active token count == max tokens
+        assert ctx.active_token_count == 52
 
         # Run step 4
         env.engine.step_modern()
@@ -1463,32 +1460,29 @@ class TestDynamicInferenceEngine:
 
         Scenario:
             - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 512
-
-        Note that for all chunks after the first chunk we subtract 1 from the active token
-        count, so the chunk size will be 1 less.
+            - Request prompt length: 513
 
         Default scheduling would do:
-            1. Chunk 256 (Remaining 256)
-            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            1. Chunk 256 (Remaining 257)
+            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
             3. Chunk 1
 
         Fixed scheduling should do:
-            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
-            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
-                                            So we reduce chunk to 254.
+            1. Chunk 256 (Remaining 257) -> 513 - 256 == 257. Schedule full 256.
+            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
+                                            So we reduce chunk to 255.
             3. Chunk 2   (Remaining 0)
         """
         chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 256 = 512
-        prompt_len = 512
+        # 256 + 255 + 2 = 513
+        prompt_len = 513
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
             num_requests=0,
             num_tokens_to_generate=None,
-            num_tokens_total=513,
+            num_tokens_total=prompt_len + 1,
             context_max_tokens=chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
@@ -1517,31 +1511,33 @@ class TestDynamicInferenceEngine:
         assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
 
         # --- Step 1 ---
-        # Available: 256. Remaining: 512.
-        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
-        env.engine.schedule_waiting_requests()
+        # Available: 256. Remaining: 513.
+        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
+
+        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
 
         assert (
             req.finished_chunk_token_count == 256
         ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
-        # Available: 256. Remaining un-prefilled: 256.
-        # Logic: 256 - (256 - 1) = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 254).
-        env.engine.schedule_waiting_requests()
+        # Available: 256. Remaining un-prefilled: 257.
+        # Logic: 257 - 256 = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
 
-        # 256 (previous) + 254 (this step) = 510
-        assert req.finished_chunk_token_count == 510, (
-            "Step 2: Expected 510 tokens processed (256+254), "
+        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+
+        # 256 (previous) + 255 (this step) = 511
+        assert req.finished_chunk_token_count == 511, (
+            "Step 2: Expected 511 tokens processed (256+255), "
             f"got {req.finished_chunk_token_count}. "
         )
 
         # --- Step 3 ---
-        # Remaining un-prefilled: 2. Available: 255.
-        # Logic: 2 <= 255. Schedule 2.
+        # Remaining un-prefilled: 2. Available: 256.
+        # Logic: 2 <= 256. Schedule 2.
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
