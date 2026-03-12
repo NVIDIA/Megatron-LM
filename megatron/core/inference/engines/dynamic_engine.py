@@ -1467,12 +1467,6 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-        if (
-            self.context.total_request_count - self.context.paused_request_count == 0
-            and len(self.waiting_request_ids) > 0
-        ):
-            raise ValueError(f"Cannot schedule request!")
-
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
