@@ -870,12 +870,17 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
+        # TODO Vijay: fuse most of the transposes with the GEMMS
         x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
         dt = dt.contiguous()
         B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
         C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
         z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
 
+        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
+        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
+        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
+        # mathematically incorrect, and potentially arithmetically unstable.
         assert (
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
