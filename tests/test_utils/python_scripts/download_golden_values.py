@@ -43,7 +43,6 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
         and pipeline_bridge.downstream_pipeline is not None
     ]
 
-    ASSETS_DIR = pathlib.Path("tmp") / "results" / "iteration=0"
     for pipeline_bridge in pipeline_bridges:
         functional_pipeline = project.pipelines.get(pipeline_bridge.downstream_pipeline["id"])
         environment = pipeline_bridge.name[len("functional:run_") :]
@@ -57,6 +56,7 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 continue
 
             try:
+                shutil.rmtree(pathlib.Path("tmp") / "results", ignore_errors=True)
                 file_name = "__artifacts.zip"
                 with open(file_name, "wb") as f:
                     job.artifacts(streamed=True, action=f.write)
@@ -68,15 +68,14 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 continue
 
             os.unlink(file_name)
-            restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
+            iteration_dir = sorted((pathlib.Path("tmp") / "results").glob("iteration=*"), key=lambda p: int(p.name.split("=")[1]))[-1]
+            restart_dir = sorted(os.listdir(iteration_dir))[-1]
+            job_name_hyphenated = job.name.replace("_", "-").lower()
+            assets_basic_dir = iteration_dir / f"{restart_dir}" / "assets" / "basic"
             golden_values_sources = list(
-                (
-                    pathlib.Path(ASSETS_DIR)
-                    / f"{restart_dir}"
-                    / "assets"
-                    / "basic"
-                    / f"{job.name.replace('_', '-').lower()}-{environment.replace('_', '-')}"
-                ).glob("g*.json")
+                (assets_basic_dir / f"{job_name_hyphenated}-{environment.replace('_', '-')}").glob("g*.json")
+            ) or list(
+                (assets_basic_dir / job_name_hyphenated).glob("g*.json")
             )
 
             if len(golden_values_sources) < 1:
