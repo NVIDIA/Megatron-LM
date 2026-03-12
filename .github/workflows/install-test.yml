@@ -49,7 +49,7 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set PATH
         run: |
@@ -65,7 +65,7 @@ jobs:
         run: bash docker/common/install.sh --environment dev --base-image pytorch --python-version ${{ matrix.python-version }}
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.63.2
@@ -94,7 +94,7 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set PATH
         run: |
@@ -113,7 +113,7 @@ jobs:
 
       # NGC PyTorch 25.05 has a version of triton that is broken on CPU only machines.
       # - name: Checkout check-imports
-      #   uses: actions/checkout@v4
+      #   uses: actions/checkout@v6
       #   with:
       #     repository: NVIDIA-NeMo/FW-CI-templates
       #     ref: v0.63.2
@@ -139,7 +139,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get workflow result
         id: result

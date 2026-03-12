@@ -41,6 +41,7 @@ class MHAMetadata(MetadataBase):
         request_to_kv_block_ids: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
+        num_speculative_tokens: int = 0,
     ):
         """
         Args:
@@ -49,6 +50,7 @@ class MHAMetadata(MetadataBase):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             batch_dimensions: Configuration object containing real batch settings
             padded_batch_dimensions: Configuration object containing padded batch settings
+            num_speculative_tokens: Number of speculative tokens
         """
         # Extract values from configs
         real_batch_size = batch_dimensions.req_count
@@ -99,7 +101,7 @@ class MHAMetadata(MetadataBase):
         )
 
         if padded_batch_dimensions.prefill_req_count == 0:
-            self._max_seqlen_q = 1
+            self._max_seqlen_q = num_speculative_tokens + 1
         else:
             # Make sure we will launch the prefill kernel for prefill graphs
             self._max_seqlen_q = max(2, padded_batch_dimensions.token_count)
@@ -150,6 +152,7 @@ class GraphedMHAMetadata(MHAMetadata):
         request_to_kv_block_ids: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
+        num_speculative_tokens: int = 0,
     ):
         """
         Args:
@@ -158,6 +161,7 @@ class GraphedMHAMetadata(MHAMetadata):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             batch_dimensions: Configuration object containing real batch settings
             padded_batch_dimensions: Configuration object containing padded batch settings
+            num_speculative_tokens: Number of speculative tokens
         """
         super().update(
             request_query_lengths,
@@ -165,6 +169,7 @@ class GraphedMHAMetadata(MHAMetadata):
             request_to_kv_block_ids,
             batch_dimensions,
             padded_batch_dimensions,
+            num_speculative_tokens,
         )
 
     def reset(self):
@@ -183,6 +188,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
         request_to_kv_block_ids: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
+        num_speculative_tokens: int = 0,
     ):
         """
         Args:
@@ -191,6 +197,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             batch_dimensions: Configuration object containing real batch settings
             padded_batch_dimensions: Configuration object containing padded batch settings
+            num_speculative_tokens: Number of speculative tokens
         """
         super().update(
             request_query_lengths,
@@ -198,10 +205,11 @@ class NonGraphedMHAMetadata(MHAMetadata):
             request_to_kv_block_ids,
             batch_dimensions,
             padded_batch_dimensions,
+            num_speculative_tokens,
         )
         if len(self.state_data["query_lengths"]) > 0:
             self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
             self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
         else:
-            self.state_data["max_seqlen_q"] = 1
+            self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
             self.state_data["max_seqlen_k"] = 1
