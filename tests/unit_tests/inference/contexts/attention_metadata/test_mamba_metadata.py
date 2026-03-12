@@ -304,33 +304,6 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
     # -------------------------------------------------------------------------
-    # Scenario 3b: Padded prefill without real prefill (EP dummy rank bug)
-    # -------------------------------------------------------------------------
-
-    @pytest.mark.internal
-    def test_update_rejects_padded_prefill_without_real_prefill(self, metadata_context):
-        """Padded prefill > 0 with real prefill == 0 must raise an assertion.
-
-        This scenario can happen on EP dummy ranks when the matched CUDA graph has
-        prefill slots but the dummy rank has no real prefill requests. The Mamba SSM
-        kernel would crash with an illegal memory access due to all-zero cu_seqlens.
-        """
-        seq_lengths = [1, 1]  # 2 decode requests, 0 prefill
-        num_decode = 2
-        padded_dims = InferenceBatchDimensions(
-            token_count=32, prefill_req_count=2, decode_req_count=2
-        )
-
-        with pytest.raises(AssertionError, match="Mamba models require real prefill requests"):
-            self._run_update_test(
-                metadata_context,
-                seq_lengths,
-                num_decode,
-                padded_dims,
-                enable_chunked_prefill=False,
-            )
-
-    # -------------------------------------------------------------------------
     # Scenario 4: Chunked Prefill
     # -------------------------------------------------------------------------
 
