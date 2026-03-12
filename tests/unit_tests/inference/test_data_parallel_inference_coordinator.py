@@ -9,7 +9,6 @@ import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
-import msgpack
 import pytest
 import torch
 
@@ -98,7 +97,6 @@ class DummyEngine(DynamicInferenceEngine):
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
-        self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
 
@@ -115,14 +113,14 @@ class DummyEngine(DynamicInferenceEngine):
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
 
-    async def run_engine_with_coordinator(self, *, loop=None):
+    async def run_engine(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
 
         In production, @trace_async_exceptions converts AssertionError to sys.exit(1) -> SystemExit.
         In Python 3.12+, asyncio re-raises SystemExit from tasks in the main thread.
         For tests, we let AssertionErrors propagate directly so pytest.raises can catch them.
         """
-        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
+        return await DynamicInferenceEngine.run_engine.__wrapped__(self, loop=loop)
 
     def suspend(self):
         pass
@@ -170,10 +168,7 @@ class DummyEngine(DynamicInferenceEngine):
                 to_remove.append(request_id)
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
-                    )
-                    self.socket_for_receiving_requests.send(payload)
+                    self.coordinator_client.send_engine_reply([entry.record.serialize()])
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -196,25 +191,21 @@ class DummyEngine(DynamicInferenceEngine):
 
 
 async def cleanup_engine(engine, client=None, timeout=30.0):
-    """Disconnect an engine between tests. The coordinator stays alive."""
+    """Disconnect an engine between tests. The coordinator stays alive.
+
+    PAUSE is injected into each rank's pending_messages rather than sent through the coordinator.
+    This avoids state-mismatch bugs: the shared coordinator's state may differ from the engine's
+    (e.g. the coordinator is PAUSED from a previous test while the engine is RUNNING).
+    """
     task = getattr(engine, 'engine_loop_task', None)
     if task is not None and not task.done():
-        if client is not None:
-            client.pause_engines()
-        try:
-            await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
-        except (asyncio.TimeoutError, Exception):
-            pass
-
-        sub = getattr(engine, 'model_parallel_num_msgs_subscriber_socket', None)
-        if sub is not None:
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
-
-        # Close ZMQ communicator sockets to unblock any stuck ranks.
-        for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
-            comm = getattr(engine, attr, None)
-            if comm is not None:
-                comm.close()
+        # Inject PAUSE locally so every rank transitions to PAUSED without
+        # relying on the coordinator's current state.
+        cc = engine.coordinator_client
+        cc.pending_messages.append((Headers.PAUSE, None))
+        async with engine._cond:
+            engine._cond.notify_all()
+        await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
 
         task.cancel()
         try:
@@ -226,9 +217,9 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
         # Walk the coordinator back to RUNNING regardless of its current state
         # so the next test starts cleanly.  Each call is a no-op when the
         # coordinator is already in the target state (just logs a warning).
-        client.resume_engines()  # SUSPENDED → PAUSED (no-op otherwise)
-        client.unpause_engines()  # PAUSED    → RUNNING (no-op otherwise)
-        client.stop()
+        client.send_signal(Headers.RESUME)  # SUSPENDED → PAUSED (no-op otherwise)
+        client.send_signal(Headers.UNPAUSE)  # PAUSED    → RUNNING (no-op otherwise)
+        await client.shutdown()
 
 
 @pytest.fixture
@@ -295,9 +286,9 @@ def coordinator():
         ctx = zmq.Context()
         sock = ctx.socket(zmq.DEALER)
         sock.connect(dp_addr)
-        sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-        sock.recv()  # CONNECT_ACK
-        sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+        sock.send_multipart([Headers.CLIENT_CONNECT.value.to_bytes()])
+        sock.recv_multipart()  # ACK
+        sock.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
         sock.close(linger=1000)
         ctx.term()
         proc.join(timeout=10.0)
@@ -435,13 +426,13 @@ class TestCoordinator:
 
                 # Try to submit signals out of FSM order.
                 # The coordinator's state machine filters these out.
-                client.suspend_engines()
+                client.send_signal(Headers.SUSPEND)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.RUNNING)
-                client.resume_engines()
+                client.send_signal(Headers.RESUME)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.RUNNING)
-                client.stop_engines()
+                client.send_signal(Headers.STOP)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.RUNNING)
 
@@ -456,7 +447,7 @@ class TestCoordinator:
                 pre_pause_futures = [
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:3]
                 ]
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
@@ -465,7 +456,7 @@ class TestCoordinator:
                 assert len(pending) > 0, "Pre-pause requests should not drain during PAUSING"
 
                 # Try pausing again and see if it breaks.
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.PAUSED)
 
@@ -479,7 +470,7 @@ class TestCoordinator:
                 assert len(pending) == 2
 
                 # UNPAUSE and verify all in-flight requests (pre-pause + paused) complete.
-                client.unpause_engines()
+                client.send_signal(Headers.UNPAUSE)
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 all_queued = pre_pause_futures + paused_futures
                 results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
@@ -496,32 +487,32 @@ class TestCoordinator:
                     assert record[-1].status == Status.COMPLETED
 
                 # Suspend.
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
-                client.suspend_engines()
+                client.send_signal(Headers.SUSPEND)
                 await asyncio.wait_for(engine.wait_until(EngineState.SUSPENDED), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # Try pausing again and see if it breaks.
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # Try suspending again and see if it breaks.
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # Resume.
-                client.resume_engines()
+                client.send_signal(Headers.RESUME)
                 await asyncio.wait_for(engine.wait_until(EngineState.RESUMED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
                 assert not engine._state_events[EngineState.SUSPENDED].is_set()
 
                 # Engine processes requests after suspend/resume cycle.
-                client.unpause_engines()
+                client.send_signal(Headers.UNPAUSE)
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
 
                 futures = [
@@ -532,7 +523,7 @@ class TestCoordinator:
                     assert record[-1].status == Status.COMPLETED
 
                 # Submit requests that will be cancelled on STOP.
-                client.pause_engines()
+                client.send_signal(Headers.PAUSE)
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
@@ -550,7 +541,7 @@ class TestCoordinator:
                 # Verify doomed futures are still pending.
                 for f in doomed_futures:
                     assert not f.done(), "Client futures should still be pending"
-                client.stop_engines()
+                client.send_signal(Headers.STOP)
 
             await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
             assert_state(engine, EngineState.STOPPED)
@@ -558,10 +549,10 @@ class TestCoordinator:
         finally:
             await cleanup_engine(engine, client)
 
-        # cleanup_engine called client.stop() which cancels pending futures.
+        # cleanup_engine called client.shutdown() which cancels pending futures.
         if torch.distributed.get_rank() == 0:
             for f in doomed_futures:
-                assert f.cancelled(), "Client futures should be cancelled after client.stop()"
+                assert f.cancelled(), "Client futures should be cancelled after client.shutdown()"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
