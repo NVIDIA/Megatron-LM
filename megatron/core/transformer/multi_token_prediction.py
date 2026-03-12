@@ -1385,6 +1385,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                attention_bias=attention_bias,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
