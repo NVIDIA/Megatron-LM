@@ -872,6 +872,8 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
+    if args.grad_reduce_in_bf16:
+        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1524,6 +1526,9 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
+        
+    if args.mla_down_proj_fusion:
+        assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
     # MoE latent projections
     if args.moe_latent_size is not None:
@@ -1790,10 +1795,11 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
-    # TODO(ksanthanam): Clean this up in future PR
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--num-speculative-tokens', type=int, default=0,
+                       help='Number of speculative tokens generated during decode')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
@@ -3020,6 +3026,13 @@ def _add_mla_args(parser):
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument(
+        '--mla-down-proj-fusion',
+        action='store_true',
+        default=False,
+        help="Enable fused q/kv down-projection and fused input layernorm when backend supports. "
+             "Otherwise fall back to the unfused MLA.",
+    )
 
     return parser
 
