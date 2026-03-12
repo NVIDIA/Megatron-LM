@@ -1657,10 +1657,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if records_to_send:
                 range_push("coordinator_communication")
                 payload = msgpack.packb(
-                    [
-                        Headers.ENGINE_REPLY.value,
-                        [r.merge().serialize() for r in records_to_send],
-                    ],
+                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)

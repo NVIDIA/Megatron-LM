@@ -8,7 +8,10 @@ import traceback
 import uuid
 import warnings
 
-from megatron.core.inference.inference_request import DynamicInferenceEventType, unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -384,7 +387,9 @@ try:
                         DynamicInferenceEventType.ERROR_TRANSIENT,
                     )
                 ]
-                if any(e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events):
+                if any(
+                    e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events
+                ):
                     has_nontransient_error = True
                 error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
                 failed_errors.append(f"Request {i}: {error_msg}")
