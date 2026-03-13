@@ -595,6 +595,9 @@ class MegatronFSDP(torch.nn.Module):
             param.grad_added_to_main_grad = False
 
         self._params_require_handle_grad = set()
+        # Saved for overlap_post_backward() which needs to accumulate gradients
+        # outside the normal autograd hook path.
+        self._overlap_grad_acc_fn = _grad_acc
 
         def _post_backward_release_module(module, *unused):
             """
@@ -1098,6 +1101,152 @@ class MegatronFSDP(torch.nn.Module):
                 Defaults to True. MegatronFSDP.model_auto_sync defaults to False.
         """
         self.model_auto_sync = sync_model
+
+    def overlap_pre_backward(self):
+        """Initialize backward state for overlap_moe_expert_parallel_comm schedule.
+
+        When the fine-grained overlap schedule bypasses normal module hooks (because it
+        calls layer sub-modules directly instead of going through module.forward()),
+        FSDP's root pre-backward hook never fires. This method replicates the essential
+        bookkeeping: populating the set of parameters that require gradient handling
+        and resetting the grad-accumulation flag on each parameter.
+
+        For optim_grads_params, also replicates the FSDP-unit state transitions and
+        forward-bucket release marking that _root_pre_backward normally performs.
+
+        Must be called before each microbatch's backward pass in the overlap schedule.
+        """
+        self._root_pre_backward_hook_issued = True
+
+        if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            fsdp_unit_modules = self.fsdp_unit_modules
+            for module in self.module.modules():
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    module._training_state = TrainingState.PRE_BACKWARD
+            # Mark all forward-pass parameter buckets as releasable so that
+            # recycle_unused_buckets() can free them when the backward pass
+            # needs pool slots for its own all-gathers.
+            ag_pipeline = self.all_gather_pipeline
+            for bucket_id in range(ag_pipeline.num_buckets):
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                if group.fsdp_unit_id is not None:
+                    ag_pipeline.bucket_can_be_released[
+                        ag_pipeline.get_bucket_key(bucket_id, bwd=False)
+                    ] = True
+
+        self._params_require_handle_grad = set()
+        for param_group in self.param_and_grad_buffer.parameter_groups:
+            if not param_group.requires_grad:
+                continue
+            self._params_require_handle_grad |= set(param_group.params)
+            for param in param_group.params:
+                param.grad_added_to_main_grad = False
+
+    def overlap_release_fsdp_unit_forward_params(self, module):
+        """Release forward parameter buckets for a specific FSDP unit after its forward completes.
+
+        In the EP overlap schedule, TransformerLayer.forward() is not called, so the
+        normal _post_forward hook never fires.  This method replicates that per-layer
+        parameter release to reduce forward-pass peak memory.
+
+        Uses lazy release so that the FixedPoolAllocator recycles these buffers
+        just-in-time inside async_bucket_gather → recycle_unused_buckets(), which
+        is the same mechanism used by _post_forward during activation recomputation.
+
+        Args:
+            module: The FSDP unit module (e.g. TransformerLayer) whose forward
+                parameter buffers should be freed.
+        """
+        if self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            return
+        for param in module.parameters():
+            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            self.all_gather_pipeline.release_bucket(bucket_id, bwd=False, lazy=True)
+        if not self.ddp_config.keep_fp8_transpose_cache:
+            for param in module.parameters():
+                if is_float8tensor(param):
+                    fp8_discard_transpose_cache(param)
+
+    def overlap_release_fsdp_unit_backward_params(self, module):
+        """Release backward parameter buckets for a specific FSDP unit after its backward completes.
+
+        In the EP overlap schedule, _post_backward_release_module never fires.  This
+        method replicates that per-layer release to reduce backward-pass peak memory.
+
+        Uses lazy release so that the FixedPoolAllocator recycles these buffers
+        just-in-time inside async_bucket_gather → recycle_unused_buckets().
+
+        Args:
+            module: The FSDP unit module (e.g. TransformerLayer) whose backward
+                parameter buffers should be freed.
+        """
+        if self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            return
+        for param in module.parameters():
+            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            self.all_gather_pipeline.release_bucket(bucket_id, bwd=True, lazy=True)
+        module._training_state = TrainingState.IDLE
+
+    def overlap_post_backward(self):
+        """Finalize backward state for overlap_moe_expert_parallel_comm schedule.
+
+        Counterpart to overlap_pre_backward(). Handles any parameters whose gradients
+        were not processed by per-parameter hooks (e.g. shared parameters), waits for
+        pending async reduce-scatter operations, and updates microbatch bookkeeping.
+
+        For optim_grads_params, also releases any backward parameter buckets not yet
+        freed by per-layer overlap_release_fsdp_unit_backward_params calls, and
+        transitions FSDP units back to IDLE.
+
+        Must be called after each microbatch's backward pass in the overlap schedule.
+        """
+        ordered_params = sorted(
+            list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]
+        )
+
+        for param in ordered_params:
+            self._overlap_grad_acc_fn(param)
+
+        grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
+            "optim_grads",
+            "optim_grads_params",
+        ]
+        is_last_microbatch = getattr(self, "is_last_microbatch", False)
+
+        outer_fsdp_group_grad_reduce = (
+            self.dist_index.use_hybrid_fsdp
+            and (is_last_microbatch or self.model_auto_sync)
+        )
+
+        if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+            self.grad_reduce_pipeline.reduce_gradients(
+                ordered_params,
+                suggested_queue_capacity=self.suggested_RS_queue_capacity,
+                outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
+            )
+
+            self.grad_reduce_pipeline.reset()
+
+        # Safety-net: release any backward parameter buckets that were not
+        # already freed by per-layer overlap_release_fsdp_unit_backward_params
+        # calls (e.g. the last layer whose attn_dw is deferred).
+        if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            fsdp_unit_modules = self.fsdp_unit_modules
+            released_buckets = set()
+            for module in self.module.modules():
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    for param in module.parameters():
+                        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                        if bucket_id not in released_buckets:
+                            self.all_gather_pipeline.release_bucket(bucket_id, bwd=True)
+                            released_buckets.add(bucket_id)
+                    module._training_state = TrainingState.IDLE
+
+        self._root_pre_backward_hook_issued = False
+        self.microbatch_count += 1
+
+        if self.model_auto_sync:
+            self.finish_grad_sync()
 
     def get_distributed_index(self) -> FSDPDistributedIndex:
         """

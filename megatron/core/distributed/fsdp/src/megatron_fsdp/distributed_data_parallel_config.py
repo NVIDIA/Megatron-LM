@@ -119,6 +119,14 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_double_buffer_pool_size: int = 2
+    """Number of buffer groups in the FixedPoolAllocator when fsdp_double_buffer
+      is enabled.  The default of 2 (true double-buffering) supports one active
+      FSDP unit plus one prefetched unit.  Increase to 3 when using the EP
+      overlap schedule with optim_grads_params, where the 1f1b interleaved
+      schedule requires forward and backward all-gathers to coexist in the pool.
+    """
+
     fsdp_all_gather_in_start_param_sync: bool = True
     """
     If True, use all-gather during the initial Megatron-FSDP parameter
