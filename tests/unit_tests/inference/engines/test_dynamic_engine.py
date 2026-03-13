@@ -1549,6 +1549,93 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_chunked_prefill_delay_scheduling_for_unavoidable_single_token_chunk(self):
+        """
+        Test that chunked prefill scheduling delays execution when the only available
+        option is to schedule a chunk of size 1 that leaves exactly 1 token remaining.
+
+        Scenario:
+            - Max tokens per step: 256
+            - Request A: 254 token prompt
+            - Request B: 2 token prompt
+
+        Sequence:
+            1. Step 1 scheduling:
+               - Request A is scheduled (255 tokens).
+               - Context has 1 token available (256 - 255).
+               - Request B has 2 tokens remaining.
+               - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
+                 crashing FA3. Since chunk_length is 1, we can't safely reduce it.
+                 The engine MUST delay scheduling Request B.
+            2. Step 1 executes prefill for Request A only.
+            3. Step 2 scheduling:
+               - Request A enters decode phase (takes 1 active token).
+               - Context has 255 tokens available (256 - 1).
+               - Request B is now safely scheduled for its full 2 tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=256,
+            context_max_tokens=256,
+            context_max_requests=2,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Add Request A (Length 255)
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (255,), device='cuda')
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_a)
+
+        # Add Request B (Length 2)
+        req_b_tokens = torch.randint(0, test_config.vocab_size, (2,), device='cuda')
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_b_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_b)
+
+        # --- Step 1 ---
+        # Should schedule Request A fully (255), but delay Request B
+        env.engine.step_modern()
+
+        assert req_a.status == Status.COMPLETED
+
+        # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
+        assert (
+            req_b.finished_chunk_token_count == 0
+        ), "Request B should have been delayed to avoid leaving a 1-token chunk"
+        assert len(env.engine.waiting_request_ids) == 1
+        assert env.engine.waiting_request_ids[0] == 2
+
+        # --- Step 2 ---
+        # Request A has completed. Context has 256 tokens available.
+        # Request B can now schedule its full 2 tokens safely.
+        env.engine.step_modern()
+
+        assert req_b.status == Status.COMPLETED
+        assert len(env.engine.waiting_request_ids) == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()

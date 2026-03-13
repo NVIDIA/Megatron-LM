@@ -1523,3 +1523,103 @@ class TestDynamicContext:
 
         # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
         assert dynamic_context.num_attention_heads_per_partition == 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_chunked_prefill_state_preserved_across_decode_completions(self):
+        """
+        Tests that when a chunked prefill request is hidden, and active decode requests
+        finish (causing the context boundary to shrink), the hidden chunked request
+        is safely pulled to the new boundary so it doesn't lose its KV blocks or Mamba slot.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.03,
+            block_size_tokens=4,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
+        )
+
+        dynamic_context.enable_chunked_prefill = True
+
+        # Add 2 normal decode requests
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=10,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=11,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+
+        # Add Chunk 1 of the chunked prefill request
+        req_999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.chunked_prefill_request_id = 999
+
+        # Capture the allocated state at index 2
+        mamba_slot_before = dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item()
+        kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+
+        assert mamba_slot_before != -1
+        assert kv_block_before != -1
+
+        # Step 1: Forward pass for all 3 requests
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # At this point, req 999 is hidden at index 2. total_request_count is 2 (req 10, 11).
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Step 2: Forward pass where req 10 finishes, req 11 continues. Req 999 is NOT scheduled.
+        active_requests_mask = torch.tensor([0, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # At this point, req 10 is evicted. Req 11 shifts to index 0. total_request_count becomes 1.
+        # Req 999 should be pulled from index 2 down to index 1 (the new boundary).
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.request_ids[0].item() == 11
+
+        # Verify that the chunked request was correctly pulled to the boundary (index 1)
+        assert dynamic_context.request_ids[1].item() == 999
+        assert (
+            dynamic_context.mamba_metadata.request_to_mamba_state_idx[1].item() == mamba_slot_before
+        )
+        assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
+
+        # Ensure the old index 2 was properly swapped during the pull
+        assert dynamic_context.request_ids[2].item() == 11
+        assert dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item() == -1
+        assert dynamic_context.request_to_kv_block_ids[2, 0].item() == -1
+
+        # Step 3: Add the next chunk. It should sit exactly at the boundary (index 1) and inherit the state.
+        req_999.finished_chunk_token_count = 4
+        dynamic_context.add_request(req_999, chunk_length=4)
+
+        # Verify state at index 1 is active and its previous Mamba slot and KV blocks were inherited
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[1].item() == 999
+        assert (
+            dynamic_context.mamba_metadata.request_to_mamba_state_idx[1].item() == mamba_slot_before
+        )
+        assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
