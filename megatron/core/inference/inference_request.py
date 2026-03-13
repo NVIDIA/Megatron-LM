@@ -514,6 +514,8 @@ class DynamicInferenceRequest(InferenceRequest):
         blocks_hashed_total: Optional[int] = None,
         blocks_hashed_active: Optional[int] = None,
         blocks_ref_count: Optional[int] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
     ):
         """Add 'generated_token' event - records each generated token.
 
@@ -523,6 +525,8 @@ class DynamicInferenceRequest(InferenceRequest):
             blocks_hashed_total (int): All allocated (hashed) blocks.
             blocks_hashed_active (int): Blocks with ref_count > 0.
             blocks_ref_count (int): Sum of block ref counts from allocator.
+            pre_fwd_active_token_count (int): Active token count before forward pass.
+            pre_fwd_step_count (int): Step count before forward pass.
         """
         payload = {"token_id": token}
         if blocks_total is not None:
@@ -533,6 +537,10 @@ class DynamicInferenceRequest(InferenceRequest):
             payload["blocks_hashed_active"] = blocks_hashed_active
         if blocks_ref_count is not None:
             payload["blocks_ref_count"] = blocks_ref_count
+        if pre_fwd_active_token_count is not None:
+            payload["pre_fwd_active_token_count"] = pre_fwd_active_token_count
+        if pre_fwd_step_count is not None:
+            payload["pre_fwd_step_count"] = pre_fwd_step_count
         return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
 
     def add_event_pause(self):

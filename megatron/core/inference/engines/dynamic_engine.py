@@ -958,6 +958,8 @@ class DynamicInferenceEngine(AbstractEngine):
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1061,6 +1063,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     blocks_ref_count=blocks_ref_count,
+                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                    pre_fwd_step_count=pre_fwd_step_count,
                                 )
                             else:
                                 event = request.add_event_generated_token(
@@ -1068,6 +1072,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     blocks_total=block_allocator.total_count,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
+                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                    pre_fwd_step_count=pre_fwd_step_count,
                                 )
                             if first_token_event is None:
                                 first_token_event = event
@@ -1534,6 +1540,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
+            "step_count": self.context.step_count,
         }
 
         # Generate tokens.
@@ -1626,6 +1633,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 log_probs,
                 top_n_logprobs,
                 routing_indices_per_request,
+                pre_fwd_active_token_count=context_state.get("active_token_count"),
+                pre_fwd_step_count=context_state.get("step_count"),
             )
 
         else:
