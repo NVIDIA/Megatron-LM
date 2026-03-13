@@ -32,6 +32,7 @@ MODEL_ARGS:
   --num-query-groups: 8
   --seq-length: 4096
   --kv-channels: 128
+  --ffn-hidden-size: 8192
   --group-query-attention: true
   --normalization: RMSNorm
   --swiglu: true

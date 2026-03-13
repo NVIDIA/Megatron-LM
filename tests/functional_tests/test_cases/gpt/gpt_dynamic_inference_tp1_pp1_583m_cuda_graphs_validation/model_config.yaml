@@ -4,4 +4,5 @@ ENV_VARS:
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
+  --async-save: true
 TEST_TYPE: regular

@@ -69,6 +69,7 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
   --sequence-parallel: true
+  --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true

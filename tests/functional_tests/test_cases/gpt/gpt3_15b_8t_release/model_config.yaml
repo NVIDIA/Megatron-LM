@@ -92,7 +92,7 @@ MODEL_ARGS:
   --wandb-save-dir: ${WANDB_SAVE_PATH}
   --async-save: true
 METRICS:
-- "iteration-time"
-- "lm loss"
-- "mem-allocated-bytes"
-- "mem-max-allocated-bytes"
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

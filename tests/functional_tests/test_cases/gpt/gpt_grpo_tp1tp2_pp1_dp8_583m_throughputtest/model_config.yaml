@@ -9,8 +9,7 @@ MODEL_ARGS:
   --tiktoken-pattern: v2
   --use-mcore-models: true
   --tokenizer-type: TikTokenizer
-  --tokenizer-model: 
-    ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --auto-detect-ckpt-format: true
   --max-tokens-to-oom: 3600000
@@ -49,7 +48,10 @@ MODEL_ARGS:
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
+  --timing-log-level: 1
+  --log-timers-to-tensorboard: true
   --cuda-graph-impl: local
+  --micro-batch-size: 1
   --global-batch-size: 16
   --grpo-group-size: 2
   --grpo-prompts-per-step: 8
@@ -58,8 +60,7 @@ MODEL_ARGS:
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: 
-    tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
   --lr: 0.000001
   --lr-warmup-samples: 0
@@ -78,5 +79,5 @@ MODEL_ARGS:
   --refit-method: gloo
   --async-save: true
 METRICS:
-- "mem-allocated-bytes"
-- "mem-max-allocated-bytes"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
