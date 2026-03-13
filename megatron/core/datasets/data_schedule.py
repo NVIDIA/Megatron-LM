@@ -44,7 +44,7 @@ class HybridCPDataLoaderWrapper:
         ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
 
         self.cp_balancing_scheduler = BalancedCPScheduler(
-            max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank, dp_cp_group=self.dp_cp_group
+            config=self.config, dp_cp_group=self.dp_cp_group
         )
 
         self.total_hdp_gpus = self.dp_cp_group.size()
@@ -277,14 +277,16 @@ class HybridCPDataLoaderWrapper:
             # dim=0 should be divisible by 8
             # Find padding required to make dim=0 divisible by 32 after sharding
             # MXFP8 BLOCK_SIZE is 32
-            # Hybrid EP requires 128
-            pad_granularity = 128
+            # Add config checks here
+            pad_granularity = 32
+            if self.config.moe_token_dispatcher_type == "flex" and self.config.moe_flex_dispatcher_backend == "hybridep":
+                # HybridEP requires MAX_NUM_OF_TOKENS_PER_RANK to be divisible by NUM_OF_TOKENS_PER_CHUNK (128)
+                pad_granularity = 128
             sharded_tensor_shape = seq_len // (local_cp_size * parallel_state.get_tensor_model_parallel_world_size())
             mod_token_count = sharded_tensor_shape % pad_granularity
             pad_len = 0
             if mod_token_count != 0:
                 pad_len = (pad_granularity - mod_token_count) * (local_cp_size * parallel_state.get_tensor_model_parallel_world_size())
-                # tensor = torch.cat([tensor, torch.zeros(pad_len, dtype=tensor.dtype, device=tensor.device)])
             
             return pad_len
 

@@ -2124,43 +2124,11 @@ def get_batch_on_this_hybrid_cp_rank(
         if key in ['attention_mask']:
             continue
         batch[key] = torch.stack([data], 0)
-    # sample_length = batch['tokens'].shape[1]
-    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
 
     assert cp_group is not None, "No valid cp_group found when using Hybrid Context Parallel"
     batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen, cp_group.size(), cp_group.rank())
     packed_seq_params.local_cp_size = local_cp_size
     packed_seq_params.cp_group = cp_group
-
-    # Create packed_seq_params for SBHD format with cp group information.
-    # packed_seq_params = PackedSeqParams(
-    #     qkv_format="thd",
-    #     cu_seqlens_q=cu_seqlens,
-    #     cu_seqlens_kv=cu_seqlens,
-    #     cu_seqlens_q_padded=cu_seqlens_padded,
-    #     cu_seqlens_kv_padded=cu_seqlens_padded,
-    #     max_seqlen_q=max_seqlen,
-    #     max_seqlen_kv=max_seqlen,
-    #     local_cp_size=local_cp_size,
-    #     cp_group=cp_group,
-    # )
-
-    # # When using hybrid_context_parallel, each sub-sample of a packed sample is
-    # # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-    # # TODO(pmannan): We remove SBHD format support to support sequence packing.
-    # if cp_group is not None and cp_group.size() > 1:
-    #     assert tex is not None and is_te_min_version("1.10.0"), (
-    #         "Please update Transformer Engine to >= 1.10 to use "
-    #         "Context Parallel with THD format data"
-    #     )
-    #     index = tex.thd_get_partitioned_indices(
-    #         cu_seqlens_padded, batch['tokens'].size(1), cp_group.size(), cp_group.rank()
-    #     )
-    #     for key, data in batch.items():
-    #         if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
-    #             continue
-    #         batch[key] = data.index_select(1, index)
-    #     # batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
 
     return batch, packed_seq_params
 
