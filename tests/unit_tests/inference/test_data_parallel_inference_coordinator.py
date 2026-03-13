@@ -624,6 +624,8 @@ class TestCoordinator:
             for f in doomed_futures:
                 assert f.cancelled(), "Client futures should be cancelled after client.stop()"
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio

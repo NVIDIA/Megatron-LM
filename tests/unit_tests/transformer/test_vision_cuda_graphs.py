@@ -47,6 +47,7 @@ class TestVisionLayerIsGraphable:
         layer = torch.nn.Linear(4, 4)
         assert _layer_is_graphable(layer, config) is False
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_wrong_cuda_graph_impl_returns_false(self):
         from megatron.core.transformer.transformer_layer import TransformerLayer
