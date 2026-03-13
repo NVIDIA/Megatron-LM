@@ -59,7 +59,9 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import (
+    ActivationType as McoreActivationType,
     InferenceGroupedGemmBackend,
+    mcore_fused_moe,
     resolve_inference_grouped_gemm_backend,
 )
 
@@ -493,6 +495,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
+        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
     def _resolve_flashinfer_activation_type(self):
@@ -510,6 +513,30 @@ class InferenceGroupedMLP(TEGroupedMLP):
         elif func == squared_relu:
             return ActivationType.Relu2
         raise ValueError(f"No FlashInfer ActivationType mapping for activation_func={func}")
+
+    def _resolve_mcore_activation_type(self):
+        """Map megatron activation config to mcore_fused_moe ActivationType."""
+        func = self.config.activation_func
+        if func == F.silu:
+            return McoreActivationType.SWIGLU
+        elif func == squared_relu:
+            return McoreActivationType.SQUARED_RELU
+        raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
+
+    def _mcore_fused_moe_forward(self, hidden_states, routing_map, probs):
+        """Torch grouped_mm fused MoE for CUDA-graphed inference iterations."""
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = mcore_fused_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+        )
+        return output, None
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA-graphed iteration mode."""
@@ -667,9 +694,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
-            return self._torch_grouped_mm_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
-            )
+            if self.is_inference_cuda_graphed_iteration:
+                assert routing_map is not None, (
+                    "routing_map is required for mcore_fused_moe forward pass."
+                )
+                return self._mcore_fused_moe_forward(
+                    permuted_local_hidden_states, routing_map, permuted_probs
+                )
+            else:
+                return self._torch_grouped_mm_forward(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                )
         elif resolved_backend == InferenceGroupedGemmBackend.TE:
             return super().forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs

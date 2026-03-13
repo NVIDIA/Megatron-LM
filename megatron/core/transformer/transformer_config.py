@@ -924,8 +924,11 @@ class TransformerConfig(ModelParallelConfig):
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
-      and torch._grouped_mm for non-CUDA-graphed iterations (falls back to TE if unavailable).
-    - 'torch': Uses torch._grouped_mm only. Not supported with CUDA graphs.
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
     - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
     """
 
@@ -1192,16 +1195,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"got '{self.inference_grouped_gemm_backend}'"
             )
 
-            if self.cuda_graph_impl == "local": 
-                if self.inference_grouped_gemm_backend == "torch":
-                    raise ValueError(
-                        "torch grouped mm is not supported with CUDA graphs. Please set "
-                        "inference_grouped_gemm_backend to 'auto', or disable CUDA graphs (--cuda-graph-impl=none)."
-                    )
-                elif self.inference_grouped_gemm_backend == "te":
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
                     raise ValueError(
                         "TE GroupedGEMM is not supported with CUDA graphs. Please set "
-                        "inference_grouped_gemm_backend to 'auto', or disable CUDA graphs (--cuda-graph-impl=none)."
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
                     )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:

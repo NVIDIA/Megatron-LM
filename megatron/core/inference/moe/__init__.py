@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
-
 import torch
+from .fused_moe import ActivationType, mcore_fused_moe
 
 
 class InferenceGroupedGemmBackend(enum.Enum):
