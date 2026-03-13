@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
