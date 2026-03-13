@@ -76,7 +76,7 @@ async def main(
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(dp_addr, deserialize=True)  # submits requests to the inference coordinator
+        client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
         client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -145,7 +145,8 @@ async def main(
             json_results = {}
             throughputs = []
 
-            for req in results:
+            for record in results:
+                req = record.merge()
                 result_dict = {
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
@@ -168,7 +169,8 @@ async def main(
         else:
             print("Results:")
             unique_prompt_map = defaultdict(list)
-            for req in results:
+            for record in results:
+                req = record.merge()
                 unique_prompt_map[req.prompt].append(req)
             for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
                 print(
