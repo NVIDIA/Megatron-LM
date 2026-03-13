@@ -1728,6 +1728,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             tensors = self._get_main_param_and_optimizer_states(model_param)
             tensors["fp32_param"] = tensors.pop("param")
 
+            # Remove 'step' — it's a 0-dim scalar already saved via param_groups,
+            # and as a plain tensor it would pollute common_state_dict (causing
+            # false validation warnings with Expert Parallelism).
+            tensors.pop('step', None)
+
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
             try:
@@ -1747,12 +1752,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
             # params.
             for state_key, state_ten in tensors.items():
-                if state_key == 'step':
-                    # Note that step is a 0-dim tensor, unlike other
-                    # states have the same size as the parameter.
-                    # The optimizer state of STEP is handled
-                    # specifically and is read from param_groups.
-                    continue
                 replace_kwargs = dict(
                     key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                     data=state_ten,
@@ -1765,11 +1764,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
                 tensors[state_key].validate_metadata_integrity()
 
-            # Remove 'step' from tensors to prevent it from polluting common_state_dict.
-            # With Expert Parallelism, different ranks have different param_idx counts,
-            # and 'step' (a plain tensor) ends up in common_state_dict with param_idx keys,
-            # causing false warnings in _validate_common_state_dict.
-            tensors.pop('step', None)
             return tensors
 
         # Not stored in the checkpoint, used only to identify params in
