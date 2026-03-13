@@ -38,8 +38,16 @@ class HFQwen35VisionEncoderWrapper(torch.nn.Module):
         super().__init__()
         full_config = AutoConfig.from_pretrained(pretrained_model_name, trust_remote_code=True)
         vision_config = full_config.vision_config
-
-        self.encoder = Qwen3_5MoeVisionModel(vision_config)
+        # NOTE: The global model can be constructed under torch.device("meta")
+        # for decoder-side FSDP initialization. The HF vision encoder should stay
+        # materialized on a real device to avoid meta tensors leaking into its
+        # rotary embedding path during forward.
+        if torch.cuda.is_available():
+            init_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            init_device = torch.device("cpu")
+        with torch.device(init_device):
+            self.encoder = Qwen3_5MoeVisionModel(vision_config)
         self.spatial_merge_size = vision_config.spatial_merge_size
 
         if load_pretrained_weights:

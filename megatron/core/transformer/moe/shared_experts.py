@@ -131,6 +131,13 @@ class SharedExpertMLP(MLP):
             output = output * gate_score
         return output
 
+    def reset_parameters(self):
+        """Initialize direct parameters for meta-device init compatibility."""
+        if self.use_shared_expert_gate and self.gate_weight is not None:
+            if self.config.perform_initialization:
+                self.config.init_method(self.gate_weight)
+            self.gate_weight.data = self.gate_weight.data.to(dtype=self.config.params_dtype)
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
