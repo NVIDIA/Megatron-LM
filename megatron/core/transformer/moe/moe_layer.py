@@ -10,6 +10,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -49,14 +50,10 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TELinear, te_checkpoint = None, None
 
 
 class RouterInterface(Protocol):
