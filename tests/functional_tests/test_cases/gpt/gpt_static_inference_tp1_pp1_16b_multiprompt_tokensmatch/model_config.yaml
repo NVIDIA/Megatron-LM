@@ -81,6 +81,5 @@ MODEL_ARGS:
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-logging-step-interval: 1
   --inference-dynamic-batching-buffer-size-gb: 20
-  --async-save: true
 METRICS:
   - "generated_text"

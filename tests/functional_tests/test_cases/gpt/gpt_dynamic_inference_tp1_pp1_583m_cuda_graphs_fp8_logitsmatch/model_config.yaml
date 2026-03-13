@@ -55,7 +55,6 @@ MODEL_ARGS:
   --inference-repeat-n: 8
   --use-flashinfer-fused-rope: true
   --inference-logging-step-interval: 1
-  --async-save: true
 METRICS:
   - "generated_tokens"
   - "logprobs"

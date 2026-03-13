@@ -55,7 +55,6 @@ MODEL_ARGS:
   --termination-id: -1
   --inference-repeat-n: 3
   --inference-logging-step-interval: 1
-  --async-save: true
 METRICS:
   - "generated_tokens"
   - "logprobs"
