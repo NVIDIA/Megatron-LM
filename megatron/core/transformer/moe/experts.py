@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import enum
 import logging
 from collections.abc import Callable
 from copy import deepcopy
@@ -38,7 +39,6 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import is_torch_min_version
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -60,6 +60,49 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 logger = logging.getLogger(__name__)
+
+
+class InferenceGroupedGemmBackend(enum.Enum):
+    """Resolved backend for grouped GEMM operations during inference."""
+
+    FLASHINFER = "flashinfer"
+    TORCH = "torch"
+    TE = "te"
+
+
+def resolve_inference_grouped_gemm_backend(
+    backend: str,
+    is_cuda_graphed: bool,
+) -> InferenceGroupedGemmBackend:
+    """Resolve the grouped GEMM backend to use for the current iteration.
+
+    Prerequisites are validated at init time in MoELayer; this function
+    simply maps (backend, is_cuda_graphed) to the concrete backend enum.
+
+    Args:
+        backend: One of 'auto', 'torch', 'te'.
+        is_cuda_graphed: Whether this is a CUDA-graphed iteration.
+
+    Returns:
+        An InferenceGroupedGemmBackend enum value.
+    """
+    if backend == 'auto':
+        if is_cuda_graphed:
+            return InferenceGroupedGemmBackend.FLASHINFER
+        else:
+            if hasattr(torch.nn.functional, 'grouped_mm'):
+                return InferenceGroupedGemmBackend.TORCH
+            else:
+                return InferenceGroupedGemmBackend.TE
+    elif backend == 'torch':
+        return InferenceGroupedGemmBackend.TORCH
+    elif backend == 'te':
+        return InferenceGroupedGemmBackend.TE
+    else:
+        raise ValueError(
+            f"Unknown inference_grouped_gemm_backend: '{backend}'. "
+            "Must be 'auto', 'torch', or 'te'."
+        )
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -462,7 +505,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
-    - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets
+    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     """
 
     def __init__(
@@ -486,15 +529,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.is_inference_cuda_graphed_iteration = False
 
-        # torch._grouped_mm requires PyTorch >= 2.10
-        self._torch_grouped_mm_available = (
-            is_torch_min_version("2.10")
-            and hasattr(torch, '_grouped_mm')
-            and not config.inference_disable_torch_grouped_mm
-        )
-
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+
+        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -533,7 +571,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         This allows:
         - TE's forward to work correctly (same Parameter objects, same internal state)
         - Training updates to flow through (param.data is a view into the big tensor)
-        - torch._grouped_mm / FlashInfer to use the big tensor directly
+        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -606,14 +644,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # offs[i] = end index of expert i's tokens
             offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
-            fc1_output = torch._grouped_mm(
+            fc1_output = torch.nn.functional.grouped_mm(
                 permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
             )
 
             # Activation with routing probabilities
             bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
 
-            fc2_output = torch._grouped_mm(
+            fc2_output = torch.nn.functional.grouped_mm(
                 bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
             )
         else:
@@ -635,7 +673,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
           is not used in this path; the FlashInfer kernel operates directly on
           routing_map.
-        - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets.
+        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -657,20 +695,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
             self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
-        if self.is_inference_cuda_graphed_iteration:
+        resolved_backend = resolve_inference_grouped_gemm_backend(
+            self.inference_grouped_gemm_backend,
+            self.is_inference_cuda_graphed_iteration,
+        )
+
+        if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                HAVE_FLASHINFER
-            ), "FlashInfer is not available; cannot use FlashInfer forward pass."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif self._torch_grouped_mm_available:
+        elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
             return self._torch_grouped_mm_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
-        else:
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+        elif resolved_backend == InferenceGroupedGemmBackend.TE:
+            return super().forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
 
 class SequentialMLP(MegatronModule):
