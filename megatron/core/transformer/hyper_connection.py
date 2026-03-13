@@ -40,6 +40,7 @@ class SinkhornKnopp(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
+        """Run Sinkhorn iterations and save inputs for backward recomputation."""
         M = _sinkhorn_iterations(input_logits, num_iterations, eps)
         ctx.save_for_backward(input_logits)
         ctx.num_iterations = num_iterations
@@ -48,6 +49,7 @@ class SinkhornKnopp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
+        """Recompute forward under enable_grad and back-propagate."""
         (input_logits,) = ctx.saved_tensors
         with torch.enable_grad():
             logits = input_logits.detach().requires_grad_(True)

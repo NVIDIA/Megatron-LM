@@ -823,6 +823,7 @@ else:
 
         @staticmethod
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
+            """cuTile fused Sinkhorn forward."""
             output, M_init = _cutile_sinkhorn_fwd(input_logits, num_iterations, eps)
             ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
@@ -831,6 +832,7 @@ else:
 
         @staticmethod
         def backward(ctx, grad_output):
+            """cuTile fused Sinkhorn backward."""
             (M_init,) = ctx.saved_tensors
             grad_input = _cutile_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
@@ -840,12 +842,14 @@ else:
 
         @staticmethod
         def forward(ctx, x: Tensor, h_pre: Tensor):
+            """cuTile fused h_aggregate forward."""
             output = _cutile_h_aggregate_fwd(x, h_pre)
             ctx.save_for_backward(x, h_pre)
             return output
 
         @staticmethod
         def backward(ctx, grad_output):
+            """cuTile fused h_aggregate backward."""
             x, h_pre = ctx.saved_tensors
             return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
 
@@ -861,6 +865,7 @@ else:
             x: Tensor,
             bias: Optional[Tensor],
         ):
+            """cuTile fused h_post_bda forward."""
             output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
             if bias is not None:
                 ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
@@ -872,6 +877,7 @@ else:
 
         @staticmethod
         def backward(ctx, grad_output):
+            """cuTile fused h_post_bda backward."""
             if ctx.has_bias:
                 h_res, orig_res, h_post, x, bias = ctx.saved_tensors
             else:
@@ -884,6 +890,7 @@ else:
 
         @staticmethod
         def forward(ctx, x: Tensor, weight: Tensor, eps: float = 1e-6):
+            """cuTile fused proj_rms forward."""
             proj, norm, r = _cutile_proj_rms_fwd(x, weight, eps)
             ctx.save_for_backward(x, weight, norm)
             ctx.eps = eps
@@ -891,6 +898,7 @@ else:
 
         @staticmethod
         def backward(ctx, grad_proj, grad_r):
+            """cuTile fused proj_rms backward."""
             x, weight, norm = ctx.saved_tensors
             grad_x, grad_weight = _cutile_proj_rms_bwd(grad_proj, grad_r, x, weight, norm, ctx.eps)
             return grad_x, grad_weight, None
