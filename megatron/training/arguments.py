@@ -1047,12 +1047,12 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-    if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
-        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+    if args.dynamic_context_parallel:
+        assert not args.pipeline_model_parallel_size > 1, 'Dynamic context parallelism not supported with pipeline parallelism'
+        assert not args.enable_cuda_graph, 'Dynamic context parallelism not supported with CUDA Graph'
+        assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
 
     if args.sequence_packing_scheduler is not None:
         assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
@@ -1330,8 +1330,8 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Muon / emerging optimizer check
-    if args.optimizer in ('muon', 'dist_muon'):
+    # emerging optimizer check
+    if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -2054,7 +2054,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
-    group.add_argument('--muon-use-nesterov', action='store_true',
+    group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
@@ -2263,7 +2263,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'soap'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
