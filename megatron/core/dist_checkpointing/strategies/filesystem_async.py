@@ -155,7 +155,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             ten = ten.detach()
             if ten.device.type != "cpu":
                 # We call ``dequantize`` if we detect a quantized tensor on GPU.
-                # This is a workaround to avoid the issue of quantized tensors not being supported by the async writer.
+                # This is a workaround to avoid the issue of quantized tensors not being
+                # supported by the async writer.
                 if ten.device.type == "cuda" and "dequantize" in type(ten).__dict__:
                     ten = ten.dequantize()
                 # We do D2H later when the async_request is scheduled for both sync / async
