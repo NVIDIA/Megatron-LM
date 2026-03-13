@@ -1722,6 +1722,98 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_chunked_prefill_log_probs_match_baseline(self):
+        """
+        Verify that chunked prefill computes the exact same prompt log probabilities
+        as non-chunked prefill. This explicitly catches the bug where garbage
+        sampled tokens corrupt the prompt log probabilities at chunk boundaries.
+        """
+        prompt_length = 512
+        num_tokens_to_generate = 4
+
+        # Create a deterministic mock forward pass that returns logits
+        # dependent ONLY on position_ids. This guarantees the same logits
+        # whether processed in one giant chunk or split across multiple chunks.
+        def deterministic_mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+            vocab_size = kwargs["vocab_size"]
+            # Use torch.linspace to generate varying but 100% deterministic logits per position
+            static_logits = torch.linspace(
+                -50, 50, 4096 * vocab_size, device=input_ids.device, dtype=torch.bfloat16
+            ).view(4096, vocab_size)
+
+            return static_logits[position_ids]
+
+        def get_log_probs(chunked: bool, max_tokens: int):
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,  # Added manually below
+                num_tokens_to_generate=num_tokens_to_generate,
+                materialize_only_last_token_logits=False,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                model_provider="gpt",
+                context_block_size_tokens=256,
+                context_max_requests=1,
+                context_max_tokens=max_tokens,
+                max_sequence_length=1024,
+                enable_chunked_prefill=chunked,
+                use_cuda_graphs_for_non_decode_steps=False,
+            )
+            env = self._build_test_env(test_config)
+
+            # Patch the mock forward to be deterministic
+            model_instance = env.engine.controller.inference_wrapped_model.model
+            model_instance.forward = partial(
+                deterministic_mock_forward, vocab_size=test_config.vocab_size
+            )
+
+            # Ensure identical prompt tokens for both runs
+            torch.manual_seed(42)
+            req_tokens = torch.randint(0, test_config.vocab_size, (prompt_length,), device='cuda')
+            req = DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=req_tokens,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    termination_id=-1,
+                ),
+            )
+
+            env.engine._add_request(req)
+
+            # Drive the engine until the request finishes
+            while env.engine.has_unfinished_requests():
+                env.engine.schedule_waiting_requests()
+                env.engine.step_modern()
+
+            return req.prompt_log_probs
+
+        # Run non-chunked baseline (all 512 tokens in one pass)
+        baseline_log_probs = get_log_probs(chunked=False, max_tokens=1000)
+
+        # Run chunked (512 tokens split across 256-token boundaries)
+        chunked_log_probs = get_log_probs(chunked=True, max_tokens=256)
+
+        assert baseline_log_probs is not None, "Baseline prompt_log_probs is missing"
+        assert chunked_log_probs is not None, "Chunked prompt_log_probs is missing"
+
+        assert len(baseline_log_probs) == prompt_length - 1
+        assert len(chunked_log_probs) == prompt_length - 1
+
+        # Compare element-wise using math.isclose to handle minor floating point rounding
+        for i, (base_lp, chunk_lp) in enumerate(zip(baseline_log_probs, chunked_log_probs)):
+            assert math.isclose(base_lp, chunk_lp, rel_tol=1e-3, abs_tol=1e-3), (
+                f"Log prob mismatch at prompt token index {i}: "
+                f"Baseline={base_lp:.4f}, Chunked={chunk_lp:.4f}. "
+                "This indicates log prob corruption at chunk boundaries!"
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
     def test_top_n_logprobs_dynamic(self, skip_prompt_log_probs: bool):

@@ -708,8 +708,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
 
-            # Reset any partially prefilled requests in the waiting pool so they recompute from the start
-            for req_id in waiting_request_ids:
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
                 req = self.get_request(req_id)
                 if req.finished_chunk_token_count > 0:
                     req.remaining_prompt_tokens = req.prompt_tokens
@@ -759,6 +759,13 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 

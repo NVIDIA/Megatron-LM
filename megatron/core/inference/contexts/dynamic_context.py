@@ -2064,8 +2064,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
-    def get_index_of_chunked_prefill_request(self) -> int:
-        """Get the index of the chunked prefill request in the context.
+    def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
+        """
+        Get the index of the chunked prefill request in the context.
+
+        If `safe` is True, then clamp the search space to the current total request count.
+        Otherwise, expand the search beyond the current total request count.
 
         Return:
             (int) Index of the chunked prefill request, or -1 if none exists.
@@ -2073,7 +2077,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.chunked_prefill_request_id == -1:
             return -1
 
-        matches = torch.where(self.request_ids == self.chunked_prefill_request_id)[0]
+        request_ids = self.request_ids
+        if safe:
+            request_ids = request_ids[: self.total_request_count]
+
+        matches = torch.where(request_ids == self.chunked_prefill_request_id)[0]
         if len(matches) > 0:
             return matches[0].item()
         return -1
@@ -2362,11 +2370,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # is called on that request.
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
 
-        chunked_prefill_request_idx = self.get_index_of_chunked_prefill_request()
         if (
-            chunked_prefill_request_idx != -1
-            and chunked_prefill_request_idx < self.total_request_count
-        ):
+            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
+        ) != -1:
             # Chunked prefill request was active this step.
             # We must keep it active so that the next iteration will add a new chunk to it.
             active_requests_mask[-1] = 1
@@ -2388,7 +2394,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Note that this requires no pending chunked prefill request
         if (
             active_request_count + self.paused_request_count == 0
-            and self.get_index_of_chunked_prefill_request() == -1
+            and self.get_index_of_chunked_prefill_request(safe=False) == -1
         ):
             if finished_request_count > 0:
                 finished_idxs = (
@@ -2466,11 +2472,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).byte()
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-            chunked_prefill_request_idx = self.get_index_of_chunked_prefill_request()
             if (
-                chunked_prefill_request_idx != -1
-                and chunked_prefill_request_idx < self.total_request_count
-            ):
+                chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
+            ) != -1:
                 active_requests_requiring_new_block[
                     chunked_prefill_request_idx - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
@@ -2563,7 +2567,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.
-        if (chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request()) != -1:
+        if (
+            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=False)
+        ) != -1:
             if chunked_prefill_request_idx < self.total_request_count:
                 # Chunked prefill request was active this step.
                 # Swap to the end of active, then hide it out of bounds.
