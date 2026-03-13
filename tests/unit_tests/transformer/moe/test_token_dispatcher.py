@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
@@ -31,6 +33,48 @@ def token_unpermutation(token_dispatcher, hidden_states):
     hidden_states = token_dispatcher.token_combine(hidden_states)
     hidden_states = token_dispatcher.combine_postprocess(hidden_states)
     return hidden_states, None
+
+
+class _NestedAttrTestDispatcher(MoETokenDispatcher):
+    def dispatch_preprocess(self, tokens, routing_map, probs):
+        raise NotImplementedError
+
+    def token_dispatch(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def combine_preprocess(self, hidden_states):
+        raise NotImplementedError
+
+    def token_combine(self, hidden_states):
+        raise NotImplementedError
+
+    def combine_postprocess(self, hidden_states):
+        raise NotImplementedError
+
+
+def test_get_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    token_probs = torch.randn(2, 3)
+    dispatcher._comm_manager = SimpleNamespace(
+        token_probs=token_probs, nested=SimpleNamespace(routing_map=torch.randn(2, 4))
+    )
+
+    assert dispatcher.get_cudagraph_attr("_comm_manager.token_probs") is token_probs
+    assert dispatcher.get_cudagraph_attr("_comm_manager.nested.routing_map") is not None
+    assert dispatcher.get_cudagraph_attr("_comm_manager.missing_attr") is None
+
+
+def test_set_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    dispatcher._comm_manager = SimpleNamespace(routing_map=None)
+    routing_map = torch.randn(4, 5)
+
+    dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
+
+    assert dispatcher._comm_manager.routing_map is routing_map
 
 
 class MoEModelTestContainer:
