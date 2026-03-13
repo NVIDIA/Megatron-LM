@@ -2020,23 +2020,24 @@ def _set_global_memory_buffer():
 def _set_global_symmetric_memory_buffer():
     """Initialize global buffer."""
     global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP, _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
-    assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None
-    ), "global symmetric memory buffer for TP is already initialized"
-    assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None
-    ), "global symmetric memory buffer for EP is already initialized"
+    # assert (
+    #     _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None
+    # ), "global symmetric memory buffer for TP is already initialized"
+    # assert (
+    #     _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None
+    # ), "global symmetric memory buffer for EP is already initialized"
 
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256,  # todo: set from an argument?
-        process_group=get_tensor_model_parallel_group(),
-    )
+    if _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None:
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = GlobalSymmetricMemoryBuffer(
+            size_in_mb=256,  # todo: set from an argument?
+            process_group=get_tensor_model_parallel_group(),
+        )
 
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256,  # todo: set from an argument?
-        process_group=get_expert_model_parallel_group(),
-    )
-
+    if _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None:
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = GlobalSymmetricMemoryBuffer(
+                size_in_mb=256,  # todo: set from an argument?
+                process_group=get_expert_model_parallel_group(),
+            )
 
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""

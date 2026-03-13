@@ -2856,6 +2856,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Initializes symmetric memory for inference, if not already initialized
         """
-        if not self.is_symmetric_memory_initialized:
-            parallel_state._set_global_symmetric_memory_buffer()
-            self.is_symmetric_memory_initialized = True
+        # if not self.is_symmetric_memory_initialized:
+        #     parallel_state._set_global_symmetric_memory_buffer()
+        #     self.is_symmetric_memory_initialized = True
+        pass

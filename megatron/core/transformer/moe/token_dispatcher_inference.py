@@ -185,6 +185,10 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(
             hidden_states, probs, self.routing_map
         )
+
+        #assert not nvls_eligible 
+        
+
         ag_buffers = None
 
         if nvls_eligible:
