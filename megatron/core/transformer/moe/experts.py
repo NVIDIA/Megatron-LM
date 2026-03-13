@@ -564,24 +564,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
-    def _verify_concatenated_weights(self):
-        """Verify concatenated weight buffers match and share storage with TE per-expert params."""
-        for i in range(self.num_local_experts):
-            fc1_param = getattr(self.linear_fc1, f'weight{i}')
-            fc2_param = getattr(self.linear_fc2, f'weight{i}')
-            fc1_match = torch.equal(self._fc1_weight[i], fc1_param.data)
-            fc2_match = torch.equal(self._fc2_weight[i], fc2_param.data)
-            fc1_shares = self._fc1_weight[i].data_ptr() == fc1_param.data.data_ptr()
-            fc2_shares = self._fc2_weight[i].data_ptr() == fc2_param.data.data_ptr()
-            if not fc1_match or not fc2_match or not fc1_shares or not fc2_shares:
-                raise RuntimeError(
-                    f"Expert {i} concatenated weight mismatch! "
-                    f"fc1_equal={fc1_match} fc1_shares_storage={fc1_shares} "
-                    f"fc2_equal={fc2_match} fc2_shares_storage={fc2_shares}. "
-                    f"_build_concatenated_weights() is broken — concatenated buffer "
-                    f"has diverged from TE per-expert parameters."
-                )
-
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
@@ -663,18 +645,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
-        # Lazily build concatenated weights on first forward (after checkpoint load)
 
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
+        # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
             assert not self.training, "Concatenated weights must be built before training forward pass."
             self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
         if self.is_inference_cuda_graphed_iteration:
-            self._verify_concatenated_weights()
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert (
                 HAVE_FLASHINFER
@@ -682,10 +663,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-            # elif self._torch_grouped_mm_available:
-            #     return self._torch_grouped_mm_forward(
-            #         permuted_local_hidden_states, tokens_per_expert, permuted_probs
-            #     )
+        elif self._torch_grouped_mm_available:
+            return self._torch_grouped_mm_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
         else:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
