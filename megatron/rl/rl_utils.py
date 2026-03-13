@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
@@ -32,14 +33,20 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.utils import (
+    toggle_cuda_graphs,
+    transition_moe_cudagraphs,
+)
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
+from megatron.core.inference.utils import device_memory_summary
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
@@ -117,16 +124,19 @@ def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
             "(see https://github.com/fzyzcjy/torch_memory_saver)"
         )
 
+    tag = "rl_inference_model"
     if to_cpu:
         if not _INFERENCE_MODEL_IS_PAUSED:
-            torch_memory_saver.pause("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: pausing {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.pause(tag)
             _INFERENCE_MODEL_IS_PAUSED = True
-            print_rank_0("[Rank 0] offloaded RL inference model weights to CPU using torch_memory_saver")
+            print_rank_0(f"torch_memory_saver: paused  {tag}, after:  {device_memory_summary()}")
     else:
         if _INFERENCE_MODEL_IS_PAUSED:
-            torch_memory_saver.resume("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: resuming {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.resume(tag)
             _INFERENCE_MODEL_IS_PAUSED = False
-            print_rank_0("[Rank 0] restored RL inference model weights to GPU using torch_memory_saver")
+            print_rank_0(f"torch_memory_saver: resumed  {tag}, after:  {device_memory_summary()}")
 
 
 def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
@@ -436,7 +446,7 @@ def get_inference_interface(args, loop, model):
                 model[0],
                 host='0.0.0.0',
                 port=8294,
-                verbose=args.inference_flask_server_logging)
+                verbose=args.inference_text_gen_server_logging)
         )
     return _INFERENCE_INTERFACE
 
@@ -644,13 +654,28 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency
-    if packed_seq_params is None and sequence_packing:
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=tokens.shape[1],
-            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-            device=tokens.device,
-        )
+    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
+    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
+    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
+    # graph signature matches the training forward_step in train_rl.py.
+    # This is necessary because reference logprobs steps will reuse the training forward graph.
+    if packed_seq_params is None:
+        if sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     nvtx_range = get_nvtx_range()
 
@@ -1055,16 +1080,17 @@ def prepare_trajectories(
     # Track counts for each environment ID
     env_id_counts = Counter()
 
-    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
+    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>', '<SPECIAL_999>']
 
     if tokenizer.library == "huggingface":
+        tokenizer : HuggingFaceTokenizer
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
-                if pad_token in tokenizer.vocab:
+                if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
                     log_single_rank(
                         logger, logging.INFO, f"Updating tokenizer pad token to {pad_token}"
                     )
-                    tokenizer._tokenizer.pad_token_id = tokenizer.vocab[pad_token]
+                    tokenizer._tokenizer.pad_token = pad_token
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
@@ -1369,13 +1395,11 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
-            # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
-
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1827,8 +1851,16 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
+    # Change cudagraph scope for inference (empty list = full-layer capture)
+    model[0].config.cuda_graph_scope = []
+    model[0].config.cuda_graph_impl = "local"
+
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+
+    # Switch MoE layers to full CUDA graph capture for inference
+    if args.rl_training_cuda_graphs and args.num_experts is not None:
+        transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1876,6 +1908,22 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
 
+        # Reset drop_and_pad leaked from inference decode
+        set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
+
+        # Restore partial capture cudagraph scope for training if this is MoE
+        if args.num_experts is not None:
+            model[0].config.cuda_graph_scope = [
+                CudaGraphScope.mamba,
+                CudaGraphScope.attn,
+                CudaGraphScope.moe_router,
+                CudaGraphScope.moe_preprocess,
+            ]
+
+        # Switch MoE layers to partial CUDA graph capture for training
+        if args.rl_training_cuda_graphs and args.num_experts is not None:
+            transition_moe_cudagraphs(lang_module, 'partial')
+
         # If this is a separate RL inference model, prefetch weights back to CPU so they
         # don't consume GPU memory during training.
         with nvtx_range("prefetch-inference-model-weights-to-cpu"):
@@ -1901,6 +1949,13 @@ def megatron_rl_inference_mode(
 
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
+    global _ROLLOUT_GENERATOR
+
+    if _ROLLOUT_GENERATOR is not None:
+        loop = get_asyncio_loop()
+        loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
+        _ROLLOUT_GENERATOR = None
+
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
