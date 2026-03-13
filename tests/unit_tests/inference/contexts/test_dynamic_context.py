@@ -2019,10 +2019,11 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_chunked_prefill_speculative_offset_math(self):
+    def test_chunked_prefill_hidden_state_prevents_token_bloat(self):
         """
-        Test that the active_token_count is correctly adjusted by chunked_prefill_offset
-        when a chunked prefill request continues in a speculative decoding setup.
+        Test that hiding the chunked prefill request in Version 2 effectively prevents
+        'dummy' speculative tokens from bloating the active_token_count, and that the
+        next chunk seamlessly appends without needing legacy offset subtractions.
         """
         self._setup_model_parallel_group(1, 1)
 
@@ -2035,43 +2036,60 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_requests=256,
             max_tokens=256,
-            num_speculative_tokens=3,  # 3 spec tokens -> offset = 4
+            num_speculative_tokens=3,
             enable_chunked_prefill=True,
+            unified_memory_level=0,
         )
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
         ctx.reset_tensors()
 
-        # Set up a request that is already mid-chunked-prefill
-        # The total_request_count is 0 because the request is hidden before
-        # the subsequent add_request call restores the request
-        ctx.total_request_count = 0
-        ctx.chunked_prefill_request_id = 42
-        ctx.request_ids[0] = 42
-
-        # Simulate active tokens from the previous step.
-        initial_active_tokens = 100
-        ctx.active_token_count = initial_active_tokens
-
-        req = DynamicInferenceRequest(
-            request_id=42,
-            prompt_tokens=torch.arange(0, 50, device='cuda'),
+        # 1. Add a standard decode request
+        req_decode = DynamicInferenceRequest(
+            request_id=10,
+            prompt_tokens=torch.arange(0, 10, device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
-        # Mark as continuing chunked prefill
-        req.finished_chunk_token_count = 100
+        ctx.add_request(req_decode)
 
-        # Add the next chunk
-        chunk_length = 50
-        ctx.add_request(req, chunk_length=chunk_length)
-
-        expected_active_tokens = initial_active_tokens + chunk_length
-        assert ctx.active_token_count == expected_active_tokens
-        assert (
-            ctx.request_output_lengths[0].item()
-            == req.finished_chunk_token_count
-            + chunk_length
-            + req.sampling_params.num_tokens_to_generate
+        # 2. Add chunk 1 of a chunked prefill request
+        req_chunked = DynamicInferenceRequest(
+            request_id=42,
+            prompt_tokens=torch.arange(0, 100, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
+        ctx.chunked_prefill_request_id = 42
+        ctx.add_request(req_chunked, chunk_length=50)
+
+        # Verify initial active token count (10 from decode + 50 from prefill)
+        assert ctx.active_token_count == 60
+
+        # 3. Call update_requests
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
+        new_spec = torch.tensor([[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cuda')
+
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_spec
+        )
+
+        # 4. Verify Hiding Invariants:
+        # The chunked prefill request should be hidden safely out of bounds.
+        # The active_token_count should ONLY contain the decode request's tokens
+        # (1 base + 3 speculative = 4 tokens).
+        assert ctx.total_request_count == 1
+        assert ctx.active_token_count == 4
+        assert ctx.request_ids[1].item() == 42
+
+        # 5. Add chunk 2
+        req_chunked.finished_chunk_token_count = 50
+        ctx.add_request(req_chunked, chunk_length=50)
+
+        # 6. Verify seamless append (no legacy offset math needed)
+        # 4 active decode tokens + 50 new prefill tokens = 54
+        assert ctx.active_token_count == 54
+        assert ctx.total_request_count == 2
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2146,6 +2164,15 @@ class TestDynamicContext:
         assert torch.equal(
             ctx.token_to_input_ids[:3], expected_flattened_tokens
         ), "Speculative tokens were not correctly flattened for the decode request!"
+
+        # 4. Verify that the new_speculative_tokens tensor itself was swapped so that
+        # the hidden state perfectly preserves the alignment for subsequent steps.
+        expected_swapped_spec_tokens = torch.tensor(
+            [[201, 101], [202, 102]], device='cuda'
+        )
+        assert torch.equal(
+            new_speculative_tokens, expected_swapped_spec_tokens
+        ), "new_speculative_tokens was not swapped in-place alongside the request metadata!"
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2388,8 +2415,8 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_chunked_prefill_speculative_offset_with_prefix_caching(self):
-        """Test chunked prefill offset math combines correctly with prefix caching and spec decoding."""
+    def test_chunked_prefill_prefix_caching_from_hidden_state(self):
+        """Test prefix caching matching safely resolves from the hidden boundary state."""
         self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
@@ -2422,15 +2449,7 @@ class TestDynamicContext:
         )
         ctx.add_request(req_first)
 
-        ctx.chunked_prefill_request_id = 42
-
-        # Manually set up as if request is mid-chunked-prefill.
-        current_id = ctx.total_request_count
-        ctx.request_ids[current_id] = 42
-
-        initial_active_tokens = ctx.active_token_count
-        ctx.active_token_count = initial_active_tokens
-
+        # Request 2: Chunked prefill sharing the same prefix
         req2 = DynamicInferenceRequest(
             request_id=42,
             prompt_tokens=first_prompt.clone(),
@@ -2438,16 +2457,36 @@ class TestDynamicContext:
             block_size_tokens=bs,
             enable_prefix_caching=True,
         )
-        req2.finished_chunk_token_count = bs  # Already processed 1 block
+        ctx.chunked_prefill_request_id = 42
 
-        chunk_length = bs * 2  # Process 2 more blocks
+        # Add chunk 1 (bs tokens)
+        req2.finished_chunk_token_count = 0
+        ctx.add_request(req2, chunk_length=bs)
+
+        # Call update_requests to move req2 to the hidden state
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
+        new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cuda')
+        ctx.update_requests(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
+
+        # Capture active tokens before chunk 2 (which should just be the 3 tokens of req_first)
+        tokens_before_chunk_2 = ctx.active_token_count
+        assert tokens_before_chunk_2 == 3
+
+        # Add chunk 2 (bs * 2 tokens)
+        req2.finished_chunk_token_count = bs
+        chunk_length = bs * 2
         ctx.add_request(req2, chunk_length=chunk_length)
 
         # Prefix match should find 2 matching blocks (blocks 1 and 2 from req_first).
         # With prefix match: 2 blocks matched -> skip (2*bs - 1) tokens
         # effective_chunk_length = chunk_length - prefix_skip_tokens
+        # prefix_skip_tokens = min(2 * bs, chunk_length - 1) = 2 * bs - 1
+        prefix_skip = 2 * bs - 1
+        eff_chunk = chunk_length - prefix_skip
+
         (_, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, chunk_length)
-        expected_active = initial_active_tokens + eff_chunk
+        expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 
     @pytest.mark.internal
