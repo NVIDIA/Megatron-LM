@@ -41,6 +41,7 @@ MODEL_ARGS:
   --log-interval: 2
   --save-interval: 10000
   --eval-interval: 1000
+  --async-save: true
   --eval-iters: 5
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1

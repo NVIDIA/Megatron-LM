@@ -75,6 +75,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 1000
   --save-retain-interval: 5000
+  --async-save: true
   # Add initialization args
   --init-method-std: 0.0134
   # Add logging args

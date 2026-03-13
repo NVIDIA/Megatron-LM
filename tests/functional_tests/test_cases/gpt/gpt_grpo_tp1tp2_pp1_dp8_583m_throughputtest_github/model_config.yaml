@@ -19,7 +19,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
-  --timing-log-level: 0
+  --timing-log-level: 1
   --distributed-backend: nccl
   --log-interval: 1
   --log-progress: true
@@ -48,10 +48,7 @@ MODEL_ARGS:
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
-  --timing-log-level: 1
-  --log-timers-to-tensorboard: true
   --cuda-graph-impl: local
-  --micro-batch-size: 1
   --global-batch-size: 16
   --grpo-group-size: 2
   --grpo-prompts-per-step: 8
@@ -62,7 +59,7 @@ MODEL_ARGS:
   --grpo-entropy-term-weight: 0.0
   --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest_github/env_config.yaml
   --rl-partial-rollouts: true
-  --lr: 0.000001
+  --lr: 1.0e-06
   --lr-warmup-samples: 0
   --clip-grad: 1.0
   --use-checkpoint-args: true
@@ -77,13 +74,12 @@ MODEL_ARGS:
   --inference-logging-step-interval: 1
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
-
+  --async-save: true
 METRICS:
-  - "iteration-time"
-  - "lm loss"
-  - "num-zeros"
-  - "mem-allocated-bytes"
-  - "mem-max-allocated-bytes"
-
+- iteration-time
+- lm loss
+- num-zeros
+- mem-allocated-bytes
+- mem-max-allocated-bytes
 THROUGHPUT_TEST_PARAMS:
   --start_step: 1

@@ -5,7 +5,6 @@ ENV_VARS:
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
-  # Add network size args
   --untie-embeddings-and-output-weights: true
   --num-layers: 6
   --hidden-size: 512
@@ -15,7 +14,7 @@ MODEL_ARGS:
   --swiglu: true
   --position-embedding-type: rope
   --rotary-percent: 0.5
-  --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
+  --no-rope-fusion: true
   --apply-layernorm-1p: true
   --apply-wd-to-qk-layernorm: true
   --attention-output-gate: true
@@ -26,7 +25,6 @@ MODEL_ARGS:
   --linear-value-head-dim: 64
   --linear-num-key-heads: 4
   --linear-num-value-heads: 8
-  # Add MoE args
   --num-experts: 32
   --moe-ffn-hidden-size: 64
   --moe-shared-expert-intermediate-size: 64
@@ -35,7 +33,6 @@ MODEL_ARGS:
   --moe-router-topk: 8
   --disable-bias-linear: true
   --moe-router-dtype: fp32
-  # Add logging args
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -57,10 +54,10 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
-  --min-lr: 1.0e-5
+  --min-lr: 1.0e-05
   --weight-decay: 1e-2
   --clip-grad: 1.0
-  --lr-warmup-fraction: .01
+  --lr-warmup-fraction: 0.01
   --log-interval: 1
   --save-interval: 25
   --eval-interval: 1000
@@ -69,7 +66,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
   --sequence-parallel: true
-  --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
@@ -79,4 +75,5 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: ckpt-resume

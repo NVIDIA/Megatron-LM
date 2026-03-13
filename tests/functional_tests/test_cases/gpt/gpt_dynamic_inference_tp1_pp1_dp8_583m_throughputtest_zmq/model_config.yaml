@@ -47,7 +47,7 @@ MODEL_ARGS:
   --cuda-graph-scope: full
   --disable-chunked-prefill: true
   --dist-ckpt-strictness: log_unexpected
-  --inference-ckpt-non-strict: true # To handle the extra_state errors
+  --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --output-every-n-results: 32
   --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
@@ -56,6 +56,7 @@ MODEL_ARGS:
   --use-flashinfer-fused-rope: true
   --throughput-check-only: true
   --inference-logging-step-interval: 1
+  --async-save: true
 METRICS:
-  - "generated_tokens"
-  - "logprobs"
+- generated_tokens
+- logprobs

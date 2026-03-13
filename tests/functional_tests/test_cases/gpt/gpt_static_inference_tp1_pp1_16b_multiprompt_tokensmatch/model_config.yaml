@@ -11,7 +11,6 @@ MODEL_ARGS:
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
   --timing-log-level: 0
-  # See the mount paths defined in the top level tests/test_utils/recipes/gpt-static-inference.yaml
   --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
@@ -50,7 +49,6 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --seq-length: 4096
   --max-position-embeddings: 4096
-  # Make sure the batch size is 1 so we test consecutive calls to inference covering state cleanup:
   --micro-batch-size: 1
   --inference-max-requests: 1
   --ckpt-format: torch_dist
@@ -78,8 +76,9 @@ MODEL_ARGS:
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --use-legacy-static-engine: true
   --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/test_prompts.jsonl
-  --incoming-requests-per-sec: -1 # all requests arrive up front.
+  --incoming-requests-per-sec: -1
   --inference-logging-step-interval: 1
   --inference-dynamic-batching-buffer-size-gb: 20
+  --async-save: true
 METRICS:
-  - "generated_text"
+- generated_text

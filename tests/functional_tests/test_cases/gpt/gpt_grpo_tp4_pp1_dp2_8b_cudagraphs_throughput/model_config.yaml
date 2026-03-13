@@ -26,7 +26,7 @@ MODEL_ARGS:
   --group-query-attention: true
   --num-query-groups: 8
   --normalization: RMSNorm
-  --norm-epsilon: 0.000001
+  --norm-epsilon: 1.0e-06
   --qk-layernorm: true
   --position-embedding-type: rope
   --rotary-percent: 1.0
@@ -45,9 +45,9 @@ MODEL_ARGS:
   --optimizer: adam
   --adam-beta1: 0.9
   --adam-beta2: 0.999
-  --adam-eps: 0.00000001
-  --lr: 0.000001  
-  --min-lr: 0.0000001
+  --adam-eps: 1.0e-08
+  --lr: 1.0e-06
+  --min-lr: 1.0e-07
   --lr-warmup-samples: 0
   --clip-grad: 1.0
   --weight-decay: 0.01
@@ -95,7 +95,8 @@ MODEL_ARGS:
   --finetune: true
   --inference-logging-step-interval: 1
   --rl-training-cuda-graphs: true
+  --async-save: true
 METRICS:
-  - "mem-allocated-bytes"
-  - "mem-max-allocated-bytes"
-  - "iteration-time"
+- mem-allocated-bytes
+- mem-max-allocated-bytes
+- iteration-time

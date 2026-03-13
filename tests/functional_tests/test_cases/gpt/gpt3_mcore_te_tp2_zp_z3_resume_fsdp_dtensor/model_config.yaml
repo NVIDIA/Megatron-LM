@@ -28,10 +28,10 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
-  --min-lr: 1.0e-5
+  --min-lr: 1.0e-05
   --weight-decay: 1e-2
   --clip-grad: 1.0
-  --lr-warmup-fraction: .01
+  --lr-warmup-fraction: 0.01
   --log-interval: 1
   --save-interval: 50
   --eval-interval: 1000
@@ -50,4 +50,5 @@ MODEL_ARGS:
   --ckpt-format: fsdp_dtensor
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
-TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
+  --async-save: true
+TEST_TYPE: regular

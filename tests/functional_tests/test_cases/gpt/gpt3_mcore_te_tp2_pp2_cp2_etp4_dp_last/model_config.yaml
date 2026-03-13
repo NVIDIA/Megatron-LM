@@ -26,10 +26,10 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
-  --min-lr: 1.0e-5
+  --min-lr: 1.0e-05
   --weight-decay: 1e-2
   --clip-grad: 1.0
-  --lr-warmup-fraction: .01
+  --lr-warmup-fraction: 0.01
   --log-interval: 1
   --save-interval: 10000
   --eval-interval: 1000
@@ -45,11 +45,12 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --dist-ckpt-strictness: log_all
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: flash
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
   --expert-tensor-parallel-size: 4
+  --async-save: true
 TEST_TYPE: regular
