@@ -1591,7 +1591,6 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
-            # initialize symmetric memory if needed
             self.inference_wrapped_model.dummy_forward()
 
             # Disable MoE padding for MTP computation
