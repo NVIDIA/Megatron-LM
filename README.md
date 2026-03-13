@@ -21,28 +21,33 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
 
+## Getting Started
 
-## Quick Start
+**Install from PyPI:**
 
-Install Megatron Core with pip:
+```bash
+uv pip install megatron-core
+```
 
-1. Install Megatron Core with required dependencies:
+**Or clone and install from source:**
 
-    ```bash
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+uv pip install -e .
+```
 
-2. Clone repository for examples:
+> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
 
-    ```bash
-    git clone https://github.com/NVIDIA/Megatron-LM.git
-    cd Megatron-LM
-    pip install --no-build-isolation .[mlm,dev]
-    ```
+For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
 
+- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
+- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
+- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 # Latest News
 
+- **[2026/03]** **Deprecating Python 3.10 support:** We're officially dropping Python 3.10 support with the upcoming 0.17.0 release. Downstream applications must raise their lower boundary to 3.12 to stay compatible with MCore.
 - **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
 - **[2025/12]** **Megatron Core development has moved to GitHub!** All development and CI now happens in the open. We welcome community contributions.
 - **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - early access branch with experimental features.
@@ -60,7 +65,6 @@ Install Megatron Core with pip:
 - **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
 
 </details>
-
 
 # Project Structure
 
@@ -86,7 +90,6 @@ Megatron-LM/
 ├── tests/                       # Comprehensive test suite
 └── docs/                        # Documentation
 ```
-
 
 # Performance Benchmarking
 
@@ -123,11 +126,9 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 
 ![Strong scaling](images/strong_scaling.png)
 
-
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
-
 
 # Resources
 

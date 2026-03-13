@@ -687,7 +687,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](../../../../CONTRIBUTING.md) for guidelines.
+We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA/Megatron-LM/blob/main/CONTRIBUTING.md) for guidelines.
 
 ## Support
 

@@ -259,12 +259,17 @@ class MambaMetadata:
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = real_decode_count
+            self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
             # This describes the number of items in the prefill tensor relative to the
             # decode tensor. If chunked prefill is present, it is included in the
             # "prefill" part of the main split.
-            self._device_decode_prefill_buffer[1] = regular_prefill_count + (
-                1 if has_chunked_prefill_req else 0
+            self._device_decode_prefill_buffer[1] = (
+                cu_seqlens[
+                    real_decode_count
+                    + regular_prefill_count
+                    + (1 if has_chunked_prefill_req else 0)
+                ]
+                - cu_seqlens[real_decode_count]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
@@ -302,6 +307,25 @@ class MambaMetadata:
         # Get a free slot
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+
+        return mamba_idx
+
+    def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
+        """
+        Allocates new slots for the given number of requests in the Mamba state buffers.
+
+        Returns:
+            torch.Tensor: The indices of the allocated slots.
+            Returns None if not enough slots are available.
+        """
+        if self.mamba_state_free_slot_count < num_slots:
+            return None
+
+        # Get free slots
+        self.mamba_state_free_slot_count -= num_slots
+        mamba_idx = self.mamba_state_free_slots[
+            self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
+        ]
 
         return mamba_idx
 

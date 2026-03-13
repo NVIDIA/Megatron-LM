@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Literal
+from typing import Literal, Optional
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -446,8 +446,35 @@ class CheckpointConfig:
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
     created and destroyed for each save operation."""
 
+    async_ckpt_cpu_priority: int = 10
+    """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
+    If it exceeds 19, it will be set to 19. If the current nice value is greater than the target, it will be left unchanged.
+    Only applies when using persistent ckpt worker."""
+
+    async_ckpt_io_priority: Optional[int] = 3
+    """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
     ckpt_fully_parallel_load: bool = False
     """Apply full load parallelization across DP for distributed checkpoints."""
+
+    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
+    """Algorithm for fully parallel load of distributed checkpoints.
+    "broadcast"(default): Broadcast the checkpoint from rank 0 to all other ranks.
+    "gather_rounds": Gather the checkpoint from all ranks in rounds.
+    "gather_object": Gather the checkpoint from all ranks in a single operation.
+    """
+
+    ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
+    """Process group for fully parallel save of distributed checkpoints.
+    "dp"(default): Data parallel process group.
+    "ep_dp": Expert data parallel process group.
+    """
+
+    ckpt_fully_parallel_load_process_group: Literal["dp", "ep_dp"] = "dp"
+    """Process group for fully parallel load of distributed checkpoints.
+    "dp"(default): Data parallel process group.
+    "ep_dp": Expert data parallel process group.
+    """
 
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""

@@ -175,6 +175,11 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     )
 
     # Check that all boundaries (start and end) are touched.
+    # Skip under fake process group — all_reduce is a no-op so only rank 0's
+    # boundaries are visible, which makes the end-boundary check always fail.
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
+        return
+
     boundary_checks = torch.tensor(
         [
             [offset == 0, offset + size == dtensor.shape[dim]]

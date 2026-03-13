@@ -44,6 +44,11 @@ on:
         description: Branch for version bump
         required: true
         type: string
+      gh-release-from-tag:
+        description: Tag of previous release for changelog builder
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write # To read repository content
@@ -59,7 +64,16 @@ jobs:
       create-gh-release: ${{ inputs.create-gh-release || true }}
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
       publish-docs: ${{ inputs.publish-docs }}
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag }}
     secrets:
       TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
       PAT: ${{ secrets.PAT }}
+      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
+      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
+      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
+      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
