@@ -900,10 +900,6 @@ class MegatronFSDP(torch.nn.Module):
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
-            assert isinstance(
-                module, tuple(fsdp_unit_modules)
-            ), "_post_forward hook should only be registered on FSDP unit modules."
-
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
             module._training_state = TrainingState.IDLE
