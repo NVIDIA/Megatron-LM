@@ -1347,7 +1347,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
-    def add_dummy_requests_for_expert_parallel_step(self) -> None:
+    def add_dummy_requests_for_expert_parallel_step(
+        self, target_graph: Optional[InferenceBatchDimensions] = None
+    ) -> None:
         """Minimal context setup so an EP rank with no real requests can replay
         an already-captured cuda graph without crashing or corrupting memory.
 
@@ -1357,50 +1359,106 @@ class DynamicInferenceContext(BaseInferenceContext):
         We setup minimal state such the initialize_attention_state and the forward
         pass can run without error.
 
+        Args:
+            target_graph: The matched CUDA graph dimensions to set up dummy requests for.
+                If None, uses the smallest decode-only graph. When provided, the dummy
+                setup will match the graph's prefill/decode split, which is critical for
+                Mamba hybrid models to avoid all-zero cu_seqlens on EP dummy ranks.
         """
-        smallest_cuda_graph_dimensions = min(
-            [x for x in self.cuda_graph_batch_dimensions_list if x.prefill_req_count == 0]
-        )
-        # the smallest cuda graph is decode only.
-        assert smallest_cuda_graph_dimensions.prefill_req_count == 0
+        if target_graph is not None:
+            target_dims = target_graph
+        else:
+            target_dims = min(
+                [x for x in self.cuda_graph_batch_dimensions_list if x.prefill_req_count == 0]
+            )
+            # the smallest cuda graph is decode only.
+            assert target_dims.prefill_req_count == 0
 
-        N = smallest_cuda_graph_dimensions.decode_req_count
+        N_decode = target_dims.decode_req_count
+        N_prefill = target_dims.prefill_req_count
+        N_total = N_decode + N_prefill
+        T = target_dims.token_count
         tokens_per_request = self.num_speculative_tokens + 1
-        T = smallest_cuda_graph_dimensions.token_count  # N * tokens_per_request
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
         # 1. Request counts and token count.
         #    With speculative decoding each decode request has (num_speculative_tokens + 1) tokens.
-        self.total_request_count = N
+        self.total_request_count = N_total
         self.active_token_count = T
-        self.num_prefill_requests = 0
+        self.num_prefill_requests = N_prefill
 
         # 2. Per-request state consumed by mha_metadata.update().
-        self.request_query_lengths[0:N].fill_(tokens_per_request)
-        self.request_kv_length_offsets[0:N].fill_(0)
-        self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
+        if N_decode > 0:
+            self.request_query_lengths[0:N_decode] = tokens_per_request
+
+        # Prefill requests: distribute remaining tokens evenly.
+        if N_prefill > 0:
+            prefill_tokens = T - (N_decode * tokens_per_request)
+            tokens_per_prefill = prefill_tokens // N_prefill
+            remainder = prefill_tokens % N_prefill
+            self.request_query_lengths[N_decode:N_total] = tokens_per_prefill
+            # Give remainder tokens to the last prefill request.
+            if remainder > 0:
+                self.request_query_lengths[N_total - 1] += remainder
+
+        self.request_kv_length_offsets[0:N_total] = 0
+        self.request_to_kv_block_ids[0:N_total, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
-        self.token_to_local_position_within_kv_block[0:T] = (
-            torch.arange(T, device=self.token_to_block_idx.device) % tokens_per_request
-        )
+
+        decode_tokens_total = N_decode * tokens_per_request
+        if decode_tokens_total > 0:
+            self.token_to_local_position_within_kv_block[0:decode_tokens_total] = (
+                torch.arange(decode_tokens_total, device=self.token_to_block_idx.device)
+                % tokens_per_request
+            )
+
+        if N_prefill > 0:
+            prefill_tokens_total = T - decode_tokens_total
+            self.token_to_local_position_within_kv_block[decode_tokens_total:T] = (
+                torch.arange(prefill_tokens_total, device=self.token_to_block_idx.device)
+                % self.block_size_tokens
+            )
 
         if self.is_hybrid_model:
             # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
-            self.token_to_request_idx[0:T] = torch.repeat_interleave(
-                torch.arange(
-                    0,
-                    N,
-                    device=self.token_to_request_idx.device,
+            if N_decode > 0:
+                self.token_to_request_idx[0:decode_tokens_total] = torch.repeat_interleave(
+                    torch.arange(
+                        0,
+                        N_decode,
+                        device=self.token_to_request_idx.device,
+                        dtype=self.token_to_request_idx.dtype,
+                    ),
+                    tokens_per_request,
+                )
+
+            # Prefill tokens: distribute among prefill requests.
+            if N_prefill > 0:
+                prefill_tokens = T - decode_tokens_total
+                tokens_per_prefill = prefill_tokens // N_prefill
+                remainder = prefill_tokens % N_prefill
+                # Build repeat counts on CPU, then do a single write to GPU.
+                repeat_counts = torch.full(
+                    (N_prefill,), tokens_per_prefill, dtype=torch.long, device="cpu"
+                )
+                if remainder > 0:
+                    repeat_counts[-1] += remainder
+                request_ids = torch.arange(
+                    N_decode,
+                    N_decode + N_prefill,
                     dtype=self.token_to_request_idx.dtype,
-                ),
-                tokens_per_request,
-            )
+                    device="cpu",
+                )
+                token_request_indices = torch.repeat_interleave(request_ids, repeat_counts)
+                self.token_to_request_idx[
+                    decode_tokens_total : decode_tokens_total + prefill_tokens
+                ] = token_request_indices.to(device=self.token_to_request_idx.device)
 
             # 5. Mamba state: allocate slots for dummy requests.
-            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
-                self.mamba_metadata.batch_allocate_slots(N)
+            self.mamba_metadata.request_to_mamba_state_idx[0:N_total] = (
+                self.mamba_metadata.batch_allocate_slots(N_total)
             )
 
     def initialize_attention_state(
@@ -1424,9 +1482,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
         ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
-        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture.
+        # For EP dummy steps, we delay the dummy setup until after graph matching
+        # so we can match the selected graph's prefill/decode split. This is critical
+        # for Mamba hybrid models: if the matched graph has prefill requests but the
+        # dummy rank has none, cu_seqlens will be all-zeros, causing illegal memory
+        # access in the Mamba SSM prefill kernel.
         if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step()
+            pass  # Dummy setup deferred to after match_graph_config (below).
         elif self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
@@ -1458,6 +1521,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Now, we need not do the remaining setup. The controller
             # will directly call the model forward pass with a single token.
             return
+
+        if is_expert_parallel_dummy_cuda_graph_step:
+            # Deferred dummy setup: now that we know the matched graph, set up
+            # dummy requests to match its prefill/decode split.
+            self.add_dummy_requests_for_expert_parallel_step(best_graph)
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+            )
+            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph

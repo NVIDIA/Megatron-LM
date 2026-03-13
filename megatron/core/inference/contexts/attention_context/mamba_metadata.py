@@ -127,6 +127,16 @@ class MambaMetadata:
 
         has_chunked_prefill_req = enable_chunked_prefill and real_prefill_count > 0
 
+        # Mamba models cannot have padded prefill requests without real prefill requests.
+        # If this happens (e.g. on EP dummy ranks with incorrect setup), cu_seqlens will
+        # be all zeros, causing an illegal memory access in the Mamba SSM prefill kernel.
+        assert not (padded_prefill_count > 0 and real_prefill_count == 0), (
+            f"Mamba models require real prefill requests when padded prefill count > 0. "
+            f"Real prefill: {real_prefill_count}, Padded prefill: {padded_prefill_count}. "
+            f"This can occur on EP dummy ranks if they are not properly set up to match "
+            f"the selected CUDA graph's prefill/decode split."
+        )
+
         # Although the context ensures that the last request is always the designated
         # chunked prefill request, what we actually care about is ensuring that any
         # prefill request with non-zero initial states is executed through the

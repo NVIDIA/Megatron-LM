@@ -1498,6 +1498,82 @@ class TestDynamicContext:
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("is_hybrid_model", [True])
+    @pytest.mark.parametrize("num_cuda_graphs", [4, -1])
+    def test_add_dummy_requests_for_expert_parallel_step_with_prefill_graph(
+        self, is_hybrid_model: bool, num_cuda_graphs: int
+    ):
+        """When target_graph has prefill requests, the dummy setup must create
+        matching prefill requests with valid token distributions. This prevents
+        all-zero cu_seqlens on EP dummy ranks for Mamba hybrid models.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=is_hybrid_model,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            num_cuda_graphs=num_cuda_graphs,
+        )
+
+        # Find a mixed (prefill + decode) graph from the list
+        mixed_graphs = [g for g in ctx.cuda_graph_batch_dimensions_list if g.prefill_req_count > 0]
+        if not mixed_graphs:
+            pytest.skip("No mixed CUDA graphs available for this configuration")
+
+        target_graph = mixed_graphs[-1]  # smallest mixed graph
+        N_decode = target_graph.decode_req_count
+        N_prefill = target_graph.prefill_req_count
+        N_total = N_decode + N_prefill
+        T = target_graph.token_count
+
+        ctx.add_dummy_requests_for_expert_parallel_step(target_graph)
+
+        # 1. Scalar counts match the target graph
+        assert ctx.total_request_count == N_total
+        assert ctx.active_token_count == T
+        assert ctx.num_prefill_requests == N_prefill
+        assert ctx.num_decode_requests == N_decode
+
+        # 2. Query lengths: decode=1, prefill tokens sum to T - N_decode
+        decode_qlens = ctx.request_query_lengths[:N_decode]
+        assert torch.all(decode_qlens == 1)
+        prefill_qlens = ctx.request_query_lengths[N_decode:N_total]
+        assert torch.all(prefill_qlens >= 1), "Each prefill request must have at least 1 token"
+        assert prefill_qlens.sum().item() == T - N_decode
+
+        # 3. Token-level state uses dummy blocks
+        dummy_block_idx = ctx.block_allocator.dummy_block_idx
+        assert torch.all(ctx.token_to_block_idx[:T] == dummy_block_idx)
+
+        # 4. Hybrid model: token_to_request_idx is valid
+        token_to_req = ctx.token_to_request_idx[:T]
+        # Decode tokens should map to requests 0..N_decode-1
+        for i in range(N_decode):
+            assert token_to_req[i].item() == i
+        # Prefill tokens should map to requests N_decode..N_total-1
+        prefill_req_ids = token_to_req[N_decode:T]
+        assert (prefill_req_ids >= N_decode).all()
+        assert (prefill_req_ids < N_total).all()
+        # Check each prefill request gets the right number of tokens
+        for i in range(N_prefill):
+            req_id = N_decode + i
+            count = (prefill_req_ids == req_id).sum().item()
+            assert count == ctx.request_query_lengths[req_id].item()
+
+        # 5. Mamba state slots are valid and unique
+        mamba_slots = ctx.mamba_metadata.request_to_mamba_state_idx[:N_total]
+        assert (mamba_slots >= 0).all(), "All mamba slots must be valid"
+        assert mamba_slots.unique().numel() == N_total, "All mamba slots must be unique"
+
+    @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):
         """Tests that TP > GQA results in 1 attention head per partition."""
         tp_size = 8
