@@ -373,13 +373,13 @@ class MixedPrecisionPolicy:
       the native model weights become the main weights. Defaults to torch.float32.
     """
 
-    main_grads_dtype: Optional[torch.dtype] = torch.float32
+    main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer utilized for distributed optimization with
       Megatron-FSDP. If set to None, main gradients will match the dtype of the model
-      compute parameters specified by the user model. Defaults to torch.float32.
+      compute parameters specified by the user model. Defaults to None.
     """
 
-    grad_comm_dtype: Optional[torch.dtype] = torch.float32
+    grad_comm_dtype: Optional[torch.dtype] = None
     """Data type for gradient gather / scatter communications. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
@@ -389,4 +389,5 @@ class MixedPrecisionPolicy:
       If set to None, the main_grads_dtype is used. Defaults to torch.float32. If using
       `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating
       `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.
+      Defaults to None.
     """
