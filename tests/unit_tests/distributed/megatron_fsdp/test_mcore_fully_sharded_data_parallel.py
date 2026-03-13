@@ -250,14 +250,14 @@ class TestFullyShardedDataParallel:
             module=dense_model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
-        assert fsdp_dense.megatron_fsdp_dist_index.expt_device_mesh is None, \
-            "Dense model: expt_device_mesh should be None"
+        assert (
+            fsdp_dense.megatron_fsdp_dist_index.expt_device_mesh is None
+        ), "Dense model: expt_device_mesh should be None"
         fsdp_dense.stop_communication()
 
         # MoE model: expt_device_mesh should be built when num_moe_experts is set
         moe_config = TransformerConfig(
-            num_attention_heads=1, num_layers=1, context_parallel_size=1,
-            num_moe_experts=4,
+            num_attention_heads=1, num_layers=1, context_parallel_size=1, num_moe_experts=4
         )
         moe_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
         fsdp_moe = FullyShardedDataParallel(
@@ -266,8 +266,9 @@ class TestFullyShardedDataParallel:
             module=moe_model,
             fsdp_unit_modules=[torch.nn.Linear],
         )
-        assert fsdp_moe.megatron_fsdp_dist_index.expt_device_mesh is not None, \
-            "MoE model: expt_device_mesh should not be None"
+        assert (
+            fsdp_moe.megatron_fsdp_dist_index.expt_device_mesh is not None
+        ), "MoE model: expt_device_mesh should not be None"
         fsdp_moe.stop_communication()
 
     # Testing fsdp_double_buffer with and without nccl_ub
