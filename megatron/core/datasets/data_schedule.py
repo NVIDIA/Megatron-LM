@@ -277,7 +277,8 @@ class HybridCPDataLoaderWrapper:
             # dim=0 should be divisible by 8
             # Find padding required to make dim=0 divisible by 32 after sharding
             # MXFP8 BLOCK_SIZE is 32
-            pad_granularity = 32
+            # Hybrid EP requires 128
+            pad_granularity = 128
             sharded_tensor_shape = seq_len // (local_cp_size * parallel_state.get_tensor_model_parallel_world_size())
             mod_token_count = sharded_tensor_shape % pad_granularity
             pad_len = 0

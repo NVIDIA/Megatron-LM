@@ -10,6 +10,15 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.rerun_state_machine import RerunDataIterator
 
+# Number of forward groups (equivalent to num_microbatches) used in the most recent
+# hybrid CP step.  Set each iteration so that training.py can use it for loss scaling.
+_num_total_groups: int = 0
+
+
+def get_num_total_groups() -> int:
+    """Return the num_total_groups value from the most recent hybrid CP step."""
+    return _num_total_groups
+
 
 class BalancedCPScheduler:
     """
@@ -617,6 +626,11 @@ def hybrid_context_parallel_forward_backward(
         num_total_groups = len(sample_id_groups) # equivalent to num_microbatches
 
     num_total_groups = _broadcast_num_total_groups(num_total_groups)
+
+    # Publish num_total_groups so training.py can use it for MoE loss scaling.
+    global _num_total_groups
+    _num_total_groups = num_total_groups
+
     # num_total_groups = num_total_groups.cpu().numpy()
     num_samples_this_group = [1 for _ in range(num_total_groups)] # After sequence packing, each group has only one sub-sample
 
@@ -664,9 +678,9 @@ def hybrid_context_parallel_forward_backward(
             # Create a barrier at end of each group.
             # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
             # no rank is starting a sub-sample ahead of it's partner ranks.
-            torch.distributed.barrier(
-                parallel_state.get_data_parallel_group(with_context_parallel=True)
-            )
+            # torch.distributed.barrier(
+            #     parallel_state.get_data_parallel_group(with_context_parallel=True)
+            # )
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():

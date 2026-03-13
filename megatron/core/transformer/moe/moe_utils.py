@@ -216,23 +216,42 @@ def get_capacity(
 
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
+    reduce_group: Union[torch.distributed.ProcessGroup, List[torch.distributed.ProcessGroup]],
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> torch.Tensor:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+
+    reduce_group can be either a single ProcessGroup or a list of ProcessGroups.
+    When a list is provided (e.g. for hybrid context parallel), sequential all-reduces are
+    performed across each group in order.  This is mathematically equivalent to a single
+    all-reduce over the combined group while avoiding the need to pre-register new NCCL
+    communicators.  The caller is responsible for ordering; all-reduce is commutative so
+    the order does not affect correctness, only potential runtime performance.
+
+    Example — hybrid context parallel:
+        reduce_group = [packed_seq_params.cp_group, self.tp_group]
+    Example — standard context parallel:
+        reduce_group = self.tp_cp_group
     """
-    local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
+    groups: List[torch.distributed.ProcessGroup] = (
+        reduce_group if isinstance(reduce_group, list) else [reduce_group]
     )
+    local_tokens_per_expert = routing_map.sum(dim=0)
+    global_tokens_per_expert = local_tokens_per_expert
+    for group in groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
     if with_padding_mask:
         local_num_tokens = local_tokens_per_expert.sum() / topk
         total_num_tokens = global_tokens_per_expert.sum() / topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+        total_num_tokens = local_num_tokens
+        for group in groups:
+            total_num_tokens = total_num_tokens * group.size()
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 

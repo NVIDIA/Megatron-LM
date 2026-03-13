@@ -143,6 +143,7 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import get_num_total_groups
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -2021,7 +2022,13 @@ def training_log(
 
     # Log MoE metrics.
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        # For hybrid CP, num_total_groups replaces num_microbatches as the step count.
+        # The logged aux_loss is accumulated once per group (not per microbatch), so we
+        # must normalise by num_total_groups to get a per-sequence average comparable
+        # to a standard-CP run.  get_num_total_groups() returns 0 when hybrid CP is not
+        # active, in which case we fall back to get_num_microbatches().
+        _hybrid_groups = get_num_total_groups()
+        moe_loss_scale = 1 / (_hybrid_groups if _hybrid_groups > 0 else get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2054,7 +2061,7 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / (_hybrid_groups if _hybrid_groups > 0 else get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
