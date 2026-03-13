@@ -2101,6 +2101,23 @@ class TransformerConfig(ModelParallelConfig):
                     'partial cuda graph'
                 )
 
+        if self.delay_wgrad_compute_for_te_grouped_gemm:
+            assert self.moe_latent_size is None, (
+                'moe_latent_size must be disabled when enabling '
+                'delay_wgrad_compute_for_te_grouped_gemm.'
+            )
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'delay_wgrad_compute_for_te_grouped_gemm.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for delay_wgrad_compute_for_te_grouped_gemm'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and delay_wgrad_compute_for_te_grouped_gemm '
+                'are mutually exclusive; use only one'
+            )
+
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
                 'overlap_moe_expert_parallel_comm must be enabled when enabling '
