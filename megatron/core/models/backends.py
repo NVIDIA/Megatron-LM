@@ -1,14 +1,25 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, cast
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
+from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
+from megatron.core.transformer.moe.experts import (
+    InferenceGroupedMLP,
+    SequentialMLP,
+    TEGroupedMLPSubmodules,
+)
+from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
+from megatron.core.typed_torch import not_none
+from megatron.core.utils import is_te_min_version
 
 try:
     import apex  # pylint: disable=unused-import
@@ -19,8 +30,9 @@ try:
     LNImpl = FusedLayerNorm
 except ImportError:
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
+    FusedLayerNorm = None
     HAVE_APEX = False
+    LNImpl = WrappedTorchNorm
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -60,7 +72,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
         """Which module for layernorm"""
         ...
 
@@ -71,13 +83,13 @@ class BackendSpecProvider(Protocol):
 
     @abstractmethod
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+        self, moe_use_grouped_gemm: bool
+    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
         """Which module and submodules to use for grouped mlp"""
         ...
 
     @abstractmethod
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         ...
 
@@ -101,7 +113,7 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return None
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if rms_norm:
             # Matching get_gpt_layer_local_spec.
@@ -115,21 +127,14 @@ class LocalSpecProvider(BackendSpecProvider):
         return DotProductAttention
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+        self, moe_use_grouped_gemm: bool
+    ) -> tuple[type[SequentialMLP], MLPSubmodules]:
         """Which module and submodules to use for grouped mlp"""
-        if moe_use_grouped_gemm:
-            warnings.warn(
-                "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
-                "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
-            )
-            return GroupedMLP, None
-        else:
-            return SequentialMLP, MLPSubmodules(
-                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
-            )
+        return SequentialMLP, MLPSubmodules(
+            linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+        )
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         return None
 
@@ -157,26 +162,29 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
-            return FusedLayerNorm
+            return not_none(FusedLayerNorm)
         return TENorm
 
     def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
-        return TEActivationOp
+        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
+        # design these classes always meet the interface.
+        return cast(TEActivationFunctionBuilder, TEActivationOp)
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
+        self, moe_use_grouped_gemm: bool
     ) -> Tuple[type, Optional[MLPSubmodules]]:
-        raise NotImplementedError(
-            "MOE is not supported with inference optimized transformer implementation."
+        """Which module and submodules to use for grouped mlp"""
+        return InferenceGroupedMLP, MLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )

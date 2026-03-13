@@ -17,7 +17,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, is_te_min_version
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -26,6 +26,7 @@ try:
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
         fused_permute,
+        fused_permute_and_pad_with_probs,
         fused_permute_with_probs,
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
@@ -57,7 +58,7 @@ def switch_load_balancing_loss_func(
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
     and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
 
-    ### Detailed explanation of the auxiliary loss #######
+    Detailed explanation of the auxiliary loss:
 
     The formula for the auxiliary loss is:
         loss = E * Σ_{i=1}^{E} (f_i * P_i)
@@ -90,8 +91,6 @@ def switch_load_balancing_loss_func(
     - tokens_per_expert: Should represent token counts at the desired level
       (either micro-batch or global batch)
     - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
-
-    #########################################################
 
     Args:
         probs (torch.Tensor): Softmax probabilities output by the router for each token.
@@ -295,7 +294,15 @@ def permute(
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    align_size: int = -1,
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -303,6 +310,9 @@ def permute(
 
     When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
     expert capacity. This function exploits this feature to use ops that support cuda graph.
+
+    If the fused permute and pad kernel is available, it will pad the tokens to the align_size
+    and return the padded permuted tokens, pad_offsets and padded tokens per expert.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
@@ -315,10 +325,20 @@ def permute(
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
+        tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
+                                                    actual token counts per expert.
+        align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
 
     Returns:
-        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-            The permuted tokens, permuted probs, and sorted indices.
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
+            The permuted tokens, (optional) permuted probs, sorted indices,
+            (optional) pad_offsets, (optional) padded_tokens_per_expert.
     """
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
@@ -326,14 +346,26 @@ def permute(
         permuted_input, sorted_indices = fused_permute(
             tokens, routing_map, num_out_tokens=num_out_tokens
         )
-        return permuted_input, None, sorted_indices
+        return permuted_input, None, sorted_indices, None, tokens_per_expert
 
     if fused and probs is not None:
-        if not HAVE_TE or fused_permute_with_probs is None:
+        if not HAVE_TE or (
+            fused_permute_and_pad_with_probs is None and fused_permute_with_probs is None
+        ):
             raise ValueError(
-                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+                "Transformer Engine (TE) fused kernel is not available. "
+                "fused_permute_with_probs typically requires TE >= 2.1.0, and "
+                "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
+        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+            return fused_permute_and_pad_with_probs(
+                tokens, probs, routing_map, tokens_per_expert, align_size
+            )
+        else:
+            output, permuted_probs, row_id_map = fused_permute_with_probs(
+                tokens, probs, routing_map, num_out_tokens=num_out_tokens
+            )
+            return output, permuted_probs, row_id_map, None, tokens_per_expert
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -376,7 +408,7 @@ def permute(
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices
+    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
 
 def unpermute(
@@ -387,6 +419,7 @@ def unpermute(
     routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
+    pad_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -408,6 +441,10 @@ def unpermute(
         fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
+        pad_offsets (torch.Tensor, optional):
+            Tensor of per-expert cumulative padding offsets used to remove padding added
+            during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
+            and is required when unpermuting padded outputs. Defaults to None.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -415,8 +452,15 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        extra_kwargs = {}
+        if is_te_min_version("2.12.0"):
+            extra_kwargs["pad_offsets"] = pad_offsets
         return fused_unpermute(
-            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+            permuted_tokens,
+            sorted_indices,
+            merging_probs=probs,
+            restore_shape=restore_shape,
+            **extra_kwargs,
         )
 
     _, hidden = restore_shape
@@ -618,6 +662,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -640,14 +685,23 @@ def topk_routing_with_score_function(
                                              recorded routing sequence.
 
                                               Defaults to None.
+        dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
+                                       sparse tensors [num_tokens, num_experts]. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
+            When dense_output=False (default):
+                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts]. Sparse tensor
+                  containing the normalized routing probability for each token-expert pair. Non-zero
+                  entries correspond to the top-k selected experts per token.
+                - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
+                  True indicates the token is routed to that expert (i.e. the expert was in the
+                  token's top-k selection).
+            When dense_output=True:
+                - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
+                  probabilities for each token's top-k selected experts.
+                - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
+                  selected for each token.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
@@ -730,6 +784,9 @@ def topk_routing_with_score_function(
     if scaling_factor:
         probs = probs * scaling_factor
 
+    if dense_output:
+        return probs, top_indices
+
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)
@@ -782,7 +839,8 @@ def compute_routing_scores_for_aux_loss(
         if score_function == "softmax":
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits)
+            # Cast logits to float32 before sigmoid for stability
+            scores = torch.sigmoid(logits.to(torch.float32))
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
@@ -991,13 +1049,20 @@ def track_moe_metrics(
     """
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
-    # Initialize the tracker if force_initialize is True
+    # Initialize the tracker if force_initialize is True.
+    # The values tensor size must match what the router creates in save_to_aux_losses_tracker,
+    # which uses (num_layers + mtp_num_layers). This is important for PP ranks that have no
+    # MoE layers (so the tracker is empty and force_initialize creates the entry); their tensor
+    # size must match ranks that do have MoE layers, otherwise all_reduce across PP will hang.
+    tracker_num_layers = num_layers
+    if mtp_num_layers is not None:
+        tracker_num_layers += mtp_num_layers
     if force_initialize:
         if track_names is not None:
             for key in track_names:
                 if key not in tracker:
                     tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["values"] = torch.zeros(tracker_num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False

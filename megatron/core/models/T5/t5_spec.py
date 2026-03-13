@@ -76,7 +76,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -102,7 +103,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_cross_attn_layernorm=TENorm,
+            pre_cross_attn_layernorm=not_none(TENorm),
             cross_attention=ModuleSpec(
                 module=CrossAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
@@ -117,7 +118,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,

@@ -17,7 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -295,4 +295,7 @@ def test_swap_gpt_parametrized(
         dst_logits, ref_logits, atol=1e-4, rtol=1e-4
     ), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
     dist.barrier()
+
+    # Clear refit caches before destroying model parallel to avoid stale plans
+    clear_all_caches()
     Utils.destroy_model_parallel()

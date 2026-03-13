@@ -116,16 +116,6 @@ def set_ideal_affinity_for_current_gpu():
     )
 
 
-@contextmanager
-def stream_acquire_context(stream, event):
-    """Stream acquire context"""
-    event.wait(stream)
-    try:
-        yield
-    finally:
-        event.record(stream)
-
-
 class NoopScheduleNode:
     """A placeholder node in the computation graph that simply passes through inputs and outputs.
 
@@ -208,26 +198,21 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} forward")
-            with torch.cuda.stream(self.stream):
-                self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
-                for i, input in enumerate(self.inputs):
-                    if input is not None:
-                        input.requires_grad = inputs[i].requires_grad
+        with self.stream_acquire_context(f"{self.name} forward"):
+            self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
+            for i, input in enumerate(self.inputs):
+                if input is not None:
+                    input.requires_grad = inputs[i].requires_grad
 
-                data = tuple(self.inputs)
-                data = self.forward_func(*data)
+            data = tuple(self.inputs)
+            data = self.forward_func(*data)
 
-                if not isinstance(data, tuple):
-                    data = make_viewless(data)
-                else:
-                    data = tuple(
-                        [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
-                    )
+            if not isinstance(data, tuple):
+                data = make_viewless(data)
+            else:
+                data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
 
-                self.output = data
-            torch.cuda.nvtx.range_pop()
+            self.output = data
 
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
@@ -250,18 +235,15 @@ class ScheduleNode:
         return self._backward(*output_grad)
 
     def _backward(self, *output_grad):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} backward")
-            with torch.cuda.stream(self.stream):
-                outputs = self.output
-                if not isinstance(outputs, tuple):
-                    outputs = (outputs,)
-                assert len(outputs) == len(output_grad), (
-                    f"{len(outputs)} of {type(outputs[0])} is not equal to "
-                    f"{len(output_grad)} of {type(output_grad[0])}"
-                )
-                output_grad = self.backward_func(outputs, output_grad)
-            torch.cuda.nvtx.range_pop()
+        with self.stream_acquire_context(f"{self.name} backward"):
+            outputs = self.output
+            if not isinstance(outputs, tuple):
+                outputs = (outputs,)
+            assert len(outputs) == len(output_grad), (
+                f"{len(outputs)} of {type(outputs[0])} is not equal to "
+                f"{len(output_grad)} of {type(output_grad[0])}"
+            )
+            output_grad = self.backward_func(outputs, output_grad)
 
         # output_grad maybe from another stream
         if output_grad:
@@ -287,6 +269,30 @@ class ScheduleNode:
         if len(grad) == 1:
             grad = grad[0]
         return grad
+
+    @contextmanager
+    def stream_acquire_context(self, name=None):
+        """Stream acquire context that handles event synchronization,
+            NVTX profiling, and stream context.
+
+        This context manager consolidates:
+        1. Event wait/record for synchronization between streams
+        2. NVTX range for profiling (if name is provided)
+        3. torch.cuda.stream context for execution on the specified stream
+
+        Args:
+            name: Optional name for NVTX range profiling
+        """
+        self.event.wait(self.stream)
+        if name:
+            torch.cuda.nvtx.range_push(name)
+        try:
+            with torch.cuda.stream(self.stream):
+                yield
+        finally:
+            if name:
+                torch.cuda.nvtx.range_pop()
+            self.event.record(self.stream)
 
     def _release_state(self):
         """Clear the state of the node"""

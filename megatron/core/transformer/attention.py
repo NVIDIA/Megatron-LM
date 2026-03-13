@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -219,8 +220,8 @@ class SelfAttentionSubmodules:
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
-    q_layernorm: Union[ModuleSpec, type] = None
-    k_layernorm: Union[ModuleSpec, type] = None
+    q_layernorm: LayerNormBuilder | None = None
+    k_layernorm: LayerNormBuilder | None = None
 
 
 @dataclass
@@ -251,11 +252,13 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -431,7 +434,16 @@ class Attention(MegatronModule, ABC):
         )
 
     def _get_pp_layer_offset_for_inference(self):
-        """Return the pipeline parallel layer offset for inference."""
+        """Return the pipeline parallel layer offset for inference.
+
+        When pp_layer_offset was explicitly provided (e.g. by MambaBlock for
+        hybrid models using --hybrid-layer-pattern with fVPP), use that value
+        directly.  Otherwise fall back to the standard computation which assumes
+        uniform layer distribution across pipeline stages.
+        """
+        if self._pp_layer_offset is not None:
+            return self._pp_layer_offset
+
         assert (
             self.config.virtual_pipeline_model_parallel_size is None
         ), "Virtual pipeline parallelism is not supported for inference"
@@ -1250,6 +1262,7 @@ class SelfAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(
             config=config,
@@ -1259,6 +1272,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1278,8 +1292,7 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
+            self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1288,8 +1301,7 @@ class SelfAttention(Attention):
             self.q_layernorm = None
 
         if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
+            self.k_layernorm = submodules.k_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1475,10 +1487,10 @@ class SelfAttention(Attention):
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = apply_module(self.q_layernorm)(query)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()

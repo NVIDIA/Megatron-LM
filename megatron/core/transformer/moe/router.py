@@ -29,7 +29,10 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         """
         Initialize the Router module.
@@ -37,12 +40,14 @@ class Router(ABC, MegatronModule):
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -145,15 +150,19 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
         """
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
@@ -438,6 +447,16 @@ class TopKRouter(Router):
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
         """
+        # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
+        # To avoid accumulating the load balancing loss multiple times, we scale it by
+        # 1/mtp_num_layers so the total loss is correct.
+        if (
+            self.is_mtp_layer
+            and self.config.mtp_use_repeated_layer
+            and self.config.mtp_num_layers is not None
+        ):
+            aux_loss = aux_loss / self.config.mtp_num_layers
+
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
@@ -445,10 +464,16 @@ class TopKRouter(Router):
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
+
+        if self.is_mtp_layer:
+            layer_number = self.layer_number + self.config.num_layers
+        else:
+            layer_number = self.layer_number
+
         save_to_aux_losses_tracker(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
-            self.layer_number,
+            layer_number,
             num_layers,
             reduce_group=reduce_group,
             reduce_group_has_dp=reduce_group_has_dp,
@@ -499,11 +524,27 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
+            # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
+            # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
+            # so the total loss is correct.
+            if (
+                self.is_mtp_layer
+                and self.config.mtp_use_repeated_layer
+                and self.config.mtp_num_layers is not None
+            ):
+                z_loss = z_loss / self.config.mtp_num_layers
+
             num_layers = self.config.num_layers
             if self.config.mtp_num_layers is not None:
                 num_layers += self.config.mtp_num_layers
+
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+            else:
+                layer_number = self.layer_number
+
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, num_layers
+                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
             )
         return logits
 
@@ -669,3 +710,115 @@ class TopKRouter(Router):
         """Save the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before saving
         return super()._save_to_state_dict(*args, **kwargs)
+
+
+class InferenceTopKRouter(TopKRouter):
+    """Inference-only top-k router that strips out training-specific overhead.
+
+    A stripped-down version of TopKRouter that skips z-loss, auxiliary load
+    balancing losses, token dropping, and expert bias updates. The _forward()
+    method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
+    instead of sparse [num_tokens, num_experts] for compatibility with FlashInfer.
+
+    Falls back to the parent TopKRouter.forward() for training or
+    non-CUDA-graphed inference iterations.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:
+        """Initialize the specialized inference top-k router.
+
+        Args:
+            config (TransformerConfig): The configuration for the transformer model.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+        """
+        # Enforce constraints before calling super().__init__
+        assert config.moe_router_num_groups is None, (
+            f"InferenceTopKRouter requires moe_router_num_groups=None, "
+            f"got {config.moe_router_num_groups}"
+        )
+        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+            f"InferenceTopKRouter requires moe_router_score_function in "
+            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+        )
+
+        super().__init__(config=config, pg_collection=pg_collection)
+
+        self.is_inference_cuda_graphed_iteration = False
+
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = True
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = False
+
+    @staticmethod
+    @torch.compile
+    def _compiled_topk_routing(
+        logits,
+        topk,
+        use_pre_softmax,
+        num_groups,
+        group_topk,
+        scaling_factor,
+        score_function,
+        expert_bias,
+        fused,
+        router_replay,
+        dense_output,
+    ):
+        return topk_routing_with_score_function(
+            logits,
+            topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            fused=fused,
+            router_replay=router_replay,
+            dense_output=dense_output,
+        )
+
+    def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        probs, top_indices = self._compiled_topk_routing(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+            fused=self.config.moe_router_fusion,
+            router_replay=self.router_replay,
+            dense_output=True,
+        )
+        return probs.squeeze(1), top_indices.squeeze(1)
+
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """Simplified forward pass for inference - returns dense tensors only.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Not used in inference.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - probs: Normalized routing probabilities [num_tokens, topk]
+                - top_indices: Selected expert indices [num_tokens, topk]
+        """
+
+        if self.training or not self.is_inference_cuda_graphed_iteration:
+            return super().forward(input, padding_mask)
+
+        return self._forward(input, padding_mask)

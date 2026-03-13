@@ -1,13 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import os
 import random
 import string
 import time
-from argparse import Namespace
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List
 from unittest import mock
 
 import pytest
@@ -22,12 +20,13 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -68,15 +67,19 @@ class TestVLMTextGenerationController:
             bf16=True,
         )
 
-        language_layer_spec = get_gpt_layer_local_spec()
-        vision_layer_spec = copy.deepcopy(language_layer_spec)
-        vision_projection_spec = copy.deepcopy(language_layer_spec.submodules.mlp.submodules)
+        language_layer_submodules = get_gpt_layer_local_submodules()
+        vision_layer_spec = ModuleSpec(
+            module=TransformerLayer, submodules=copy.deepcopy(language_layer_submodules)
+        )
+        vision_projection_spec = copy.deepcopy(language_layer_submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=self.language_vocab_size,
             language_max_sequence_length=self.language_max_sequence_length,
             vision_transformer_config=vision_config,

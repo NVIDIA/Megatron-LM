@@ -42,5 +42,5 @@ jobs:
       freeze-commit: ${{ inputs.freeze-commit }}
       dry-run: ${{ inputs.dry-run }}
     secrets:
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
