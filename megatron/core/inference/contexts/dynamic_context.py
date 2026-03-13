@@ -2563,7 +2563,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count, newly_paused_request_ids
         )
 
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+        assert (
+            active_request_count > 0 or self.chunked_prefill_request_id != -1
+        ), "active_request_count == %d with no hidden chunked prefill." % active_request_count
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.

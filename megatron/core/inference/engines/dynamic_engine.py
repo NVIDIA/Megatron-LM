@@ -719,6 +719,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
+        # Reset the chunked prefill request id
+        self.chunked_prefill_request_id = -1
+
         # Checkpoint active requests that are marked for recompute.
         for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
@@ -759,12 +762,6 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
-
-            # Ensure chunked prefill request remains at the head of the waiting queue
-            if self.context.chunked_prefill_request_id != -1:
-                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
-                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
-                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
 
             torch.cuda.synchronize()
             add_time = time.time() - add_time

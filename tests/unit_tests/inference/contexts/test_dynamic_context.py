@@ -1623,3 +1623,90 @@ class TestDynamicContext:
             dynamic_context.mamba_metadata.request_to_mamba_state_idx[1].item() == mamba_slot_before
         )
         assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
+
+    @pytest.mark.internal
+    @rounder_override(4)
+    def test_chunked_prefill_all_active_requests_finish_while_hidden(self):
+        """
+        Tests that update_requests does not crash when ALL active decode requests
+        finish while a chunked prefill request is hidden (not scheduled this step).
+
+        This exercises the scenario where:
+        1. A chunked prefill completes a chunk and is hidden at total_request_count
+        2. The next chunk is not scheduled (e.g., no token budget)
+        3. All remaining active decode requests finish in the same step
+        4. active_request_count becomes 0 — the code must not assert-fail
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.03,
+            block_size_tokens=4,
+            max_tokens=None,
+        )
+
+        dynamic_context.enable_chunked_prefill = True
+
+        # Add 2 normal decode requests
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=10,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=11,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+
+        # Add Chunk 1 of a chunked prefill request
+        req_999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.chunked_prefill_request_id = 999
+
+        kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+        assert kv_block_before != -1
+
+        # Step 1: All 3 requests are active, process forward pass
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # Chunked prefill is now hidden at position 2, total_request_count = 2
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Step 2: Both decode requests finish, chunked prefill NOT scheduled this step.
+        # This must NOT crash even though active_request_count becomes 0.
+        active_requests_mask = torch.tensor([0, 0], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # total_request_count should be 0 (both finished, chunked prefill hidden)
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context.active_token_count == 0
+
+        # The hidden chunked prefill should be pulled to position 0 (the new boundary)
+        assert dynamic_context.request_ids[0].item() == 999
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == kv_block_before
+
+        # Verify we can still add the next chunk at position 0
+        req_999.finished_chunk_token_count = 4
+        dynamic_context.add_request(req_999, chunk_length=4)
+
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.request_ids[0].item() == 999
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == kv_block_before
