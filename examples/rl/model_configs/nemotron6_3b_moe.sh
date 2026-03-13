@@ -9,39 +9,21 @@ echo "Using Nemotron6 3B MOE model checkpoint"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 source $(dirname $SCRIPT_PATH)/common.sh
 
-# In all cases, one can override those values.
-# However, running without envs will give you some
-# good perf out of the box for established envs.
-if [ "$(basename "$ENV_CONFIG")" = "dapo.yaml" ]; then
-  echo "Using DAPO environment config"
-  GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
-  GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.28}
-  MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-32}
-  GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-16}
-  GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-64}
-  GRPO_ITERATIONS=${GRPO_ITERATIONS:-1}
-  GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
-  TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-1024}
-  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
-  MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-11999}
-  EXIT_INTERVAL=${EXIT_INTERVAL:-20}
-  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
-else
-  # Some default values if config is unsupported.
-  echo "Undected environment config, using default values"
-  GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
-  GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.28}
-  MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-64}
-  GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-2}
-  GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-16}
-  GRPO_ITERATIONS=${GRPO_ITERATIONS:-1}
-  GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
-  TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-32}
-  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
-  MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-1024}
-  EXIT_INTERVAL=${EXIT_INTERVAL:-20}
-  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
-fi
+
+echo "Undected environment config, using default values"
+GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
+GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.28}
+MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-64}
+GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-16}
+GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-64}
+GRPO_ITERATIONS=${GRPO_ITERATIONS:-1}
+GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
+TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-1024}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-8192}
+EXIT_INTERVAL=${EXIT_INTERVAL:-15}
+CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
+
 
 ENV_DEPENDENT="\
   --micro-batch-size $MICRO_BATCH_SIZE \
@@ -60,10 +42,15 @@ MODEL_OPTIONS="\
   --rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching-max-tokens 8192 \
+  --inference-dynamic-batching-num-cuda-graphs 4 \
   --inference-dynamic-batching-max-requests 128 \
-  --inference-dynamic-batching-num-cuda-graphs 2 \
-  --decode-only-cuda-graphs \
+  --inference-dynamic-batching-paused-buffer-size-gb 5 \
+  --inference-dynamic-batching-buffer-size-gb 5 \
+  --inference-dynamic-batching-unified-memory-level 1 \
+  --rl-training-cuda-graphs \
+  --empty-unused-memory-level 0 \
+  --rl-parallel-generation-tasks 128 \
+  --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
   --use-checkpoint-args \
@@ -119,4 +106,8 @@ MODEL_OPTIONS="\
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
-  --no-load-rng "
+  --no-load-rng \
+  --moe-permute-fusion \
+  --eval-interval 1000 \
+  --timing-log-level 2 \
+  "
