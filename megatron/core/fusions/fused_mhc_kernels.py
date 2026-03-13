@@ -52,12 +52,15 @@ def is_cutile_available() -> bool:
 
 
 # -- Sinkhorn ----------------------------------------------------------------
-def _ref_sinkhorn_fwd(input_logits: Tensor, num_iterations: int, eps: float = 1e-8) -> Tensor:
-    M = torch.exp(input_logits)
+def _ref_sinkhorn_fwd(
+    input_logits: Tensor, num_iterations: int, eps: float = 1e-8
+) -> Tuple[Tensor, Tensor]:
+    M_init = torch.exp(input_logits)
+    M = M_init
     for _ in range(num_iterations):
         M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
         M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
-    return M
+    return M, M_init
 
 
 def _ref_sinkhorn_bwd(
@@ -200,16 +203,23 @@ _compiled_proj_rms_bwd = torch.compile(_ref_proj_rms_bwd)
 if _CUTILE_AVAILABLE:
     ConstInt = ct.Constant[int]
     PAD_ZERO = ct.PaddingMode.ZERO
+    LOG2E = 1.4426950408889634
 
     # -- Sinkhorn kernels ----------------------------------------------------
 
     @ct.kernel
     def _ct_sinkhorn_fwd_kernel(
-        inp, out, eps, HC: ConstInt, NUM_ITERS: ConstInt, TILE_SIZE: ConstInt
+        inp, out, M_init_out, eps, HC: ConstInt, NUM_ITERS: ConstInt, TILE_SIZE: ConstInt
     ):
         pid = ct.bid(0)
-        M = ct.load(inp, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(ct.float32)
-        M = ct.exp(M)
+        logits = ct.load(inp, index=(pid, 0, 0), shape=(TILE_SIZE, HC, HC)).astype(ct.float32)
+        row_max = ct.max(logits, axis=2, keepdims=True)
+        M = ct.exp2((logits - row_max) * LOG2E)
+        ct.store(
+            M_init_out,
+            index=(pid, 0, 0),
+            tile=ct.reshape(M.astype(M_init_out.dtype), (TILE_SIZE, HC, HC)),
+        )
         for _ in range(NUM_ITERS):
             row_sum = ct.sum(M, axis=2, keepdims=True)
             M = M / (row_sum + eps)
@@ -263,19 +273,21 @@ if _CUTILE_AVAILABLE:
 
     def _cutile_sinkhorn_fwd(
         input_logits: Tensor, num_iterations: int, eps: float = 1e-8
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
         original_shape = input_logits.shape
         hc = original_shape[-1]
         N_batch = input_logits.numel() // (hc * hc)
         TILE_SIZE = math.gcd(N_batch, 128)
-        out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=input_logits.device)
+        dev = input_logits.device
+        out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
+        M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         ct.launch(
             torch.cuda.current_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
             _ct_sinkhorn_fwd_kernel,
-            (input_logits.view(N_batch, hc, hc), out, eps, hc, num_iterations, TILE_SIZE),
+            (input_logits.view(N_batch, hc, hc), out, M_init, eps, hc, num_iterations, TILE_SIZE),
         )
-        return out.view(original_shape)
+        return out.view(original_shape), M_init.view(original_shape)
 
     def _cutile_sinkhorn_bwd(
         grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
@@ -948,8 +960,7 @@ class FusedSinkhornKnopp(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-8):
-        M_init = torch.exp(input_logits)
-        output = _sinkhorn_fwd_fn(input_logits, num_iterations, eps)
+        output, M_init = _sinkhorn_fwd_fn(input_logits, num_iterations, eps)
         ctx.save_for_backward(M_init)
         ctx.num_iterations = num_iterations
         ctx.eps = eps
