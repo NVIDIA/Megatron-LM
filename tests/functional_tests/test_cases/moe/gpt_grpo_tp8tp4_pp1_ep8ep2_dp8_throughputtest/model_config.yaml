@@ -130,6 +130,7 @@ MODEL_ARGS:
   --straggler-minmax-count: 16
   --empty-unused-memory-level: 2
 
+  --async-save: true
 METRICS:
   - "iteration-time"
   - "lm loss"

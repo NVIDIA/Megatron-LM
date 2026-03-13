@@ -60,4 +60,5 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: ckpt-resume
