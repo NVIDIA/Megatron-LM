@@ -52,6 +52,11 @@ class TestTextGenerationController:
         batch_size: int = 4,
         static: bool = True,
         use_training_random_init: bool = False,
+        materialize_only_last_token_logits: bool = False,
+        num_speculative_tokens: int = 0,
+        block_size_tokens: int = 256,
+        enable_prefix_caching: bool = False,
+        max_requests: int = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -108,10 +113,14 @@ class TestTextGenerationController:
                 inference_config=InferenceConfig(
                     max_sequence_length=2048,
                     buffer_size_gb=0.2,
-                    materialize_only_last_token_logits=False,
+                    materialize_only_last_token_logits=materialize_only_last_token_logits,
                     use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                     # this is for compatibility with the LTS environment
                     unified_memory_level=0,  # unit tests currently broken with UVM
+                    num_speculative_tokens=num_speculative_tokens,
+                    block_size_tokens=block_size_tokens,
+                    enable_prefix_caching=enable_prefix_caching,
+                    max_requests=max_requests,
                 ),
             )
 
@@ -224,11 +233,15 @@ class TestTextGenerationController:
         self, backend: str, materialize_only_last_token_logits: bool
     ):
         batch_size = 12
-        self.setup_model(torch.float32, batch_size=batch_size, static=False)
+        self.setup_model(
+            torch.float32,
+            batch_size=batch_size,
+            static=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = materialize_only_last_token_logits
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
@@ -743,11 +756,15 @@ class TestTextGenerationController:
         3. Correct number of tokens are returned for each request
         """
         batch_size = 4
-        self.setup_model(torch.bfloat16, batch_size=batch_size, static=False)
+        self.setup_model(
+            torch.bfloat16,
+            batch_size=batch_size,
+            static=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = materialize_only_last_token_logits
 
         # Prepare sampling params
         top_n = 5
