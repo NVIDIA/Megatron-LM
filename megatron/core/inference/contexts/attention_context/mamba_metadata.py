@@ -287,8 +287,7 @@ class MambaMetadata:
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
             self._device_decode_prefill_buffer[1] = (
-                cu_seqlens[real_decode_count + real_prefill_count]
-                - cu_seqlens[real_decode_count]
+                cu_seqlens[real_decode_count + real_prefill_count] - cu_seqlens[real_decode_count]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
