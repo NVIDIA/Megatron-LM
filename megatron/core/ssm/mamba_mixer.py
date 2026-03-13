@@ -401,6 +401,12 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        # Dynamic CP group support
+        # This is used in long context training/fine-tuning with sequence packing.
+        # Allows for dynamic CP group selection based on the true length of samples in the batch.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            self.cp.set_context_parallel_group(packed_seq_params.cp_group)
+        
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)

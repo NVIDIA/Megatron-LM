@@ -33,7 +33,7 @@ from megatron.core.parallel_state import (
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, is_te_min_version, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
@@ -80,39 +80,38 @@ def get_batch(data_iterator, vp_stage=None):
         'loss_mask': None,
         'attention_mask': None,
         'position_ids': None,
-        'cu_seqlens': None,
-        'max_seqlen': None,
     }
 
     # TODO(duncan): Is there a more efficient way to access is_packed_sequence here?
     is_packed_sequence = get_args().sft  # SFT always uses packed sequence
     if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence:
-        return empty_batch.values()
+        return (*empty_batch.values(), None)
 
     batch = get_batch_on_this_tp_rank(data_iterator)
     
-    cu_seqlens = batch['cu_seqlens']
-    # Unused at the moment
+    cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    # Support for Hybrid Context Parallel (Unused in this script)
+    # Support for Hybrid Context Parallel
     local_cp_size = batch.pop('local_cp_size', None)
+    if local_cp_size is not None:
+        local_cp_size = int(local_cp_size.item())
 
     if cu_seqlens is not None:
         assert (
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
         cu_seqlens = cu_seqlens[0]
-        batch['cu_seqlens'] = cu_seqlens
+        if cu_seqlens_padded is None:
+            cu_seqlens_padded = cu_seqlens
 
-        max_seqlen = batch['max_seqlen']
-        assert max_seqlen.dim() == 1
-        # TODO(duncan): can this be kept as a 0-D tensor?
-        batch['max_seqlen'] = int(max_seqlen[0].item())
+        max_seqlen = batch.pop('max_seqlen', None)
 
     if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
-        total_tokens = batch['tokens'].size(1)
+        # total_tokens = batch['tokens'].size(1)
+        pass
     elif mpu.is_pipeline_last_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
-        total_tokens = batch['labels'].size(1)
+        # total_tokens = batch['labels'].size(1)
+        pass
     else:  # packed sequence
         empty_batch['cu_seqlens'] = cu_seqlens
         empty_batch['max_seqlen'] = max_seqlen
@@ -121,29 +120,16 @@ def get_batch(data_iterator, vp_stage=None):
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-    else:  # Packed THD format
-        cp_size = get_context_parallel_world_size()
-        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-            assert tex is not None and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 to use "
-                "Context Parallel with THD format data"
-            )
-            cp_rank = get_context_parallel_rank()
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens,
-                total_tokens,
-                cp_size,
-                cp_rank,
-            )
-            for key, data in batch.items():
-                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
-                    continue
-                if data is not None:
-                    # On first PP rank, labels and loss_mask can be None.
-                    # On last PP rank, tokens and position_ids can be None.
-                    batch[key] = data.index_select(1, index)
+        packed_seq_params = None
+    elif local_cp_size is None:  # Packed THD format
+        assert max_seqlen.dim() == 1
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+        total_tokens = batch['tokens'].size(1) if batch['tokens'] is not None else batch['labels'].size(1)
+        packed_seq_params.total_tokens = total_tokens
+    else: # Hybrid CP format
+        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen, local_cp_size)
 
-    return batch.values()
+    return (*batch.values(), packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -229,24 +215,8 @@ def forward_step(data_iterator, model: MambaModel):
             loss_mask,
             attention_mask,
             position_ids,
-            cu_seqlens,
-            max_seqlen,
+            packed_seq_params
         ) = get_batch(data_iterator, vp_stage)
-
-    if cu_seqlens is None:
-        packed_seq_params = None
-    else:
-        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=None,
-            cu_seqlens_kv_padded=None,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-            total_tokens=total_tokens,
-        )
 
     timers('batch-generator').stop()
 
@@ -307,6 +277,9 @@ def core_gpt_dataset_config_from_args(args):
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
         context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size*args.sequence_parallel,
+        hybrid_context_parallel=args.hybrid_context_parallel,
     )
 
 

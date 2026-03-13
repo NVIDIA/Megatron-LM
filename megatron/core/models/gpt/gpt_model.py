@@ -647,6 +647,9 @@ class GPTModel(LanguageModule):
                         runtime_gather_output=runtime_gather_output,
                     )
             else:
+                # For hybrid context parallel, use the dynamic CP sub-group
+                if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                    self.pg_collection.cp = packed_seq_params.cp_group
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
