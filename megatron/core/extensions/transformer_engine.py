@@ -2580,7 +2580,10 @@ try:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.12.0", check_equality=True):
+        if interleaved:
+            assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
+
+        if is_te_min_version("2.3.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
                 freqs,
@@ -2590,6 +2593,16 @@ try:
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 interleaved=interleaved,
+            )        
+        elif is_te_min_version("1.12.0", check_equality=True):
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
             )
         else:
             assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
