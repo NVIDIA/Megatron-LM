@@ -1,0 +1,97 @@
+# Llama 3.1 8B with Megatron-FSDP, mcore, single node
+ENV_VARS:
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+
+# Model Architecture
+  --num-layers: 32
+  --hidden-size: 4096
+  --ffn-hidden-size: 14336
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 8
+  --normalization: RMSNorm
+  --swiglu: true
+  --disable-bias-linear: true
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 1.0
+  --rotary-base: 500000
+  --use-rotary-position-embeddings: true
+  --no-masked-softmax-fusion: true
+  --max-position-embeddings: 8192
+  --seq-length: 2048
+
+# Dataset
+  --tokenizer-type: "NullTokenizer"
+  --vocab-size: 131072
+  --mock-data: true
+  --split: 949,50,1  
+
+# LR
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --lr-decay-iters: 320000
+  --min-lr: 1.0e-5
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --lr-warmup-fraction: .01  
+
+# Parallelism
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+  --use-megatron-fsdp: true
+  --data-parallel-sharding-strategy: "optim_grads_params"
+  --outer-dp-sharding-strategy: "no_shard"
+  --num-distributed-optimizer-instances 2
+
+# Precision
+  --fp8-param: true
+  --fp8-format: "e4m3"
+  --fp8-recipe: "tensorwise"
+  --fp8-param-gather: true
+
+# Trainer Args
+  --micro-batch-size: 1
+  --global-batch-size: 8
+  --train-iters: 50
+  --eval-interval: 1000
+  --eval-iters: 5
+  --exit-interval: 50  
+  --distributed-backend: nccl
+  --use-mcore-models: true
+  --save-interval: 10000
+  --transformer-impl: transformer_engine
+
+  --deterministic-mode: true
+  --ckpt-format: "fsdp_dtensor"
+  --no-gradient-accumulation-fusion: true
+  --attention-softmax-in-fp32: true
+
+# Full Offloading
+  --cpu-offloading: true
+  --cpu-offloading-num-layers: 4
+
+# Full Recompute
+  --recompute-granularity:  "full"
+  --recompute-num-layers: 4
+
+# Logger
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --timing-log-level: 0
+  --log-interval: 1
+  --log-memory-to-tensorboard: true
+
+   
+
+TEST_TYPE: regular
+METRICS:
+  - iteration-time
+  - lm loss
+  - "mem-allocated-bytes"
+
