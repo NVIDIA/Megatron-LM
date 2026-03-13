@@ -504,9 +504,15 @@ class DataParallelInferenceCoordinator:
             finished_request["prompt"] = self.tokenizer.detokenize(
                 finished_request["prompt_tokens"][1]
             )
-        finished_request["generated_text"] = self.tokenizer.detokenize(
-            finished_request["generated_tokens"]
-        )
+        generated_tokens = finished_request["generated_tokens"]
+        termination_id = (finished_request.get("sampling_params", {}) or {}).get("termination_id")
+        while (
+            generated_tokens
+            and termination_id is not None
+            and generated_tokens[-1] == termination_id
+        ):
+            generated_tokens = generated_tokens[:-1]
+        finished_request["generated_text"] = self.tokenizer.detokenize(generated_tokens)
 
     @classmethod
     def entrypoint(

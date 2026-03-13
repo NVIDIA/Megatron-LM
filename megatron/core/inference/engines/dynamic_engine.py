@@ -1638,9 +1638,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt = self.controller.tokenizer.detokenize(
                             request.prompt_tokens.tolist()
                         )
-                    request.generated_text = self.controller.tokenizer.detokenize(
-                        request.generated_tokens
-                    )
+                    generated_tokens = request.generated_tokens
+                    termination_id = request.sampling_params.termination_id
+                    while (
+                        generated_tokens
+                        and termination_id is not None
+                        and generated_tokens[-1] == termination_id
+                    ):
+                        generated_tokens = generated_tokens[:-1]
+                    request.generated_text = self.controller.tokenizer.detokenize(generated_tokens)
             range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
