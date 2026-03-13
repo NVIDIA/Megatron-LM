@@ -28,6 +28,24 @@ MODEL_ARGS:
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
   
+  --deterministic-mode: true
+  --ckpt-format: "fsdp_dtensor"
+  --no-gradient-accumulation-fusion: true
+
+# Precision
+  --fp8-param: true
+  --fp8-format: "e4m3"
+  --fp8-recipe: "tensorwise"
+  --fp8-param-gather: true
+
+# Full Offloading
+  --cpu-offloading: true
+  --cpu-offloading-num-layers: 4
+
+# Full Recompute
+  --recompute-granularity:  "full"
+  --recompute-num-layers: 4
+
 # Training args
   --use-mcore-models: true
   --sequence-parallel: true
@@ -127,7 +145,7 @@ MODEL_ARGS:
   --log-interval: 1
   --logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
-  --bf16: true
+
   --exit-interval: 50
 TEST_TYPE: regular
 METRICS:
