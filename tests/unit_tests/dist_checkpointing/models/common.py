@@ -6,7 +6,6 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
