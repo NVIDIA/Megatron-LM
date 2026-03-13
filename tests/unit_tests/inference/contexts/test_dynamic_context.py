@@ -2066,12 +2066,14 @@ class TestDynamicContext:
         # 3. Call update_requests
         active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
         new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
-        new_spec = torch.tensor([[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cuda')
+        new_spec = torch.tensor(
+            [[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cuda'
+        )
 
         ctx.update_requests(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
-            new_speculative_tokens=new_spec
+            new_speculative_tokens=new_spec,
         )
 
         # 4. Verify Hiding Invariants:
@@ -2167,9 +2169,7 @@ class TestDynamicContext:
 
         # 4. Verify that the new_speculative_tokens tensor itself was swapped so that
         # the hidden state perfectly preserves the alignment for subsequent steps.
-        expected_swapped_spec_tokens = torch.tensor(
-            [[201, 101], [202, 102]], device='cuda'
-        )
+        expected_swapped_spec_tokens = torch.tensor([[201, 101], [202, 102]], device='cuda')
         assert torch.equal(
             new_speculative_tokens, expected_swapped_spec_tokens
         ), "new_speculative_tokens was not swapped in-place alongside the request metadata!"
