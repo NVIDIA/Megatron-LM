@@ -124,14 +124,14 @@ class TestMatchGraphConfigWithEP:
     Uses the world group as the EP group (all 8 GPUs form one EP group).
     """
 
-    def setup_method(self, method):
+    def setup_class(cls):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=Utils.world_size,
         )
 
-    def teardown_method(self, method):
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     @staticmethod
