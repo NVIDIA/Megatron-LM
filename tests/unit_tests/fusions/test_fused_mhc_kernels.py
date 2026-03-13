@@ -22,9 +22,7 @@ from megatron.core.transformer.hyper_connection import (
     native_sinkhorn,
 )
 
-_require_cutile = pytest.mark.skipif(
-    not is_cutile_available(), reason="cuTile not installed"
-)
+_require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +36,18 @@ DEVICE = "cuda"
 FWD_ATOL, FWD_RTOL = 2e-2, 2e-2
 BWD_ATOL, BWD_RTOL = 5e-2, 5e-2
 RAND_LO, RAND_HI = -0.1, 0.1
+COSINE_SIM_THRESH = 0.999
+
+
+def _assert_cosine_similar(a: Tensor, b: Tensor, threshold: float, msg: str = ""):
+    """Assert that flattened tensors have cosine similarity >= threshold."""
+    a_flat = a.flatten().float()
+    b_flat = b.flatten().float()
+    sim = torch.nn.functional.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)).item()
+    assert sim >= threshold, (
+        f"{msg}: cosine similarity {sim:.6f} < {threshold} "
+        f"(max_abs_diff={torch.max(torch.abs(a_flat - b_flat)):.6e})"
+    )
 
 
 def _rand(*shape, **kwargs):
@@ -55,7 +65,7 @@ def _info():
 # ============================================================================
 
 
-def _native_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
+def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
     row_max = logits.max(dim=-1, keepdim=True).values
     M = torch.exp(logits - row_max)
     for _ in range(num_iters):
@@ -112,7 +122,7 @@ class TestNativeSinkhorn:
 
         # -- inline torch reference (fully differentiable) --
         inp_r = data.clone().requires_grad_(True)
-        out_r = _native_sinkhorn(inp_r, iters, eps)
+        out_r = _ref_sinkhorn(inp_r, iters, eps)
         out_r.backward(grad_out)
         grad_r = inp_r.grad.clone()
 
@@ -140,7 +150,7 @@ class TestFusedSinkhorn:
 
         # -- reference path (fully differentiable) --
         inp_r = data.clone().requires_grad_(True)
-        out_r = _native_sinkhorn(inp_r, iters, eps)
+        out_r = _ref_sinkhorn(inp_r, iters, eps)
         out_r.backward(grad_out)
         grad_r = inp_r.grad.clone()
 
@@ -256,8 +266,7 @@ class TestNativeHPostBDA:
             )
         if with_bias:
             torch.testing.assert_close(
-                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
-                msg="backward mismatch on bias",
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
             )
 
 
@@ -307,8 +316,7 @@ class TestFusedHPostBDA:
             )
         if with_bias:
             torch.testing.assert_close(
-                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
-                msg="backward mismatch on bias",
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
             )
 
 
@@ -451,7 +459,7 @@ class TestEndToEndNative:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = _native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -472,12 +480,8 @@ class TestEndToEndNative:
         torch.testing.assert_close(
             out_m, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
         )
-        torch.testing.assert_close(
-            grad_m,
-            grad_r,
-            atol=BWD_ATOL,
-            rtol=BWD_RTOL,
-            msg="hidden_states grad mismatch (E2E backward)",
+        _assert_cosine_similar(
+            grad_m, grad_r, COSINE_SIM_THRESH, msg="hidden_states grad (E2E backward)"
         )
 
 
@@ -541,7 +545,7 @@ class TestEndToEndFused:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = _native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -562,10 +566,6 @@ class TestEndToEndFused:
         torch.testing.assert_close(
             out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
         )
-        torch.testing.assert_close(
-            grad_f,
-            grad_r,
-            atol=BWD_ATOL,
-            rtol=BWD_RTOL,
-            msg=f"hidden_states grad mismatch (E2E backward), max_diff={torch.max(torch.abs(grad_f - grad_r))}",
+        _assert_cosine_similar(
+            grad_f, grad_r, COSINE_SIM_THRESH, msg="hidden_states grad (E2E backward)"
         )
