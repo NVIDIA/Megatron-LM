@@ -61,7 +61,7 @@ except ImportError as import_megatron_fsdp_error:
 
 try:
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
-
+    except (ImportError, ModuleNotFoundError):
     HAVE_TE = True
 except:
     HAVE_TE = False
