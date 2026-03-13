@@ -14,6 +14,8 @@ import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -2186,3 +2188,5 @@ def destroy_model_parallel():
 
     global _global_process_group_list
     _global_process_group_list = None
+
+    SymmetricMemoryManager.destroy()
