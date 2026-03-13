@@ -1216,18 +1216,36 @@ def get_packing_compute_tokens(packing_context: PackingContext) -> int:
 
 
 def get_packing_efficiency(packing_context: PackingContext) -> float:
-    """Get the packing efficiency (actual_tokens / compute_tokens) for this rank.
-    
+    """Get the packing efficiency (actual_tokens / total_capacity) across all DP ranks.
+
     Args:
         packing_context: The PackingContext containing packing information.
-        
+
     Returns:
         Packing efficiency as a float between 0 and 1.
     """
-    actual_tokens = get_packing_actual_tokens(packing_context)
-    compute_tokens = get_packing_compute_tokens(packing_context)
-    
-    if compute_tokens == 0:
+    if packing_context is None or packing_context.packing_info is None:
         return 0.0
-    
-    return actual_tokens / compute_tokens
+
+    total_actual_tokens = sum(packing_context.packing_info.seq_lengths)
+    num_ranks = mpu.get_data_parallel_world_size()
+    bins_per_rank = packing_context.packed_trajs.shape[0] if packing_context.packed_trajs is not None else 0
+    bin_size = packing_context.packed_trajs.shape[1] if packing_context.packed_trajs is not None else 0
+    total_capacity = bins_per_rank * bin_size * num_ranks
+
+    if total_capacity == 0:
+        return 0.0
+
+    return total_actual_tokens / total_capacity
+
+
+def get_packing_avg_seq_length(packing_context: PackingContext) -> float:
+    """Get the average sequence length across all sequences in the packing context."""
+    if packing_context is None or packing_context.packing_info is None:
+        return 0.0
+
+    seq_lengths = packing_context.packing_info.seq_lengths
+    if not seq_lengths or len(seq_lengths) == 0:
+        return 0.0
+
+    return sum(seq_lengths) / len(seq_lengths)

@@ -2283,7 +2283,21 @@ def training_log(
                 log_string += f' actual_toks/s: {actual_tokens_per_sec:.0f} |'
                 log_string += f' actual_toks/s/gpu: {actual_tokens_per_sec_per_gpu:.0f} |'
                 log_string += f' packing_eff: {packing_efficiency:.1%} |'
-        
+
+        # Log avg sequence length (for both packing and non-packing RL paths)
+        if has_rl_utils and getattr(args, 'perform_rl_step', False):
+            runtime_state = rl_utils.get_rl_runtime_state()
+            packing_ctx = runtime_state.packing_context
+            if getattr(args, 'rl_use_sequence_packing', False) and packing_ctx is not None:
+                avg_seq_length = rl_utils.get_packing_avg_seq_length(packing_ctx)
+                packing_eff = rl_utils.get_packing_efficiency(packing_ctx)
+                log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+                log_string += f' packing_eff: {packing_eff:.1%} |'
+            elif args.log_throughput:
+                effective_tokens = batch_size * args.seq_length
+                avg_seq_length = effective_tokens / batch_size if batch_size > 0 else 0.0
+                log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0

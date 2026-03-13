@@ -60,6 +60,7 @@ from megatron.rl.sequence_packing_utils import (
     get_packing_actual_tokens,
     get_packing_compute_tokens,
     get_packing_efficiency,
+    get_packing_avg_seq_length,
     update_microbatch_calculator,
 )
 from megatron.rl.agent.api import (
