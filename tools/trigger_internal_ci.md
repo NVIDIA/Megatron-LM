@@ -36,6 +36,7 @@ export GITLAB_TRIGGER_TOKEN=glptt-<your-token>
 ## Usage
 
 ```bash
+python -m pip install python-gitlab
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \
   [--trigger-token glptt-<your-token>] \
