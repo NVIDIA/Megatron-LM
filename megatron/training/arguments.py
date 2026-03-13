@@ -3149,11 +3149,11 @@ def _add_experimental_args(parser):
                        help="Data type for the main weight buffer utilized for distributed optimization "
                             "and quantization with Megatron-FSDP. If 'auto', then the native model parameter "
                             "data-type will be used for the main weight data-type.")
-    group.add_argument('--megatron-fsdp-main-grads-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16', 'auto'],
+    group.add_argument('--megatron-fsdp-main-grads-dtype', default='auto', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main gradient buffer utilized for distributed optimization "
                             "with Megatron-FSDP. If 'auto', then the native model gradient data-type will "
                             "be used for the main gradient / accumulation data-type.")
-    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='fp32', choices=['fp32', 'fp16', 'bf16', 'auto'],
+    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
                         help="When using Megatron-FSDP, this controls the data-type used when communicating "
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
