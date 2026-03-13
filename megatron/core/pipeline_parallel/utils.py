@@ -176,7 +176,7 @@ class ScheduleNode:
         self.inputs = None
         self.outputs = None
         self.delay_grads_release = False
-        self.manual_release_grads = False
+        self.manual_release_grads = True
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
