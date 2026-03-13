@@ -230,9 +230,7 @@ def get_megatron_muon_optimizer(
                     opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
     nonlinear_init_state_fn = (
-        lion_init_state_fn
-        if config.muon_nonlinear_optimizer == 'lion'
-        else adam_init_state_fn
+        lion_init_state_fn if config.muon_nonlinear_optimizer == 'lion' else adam_init_state_fn
     )
 
     optimizers = []
@@ -351,7 +349,9 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
-    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [nonlinear_init_state_fn]
+    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [
+        nonlinear_init_state_fn
+    ]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:

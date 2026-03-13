@@ -16,14 +16,13 @@ import torch.nn as nn
 from megatron.core.optimizer import (
     HAVE_LION,
     OptimizerConfig,
-    _get_param_groups,
     _get_megatron_optimizer_based_on_param_groups,
+    _get_param_groups,
 )
 from megatron.core.optimizer.optimizer import FP32Optimizer
 
 requires_emerging_optimizers = pytest.mark.skipif(
-    not HAVE_LION,
-    reason="emerging_optimizers package not installed",
+    not HAVE_LION, reason="emerging_optimizers package not installed"
 )
 
 
@@ -124,11 +123,7 @@ class TestLionOptimizerExactness:
 
         model = SimpleModel()
         config = OptimizerConfig(
-            optimizer="lion",
-            lr=3e-4,
-            lion_beta1=0.93,
-            lion_beta2=0.99,
-            weight_decay=0.01,
+            optimizer="lion", lr=3e-4, lion_beta1=0.93, lion_beta2=0.99, weight_decay=0.01
         )
 
         optimizer = _create_lion_optimizer(model, config)
@@ -167,23 +162,14 @@ class TestLionOptimizerExactness:
             assert inner_opt.state[p]["exp_avg"].shape == p.shape
             assert inner_opt.state[p]["exp_avg"].dtype == p.dtype
             torch.testing.assert_close(
-                inner_opt.state[p]["exp_avg"],
-                torch.zeros_like(p.data),
-                atol=0,
-                rtol=0,
+                inner_opt.state[p]["exp_avg"], torch.zeros_like(p.data), atol=0, rtol=0
             )
 
     @pytest.mark.parametrize(
         "lr,beta1,beta2,weight_decay",
-        [
-            (1e-3, 0.95, 0.98, 0.0),
-            (3e-4, 0.9, 0.99, 0.01),
-            (1e-4, 0.85, 0.95, 0.1),
-        ],
+        [(1e-3, 0.95, 0.98, 0.0), (3e-4, 0.9, 0.99, 0.01), (1e-4, 0.85, 0.95, 0.1)],
     )
-    def test_megatron_lion_exact_match_with_standalone(
-        self, lr, beta1, beta2, weight_decay
-    ):
+    def test_megatron_lion_exact_match_with_standalone(self, lr, beta1, beta2, weight_decay):
         """Megatron-plumbed Lion must produce bit-for-bit identical results to standalone Lion.
 
         This is the core correctness test: we run the same forward-backward-step on two
@@ -207,19 +193,12 @@ class TestLionOptimizerExactness:
 
         # Create standalone Lion directly from emerging_optimizers.
         opt_standalone = Lion(
-            model_standalone.parameters(),
-            lr=lr,
-            betas=(beta1, beta2),
-            weight_decay=weight_decay,
+            model_standalone.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=weight_decay
         )
 
         # Create Lion through Megatron's factory.
         config = OptimizerConfig(
-            optimizer="lion",
-            lr=lr,
-            lion_beta1=beta1,
-            lion_beta2=beta2,
-            weight_decay=weight_decay,
+            optimizer="lion", lr=lr, lion_beta1=beta1, lion_beta2=beta2, weight_decay=weight_decay
         )
         megatron_optimizer = _create_lion_optimizer(model_megatron, config)
         opt_megatron = megatron_optimizer.optimizer
@@ -243,11 +222,7 @@ class TestLionOptimizerExactness:
 
             # Verify losses are exactly equal.
             torch.testing.assert_close(
-                loss_standalone,
-                loss_megatron,
-                atol=0,
-                rtol=0,
-                msg=f"Step {step}: losses differ",
+                loss_standalone, loss_megatron, atol=0, rtol=0, msg=f"Step {step}: losses differ"
             )
 
             # Verify all parameters are exactly equal after each step.
@@ -263,9 +238,7 @@ class TestLionOptimizerExactness:
                 )
 
             # Verify optimizer states (exp_avg) are exactly equal.
-            for p_s, p_m in zip(
-                model_standalone.parameters(), model_megatron.parameters()
-            ):
+            for p_s, p_m in zip(model_standalone.parameters(), model_megatron.parameters()):
                 state_s = opt_standalone.state[p_s]
                 state_m = opt_megatron.state[p_m]
                 assert state_s.keys() == state_m.keys(), (
