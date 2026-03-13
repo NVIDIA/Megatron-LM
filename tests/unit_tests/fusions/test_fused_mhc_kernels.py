@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for fused mHC kernels (cuTile) and reference implementations.
+"""Unit tests for fused mHC kernels (cuTile) and native implementations.
 
 Each test compares the fused kernel's forward output AND backward gradients
 against a pure-PyTorch differentiable reference to catch numerical drift
@@ -16,13 +16,15 @@ from torch import Tensor
 
 from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
 from megatron.core.transformer.hyper_connection import (
-    RefHAggregate,
-    RefHPostBDA,
-    RefProjRms,
-    ref_sinkhorn,
+    NativeHAggregate,
+    NativeHPostBDA,
+    NativeProjRms,
+    native_sinkhorn,
 )
 
-_require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
+_require_cutile = pytest.mark.skipif(
+    not is_cutile_available(), reason="cuTile not installed"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +46,7 @@ def _rand(*shape, **kwargs):
 
 
 def _info():
-    backend = "cuTile" if is_cutile_available() else "reference"
+    backend = "cuTile" if is_cutile_available() else "native"
     print(f"\n  [backend: {backend}]")
 
 
@@ -53,7 +55,7 @@ def _info():
 # ============================================================================
 
 
-def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
+def _native_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
     row_max = logits.max(dim=-1, keepdim=True).values
     M = torch.exp(logits - row_max)
     for _ in range(num_iters):
@@ -91,26 +93,26 @@ def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6):
 # ============================================================================
 
 
-class TestRefSinkhorn:
-    """Tests for the reference SinkhornKnopp implementation."""
+class TestNativeSinkhorn:
+    """Tests for the native SinkhornKnopp implementation."""
 
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, iters):
-        """ref_sinkhorn fwd output and bwd grad must match the inline PyTorch reference."""
+        """native_sinkhorn fwd output and bwd grad must match the inline PyTorch reference."""
         _info()
         eps = 1e-6
         data = _rand(s, b, n, n)
         grad_out = _rand(s, b, n, n)
 
-        # -- ref_sinkhorn path (autograd.Function) --
+        # -- native_sinkhorn path (autograd.Function) --
         inp_f = data.clone().requires_grad_(True)
-        out_f = ref_sinkhorn(inp_f, iters, eps)
+        out_f = native_sinkhorn(inp_f, iters, eps)
         out_f.backward(grad_out)
         grad_f = inp_f.grad.clone()
 
         # -- inline torch reference (fully differentiable) --
         inp_r = data.clone().requires_grad_(True)
-        out_r = _ref_sinkhorn(inp_r, iters, eps)
+        out_r = _native_sinkhorn(inp_r, iters, eps)
         out_r.backward(grad_out)
         grad_r = inp_r.grad.clone()
 
@@ -138,7 +140,7 @@ class TestFusedSinkhorn:
 
         # -- reference path (fully differentiable) --
         inp_r = data.clone().requires_grad_(True)
-        out_r = _ref_sinkhorn(inp_r, iters, eps)
+        out_r = _native_sinkhorn(inp_r, iters, eps)
         out_r.backward(grad_out)
         grad_r = inp_r.grad.clone()
 
@@ -151,20 +153,20 @@ class TestFusedSinkhorn:
 # ============================================================================
 
 
-class TestRefHAggregate:
-    """Tests for the reference RefHAggregate module."""
+class TestNativeHAggregate:
+    """Tests for the NativeHAggregate module."""
 
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()
-        ref_mod = RefHAggregate().to(DEVICE)
+        native_mod = NativeHAggregate().to(DEVICE)
         x_data = _rand(s, b, n, C)
         h_data = _rand(s, b, n)
         grad_out = _rand(s, b, C)
 
         xf = x_data.clone().requires_grad_(True)
         hf = h_data.clone().requires_grad_(True)
-        of = ref_mod(xf, hf)
+        of = native_mod(xf, hf)
         of.backward(grad_out)
 
         xr = x_data.clone().requires_grad_(True)
@@ -211,14 +213,14 @@ class TestFusedHAggregate:
 # ============================================================================
 
 
-class TestRefHPostBDA:
-    """Tests for the reference RefHPostBDA module."""
+class TestNativeHPostBDA:
+    """Tests for the NativeHPostBDA module."""
 
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C, with_bias):
         _info()
-        ref_mod = RefHPostBDA().to(DEVICE)
+        native_mod = NativeHPostBDA().to(DEVICE)
         hr_data = _rand(s, b, n, n)
         orig_data = _rand(s, b, n, C)
         hp_data = _rand(s, b, n)
@@ -235,7 +237,7 @@ class TestRefHPostBDA:
             return hr, orig, hp, x, bi
 
         hr_f, orig_f, hp_f, x_f, bi_f = _make_inputs()
-        out_f = ref_mod(hr_f, orig_f, hp_f, x_f, bi_f)
+        out_f = native_mod(hr_f, orig_f, hp_f, x_f, bi_f)
         out_f.backward(grad_out)
 
         hr_r, orig_r, hp_r, x_r, bi_r = _make_inputs()
@@ -254,7 +256,8 @@ class TestRefHPostBDA:
             )
         if with_bias:
             torch.testing.assert_close(
-                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
+                msg="backward mismatch on bias",
             )
 
 
@@ -304,7 +307,8 @@ class TestFusedHPostBDA:
             )
         if with_bias:
             torch.testing.assert_close(
-                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
+                msg="backward mismatch on bias",
             )
 
 
@@ -313,14 +317,14 @@ class TestFusedHPostBDA:
 # ============================================================================
 
 
-class TestRefProjRms:
-    """Tests for the reference RefProjRms module."""
+class TestNativeProjRms:
+    """Tests for the NativeProjRms module."""
 
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
     def test_fwd_bwd_vs_torch_reference(self, M, N, K):
         _info()
         eps = 1e-6
-        ref_mod = RefProjRms().to(DEVICE)
+        native_mod = NativeProjRms().to(DEVICE)
         x_data = _rand(M, K)
         w_data = _rand(N, K)
         grad_proj = _rand(M, N)
@@ -328,7 +332,7 @@ class TestRefProjRms:
 
         xf = x_data.clone().requires_grad_(True)
         wf = w_data.clone().requires_grad_(True)
-        proj_f, r_f = ref_mod(xf, wf, eps)
+        proj_f, r_f = native_mod(xf, wf, eps)
         (proj_f * grad_proj + r_f * grad_r).sum().backward()
 
         xr = x_data.clone().requires_grad_(True)
@@ -387,11 +391,11 @@ class TestFusedProjRms:
 # ============================================================================
 
 
-class TestEndToEndReference:
-    """Full mHC pipeline using reference modules.
+class TestEndToEndNative:
+    """Full mHC pipeline using native modules.
 
     proj_rms -> compute_h -> sinkhorn -> aggregate -> h_post_bda.
-    Compares the reference modules against inline PyTorch reference.
+    Compares the native modules against inline PyTorch reference.
     """
 
     def test_full_pipeline_fwd_bwd(self):
@@ -400,21 +404,21 @@ class TestEndToEndReference:
         eps = 1e-6
         sinkhorn_iters = 5
 
-        ref_proj_rms_mod = RefProjRms().to(DEVICE)
-        ref_h_agg_mod = RefHAggregate().to(DEVICE)
-        ref_hpb_mod = RefHPostBDA().to(DEVICE)
+        native_proj_rms_mod = NativeProjRms().to(DEVICE)
+        native_h_agg_mod = NativeHAggregate().to(DEVICE)
+        native_hpb_mod = NativeHPostBDA().to(DEVICE)
 
         hs_data = _rand(s, b, n * C)
         w_data = _rand(n * n + 2 * n, n * C)
         layer_out_data = _rand(s, b, C)
         layer_bias_data = _rand(C)
 
-        def _run_ref_modules():
+        def _run_native_modules():
             hs = hs_data.clone().requires_grad_(True)
             w = w_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            proj, r = ref_proj_rms_mod(x_2d, w, eps)
+            proj, r = native_proj_rms_mod(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -422,11 +426,11 @@ class TestEndToEndReference:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res = native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
-            aggregated = ref_h_agg_mod(hs.view(s, b, n, C), h_pre)
+            aggregated = native_h_agg_mod(hs.view(s, b, n, C), h_pre)
 
-            output = ref_hpb_mod(
+            output = native_hpb_mod(
                 h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
             )
 
@@ -447,7 +451,7 @@ class TestEndToEndReference:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res = _native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -459,7 +463,7 @@ class TestEndToEndReference:
             loss.backward()
             return output.detach(), aggregated.detach(), hs.grad.clone()
 
-        out_m, agg_m, grad_m = _run_ref_modules()
+        out_m, agg_m, grad_m = _run_native_modules()
         out_r, agg_r, grad_r = _run_inline_ref()
 
         torch.testing.assert_close(
@@ -537,7 +541,7 @@ class TestEndToEndFused:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res = _native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 

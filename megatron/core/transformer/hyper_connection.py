@@ -58,13 +58,13 @@ class SinkhornKnopp(torch.autograd.Function):
         return logits.grad, None, None
 
 
-def ref_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
-    """Reference Sinkhorn-Knopp (autograd.Function wrapper)."""
+def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
+    """Native Sinkhorn-Knopp (autograd.Function wrapper)."""
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
-class RefHAggregate(nn.Module):
-    """Reference n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
+class NativeHAggregate(nn.Module):
+    """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
 
     @torch.compile
     def forward(self, x: Tensor, h_pre: Tensor) -> Tensor:
@@ -72,8 +72,8 @@ class RefHAggregate(nn.Module):
         return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-class RefHPostBDA(nn.Module):
-    """Reference fused H_res @ residual + H_post * (x [+ bias])."""
+class NativeHPostBDA(nn.Module):
+    """Native H_res @ residual + H_post * (x [+ bias])."""
 
     @torch.compile
     def forward(
@@ -96,8 +96,8 @@ class RefHPostBDA(nn.Module):
         return x_expanded + mixed
 
 
-class RefProjRms(nn.Module):
-    """Reference fused projection + RMS normalization."""
+class NativeProjRms(nn.Module):
+    """Native projection + RMS normalization."""
 
     @torch.compile
     def forward(self, x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
@@ -178,10 +178,10 @@ class HyperConnectionModule(MegatronModule):
             self._h_post_bda_op = fused_h_post_bda
             self._proj_rms_op = fused_proj_rms
         else:
-            self._sinkhorn_op = ref_sinkhorn
-            self._h_aggregate_op = RefHAggregate()
-            self._h_post_bda_op = RefHPostBDA()
-            self._proj_rms_op = RefProjRms()
+            self._sinkhorn_op = native_sinkhorn
+            self._h_aggregate_op = NativeHAggregate()
+            self._h_post_bda_op = NativeHPostBDA()
+            self._proj_rms_op = NativeProjRms()
 
         self._init_weights()
 
