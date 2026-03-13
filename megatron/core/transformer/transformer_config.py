@@ -920,6 +920,18 @@ class TransformerConfig(ModelParallelConfig):
     """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
     falling back to TE GroupedGEMM. """
 
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    """Specifies the backend to use for grouped GEMM operations during inference.
+    Options:
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -1158,18 +1170,38 @@ class TransformerConfig(ModelParallelConfig):
                     "Inference-optimized MoE layers do not support padded "
                     "routing map for quantization."
                 )
-            if self.moe_router_dtype != "fp32":
-                raise ValueError(
-                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
-                    "to avoid costly dtype conversions during decode."
-                )
-            if self.gated_linear_unit and self.cuda_graph_impl != "none":
-                raise ValueError(
-                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
-                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
-                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
-                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
-                )
+            if self.inference_grouped_gemm_backend == 'auto':
+                if self.moe_router_dtype != "fp32":
+                    raise ValueError(
+                        "inference_grouped_gemm_backend='auto' requires --moe-router-dtype=fp32 "
+                        "to avoid costly dtype conversions during decode."
+                    )
+                if self.gated_linear_unit and self.cuda_graph_impl == "local":
+                    raise ValueError(
+                        "inference_grouped_gemm_backend='auto' does not yet support CUDA graphs "
+                        "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                        "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                        "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                        "(e.g. squared_relu)."
+                    )
+            
+        
+            assert self.inference_grouped_gemm_backend in (
+                'auto',
+                'torch',
+                'te',
+            ), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")

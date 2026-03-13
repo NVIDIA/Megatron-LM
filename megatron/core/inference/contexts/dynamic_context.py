@@ -573,7 +573,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
-        self.is_symmetric_memory_initialized = False
         self.initialize_all_tensors()
 
         # Print info.
@@ -2851,11 +2850,3 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
         }
-
-    def maybe_initialize_symmetric_memory(self):
-        """
-        Initializes symmetric memory for inference, if not already initialized
-        """
-        if not self.is_symmetric_memory_initialized:
-            parallel_state._set_global_symmetric_memory_buffer()
-            self.is_symmetric_memory_initialized = True

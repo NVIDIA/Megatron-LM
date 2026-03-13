@@ -224,6 +224,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
+        self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -2042,7 +2043,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # We have tried that and it blocks the event loop in megatron-rl.
             global_work, global_consensus = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val
+                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
                 )
             )
         else:
@@ -2062,7 +2063,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
-            await self.world_zmq_communicator.all_reduce_max(1)
+            await self.world_zmq_communicator.all_reduce_max(1, async_op=(not self.use_synchronous_zmq_collectives))
         range_pop()
 
     @trace_async_exceptions
