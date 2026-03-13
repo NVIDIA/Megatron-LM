@@ -5,7 +5,7 @@ import logging
 import time
 from typing import List, Optional, Union
 
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -51,13 +51,16 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_address: str):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
         Args:
             inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
+            deserialize (bool): If True, deserialize completed requests
+                into DynamicInferenceRequest objects. If False (default), return
+                the raw serialized dict for lower overhead.
         """
         assert (
             HAVE_ZMQ
@@ -76,6 +79,7 @@ class InferenceClient:
 
         self._loop = None
         self.socket = socket
+        self.deserialize = deserialize
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
@@ -98,7 +102,8 @@ class InferenceClient:
 
         Returns:
             asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequestRecord` object containing the completed result.
+            `DynamicInferenceRequest` object (if deserialize=True) or a raw
+            serialized dict (if deserialize=False) containing the completed result.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -136,7 +141,9 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
-                    completed_request = DynamicInferenceRequestRecord.deserialize(reply)
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+                    )
                     completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)

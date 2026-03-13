@@ -1623,7 +1623,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
