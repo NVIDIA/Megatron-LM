@@ -14,6 +14,7 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
@@ -93,7 +94,6 @@ def get_gpt_layer_with_inference_submodules(
         backend=backend,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=False,
         use_te_activation_func=False,
     )
@@ -111,7 +111,7 @@ def get_gpt_layer_with_inference_submodules(
             else backend.column_parallel_linear()
         )
         return TransformerLayerSubmodules(
-            input_layernorm=backend.layer_norm(),
+            input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -179,13 +179,13 @@ def get_gpt_layer_with_transformer_engine_submodules(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    mla_down_proj_fusion: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -197,11 +197,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
-        moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
-                                                      Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
+                                               layernorm when backend supports. Otherwise fall back
+                                               to the unfused MLA.
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
@@ -231,7 +232,6 @@ def get_gpt_layer_with_transformer_engine_submodules(
         backend=backend,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
     )
@@ -248,8 +248,47 @@ def get_gpt_layer_with_transformer_engine_submodules(
             if qk_layernorm
             else backend.column_parallel_linear()
         )
+
+        if mla_down_proj_fusion:
+            fuse_input_layernorm = backend.column_parallel_layer_norm_linear() is not None
+            input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
+            down_proj_linear = (
+                backend.column_parallel_layer_norm_linear()
+                if fuse_input_layernorm
+                else backend.linear()
+            )
+            return TransformerLayerSubmodules(
+                input_layernorm=input_layernorm,
+                self_attention=ModuleSpec(
+                    module=FusedMLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=backend.column_parallel_linear(),
+                        linear_qkv_down_proj=down_proj_linear,
+                        linear_q_up_proj=linear_q_up_proj,
+                        linear_kv_up_proj=linear_kv_up_proj,
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map=(
+                    {
+                        "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                    }
+                    if fuse_input_layernorm
+                    else {}
+                ),
+            )
         return TransformerLayerSubmodules(
-            input_layernorm=backend.layer_norm(),
+            input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
                 module=MLASelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -266,7 +305,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         )
@@ -289,7 +328,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
@@ -318,7 +357,6 @@ def get_gpt_layer_local_submodules(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
@@ -334,8 +372,6 @@ def get_gpt_layer_local_submodules(
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
-        moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
-                                                      Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
 
     Returns:
@@ -353,10 +389,10 @@ def get_gpt_layer_local_submodules(
         backend = LocalSpecProvider()
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
-        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False)
+        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
         qk_norm = backend.layer_norm(rms_norm=True, for_qk=True)
     else:
-        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False)
+        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False, has_residual=True)
         qk_norm = backend.layer_norm(rms_norm=False, for_qk=True)
 
     if fp8 is not None:
@@ -366,10 +402,7 @@ def get_gpt_layer_local_submodules(
         )
 
     mlp = get_mlp_module_spec_for_backend(
-        backend=backend,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
     if multi_latent_attention:
@@ -438,7 +471,6 @@ def _get_mlp_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ):
     warnings.warn(
         """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
@@ -446,11 +478,7 @@ def _get_mlp_module_spec(
     )
 
     return get_mlp_module_spec(
-        use_te=use_te,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
-        fp8=fp8,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        use_te=use_te, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=fp8
     )
 
 
@@ -459,7 +487,6 @@ def get_mlp_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
@@ -482,7 +509,6 @@ def get_mlp_module_spec(
         backend=TESpecProvider() if use_te else LocalSpecProvider(),
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
     )
 
@@ -491,7 +517,6 @@ def get_mlp_module_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
 ) -> ModuleSpec:
@@ -520,7 +545,6 @@ def get_mlp_module_spec_for_backend(
             backend=backend,
             num_experts=num_experts,
             moe_grouped_gemm=moe_grouped_gemm,
-            moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
             use_te_activation_func=use_te_activation_func,
         )
 
@@ -541,24 +565,24 @@ def get_gpt_decoder_layer_specs(
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -582,7 +606,6 @@ def get_gpt_decoder_layer_specs(
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
@@ -594,7 +617,6 @@ def get_gpt_decoder_layer_specs(
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,

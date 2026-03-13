@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+from unittest import mock
 
 import pytest
 import torch
@@ -60,6 +61,7 @@ class TestDynamicContext:
         layer_type_list=None,
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
+        num_speculative_tokens=0,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -67,7 +69,11 @@ class TestDynamicContext:
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
             mamba_inference_state_config = MambaInferenceStateConfig(
-                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+                layer_type_list,
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
         else:
             mamba_inference_state_config = None
@@ -89,6 +95,7 @@ class TestDynamicContext:
                 ),
                 block_size_tokens=block_size_tokens,
                 max_tokens=max_tokens,
+                num_speculative_tokens=num_speculative_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
@@ -822,6 +829,10 @@ class TestDynamicContext:
             dynamic_context.request_to_kv_block_ids[i, 0] = initial_blocks[i]
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
+            dynamic_context.request_last_kv_block_id[i] = initial_blocks[i]
+            dynamic_context.request_last_kv_block_offset[i] = 0
+            dynamic_context.request_kv_block_counts[i] = 1
+            dynamic_context.request_in_prefill_status_tensor[i] = 0
             if is_hybrid_model:
                 dynamic_context.mamba_conv_states[:, i, :, :].fill_(
                     float(i + 1)
@@ -910,9 +921,16 @@ class TestDynamicContext:
         for i in range(3):
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
+            dynamic_context.request_last_kv_block_id[i] = dynamic_context.request_to_kv_block_ids[
+                i, dynamic_context.request_kv_block_counts[i] - 1
+            ]
+            dynamic_context.request_last_kv_block_offset[i] = 0
+            dynamic_context.request_in_prefill_status_tensor[i] = 0
             if is_hybrid_model:
                 dynamic_context.mamba_conv_states[:, i, :, :].fill_(float(i + 1))
                 dynamic_context.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
+                dynamic_context.mamba_metadata.request_to_mamba_state_idx[i] = i
+                dynamic_context.mamba_metadata.mamba_state_free_slot_count -= 1
 
         # Create an active_requests_mask where all requests are finished
         active_requests_mask = torch.tensor([0, 0, 0], device=torch.cuda.current_device())
@@ -1238,29 +1256,34 @@ class TestDynamicContext:
 
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
+        params_dtype = torch.float32
 
         if rank == 0:
             mamba_inference_state_config = MambaInferenceStateConfig(
                 [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
         else:
             mamba_inference_state_config = MambaInferenceStateConfig(
                 [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
+                params_dtype,
+                params_dtype,
             )
 
         context = DynamicInferenceContext(
             model_config=TransformerConfig(
-                params_dtype=torch.float32,
+                params_dtype=params_dtype,
                 num_layers=10,
                 kv_channels=64,
                 num_attention_heads=8,
                 pipeline_model_parallel_size=pp_size,
                 tensor_model_parallel_size=1,
-                pipeline_dtype=torch.float32,
+                pipeline_dtype=params_dtype,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=128,
@@ -1309,7 +1332,11 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            layer_type_list,
+            mamba_conv_states_shape,
+            mamba_ssm_states_shape,
+            params_dtype,
+            params_dtype,
         )
 
         context = DynamicInferenceContext(
@@ -1391,8 +1418,9 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     @pytest.mark.parametrize("num_cuda_graphs", [-1, 16, 32])
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 3])
     def test_add_dummy_requests_for_expert_parallel_step_matches_slow_path(
-        self, is_hybrid_model: bool, num_cuda_graphs: int
+        self, is_hybrid_model: bool, num_cuda_graphs: int, num_speculative_tokens: int
     ):
         """The fast path (add_dummy_requests_for_expert_parallel_step) must leave
         the same observable state as the slow path
@@ -1416,10 +1444,12 @@ class TestDynamicContext:
                 else None
             ),
             num_cuda_graphs=num_cuda_graphs,
+            num_speculative_tokens=num_speculative_tokens,
         )
 
         smallest = min(ctx.cuda_graph_batch_dimensions_list)
         N = smallest.decode_req_count
+        T = smallest.token_count  # N * (num_speculative_tokens + 1)
         assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
 
         # --- slow path (reference) ---
@@ -1431,10 +1461,10 @@ class TestDynamicContext:
         slow_request_query_lengths = ctx.request_query_lengths[:N].clone()
         slow_request_kv_length_offsets = ctx.request_kv_length_offsets[:N].clone()
         slow_request_to_kv_block_ids_col0 = ctx.request_to_kv_block_ids[:N, 0].clone()
-        slow_token_to_block_idx = ctx.token_to_block_idx[:N].clone()
-        slow_token_to_local_pos = ctx.token_to_local_position_within_kv_block[:N].clone()
+        slow_token_to_block_idx = ctx.token_to_block_idx[:T].clone()
+        slow_token_to_local_pos = ctx.token_to_local_position_within_kv_block[:T].clone()
         if is_hybrid_model:
-            slow_token_to_request_idx = ctx.token_to_request_idx[:N].clone()
+            slow_token_to_request_idx = ctx.token_to_request_idx[:T].clone()
             slow_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N].clone()
 
         # --- reset and run fast path ---
@@ -1453,13 +1483,13 @@ class TestDynamicContext:
 
         # 3. Token-level state
         dummy_block_idx = ctx.block_allocator.dummy_block_idx
-        assert torch.all(ctx.token_to_block_idx[:N] == dummy_block_idx)
-        assert torch.equal(ctx.token_to_block_idx[:N], slow_token_to_block_idx)
-        assert torch.equal(ctx.token_to_local_position_within_kv_block[:N], slow_token_to_local_pos)
+        assert torch.all(ctx.token_to_block_idx[:T] == dummy_block_idx)
+        assert torch.equal(ctx.token_to_block_idx[:T], slow_token_to_block_idx)
+        assert torch.equal(ctx.token_to_local_position_within_kv_block[:T], slow_token_to_local_pos)
 
         if is_hybrid_model:
             # 4. token_to_request_idx
-            assert torch.equal(ctx.token_to_request_idx[:N], slow_token_to_request_idx)
+            assert torch.equal(ctx.token_to_request_idx[:T], slow_token_to_request_idx)
 
             # 5. Mamba state slots allocated (indices may differ, but must be valid and unique)
             fast_mamba = ctx.mamba_metadata.request_to_mamba_state_idx[:N]
