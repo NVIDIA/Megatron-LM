@@ -126,11 +126,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def dummy_forward(self):
         """Run a dummy forward pass through the model, with a single token.
         Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication."""
+        for the all-to-all communication.
+        Runs under inference_mode so that transformer layers can distinguish this eager
+        dummy_forward from training/validation passes and skip matching on CUDA graphs."""
+
         # we use num_dummy_tokens equal to tensor model parallel size
         # so that the dummy forward pass will work with sequence parallel
         num_dummy_tokens = self.tp_size
@@ -145,6 +148,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.inference_context.is_dynamic_batching()
             and self.inference_context.num_speculative_tokens > 0
         )
+
         return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
 
     def _get_batch_size_and_seq_len(
