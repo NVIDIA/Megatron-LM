@@ -16,9 +16,9 @@ from torch import Tensor
 
 from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
 from megatron.core.transformer.hyper_connection import (
-    NativeHAggregate,
-    NativeHPostBDA,
-    NativeProjRms,
+    native_h_aggregate,
+    native_h_post_bda,
+    native_proj_rms,
     native_sinkhorn,
 )
 
@@ -164,19 +164,18 @@ class TestFusedSinkhorn:
 
 
 class TestNativeHAggregate:
-    """Tests for the NativeHAggregate module."""
+    """Tests for native_h_aggregate."""
 
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()
-        native_mod = NativeHAggregate().to(DEVICE)
         x_data = _rand(s, b, n, C)
         h_data = _rand(s, b, n)
         grad_out = _rand(s, b, C)
 
         xf = x_data.clone().requires_grad_(True)
         hf = h_data.clone().requires_grad_(True)
-        of = native_mod(xf, hf)
+        of = native_h_aggregate(xf, hf)
         of.backward(grad_out)
 
         xr = x_data.clone().requires_grad_(True)
@@ -224,13 +223,12 @@ class TestFusedHAggregate:
 
 
 class TestNativeHPostBDA:
-    """Tests for the NativeHPostBDA module."""
+    """Tests for native_h_post_bda."""
 
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C, with_bias):
         _info()
-        native_mod = NativeHPostBDA().to(DEVICE)
         hr_data = _rand(s, b, n, n)
         orig_data = _rand(s, b, n, C)
         hp_data = _rand(s, b, n)
@@ -247,7 +245,7 @@ class TestNativeHPostBDA:
             return hr, orig, hp, x, bi
 
         hr_f, orig_f, hp_f, x_f, bi_f = _make_inputs()
-        out_f = native_mod(hr_f, orig_f, hp_f, x_f, bi_f)
+        out_f = native_h_post_bda(hr_f, orig_f, hp_f, x_f, bi_f)
         out_f.backward(grad_out)
 
         hr_r, orig_r, hp_r, x_r, bi_r = _make_inputs()
@@ -326,13 +324,12 @@ class TestFusedHPostBDA:
 
 
 class TestNativeProjRms:
-    """Tests for the NativeProjRms module."""
+    """Tests for native_proj_rms."""
 
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
     def test_fwd_bwd_vs_torch_reference(self, M, N, K):
         _info()
         eps = 1e-6
-        native_mod = NativeProjRms().to(DEVICE)
         x_data = _rand(M, K)
         w_data = _rand(N, K)
         grad_proj = _rand(M, N)
@@ -340,7 +337,7 @@ class TestNativeProjRms:
 
         xf = x_data.clone().requires_grad_(True)
         wf = w_data.clone().requires_grad_(True)
-        proj_f, r_f = native_mod(xf, wf, eps)
+        proj_f, r_f = native_proj_rms(xf, wf, eps)
         (proj_f * grad_proj + r_f * grad_r).sum().backward()
 
         xr = x_data.clone().requires_grad_(True)
@@ -412,10 +409,6 @@ class TestEndToEndNative:
         eps = 1e-6
         sinkhorn_iters = 5
 
-        native_proj_rms_mod = NativeProjRms().to(DEVICE)
-        native_h_agg_mod = NativeHAggregate().to(DEVICE)
-        native_hpb_mod = NativeHPostBDA().to(DEVICE)
-
         hs_data = _rand(s, b, n * C)
         w_data = _rand(n * n + 2 * n, n * C)
         layer_out_data = _rand(s, b, C)
@@ -426,7 +419,7 @@ class TestEndToEndNative:
             w = w_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            proj, r = native_proj_rms_mod(x_2d, w, eps)
+            proj, r = native_proj_rms(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -436,9 +429,9 @@ class TestEndToEndNative:
             h_res_logits = h[..., 2 * n :]
             h_res = native_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
-            aggregated = native_h_agg_mod(hs.view(s, b, n, C), h_pre)
+            aggregated = native_h_aggregate(hs.view(s, b, n, C), h_pre)
 
-            output = native_hpb_mod(
+            output = native_h_post_bda(
                 h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
             )
 

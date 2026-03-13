@@ -15,11 +15,6 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
 
-# ============================================================================
-# Reference implementations – forward only (autograd handles backward)
-# ============================================================================
-
-
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
@@ -31,7 +26,7 @@ def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) 
 
 
 class SinkhornKnopp(torch.autograd.Function):
-    """Reference Sinkhorn-Knopp projection to doubly stochastic matrix.
+    """Sinkhorn-Knopp projection to doubly stochastic matrix.
 
     This is an autograd.Function because the iterative forward is re-executed
     during backward (under torch.enable_grad) so that PyTorch's autograd can
@@ -63,51 +58,37 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
-class NativeHAggregate(nn.Module):
+@torch.compile
+def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-
-    @torch.compile
-    def forward(self, x: Tensor, h_pre: Tensor) -> Tensor:
-        """Weighted sum across the n-stream dimension."""
-        return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-class NativeHPostBDA(nn.Module):
+@torch.compile
+def native_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
     """Native H_res @ residual + H_post * (x [+ bias])."""
-
-    @torch.compile
-    def forward(
-        self,
-        h_res: Tensor,
-        original_residual: Tensor,
-        h_post: Tensor,
-        x: Tensor,
-        bias: Optional[Tensor],
-    ) -> Tensor:
-        """Compute H_res @ residual + H_post * (x [+ bias])."""
-        s, b, n, C = original_residual.shape
-        h_res_batched = h_res.view(s * b, n, n)
-        residual_batched = original_residual.view(s * b, n, C)
-        mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
-        x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
-        if bias is not None:
-            bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-            return x_expanded + bias_expanded + mixed
-        return x_expanded + mixed
+    s, b, n, C = original_residual.shape
+    h_res_batched = h_res.view(s * b, n, n)
+    residual_batched = original_residual.view(s * b, n, C)
+    mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+    x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
+    if bias is not None:
+        bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
+        return x_expanded + bias_expanded + mixed
+    return x_expanded + mixed
 
 
-class NativeProjRms(nn.Module):
-    """Native projection + RMS normalization."""
-
-    @torch.compile
-    def forward(self, x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-        """Project x with weight and compute the reciprocal RMS scaling factor."""
-        proj = torch.matmul(x, weight.t())
-        norm = x.norm(dim=-1, keepdim=True)
-        K = x.shape[-1]
-        v = norm / math.sqrt(K) + eps
-        r = 1.0 / v
-        return proj, r
+@torch.compile
+def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+    """Native fused projection + RMS normalization."""
+    proj = torch.matmul(x, weight.t())
+    norm = x.norm(dim=-1, keepdim=True)
+    K = x.shape[-1]
+    v = norm / math.sqrt(K) + eps
+    r = 1.0 / v
+    return proj, r
 
 
 # ============================================================================
@@ -179,9 +160,9 @@ class HyperConnectionModule(MegatronModule):
             self._proj_rms_op = fused_proj_rms
         else:
             self._sinkhorn_op = native_sinkhorn
-            self._h_aggregate_op = NativeHAggregate()
-            self._h_post_bda_op = NativeHPostBDA()
-            self._proj_rms_op = NativeProjRms()
+            self._h_aggregate_op = native_h_aggregate
+            self._h_post_bda_op = native_h_post_bda
+            self._proj_rms_op = native_proj_rms
 
         self._init_weights()
 
