@@ -1446,7 +1446,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if remainder > 0:
                     repeat_counts[-1] += remainder
                 request_ids = torch.arange(
-                    N_decode, N_decode + N_prefill, dtype=self.token_to_request_idx.dtype, device="cpu"
+                    N_decode,
+                    N_decode + N_prefill,
+                    dtype=self.token_to_request_idx.dtype,
+                    device="cpu",
                 )
                 token_request_indices = torch.repeat_interleave(request_ids, repeat_counts)
                 self.token_to_request_idx[
