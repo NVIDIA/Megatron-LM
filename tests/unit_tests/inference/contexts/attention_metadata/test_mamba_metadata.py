@@ -239,9 +239,9 @@ class TestMambaMetadata:
         expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
-        # device_decode_prefill stores [real_decode_count, real_prefill_count].
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 30], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -259,6 +259,34 @@ class TestMambaMetadata:
             [expected_seq_idx_0, expected_seq_idx_1, expected_seq_idx_padding], dim=1
         )
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    @pytest.mark.internal
+    def test_update_mixed_batch_mtp(self, metadata_context):
+        """Test mixed batch with MTP (decode seq_len > 1) to verify token-count split."""
+        # 2 decode requests each with 3 tokens (1 accepted + 2 speculative),
+        # 1 prefill request with 20 tokens.
+        seq_lengths = [3, 3, 20]
+        num_decode = 2
+        padded_dims = InferenceBatchDimensions(
+            token_count=26, prefill_req_count=1, decode_req_count=2
+        )
+
+        self._run_update_test(
+            metadata_context, seq_lengths, num_decode, padded_dims, enable_chunked_prefill=False
+        )
+
+        expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
+        expected_prefill = torch.tensor([2], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
+        # 2 decode requests * 3 tokens each = 6 decode tokens, 20 prefill tokens.
+        expected_device_counts = torch.tensor(
+            [6, 20], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
     @pytest.mark.internal
     def test_update_padded_prefill_and_decode(self, metadata_context):
@@ -286,9 +314,9 @@ class TestMambaMetadata:
         )
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
-        # device_decode_prefill stores [real_decode_count, real_prefill_count].
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
         expected_device_counts = torch.tensor(
-            [1, 1], dtype=torch.int32, device=metadata_context.device
+            [1, 10], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -331,8 +359,9 @@ class TestMambaMetadata:
         expected_prefill = torch.tensor([1, 2], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
         expected_device_counts = torch.tensor(
-            [1, 2], dtype=torch.int32, device=metadata_context.device
+            [1, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -372,8 +401,9 @@ class TestMambaMetadata:
         expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
+        # device_decode_prefill stores [decode_token_count, prefill_token_count].
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 

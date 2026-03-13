@@ -285,8 +285,11 @@ class MambaMetadata:
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = real_decode_count
-            self._device_decode_prefill_buffer[1] = real_prefill_count
+            self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
+            self._device_decode_prefill_buffer[1] = (
+                cu_seqlens[real_decode_count + real_prefill_count]
+                - cu_seqlens[real_decode_count]
+            )
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:
