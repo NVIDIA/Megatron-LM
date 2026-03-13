@@ -543,7 +543,7 @@ if _CUTILE_AVAILABLE:
             g_x_2d = ct.full((1, TILE_C), 0, dtype=hp.dtype)
             g_orig_2d = ct.full((N, TILE_C), 0, dtype=hp.dtype)
             for j in range(N):
-                g_x_2d += ct.extract(hp_2d, (j, 0), shape=(1, 1)).item() * ct.extract(
+                g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
                 g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1)) * ct.extract(
