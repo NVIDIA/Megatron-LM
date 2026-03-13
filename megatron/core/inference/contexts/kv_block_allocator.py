@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import deque
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 from torch import Tensor
@@ -9,7 +9,7 @@ from torch import Tensor
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
 
-class BlockAllocator:
+class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
 
     This allocator is responsible for:
@@ -38,6 +38,7 @@ class BlockAllocator:
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
+        self.on_blocks_deregistered: Optional[Callable] = None
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -58,7 +59,7 @@ class BlockAllocator:
             )
 
             # Hash-to-block mapping for O(1) prefix lookup
-            self.hash_to_block_id: Dict[int, int] = {}
+            self.kv_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
@@ -205,6 +206,19 @@ class BlockAllocator:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
+            elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                # Unregistered blocks (hash == -1, ref_count == 0) have no hash
+                # entry to preserve for reuse (e.g., partial blocks at the end of
+                # a request). Return them directly to the free pool so they are not
+                # leaked.
+                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
+                    self.block_hashes[blocks] == -1
+                )
+                if unreg_mask.any():
+                    unreg_blocks = blocks[unreg_mask]
+                    num_unreg = unreg_blocks.numel()
+                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
+                    self.total_avail += num_unreg
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
@@ -236,7 +250,7 @@ class BlockAllocator:
             self.block_hashes.fill_(-1)
 
             # Reset prefix caching state
-            self.hash_to_block_id.clear()
+            self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -245,7 +259,7 @@ class BlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Args:
@@ -257,7 +271,7 @@ class BlockAllocator:
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
-        self.hash_to_block_id.update(zip(block_hashes, block_ids))
+        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -275,11 +289,16 @@ class BlockAllocator:
         block_ids_i64 = block_ids.to(torch.int64)
         hashes = self.block_hashes[block_ids_i64].tolist()
 
-        # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
+        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
         deque(
-            map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0
+            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
+            maxlen=0,
         )
+
+        # Notify Mamba slot allocator (if wired) to clean up its state
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1

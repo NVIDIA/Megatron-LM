@@ -39,6 +39,9 @@ class MambaInferenceStateConfig:
     ssm_states_dtype: torch.dtype
     """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
 
+    mamba_chunk_size: int = 128
+    """The chunk size used by the Mamba SSM Triton kernels."""
+
     @classmethod
     def from_model(
         cls,
@@ -59,12 +62,18 @@ class MambaInferenceStateConfig:
                 conv_states_dtype = model.config.params_dtype
             if ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
+            mamba_chunk_size = 128
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    mamba_chunk_size = layer.mixer.mamba_chunk_size
+                    break
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
+                mamba_chunk_size=mamba_chunk_size,
             )
         return None
 
@@ -250,6 +259,16 @@ class InferenceConfig:
 
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
+
+    prefix_caching_mamba_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
+    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
+    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    block boundaries are cached and reused across requests with matching prefixes."""
+
+    use_triton_conv1d: bool = False
+    """Use Triton varlen conv1d kernel for Mamba prefill instead of
+    per-request causal_conv1d_fn calls."""
 
     # =================================
     # Logging config

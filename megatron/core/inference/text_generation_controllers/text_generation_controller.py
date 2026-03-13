@@ -762,7 +762,7 @@ class TextGenerationController:
             context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
 
             # Release the blocks back to the allocator
-            context.block_allocator.release_memory_blocks(blocks_to_release)
+            context.kv_block_allocator.release_memory_blocks(blocks_to_release)
 
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
@@ -1791,8 +1791,8 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # No tokens?
-        if context.active_token_count == 0:
+        # No tokens and no active requests?
+        if context.active_token_count == 0 and active_request_count == 0:
             return None
 
         input_ids, position_ids = self._dynamic_step_context_init()
@@ -1809,6 +1809,13 @@ class TextGenerationController:
         # Forward pass produces only base logits. When speculative decoding is
         # active, MTP logits are computed serially after verification.
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # Commit Mamba intermediate states before update_requests, which
+        # may swap request indices. The Python lists tracking EOS block IDs
+        # and intermediate offsets are not swapped along with tensors, so
+        # commit must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()

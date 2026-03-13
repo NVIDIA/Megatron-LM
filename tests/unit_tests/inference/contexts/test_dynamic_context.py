@@ -126,16 +126,16 @@ class TestDynamicContext:
         )
 
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.total_count == 491
-            assert dynamic_context.block_allocator.active_count == 392
+            assert dynamic_context.kv_block_allocator.total_count == 491
+            assert dynamic_context.kv_block_allocator.active_count == 392
             # We make max_requests divisible by the REQUEST_ROUNDER.
             assert dynamic_context.max_requests == 448
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 556
-            assert dynamic_context.block_allocator.active_count == 444
+            assert dynamic_context.kv_block_allocator.total_count == 556
+            assert dynamic_context.kv_block_allocator.active_count == 444
             assert dynamic_context.max_requests == 512
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
@@ -175,13 +175,13 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.block_allocator.total_avail = 10
-        assert dynamic_context.block_allocator.is_memory_available(10)
-        assert not dynamic_context.block_allocator.is_memory_available(11)
+        dynamic_context.kv_block_allocator.total_avail = 10
+        assert dynamic_context.kv_block_allocator.is_memory_available(10)
+        assert not dynamic_context.kv_block_allocator.is_memory_available(11)
 
-        assert dynamic_context.block_allocator.is_memory_available(1)
-        dynamic_context.block_allocator.total_avail = 0
-        assert not dynamic_context.block_allocator.is_memory_available(1)
+        assert dynamic_context.kv_block_allocator.is_memory_available(1)
+        dynamic_context.kv_block_allocator.total_avail = 0
+        assert not dynamic_context.kv_block_allocator.is_memory_available(1)
 
     @pytest.mark.internal
     @rounder_override(1)
@@ -308,11 +308,11 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_block_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_block == 0)
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.active_count == 819
-            assert dynamic_context.block_allocator.total_count == 1024
+            assert dynamic_context.kv_block_allocator.active_count == 819
+            assert dynamic_context.kv_block_allocator.total_count == 1024
         else:
-            assert dynamic_context.block_allocator.active_count == 1517
-            assert dynamic_context.block_allocator.total_count == 1897
+            assert dynamic_context.kv_block_allocator.active_count == 1517
+            assert dynamic_context.kv_block_allocator.total_count == 1897
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
@@ -341,27 +341,27 @@ class TestDynamicContext:
         expected_block_count_avail = expected_memory_blocks[0]
 
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(4)
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(4)
             .cpu()
             .detach()
             .numpy()
             .tolist()
             == expected_memory_blocks
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail
-        dynamic_context.block_allocator.release_memory_blocks(
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail
+        dynamic_context.kv_block_allocator.release_memory_blocks(
             torch.tensor(expected_memory_blocks[-2:], device='cuda')
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 2
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 2
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(1).item()
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(1).item()
             == expected_memory_blocks[-1]
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 1
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 1
         # Should return None since we allocate more blocks than what we have.
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(
-                dynamic_context.block_allocator.total_avail + 100
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(
+                dynamic_context.kv_block_allocator.total_avail + 100
             )
             == None
         )
@@ -471,14 +471,14 @@ class TestDynamicContext:
 
         lengths = [req.remaining_prompt_length for req in requests]
         total_tokens = sum(lengths)
-        block_avail_before = dynamic_context.block_allocator.total_avail
+        block_avail_before = dynamic_context.kv_block_allocator.total_avail
 
         dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
 
         assert dynamic_context.active_token_count == total_tokens
         assert dynamic_context.total_request_count == len(requests)
         assert dynamic_context.num_prefill_requests == 0
-        assert dynamic_context.block_allocator.total_avail == block_avail_before
+        assert dynamic_context.kv_block_allocator.total_avail == block_avail_before
 
         expected_tokens = torch.cat(
             [torch.arange(0, 3, device='cuda'), torch.arange(3, 9, device='cuda')]
@@ -505,7 +505,7 @@ class TestDynamicContext:
             dynamic_context.token_to_local_position_within_kv_block[:total_tokens], expected_local
         )
 
-        dummy_block_idx = dynamic_context.block_allocator.dummy_block_idx
+        dummy_block_idx = dynamic_context.kv_block_allocator.dummy_block_idx
         assert torch.all(dynamic_context.token_to_block_idx[:total_tokens] == dummy_block_idx)
 
         assert torch.equal(
@@ -619,7 +619,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_block_counts[0:3] = 1
-        new_block_ids = dynamic_context.block_allocator.allocate_memory_blocks(3)
+        new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
         dynamic_context.request_to_kv_block_ids[0:3, 0] = new_block_ids
 
         if is_hybrid_model:
@@ -669,16 +669,16 @@ class TestDynamicContext:
             )
 
         total_request_count = 10
-        dynamic_context.block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
+        dynamic_context.kv_block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
         dynamic_context.total_request_count = total_request_count
 
         dynamic_context.request_to_kv_block_ids[0:total_request_count, 0] = torch.arange(
-            dynamic_context.block_allocator.total_avail,
-            dynamic_context.block_allocator.total_avail + 10,
+            dynamic_context.kv_block_allocator.total_avail,
+            dynamic_context.kv_block_allocator.total_avail + 10,
         )
         dynamic_context.request_to_kv_block_ids[3][
             1
-        ] = dynamic_context.block_allocator.total_avail  # Assign one extra block  to request 3.
+        ] = dynamic_context.kv_block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
         # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
         dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
@@ -817,12 +817,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 5 requests
         # Allocate 5 blocks for 5 requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(5)
+        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(5)
         dynamic_context.total_request_count = 5
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.total_avail
+        initial_available_blocks = dynamic_context.kv_block_allocator.total_avail
 
         # Assign blocks to the requests (one block per request)
         for i in range(5):
@@ -857,7 +857,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 2
 
         # Verify that 3 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 3
+        assert dynamic_context.kv_block_allocator.total_avail == initial_available_blocks + 3
 
         if is_hybrid_model:
             # Request at position 3 now moves into finished request position 0
@@ -894,12 +894,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 3 requests, where some use multiple blocks
         # Allocate 6 blocks in total for the requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(6)
+        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(6)
         dynamic_context.total_request_count = 3
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.total_avail
+        initial_available_blocks = dynamic_context.kv_block_allocator.total_avail
 
         # Assign blocks to the requests:
         # - Request 0: 1 block
@@ -946,7 +946,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 0
 
         # Verify that all 6 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
+        assert dynamic_context.kv_block_allocator.total_avail == initial_available_blocks + 6
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1296,7 +1296,7 @@ class TestDynamicContext:
 
         # Collect the total block counts on each rank
         local_total_blocks = torch.tensor(
-            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+            [context.kv_block_allocator.total_count], device='cuda', dtype=torch.long
         )
         gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
         torch.distributed.all_gather(
@@ -1380,8 +1380,8 @@ class TestDynamicContext:
         expected_total_blocks = expected_active_blocks + expected_paused_blocks
 
         # Check that block allocator received the reduced block counts
-        assert context.block_allocator.total_count == expected_active_blocks
-        assert context.block_allocator.paused_count == expected_paused_blocks
+        assert context.kv_block_allocator.total_count == expected_active_blocks
+        assert context.kv_block_allocator.paused_count == expected_paused_blocks
 
         # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
         # or the block count - 1 if that is smaller
@@ -1482,7 +1482,7 @@ class TestDynamicContext:
         assert torch.equal(ctx.request_to_kv_block_ids[:N, 0], slow_request_to_kv_block_ids_col0)
 
         # 3. Token-level state
-        dummy_block_idx = ctx.block_allocator.dummy_block_idx
+        dummy_block_idx = ctx.kv_block_allocator.dummy_block_idx
         assert torch.all(ctx.token_to_block_idx[:T] == dummy_block_idx)
         assert torch.equal(ctx.token_to_block_idx[:T], slow_token_to_block_idx)
         assert torch.equal(ctx.token_to_local_position_within_kv_block[:T], slow_token_to_local_pos)

@@ -1479,7 +1479,7 @@ class TestDynamicInferenceEngine:
                                             So we reduce chunk to 254.
             3. Chunk 2   (Remaining 0)
         """
-        chunk_size = 256
+        prefill_chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
         # 256 + 256 = 512
         prompt_len = 512
@@ -1489,7 +1489,7 @@ class TestDynamicInferenceEngine:
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=513,
-            context_max_tokens=chunk_size,
+            context_max_tokens=prefill_chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
             enable_chunked_prefill=True,
@@ -1791,7 +1791,7 @@ class TestDynamicInferenceEngine:
             )
             assert context.max_requests == 4
             assert step_count == 34
-        assert context.block_allocator.active_count == 655
+        assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal
     @pytest.mark.skipif(

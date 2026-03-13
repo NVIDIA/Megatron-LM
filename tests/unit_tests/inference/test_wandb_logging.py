@@ -149,7 +149,7 @@ class TestInferenceWandbLogging:
         # Verify relationship: allocated_blocks + block_count_avail + 1 (dummy) = total
         assert (
             stats_after['allocated_blocks'] + stats_after['block_count_avail'] + 1
-            == dynamic_context.block_allocator.total_count
+            == dynamic_context.kv_block_allocator.total_count
         )
 
         # Verify utilization bounds [0, 1]
