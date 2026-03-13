@@ -87,16 +87,16 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
         if self.train_on_assistant_responses_only:
             self.role_start_tokens = {
-                "system": self.tokenizer.encode(self.chat_template_config.system_start_str, add_special_tokens=False),
-                "user": self.tokenizer.encode(self.chat_template_config.user_start_str, add_special_tokens=False),
-                "assistant": self.tokenizer.encode(self.chat_template_config.assistant_start_str, add_special_tokens=False),
+                "system": self.tokenizer.tokenize(self.chat_template_config.system_start_str),
+                "user": self.tokenizer.tokenize(self.chat_template_config.user_start_str),
+                "assistant": self.tokenizer.tokenize(self.chat_template_config.assistant_start_str),
             }
-            self.end_tokens = self.tokenizer.encode(self.chat_template_config.end_str, add_special_tokens=False)
-            self.think_start_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_start_str)
-            self.think_end_id = self.tokenizer.convert_tokens_to_ids(self.chat_template_config.think_end_str)
-            self.tool_call_start_tokens = self.tokenizer.encode(self.chat_template_config.tool_call_start_str, add_special_tokens=False)
-            self.tool_call_end_tokens = self.tokenizer.encode(self.chat_template_config.tool_call_end_str, add_special_tokens=False)
-            self.tool_response_start_tokens = self.tokenizer.encode(self.chat_template_config.tool_response_start_str, add_special_tokens=False)
+            self.end_tokens = self.tokenizer.tokenize(self.chat_template_config.end_str)
+            self.think_start_id = self.tokenizer.tokenize(self.chat_template_config.think_start_str)[0]
+            self.think_end_id = self.tokenizer.tokenize(self.chat_template_config.think_end_str)[0]
+            self.tool_call_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_start_str)
+            self.tool_call_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_end_str)
+            self.tool_response_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_start_str)
 
 
 class SFTDataset(MegatronDataset):
