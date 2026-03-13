@@ -525,18 +525,23 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
-    def _mcore_fused_moe_forward(self, hidden_states, routing_map, probs):
-        """Torch grouped_mm fused MoE for CUDA-graphed inference iterations."""
+    def _mcore_fused_moe_forward(
+        self, hidden_states, probs,
+        routing_map=None, tokens_per_expert=None, skip_permute=False,
+    ):
+        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
-            routing_map,
             probs,
             self._fc1_weight,
             self._fc2_weight,
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
+            routing_map=routing_map,
+            tokens_per_expert=tokens_per_expert,
+            skip_permute=skip_permute,
         )
         return output, None
 
@@ -742,11 +747,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     "routing_map is required for mcore_fused_moe forward pass."
                 )
                 return self._mcore_fused_moe_forward(
-                    permuted_local_hidden_states, routing_map, permuted_probs
+                    permuted_local_hidden_states, permuted_probs,
+                    routing_map=routing_map,
                 )
             else:
-                return self._torch_grouped_mm_forward(
-                    permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                return self._mcore_fused_moe_forward(
+                    permuted_local_hidden_states, permuted_probs,
+                    tokens_per_expert=tokens_per_expert,
+                    skip_permute=True,
                 )
         elif resolved_backend == InferenceGroupedGemmBackend.TE:
             return super().forward(

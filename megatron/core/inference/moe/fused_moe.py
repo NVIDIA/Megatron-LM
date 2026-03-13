@@ -10,7 +10,10 @@ from typing import Callable
 
 import torch
 
+from typing import Optional
+
 from megatron.core.inference.moe.activations import padded_squared_relu, padded_swiglu
+from megatron.core.inference.moe.pad import pad_to_alignment, unpad_from_alignment
 from megatron.core.inference.moe.permute import permute_tokens, unpermute_tokens
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -68,25 +71,38 @@ def _get_activation_func(
 
 def mcore_fused_moe(
     hidden_states: torch.Tensor,
-    routing_map: torch.Tensor,
     probs: torch.Tensor,
     fc1_weight,
     fc2_weight,
     activation_type: ActivationType,
     num_local_experts: int,
     local_expert_start: int,
+    routing_map: Optional[torch.Tensor] = None,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    skip_permute: bool = False,
 ) -> torch.Tensor:
-    """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
+    """Fused MoE: [permute ->] pad -> FC1 -> activation -> FC2 -> unpad [-> unpermute].
+
+    Two modes:
+    - skip_permute=False (default): tokens are unpermuted. Requires routing_map.
+      Performs full permute -> compute -> unpermute.
+    - skip_permute=True: tokens are already permuted by the dispatcher. Requires
+      tokens_per_expert. Pads to alignment, computes, then unpads. Probs are
+      applied during unpad.
 
     Args:
         hidden_states: [num_tokens, hidden_size] BF16 input.
-        routing_map: [num_tokens, topk] int expert assignments.
-        probs: [num_tokens, topk] float32 routing probabilities.
+        probs: routing probabilities. Shape is [num_tokens, topk] when
+            skip_permute=False, or [num_tokens] (already gathered) when
+            skip_permute=True.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
         activation_type: ActivationType enum (SWIGLU or SQUARED_RELU).
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
+        routing_map: [num_tokens, topk] int expert assignments. Required when skip_permute=False.
+        tokens_per_expert: [num_local_experts] int32 token counts. Required when skip_permute=True.
+        skip_permute: if True, skip permute/unpermute (tokens already in expert order).
 
     Returns:
         [num_tokens, hidden_size] BF16 output.
@@ -111,21 +127,42 @@ def mcore_fused_moe(
         mm_fn = _bf16_grouped_mm
         expert_alignment = 16
 
-    # --- Permute ---
-    permuted_hidden, permuted_probs, permutation_map, offs = permute_tokens(
-        hidden_states, probs, routing_map,
-        local_expert_start, num_local_experts,
-        alignment=expert_alignment,
-    )
+    # --- Pre-processing: permute or pad ---
+    if skip_permute:
+        assert tokens_per_expert is not None, (
+            "tokens_per_expert is required when skip_permute=True"
+        )
+        tokens_per_expert = tokens_per_expert.cuda().int()
+        assert routing_map is None, (
+            "routing_map must be None when skip_permute=True"
+        )
+        work_hidden, permutation_map, offs = pad_to_alignment(
+            hidden_states, tokens_per_expert, expert_alignment,
+        )
+        permuted_probs = None
+
+    else:
+        assert routing_map is not None, (
+            "routing_map is required when skip_permute=False"
+        )
+        work_hidden, permuted_probs, permutation_map, offs = permute_tokens(
+            hidden_states, probs, routing_map,
+            local_expert_start, num_local_experts,
+            alignment=expert_alignment,
+        )
 
     # --- FC1 -> activation -> FC2 ---
-    if use_mxfp8: 
-        permuted_hidden = MXFP8Tensor.from_bf16(permuted_hidden, backend="triton")
-    fc1_output = mm_fn(permuted_hidden, fc1_weight, offs)
+    if use_mxfp8:
+        work_hidden = MXFP8Tensor.from_bf16(work_hidden, backend="triton")
+    fc1_output = mm_fn(work_hidden, fc1_weight, offs)
     activated = activation_func(fc1_output, permutation_map)
-    if use_mxfp8: 
+    if use_mxfp8:
         activated = MXFP8Tensor.from_bf16(activated, backend="triton")
     fc2_output = mm_fn(activated, fc2_weight, offs)
 
-    # --- Unpermute ---
-    return unpermute_tokens(fc2_output, permuted_probs, permutation_map, num_tokens)
+    # --- Post-processing: unpermute or unpad ---
+    if skip_permute:
+        probs_1d = probs.squeeze(-1) if probs.dim() > 1 else probs
+        return unpad_from_alignment(fc2_output, permutation_map, num_tokens, probs=probs_1d)
+    else:
+        return unpermute_tokens(fc2_output, permuted_probs, permutation_map, num_tokens)
