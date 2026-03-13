@@ -197,6 +197,20 @@ class MegatronFSDP(torch.nn.Module):
                 "the device used by corresponding Tensors during "
                 "operations of the module forward pass."
             )
+        # If the module already contains meta tensors, we must use the meta-device
+        # initialization path. Calling module.to(device) on meta tensors raises:
+        # "Cannot copy out of meta tensor; no data!".
+        has_meta_tensors = any(p.is_meta for p in module.parameters()) or any(
+            b.is_meta for b in module.buffers()
+        )
+        if has_meta_tensors and not init_model_with_meta_device:
+            logger.warning(
+                "[Megatron-FSDP] Detected meta tensors in the incoming module while "
+                "init_model_with_meta_device=False. Enabling meta-device init path "
+                "automatically to avoid invalid module.to() on meta tensors."
+            )
+            init_model_with_meta_device = True
+
         # Only map the module to the device if the original device argument is not None,
         # otherwise Megatron-FSDP will proceed with the existing module and send the model
         # weights to the current device via copy during initialization.
