@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for fused mHC kernels (cuTile / torch.compile fallback).
+"""Unit tests for fused mHC kernels (cuTile) and reference implementations.
 
 Each test compares the fused kernel's forward output AND backward gradients
 against a pure-PyTorch differentiable reference to catch numerical drift
@@ -14,13 +14,15 @@ import pytest
 import torch
 from torch import Tensor
 
-from megatron.core.fusions.fused_mhc_kernels import (
-    fused_h_aggregate,
-    fused_h_post_bda,
-    fused_proj_rms,
-    fused_sinkhorn,
-    is_cutile_available,
+from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
+from megatron.core.transformer.hyper_connection import (
+    RefHAggregate,
+    RefHPostBDA,
+    RefProjRms,
+    ref_sinkhorn,
 )
+
+_require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +44,7 @@ def _rand(*shape, **kwargs):
 
 
 def _info():
-    backend = "cuTile" if is_cutile_available() else "torch.compile"
+    backend = "cuTile" if is_cutile_available() else "reference"
     print(f"\n  [backend: {backend}]")
 
 
@@ -51,21 +53,19 @@ def _info():
 # ============================================================================
 
 
-@torch.compile
-def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-8) -> Tensor:
-    M = torch.exp(logits)
+def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
+    row_max = logits.max(dim=-1, keepdim=True).values
+    M = torch.exp(logits - row_max)
     for _ in range(num_iters):
         M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
         M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
     return M
 
 
-@torch.compile
 def _ref_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-@torch.compile
 def _ref_h_post_bda(
     h_res: Tensor, orig_res: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
@@ -78,8 +78,7 @@ def _ref_h_post_bda(
     return out
 
 
-@torch.compile
-def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-8):
+def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6):
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
@@ -92,12 +91,42 @@ def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-8):
 # ============================================================================
 
 
+class TestRefSinkhorn:
+    """Tests for the reference SinkhornKnopp implementation."""
+
+    @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
+    def test_fwd_bwd_vs_torch_reference(self, s, b, n, iters):
+        """ref_sinkhorn fwd output and bwd grad must match the inline PyTorch reference."""
+        _info()
+        eps = 1e-6
+        data = _rand(s, b, n, n)
+        grad_out = _rand(s, b, n, n)
+
+        # -- ref_sinkhorn path (autograd.Function) --
+        inp_f = data.clone().requires_grad_(True)
+        out_f = ref_sinkhorn(inp_f, iters, eps)
+        out_f.backward(grad_out)
+        grad_f = inp_f.grad.clone()
+
+        # -- inline torch reference (fully differentiable) --
+        inp_r = data.clone().requires_grad_(True)
+        out_r = _ref_sinkhorn(inp_r, iters, eps)
+        out_r.backward(grad_out)
+        grad_r = inp_r.grad.clone()
+
+        torch.testing.assert_close(out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(grad_f, grad_r, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+
 class TestFusedSinkhorn:
+    @_require_cutile
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
-        """E2E: fwd output and bwd grad must match the PyTorch reference."""
+        """E2E: fused cuTile fwd output and bwd grad must match the PyTorch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_sinkhorn
+
         _info()
-        eps = 1e-8
+        eps = 1e-6
         data = _rand(s, b, n, n)
         grad_out = _rand(s, b, n, n)
 
@@ -122,10 +151,39 @@ class TestFusedSinkhorn:
 # ============================================================================
 
 
+class TestRefHAggregate:
+    """Tests for the reference RefHAggregate module."""
+
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
+    def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
+        _info()
+        ref_mod = RefHAggregate().to(DEVICE)
+        x_data = _rand(s, b, n, C)
+        h_data = _rand(s, b, n)
+        grad_out = _rand(s, b, C)
+
+        xf = x_data.clone().requires_grad_(True)
+        hf = h_data.clone().requires_grad_(True)
+        of = ref_mod(xf, hf)
+        of.backward(grad_out)
+
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        oref = _ref_h_aggregate(xr, hr)
+        oref.backward(grad_out)
+
+        torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+
 class TestFusedHAggregate:
+    @_require_cutile
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_reference(self, s, b, n, C):
-        """E2E: fwd output and bwd grads must match the PyTorch reference."""
+        """E2E: fused cuTile fwd output and bwd grads must match the PyTorch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
         _info()
         x_data = _rand(s, b, n, C)
         h_data = _rand(s, b, n)
@@ -153,11 +211,61 @@ class TestFusedHAggregate:
 # ============================================================================
 
 
+class TestRefHPostBDA:
+    """Tests for the reference RefHPostBDA module."""
+
+    @pytest.mark.parametrize("with_bias", [True, False])
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
+    def test_fwd_bwd_vs_torch_reference(self, s, b, n, C, with_bias):
+        _info()
+        ref_mod = RefHPostBDA().to(DEVICE)
+        hr_data = _rand(s, b, n, n)
+        orig_data = _rand(s, b, n, C)
+        hp_data = _rand(s, b, n)
+        x_data = _rand(s, b, C)
+        bias_data = _rand(C) if with_bias else None
+        grad_out = _rand(s, b, n, C)
+
+        def _make_inputs():
+            hr = hr_data.clone().requires_grad_(True)
+            orig = orig_data.clone().requires_grad_(True)
+            hp = hp_data.clone().requires_grad_(True)
+            x = x_data.clone().requires_grad_(True)
+            bi = bias_data.clone().requires_grad_(True) if with_bias else None
+            return hr, orig, hp, x, bi
+
+        hr_f, orig_f, hp_f, x_f, bi_f = _make_inputs()
+        out_f = ref_mod(hr_f, orig_f, hp_f, x_f, bi_f)
+        out_f.backward(grad_out)
+
+        hr_r, orig_r, hp_r, x_r, bi_r = _make_inputs()
+        out_r = _ref_h_post_bda(hr_r, orig_r, hp_r, x_r, bi_r)
+        out_r.backward(grad_out)
+
+        torch.testing.assert_close(out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        for name, gf, gr in [
+            ("h_res", hr_f.grad, hr_r.grad),
+            ("orig_res", orig_f.grad, orig_r.grad),
+            ("h_post", hp_f.grad, hp_r.grad),
+            ("x", x_f.grad, x_r.grad),
+        ]:
+            torch.testing.assert_close(
+                gf, gr, atol=BWD_ATOL, rtol=BWD_RTOL, msg=f"backward mismatch on {name}"
+            )
+        if with_bias:
+            torch.testing.assert_close(
+                bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
+            )
+
+
 class TestFusedHPostBDA:
+    @_require_cutile
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
     def test_fwd_bwd_vs_reference(self, s, b, n, C, with_bias):
-        """E2E: fwd output and bwd grads must match the PyTorch reference."""
+        """E2E: fused cuTile fwd output and bwd grads must match the PyTorch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
+
         _info()
         hr_data = _rand(s, b, n, n)
         orig_data = _rand(s, b, n, C)
@@ -205,12 +313,48 @@ class TestFusedHPostBDA:
 # ============================================================================
 
 
+class TestRefProjRms:
+    """Tests for the reference RefProjRms module."""
+
+    @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
+    def test_fwd_bwd_vs_torch_reference(self, M, N, K):
+        _info()
+        eps = 1e-6
+        ref_mod = RefProjRms().to(DEVICE)
+        x_data = _rand(M, K)
+        w_data = _rand(N, K)
+        grad_proj = _rand(M, N)
+        grad_r = _rand(M, 1)
+
+        xf = x_data.clone().requires_grad_(True)
+        wf = w_data.clone().requires_grad_(True)
+        proj_f, r_f = ref_mod(xf, wf, eps)
+        (proj_f * grad_proj + r_f * grad_r).sum().backward()
+
+        xr = x_data.clone().requires_grad_(True)
+        wr = w_data.clone().requires_grad_(True)
+        proj_r, r_r = _ref_proj_rms(xr, wr, eps)
+        (proj_r * grad_proj + r_r * grad_r).sum().backward()
+
+        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(
+            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
+        )
+        torch.testing.assert_close(
+            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
+        )
+
+
 class TestFusedProjRms:
+    @_require_cutile
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
     def test_fwd_bwd_vs_reference(self, M, N, K):
-        """E2E: fwd output and bwd grads must match the PyTorch reference."""
+        """E2E: fused cuTile fwd output and bwd grads must match the PyTorch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms
+
         _info()
-        eps = 1e-8
+        eps = 1e-6
         x_data = _rand(M, K)
         w_data = _rand(N, K)
         grad_proj = _rand(M, N)
@@ -243,15 +387,108 @@ class TestFusedProjRms:
 # ============================================================================
 
 
-class TestEndToEnd:
-    """Full mHC pipeline: proj_rms -> compute_h -> sinkhorn -> aggregate -> h_post_bda.
+class TestEndToEndReference:
+    """Full mHC pipeline using reference modules.
 
-    Runs the fused path and a pure-PyTorch reference path in lock-step, then
-    compares both the final forward output and the gradients back to the input
-    hidden_states.
+    proj_rms -> compute_h -> sinkhorn -> aggregate -> h_post_bda.
+    Compares the reference modules against inline PyTorch reference.
     """
 
     def test_full_pipeline_fwd_bwd(self):
+        _info()
+        s, b, n, C = 2, 4, 4, 1024
+        eps = 1e-6
+        sinkhorn_iters = 5
+
+        ref_proj_rms_mod = RefProjRms().to(DEVICE)
+        ref_h_agg_mod = RefHAggregate().to(DEVICE)
+        ref_hpb_mod = RefHPostBDA().to(DEVICE)
+
+        hs_data = _rand(s, b, n * C)
+        w_data = _rand(n * n + 2 * n, n * C)
+        layer_out_data = _rand(s, b, C)
+        layer_bias_data = _rand(C)
+
+        def _run_ref_modules():
+            hs = hs_data.clone().requires_grad_(True)
+            w = w_data.clone().requires_grad_(True)
+
+            x_2d = hs.reshape(s * b, n * C)
+            proj, r = ref_proj_rms_mod(x_2d, w, eps)
+            proj = proj.view(s, b, -1)
+            r = r.view(s, b, 1)
+
+            h = r * proj
+            h_pre = h[..., :n].sigmoid()
+            h_post = h[..., n : 2 * n].sigmoid() * 2
+            h_res_logits = h[..., 2 * n :]
+            h_res = ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+
+            aggregated = ref_h_agg_mod(hs.view(s, b, n, C), h_pre)
+
+            output = ref_hpb_mod(
+                h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
+            )
+
+            loss = output.sum() + aggregated.sum()
+            loss.backward()
+            return output.detach(), aggregated.detach(), hs.grad.clone()
+
+        def _run_inline_ref():
+            hs = hs_data.clone().requires_grad_(True)
+            w = w_data.clone().requires_grad_(True)
+
+            x_2d = hs.reshape(s * b, n * C)
+            proj, r = _ref_proj_rms(x_2d, w, eps)
+            proj = proj.view(s, b, -1)
+            r = r.view(s, b, 1)
+
+            h = r * proj
+            h_pre = h[..., :n].sigmoid()
+            h_post = h[..., n : 2 * n].sigmoid() * 2
+            h_res_logits = h[..., 2 * n :]
+            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+
+            aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
+
+            output = _ref_h_post_bda(
+                h_res, hs.view(s, b, n, C), h_post, layer_out_data, layer_bias_data
+            )
+
+            loss = output.sum() + aggregated.sum()
+            loss.backward()
+            return output.detach(), aggregated.detach(), hs.grad.clone()
+
+        out_m, agg_m, grad_m = _run_ref_modules()
+        out_r, agg_r, grad_r = _run_inline_ref()
+
+        torch.testing.assert_close(
+            agg_m, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated output mismatch"
+        )
+        torch.testing.assert_close(
+            out_m, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
+        )
+        torch.testing.assert_close(
+            grad_m,
+            grad_r,
+            atol=BWD_ATOL,
+            rtol=BWD_RTOL,
+            msg="hidden_states grad mismatch (E2E backward)",
+        )
+
+
+class TestEndToEndFused:
+    """Full mHC pipeline using fused cuTile kernels (requires cuTile)."""
+
+    @_require_cutile
+    def test_full_pipeline_fwd_bwd(self):
+        from megatron.core.fusions.fused_mhc_kernels import (
+            fused_h_aggregate,
+            fused_h_post_bda,
+            fused_proj_rms,
+            fused_sinkhorn,
+        )
+
         _info()
         s, b, n, C = 2, 4, 4, 1024
         eps = 1e-6
@@ -275,7 +512,7 @@ class TestEndToEnd:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters)
+            h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -300,7 +537,7 @@ class TestEndToEnd:
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
-            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters)
+            h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -326,5 +563,5 @@ class TestEndToEnd:
             grad_r,
             atol=BWD_ATOL,
             rtol=BWD_RTOL,
-            msg=f"hidden_states grad mismatch (E2E backward), max diff: {grad_f.max() - grad_r.max()}",
+            msg=f"hidden_states grad mismatch (E2E backward), max_diff={torch.max(torch.abs(grad_f - grad_r))}",
         )

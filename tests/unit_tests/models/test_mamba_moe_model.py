@@ -263,6 +263,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tp_only_amax_red": False,
     "transformer_impl": "transformer_engine",
     "use_cpu_initialization": None,
+    "use_fused_mhc": False,
     "use_fused_weighted_squared_relu": False,
     "use_inference_optimized_layers": False,
     "use_kitchen": False,

@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Fused kernels for mHC (Manifold-Constrained Hyper-Connections).
+"""Fused cuTile kernels for mHC (Manifold-Constrained Hyper-Connections).
 
-Uses cuTile (cuda.tile) fused kernels by default for optimal performance on
-supported GPUs (compute capability 10.x+). Falls back to torch.compile
-reference implementations if cuTile is not installed.
+Requires cuda.tile (cuTile) for optimal performance on supported GPUs
+(compute capability 10.x+).  Reference (non-fused) implementations live in
+``megatron.core.transformer.hyper_connection`` and are used when cuTile is
+unavailable or when the ``use_fused_mhc`` config flag is False.
 
 Four fused operations:
   - sinkhorn:     Sinkhorn-Knopp projection to doubly stochastic matrix
@@ -14,7 +15,6 @@ Four fused operations:
 """
 
 import math
-import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -31,169 +31,10 @@ try:
 except ImportError:
     pass
 
-if not _CUTILE_AVAILABLE:
-    warnings.warn(
-        "cuda.tile (cuTile) is not available. mHC fused kernels will use "
-        "torch.compile reference implementations. Performance may be degraded. "
-        "Install cuda-tile[tileiras] for optimal performance on supported GPUs.",
-        UserWarning,
-        stacklevel=2,
-    )
-
 
 def is_cutile_available() -> bool:
     """Return True if cuTile fused kernels are available."""
     return _CUTILE_AVAILABLE
-
-
-# ============================================================================
-# Reference implementations (torch.compile fallback)
-# ============================================================================
-
-
-# -- Sinkhorn ----------------------------------------------------------------
-def _ref_sinkhorn_fwd(
-    input_logits: Tensor, num_iterations: int, eps: float = 1e-8
-) -> Tuple[Tensor, Tensor]:
-    M_init = torch.exp(input_logits)
-    M = M_init
-    for _ in range(num_iterations):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
-    return M, M_init
-
-
-def _ref_sinkhorn_bwd(
-    grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
-) -> Tensor:
-    with torch.enable_grad():
-        M_input = M_init.detach().requires_grad_(True)
-        M_current = M_input
-        for _ in range(num_iterations):
-            M_current = M_current / M_current.sum(dim=-1, keepdim=True).clamp(min=eps)
-            M_current = M_current / M_current.sum(dim=-2, keepdim=True).clamp(min=eps)
-        (grad_M_init,) = torch.autograd.grad(
-            outputs=M_current,
-            inputs=M_input,
-            grad_outputs=grad_output,
-            create_graph=False,
-            retain_graph=False,
-        )
-    return grad_M_init * M_init
-
-
-# -- H_aggregate -------------------------------------------------------------
-def _ref_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
-
-
-def _ref_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
-    with torch.enable_grad():
-        x_in = x.detach().requires_grad_(True)
-        h_in = h_pre.detach().requires_grad_(True)
-        out = (x_in * h_in.unsqueeze(-1)).sum(dim=2)
-        grad_x, grad_h = torch.autograd.grad(
-            outputs=out,
-            inputs=[x_in, h_in],
-            grad_outputs=grad_output,
-            create_graph=False,
-            retain_graph=False,
-        )
-    return grad_x, grad_h
-
-
-# -- H_post BDA --------------------------------------------------------------
-def _ref_h_post_bda_fwd(
-    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
-) -> Tensor:
-    s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
-    x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
-    if bias is not None:
-        bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
-
-
-def _ref_h_post_bda_bwd(
-    grad_output: Tensor,
-    h_res: Tensor,
-    original_residual: Tensor,
-    h_post: Tensor,
-    x: Tensor,
-    bias: Optional[Tensor],
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
-    s, b, n, C = original_residual.shape
-    with torch.enable_grad():
-        h_res_in = h_res.detach().requires_grad_(True)
-        res_in = original_residual.detach().requires_grad_(True)
-        hp_in = h_post.detach().requires_grad_(True)
-        x_in = x.detach().requires_grad_(True)
-        bias_in = bias.detach().requires_grad_(True) if bias is not None else None
-
-        h_batched = h_res_in.view(s * b, n, n)
-        r_batched = res_in.view(s * b, n, C)
-        mixed = torch.bmm(h_batched, r_batched).view(s, b, n, C)
-        x_exp = hp_in.unsqueeze(-1) * x_in.unsqueeze(2)
-
-        if bias_in is not None:
-            b_exp = hp_in.unsqueeze(-1) * bias_in.view(1, 1, 1, C)
-            out = x_exp + b_exp + mixed
-        else:
-            out = x_exp + mixed
-
-        inputs = [h_res_in, res_in, hp_in, x_in]
-        if bias_in is not None:
-            inputs.append(bias_in)
-        grads = torch.autograd.grad(
-            outputs=out,
-            inputs=inputs,
-            grad_outputs=grad_output,
-            create_graph=False,
-            retain_graph=False,
-        )
-
-    grad_bias = grads[4] if bias_in is not None else None
-    return grads[0], grads[1], grads[2], grads[3], grad_bias
-
-
-# -- Proj RMS ----------------------------------------------------------------
-def _ref_proj_rms_fwd(
-    x: Tensor, weight: Tensor, eps: float = 1e-8
-) -> Tuple[Tensor, Tensor, Tensor]:
-    proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, norm, r
-
-
-def _ref_proj_rms_bwd(
-    grad_proj: Tensor, grad_r: Tensor, x: Tensor, weight: Tensor, norm: Tensor, eps: float = 1e-8
-) -> Tuple[Tensor, Tensor]:
-    M, K = x.shape
-    inv_sqrt_k = 1.0 / math.sqrt(K)
-    v = norm * inv_sqrt_k + eps
-    coeff = (-1.0 / (v * v)) * inv_sqrt_k
-    inv_norm = torch.where(norm > 0, 1.0 / norm, torch.zeros_like(norm))
-    grad_x_from_r = grad_r * coeff * x * inv_norm
-    grad_x = torch.matmul(grad_proj, weight) + grad_x_from_r
-    grad_weight = torch.matmul(grad_proj.t(), x)
-    return grad_x, grad_weight
-
-
-# -- torch.compile wrappers --------------------------------------------------
-_compiled_sinkhorn_fwd = torch.compile(_ref_sinkhorn_fwd)
-_compiled_sinkhorn_bwd = torch.compile(_ref_sinkhorn_bwd)
-_compiled_h_aggregate_fwd = torch.compile(_ref_h_aggregate_fwd)
-_compiled_h_aggregate_bwd = torch.compile(_ref_h_aggregate_bwd)
-_compiled_h_post_bda_fwd = torch.compile(_ref_h_post_bda_fwd)
-_compiled_h_post_bda_bwd = torch.compile(_ref_h_post_bda_bwd)
-_compiled_proj_rms_fwd = torch.compile(_ref_proj_rms_fwd)
-_compiled_proj_rms_bwd = torch.compile(_ref_proj_rms_bwd)
 
 
 # ============================================================================
@@ -297,9 +138,7 @@ if _CUTILE_AVAILABLE:
         N_batch = grad_output.numel() // (hc * hc)
         TILE_SIZE = math.gcd(N_batch, 128)
         dev = grad_output.device
-        ws_M = torch.empty(
-            N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev
-        )
+        ws_M = torch.empty(N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev)
         ws_rs = torch.empty(N_batch * num_iterations, hc, 1, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations, 1, hc, dtype=torch.float32, device=dev)
         grad_input = torch.empty(N_batch, hc, hc, dtype=grad_output.dtype, device=dev)
@@ -310,8 +149,14 @@ if _CUTILE_AVAILABLE:
             (
                 grad_output.view(N_batch, hc, hc),
                 M_init.view(N_batch, hc, hc),
-                grad_input, ws_M, ws_rs, ws_cs,
-                eps, hc, num_iterations, TILE_SIZE,
+                grad_input,
+                ws_M,
+                ws_rs,
+                ws_cs,
+                eps,
+                hc,
+                num_iterations,
+                TILE_SIZE,
             ),
         )
         return grad_input.view(original_shape)
@@ -377,8 +222,14 @@ if _CUTILE_AVAILABLE:
             (math.ceil(sb / TILE_M),),
             _ct_h_agg_bwd_kernel,
             (
-                grad_output.view(sb, C), x.view(sb, n, C), h_pre.view(sb, n),
-                gx, gh, n, TILE_M, TILE_C,
+                grad_output.view(sb, C),
+                x.view(sb, n, C),
+                h_pre.view(sb, n),
+                gx,
+                gh,
+                n,
+                TILE_M,
+                TILE_C,
             ),
         )
         return gx.view(s, b, n, C), gh.view(s, b, n)
@@ -599,9 +450,15 @@ if _CUTILE_AVAILABLE:
                 grid,
                 _ct_hpb_fwd_bias_kernel,
                 (
-                    h_res.view(sb, n, n), original_residual.view(sb, n, C),
-                    h_post.view(sb, n), x.view(sb, C), bias,
-                    out, n, TILE_C, TILE_SIZE,
+                    h_res.view(sb, n, n),
+                    original_residual.view(sb, n, C),
+                    h_post.view(sb, n),
+                    x.view(sb, C),
+                    bias,
+                    out,
+                    n,
+                    TILE_C,
+                    TILE_SIZE,
                 ),
             )
         else:
@@ -610,9 +467,14 @@ if _CUTILE_AVAILABLE:
                 grid,
                 _ct_hpb_fwd_kernel,
                 (
-                    h_res.view(sb, n, n), original_residual.view(sb, n, C),
-                    h_post.view(sb, n), x.view(sb, C),
-                    out, n, TILE_C, TILE_SIZE,
+                    h_res.view(sb, n, n),
+                    original_residual.view(sb, n, C),
+                    h_post.view(sb, n),
+                    x.view(sb, C),
+                    out,
+                    n,
+                    TILE_C,
+                    TILE_SIZE,
                 ),
             )
         return out.view(s, b, n, C)
@@ -646,8 +508,13 @@ if _CUTILE_AVAILABLE:
                     h_post.view(sb, n),
                     x.view(sb, C),
                     bias,
-                    g_hr, g_res, g_hp, g_x,
-                    n, TILE_C, TILE_SIZE,
+                    g_hr,
+                    g_res,
+                    g_hp,
+                    g_x,
+                    n,
+                    TILE_C,
+                    TILE_SIZE,
                 ),
             )
         else:
@@ -661,8 +528,13 @@ if _CUTILE_AVAILABLE:
                     original_residual.view(sb, n, C),
                     h_post.view(sb, n),
                     x.view(sb, C),
-                    g_hr, g_res, g_hp, g_x,
-                    n, TILE_C, TILE_SIZE,
+                    g_hr,
+                    g_res,
+                    g_hp,
+                    g_x,
+                    n,
+                    TILE_C,
+                    TILE_SIZE,
                 ),
             )
         g_bias = g_x.sum(dim=0) if bias is not None else None
@@ -927,175 +799,158 @@ if _CUTILE_AVAILABLE:
 
 
 # ============================================================================
-# Select active forward/backward implementations
+# Autograd Functions (cuTile only – guarded by _CUTILE_AVAILABLE)
 # ============================================================================
 
-if _CUTILE_AVAILABLE:
-    _sinkhorn_fwd_fn = _cutile_sinkhorn_fwd
-    _sinkhorn_bwd_fn = _cutile_sinkhorn_bwd
-    _h_aggregate_fwd_fn = _cutile_h_aggregate_fwd
-    _h_aggregate_bwd_fn = _cutile_h_aggregate_bwd
-    _h_post_bda_fwd_fn = _cutile_h_post_bda_fwd
-    _h_post_bda_bwd_fn = _cutile_h_post_bda_bwd
-    _proj_rms_fwd_fn = _cutile_proj_rms_fwd
-    _proj_rms_bwd_fn = _cutile_proj_rms_bwd
+if not _CUTILE_AVAILABLE:
+
+    def _no_cutile_error(*_args, **_kwargs):
+        raise RuntimeError(
+            "Fused mHC kernels require cuda.tile (cuTile) which is not installed. "
+            "Either install cuTile or set use_fused_mhc=False to use reference "
+            "implementations."
+        )
+
+    fused_sinkhorn = _no_cutile_error
+    fused_h_aggregate = _no_cutile_error
+    fused_h_post_bda = _no_cutile_error
+    fused_proj_rms = _no_cutile_error
+
 else:
-    _sinkhorn_fwd_fn = _compiled_sinkhorn_fwd
-    _sinkhorn_bwd_fn = _compiled_sinkhorn_bwd
-    _h_aggregate_fwd_fn = _compiled_h_aggregate_fwd
-    _h_aggregate_bwd_fn = _compiled_h_aggregate_bwd
-    _h_post_bda_fwd_fn = _compiled_h_post_bda_fwd
-    _h_post_bda_bwd_fn = _compiled_h_post_bda_bwd
-    _proj_rms_fwd_fn = _compiled_proj_rms_fwd
-    _proj_rms_bwd_fn = _compiled_proj_rms_bwd
 
+    class FusedSinkhornKnopp(torch.autograd.Function):
+        """Fused Sinkhorn-Knopp projection to doubly stochastic matrix (cuTile)."""
 
-# ============================================================================
-# Autograd Functions
-# ============================================================================
+        @staticmethod
+        def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
+            output, M_init = _cutile_sinkhorn_fwd(input_logits, num_iterations, eps)
+            ctx.save_for_backward(M_init)
+            ctx.num_iterations = num_iterations
+            ctx.eps = eps
+            return output
 
+        @staticmethod
+        def backward(ctx, grad_output):
+            (M_init,) = ctx.saved_tensors
+            grad_input = _cutile_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
+            return grad_input, None, None
 
-class FusedSinkhornKnopp(torch.autograd.Function):
-    """Fused Sinkhorn-Knopp projection to doubly stochastic matrix."""
+    class FusedHAggregate(torch.autograd.Function):
+        """Fused n-stream weighted aggregation (cuTile)."""
 
-    @staticmethod
-    def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-8):
-        output, M_init = _sinkhorn_fwd_fn(input_logits, num_iterations, eps)
-        ctx.save_for_backward(M_init)
-        ctx.num_iterations = num_iterations
-        ctx.eps = eps
-        return output
+        @staticmethod
+        def forward(ctx, x: Tensor, h_pre: Tensor):
+            output = _cutile_h_aggregate_fwd(x, h_pre)
+            ctx.save_for_backward(x, h_pre)
+            return output
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        (M_init,) = ctx.saved_tensors
-        grad_input = _sinkhorn_bwd_fn(grad_output, M_init, ctx.num_iterations, ctx.eps)
-        return grad_input, None, None
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, h_pre = ctx.saved_tensors
+            return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
 
+    class FusedHPostBDA(torch.autograd.Function):
+        """Fused: output = H_res @ orig_res + H_post * (x [+ bias]) (cuTile)."""
 
-class FusedHAggregate(torch.autograd.Function):
-    """Fused n-stream weighted aggregation: out[s,b,C] = sum_j(h_pre[s,b,j] * x[s,b,j,C])."""
+        @staticmethod
+        def forward(
+            ctx,
+            h_res: Tensor,
+            original_residual: Tensor,
+            h_post: Tensor,
+            x: Tensor,
+            bias: Optional[Tensor],
+        ):
+            output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
+            if bias is not None:
+                ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
+                ctx.has_bias = True
+            else:
+                ctx.save_for_backward(h_res, original_residual, h_post, x)
+                ctx.has_bias = False
+            return output
 
-    @staticmethod
-    def forward(ctx, x: Tensor, h_pre: Tensor):
-        output = _h_aggregate_fwd_fn(x, h_pre)
-        ctx.save_for_backward(x, h_pre)
-        return output
+        @staticmethod
+        def backward(ctx, grad_output):
+            if ctx.has_bias:
+                h_res, orig_res, h_post, x, bias = ctx.saved_tensors
+            else:
+                h_res, orig_res, h_post, x = ctx.saved_tensors
+                bias = None
+            return _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, h_pre = ctx.saved_tensors
-        return _h_aggregate_bwd_fn(grad_output, x, h_pre)
+    class FusedProjRms(torch.autograd.Function):
+        """Fused projection + RMS normalization (cuTile)."""
 
+        @staticmethod
+        def forward(ctx, x: Tensor, weight: Tensor, eps: float = 1e-6):
+            proj, norm, r = _cutile_proj_rms_fwd(x, weight, eps)
+            ctx.save_for_backward(x, weight, norm)
+            ctx.eps = eps
+            return proj, r
 
-class FusedHPostBDA(torch.autograd.Function):
-    """Fused: output = H_res @ orig_res + H_post * (x [+ bias])."""
+        @staticmethod
+        def backward(ctx, grad_proj, grad_r):
+            x, weight, norm = ctx.saved_tensors
+            grad_x, grad_weight = _cutile_proj_rms_bwd(grad_proj, grad_r, x, weight, norm, ctx.eps)
+            return grad_x, grad_weight, None
 
-    @staticmethod
-    def forward(
-        ctx,
-        h_res: Tensor,
-        original_residual: Tensor,
-        h_post: Tensor,
-        x: Tensor,
-        bias: Optional[Tensor],
-    ):
-        output = _h_post_bda_fwd_fn(h_res, original_residual, h_post, x, bias)
-        if bias is not None:
-            ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
-            ctx.has_bias = True
-        else:
-            ctx.save_for_backward(h_res, original_residual, h_post, x)
-            ctx.has_bias = False
-        return output
+    # ========================================================================
+    # Public API (only available when cuTile is installed)
+    # ========================================================================
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        if ctx.has_bias:
-            h_res, orig_res, h_post, x, bias = ctx.saved_tensors
-        else:
-            h_res, orig_res, h_post, x = ctx.saved_tensors
-            bias = None
-        return _h_post_bda_bwd_fn(grad_output, h_res, orig_res, h_post, x, bias)
+    def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
+        """Project logits to doubly stochastic matrix via Sinkhorn-Knopp.
 
+        Args:
+            input_logits: [..., n, n] raw logits
+            num_iterations: Sinkhorn iterations
+            eps: numerical stability
 
-class FusedProjRms(torch.autograd.Function):
-    """Fused projection + RMS normalization: proj = x @ W^T, r = 1/(||x||/sqrt(K) + eps)."""
+        Returns:
+            [..., n, n] doubly stochastic matrix
+        """
+        return FusedSinkhornKnopp.apply(input_logits, num_iterations, eps)
 
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, eps: float = 1e-8):
-        proj, norm, r = _proj_rms_fwd_fn(x, weight, eps)
-        ctx.save_for_backward(x, weight, norm)
-        ctx.eps = eps
-        return proj, r
+    def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
+        """Weighted n-stream to 1-stream aggregation.
 
-    @staticmethod
-    def backward(ctx, grad_proj, grad_r):
-        x, weight, norm = ctx.saved_tensors
-        grad_x, grad_weight = _proj_rms_bwd_fn(grad_proj, grad_r, x, weight, norm, ctx.eps)
-        return grad_x, grad_weight, None
+        Args:
+            x: [s, b, n, C] n-stream hidden states
+            h_pre: [s, b, n] aggregation weights
 
+        Returns:
+            [s, b, C] aggregated hidden states
+        """
+        return FusedHAggregate.apply(x, h_pre)
 
-# ============================================================================
-# Public API
-# ============================================================================
+    def fused_h_post_bda(
+        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+    ) -> Tensor:
+        """Fused H_res @ residual + H_post * (x + bias).
 
+        Args:
+            h_res: [s, b, n, n] residual mixing matrix
+            original_residual: [s, b, n, C] n-stream residual
+            h_post: [s, b, n] expansion weights
+            x: [s, b, C] layer output
+            bias: [C] or None
 
-def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-8) -> Tensor:
-    """Project logits to doubly stochastic matrix via Sinkhorn-Knopp.
+        Returns:
+            [s, b, n, C] fused output
+        """
+        return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
 
-    Args:
-        input_logits: [..., n, n] raw logits
-        num_iterations: Sinkhorn iterations
-        eps: numerical stability
+    def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+        """Fused projection + RMS normalization.
 
-    Returns:
-        [..., n, n] doubly stochastic matrix
-    """
-    return FusedSinkhornKnopp.apply(input_logits, num_iterations, eps)
+        Args:
+            x: [M, K] input
+            weight: [N, K] projection weight
+            eps: stability epsilon
 
-
-def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
-    """Weighted n-stream to 1-stream aggregation.
-
-    Args:
-        x: [s, b, n, C] n-stream hidden states
-        h_pre: [s, b, n] aggregation weights
-
-    Returns:
-        [s, b, C] aggregated hidden states
-    """
-    return FusedHAggregate.apply(x, h_pre)
-
-
-def fused_h_post_bda(
-    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
-) -> Tensor:
-    """Fused H_res @ residual + H_post * (x + bias).
-
-    Args:
-        h_res: [s, b, n, n] residual mixing matrix
-        original_residual: [s, b, n, C] n-stream residual
-        h_post: [s, b, n] expansion weights
-        x: [s, b, C] layer output
-        bias: [C] or None
-
-    Returns:
-        [s, b, n, C] fused output
-    """
-    return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
-
-
-def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-8) -> Tuple[Tensor, Tensor]:
-    """Fused projection + RMS normalization.
-
-    Args:
-        x: [M, K] input
-        weight: [N, K] projection weight
-        eps: stability epsilon
-
-    Returns:
-        proj: [M, N] = x @ weight^T
-        r: [M, 1] = 1 / (||x|| / sqrt(K) + eps)
-    """
-    return FusedProjRms.apply(x, weight, eps)
+        Returns:
+            proj: [M, N] = x @ weight^T
+            r: [M, 1] = 1 / (||x|| / sqrt(K) + eps)
+        """
+        return FusedProjRms.apply(x, weight, eps)
