@@ -1371,6 +1371,20 @@ def prepare_data_for_update(
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
+
+            my_real_tokens = sum(
+                packing_context.packing_info.seq_lengths[idx]
+                for indices in packing_context.packing_info.bin_seq_indices
+                for idx in indices
+            )
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
         else:
             # Always compute standard masks for the original data (we'll need them later)
             with nvtx_range("get_ltor_masks_and_position_ids"):
@@ -1391,6 +1405,19 @@ def prepare_data_for_update(
                     batch_size=args.micro_batch_size,
                 )
                 logprobs_batch_size = args.micro_batch_size
+
+            # Without sequence packing, training.py defaults to GBS*seq_length which
+            # counts padding tokens and inflates TPS metrics.  Report only the real
+            # (non-padding) tokens so the metric is comparable to the SP path.
+            my_real_tokens = int((trajs != tokenizer.pad).sum().item())
+            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
+            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
+            global_real_tokens = real_tokens_tensor.item()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
