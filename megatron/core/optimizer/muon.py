@@ -182,6 +182,8 @@ def get_megatron_muon_optimizer(
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
     """
+    # TODO: Mutating config.optimizer is a side effect; clean up after
+    # https://github.com/NVIDIA/Megatron-LM/pull/3638 lands.
     # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
     config.optimizer = config.muon_nonlinear_optimizer
 
