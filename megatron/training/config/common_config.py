@@ -131,5 +131,23 @@ class DistributedInitConfig:
     distributed_timeout_seconds_after_init: int | None = None
     """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
 
+    flight_recorder_dump_path: str | None = None
+    """Path for NCCL flight recorder trace dumps. Sets TORCH_FR_DUMP_TEMP_FILE and TORCH_NCCL_DEBUG_INFO_TEMP_FILE env variables before distributed init."""
+
+    flight_recorder_trace_buffer_size: int = 2000
+    """Size of the NCCL flight recorder trace buffer (TORCH_NCCL_TRACE_BUFFER_SIZE)."""
+
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump flight recorder traces on NCCL timeout (TORCH_NCCL_DUMP_ON_TIMEOUT)."""
+
+    flight_recorder_include_stack_trace: bool = False
+    """Include stack traces in flight recorder dumps (TORCH_INCLUDE_STACK_TRACE)."""
+
+    flight_recorder_include_only_active: bool = True
+    """Include only active operations in flight recorder dumps (TORCH_INCLUDE_ONLY_ACTIVE)."""
+
+    flight_recorder_extra_dump_on_exec: bool = True
+    """Enable extra flight recorder dump on execution (TORCH_NCCL_EXTRA_DUMP_ON_EXEC)."""
+
     disable_jit_fuser: bool = False
     """Disable the JIT fuser."""
