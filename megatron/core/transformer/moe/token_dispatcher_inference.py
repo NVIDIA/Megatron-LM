@@ -114,7 +114,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         topk = probs.size(-1)
         hidden_dim = hidden_states.size(-1)
 
-        result = SymmetricMemoryManager.get_buffer("ep", process_group=self.ep_group).maybe_get_tensors(
+        result = SymmetricMemoryManager.get_buffer(
+            "ep", process_group=self.ep_group
+        ).maybe_get_tensors(
             [
                 (global_tokens * topk, routing_map.dtype),
                 (global_tokens * topk, probs.dtype),
@@ -150,9 +152,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
             dict: A dictionary with keys "handle" (symmetric memory handle, or
                 None if unavailable) and "tensor" (the allocated buffer, or None).
         """
-        symm_mem_buffer = SymmetricMemoryManager.get_buffer("ep", process_group=self.ep_group).maybe_get_tensor(
-            list(x.size()), dtype=x.dtype
-        )
+        symm_mem_buffer = SymmetricMemoryManager.get_buffer(
+            "ep", process_group=self.ep_group
+        ).maybe_get_tensor(list(x.size()), dtype=x.dtype)
         return symm_mem_buffer
 
     def token_dispatch(self, hidden_states, probs):

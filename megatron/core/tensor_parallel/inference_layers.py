@@ -160,15 +160,15 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # 1. skip_norm_and_all_gather is True
         # 2. tp_size > 1
         # 3. enough symmetric memory is available - if available it already has the output
-        
+
         if self.training:
             return super().forward(x)
-        
+
         if self.tp_size == 1:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
-        
+
         symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
         is_in_fused_mode = (
             self.skip_norm_and_all_gather
@@ -314,7 +314,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         self.residual = residual
 
-    
     def forward(
         self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, None]:
@@ -323,7 +322,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.training:
             return super().forward(x)
-        
+
         if self.tp_size == 1:
             x = _apply_linear(x, self.weight, self.config)
             return x, None

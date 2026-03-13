@@ -29,7 +29,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import numpy
 import torch
 
-
 from megatron.core import config
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.package_info import __version__ as mcore_version

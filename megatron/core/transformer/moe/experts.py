@@ -651,7 +651,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            assert not self.training, "Concatenated weights must be built before training forward pass."
+            assert (
+                not self.training
+            ), "Concatenated weights must be built before training forward pass."
             self._build_concatenated_weights()
             self._concatenated_weights_built = True
 

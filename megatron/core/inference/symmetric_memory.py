@@ -10,9 +10,9 @@ relative to the inference context.
 
 from __future__ import annotations
 
-from typing import Optional
-from functools import reduce 
 import operator
+from functools import reduce
+from typing import Optional
 
 import torch
 
@@ -128,7 +128,6 @@ class SymmetricMemoryBuffer:
         }
 
 
-
 class SymmetricMemoryManager:
     """Registry of lazily-initialized symmetric memory buffers.
 
@@ -157,12 +156,11 @@ class SymmetricMemoryManager:
             size_mb: Buffer size in MiB (default 256).
         """
         if key not in cls._buffers:
-            assert process_group is not None, (
-                f"SymmetricMemoryManager: process_group is required on first access for key='{key}'"
-            )
+            assert (
+                process_group is not None
+            ), f"SymmetricMemoryManager: process_group is required on first access for key='{key}'"
             cls._buffers[key] = SymmetricMemoryBuffer(
-                size_in_mb=size_mb or cls._default_size_mb,
-                process_group=process_group,
+                size_in_mb=size_mb or cls._default_size_mb, process_group=process_group
             )
         return cls._buffers[key]
 

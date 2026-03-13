@@ -12,9 +12,9 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, is_torch_min_version
-
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -2015,6 +2015,7 @@ def _set_global_memory_buffer():
     assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
+
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
@@ -2025,7 +2026,6 @@ def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
-
 
 
 def get_all_ranks():
