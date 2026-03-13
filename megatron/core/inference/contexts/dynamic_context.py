@@ -1389,19 +1389,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 2. Per-request state consumed by mha_metadata.update().
         if N_decode > 0:
-            self.request_query_lengths[0:N_decode].fill_(tokens_per_request)
+            self.request_query_lengths[0:N_decode] = tokens_per_request
 
         # Prefill requests: distribute remaining tokens evenly.
         if N_prefill > 0:
             prefill_tokens = T - (N_decode * tokens_per_request)
             tokens_per_prefill = prefill_tokens // N_prefill
             remainder = prefill_tokens % N_prefill
-            self.request_query_lengths[N_decode:N_total].fill_(tokens_per_prefill)
+            self.request_query_lengths[N_decode:N_total] = tokens_per_prefill
             # Give remainder tokens to the last prefill request.
             if remainder > 0:
                 self.request_query_lengths[N_total - 1] += remainder
 
-        self.request_kv_length_offsets[0:N_total].fill_(0)
+        self.request_kv_length_offsets[0:N_total] = 0
         self.request_to_kv_block_ids[0:N_total, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
@@ -1439,11 +1439,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefill_tokens = T - decode_tokens_total
                 tokens_per_prefill = prefill_tokens // N_prefill
                 remainder = prefill_tokens % N_prefill
-                token_offset = decode_tokens_total
-                for i in range(N_prefill):
-                    qlen = tokens_per_prefill + (remainder if i == N_prefill - 1 else 0)
-                    self.token_to_request_idx[token_offset : token_offset + qlen] = N_decode + i
-                    token_offset += qlen
+                # Build repeat counts on CPU, then do a single write to GPU.
+                repeat_counts = torch.full(
+                    (N_prefill,), tokens_per_prefill, dtype=torch.long, device="cpu"
+                )
+                if remainder > 0:
+                    repeat_counts[-1] += remainder
+                request_ids = torch.arange(
+                    N_decode, N_decode + N_prefill, dtype=self.token_to_request_idx.dtype, device="cpu"
+                )
+                token_request_indices = torch.repeat_interleave(request_ids, repeat_counts)
+                self.token_to_request_idx[
+                    decode_tokens_total : decode_tokens_total + prefill_tokens
+                ] = token_request_indices.to(device=self.token_to_request_idx.device)
 
             # 5. Mamba state: allocate slots for dummy requests.
             self.mamba_metadata.request_to_mamba_state_idx[0:N_total] = (
