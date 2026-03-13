@@ -9,7 +9,6 @@ MODEL_ENV_VARS:
   MODEL_ARGS:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 1
-  --async-save: true
   MODEL_ARGS_10:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 2
@@ -103,6 +102,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
+  --async-save: true
   # rerun settings
   --rerun-mode: validate_results
 MODEL_ARGS:
@@ -114,7 +114,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --context-parallel-size: 1
   --pipeline-model-parallel-size: 1
-  --async-save: true
 MODEL_ARGS_2:
   <<: *BASE_MODEL_ARGS
   #########################################################
