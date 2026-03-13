@@ -16,8 +16,8 @@ from megatron.core.inference.communication.torch_symm_triton import (
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer_tp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -123,9 +123,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         symm_mem_buffer_dims = list(x.size())
         symm_mem_buffer_dims[0] *= self.tp_size
-        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
-            symm_mem_buffer_dims, dtype=x.dtype
-        )
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
         return symm_mem_buffer
 
     def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> None:
@@ -252,9 +251,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             # Remove batch dimension for FlashInfer mxfp8
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
-        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
-            symm_mem_buffer_dims, dtype=x.dtype
-        )
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
 
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output

@@ -664,16 +664,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
         # Lazily build concatenated weights on first forward (after checkpoint load)
-        if not self._concatenated_weights_built:
-            self._build_concatenated_weights()
-            self._concatenated_weights_built = True
-
-        self._verify_concatenated_weights()
 
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        elif self.is_inference_cuda_graphed_iteration:
+        if not self._concatenated_weights_built:
+            assert not self.training, "Concatenated weights must be built before training forward pass."
+            self._build_concatenated_weights()
+            self._concatenated_weights_built = True
+
+        if self.is_inference_cuda_graphed_iteration:
+            self._verify_concatenated_weights()
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert (
                 HAVE_FLASHINFER
@@ -681,12 +682,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        #elif self._torch_grouped_mm_available:
-        return self._torch_grouped_mm_forward(
-            permuted_local_hidden_states, tokens_per_expert, permuted_probs
-        )
-        # else:
-        #return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+            # elif self._torch_grouped_mm_available:
+            #     return self._torch_grouped_mm_forward(
+            #         permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            #     )
+        else:
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
 
 class SequentialMLP(MegatronModule):
