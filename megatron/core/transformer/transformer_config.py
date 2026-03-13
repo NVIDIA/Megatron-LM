@@ -2157,10 +2157,6 @@ class TransformerConfig(ModelParallelConfig):
                 'overlap_moe_expert_parallel_comm must be disabled when enabling '
                 'delay_wgrad_compute_for_te_grouped_gemm.'
             )
-            assert not self.moe_use_legacy_grouped_gemm, (
-                'delay_wgrad_compute_for_te_grouped_gemm is not supported with '
-                'legacy grouped gemm implementation'
-            )
             assert is_te_min_version(
                 "2.3.0"
             ), 'TE version >= 2.3.0 is required for delay_wgrad_compute_for_te_grouped_gemm'
