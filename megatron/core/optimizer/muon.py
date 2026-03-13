@@ -29,6 +29,7 @@ try:
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.scalar_optimizers import Lion
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -181,9 +182,10 @@ def get_megatron_muon_optimizer(
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
     """
-    # Muon currently use adam config. setting str here to call regular get for adam creation
-    # side effect is muon optimizer will have wrong name, i.e. config.optimizer == 'adam'
-    config.optimizer = 'adam'
+    # TODO: Mutating config.optimizer is a side effect; clean up after
+    # https://github.com/NVIDIA/Megatron-LM/pull/3638 lands.
+    # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
+    config.optimizer = config.muon_nonlinear_optimizer
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
@@ -220,6 +222,16 @@ def get_megatron_muon_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                     else:
                         opt.initialize_state(p)
+
+    def lion_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+
+    nonlinear_init_state_fn = (
+        lion_init_state_fn if config.muon_nonlinear_optimizer == 'lion' else adam_init_state_fn
+    )
 
     optimizers = []
     # record list of non/linear params
@@ -337,7 +349,9 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
-    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [adam_init_state_fn]
+    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [
+        nonlinear_init_state_fn
+    ]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
