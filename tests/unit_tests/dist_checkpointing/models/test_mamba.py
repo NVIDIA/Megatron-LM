@@ -6,12 +6,11 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
@@ -119,7 +118,7 @@ class TestMambaReconfiguration:
             )
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,

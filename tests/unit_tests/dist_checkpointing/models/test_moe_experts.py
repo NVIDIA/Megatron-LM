@@ -6,12 +6,11 @@ from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -187,7 +186,7 @@ class TestExpertLayerReconfiguration:
             model_A = initialize_expert_layer(1, use_glu, expert_type)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
@@ -282,7 +281,7 @@ class TestExpertLayerReconfiguration:
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
@@ -360,7 +359,7 @@ class TestExpertLayerReconfiguration:
             model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
