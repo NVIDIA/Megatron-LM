@@ -1898,6 +1898,39 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+        
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, restore runtime lr bounds so
+            # scheduler math does not stay pinned to checkpoint lr settings.
+            if args.override_opt_param_scheduler:
+                for param_group in optimizer.param_groups:
+                    if (
+                        param_group.get('is_decoupled_lr', False)
+                        and args.decoupled_lr is not None
+                    ):
+                        param_group['max_lr'] = args.decoupled_lr
+                        param_group['min_lr'] = (
+                            args.decoupled_min_lr
+                            if args.decoupled_min_lr is not None
+                            else args.min_lr
+                        )
+                    else:
+                        param_group['max_lr'] = args.lr
+                        param_group['min_lr'] = args.min_lr
+                # Synchronize scheduler num_steps with consumed_train_samples
+                # to ensure lr calculation is based on current training progress
+                if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                    print_rank_0(
+                        f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                        f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                        f"Resetting scheduler num_steps to match consumed_train_samples."
+                    )
+                    opt_param_scheduler.num_steps = args.consumed_train_samples
+                opt_param_scheduler.step(increment=0)
+                print_rank_0(
+                    " > restored optimizer param_group max_lr/min_lr from runtime args "
+                    "because --override-opt_param-scheduler is set"
+                )
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
