@@ -42,6 +42,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
 )
 from megatron.core.tensor_parallel.inference_layers import (
+    InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
