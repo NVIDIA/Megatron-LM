@@ -22,7 +22,7 @@ MODEL_ARGS:
   --overlap-param-gather: true
   --attention-backend: unfused
 
-  --num-distributed-optimizer-instances 1
+  --num-distributed-optimizer-instances: 1
 
   # FSDP args
   --use-megatron-fsdp: true
