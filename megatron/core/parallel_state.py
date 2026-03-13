@@ -432,6 +432,7 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     # We limit the allowed group sizes in order to avoid excessive overhead.
     # TODO(pmannan): Temporarily including the group size 1 in the list of allowed group sizes.
     # Ideally, we should force CP==1 and re-use that group to save memory.
+    # group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
     group_sizes = [2**i for i in range(int(log2(len(ranks))))]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):

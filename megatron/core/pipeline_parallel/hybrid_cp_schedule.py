@@ -11,8 +11,9 @@ from megatron.core import parallel_state
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-# Number of forward groups (equivalent to num_microbatches) used in the most recent
-# hybrid CP step.  Set each iteration so that training.py can use it for loss scaling.
+# Number of forward groups (logically equivalent to num_microbatches) used in the most 
+# recent hybrid CP step. 
+# Set each iteration so that training.py can use it for loss scaling.
 _num_total_groups: int = 0
 
 
@@ -60,7 +61,7 @@ class BalancedCPScheduler:
         The number is rounded up to the next power of 2 to match the available
         hybrid context parallel process group sizes.
         """
-        # HACK: HybridEP ranks run out of sync and crash due to hang
+        # HACK: EP ranks run out of sync and can crash due to hang
         # This is a temporary fix to ensure that expert ranks run in sync.
         # TODO(pmannan): Remove this hack after fixing the hang issue.
         # This is sufficient to get most of the benefits of HybridCP
@@ -579,8 +580,9 @@ def hybrid_context_parallel_forward_backward(
 
     # TODO(pmannan): This is now equivalent to regular no pipeline schedule.
     # Remove this special forward_backward_func and merge with forward_backward_no_pipelining.
-    # With sequence packing + Dynamic CP enable, num_total_groups is equivalent to num_microbatches.
-    # num_samples_this_group is set to 1.
+    # With sequence packing + Dynamic CP enable, num_total_groups is logicallye
+    # quivalent to num_microbatches.
+    # num_samples_this_group is set to 1 as we now run 1 packed sample per group.
     num_total_groups = _broadcast_num_total_groups(num_total_groups)
 
     # Publish num_total_groups so training.py can use it for MoE loss scaling.
@@ -616,13 +618,6 @@ def hybrid_context_parallel_forward_backward(
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
-
-            # Create a barrier at end of each group.
-            # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
-            # no rank is starting a sub-sample ahead of it's partner ranks.
-            # torch.distributed.barrier(
-            #     parallel_state.get_data_parallel_group(with_context_parallel=True)
-            # )
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():

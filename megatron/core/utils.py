@@ -2078,9 +2078,12 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-        )
+        try:
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+            )
+        except Exception as e:
+            print(f"cu_seqlens_padded: {cu_seqlens_padded} tokens: {batch['tokens'].size(1)} cp_size: {cp_size} cp_rank: {cp_rank}")
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
                 continue

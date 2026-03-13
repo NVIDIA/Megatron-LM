@@ -323,9 +323,7 @@ class MambaModel(LanguageModule):
             return hidden_states
 
         if self.config.mtp_num_layers is not None:
-            # For hybrid context parallel, use the per-sequence CP sub-group so that
-            # roll_tensor exchanges boundary tokens only with ranks that share this
-            # sequence, not with ranks processing a different sequence.
+            # For hybrid context parallel, use the dynamic CP sub-group
             if packed_seq_params is not None and packed_seq_params.cp_group is not None:
                 self.pg_collection.cp = packed_seq_params.cp_group
             hidden_states = process_mtp_loss(

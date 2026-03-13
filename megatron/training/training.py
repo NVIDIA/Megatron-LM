@@ -2023,12 +2023,12 @@ def training_log(
     # Log MoE metrics.
     if args.num_experts is not None:
         # For hybrid CP, num_total_groups replaces num_microbatches as the step count.
-        # The logged aux_loss is accumulated once per group (not per microbatch), so we
-        # must normalise by num_total_groups to get a per-sequence average comparable
-        # to a standard-CP run.  get_num_total_groups() returns 0 when hybrid CP is not
-        # active, in which case we fall back to get_num_microbatches().
-        _hybrid_groups = get_num_total_groups()
-        moe_loss_scale = 1 / (_hybrid_groups if _hybrid_groups > 0 else get_num_microbatches())
+        if args.hybrid_context_parallel:
+            _hybrid_groups = get_num_total_groups()
+            assert _hybrid_groups > 0, "Hybrid CP must report groups to log MoE metrics"
+            moe_loss_scale = 1 / _hybrid_groups
+        else:
+            moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
