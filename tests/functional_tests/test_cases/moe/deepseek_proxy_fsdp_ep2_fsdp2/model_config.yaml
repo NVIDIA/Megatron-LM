@@ -113,8 +113,9 @@ MODEL_ARGS:
   # Validation, checkpointing, logging
   --eval-iters: 10
   --eval-interval: 200
-  --save: ${CHECKPOINT_SAVE_PATH}
-  --load: ${CHECKPOINT_LOAD_PATH}
+  #--save: ${CHECKPOINT_SAVE_PATH}
+  #--load: ${CHECKPOINT_LOAD_PATH}
+  #--ckpt-format: fsdp_dtensor
   --save-interval: 25
   --init-method-std: 0.02
   --log-timers-to-tensorboard: true
