@@ -29,7 +29,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector, get_batch_on_this_cp_rank
 from megatron.training import (
     get_args,
     get_timers,
@@ -43,7 +43,6 @@ from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, g
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -67,13 +66,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+    (not mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        mtp_on_this_rank=mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
         )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -85,7 +84,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        batch = get_batch_on_this_cp_rank(batch)
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
         assert max_seqlen.dim() == 1
@@ -206,7 +205,7 @@ def is_dataset_built_on_rank(vp_stage=None):
     config = core_transformer_config_from_args(args)
     return (
         is_first_or_last_pipeline_stage(vp_stage)
-        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        or mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 

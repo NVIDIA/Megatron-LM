@@ -26,6 +26,8 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
 
+from transformers import AutoTokenizer
+
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
 class CustomLanguageVars(PunktLanguageVars):
@@ -51,7 +53,8 @@ class Encoder(object):
 
     def initializer(self):
         # Use Encoder class as a container for global data
-        Encoder.tokenizer = build_tokenizer(self.args)
+        Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.tokenizer_model) # build_tokenizer(self.args)
+        print("Tokenizer: ", Encoder.tokenizer)
         if self.args.split_sentences:
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
@@ -88,24 +91,31 @@ class Encoder(object):
         data = json.loads(json_line)
         ids = {}
         lens = {}
-        for key in self.args.json_keys:
-            text = data[key]
-            if isinstance(text, list):
-                sentences = text
-            else:
-                sentences = [text]
-            doc_ids = []
-            sentence_lens = []
-            for sentence in sentences:
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
-                if len(sentence_ids) > 0:
-                    doc_ids.extend(sentence_ids)
-                    sentence_lens.append(len(sentence_ids))
-            if len(doc_ids) > 0 and self.args.append_eod:
-                doc_ids.append(Encoder.tokenizer.eod)
-                sentence_lens[-1] += 1
-            ids[key] = doc_ids
-            lens[key] = sentence_lens
+        if self.args.sft: # NOTE(asolergi-nv): SFT path
+            json_key = self.args.json_keys[0]
+            conversation = data[json_key]
+            conversation_ids = Encoder.tokenizer.apply_chat_template(conversation, tokenize=True, add_generation_prompt=False, truncate_history_thinking=False).input_ids
+            ids[json_key] = conversation_ids
+            lens[json_key] = [len(conversation_ids)]
+        else: # NOTE(asolergi-nv): Pretraining path
+            for key in self.args.json_keys:
+                text = data[key]
+                if isinstance(text, list):
+                    sentences = text
+                else:
+                    sentences = [text]
+                doc_ids = []
+                sentence_lens = []
+                for sentence in sentences:
+                    sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                    if len(sentence_ids) > 0:
+                        doc_ids.extend(sentence_ids)
+                        sentence_lens.append(len(sentence_ids))
+                if len(doc_ids) > 0 and self.args.append_eod:
+                    doc_ids.append(Encoder.tokenizer.eod)
+                    sentence_lens[-1] += 1
+                ids[key] = doc_ids
+                lens[key] = sentence_lens
         return ids, lens, len(json_line)
 
 
@@ -153,7 +163,7 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
-        tokenizer = build_tokenizer(self.args)
+        tokenizer = AutoTokenizer.from_pretrained(self.args.tokenizer_model) # build_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
 
@@ -208,6 +218,8 @@ def get_args():
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
                        help='Language to use for NLTK-powered sentence splitting.')
+    group.add_argument('--sft', action='store_true',
+                       help='Process SFT data. Applies the chat template to the conversation and tokenizes it.')
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
@@ -375,7 +387,9 @@ def main():
     output_bin_files = {}
     output_idx_files = {}
     builders = {}
-    tokenizer = build_tokenizer(args)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model) # build_tokenizer(args)
+    print("Tokenizer: ", tokenizer)
+    
 
     for key in args.json_keys:
         output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,

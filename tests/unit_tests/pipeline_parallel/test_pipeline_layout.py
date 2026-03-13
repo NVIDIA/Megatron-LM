@@ -71,7 +71,7 @@ def initialize_gpt_model(
         else:
             layer_spec = layer_spec_fn()
 
-        if with_mtp and mtp_on_this_rank(transformer_config, ignore_virtual=False, vp_stage=i):
+        if with_mtp and mtp_on_this_rank(layout=transformer_config.pipeline_model_parallel_layout, mtp_num_layers=transformer_config.mtp_num_layers, ignore_virtual=False, vp_stage=i):
             if is_moe:
                 transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
             else:

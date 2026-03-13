@@ -11,6 +11,9 @@ SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2T
 
 logger = logging.getLogger(__name__)
 
+NULL_TOKENIZERS = {'NullTokenizer': 'null-text', 'NullMultimodalTokenizer': 'null-multimodal', 'NullSFTTokenizer': 'null-sft'}
+
+# TODO(asolergi-nv): Fix elif args.tokenizer_type == 'SFTTokenizer':, upstream is different
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
@@ -67,9 +70,9 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sft'
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
-    elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
+    elif args.tokenizer_type in NULL_TOKENIZERS.keys():
         tokenizer_library = (
-            'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
+            NULL_TOKENIZERS[args.tokenizer_type]
         )
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
@@ -79,6 +82,14 @@ def build_tokenizer(args, **kwargs):
         # Add vocab size (if not already set from a checkpoint).
         _set_padded_vocab_size(args, tokenizer)
 
+        return tokenizer
+    elif args.tokenizer_type == 'SFTTokenizer':
+        # SFTTokenizer uses the legacy tokenizer system
+        from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer 
+        tokenizer = SFTTokenizer(
+            args.tokenizer_model,
+            args.sft_tokenizer_prompt_format,
+        )
         return tokenizer
 
     if args.tokenizer_metadata:
