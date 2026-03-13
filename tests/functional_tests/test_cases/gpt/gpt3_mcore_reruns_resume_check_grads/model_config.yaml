@@ -102,7 +102,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  --async-save: true
   # rerun settings
   --rerun-mode: validate_results
 MODEL_ARGS:

@@ -77,7 +77,6 @@ MODEL_ARGS:
   --inference-logging-step-interval: 1
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
-  --async-save: true
 METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"

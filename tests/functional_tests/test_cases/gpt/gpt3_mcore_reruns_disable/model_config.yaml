@@ -77,7 +77,6 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   # rerun settings
   --rerun-mode: disabled
-  --async-save: true
 AFTER_SCRIPT: |
   check_log() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then exit 1; else echo OK; fi }
   check_log_not() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then echo OK; else exit 1; fi }

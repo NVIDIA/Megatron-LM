@@ -94,7 +94,6 @@ MODEL_ARGS:
   --eval-interval: 1000000
   --finetune: true
   --inference-logging-step-interval: 1
-  --async-save: true
 METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"

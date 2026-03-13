@@ -90,7 +90,6 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 51000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
-  --async-save: true
 METRICS:
   - "iteration-time"
   - "lm loss"

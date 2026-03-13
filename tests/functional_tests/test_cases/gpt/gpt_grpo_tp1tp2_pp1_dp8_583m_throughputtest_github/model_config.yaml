@@ -78,7 +78,6 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
 
-  --async-save: true
 METRICS:
   - "iteration-time"
   - "lm loss"
