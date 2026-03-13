@@ -124,6 +124,8 @@ def get_batch(data_iterator, vp_stage=None):
     elif local_cp_size is None:  # Packed THD format
         assert max_seqlen.dim() == 1
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+        total_tokens = batch['tokens'].size(1) if batch['tokens'] is not None else batch['labels'].size(1)
+        packed_seq_params.total_tokens = total_tokens
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen, local_cp_size)
 

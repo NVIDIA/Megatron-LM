@@ -70,7 +70,7 @@ examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /pat
     ```
     > Please enter a desired train/val/test split like "0.5, 0.2, 0.3" or "8,1,1": 9,1,0
     > Do you want to create a dataset.yaml interactively? [Y/n]: Y
-    > Please enter a number to choose a class: 10 (VQAWebdataset)
+    > Please enter a number to choose a class: 9 (VQASample)
     > Do you want to set a simple field_map[Y] (or write your own sample_loader [n])? [Y/n]: Y
     > Please enter a webdataset field name for 'image' (<class 'torch.Tensor'>): jpg
     > Please enter a webdataset field name for 'context' (<class 'str'>): json[0][value]

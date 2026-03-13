@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import multiprocessing
 import os
 import random
 import shutil
@@ -39,6 +40,7 @@ from ..core.dist_checkpointing.serialization import get_default_save_sharded_str
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import is_empty_async_queue, schedule_async_save
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest, _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
@@ -69,6 +71,32 @@ _LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+
+# Track deletion processes to prevent zombies
+_deletion_processes = []
+
+def finalize_deletion_processes(blocking=False):
+    """Clean up deletion processes to prevent zombie processes.
+
+    Args:
+        blocking (bool): If True, waits for all deletion processes to complete.
+                        If False, only joins processes that have already finished.
+
+    Note: Deletion processes are daemon processes (auto-terminate if parent dies),
+    but we still need to join() them to reap zombie processes when they complete normally.
+    The daemon flag and join() serve different purposes:
+    - daemon=True: Auto-terminate if parent process dies abruptly
+    - join(): Reap zombie processes after normal completion
+    """
+    global _deletion_processes
+    finished = []
+    for proc in _deletion_processes:
+        if not proc.is_alive() or blocking:
+            logger.debug(f"Joining deletion process {proc.pid} (blocking={blocking}, is_alive={proc.is_alive()})")
+            proc.join()
+            finished.append(proc)
+    for proc in finished:
+        _deletion_processes.remove(proc)
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -360,27 +388,8 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        ep_size = mpu.get_expert_model_parallel_world_size()
-
-        if ep_size > 1:
-            # Shard RNG by PP, TP, DP when using expert parallelism.
-            dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
-            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
-            rng_state_list = ShardedObject(
-                'rng_state',
-                rng_state_list,
-                (pp_size, tp_size, dp_size),
-                (pp_rank, tp_rank, dp_rank),
-                replica_id=0,
-            )
-        else:
-            rng_state_list = ShardedObject(
-                'rng_state',
-                rng_state_list,
-                (pp_size, tp_size),
-                (pp_rank, tp_rank),
-                replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
-            )
+        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
+                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -616,6 +625,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_strategy = get_default_save_sharded_strategy(args.ckpt_format)
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
+                    if args.async_save:
+                        save_strategy.thread_count = args.dist_ckpt_workers
+                    else:
+                        # We don't allow per-rank parallel save for sync save
+                        logger.warning('Per-rank parallel save is not supported for sync save. '
+                                       'Setting args.dist_ckpt_workers to 1')
+                        save_strategy.thread_count = 1
                     if checkpointing_context is not None and 'load_strategy' in checkpointing_context:
                         cached_global_metadata = getattr(checkpointing_context['load_strategy'], 'cached_global_metadata', None)
                         if cached_global_metadata is not None:
@@ -625,7 +641,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             logger.debug("Failed to plug in the read metadata from the load strategy...")
 
                 if args.ckpt_fully_parallel_save:
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                    if args.ckpt_fully_parallel_save_process_group == 'dp':
+                        process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+                    elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
+                        process_group = mpu.get_expert_data_parallel_group()
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -732,22 +752,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
 
-                def delete_checkpoint(args, iteration_to_delete):
-                    checkpoint_name = get_checkpoint_name(args.save, iteration=iteration_to_delete,
-                                                          return_base_dir=True)
-                    try:
-                        shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
-                        print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
-                                     f"deleted checkpoint from iteration {iteration_to_delete:7d} "
-                                     f"at {args.save}")
-                        if args.log_progress:
-                            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
-                    except Exception as e:
-                        print_rank_0(f'  encountered exception "{e}" when trying to delete checkpoint from '
-                                     f'iteration {iteration_to_delete:7d} at {args.save}')
-                        # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
-                        pass
-
                 if save_retain_interval is not None:
                     if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
                         checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
@@ -758,7 +762,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                          f'at {args.save} since it is a symbolic link')
                         else:
                             # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
+                            # Use multiprocessing to delete checkpoint in background
+                            if args.async_save:
+                                # Clean up any finished deletion processes before starting a new one
+                                finalize_deletion_processes(blocking=False)
+                                ctx = multiprocessing.get_context('fork')
+                                delete_process = ctx.Process(
+                                    target=_async_delete_checkpoint_impl,
+                                    args=(args.save, prev_iteration, args.log_progress, True,
+                                          args.async_ckpt_cpu_priority, args.async_ckpt_io_priority),
+                                    daemon=True
+                                )
+                                delete_process.start()
+                                # Track the process so we can join it later to prevent zombies
+                                _deletion_processes.append(delete_process)
+                            else:
+                                th = threading.Thread(target=_async_delete_checkpoint_impl, args=(args.save, prev_iteration, args.log_progress))
+                                th.start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -801,6 +821,42 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
+
+@_disable_gc()
+def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
+                                  cpu_priority=None, io_priority=None):
+    """Module-level function for async checkpoint deletion.
+    
+    This function can be pickled and executed by the async worker process.
+    Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
+    since torch.distributed won't be initialized in the async worker process.
+    
+    Args:
+        save_path (str): Path to the checkpoints directory
+        iteration_to_delete (int): Iteration number of checkpoint to delete
+        log_progress (bool): Whether to log progress
+        lower_priority (bool): If True, set process QoS (e.g. nice, ionice) so deletion doesn't contend with training.
+        cpu_priority (int): Nice value for CPU when lower_priority is True (from args.async_ckpt_cpu_priority).
+        io_priority (int): I/O class when lower_priority is True (from args.async_ckpt_io_priority).
+    """
+    if lower_priority:
+        from megatron.core.dist_checkpointing.strategies.async_utils import _set_process_qos
+        _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
+
+    checkpoint_name = get_checkpoint_name(save_path, iteration=iteration_to_delete,
+                                         return_base_dir=True)
+    try:
+        shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
+        print(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
+              f'at {save_path}', flush=True)
+        if log_progress:
+            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+    except Exception as e:
+        print(f'  encountered exception "{e}" when trying to delete checkpoint from '
+              f'iteration {iteration_to_delete:7d} at {save_path}', flush=True)
+        # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
+        pass
+
 
 def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
@@ -1119,11 +1175,20 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = get_default_load_sharded_strategy(checkpoint_name)
+    load_strategy = get_default_load_sharded_strategy(
+        checkpoint_name, cache_metadata=args.ckpt_assume_constant_structure
+    )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
+        if args.ckpt_fully_parallel_load_process_group == 'dp':
+            process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
+            process_group = mpu.get_expert_data_parallel_group()
+        else:
+            raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
+
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
@@ -1375,6 +1440,18 @@ def load_args_from_checkpoint(
             checkpoint_args, 'add_bias_linear', not getattr(checkpoint_args, 'disable_bias_linear')
         )
 
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (getattr(checkpoint_args, 'hybrid_override_pattern', None) is not None
+            and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None):
+        setattr(
+            checkpoint_args, 'hybrid_layer_pattern',
+            getattr(checkpoint_args, 'hybrid_override_pattern'),
+        )
+        # num_layers is now derived from hybrid_layer_pattern in validate_args, and should not be
+        # set at the same time as hybrid_layer_pattern.
+        if hasattr(checkpoint_args, 'num_layers'):
+            setattr(checkpoint_args, 'num_layers', None)
+
     def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
@@ -1417,18 +1494,15 @@ def load_args_from_checkpoint(
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
 
-    _set_arg('hybrid_override_pattern', force=True)
-
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
     _set_arg('spec', force=True)
-    _set_arg('hybrid_attention_ratio', force=True)
-    _set_arg('hybrid_mlp_ratio', force=True)
 
     _set_arg('num_experts', force=True)
+    _set_arg('mtp_num_layers', force=True)
     _set_arg('moe_layer_freq', force=True)
     if getattr(checkpoint_args, 'num_experts', None) is not None:
         _set_arg('moe_ffn_hidden_size', force=True)
@@ -1448,7 +1522,9 @@ def load_args_from_checkpoint(
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
-    _set_arg('is_hybrid_model', force=True)
+    # We need to be able to override hybrid_layer_pattern from the command-line so that different
+    # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
+    _set_arg('hybrid_layer_pattern')
 
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)

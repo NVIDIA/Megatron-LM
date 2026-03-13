@@ -12,6 +12,7 @@ from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.typed_torch import copy_signature
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,6 @@ except ImportError:
         HAVE_TE = True
     else:
         HAVE_TE = False
-
-logger = logging.getLogger(__name__)
 
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
@@ -202,6 +201,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     verbose: bool = False
     real_quant_cfg: str = "None"
 
+    @copy_signature(TransformerLayer.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
