@@ -347,7 +347,6 @@ class TestPartialCudaGraphedA2AOverlap:
                 pytest.skip("Deep EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
         elif moe_dispatcher_type == "hybridep":
             if not is_hybrid_ep_available():
                 pytest.skip("Hybrid EP is not available")
