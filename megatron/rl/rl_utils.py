@@ -1437,7 +1437,7 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("compute-old-logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
