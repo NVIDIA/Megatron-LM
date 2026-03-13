@@ -4,12 +4,9 @@ ENV_VARS:
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   SKIP_PYTEST: 1
-BEFORE_SCRIPT: 'pip uninstall -y transformer_engine || true
-
-  pip uninstall -y Apex || true ## TODO: remove once Apex dependency has been removed
-  completely
-
-  '
+BEFORE_SCRIPT: |
+  pip uninstall -y transformer_engine || true
+  pip uninstall -y Apex || true ## TODO: remove once Apex dependency has been removed completely
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -35,10 +32,10 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
-  --min-lr: 1.0e-05
+  --min-lr: 1.0e-5
   --weight-decay: 1e-2
   --clip-grad: 1.0
-  --lr-warmup-fraction: 0.01
+  --lr-warmup-fraction: .01
   --log-interval: 1
   --save-interval: 10000
   --eval-interval: 1000
@@ -52,7 +49,7 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true

@@ -34,10 +34,10 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
-  --min-lr: 1.0e-05
+  --min-lr: 1.0e-5
   --weight-decay: 1e-2
   --clip-grad: 1.0
-  --lr-warmup-fraction: 0.01
+  --lr-warmup-fraction: .01
   --log-interval: 2
   --save-interval: 10000
   --eval-interval: 1000
@@ -52,15 +52,15 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --log-memory-to-tensorboard: true
   --async-save: true
 TEST_TYPE: regular
 METRICS:
-- iteration-time
-- lm loss
-- num-zeros
-- mem-allocated-bytes
-- mem-max-allocated-bytes
+- "iteration-time"
+- "lm loss"
+- "num-zeros"
+- "mem-allocated-bytes"
+- "mem-max-allocated-bytes"
