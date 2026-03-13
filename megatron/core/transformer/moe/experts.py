@@ -732,6 +732,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
+            assert self.is_inference_cuda_graphed_iteration, "FlashInfer forward path is only used in CUDA-graphed inference iterations."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )

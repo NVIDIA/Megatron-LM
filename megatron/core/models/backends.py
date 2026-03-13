@@ -153,7 +153,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module TE backend uses"""
-        return TEColumnParallelLinear
+        return InferenceColumnParallelLinear
 
     def row_parallel_linear(self) -> type:
         """Which row parallel linear module TE backend uses"""

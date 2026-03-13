@@ -23,9 +23,6 @@ except ImportError:
 
 try:
     from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
-
-    _SWIZZLE = SwizzleType.SWIZZLE_32_4_4
-    _RECIPE = ScalingType.BlockWise1x32
     HAVE_SCALED_GMM = True
 except ImportError:
     HAVE_SCALED_GMM = False
@@ -51,9 +48,9 @@ def _mxfp8_grouped_mm(
     """MXFP8 scaled_grouped_mm with pre-quantized activations and weights."""
     return scaled_grouped_mm(
         act.data, weight.data.transpose(1, 2),
-        act.scale_2d(), _RECIPE,
-        weight.scale, _RECIPE,
-        swizzle_a=_SWIZZLE, swizzle_b=_SWIZZLE,
+        act.scale_2d(), ScalingType.BlockWise1x32,
+        weight.scale, ScalingType.BlockWise1x32,
+        swizzle_a=SwizzleType.SWIZZLE_32_4_4, swizzle_b=SwizzleType.SWIZZLE_32_4_4,
         offs=offs, output_dtype=torch.bfloat16,
     )
 
@@ -78,7 +75,6 @@ def mcore_fused_moe(
     activation_type: ActivationType,
     num_local_experts: int,
     local_expert_start: int,
-    expert_alignment: int = 32,
 ) -> torch.Tensor:
     """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
@@ -86,12 +82,11 @@ def mcore_fused_moe(
         hidden_states: [num_tokens, hidden_size] BF16 input.
         routing_map: [num_tokens, topk] int expert assignments.
         probs: [num_tokens, topk] float32 routing probabilities.
-        fc1_weight: [num_experts, out_features, hidden_size] BF16 stacked weight for FC1.
-        fc2_weight: [num_experts, hidden_size, ffn_hidden] BF16 stacked weight for FC2.
+        fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
+        fc2_weight: stacked weight for FC2 (same type as fc1_weight).
         activation_type: ActivationType enum (SWIGLU or SQUARED_RELU).
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
-        expert_alignment: per-expert token alignment (default 32).
 
     Returns:
         [num_tokens, hidden_size] BF16 output.
@@ -99,7 +94,6 @@ def mcore_fused_moe(
     assert hidden_states.dtype == torch.bfloat16, (
         f"mcore_fused_moe requires bf16 input, got {hidden_states.dtype}"
     )
-    assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
 
     num_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
@@ -108,9 +102,14 @@ def mcore_fused_moe(
     if use_mxfp8:
         assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available"
         mm_fn = _mxfp8_grouped_mm
+        # scaled_grouped_mm requires each expert's token count aligned to 32,
+        # but swizzled MXFP8 scales require alignment to 128. Use 128 to
+        # satisfy both constraints.
+        expert_alignment = 128
     else:
         assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
         mm_fn = _bf16_grouped_mm
+        expert_alignment = 16
 
     # --- Permute ---
     permuted_hidden, permuted_probs, permutation_map, offs = permute_tokens(
