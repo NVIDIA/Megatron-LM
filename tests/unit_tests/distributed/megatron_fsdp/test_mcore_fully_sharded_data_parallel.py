@@ -689,13 +689,13 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
-                id="optim_grads_no_double_buffer",
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
+                id="optim_grads_double_buffer",
             ),
             pytest.param(
                 dict(data_parallel_sharding_strategy="optim", fsdp_double_buffer=False),
-                id="optim_double_buffer",
-            ),
-        ],
+                id="optim_no_double_buffer",
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
         if "fp8_recipe" in spec_configs or "fp4_recipe" in spec_configs:
