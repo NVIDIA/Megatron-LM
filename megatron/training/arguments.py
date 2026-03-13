@@ -960,8 +960,12 @@ def validate_args(args, defaults={}):
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
     
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
-        assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+        if args.fp8 is not None:
+            assert args.transformer_impl == "inference_optimized", \
+                "fp8 with full_iteration_inference CUDA graphs is only supported with " \
+                "--transformer-impl=inference_optimized"
+            assert args.fp8_recipe == "mxfp8", \
+                "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
 
     if args.cuda_graph_impl == 'local':
         assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \

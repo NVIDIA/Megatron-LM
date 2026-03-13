@@ -81,11 +81,14 @@ def _mxfp8_quant_swizzle_kernel(
     col_mask = col_offs < REAL_GROUPS
 
     # Compute swizzled offsets for each scale element
+    # divide scales into 128x4 macro tiles
+    # then flatten each tile.
     macro_row_block = row // 128
     macro_col_block = col_offs // 4
     local_row = row % 128
     local_col = col_offs % 4
-    group = local_row // 32
+    # each group of 32 elements shares the same scale
+    group = local_row // 32 
     sub_row = local_row % 32
     tile_idx = macro_row_block * n_col_blocks + macro_col_block
     swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col

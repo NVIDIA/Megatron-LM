@@ -39,6 +39,8 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.typed_torch import apply_module, not_none
 
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
@@ -546,7 +548,46 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Disable CUDA-graphed iteration mode."""
         self.is_inference_cuda_graphed_iteration = False
 
-    @torch.inference_mode(False)
+    def _build_concatenated_mxfp8_weights(self):
+        """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
+
+        After quantize_model_to_mxfp8, each per-expert weight (weight0, weight1, ...)
+        has been replaced with an MXFP8Tensor. This method stacks their data and
+        scales into _fc1_weight / _fc2_weight for scaled_grouped_mm.
+
+        Note: this creates a contiguous copy since per-expert MXFP8Tensor attributes
+        are not contiguous across experts. This is a one-time cost at first forward.
+
+        Unlike _build_concatenated_weights, this does not create nn.Parameter views
+        back into the buffer — MXFP8 weights are not nn.Parameters (they are plain
+        MXFP8Tensor attributes set by quantize_model_to_mxfp8). This path is only
+        intended for non-colocated inference.
+        """
+
+        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'),
+                                       ('linear_fc2', '_fc2_weight')]:
+            linear = getattr(self, linear_name)
+            q_list, s_list = [], []
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                if isinstance(w, MXFP8Tensor):
+                    mxfp8 = w
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    mxfp8 = w.data
+                else:
+                    raise RuntimeError(
+                        f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
+                        f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
+                    )
+                q_list.append(mxfp8.data)
+                s_list.append(mxfp8.scale)
+
+            setattr(self, buf_name, MXFP8Tensor(
+                data=torch.stack(q_list, dim=0).contiguous(),
+                scale=torch.stack(s_list, dim=0).contiguous(),
+            ))
+
+    @torch.inference_mode(False) # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
 
@@ -673,14 +714,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
 
         if self.training:
+            assert not self.config.fp8_recipe == "mxfp8", "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            assert (
-                not self.training
-            ), "Concatenated weights must be built before training forward pass."
-            self._build_concatenated_weights()
+            if self.config.fp8_recipe == "mxfp8":
+                self._build_concatenated_mxfp8_weights()
+            else:
+                self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
         resolved_backend = resolve_inference_grouped_gemm_backend(

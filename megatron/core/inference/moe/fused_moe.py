@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.inference.moe.activations import padded_squared_relu, padded_swiglu
 from megatron.core.inference.moe.permute import permute_tokens, unpermute_tokens
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 try:
     from torch.nn.functional import grouped_mm
@@ -19,6 +20,15 @@ try:
     HAVE_GROUPED_MM = True
 except ImportError:
     HAVE_GROUPED_MM = False
+
+try:
+    from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
+
+    _SWIZZLE = SwizzleType.SWIZZLE_32_4_4
+    _RECIPE = ScalingType.BlockWise1x32
+    HAVE_SCALED_GMM = True
+except ImportError:
+    HAVE_SCALED_GMM = False
 
 
 class ActivationType(Enum):
@@ -34,6 +44,18 @@ def _bf16_grouped_mm(
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
+
+def _mxfp8_grouped_mm(
+    act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor,
+) -> torch.Tensor:
+    """MXFP8 scaled_grouped_mm with pre-quantized activations and weights."""
+    return scaled_grouped_mm(
+        act.data, weight.data.transpose(1, 2),
+        act.scale_2d(), _RECIPE,
+        weight.scale, _RECIPE,
+        swizzle_a=_SWIZZLE, swizzle_b=_SWIZZLE,
+        offs=offs, output_dtype=torch.bfloat16,
+    )
 
 def _get_activation_func(
     activation_type: ActivationType
@@ -80,7 +102,15 @@ def mcore_fused_moe(
     assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
 
     num_tokens = hidden_states.shape[0]
+    use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     activation_func = _get_activation_func(activation_type)
+
+    if use_mxfp8:
+        assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available"
+        mm_fn = _mxfp8_grouped_mm
+    else:
+        assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available"
+        mm_fn = _bf16_grouped_mm
 
     # --- Permute ---
     permuted_hidden, permuted_probs, permutation_map, offs = permute_tokens(
@@ -89,13 +119,14 @@ def mcore_fused_moe(
         alignment=expert_alignment,
     )
 
-    if permuted_hidden.nelement() == 0:
-        return torch.zeros_like(hidden_states)
-
     # --- FC1 -> activation -> FC2 ---
-    fc1_output = _bf16_grouped_mm(permuted_hidden, fc1_weight, offs)
+    if use_mxfp8: 
+        permuted_hidden = MXFP8Tensor.from_bf16(permuted_hidden, backend="triton")
+    fc1_output = mm_fn(permuted_hidden, fc1_weight, offs)
     activated = activation_func(fc1_output, permutation_map)
-    fc2_output = _bf16_grouped_mm(activated, fc2_weight, offs)
+    if use_mxfp8: 
+        activated = MXFP8Tensor.from_bf16(activated, backend="triton")
+    fc2_output = mm_fn(activated, fc2_weight, offs)
 
     # --- Unpermute ---
     return unpermute_tokens(fc2_output, permuted_probs, permutation_map, num_tokens)
