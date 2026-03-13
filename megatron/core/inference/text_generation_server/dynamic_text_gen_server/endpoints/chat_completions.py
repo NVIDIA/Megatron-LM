@@ -278,22 +278,28 @@ try:
                             **chat_template_kwargs,
                         )
 
-                        # Replace the prefix tokens with the tokens from the previous generation
+                        # Replace the prefix tokens with the tokens from the previous generation.
+                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
+                        # instead of failing the request.
                         last_assistant_message = template_messages[last_assistant_message_idx]
-                        assert (
-                            "prompt_token_ids" in last_assistant_message
-                            and "generation_token_ids" in last_assistant_message
-                        ), "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
-                        previous_turn_token_ids = (
-                            last_assistant_message["prompt_token_ids"]
-                            + last_assistant_message["generation_token_ids"]
-                        )
-                        prompt_tokens = _replace_prefix_tokens(
-                            eos_token_id,
-                            previous_turn_token_ids,
-                            retokenized_previous_turn_token_ids,
-                            prompt_tokens,
-                        )
+                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+                        generation_token_ids = last_assistant_message.get("generation_token_ids")
+
+                        if isinstance(prompt_token_ids, list) and isinstance(
+                            generation_token_ids, list
+                        ):
+                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
+                            prompt_tokens = _replace_prefix_tokens(
+                                eos_token_id,
+                                previous_turn_token_ids,
+                                retokenized_previous_turn_token_ids,
+                                prompt_tokens,
+                            )
+                        else:
+                            logger.warning(
+                                "Last assistant message missing prompt_token_ids/"
+                                "generation_token_ids; skipping prefix replacement."
+                            )
 
             else:
                 warnings.warn(
