@@ -2593,7 +2593,7 @@ try:
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 interleaved=interleaved,
-            )        
+            )
         elif is_te_min_version("1.12.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
