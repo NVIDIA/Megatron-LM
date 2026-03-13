@@ -100,6 +100,7 @@ class TestMambaMetadata:
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -124,6 +125,7 @@ class TestMambaMetadata:
             [0, 1, -1, -1], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -144,6 +146,7 @@ class TestMambaMetadata:
         # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.cu_seqlens is None
@@ -242,7 +245,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 30], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -288,7 +291,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [1, 1], dtype=torch.int32, device=metadata_context.device
+            [1, 10], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -334,7 +337,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [1, 2], dtype=torch.int32, device=metadata_context.device
+            [1, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -375,7 +378,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 

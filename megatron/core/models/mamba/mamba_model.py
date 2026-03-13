@@ -1,7 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -18,6 +20,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    compute_mtp_inference_logits,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -26,7 +29,10 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    log_single_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MambaModel(LanguageModule):
@@ -38,16 +44,25 @@ class MambaModel(LanguageModule):
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer
-            (used with pipeline parallelism). Defaults to True.
-        hybrid_attention_ratio (float, optional): The target ratio of attention
-            layers to total layers
-        hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
-        hybrid_override_pattern (str, optional): Unified hybrid layer pattern with optional MTP.
+        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
+            pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
+                - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+        hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_mlp_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
+            with a deprecation warning.
+        pre_process (bool, optional): Include embedding layer
+            (used with pipeline parallelism). Defaults to True.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
@@ -65,6 +80,7 @@ class MambaModel(LanguageModule):
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
     """
 
     def __init__(
@@ -73,10 +89,11 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        hybrid_layer_pattern: Optional[str] = None,
+        hybrid_attention_ratio: Optional[float] = None,
+        hybrid_mlp_ratio: Optional[float] = None,
+        hybrid_override_pattern: Optional[str] = None,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
@@ -95,13 +112,19 @@ class MambaModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        if self.config.use_mup and not getattr(MambaModel, "mup_warning_printed", False):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MuP for MambaModel is experimental and not fully validated yet.",
+            )
+            MambaModel.mup_warning_printed = True
+
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        self.hybrid_layer_pattern = hybrid_layer_pattern
         self.pre_process = pre_process
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
-        self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
@@ -109,18 +132,73 @@ class MambaModel(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
 
-        # Parse unified pattern to extract main and MTP components
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+        # Backward compatibility for deprecated hybrid parameters
+        if hybrid_override_pattern is not None:
+            if self.hybrid_layer_pattern is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "hybrid_override_pattern has been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                )
+                self.hybrid_layer_pattern = hybrid_override_pattern
+            else:
+                raise ValueError(
+                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
+                )
+        if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
+            hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
+        ):
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "hybrid_layer_pattern cannot be used together with "
+                    "hybrid_attention_ratio or hybrid_mlp_ratio. "
+                    "These ratios have been deprecated; use hybrid_layer_pattern alone."
+                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
+                "Use hybrid_layer_pattern instead.",
+            )
+            if self.hybrid_layer_pattern is None:
+                from megatron.core.ssm.mamba_hybrid_layer_allocation import pattern_from_ratios
 
-        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+                attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
+                mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
+                self.hybrid_layer_pattern = pattern_from_ratios(
+                    config.num_layers, attn_ratio, mlp_ratio
+                )
+
+        # Parse unified pattern to extract main and MTP components, and
+        # determine the pipeline segment for this model instance.
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            parse_hybrid_pattern,
+            select_pipeline_segment,
+        )
+
+        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+
+        layer_type_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
             self.mtp_pattern is not None
             and self.mtp_num_depths > 0
-            and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
+            # The following forces MTP to be on the final pipeline stage. It might be more optimal
+            # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
+            # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
+            # stage separate from loss) to be supported in the hybrid model.
+            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
         )
 
         # megatron core pipelining currently depends on model type
@@ -156,9 +234,8 @@ class MambaModel(LanguageModule):
             mamba_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            hybrid_attention_ratio=self.hybrid_attention_ratio,
-            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=parsed.main_pattern,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -189,7 +266,11 @@ class MambaModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
@@ -236,6 +317,7 @@ class MambaModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -312,7 +394,18 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if self.mtp_process:
+        # Check if speculative decoding is active. When it is, MTP must be
+        # computed *after* verification so that it is conditioned on verified
+        # tokens rather than stale speculative tokens from the previous step.
+        if is_spec_decode is None:
+            is_spec_decode = (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+            )
+
+        mtp_forward_ran = self.mtp_process and not is_spec_decode
+        if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -327,21 +420,38 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None:
-            hidden_states = process_mtp_loss(
-                hidden_states=hidden_states,
-                labels=labels,
-                loss_mask=loss_mask,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                is_training=self.training,
-                compute_language_model_loss=self.compute_language_model_loss,
-                config=self.config,
-                cp_group=self.pg_collection.cp,
-                packed_seq_params=packed_seq_params,
-            )
-
+        if self.config.mtp_num_layers is not None and (mtp_forward_ran or is_spec_decode):
+            assert self.config.mtp_num_layers > 0
+            # The new process_mtp_loss function doesn't handle mtp_logits_cache,
+            # so we manually generate and cache MTP logits when in inference mode.
+            if in_inference_mode:
+                if is_spec_decode:
+                    # Cache decoder hidden states for serial MTP computation
+                    # after speculative token verification.
+                    self._decoder_hidden_states_cache = hidden_states
+                else:
+                    hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
+                        hidden_states=hidden_states,
+                        mtp_num_layers=self.config.mtp_num_layers,
+                        output_layer=self.output_layer,
+                        output_weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )
+            else:
+                hidden_states = process_mtp_loss(
+                    hidden_states=hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    is_training=self.training,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    packed_seq_params=packed_seq_params,
+                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
@@ -357,17 +467,16 @@ class MambaModel(LanguageModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample's true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [B, 1, H]
-                # (so that the output layer, which expects S×B×H, receives only the final token)
-                hidden_states = inference_context.last_token_logits(
-                    hidden_states.squeeze(1).unsqueeze(0)
-                ).unsqueeze(1)
+                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                # then back to [S', B, H] for the output layer.
+                reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         if labels is None:
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
+            logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -396,3 +505,46 @@ class MambaModel(LanguageModule):
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: int,
+        runtime_gather_output: bool = True,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int): MTP depth index (0-indexed).
+            runtime_gather_output (bool): Whether to gather output across TP.
+
+        Returns:
+            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
+        """
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(
+            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+
+        return mtp_hidden, logits

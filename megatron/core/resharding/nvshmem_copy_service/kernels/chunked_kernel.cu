@@ -96,6 +96,13 @@ __global__ void chunked_batched_copy_kernel(
             }
         }
     }
+
+    // System-wide memory fence: ensures all writes from this thread are visible
+    // to system agents (NIC DMA engines, other GPUs via PCIe/NVLink).
+    // Required so that NVSHMEM put() on another CUDA stream can read correct
+    // pack data from the send buffer. Without this, writes may remain in L2
+    // cache, invisible to the NIC's DMA engine.
+    __threadfence_system();
 }
 
 }

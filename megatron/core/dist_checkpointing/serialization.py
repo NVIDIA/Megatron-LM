@@ -453,6 +453,14 @@ def get_default_save_common_strategy(
     return get_default_strategy(StrategyAction.SAVE_COMMON, backend, version)
 
 
-def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
-    """Get default load sharded strategy."""
-    return verify_checkpoint_and_load_strategy(checkpoint_dir)[0]
+def get_default_load_sharded_strategy(
+    checkpoint_dir: str, cache_metadata: bool = False
+) -> LoadShardedStrategy:
+    """Get default load sharded strategy.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory.
+        cache_metadata: If True and checkpoint format is torch_dist, use a strategy that caches
+            metadata (e.g. when ckpt_assume_constant_structure is enabled).
+    """
+    return verify_checkpoint_and_load_strategy(checkpoint_dir, cache_metadata=cache_metadata)[0]
