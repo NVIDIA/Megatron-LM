@@ -37,7 +37,7 @@ ENV_DEPENDENT="\
 MODEL_OPTIONS="
 --seq-length $MAX_SEQ_LENGTH \
 --inference-max-seq-length $MAX_SEQ_LENGTH \
---inference-max-batch-size $MAX_INFERENCE_BS \
+--inference-max-requests $MAX_INFERENCE_BS \
 --pretrained-checkpoint $CHECKPOINT \
 --no-use-tokenizer-model-from-checkpoint-args \
 --seq-length 8192 \
@@ -51,6 +51,7 @@ MODEL_OPTIONS="
 --te-rng-tracker \
 --tokenizer-type HuggingFaceTokenizer \
 --tokenizer-model Qwen/Qwen3-30B-A3B \
+--tokenizer-hf-include-special-tokens \
 --untie-embeddings-and-output-weights \
 --num-layers 48 \
 --hidden-size 2048 \

@@ -38,7 +38,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch_dist \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --num-layers 64 \
@@ -64,6 +64,7 @@ MODEL_OPTIONS="\
   --attention-softmax-in-fp32 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model Qwen/Qwen3-4B \
+  --tokenizer-hf-include-special-tokens \
   --vocab-size 151936 \
   --make-vocab-size-divisible-by 128 \
   --optimizer adam \

@@ -10,10 +10,7 @@ import pytest
 import requests
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.training.tokenizer.gpt2_tokenization import (
-    PRETRAINED_MERGES_ARCHIVE_MAP,
-    PRETRAINED_VOCAB_ARCHIVE_MAP,
-)
+from megatron.core.tokenizers.text.libraries.megatron_hf_tokenizer import MEGATRON_CONFIG_MAP
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_data import Encoder
 from tools.preprocess_data import get_args as build_args
@@ -170,7 +167,7 @@ def gpt2_vocab(odir):
         return __LOCAL_GPT2_VOCAB
     path = os.path.join(odir, "vocab.json")
     with open(path, "wb") as writer:
-        writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
+        writer.write(requests.get(MEGATRON_CONFIG_MAP['GPT2BPETokenizer']['vocab']).content)
     return path
 
 
@@ -179,7 +176,7 @@ def gpt2_merge(odir):
         return __LOCAL_GPT2_MERGE
     path = os.path.join(odir, "merge.txt")
     with open(path, "wb") as writer:
-        writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
+        writer.write(requests.get(MEGATRON_CONFIG_MAP['GPT2BPETokenizer']['merges_file']).content)
     return path
 
 

@@ -9,8 +9,8 @@ Megatron Core
 ## ⚡ Quick Start
 
 ```bash
-# Install Megatron Core with required dependencies
-pip install --no-build-isolation megatron-core[dev]
+# Install Megatron Core
+uv pip install megatron-core
 
 # Distributed training example (2 GPUs, mock data)
 torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
@@ -48,4 +48,4 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ---
 
-*For complete installation instructions, performance benchmarks, and ecosystem information, see the [main README](../README.md).*
+*For complete installation instructions, performance benchmarks, and ecosystem information, see the [main README](../../README.md).*

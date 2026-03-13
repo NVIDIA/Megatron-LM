@@ -4,13 +4,14 @@ import asyncio
 import logging
 import time
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -21,7 +22,7 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -110,105 +111,111 @@ try:
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
-        start_time = time.perf_counter()
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
+
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             return f"Error during inference: {e}", 500
 
-        logger.info(
-            f"Batch of {len(tasks)} requests processed in {time.perf_counter() - start_time:.2f}s"
-        )
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
 
         # --- 4. Format Response (matching old_completions.py) ---
         choices = []
 
         request_idx = 0
-        for record in batch_results:
-            for result in record.requests:
-                full_text = result.generated_text or ""
-                text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
+        for completed_request in batch_results:
+            request_dict = (
+                completed_request
+                if isinstance(completed_request, dict)
+                else completed_request.serialize()
+            )
+            result = unwrap_serialized_tensors(request_dict)
+            full_text = result["generated_text"] or ""
+            text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
-                logprobs_data = None
-                if sampling_params.return_log_probs:
-                    # Get prompt tokens and logprobs
-                    prompt_tokens_list = []
-                    if result.prompt_tokens is not None:
-                        if hasattr(result.prompt_tokens, 'tolist'):
-                            prompt_tokens_list = result.prompt_tokens.tolist()
-                        else:
-                            prompt_tokens_list = list(result.prompt_tokens)
+            logprobs_data = None
+            if sampling_params.return_log_probs:
+                # Get prompt tokens and logprobs
+                prompt_tokens_list = result["prompt_tokens"] or []
 
-                    prompt_log_probs = getattr(result, 'prompt_log_probs', None) or []
-                    prompt_top_n_logprobs = getattr(result, 'prompt_top_n_logprobs', None) or []
+                prompt_log_probs = result.get('prompt_log_probs') or []
+                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
 
-                    # Get generated tokens and logprobs
-                    generated_tokens_list = (
-                        list(result.generated_tokens) if result.generated_tokens else []
-                    )
-                    generated_log_probs = getattr(result, 'generated_log_probs', None) or []
-                    generated_top_n_logprobs = (
-                        getattr(result, 'generated_top_n_logprobs', None) or []
-                    )
+                # Get generated tokens and logprobs
+                generated_tokens_list = result["generated_tokens"] or []
+                generated_log_probs = result.get('generated_log_probs') or []
+                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
 
-                    if echo:
-                        # When echo=True, include prompt tokens and their logprobs
-                        # Prompt logprobs are for tokens [1:] (first token has no logprob)
-                        all_token_ids = prompt_tokens_list + generated_tokens_list
-                        tokens = [tokenizer.detokenize([tok]) for tok in all_token_ids]
+                if echo:
+                    # When echo=True, include prompt tokens and their logprobs
+                    # Prompt logprobs are for tokens [1:] (first token has no logprob)
+                    all_token_ids = prompt_tokens_list + generated_tokens_list
+                    tokens = [tokenizer.detokenize([tok]) for tok in all_token_ids]
 
-                        # Build token_logprobs: [None] for first token, then prompt logprobs,
-                        # then generated logprobs
-                        token_logprobs = [None] + list(prompt_log_probs) + list(generated_log_probs)
+                    # Build token_logprobs: [None] for first token, then prompt logprobs,
+                    # then generated logprobs
+                    token_logprobs = [None] + list(prompt_log_probs) + list(generated_log_probs)
 
-                        # Build top_logprobs: [None] for first token, then prompt top_n,
-                        # then generated top_n
-                        top_logprobs = None
-                        if prompt_top_n_logprobs or generated_top_n_logprobs:
-                            top_logprobs = (
-                                [None]
-                                + list(prompt_top_n_logprobs)
-                                + list(generated_top_n_logprobs)
-                            )
+                    # Build top_logprobs: [None] for first token, then prompt top_n,
+                    # then generated top_n
+                    top_logprobs = None
+                    if prompt_top_n_logprobs or generated_top_n_logprobs:
+                        top_logprobs = (
+                            [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
+                        )
 
-                        # Calculate text_offset: cumulative character positions starting from 0
-                        text_offset = []
-                        current_offset = 0
-                        for tok_str in tokens:
-                            text_offset.append(current_offset)
-                            current_offset += len(tok_str)
-                    else:
-                        # When echo=False, only return generated tokens and their logprobs
-                        tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
+                    # Calculate text_offset: cumulative character positions starting from 0
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
+                else:
+                    # When echo=False, only return generated tokens and their logprobs
+                    tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
 
-                        # Prepend [None] to match OpenAI format
-                        token_logprobs = [None] + list(generated_log_probs)
+                    # Prepend [None] to match OpenAI format
+                    token_logprobs = [None] + list(generated_log_probs)
 
-                        # Build top_logprobs
-                        top_logprobs = None
-                        if generated_top_n_logprobs:
-                            top_logprobs = [None] + list(generated_top_n_logprobs)
+                    # Build top_logprobs
+                    top_logprobs = None
+                    if generated_top_n_logprobs:
+                        top_logprobs = [None] + list(generated_top_n_logprobs)
 
-                        # Calculate text_offset for generated tokens only
-                        text_offset = []
-                        current_offset = 0
-                        for tok_str in tokens:
-                            text_offset.append(current_offset)
-                            current_offset += len(tok_str)
+                    # Calculate text_offset for generated tokens only
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
 
-                    logprobs_data = {
-                        "token_logprobs": token_logprobs,
-                        "tokens": tokens,
-                        "text_offset": text_offset,
-                        "top_logprobs": top_logprobs,
-                    }
+                logprobs_data = {
+                    "token_logprobs": token_logprobs,
+                    "tokens": tokens,
+                    "text_offset": text_offset,
+                    "top_logprobs": top_logprobs,
+                }
 
-                choices.append(
-                    {"index": request_idx, "text": text_output, "logprobs": logprobs_data}
+            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
+            if result["routing_indices"] is not None:
+                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                prompt_length = (
+                    len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
                 )
-                request_idx += 1
+                if prompt_length:
+                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                        :prompt_length
+                    ]
+
+            request_idx += 1
 
         return jsonify({"choices": choices})
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")

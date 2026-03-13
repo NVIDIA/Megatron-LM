@@ -211,31 +211,6 @@ test:unit_tests_notify:
       when: always
     - when: never
 
-test:linting_docs_build:
-  extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  needs: [test:build_image]
-  script:
-    - cd ..
-    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
-    - mv megatron-lm/ documentation/
-    - cd documentation/
-    - ./repo docs
-  rules:
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $BUILD == "no"
-      when: never
-    - when: on_success
-      allow_failure: true
-
 # Override from template
 secret_detection:
   rules:

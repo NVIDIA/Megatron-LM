@@ -43,7 +43,8 @@ set to 1.
 The arguments in the script will need to be changed if using a checkpoint with a
 different model parallel configuration or other differences, such as model
 architecture. For example, to run the 8B pure Mamba-2 model, change
-`--hybrid-attention-ratio` and `--hybrid-mlp-ratio` to 0.0, or remove them.
+`--hybrid-layer-pattern` to use only `M` symbols (e.g., 56 `M`s for the 8B
+model), or remove it entirely.
 
 Use [`run_text_gen_server_8b_gpt3.sh`](./run_text_gen_server_8b_gpt3.sh) to start
 a text generation server using the 8B reference Transformer checkpoint.
@@ -67,24 +68,46 @@ export PYTHONPATH=<path-to-megatron>:PYTHONPATH
 
 ## Hybrid Options
 
-`--hybrid-attention-ratio ATT` specifies a target ratio of attention layers
-to total layers. For example, 4 attention layers out of 48 total layers is
-specified by `--hybrid-attention-ratio 0.08`.
+`--hybrid-layer-pattern PATTERN` specifies the layer type for every layer in
+the model using a string of single-character symbols:
 
-`--hybrid-mlp-ratio MLP` specifies a target ratio of MLP layers to total
-layers. For example, 24 MLP layers out of 48 total layers is specified by
-`--hybrid-mlp-ratio 0.5`.
+* `M` — Mamba layer
+* `*` — Attention layer
+* `-` — MLP layer
+* `E` — MoE layer
 
-* (`ATT` + `MLP`) must be less than or equal to 1.0.
-* (1.0 - `ATT` - `MLP`) is the hybrid mamba ratio, the ratio of mamba layers to
-total layers.
-* `ATT` = `MLP` = 0 is a pure Mamba model.
-* `ATT` = `MLP` = 0.5 is a transfomer model.
+The number of layers is derived from the pattern length, so `--num-layers`
+should not be specified when `--hybrid-layer-pattern` is used.
 
-If either `ATT` or `MLP` is greater than 0.0 or if `--hybrid-override-pattern`
-is specified, the logfile will include information about the hybrid layer
-pattern used. `--hybrid-override-pattern` can be used to specify a different
-pattern than the default, algorithmically-generated one.
+For example, the 8B hybrid model described in the technical report uses:
+
+```
+--hybrid-layer-pattern "M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+```
+
+This is a 56-layer model with 4 attention layers, 28 MLP layers, and 24 Mamba
+layers.
+
+A pure Mamba model uses only `M` symbols (e.g., `MMMMMMMM` for 8 layers).
+A pure transformer model uses only `*` and `-` symbols.
+
+### Pipeline parallelism
+
+Use `|` to define pipeline stage boundaries for flexible virtual pipeline
+parallelism (fVPP). For example, `M-M-|M-M*-|M-M-|M-M*-` defines 4 pipeline
+segments. The number of segments must be evenly divisible by
+`--pipeline-model-parallel-size`.
+
+### Multi-Token Prediction (MTP)
+
+Use `/` to append MTP layer patterns. Each pattern after the separator
+represents one MTP prediction depth. For example, `M*M*/MM/MM` has main
+pattern `M*M*` with MTP pattern `MM` repeated for 2 depths.
+
+### Deprecated options
+
+`--hybrid-override-pattern`, `--hybrid-attention-ratio`, and
+`--hybrid-mlp-ratio` are deprecated. Use `--hybrid-layer-pattern` instead.
 
 ## Mamba vs Mamba-2
 

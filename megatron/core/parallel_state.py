@@ -23,8 +23,6 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-logger = logging.getLogger(__name__)
-
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -140,8 +138,9 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# Global symmetric memory buffer for inference
-_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
+# Global symmetric memory buffers for inference
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = None
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = None
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -568,6 +567,8 @@ def initialize_model_parallel(
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
     create_all_gather_group: Optional[bool] = False,
+    rank_offset: int = 0,
+    local_world_size: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -735,7 +736,9 @@ def initialize_model_parallel(
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
+    world_size: int = (
+        local_world_size if local_world_size is not None else torch.distributed.get_world_size()
+    )
 
     model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
 
@@ -781,7 +784,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=context_parallel_size,
         order=order,
-        rank_offset=0,
+        rank_offset=rank_offset,
     )
 
     # Build expert rank generator
@@ -804,7 +807,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=1,
         order=order,
-        rank_offset=0,
+        rank_offset=rank_offset,
     )
 
     assert (
@@ -1359,16 +1362,6 @@ def initialize_model_parallel(
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
-
-
-def is_unitialized() -> bool:
-    """Check if parallel state has been initialized
-
-    Deprecated. Use is_initialized instead.
-
-    """
-    warnings.warn("is_unitialized is deprecated, use is_initialized instead", DeprecationWarning)
-    return not is_initialized()
 
 
 def model_parallel_is_initialized():
@@ -1958,16 +1951,6 @@ def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_p
         return _EXPERT_DATA_PARALLEL_GROUP
 
 
-def get_data_modulo_expert_parallel_group(partial_expert_data_parallel=False):
-    """[Deprecated] Get expert data parallel group."""
-    warnings.warn(
-        "get_data_modulo_expert_parallel_group is deprecated, please use "
-        "get_expert_data_parallel_group instead.",
-        DeprecationWarning,
-    )
-    return get_expert_data_parallel_group(partial_expert_data_parallel=partial_expert_data_parallel)
-
-
 def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
     """Get expert data parallel group-gloo."""
     if partial_expert_data_parallel:
@@ -2036,12 +2019,22 @@ def _set_global_memory_buffer():
 
 def _set_global_symmetric_memory_buffer():
     """Initialize global buffer."""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP, _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None
+    ), "global symmetric memory buffer for TP is already initialized"
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None
+    ), "global symmetric memory buffer for EP is already initialized"
 
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = GlobalSymmetricMemoryBuffer(
         size_in_mb=256,  # todo: set from an argument?
         process_group=get_tensor_model_parallel_group(),
+    )
+
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = GlobalSymmetricMemoryBuffer(
+        size_in_mb=256,  # todo: set from an argument?
+        process_group=get_expert_model_parallel_group(),
     )
 
 
@@ -2051,12 +2044,20 @@ def get_global_memory_buffer():
     return _GLOBAL_MEMORY_BUFFER
 
 
-def get_global_symmetric_memory_buffer():
+def get_global_symmetric_memory_buffer_tp():
     """Return the global GlobalSymmetricMemoryBuffer object"""
     assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is not None
     ), "global symmetric memory buffer is not initialized"
-    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP
+
+
+def get_global_symmetric_memory_buffer_ep():
+    """Return the global GlobalSymmetricMemoryBuffer object"""
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is not None
+    ), "global symmetric memory buffer is not initialized"
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
 
 
 def destroy_global_memory_buffer():
@@ -2067,8 +2068,9 @@ def destroy_global_memory_buffer():
 
 def destroy_global_symmetric_memory_buffer():
     """Sets the global symmetric memory buffer to None"""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP, _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = None
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = None
 
 
 def get_all_ranks():
@@ -2149,8 +2151,11 @@ def destroy_model_parallel():
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
 
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = None
+
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
