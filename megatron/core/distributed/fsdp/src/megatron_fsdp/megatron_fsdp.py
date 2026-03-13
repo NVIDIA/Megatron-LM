@@ -73,6 +73,34 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
+def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
+    """Configure delayed wgrad gradient processing for MoE expert parameters.
+
+    When ``delay_wgrad_compute_for_te_grouped_gemm`` is enabled on a TransformerLayer,
+    this function:
+      1. Marks expert parameters so the normal post-accumulate-grad hook is skipped.
+      2. Registers a callback on the MoE layer that invokes FSDP's gradient
+         reduce-scatter after the delayed wgrad computation completes.
+
+    Args:
+        module: The module being processed in the forward pre-hook. Only
+            ``TransformerLayer`` instances with the delayed wgrad config flag
+            enabled are affected; all other modules are no-ops.
+        process_post_backward_gradients_fn: The FSDP gradient processing function
+            (``_process_post_backward_gradients``) to be called after the delayed
+            wgrad computation finishes.
+    """
+    from functools import partial
+
+    need_backward_dw = getattr(module, "need_backward_dw", lambda: False)
+    if not need_backward_dw():
+        return
+
+    for param in module.parameters():
+        if getattr(param, 'skip_backward_post_hook', False):
+            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
+
+
 class MegatronFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training.
 
@@ -728,6 +756,7 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
+
             return args, kwargs
 
         @torch.compiler.disable
@@ -983,6 +1012,8 @@ class MegatronFSDP(torch.nn.Module):
 
         fsdp_modules = []
         for name, module in root_module.named_modules():
+            # Set post backward hook for TE grouped gemm if enabled comm overlap
+            setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
                 _register_pre_backward_param_unshard_hook(module)
@@ -1038,7 +1069,11 @@ class MegatronFSDP(torch.nn.Module):
             for param in grad_acc_param_list:
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
-                        lambda p: _process_post_backward_gradients([p])
+                        lambda p: (
+                            None
+                            if getattr(p, 'skip_backward_post_hook', False)
+                            else _process_post_backward_gradients([p])
+                        )
                     )
                 )
 
