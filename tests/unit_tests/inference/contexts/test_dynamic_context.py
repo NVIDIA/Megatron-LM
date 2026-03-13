@@ -62,6 +62,8 @@ class TestDynamicContext:
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
         num_speculative_tokens=0,
+        enable_chunked_prefill: bool = False,
+        max_requests: int = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -100,6 +102,8 @@ class TestDynamicContext:
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_requests=max_requests,
             ),
         )
         return dynamic_context
@@ -1545,9 +1549,8 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=True,
             layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
+            enable_chunked_prefill=True,
         )
-
-        dynamic_context.enable_chunked_prefill = True
 
         # Add 2 normal decode requests
         dynamic_context.add_request(
@@ -1648,9 +1651,9 @@ class TestDynamicContext:
             buffer_size_gb=0.03,
             block_size_tokens=4,
             max_tokens=None,
+            enable_chunked_prefill=True,
+            max_requests=16,
         )
-
-        dynamic_context.enable_chunked_prefill = True
 
         # Add 2 normal decode requests
         dynamic_context.add_request(
