@@ -48,17 +48,24 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
-from .async_utils import AsyncRequest
+from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
+from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
+from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+    CheckpointMetadataCache,
+    save_state_dict_async_finalize,
+    save_state_dict_async_plan,
+)
+
 from .base import (
     AsyncSaveShardedStrategy,
     LoadShardedStrategy,
     StrategyAction,
     register_default_strategy,
 )
-from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
-from .filesystem_async import FileSystemWriterAsync
-from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
 try:
     if not torch.cuda.is_available():
@@ -621,24 +628,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
-        # Cached SavePlans to skip plan in `save_state_dict_async_plan`
-        # cached outcome of `SavePlan.prepare_global_plan`,
-        # which aggregates local plans from all ranks
-        self.cached_central_plan: SavePlan = None
-        # cached outcome of `SavePlan.prepare_local_plan` describes how local state_dict is written
-        self.cached_local_plan: SavePlan = None
-        # Cached global metadata, only `coordinator` for dist-ckpt holds
-        # if central plans are consistent over iters
-        self.cached_global_metadata: Metadata = None
-        # This variable records if the ckpt structures are consistent
-        # so the following checkpoint savings reuse `cached_global_metadata`
-        self.validated_cache_reuse: bool = False
         # The knob to enable cached metadata communication in saving
         self.use_cached_ckpt_structure: bool = cached_metadata
+        # Metadata cache encapsulating all cached plan/metadata state (from nvidia-resiliency-ext)
+        self._metadata_cache: Optional[CheckpointMetadataCache] = None
+        # FullyParallel wrappers and load paths may seed save-time metadata reuse here.
+        self.cached_global_metadata: Optional[Metadata] = None
 
         self.separation_hint = separation_hint
-
-        self.validated_loaded_metadata_reuse = False
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -661,6 +658,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         if self.separation_hint is not None and self.thread_count <= 1:
             self.thread_count = 2
+        
+        if self._metadata_cache is None:
+            self._metadata_cache = CheckpointMetadataCache()
+            if self.cached_global_metadata is not None:
+                self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
 
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
@@ -668,35 +670,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            use_cached_data_structure = self.use_cached_ckpt_structure
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
-        # Try twice to validate the generated `central_plan` is the same across iterations
-        # If so, reuse `cached_central_plan` and `cached_global_metadata`
-        # From the 3rd iteration, `save_state_dict_async_plan` will not generate `global_metadata`
-        # (return None) so `self.cached_global_metadata` is reused
-        args_cached_plans = None
-        loaded_all_plans = None
-        if self.use_cached_ckpt_structure:
-            loaded_all_plans = getattr(self.cached_global_metadata, "all_local_plans", None)
-            if loaded_all_plans is None:
-                logger.debug(
-                    "no all_local_plans in metadata - can't verify global metadata reuse..."
-                )
-
-            args_cached_plans = (
-                self.cached_central_plan,
-                self.cached_local_plan,
-                self.validated_cache_reuse,
-            )
-
-        (
-            save_state_dict_ret,
-            self.cached_central_plan,
-            self.cached_local_plan,
-            self.validated_cache_reuse,
-            self.validated_loaded_metadata_reuse,
-        ) = save_state_dict_async_plan(
+        save_state_dict_ret = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
             None,
@@ -708,37 +686,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
-            cached_ckpt_structure=args_cached_plans,
-            loaded_all_plans=loaded_all_plans,
+            enable_cache=self.use_cached_ckpt_structure,
+            metadata_cache=self._metadata_cache,
         )
-        rank = torch.distributed.get_rank()
-        if self.use_cached_ckpt_structure:
-            if (
-                loaded_all_plans
-                and self.cached_global_metadata
-                and self.validated_loaded_metadata_reuse
-            ):
-                if coordinator == rank:
-                    logger.debug(
-                        f"rank: {rank}, reuse global metadata from loaded"
-                        f" .metadata, {save_state_dict_ret[1]}"
-                    )
-                    save_state_dict_ret = list(save_state_dict_ret)
-                    save_state_dict_ret[1] = self.cached_global_metadata
-
-            elif self.validated_cache_reuse:
-                logger.debug(f"rank: {rank}, cache validated")
-                if save_state_dict_ret[1]:  # when global_metadata is not cached
-                    self.cached_global_metadata = save_state_dict_ret[1]  # Cache Metadata
-                # Only Coordinator rank holds cached global_metadata
-                # (None is returned for global_metadata)
-                elif coordinator == rank:
-                    logger.debug(
-                        f"rank: {rank}, reuse global metadata cached from previous"
-                        f" save iteration, {save_state_dict_ret[1]}"
-                    )
-                    save_state_dict_ret = list(save_state_dict_ret)
-                    save_state_dict_ret[1] = self.cached_global_metadata
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
 

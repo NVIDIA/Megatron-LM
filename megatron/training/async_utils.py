@@ -7,19 +7,22 @@ the async checkpoint save calls.
 import logging
 import time
 
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
     CachedMetadataFileSystemReader,
 )
-from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue, get_write_results_queue
+from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue, AsyncRequest
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    _results_queue,
+    get_write_results_queue,
+)
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
 # Singleton manager of async calls
-# The default is `TemporalAsyncCaller`
-_async_calls_queue = AsyncCallsQueue()
+# The default is `TemporalAsyncCaller` (persistent=False)
+_async_calls_queue = None # AsyncCallsQueue(persistent=False)
 
 
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
@@ -32,9 +35,9 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         print(f"init_persistent_async_worker: {rank}, Starting Async Caller", flush=True)
     _async_calls_queue = AsyncCallsQueue(persistent=True)
     # initialize the persistent caller with QoS priorities from args
+    # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
-        mp_mode,
         cpu_priority=args.async_ckpt_cpu_priority,
         io_priority=args.async_ckpt_io_priority,
     )
