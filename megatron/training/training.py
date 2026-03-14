@@ -149,7 +149,8 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_global_symmetric_memory_buffer,
     destroy_model_parallel,
-    update_pg_timeout
+    update_pg_timeout,
+    create_all_gather_groups,
 )
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
@@ -1215,6 +1216,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+        if args.create_all_gather_group:
+            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+                for_expert_parallelism=(args.expert_model_parallel_size > 1),
+                timeout=timeout,
+            )
+            pg_collection.dp_cp_ag = dp_cp_ag
+            pg_collection.expt_dp_ag = expt_dp_ag
+
+            print_rank_0("> created all-gather process groups for AG/RS overlap")
+            if expt_dp_ag is not None:
+                print_rank_0(">   including expert parallelism AG group")
+
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
@@ -1385,6 +1399,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
                 dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
                 dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+                if getattr(args, 'megatron_fsdp_pg_collection', False):
+                    dp_init_kwargs["pg_collection"] = pg_collection
 
             model = [
                 DP(
