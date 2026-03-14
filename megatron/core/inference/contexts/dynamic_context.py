@@ -258,10 +258,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
-        if self.cache_mla_latent:
-            assert (
-                inference_config.block_size_tokens == 64
-            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads

@@ -2266,6 +2266,18 @@ class MLATransformerConfig(TransformerConfig):
     """
 
     def __post_init__(self):
+        if self.qk_head_dim + self.qk_pos_emb_head_dim == self.v_head_dim:
+            if self.kv_channels is not None and self.kv_channels != self.v_head_dim:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    (
+                        f"automatically set `kv_channels={self.kv_channels}` to support local MLA "
+                        "implementation, since qk_head_dim + qk_pos_emb_head_dim == v_head_dim"
+                    ),
+                )
+            self.kv_channels = self.v_head_dim
+
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
@@ -2277,3 +2289,16 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+        # The local `DotProductAttention` implementation only supports using the same channel
+        # dimensions for K and V. In those cases where `DotProductAttention` can be supported, we
+        # thus set the corresponding config.
+        if (
+            self.transformer_impl == "local"
+            and self.qk_head_dim + self.qk_pos_emb_head_dim != self.v_head_dim
+        ):
+            raise ValueError(
+                "local implementation only supports MLA when "
+                "qk_head_dim + qk_pos_emb_head_dim == v_head_dim (currently "
+                f"{self.qk_head_dim} + {self.qk_pos_emb_head_dim} != {self.v_head_dim})"
+            )
