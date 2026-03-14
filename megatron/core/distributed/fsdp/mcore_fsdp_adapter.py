@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import nullcontext
 from typing import List, Optional
 
 try:
@@ -39,6 +40,8 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -55,6 +58,13 @@ try:
 except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
     HAVE_MEGATRON_FSDP = False
+
+try:
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+    except (ImportError, ModuleNotFoundError):
+    HAVE_TE = True
+except:
+    HAVE_TE = False
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +133,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 self.fsdp_unit_modules = []
 
         self._fix_tensor_parallel_attributes(module)
+        self._set_te_module_quantization_ctx(module)
 
         super().__init__(
             config=config,
@@ -356,6 +367,29 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
+
+    def _set_te_module_quantization_ctx(self, root_module):
+        """
+        Initialize Transformer Engine modules with the appropriate quantization
+        context (FP8, FP4, or a no-op context) for parameter initialization on
+        the meta device.
+        """
+        if not HAVE_TE:
+            return
+
+        for module in root_module.modules():
+            if not isinstance(module, TransformerEngineBaseModule):
+                continue
+
+            layer_no = module.layer_number if hasattr(module, "layer_number") else -1
+            if module.config.fp8:
+                quantization_context = get_fp8_context(module.config, layer_no, is_init=True)
+            elif module.config.fp4:
+                quantization_context = get_fp4_context(module.config, layer_no, is_init=True)
+            else:
+                quantization_context = nullcontext()
+
+            module._te_quantization_context = quantization_context
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):

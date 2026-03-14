@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -348,6 +349,218 @@ def _fp8_quantize_fallback(
             packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
         )
         _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
+
+
+# Check if Transformer Engine has class for fp4 tensors.
+HAVE_TE_FP4_TENSOR_CLASS = False
+if HAVE_TE:
+    if is_te_min_version("2.7.0.dev0"):
+        try:
+            from transformer_engine.pytorch.tensor.nvfp4_tensor import (
+                NVFP4Tensor as FP4_TENSOR_CLASS,
+            )
+
+            HAVE_TE_FP4_TENSOR_CLASS = True
+        except (ImportError, ModuleNotFoundError):
+            HAVE_TE_FP4_TENSOR_CLASS = False
+            FP4_TENSOR_CLASS = None
+    else:
+        HAVE_TE_FP4_TENSOR_CLASS = False
+        FP4_TENSOR_CLASS = None
+else:
+    HAVE_TE_FP4_TENSOR_CLASS = False
+    FP4_TENSOR_CLASS = None
+
+
+def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine NVFP4Tensor."""
+    return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
+
+
+def quantize_nvfp4_param_shard(
+    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+):
+    """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
+
+    This function wraps Transformer Engine's quantize_master_weights, which handles:
+    - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
+    - Partial casting with nibble-accurate updates
+    - Coordinated amax reduction across data parallel group
+
+    Args:
+        model_params: List of NVFP4 model parameters (NVFP4Tensor).
+        main_params: List of FP32 master weights (shards).
+        start_offsets: List of starting offsets in the full model weight for each shard.
+        data_parallel_group: Distributed group for amax reduction.
+        fsdp_shard_model_params: Optional list of FSDP sharded model params.
+    """
+    if not HAVE_TE_FP4_TENSOR_CLASS:
+        raise RuntimeError("NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0")
+
+    try:
+        from transformer_engine.pytorch.tensor.utils import quantize_master_weights
+    except ImportError:
+        raise RuntimeError(
+            "quantize_master_weights not available in this Transformer Engine version"
+        )
+
+    if len(model_params) == 0:
+        return
+
+    # # Debug: print what we're passing to quantize_master_weights
+    # print(f"\n[FP4_UTILS DEBUG] quantize_nvfp4_param_shard called with {len(model_params)} params")
+    # for i, (mp, main_p, offset) in enumerate(zip(model_params, main_params, start_offsets)):
+    #     mp_shape = tuple(mp.shape) if hasattr(mp, 'shape') else 'N/A'
+    #     main_shape = tuple(main_p.shape) if main_p is not None else 'None'
+    #     print(f"[FP4_UTILS DEBUG]   [{i}] model_param shape={mp_shape}, main_param shape={main_shape}, offset={offset}")
+    #     if i == 0:  # Just show first param details
+    #         print(f"[FP4_UTILS DEBUG]   [{i}] model_param type={type(mp).__name__}")
+    #         if hasattr(mp, '_rowwise_data'):
+    #             print(f"[FP4_UTILS DEBUG]   [{i}] _rowwise_data shape={mp._rowwise_data.shape}")
+
+    args = [model_params, main_params, start_offsets, data_parallel_group]
+    if fsdp_shard_model_params is not None:
+        args.append(fsdp_shard_model_params)
+
+    quantize_master_weights(*args)
+
+
+def nvfp4_set_raw_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
+    """Set the raw data of a Transformer Engine NVFP4Tensor."""
+    data_attr = "_rowwise_data"
+    old_data = getattr(tensor, data_attr)
+    assert old_data.dtype == data.dtype, "The data types of raw data don't match"
+    assert (
+        old_data.shape == data.shape
+    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    setattr(tensor, data_attr, data)
+
+
+def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
+    """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
+    if len(shape) == 0:
+        return shape
+    assert shape[-1] % 2 == 0, "NVFP4 requires inner dimension divisible by 2"
+    packed = list(shape)
+    packed[-1] = packed[-1] // 2
+    return torch.Size(packed)
+
+
+def _get_data_attr(tensor: torch.Tensor, is_transpose: bool = False) -> str:
+    if is_transpose:
+        assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
+        data_attr = "_columnwise_data"
+    elif hasattr(tensor, "_rowwise_data"):
+        data_attr = "_rowwise_data"
+    elif hasattr(tensor, "_data"):
+        data_attr = "_data"
+    else:
+        assert not is_nvfp4tensor(tensor), f"Type {type(tensor)} is not a NVFP4 tensor"
+        assert not is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
+        data_attr = "data"
+
+    return data_attr
+
+
+def get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch.Tensor:
+    """Get the underlying raw storage of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    return getattr(tensor, _get_data_attr(tensor, get_transpose))
+
+
+def set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bool = False) -> None:
+    """Set the raw data of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    data_attr = _get_data_attr(tensor, set_transpose)
+    old_data = getattr(tensor, data_attr)
+    assert old_data.dtype == data.dtype, "The data types of raw data don't match"
+    assert (
+        old_data.shape == data.shape
+    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    setattr(tensor, data_attr, data)
+
+
+def quantize(
+    model_params: List[torch.Tensor],
+    main_params: List[torch.Tensor],
+    start_offsets: List[int],
+    data_parallel_group: torch.distributed.ProcessGroup,
+    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
+) -> None:
+    """Quantize sharded parameters to FP8 or NVFP4."""
+    if len(model_params) == 0:
+        return
+
+    if is_nvfp4tensor(model_params[0]):
+        assert all(
+            is_nvfp4tensor(p) for p in model_params
+        ), "All model_params must be NVFP4 tensors"
+        quantize_nvfp4_param_shard(model_params, main_params, start_offsets, data_parallel_group)
+    elif is_float8tensor(model_params[0]):
+        assert all(is_float8tensor(p) for p in model_params), "All model_params must be FP8 tensors"
+        fp8_quantize(
+            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
+        )
+    else:
+        raise ValueError("quantize function only supports FP8 or NVFP4 tensors in model_params")
+
+
+def _tensor_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Get the effective dtype of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    if is_nvfp4tensor(tensor):
+        return "nvfp4"
+    elif is_float8tensor(tensor):
+        if fp8_need_transpose_data(tensor):
+            return "nvfp8_t"
+        return "nvfp8"
+    else:
+        return tensor.dtype
+
+
+def _meta_device_param_dtype(module: torch.nn.Module, name: str, param: torch.Tensor):
+    if not HAVE_TE_FP8_TENSOR_CLASS:
+        return param.dtype
+
+    fp8_meta_index = module.param_init_meta[name].fp8_meta_index
+    if module.primary_weights_in_fp8 and fp8_meta_index is not None:
+        if HAVE_TE_FP4_TENSOR_CLASS and module.fp8_meta["recipe"].nvfp4():
+            return "nvfp4"
+        if fp8_need_transpose_data_for_meta_device_init(module):
+            return "nvfp8_t"
+        return "nvfp8"
+
+    return param.dtype
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    """
+    Get the size of the dtype. Note that many data-types un-common to ML
+    or not supported by NCCL communication (e.g. CFloat) are listed here
+    for mixed-precision coverage and to avoid allocating a dummy Tensor.
+
+    Args:
+        dtype (torch.dtype): The dtype to get the size of.
+    Returns:
+        int: The size of the dtype.
+    """
+    if dtype == torch.float16 or dtype == torch.bfloat16 or dtype == torch.int16:
+        return 2
+    elif dtype == torch.float32 or dtype == torch.int32 or dtype == torch.complex32:
+        return 4
+    elif dtype == torch.float64 or dtype == torch.int64 or dtype == torch.complex64:
+        return 8
+    elif dtype == torch.uint8 or dtype == torch.int8:
+        return 1
+    elif dtype in ["nvfp8", "nvfp8_t"]:
+        return 1
+    elif dtype == "nvfp4":
+        return 0.5
+    else:
+        try:
+            # Allocate an empty Tensor on-the-fly to check the size.
+            # Non-ideal fall-back option before sizing the new dtype.
+            # Why does torch.dtype not support this without alloc?
+            return torch.empty((), dtype=dtype).element_size()
+        except:
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def get_quantized_model_init_context_cls():
