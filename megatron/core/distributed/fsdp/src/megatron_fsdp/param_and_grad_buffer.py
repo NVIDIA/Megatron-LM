@@ -3157,7 +3157,7 @@ class ParamAndGradBuffer:
         all_reduce_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
+            if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
