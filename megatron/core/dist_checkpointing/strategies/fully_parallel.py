@@ -1,8 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
+import re
+from collections import defaultdict
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Dict, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -43,6 +45,89 @@ from megatron.core.utils import get_pg_rank, get_pg_size
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T', ShardedObject, ShardedTensor)
+
+# Regex to extract the global rank from a distcp file name, e.g. "__17_0.distcp" → 17
+_DISTCP_RANK_RE = re.compile(r'^__(\d+)_')
+
+
+def _build_key_to_source_ranks(checkpoint_dir: Path) -> Dict[str, List[int]]:
+    """Build mapping from FQN to the list of global ranks that saved it.
+
+    Reads the checkpoint metadata and extracts the source rank from file names
+    (e.g., ``__17_0.distcp`` → rank 17).  For TP-sharded tensors the same FQN
+    may appear with different offsets from different TP groups; all source ranks
+    are collected so that the caller can pick the one belonging to its own
+    parallelization group.
+
+    Args:
+        checkpoint_dir: path to the checkpoint directory.
+
+    Returns:
+        Mapping from FQN to list of global ranks that saved data for it.
+    """
+    from .torch import _get_filesystem_reader
+
+    fs_reader = _get_filesystem_reader(checkpoint_dir)
+    metadata = fs_reader.read_metadata()
+
+    key_to_source_ranks: Dict[str, List[int]] = defaultdict(list)
+    seen: Dict[str, set] = defaultdict(set)
+
+    if metadata.storage_data:
+        for meta_idx, storage_info in metadata.storage_data.items():
+            fqn = meta_idx.fqn
+            m = _DISTCP_RANK_RE.match(storage_info.relative_path)
+            if m:
+                rank = int(m.group(1))
+                if rank not in seen[fqn]:
+                    seen[fqn].add(rank)
+                    key_to_source_ranks[fqn].append(rank)
+
+    return dict(key_to_source_ranks)
+
+
+# Regex matching the TP-replica postfix appended by make_sharded_tensor_for_checkpoint.
+_TP_REPLICA_POSTFIX_RE = re.compile(r'\.__tp_replica_\d+$')
+
+
+def _checkpoint_has_tp_replica_keys(checkpoint_dir: Path) -> bool:
+    """Return True if the checkpoint was saved with TP-replica postfix keys.
+
+    Old checkpoints (saved before the postfix change) store replicated tensors
+    under their original FQN.  New checkpoints append ``.__tp_replica_{tp_rank}``
+    to the FQN so each TP rank has its own entry.
+
+    The result is used for backward compatibility: when loading an old
+    checkpoint we strip the postfix from the load-side ShardedTensors so that
+    the keys match what is stored in the checkpoint.
+    """
+    from .torch import _get_filesystem_reader
+
+    fs_reader = _get_filesystem_reader(checkpoint_dir)
+    metadata = fs_reader.read_metadata()
+    for key in metadata.state_dict_metadata:
+        if '.__tp_replica_' in key:
+            return True
+    return False
+
+
+def _strip_tp_replica_postfix(sharded_state_dict: ShardedStateDict) -> None:
+    """Strip ``.__tp_replica_X`` postfix from all ShardedTensor keys in place.
+
+    Used for backward compatibility when loading from a checkpoint that was
+    saved before the TP-replica postfix change.  Modifies the ShardedTensor
+    objects in *sharded_state_dict* directly (no copy).
+    """
+    count = 0
+    for item in nested_values(sharded_state_dict):
+        if isinstance(item, ShardedTensor) and _TP_REPLICA_POSTFIX_RE.search(item.key):
+            item.key = _TP_REPLICA_POSTFIX_RE.sub('', item.key)
+            count += 1
+    if count:
+        logger.info(
+            f'Stripped .__tp_replica_* postfix from {count} ShardedTensor keys '
+            f'(backward compat with old checkpoint format)'
+        )
 
 
 class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
@@ -217,13 +302,23 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         loaded_state_dict = {}
 
+        # Step 0: Backward compatibility — detect old checkpoints that were saved
+        # without TP-replica postfix keys and strip the postfix from the load-side
+        # ShardedTensors so that keys match the checkpoint metadata.
+        try:
+            if not _checkpoint_has_tp_replica_keys(checkpoint_dir):
+                logger.info('Old checkpoint format detected (no TP-replica postfix keys)')
+                _strip_tp_replica_postfix(sharded_state_dict)
+        except Exception as e:
+            logger.warning(f'Failed to check for TP-replica keys, skipping compat: {e}')
+
         if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
             precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
-                sharded_state_dict
+                sharded_state_dict, checkpoint_dir=checkpoint_dir
             )
             assert (
                 precomputed_distribution is not None
@@ -352,7 +447,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         )
 
     def apply_loading_parallelization(
-        self, sharded_state_dict: ShardedStateDict
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Optional[Path] = None,
     ) -> Optional[ShardDistribution]:
         """Distributes the load across ranks by exchanging metadata.
 
@@ -365,8 +462,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         the calls and subsequent distributions happen without any inter-rank
         communication.
 
+        When ``checkpoint_dir`` is provided, reads checkpoint metadata to build a
+        source-rank mapping so that each rank preferentially loads from its own
+        checkpoint file, minimising the number of distinct files opened per rank.
+
         Args:
             sharded_state_dict (ShardedStateDict): state dict to distribute the loading
+            checkpoint_dir (Path, optional): checkpoint directory used to extract
+                file-locality information for the load distribution.
 
         Returns:
             ShardDistribution (optional): the computed loading distribution
@@ -376,8 +479,24 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             precomputed_distribution = self.cached_distribution
         else:
             logger.debug(f'Apply load parallelization')
+            # Build FQN → source-rank mapping for file-locality-aware assignment.
+            key_to_source_ranks = None
+            if checkpoint_dir is not None:
+                try:
+                    key_to_source_ranks = _build_key_to_source_ranks(checkpoint_dir)
+                    logger.debug(
+                        f'Built key_to_source_ranks with {len(key_to_source_ranks)} entries'
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f'Failed to build key_to_source_ranks, '
+                        f'falling back to default distribution: {e}'
+                    )
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group, True
+                sharded_state_dict,
+                self.parallelization_group,
+                True,
+                key_to_source_ranks=key_to_source_ranks,
             )
 
         distribute_main_replicas_with_precomputed_distribution(
