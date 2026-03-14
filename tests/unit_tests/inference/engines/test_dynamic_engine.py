@@ -1330,12 +1330,10 @@ class TestDynamicInferenceEngine:
         assert 1 in active_ids
         assert 2 not in active_ids
         assert 3 not in active_ids
-        assert 2 in env.engine.waiting_request_ids
-        assert 3 in env.engine.waiting_request_ids
+        assert list(env.engine.waiting_request_ids) == [1, 2, 3]
 
-        # Verify that active token count == max tokens - 1
-        # The -1 is for the useless chunked prefill token
-        assert ctx.active_token_count == 51
+        # Verify that active token count == max tokens
+        assert ctx.active_token_count == 52
 
         # Verify that request 1 is the designated chunked prefill request
         assert ctx.chunked_prefill_request_id == 1
@@ -1390,9 +1388,8 @@ class TestDynamicInferenceEngine:
         assert 3 not in active_ids
         assert 3 in env.engine.waiting_request_ids
 
-        # Verify that active token count == max tokens - 1
-        # The -1 is for the useless chunked prefill token
-        assert ctx.active_token_count == 51
+        # Verify that active token count == max tokens
+        assert ctx.active_token_count == 52
 
         # Run step 4
         env.engine.step_modern()
@@ -1465,32 +1462,29 @@ class TestDynamicInferenceEngine:
 
         Scenario:
             - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 512
-
-        Note that for all chunks after the first chunk we subtract 1 from the active token
-        count, so the chunk size will be 1 less.
+            - Request prompt length: 513
 
         Default scheduling would do:
-            1. Chunk 256 (Remaining 256)
-            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            1. Chunk 256 (Remaining 257)
+            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
             3. Chunk 1
 
         Fixed scheduling should do:
-            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
-            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
-                                            So we reduce chunk to 254.
+            1. Chunk 256 (Remaining 257) -> 513 - 256 == 257. Schedule full 256.
+            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
+                                            So we reduce chunk to 255.
             3. Chunk 2   (Remaining 0)
         """
         chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 256 = 512
-        prompt_len = 512
+        # 256 + 255 + 2 = 513
+        prompt_len = 513
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
             num_requests=0,
             num_tokens_to_generate=None,
-            num_tokens_total=513,
+            num_tokens_total=prompt_len + 1,
             context_max_tokens=chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
@@ -1519,37 +1513,126 @@ class TestDynamicInferenceEngine:
         assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
 
         # --- Step 1 ---
-        # Available: 256. Remaining: 512.
-        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
-        env.engine.schedule_waiting_requests()
+        # Available: 256. Remaining: 513.
+        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
+
+        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
 
         assert (
             req.finished_chunk_token_count == 256
         ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
-        # Available: 256. Remaining un-prefilled: 256.
-        # Logic: 256 - (256 - 1) = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 254).
-        env.engine.schedule_waiting_requests()
+        # Available: 256. Remaining un-prefilled: 257.
+        # Logic: 257 - 256 = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
 
-        # 256 (previous) + 254 (this step) = 510
-        assert req.finished_chunk_token_count == 510, (
-            "Step 2: Expected 510 tokens processed (256+254), "
+        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+
+        # 256 (previous) + 255 (this step) = 511
+        assert req.finished_chunk_token_count == 511, (
+            "Step 2: Expected 511 tokens processed (256+255), "
             f"got {req.finished_chunk_token_count}. "
         )
 
         # --- Step 3 ---
-        # Remaining un-prefilled: 2. Available: 255.
-        # Logic: 2 <= 255. Schedule 2.
+        # Remaining un-prefilled: 2. Available: 256.
+        # Logic: 2 <= 256. Schedule 2.
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
         # Verify request finishes prefill and completes
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_delay_scheduling_for_unavoidable_single_token_chunk(self):
+        """
+        Test that chunked prefill scheduling delays execution when the only available
+        option is to schedule a chunk of size 1 that leaves exactly 1 token remaining.
+
+        Scenario:
+            - Max tokens per step: 256
+            - Request A: 254 token prompt
+            - Request B: 2 token prompt
+
+        Sequence:
+            1. Step 1 scheduling:
+               - Request A is scheduled (255 tokens).
+               - Context has 1 token available (256 - 255).
+               - Request B has 2 tokens remaining.
+               - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
+                 crashing FA3. Since chunk_length is 1, we can't safely reduce it.
+                 The engine MUST delay scheduling Request B.
+            2. Step 1 executes prefill for Request A only.
+            3. Step 2 scheduling:
+               - Request A enters decode phase (takes 1 active token).
+               - Context has 255 tokens available (256 - 1).
+               - Request B is now safely scheduled for its full 2 tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=256,
+            context_max_tokens=256,
+            context_max_requests=2,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Add Request A (Length 255)
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (255,), device='cuda')
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_a)
+
+        # Add Request B (Length 2)
+        req_b_tokens = torch.randint(0, test_config.vocab_size, (2,), device='cuda')
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_b_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_b)
+
+        # --- Step 1 ---
+        # Should schedule Request A fully (255), but delay Request B
+        env.engine.step_modern()
+
+        assert req_a.status == Status.COMPLETED
+
+        # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
+        assert (
+            req_b.finished_chunk_token_count == 0
+        ), "Request B should have been delayed to avoid leaving a 1-token chunk"
+        assert len(env.engine.waiting_request_ids) == 1
+        assert env.engine.waiting_request_ids[0] == 2
+
+        # --- Step 2 ---
+        # Request A has completed. Context has 256 tokens available.
+        # Request B can now schedule its full 2 tokens safely.
+        env.engine.step_modern()
+
+        assert req_b.status == Status.COMPLETED
+        assert len(env.engine.waiting_request_ids) == 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1636,6 +1719,98 @@ class TestDynamicInferenceEngine:
                     f"Request {request.request_id}, generated token {i}: "
                     f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
                 )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_log_probs_match_baseline(self):
+        """
+        Verify that chunked prefill computes the exact same prompt log probabilities
+        as non-chunked prefill. This explicitly catches the bug where garbage
+        sampled tokens corrupt the prompt log probabilities at chunk boundaries.
+        """
+        prompt_length = 512
+        num_tokens_to_generate = 4
+
+        # Create a deterministic mock forward pass that returns logits
+        # dependent ONLY on position_ids. This guarantees the same logits
+        # whether processed in one giant chunk or split across multiple chunks.
+        def deterministic_mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+            vocab_size = kwargs["vocab_size"]
+            # Use torch.linspace to generate varying but 100% deterministic logits per position
+            static_logits = torch.linspace(
+                -50, 50, 4096 * vocab_size, device=input_ids.device, dtype=torch.bfloat16
+            ).view(4096, vocab_size)
+
+            return static_logits[position_ids]
+
+        def get_log_probs(chunked: bool, max_tokens: int):
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,  # Added manually below
+                num_tokens_to_generate=num_tokens_to_generate,
+                materialize_only_last_token_logits=False,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                model_provider="gpt",
+                context_block_size_tokens=256,
+                context_max_requests=1,
+                context_max_tokens=max_tokens,
+                max_sequence_length=1024,
+                enable_chunked_prefill=chunked,
+                use_cuda_graphs_for_non_decode_steps=False,
+            )
+            env = self._build_test_env(test_config)
+
+            # Patch the mock forward to be deterministic
+            model_instance = env.engine.controller.inference_wrapped_model.model
+            model_instance.forward = partial(
+                deterministic_mock_forward, vocab_size=test_config.vocab_size
+            )
+
+            # Ensure identical prompt tokens for both runs
+            torch.manual_seed(42)
+            req_tokens = torch.randint(0, test_config.vocab_size, (prompt_length,), device='cuda')
+            req = DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=req_tokens,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    termination_id=-1,
+                ),
+            )
+
+            env.engine._add_request(req)
+
+            # Drive the engine until the request finishes
+            while env.engine.has_unfinished_requests():
+                env.engine.schedule_waiting_requests()
+                env.engine.step_modern()
+
+            return req.prompt_log_probs
+
+        # Run non-chunked baseline (all 512 tokens in one pass)
+        baseline_log_probs = get_log_probs(chunked=False, max_tokens=1000)
+
+        # Run chunked (512 tokens split across 256-token boundaries)
+        chunked_log_probs = get_log_probs(chunked=True, max_tokens=256)
+
+        assert baseline_log_probs is not None, "Baseline prompt_log_probs is missing"
+        assert chunked_log_probs is not None, "Chunked prompt_log_probs is missing"
+
+        assert len(baseline_log_probs) == prompt_length - 1
+        assert len(chunked_log_probs) == prompt_length - 1
+
+        # Compare element-wise using math.isclose to handle minor floating point rounding
+        for i, (base_lp, chunk_lp) in enumerate(zip(baseline_log_probs, chunked_log_probs)):
+            assert math.isclose(base_lp, chunk_lp, rel_tol=1e-3, abs_tol=1e-3), (
+                f"Log prob mismatch at prompt token index {i}: "
+                f"Baseline={base_lp:.4f}, Chunked={chunk_lp:.4f}. "
+                "This indicates log prob corruption at chunk boundaries!"
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

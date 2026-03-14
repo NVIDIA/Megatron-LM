@@ -226,13 +226,13 @@ class MambaMetadata:
             seq_len = end_regular_prefill_token_idx - start_regular_prefill_token_idx
 
             if seq_len > 0:
-                # We subtract start_regular_prefill_req_idx to normalize request IDs to
-                # 0-based relative to this buffer
+                # We subtract token_to_request_idx[start_regular_prefill_req_idx] to normalize
+                # request IDs to 0-based relative to this buffer
                 self._seq_idx_buffer[:, :seq_len].copy_(
                     token_to_request_idx[
                         start_regular_prefill_token_idx:end_regular_prefill_token_idx
                     ]
-                    - start_regular_prefill_req_idx
+                    - token_to_request_idx[start_regular_prefill_token_idx]
                 )
 
             if padded_token_count > seq_len:
