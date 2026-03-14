@@ -57,7 +57,7 @@ ENV_DEPENDENT="\
 MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
-  --no-rl-use-sequence-packing \
+  --rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-max-tokens 8192 \
