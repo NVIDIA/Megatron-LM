@@ -174,9 +174,14 @@ class P2PCommunicator:
         return is_pp_last_stage(self.pp_group)
 
     @property
-    def num_warmup_microbatches(self) -> int:
-        """Return number of warmup microbatches."""
-        return self.pp_group.size() - self.pp_group.rank() - 1
+    def total_stages(self) -> int:
+        """Return total number of pipeline stages."""
+        return self.pp_group.size()
+
+    @property
+    def current_stage(self) -> int:
+        """Return current pipeline stage index (0-indexed)."""
+        return self.pp_group.rank()
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
