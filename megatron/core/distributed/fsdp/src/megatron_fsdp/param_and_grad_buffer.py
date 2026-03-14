@@ -1967,25 +1967,23 @@ class ParamAndGradBuffer:
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            UB_BUFFER_NUM = 2
+            pool_size = self.ddp_config.fsdp_double_buffer_pool_size
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=pool_size,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=pool_size,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=(
-                    self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                ),
+                size=pool_size,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -1995,7 +1993,7 @@ class ParamAndGradBuffer:
                 self.hsdp_grad_comm_alloc = FixedPoolAllocator(
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
-                    size=UB_BUFFER_NUM,
+                    size=pool_size,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
@@ -3328,6 +3326,7 @@ class GradReducePipeline:
         if not self.buffer.ddp_config.fsdp_double_buffer:
             return
 
+        pool_size = self.buffer.main_grad_alloc.size
         param_groups = self.buffer.parameter_groups
         double_buf_units = set()
         for bucket_id in add_buckets:
@@ -3335,14 +3334,14 @@ class GradReducePipeline:
             if fsdp_unit_id in self.buffer.double_buf_units:
                 double_buf_units.add(fsdp_unit_id)
         assert (
-            len(double_buf_units) <= 2
+            len(double_buf_units) <= pool_size
         ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
 
         keep_n = len(self.grad_reduce_queue)
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > pool_size:
                 keep_n -= 1
         self.wait_for_previous_grad_reduce(keep_n)
 
@@ -3767,20 +3766,34 @@ class AllGatherPipeline:
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
+            pool_size = self.buffer.weight_alloc.size
             double_buf_units = set()
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
                     double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > pool_size:
                 raise ValueError(
                     f"{double_buf_units} FSDP units were requested, "
-                    "but double buffers can support no more than 2 FSDP units."
+                    f"but the buffer pool (size={pool_size}) can support "
+                    f"no more than {pool_size} FSDP units."
                 )
 
         # Do not release the buckets that are being all-gathered.
         for bucket_id in ag_buckets:
             self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
+
+        # Flush any lazily-released buckets before prefetch decisions so the
+        # FixedPoolAllocator has accurate free-slot information.
+        pool_occupied_units = set()
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            self.recycle_unused_buckets()
+            alloc = self.buffer.weight_alloc
+            ag_bucket_set = set(ag_buckets)
+            for bid in alloc.using_buffer:
+                if bid not in ag_bucket_set:
+                    uid = alloc.fsdp_param_groups[bid].fsdp_unit_id
+                    pool_occupied_units.add(uid)
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
@@ -3809,14 +3822,15 @@ class AllGatherPipeline:
                 return bucket_id
 
             def need_skip_prefetch(bucket_id):
-                # If use double buffer, we need to check if the next bucket
-                # is exceeding the coverage of the double buffer.
+                # Check whether prefetching bucket_id would exceed the pool
+                # capacity.  We union the FSDP units that will be gathered
+                # (double_buf_units) with units that already occupy pool slots
+                # from a concurrent pass (pool_occupied_units, e.g. backward
+                # buffers held while a forward prefetch is considered).
                 if self.buffer.ddp_config.fsdp_double_buffer:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                     double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
-                        # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
+                    if len(double_buf_units | pool_occupied_units) > pool_size:
                         return True
                 return False
 
@@ -3857,6 +3871,17 @@ class AllGatherPipeline:
             for bucket_id in ag_buckets
             if self.bucket_status[self.get_bucket_key(bucket_id, bwd)] == BucketStatus.EMPTY
         ]
+
+        # Trim prefetched buckets that would overflow the FixedPoolAllocator.
+        # After the early recycle above, idle_buffer reflects the true available
+        # capacity.  Gathering more buckets than available slots would crash inside
+        # fetch_bucket → allocate.
+        if self.buffer.ddp_config.fsdp_double_buffer and len(ag_buckets) > 0:
+            alloc = self.buffer.weight_alloc
+            available_slots = len(alloc.idle_buffer)
+            if len(ag_buckets) > available_slots:
+                ag_buckets = ag_buckets[:available_slots]
+
         if len(ag_buckets) == 0:
             return
 
