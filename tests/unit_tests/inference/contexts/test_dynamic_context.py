@@ -62,6 +62,8 @@ class TestDynamicContext:
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
         num_speculative_tokens=0,
+        enable_chunked_prefill: bool = False,
+        max_requests: int = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -100,6 +102,8 @@ class TestDynamicContext:
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_requests=max_requests,
             ),
         )
         return dynamic_context
@@ -1526,6 +1530,192 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_chunked_prefill_state_preserved_across_decode_completions(self):
+        """
+        Tests that when a chunked prefill request is hidden, and active decode requests
+        finish (causing the context boundary to shrink), the hidden chunked request
+        is safely pulled to the new boundary so it doesn't lose its KV blocks or Mamba slot.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.03,
+            block_size_tokens=4,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
+            enable_chunked_prefill=True,
+        )
+
+        # Add 2 normal decode requests
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=10,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=11,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+
+        # Add Chunk 1 of the chunked prefill request
+        req_999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.chunked_prefill_request_id = 999
+
+        # Capture the allocated state at index 2
+        mamba_slot_before = dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item()
+        kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+
+        assert mamba_slot_before != -1
+        assert kv_block_before != -1
+
+        # Step 1: Forward pass for all 3 requests
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # At this point, req 999 is hidden at index 2. total_request_count is 2 (req 10, 11).
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Step 2: Forward pass where req 10 finishes, req 11 continues. Req 999 is NOT scheduled.
+        active_requests_mask = torch.tensor([0, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # At this point, req 10 is evicted. Req 11 shifts to index 0. total_request_count becomes 1.
+        # Req 999 should be pulled from index 2 down to index 1 (the new boundary).
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.request_ids[0].item() == 11
+
+        # Verify that the chunked request was correctly pulled to the boundary (index 1)
+        assert dynamic_context.request_ids[1].item() == 999
+        assert (
+            dynamic_context.mamba_metadata.request_to_mamba_state_idx[1].item() == mamba_slot_before
+        )
+        assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
+
+        # Ensure the old index 2 was properly swapped during the pull
+        assert dynamic_context.request_ids[2].item() == 11
+        assert dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item() == -1
+        assert dynamic_context.request_to_kv_block_ids[2, 0].item() == -1
+
+        # Step 3: Add the next chunk. It should sit exactly at the boundary (index 1) and inherit the state.
+        req_999.finished_chunk_token_count = 4
+        dynamic_context.add_request(req_999, chunk_length=4)
+
+        # Verify state at index 1 is active and its previous Mamba slot and KV blocks were inherited
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[1].item() == 999
+        assert (
+            dynamic_context.mamba_metadata.request_to_mamba_state_idx[1].item() == mamba_slot_before
+        )
+        assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
+
+    @pytest.mark.internal
+    @rounder_override(4)
+    def test_chunked_prefill_all_active_requests_finish_while_hidden(self):
+        """
+        Tests that update_requests does not crash when ALL active decode requests
+        finish while a chunked prefill request is hidden (not scheduled this step).
+
+        This exercises the scenario where:
+        1. A chunked prefill completes a chunk and is hidden at total_request_count
+        2. The next chunk is not scheduled (e.g., no token budget)
+        3. All remaining active decode requests finish in the same step
+        4. active_request_count becomes 0 — the code must not assert-fail
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.03,
+            block_size_tokens=4,
+            max_tokens=None,
+            enable_chunked_prefill=True,
+            max_requests=16,
+        )
+
+        # Add 2 normal decode requests
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=10,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=11,
+                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+        )
+
+        # Add Chunk 1 of a chunked prefill request
+        req_999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.chunked_prefill_request_id = 999
+
+        kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+        assert kv_block_before != -1
+
+        # Step 1: All 3 requests are active, process forward pass
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # Chunked prefill is now hidden at position 2, total_request_count = 2
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Step 2: Both decode requests finish, chunked prefill NOT scheduled this step.
+        # This must NOT crash even though active_request_count becomes 0.
+        active_requests_mask = torch.tensor([0, 0], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(active_requests_mask, new_tokens)
+
+        # total_request_count should be 0 (both finished, chunked prefill hidden)
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context.active_token_count == 0
+
+        # The hidden chunked prefill should be pulled to position 0 (the new boundary)
+        assert dynamic_context.request_ids[0].item() == 999
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == kv_block_before
+
+        # Verify we can still add the next chunk at position 0
+        req_999.finished_chunk_token_count = 4
+        dynamic_context.add_request(req_999, chunk_length=4)
+
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.request_ids[0].item() == 999
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == kv_block_before
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
         self._setup_model_parallel_group(1, 1)
@@ -1829,10 +2019,11 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_chunked_prefill_speculative_offset_math(self):
+    def test_chunked_prefill_hidden_state_prevents_token_bloat(self):
         """
-        Test that the active_token_count is correctly adjusted by chunked_prefill_offset
-        when a chunked prefill request continues in a speculative decoding setup.
+        Test that hiding the chunked prefill request in Version 2 effectively prevents
+        'dummy' speculative tokens from bloating the active_token_count, and that the
+        next chunk seamlessly appends without needing legacy offset subtractions.
         """
         self._setup_model_parallel_group(1, 1)
 
@@ -1845,48 +2036,62 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_requests=256,
             max_tokens=256,
-            num_speculative_tokens=3,  # 3 spec tokens -> offset = 4
+            num_speculative_tokens=3,
             enable_chunked_prefill=True,
+            unified_memory_level=0,
         )
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
         ctx.reset_tensors()
 
-        # Setup a request that is already mid-chunked-prefill
-        ctx.total_request_count = 1
-        ctx.chunked_prefill_request_id = 42
-        ctx.request_ids[0] = 42
-
-        # Simulate active tokens from the previous step.
-        # Normally, the previous step generated a dummy token + spec tokens that
-        # need to be overwritten.
-        initial_active_tokens = 100
-        ctx.active_token_count = initial_active_tokens
-
-        req = DynamicInferenceRequest(
-            request_id=42,
-            prompt_tokens=torch.arange(0, 50, device='cuda'),
+        # 1. Add a standard decode request
+        req_decode = DynamicInferenceRequest(
+            request_id=10,
+            prompt_tokens=torch.arange(0, 10, device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
-        # Mark as continuing chunked prefill
-        req.finished_chunk_token_count = 100
+        ctx.add_request(req_decode)
 
-        # Add the next chunk
-        chunk_length = 50
-        ctx.add_request(req, chunk_length=chunk_length)
+        # 2. Add chunk 1 of a chunked prefill request
+        req_chunked = DynamicInferenceRequest(
+            request_id=42,
+            prompt_tokens=torch.arange(0, 100, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        ctx.chunked_prefill_request_id = 42
+        ctx.add_request(req_chunked, chunk_length=50)
 
-        # The new active token count should be:
-        # initial (100) - chunked_prefill_offset (1 + 3 = 4) + chunk_length (50) = 146
-        expected_active_tokens = (
-            initial_active_tokens - (1 + ctx.num_speculative_tokens) + chunk_length
+        # Verify initial active token count (10 from decode + 50 from prefill)
+        assert ctx.active_token_count == 60
+
+        # 3. Call update_requests
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
+        new_spec = torch.tensor(
+            [[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cuda'
         )
 
-        assert ctx.active_token_count == expected_active_tokens
-        assert (
-            ctx.request_output_lengths[0].item()
-            == req.finished_chunk_token_count
-            + chunk_length
-            + req.sampling_params.num_tokens_to_generate
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_spec,
         )
+
+        # 4. Verify Hiding Invariants:
+        # The chunked prefill request should be hidden safely out of bounds.
+        # The active_token_count should ONLY contain the decode request's tokens
+        # (1 base + 3 speculative = 4 tokens).
+        assert ctx.total_request_count == 1
+        assert ctx.active_token_count == 4
+        assert ctx.request_ids[1].item() == 42
+
+        # 5. Add chunk 2
+        req_chunked.finished_chunk_token_count = 50
+        ctx.add_request(req_chunked, chunk_length=50)
+
+        # 6. Verify seamless append (no legacy offset math needed)
+        # 4 active decode tokens + 50 new prefill tokens = 54
+        assert ctx.active_token_count == 54
+        assert ctx.total_request_count == 2
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1951,15 +2156,23 @@ class TestDynamicContext:
 
         # 2. Verify the Decode request (now at Index 0) correctly flattened its
         #    base token (200) AND its specific speculative tokens (201, 202).
-        # 3. Verify the Prefill request (now at Index 1) flattened its tokens (100, 101, 102).
+        # 3. Verify the Prefill request (now at Index 1) is hidden and does NOT
+        #    flatten its dummy tokens.
         expected_flattened_tokens = torch.tensor(
-            [200, 201, 202, 100, 101, 102],  # Decode request (ID 99)  # Prefill request (ID 42)
-            device='cuda',
+            [200, 201, 202], device='cuda'  # Decode request (ID 99)
         )
 
+        assert ctx.active_token_count == 3
         assert torch.equal(
-            ctx.token_to_input_ids[:6], expected_flattened_tokens
-        ), "Speculative tokens were not correctly swapped alongside the chunked prefill request!"
+            ctx.token_to_input_ids[:3], expected_flattened_tokens
+        ), "Speculative tokens were not correctly flattened for the decode request!"
+
+        # 4. Verify that the new_speculative_tokens tensor itself was swapped so that
+        # the hidden state perfectly preserves the alignment for subsequent steps.
+        expected_swapped_spec_tokens = torch.tensor([[201, 101], [202, 102]], device='cuda')
+        assert torch.equal(
+            new_speculative_tokens, expected_swapped_spec_tokens
+        ), "new_speculative_tokens was not swapped in-place alongside the request metadata!"
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2202,8 +2415,8 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_chunked_prefill_speculative_offset_with_prefix_caching(self):
-        """Test chunked prefill offset math combines correctly with prefix caching and spec decoding."""
+    def test_chunked_prefill_prefix_caching_from_hidden_state(self):
+        """Test prefix caching matching safely resolves from the hidden boundary state."""
         self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
@@ -2236,19 +2449,7 @@ class TestDynamicContext:
         )
         ctx.add_request(req_first)
 
-        # Second request: same prefix, continuing chunked prefill.
-        # Simulate that this request already processed bs tokens in a prior chunk.
-        ctx.chunked_prefill_request_id = 42
-        ctx.request_ids[ctx.total_request_count] = 42
-
-        # Manually set up as if request is mid-chunked-prefill.
-        ctx.total_request_count += 1
-        current_id = ctx.total_request_count - 1
-        ctx.request_ids[current_id] = 42
-
-        initial_active_tokens = ctx.active_token_count + 1 + ctx.num_speculative_tokens
-        ctx.active_token_count = initial_active_tokens
-
+        # Request 2: Chunked prefill sharing the same prefix
         req2 = DynamicInferenceRequest(
             request_id=42,
             prompt_tokens=first_prompt.clone(),
@@ -2256,18 +2457,36 @@ class TestDynamicContext:
             block_size_tokens=bs,
             enable_prefix_caching=True,
         )
-        req2.finished_chunk_token_count = bs  # Already processed 1 block
+        ctx.chunked_prefill_request_id = 42
 
-        chunk_length = bs * 2  # Process 2 more blocks
+        # Add chunk 1 (bs tokens)
+        req2.finished_chunk_token_count = 0
+        ctx.add_request(req2, chunk_length=bs)
+
+        # Call update_requests to move req2 to the hidden state
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
+        new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cuda')
+        ctx.update_requests(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
+
+        # Capture active tokens before chunk 2 (which should just be the 3 tokens of req_first)
+        tokens_before_chunk_2 = ctx.active_token_count
+        assert tokens_before_chunk_2 == 3
+
+        # Add chunk 2 (bs * 2 tokens)
+        req2.finished_chunk_token_count = bs
+        chunk_length = bs * 2
         ctx.add_request(req2, chunk_length=chunk_length)
 
         # Prefix match should find 2 matching blocks (blocks 1 and 2 from req_first).
-        # The chunked_prefill_offset (1 + num_speculative_tokens = 3) should be subtracted.
-        chunked_prefill_offset = 1 + ctx.num_speculative_tokens
         # With prefix match: 2 blocks matched -> skip (2*bs - 1) tokens
         # effective_chunk_length = chunk_length - prefix_skip_tokens
+        # prefix_skip_tokens = min(2 * bs, chunk_length - 1) = 2 * bs - 1
+        prefix_skip = 2 * bs - 1
+        eff_chunk = chunk_length - prefix_skip
+
         (_, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, chunk_length)
-        expected_active = initial_active_tokens - chunked_prefill_offset + eff_chunk
+        expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 
     @pytest.mark.internal
@@ -2585,6 +2804,7 @@ class TestDynamicContext:
         # Simulate update_requests completing the chunk
         ctx.active_token_count += 1
         ctx.request_in_prefill_status_tensor[1] = 0
+        ctx.total_request_count -= 1
 
         # Add the second chunk (64 tokens)
         req2.finished_chunk_token_count = 64
