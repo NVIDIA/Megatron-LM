@@ -189,8 +189,8 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> Tuple[type, Optional[TEGroupedMLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
-        return InferenceGroupedMLP, MLPSubmodules(
+        return InferenceGroupedMLP, TEGroupedMLPSubmodules(
             linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )

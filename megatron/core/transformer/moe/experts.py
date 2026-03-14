@@ -469,7 +469,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: MLPSubmodules,
+        submodules: TEGroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
