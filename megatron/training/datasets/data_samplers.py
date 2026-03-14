@@ -31,13 +31,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         split = None
 
     if split == Split.valid and args.full_validation:
-        batch_sampler = MegatronPretrainingSampler(
+        # Use specialized sampler for full validation that handles small datasets
+        batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
-            consumed_samples=0,
-            micro_batch_size=args.micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
-        )
+            data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
         if args.hybrid_context_parallel:
             batch_sampler = HybridCPMegatronPretrainingSampler(
@@ -205,6 +203,50 @@ class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
             for i in range(self.num_micro_batches):
                 global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
             yield global_batch_idx
+
+
+class MegatronFullValidationSampler:
+    """Sampler for full validation that handles small datasets gracefully.
+
+    This sampler is designed for validation datasets that may be smaller than
+    data_parallel_size * micro_batch_size. It uses micro_batch_size=1 to minimize
+    the samples needed per batch and properly handles partial batches where some
+    ranks may not have data.
+    """
+
+    def __init__(self, total_samples, data_parallel_rank, data_parallel_size):
+        self.total_samples = total_samples
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        self.micro_batch_size = 1  # Always use 1 for small dataset support
+
+        # Sanity checks
+        assert self.total_samples > 0, f'no sample to consume: {self.total_samples}'
+        assert data_parallel_size > 0
+        assert self.data_parallel_rank < data_parallel_size, \
+            f'data_parallel_rank should be smaller than data size: {self.data_parallel_rank}, {data_parallel_size}'
+
+    def __len__(self):
+        """Returns the number of batches this rank will yield."""
+        # Each batch takes data_parallel_size samples (1 per rank)
+        # This rank gets samples at indices: data_parallel_rank, data_parallel_rank + data_parallel_size, ...
+        num_batches = 0
+        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
+            # Check if this rank has data in this batch
+            sample_idx = batch_idx + self.data_parallel_rank
+            if sample_idx < self.total_samples:
+                num_batches += 1
+        return num_batches
+
+    def __iter__(self):
+        """Yield batches for this data parallel rank."""
+        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
+            # Check if this rank has data in this batch
+            sample_idx = batch_idx + self.data_parallel_rank
+            if sample_idx < self.total_samples:
+                # Yield a batch with a single sample index for this rank
+                yield [sample_idx]
+
 
 class RandomSeedDataset(Dataset):
     """
