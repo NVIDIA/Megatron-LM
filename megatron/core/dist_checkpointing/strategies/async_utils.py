@@ -25,6 +25,23 @@ from ..utils import debug_time
 logger = logging.getLogger(__name__)
 
 
+def _get_rank_or_unknown() -> str:
+    """Return the current distributed rank as a string, or '?' if unavailable.
+
+    During Python interpreter shutdown the distributed process group may already
+    be destroyed by the time ``__del__`` / ``close()`` runs.  Calling
+    ``torch.distributed.get_rank()`` in that situation raises ``ValueError``.
+    This helper lets callers embed the rank in log messages without risking an
+    unhandled exception.
+    """
+    try:
+        if torch.distributed.is_initialized():
+            return str(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return "?"
+
+
 def _set_process_qos(cpu_priority: int, io_priority: Optional[int]) -> None:
     """
     Set QoS (Quality of Service) for the current checkpoint writer process.
@@ -227,7 +244,7 @@ class AsyncCaller(ABC):
     @abstractmethod
     def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.debug(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
+        raise NotImplementedError
 
     def __del__(self):
         raise NotImplementedError("This should be implemented")
@@ -323,12 +340,12 @@ class TemporalAsyncCaller(AsyncCaller):
                 the checkpoint async process needs to be aborted.
         """
         if self.process:
-            logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
+            logger.debug(f"rank: {_get_rank_or_unknown()}, joining self.process")
             if abort:
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Temporal worker aborted in rank {torch.distributed.get_rank()}",
+                    f"Temporal worker aborted in rank {_get_rank_or_unknown()}",
                 )
                 self.process.kill()
             else:
@@ -494,14 +511,14 @@ class PersistentAsyncCaller(AsyncCaller):
                 the checkpoint async process needs to be aborted.
         """
         logger.debug(
-            f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
+            f"PersistentAsyncCaller: {_get_rank_or_unknown()}, Destroying Async Caller"
         )
         if self.process:
             if abort:
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
+                    f"Persistent worker aborted in rank {_get_rank_or_unknown()}",
                 )
                 self.process.kill()
             else:
