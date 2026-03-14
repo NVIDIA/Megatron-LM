@@ -8,7 +8,6 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -944,10 +943,6 @@ def forward_backward_pipelining_with_interleaving(
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
@@ -2110,6 +2105,7 @@ def forward_backward_pipelining_without_interleaving(
 
     elif p2p_communicator is not None and pg_collection is not None:
         # Custom process groups provided
+        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
 
         if is_multimodule:
             # Multi-module: use language model's CP size for loss scaling
@@ -2126,9 +2122,24 @@ def forward_backward_pipelining_without_interleaving(
 
         elif isinstance(pg_collection, ProcessGroupCollection):
             # Single-module: extract tp/cp groups and cp_size
-            # Note: finalize_model_grads validates other fields (embd, pos_embd, pp, dp_cp)
-            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
-            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
+            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
+            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
+            assert hasattr(pg_collection, 'embd'), (
+                "pg_collection must have a embd. In previous version, it is used default "
+                "`parallel_state.default_embedding_ranks` to create the process group. "
+                " If you are using the default process group, please use "
+                " `parallel_state.get_embedding_group()` "
+                "If you don't need embd_group, you need to explicitly set it to None."
+            )
+            assert hasattr(pg_collection, 'pos_embd'), (
+                "pg_collection must have a pos_embd. In previous version, it is used default "
+                "`parallel_state.default_position_embedding_ranks` to create the process group. "
+                " If you are using the default process group, please use  "
+                " `parallel_state.get_position_embedding_group()` "
+                "If you don't need pos_embd_group, you need to explicitly set it to None."
+            )
+            assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
+            assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
             tp_group = pg_collection.tp
             cp_group = pg_collection.cp
             cp_size = cp_group.size()
@@ -2138,7 +2149,6 @@ def forward_backward_pipelining_without_interleaving(
                 f"pg_collection must be ProcessGroupCollection or "
                 f"MultiModuleProcessGroupCollection, got {type(pg_collection)}"
             )
-
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
