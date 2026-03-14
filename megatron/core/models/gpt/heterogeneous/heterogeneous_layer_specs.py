@@ -122,7 +122,7 @@ def _get_heterogenous_attention_spec(
                     not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
                 ),
                 core_attention=not_none(TEDotProductAttention) if use_te else DotProductAttention,
-                linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
+                linear_proj=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
                 q_layernorm=ln,
                 k_layernorm=ln,
             ),

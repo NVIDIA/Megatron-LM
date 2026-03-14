@@ -127,7 +127,7 @@ def get_radio_g_layer_spec_te() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),

@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelGroupedLinear,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.attention import LinearProjBuilder
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import (
@@ -54,6 +55,11 @@ class BackendSpecProvider(Protocol):
     @abstractmethod
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
+        ...
+
+    @abstractmethod
+    def row_parallel_linear_proj(self) -> LinearProjBuilder:
+        """Which module the backend uses for the final linear projection in attention"""
         ...
 
     @abstractmethod
@@ -103,7 +109,11 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear_proj(self) -> LinearProjBuilder:
+        """Which module the backend uses for the final linear projection in attention"""
+        return RowParallelLinear
+
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
@@ -154,8 +164,12 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
-        """Which row parallel linear module TE backend uses"""
+    def row_parallel_linear_proj(self) -> LinearProjBuilder:
+        """Which module the backend uses for the final linear projection in attention"""
+        return InferenceRowParallelLinear
+
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
+        """Which row parallel linear module Inference backend uses"""
         return InferenceRowParallelLinear
 
     def fuse_layernorm_and_linear(self) -> bool:
