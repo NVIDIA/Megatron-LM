@@ -48,8 +48,6 @@ MODEL_ARGS:
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
   --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
   --manual-gc: true
   --manual-gc-interval: 100
   --transformer-impl: transformer_engine
