@@ -2333,6 +2333,39 @@ def _add_training_args(parser):
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
+    group.add_argument('--global-batch-size', type=int, default=None,
+                       help='Training batch size. If set, it should be a '
+                       'multiple of micro-batch-size times data-parallel-size. '
+                       'If this value is None, then '
+                       'use micro-batch-size * data-parallel-size as the '
+                       'global batch size. This choice will result in 1 for '
+                       'number of micro-batches.')
+    group.add_argument('--rampup-batch-size', nargs='*', default=None,
+                       help='Batch size ramp up with the following values:'
+                       '  --rampup-batch-size <start batch size> '
+                       '                      <batch size incerement> '
+                       '                      <ramp-up samples> '
+                       'For example:'
+                       '   --rampup-batch-size 16 8 300000 \\ '
+                       '   --global-batch-size 1024'
+                       'will start with global batch size 16 and over '
+                       ' (1024 - 16) / 8 = 126 intervals will increase'
+                       'the batch size linearly to 1024. In each interval'
+                       'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--step-batch-size-schedule', type=str, default=None,
+                    help='Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...". '
+                    'Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12). '
+                    'If --seq-length is provided, thresholds are interpreted as tokens; '
+                    'otherwise as samples. '
+                    'Example: --step-batch-size-schedule "0:768 250B:1536 500B:3072 750B:6144" '
+                    'Cannot be used together with --rampup-batch-size.')
+    group.add_argument('--decrease-batch-size-if-needed', action='store_true', default=False,
+                       help='If set, decrease batch size if microbatch_size * dp_size'
+                       'does not divide batch_size. Useful for KSO (Keep Soldiering On)'
+                       'to continue making progress if number of healthy GPUs (and'
+                       'corresponding dp_size) does not support current batch_size.'
+                       'Old batch_size will be restored if training is re-started with'
+                       'dp_size that divides batch_size // microbatch_size.')
     group.add_argument('--recompute-activations', action='store_true',
                        help='recompute activation to allow for training '
                        'with larger models, sequences, and batch sizes.')

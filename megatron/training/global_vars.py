@@ -90,12 +90,17 @@ def set_global_variables(args, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
+    if args.step_batch_size_schedule is not None:
+        print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+
     init_num_microbatches_calculator(
         args.rank,
         args.rampup_batch_size,
         args.global_batch_size,
         args.micro_batch_size,
         args.data_parallel_size,
+        args.step_batch_size_schedule,
+        args.seq_length,
         args.decrease_batch_size_if_needed,
     )
     if build_tokenizer:

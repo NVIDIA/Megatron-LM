@@ -4,13 +4,13 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
-    'ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator'
+    'ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator'
 ] = None
 
 
@@ -67,6 +67,8 @@ def init_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
+    step_batch_size_schedule: Optional[str],
+    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
 ) -> None:
     """Initialize number of microbatches calculator. Supporting backward compatibility.
@@ -83,6 +85,13 @@ def init_num_microbatches_calculator(
             Micro batch size at initialization.
         data_parallel_size (int):
             Data parallel size.
+        step_batch_size_schedule (Optional[str]):
+            Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
+            Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+            Example: "0:768 250B:1536 500B:3072 750B:6144"
+        seq_length (Optional[int]):
+            Sequence length for token-to-sample conversion when using step_batch_size_schedule.
+            If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
         decrease_batch_size_if_needed (bool, optional):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
             Defaults to False.
@@ -93,6 +102,8 @@ def init_num_microbatches_calculator(
         global_batch_size,
         micro_batch_size,
         data_parallel_size,
+        step_batch_size_schedule,
+        seq_length,
         decrease_batch_size_if_needed,
         init=True,
     )
@@ -110,6 +121,8 @@ def reconfigure_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
+    step_batch_size_schedule: Optional[str],
+    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
 ) -> None:
     """Reconfigure number of microbatches calculator. Supporting backward compatibility.
@@ -129,6 +142,13 @@ def reconfigure_num_microbatches_calculator(
         decrease_batch_size_if_needed (bool, optional):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
             Defaults to False.
+        step_batch_size_schedule (Optional[str]):
+            Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
+            Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+            Example: "0:768 250B:1536 500B:3072 750B:6144"
+        seq_length (Optional[int]):
+            Sequence length for token-to-sample conversion when using step_batch_size_schedule.
+            If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
     _configure_global_num_microbatches_calculator(
         rank,
@@ -136,6 +156,8 @@ def reconfigure_num_microbatches_calculator(
         global_batch_size,
         micro_batch_size,
         data_parallel_size,
+        step_batch_size_schedule,
+        seq_length,
         decrease_batch_size_if_needed,
         init=False,
     )
@@ -147,6 +169,8 @@ def _configure_global_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
+    step_batch_size_schedule: Optional[str],
+    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
     init: bool = False,
 ) -> None:
@@ -170,6 +194,13 @@ def _configure_global_num_microbatches_calculator(
             Defaults to False.
         init (bool, optional):
             If true, initialize the calculator. Defaults to False.
+        step_batch_size_schedule (Optional[str]):
+            Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
+            Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+            Example: "0:768 250B:1536 500B:3072 750B:6144"
+        seq_length (Optional[int]):
+            Sequence length for token-to-sample conversion when using step_batch_size_schedule.
+            If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
@@ -185,17 +216,21 @@ def _configure_global_num_microbatches_calculator(
         micro_batch_size,
         data_parallel_size,
         decrease_batch_size_if_needed,
+        step_batch_size_schedule,
+        seq_length,
     )
 
 
 def _build_num_microbatches_calculator(
     rank: int,
     rampup_batch_size: Optional[List[int]],
-    global_batch_size: int,
+    global_batch_size: Optional[int],
     micro_batch_size: int,
     data_parallel_size: int,
     decrease_batch_size_if_needed: bool,
-) -> Union['ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator']:
+    step_batch_size_schedule: Optional[str] = None,
+    seq_length: Optional[int] = None,
+) -> Union['ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator']:
     """Build number of microbatches calculator. Internal helper method.
 
     Args:
@@ -204,32 +239,50 @@ def _build_num_microbatches_calculator(
         rampup_batch_size (Optional[List[int]]):
             Rampup batch size, should be in format of
             [start_global_batch_size, batch_size_increment, ramup_samples].
-        global_batch_size (int):
-            Global batch size for the model.
+        global_batch_size (Optional[int]):
+            Global batch size for the model. Required for constant and rampup modes.
+            Ignored when step_batch_size_schedule is provided.
         micro_batch_size (int):
             Micro batch size at initialization.
         data_parallel_size (int):
             Data parallel size.
         decrease_batch_size_if_needed (bool):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
-
+        step_batch_size_schedule (Optional[str]):
+            Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
+            Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+            Example: "0:768 250B:1536 500B:3072 750B:6144"
+        seq_length (Optional[int]):
+            Sequence length for token-to-sample conversion when using step_batch_size_schedule.
+            If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
 
-    # Constant batch size.
-    if rampup_batch_size is None:
-        num_microbatches_calculator = ConstantNumMicroBatchesCalculator(
-            global_batch_size,
-            micro_batch_size,
-            data_parallel_size,
-            decrease_batch_size_if_needed,
-            rank,
+    # Validate mutually exclusive options
+    if step_batch_size_schedule is not None and rampup_batch_size is not None:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --rampup-batch-size'
         )
-        if rank == 0:
-            logger.info(
-                f'setting number of microbatches to constant {num_microbatches_calculator.get()}'
+
+    # Step batch size schedule
+    if step_batch_size_schedule is not None:
+        if global_batch_size is not None and rank == 0:
+            logger.warning(
+                '--global-batch-size is ignored when using --step-batch-size-schedule'
             )
-    # Batch size ramp up.
-    else:
+        num_microbatches_calculator = StepBatchsizeNumMicroBatchesCalculator(
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=data_parallel_size,
+            decrease_batch_size_if_needed=decrease_batch_size_if_needed,
+            rank=rank,
+            schedule=step_batch_size_schedule,
+            seq_length=seq_length,
+        )
+
+    # Batch size ramp up
+    elif rampup_batch_size is not None:
+        assert global_batch_size is not None, (
+            '--global-batch-size is required when using --rampup-batch-size'
+        )
         assert len(rampup_batch_size) == 3, (
             'expected the following '
             'format: --rampup-batch-size <start batch size> '
@@ -254,6 +307,23 @@ def _build_num_microbatches_calculator(
             batch_size_increment,
             ramup_samples,
         )
+
+    # Constant batch size
+    else:
+        assert global_batch_size is not None, (
+            '--global-batch-size is required when not using --step-batch-size-schedule'
+        )
+        num_microbatches_calculator = ConstantNumMicroBatchesCalculator(
+            global_batch_size,
+            micro_batch_size,
+            data_parallel_size,
+            decrease_batch_size_if_needed,
+            rank,
+        )
+        if rank == 0:
+            logger.info(
+                f'setting number of microbatches to constant {num_microbatches_calculator.get()}'
+            )
 
     return num_microbatches_calculator
 
@@ -500,6 +570,216 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 self.current_running_global_batch_size % self.micro_batch_times_data_parallel_size
                 == 0
             )
+        else:
+            self.current_running_global_batch_size = self.current_global_batch_size
+
+        self.num_micro_batches = (
+            self.current_running_global_batch_size // self.micro_batch_times_data_parallel_size
+        )
+
+class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
+    """Calculator of number of microbatches with arbitrary step-wise batch size schedule.
+
+    Args:
+        micro_batch_size (int): Micro batch size.
+        data_parallel_size (int): Data parallel size.
+        decrease_batch_size_if_needed (bool): Decrease batch size for divisibility.
+        rank (int): Rank for logging.
+        schedule (str): Schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
+            Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+            Examples:
+                "0:768 250B:1536 500B:3072 750B:6144" (thresholds in tokens)
+                "0:768 61035156250:1536" (thresholds in samples)
+        seq_length (int, optional): Sequence length for token-to-sample conversion.
+            If provided, thresholds are interpreted as tokens and converted to samples.
+            If None, thresholds are interpreted as samples directly.
+    """
+
+    def __init__(
+        self,
+        micro_batch_size: int,
+        data_parallel_size: int,
+        decrease_batch_size_if_needed: bool,
+        rank: int,
+        schedule: str,
+        seq_length: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        self.micro_batch_size = micro_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.decrease_batch_size_if_needed = decrease_batch_size_if_needed
+        self.rank = rank
+        self.seq_length = seq_length
+
+        self.micro_batch_times_data_parallel_size = micro_batch_size * data_parallel_size
+        assert self.micro_batch_times_data_parallel_size > 0
+
+        # Parse schedule string
+        self.schedule = self._parse_schedule(schedule, seq_length)
+
+        # Validate schedule
+        self._validate_schedule()
+
+        self.global_batch_size = self.schedule[-1][1]
+        self.current_global_batch_size = None
+
+        if rank == 0:
+            logger.info(f'> initializing step batch size schedule')
+            logger.info(f'  raw schedule string: "{schedule}"')
+            logger.info(f'  seq_length: {seq_length} (thresholds interpreted as {"tokens" if seq_length else "samples"})')
+            logger.info(f'  micro_batch_size: {micro_batch_size}')
+            logger.info(f'  data_parallel_size: {data_parallel_size}')
+            logger.info(f'  decrease_batch_size_if_needed: {decrease_batch_size_if_needed}')
+            logger.info(f'step batch size schedule ({len(self.schedule)} steps):')
+            for threshold, batch_size in self.schedule:
+                num_microbatches = batch_size // self.micro_batch_times_data_parallel_size
+                if seq_length:
+                    tokens = threshold * seq_length
+                    logger.info(f'  >= {tokens:,} tokens ({threshold:,} samples) -> batch_size={batch_size}, num_microbatches={num_microbatches}')
+                else:
+                    logger.info(f'  >= {threshold:,} samples -> batch_size={batch_size}, num_microbatches={num_microbatches}')
+        # Initialize
+        self.update(0, consistency_check=False, verbose=True)
+
+    @staticmethod
+    def _parse_numeric_value(value_str: str) -> int:
+        """Parse numeric value with optional suffix (K, M, B, T)."""
+        value_str = value_str.strip().upper()
+
+        multiplier = 1
+        if value_str.endswith('T'):
+            multiplier = 1_000_000_000_000
+            value_str = value_str[:-1]
+        elif value_str.endswith('B'):
+            multiplier = 1_000_000_000
+            value_str = value_str[:-1]
+        elif value_str.endswith('M'):
+            multiplier = 1_000_000
+            value_str = value_str[:-1]
+        elif value_str.endswith('K'):
+            multiplier = 1_000
+            value_str = value_str[:-1]
+
+        return int(float(value_str) * multiplier)
+
+    @classmethod
+    def _parse_schedule(
+        cls, schedule_str: str, seq_length: Optional[int]
+    ) -> List[Tuple[int, int]]:
+        """Parse schedule string into list of (threshold_samples, batch_size) tuples.
+
+        Args:
+            schedule_str: Space-separated "THRESHOLD:BATCH_SIZE" pairs.
+            seq_length: If provided, convert thresholds from tokens to samples.
+
+        Returns:
+            List of (threshold_samples, batch_size) tuples, sorted by threshold.
+        """
+        schedule = []
+        entries = schedule_str.strip().replace(',', ' ').split()
+
+        for entry in entries:
+            if ':' not in entry:
+                raise ValueError(
+                    f'Invalid schedule entry "{entry}". Expected format: "THRESHOLD:BATCH_SIZE"'
+                )
+
+            threshold_str, batch_size_str = entry.split(':', 1)
+            threshold = cls._parse_numeric_value(threshold_str)
+            batch_size = cls._parse_numeric_value(batch_size_str)
+
+            # Convert tokens to samples if seq_length provided
+            if seq_length is not None:
+                threshold = threshold // seq_length
+
+            schedule.append((threshold, batch_size))
+
+        # Sort by threshold ascending
+        schedule.sort(key=lambda x: x[0])
+
+        return schedule
+
+    def _validate_schedule(self) -> None:
+        """Validate the parsed schedule."""
+        assert len(self.schedule) > 0, 'schedule must have at least one entry'
+        assert self.schedule[0][0] == 0, (
+            f'first schedule entry must have threshold 0, got {self.schedule[0][0]}'
+        )
+
+        # Check strictly increasing thresholds
+        for i in range(1, len(self.schedule)):
+            assert self.schedule[i][0] > self.schedule[i - 1][0], (
+                f'schedule thresholds must be strictly increasing, '
+                f'got {self.schedule[i - 1][0]} before {self.schedule[i][0]}'
+            )
+
+        # Validate batch sizes are positive.
+        # NOTE: divisibility by micro_batch_size * data_parallel_size is NOT checked here
+        # because early schedule entries may be smaller than the current GPU configuration
+        # (e.g., after scaling up GPUs mid-training). Divisibility of the CURRENT batch size
+        # is checked at runtime in update() when consistency_check=True (after checkpoint loading).
+        for threshold, batch_size in self.schedule:
+            assert batch_size > 0, f'batch size must be positive, got {batch_size}'
+
+    def _get_batch_size_for_samples(self, consumed_samples: int) -> int:
+        """Get the batch size for the given number of consumed samples."""
+        batch_size = self.schedule[0][1]
+        for threshold, bs in self.schedule:
+            if consumed_samples >= threshold:
+                batch_size = bs
+            else:
+                break
+        return batch_size
+
+    @staticmethod
+    def _round(batch_size: int, divisor: int) -> int:
+        """Round batch_size down to nearest value divisible by divisor."""
+        return (batch_size // divisor) * divisor
+
+    def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
+        """Update number of microbatches based on consumed samples.
+
+        Args:
+            consumed_samples (int): Number of samples consumed.
+            consistency_check (bool): Check divisibility constraints.
+            verbose (bool): Enable logging.
+        """
+        old_current_global_batch_size = self.current_global_batch_size
+        self.current_global_batch_size = self._get_batch_size_for_samples(consumed_samples)
+
+        global_batch_size_changed = old_current_global_batch_size != self.current_global_batch_size
+
+        if self.rank == 0 and global_batch_size_changed and verbose:
+            if old_current_global_batch_size is None:
+                logger.info(f'setting initial batch size to {self.current_global_batch_size}')
+            else:
+                logger.info(
+                    f'stepping batch size from {old_current_global_batch_size} to '
+                    f'{self.current_global_batch_size} at {consumed_samples:,} samples'
+                )
+
+        # Consistency check
+        if consistency_check and not self.decrease_batch_size_if_needed:
+            assert self.current_global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
+                f'current global batch size ({self.current_global_batch_size}) is not divisible by '
+                f'micro_batch_size ({self.micro_batch_size}) * '
+                f'data_parallel_size ({self.data_parallel_size})'
+            )
+
+        # Handle decrease_batch_size_if_needed
+        if (
+            self.decrease_batch_size_if_needed
+            and self.current_global_batch_size % self.micro_batch_times_data_parallel_size != 0
+        ):
+            self.current_running_global_batch_size = self._round(
+                self.current_global_batch_size, self.micro_batch_times_data_parallel_size
+            )
+            if self.rank == 0 and global_batch_size_changed and verbose:
+                logger.info(
+                    f'adjusted running batch size to {self.current_running_global_batch_size} '
+                    f'for divisibility'
+                )
         else:
             self.current_running_global_batch_size = self.current_global_batch_size
 
