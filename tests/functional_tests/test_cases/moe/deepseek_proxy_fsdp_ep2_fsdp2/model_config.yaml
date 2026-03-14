@@ -33,18 +33,10 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
 
 # Precision
-  --fp8-param: true
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
   --fp8-param-gather: true
 
-# Full Offloading
-  --cpu-offloading: true
-  --cpu-offloading-num-layers: 4
-
-# Full Recompute
-  --recompute-granularity:  "full"
-  --recompute-num-layers: 4
 
 # Training args
   --use-mcore-models: true
