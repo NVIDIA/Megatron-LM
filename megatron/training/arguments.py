@@ -1057,6 +1057,13 @@ def validate_args(args, defaults={}):
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
+    
+    if args.context_parallel_size > 1 and not args.calculate_per_token_loss:
+        warn_rank_0(
+            'Using Context Parallelism (CP) without per-token loss. Please ensure that'\
+            'the number of tokens is identical across different CP ranks, '\
+            'and verify that data has not been padded or masked differently across ranks.'
+        )
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
