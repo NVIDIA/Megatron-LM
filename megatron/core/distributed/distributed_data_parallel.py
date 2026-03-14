@@ -35,6 +35,8 @@ class DistributedDataParallel(_BaseDataParallel):
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
         pg_collection: Optional unified process group for distributed training.
+        optimizer_class: Optional optimizer class with a `compute_param_layout` classmethod.
+            When provided, the buffer delegates parameter layout computation to this class.
 
     """
 
@@ -45,6 +47,7 @@ class DistributedDataParallel(_BaseDataParallel):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        optimizer_class: Optional[type] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -209,6 +212,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
                         pg_collection,
+                        optimizer_class=optimizer_class,
                     )
                 )
 

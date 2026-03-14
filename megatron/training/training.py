@@ -1386,6 +1386,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
                 dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
 
+            # Pass the optimizer class to DDP so it can delegate parameter layout
+            # computation. This avoids baking optimizer-specific layout assumptions
+            # (padding, bucket splitting) into the buffer.
+            if args.use_distributed_optimizer:
+                dp_init_kwargs["optimizer_class"] = DistributedOptimizer
             model = [
                 DP(
                     config=config,
