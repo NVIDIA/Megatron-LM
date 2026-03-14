@@ -17,137 +17,185 @@ SCALE_INV_BLOCK_SIZE = 32
 class PagedStashBuffer:
     """
     A paged stash buffer with page-level memory management.
+    Supports both CUDA and optional pinned host buffer for overflow fallback.
 
-    The buffer is organized as [num_pages, page_size, hidden_size].
-    Uses a free list (circular buffer) to track available pages.
+    Buffers are organized as [num_pages, page_size, hidden_size].
+    Uses per-buffer free lists (circular buffer) tracked as two-element state: [0]=CUDA, [1]=host.
     """
 
-    def __init__(self, num_tokens, hidden_size, page_size, device, overflow, dtype):
+    def __init__(self, num_tokens, hidden_size, page_size, device, overflow, dtype, num_tokens_host=0):
         """
         Args:
-            num_tokens: Maximum number of tokens the buffer can hold
+            num_tokens: Maximum number of tokens the CUDA buffer can hold
             hidden_size: Hidden dimension size
             page_size: Number of tokens per page
             device: Device for the buffer
             overflow: Overflow flag tensor (shared across all buffers)
             dtype: Data type
+            num_tokens_host: If > 0, allocate pinned host buffer with this many tokens for spillover.
         """
         self.hidden_size = hidden_size
         self.page_size = page_size
-        self.num_pages = (num_tokens + page_size - 1) // page_size  # Ceiling division
-        self.total_tokens = self.num_pages * page_size
-
-        # Create 2D buffer [total_tokens, hidden_size]
-        # Organized as pages: [page_0_tokens, page_1_tokens, ...]
-        if os.getenv('PAGED_STASH_TO_CPU', '0') == '1':
-            self.buffer = torch.empty(
-                (self.total_tokens, hidden_size), dtype=dtype, device='cpu', pin_memory=True
-            )
-        else:
-            self.buffer = torch.empty((self.total_tokens, hidden_size), dtype=dtype, device=device)
-
-        self.overflow = overflow  # GPU flag (shared)
         self.device = device
         self.dtype = dtype
+        self.overflow = overflow  # GPU flag (shared)
 
-        # Free list as circular buffer: stores available page IDs
-        self.free_list = torch.arange(self.num_pages, dtype=torch.int64, device=device)
+        # CUDA buffer
+        self.num_cuda_pages = (num_tokens + page_size - 1) // page_size
+        self.total_cuda_tokens = self.num_cuda_pages * page_size
+        self.cuda_buffer = torch.empty(
+            (self.total_cuda_tokens, hidden_size), dtype=dtype, device=device
+        )
 
-        # Head and tail pointers for free_list circular buffer
-        self.free_list_head = torch.zeros(
-            1, dtype=torch.int64, device=device
-        )  # Read pointer (allocation)
-        self.free_list_tail = self.num_pages * torch.ones(
-            1, dtype=torch.int64, device=device
-        )  # Write pointer (deallocation)
+        # Host buffer (pinned), optional
+        self.num_host_pages = (num_tokens_host + page_size - 1) // page_size if num_tokens_host > 0 else 0
+        self.total_host_tokens = self.num_host_pages * page_size if self.num_host_pages > 0 else 0
+        if self.num_host_pages > 0:
+            self.host_buffer = torch.empty(
+                (self.total_host_tokens, hidden_size), dtype=dtype, device='cpu', pin_memory=True
+            )
+        else:
+            self.host_buffer = None
 
-        # Capacity of free list
-        self.free_list_capacity = self.num_pages * torch.ones(1, dtype=torch.int64, device=device)
+        # Free list state: shape (2,) index 0 = CUDA, 1 = host (all in device memory for kernel)
+        self.free_list_head = torch.zeros(2, dtype=torch.int64, device=device)
+        self.free_list_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages], dtype=torch.int64, device=device
+        )
+        self.free_list_capacity = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages], dtype=torch.int64, device=device
+        )
+
+        # Free list arrays (device memory): page IDs for each buffer
+        self.free_list_cuda = torch.arange(self.num_cuda_pages, dtype=torch.int64, device=device)
+        if self.num_host_pages > 0:
+            self.free_list_host = torch.arange(self.num_host_pages, dtype=torch.int64, device=device)
+        else:
+            self.free_list_host = torch.empty(0, dtype=torch.int64, device=device)
+
+        # Pre-allocated reset values (CUDA graph safe: no allocation in reset())
+        self._reset_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=device,
+        )
+        self._reset_free_list_cuda = torch.arange(
+            self.num_cuda_pages, dtype=torch.int64, device=device
+        )
+        if self.num_host_pages > 0:
+            self._reset_free_list_host = torch.arange(
+                self.num_host_pages, dtype=torch.int64, device=device
+            )
+        else:
+            self._reset_free_list_host = None
+
+        # Legacy single-buffer API (used by kernels when host disabled): same as cuda
+        self.free_list = self.free_list_cuda
 
     def reset(self):
-        """Reset the paged buffer - reinitialize free list."""
-        self.free_list.copy_(torch.arange(self.num_pages, dtype=torch.int64, device=self.device))
+        """Reset both CUDA and host free lists (CUDA graph safe: no new allocations)."""
+        self.free_list_cuda.copy_(self._reset_free_list_cuda)
         self.free_list_head.zero_()
-        self.free_list_tail.fill_(self.num_pages)
+        self.free_list_tail.copy_(self._reset_tail)
+        if self._reset_free_list_host is not None:
+            self.free_list_host.copy_(self._reset_free_list_host)
 
     def __repr__(self):
         return (
-            f"PagedStashBuffer(num_pages={self.num_pages}, page_size={self.page_size}, "
-            f"hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
+            f"PagedStashBuffer(num_cuda_pages={self.num_cuda_pages}, num_host_pages={self.num_host_pages}, "
+            f"page_size={self.page_size}, hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
         )
 
 
 @triton.jit
 def _paged_stash_copy_kernel(
     src_ptr,
-    dst_ptr,
+    cuda_dst_ptr,
+    host_dst_ptr,
     num_tokens_ptr,
-    free_list_ptr,
-    free_list_head_ptr,  # Read-only: current head position
-    free_list_tail_ptr,  # Read-only: current tail position (for overflow check)
+    free_list_cuda_ptr,
+    free_list_host_ptr,
+    free_list_head_ptr,   # shape (2,): [cuda_head, host_head]
+    free_list_tail_ptr,  # shape (2,)
     free_list_capacity_ptr,
-    page_record_ptr,  # Output: records which pages were used
+    page_record_ptr,
     overflow_ptr,
-    new_free_list_head_ptr,  # Output: new head position (written by kernel)
+    spilled_to_host_ptr,   # Output: 0 = stored in CUDA, 1 = stored in host or overflow
+    new_free_list_head_ptr,  # Output: shape (2,) updated heads
     PAGE_SIZE: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_HOST_BUFFER: tl.constexpr,
 ):
-    """Triton kernel to copy tokens to paged stash buffer.
-
-    Allocates pages from free list (reads from head, advances head).
-    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
-    Grid: (num_blocks,) where blocks process tokens in a strided pattern.
-    Writes new head to temporary tensor to avoid race conditions.
-    """
+    """Copy tokens to paged stash: try CUDA first (fast path), then host if CUDA full."""
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
 
-    # Load parameters
+    # Load overflow first (get in flight early); branch on it only before any write
+    overflow = tl.load(overflow_ptr)
+
     num_tokens = tl.load(num_tokens_ptr)
-    free_list_head = tl.load(free_list_head_ptr)
-    free_list_tail = tl.load(free_list_tail_ptr)
-    free_list_capacity = tl.load(free_list_capacity_ptr)
-
-    # Check available pages (unwrapped indices: simple subtraction, no modulo needed)
-    avail_pages = free_list_tail - free_list_head
-
-    # Calculate required pages
     required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
-    overflow_detected = avail_pages < required_pages
 
-    # Only block 0 writes overflow flag
-    if pid == 0 and overflow_detected:
-        tl.store(overflow_ptr, 1)
+    # Common case: load only CUDA state (and head_host for output when use_cuda)
+    head_cuda = tl.load(free_list_head_ptr)
+    head_host = tl.load(free_list_head_ptr + 1)
+    tail_cuda = tl.load(free_list_tail_ptr)
+    cap_cuda = tl.load(free_list_capacity_ptr)
 
-    # All blocks return early if overflow
-    if overflow_detected:
+    avail_cuda = tail_cuda - head_cuda
+    use_cuda = avail_cuda >= required_pages
+
+    # Assume CUDA path: set everything for GPU stash
+    spill = 0
+    dst_ptr = cuda_dst_ptr
+    free_list_ptr = free_list_cuda_ptr
+    head = head_cuda
+    cap = cap_cuda
+    new_head_cuda = head_cuda + required_pages
+    new_head_host = head_host
+    
+    if overflow == 1:
         return
 
-    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    # Only when CUDA is full: load host state and maybe switch to host
+    if not use_cuda:
+        tail_host = tl.load(free_list_tail_ptr + 1)
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        use_host = HAS_HOST_BUFFER == 1 and (tail_host - head_host) >= required_pages
+        if use_host:
+            spill = 1
+            dst_ptr = host_dst_ptr
+            free_list_ptr = free_list_host_ptr
+            head = head_host
+            cap = cap_host
+            new_head_cuda = head_cuda
+            new_head_host = head_host + required_pages
+        else:
+            if pid == 0:
+                tl.store(overflow_ptr, 1)
+                tl.store(spilled_to_host_ptr, 1)
+                tl.store(new_free_list_head_ptr, head_cuda)
+                tl.store(new_free_list_head_ptr + 1, head_host)
+            return
+
+    if pid == 0:
+        tl.store(spilled_to_host_ptr, spill)
+
+    # Copy loop: strided over tokens
     token_idx = pid
     while token_idx < num_tokens:
-        # Determine which page this token belongs to
         page_slot = token_idx // PAGE_SIZE
         token_in_page = token_idx % PAGE_SIZE
-
-        # Read page ID from free list (with wraparound)
-        free_list_idx = (free_list_head + page_slot) % free_list_capacity
+        free_list_idx = (head + page_slot) % cap
         page_id = tl.load(free_list_ptr + free_list_idx)
-
-        # First token in page: record the page ID (only if this block handles token 0 of the page)
         if token_in_page == 0:
             tl.store(page_record_ptr + page_slot, page_id)
-
-        # Calculate destination address in paged buffer
         dst_token_idx = page_id * PAGE_SIZE + token_in_page
 
-        # Copy token data (2D: hidden dimension)
         elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
         need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
         num_iters = elements_per_thread + (1 if need_mask else 0)
-
-        # Use int64 for address math to avoid int32 overflow when indices get large.
         token_idx_i64 = token_idx.to(tl.int64)
         dst_token_idx_i64 = dst_token_idx.to(tl.int64)
         src_base = src_ptr + token_idx_i64 * HIDDEN_SIZE
@@ -164,67 +212,80 @@ def _paged_stash_copy_kernel(
                 hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
-
-        # Stride to next token for this block
         token_idx += num_blocks
 
-    # Calculate and store new free list head (only block 0)
-    # We consumed pages, so advance head forward (unwrapped: no modulo)
-    # Write to temporary tensor to avoid race conditions
     if pid == 0:
-        new_head = free_list_head + required_pages
-        tl.store(new_free_list_head_ptr, new_head)
+        tl.store(new_free_list_head_ptr, new_head_cuda)
+        tl.store(new_free_list_head_ptr + 1, new_head_host)
 
 
 @triton.jit
 def _paged_stash_pop_kernel(
-    src_ptr,
+    cuda_src_ptr,
+    host_src_ptr,
     dst_ptr,
     num_tokens_ptr,
-    page_record_ptr,  # Input: which pages to read
-    free_list_ptr,
-    free_list_head_ptr,  # Read-only: current head position (not used)
-    free_list_tail_ptr,  # Read-only: current tail position
+    page_record_ptr,
+    spilled_to_host_ptr,  # 0 = read from CUDA, 1 = read from host
+    overflow_ptr,
+    free_list_cuda_ptr,
+    free_list_host_ptr,
+    free_list_tail_ptr,   # shape (2,)
     free_list_capacity_ptr,
-    new_free_list_tail_ptr,  # Output: new tail position (written by kernel)
+    new_free_list_tail_ptr,  # Output: shape (2,) updated tails
     PAGE_SIZE: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Triton kernel to reload tokens from paged stash buffer.
-
-    Returns pages to free list (writes to tail, advances tail).
-    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
-    Grid: (num_blocks,) where blocks process tokens in a strided pattern.
-    Writes new tail to temporary tensor to avoid race conditions.
-    """
+    """Reload tokens from paged stash; CUDA path fast, host path when spilled_to_host."""
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
 
-    # Load parameters
-    num_tokens = tl.load(num_tokens_ptr)
-    free_list_tail = tl.load(free_list_tail_ptr)
-    free_list_capacity = tl.load(free_list_capacity_ptr)
+    # Load overflow first (get in flight early); branch on it only before any write
+    overflow = tl.load(overflow_ptr)
 
-    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    num_tokens = tl.load(num_tokens_ptr)
+    spill = tl.load(spilled_to_host_ptr)
+    required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+
+    # Common case: load only CUDA state (and tail_host for output when spill=0)
+    tail_cuda = tl.load(free_list_tail_ptr)
+    tail_host = tl.load(free_list_tail_ptr + 1)
+    cap_cuda = tl.load(free_list_capacity_ptr)
+
+    # Assume CUDA path
+    src_ptr = cuda_src_ptr
+    free_list_ptr = free_list_cuda_ptr
+    tail = tail_cuda
+    cap = cap_cuda
+    new_tail_cuda = tail_cuda + required_pages
+    new_tail_host = tail_host
+
+    # Only when spilled to host: load host state and switch
+    if spill == 1:
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        if cap_host == 0:
+            return
+        src_ptr = host_src_ptr
+        free_list_ptr = free_list_host_ptr
+        tail = tail_host
+        cap = cap_host
+        new_tail_cuda = tail_cuda
+        new_tail_host = tail_host + required_pages
+
+    if overflow == 1:
+        return
+
     token_idx = pid
     while token_idx < num_tokens:
-        # Determine which page this token belongs to
         page_slot = token_idx // PAGE_SIZE
         token_in_page = token_idx % PAGE_SIZE
-
-        # Read page ID from page record
         page_id = tl.load(page_record_ptr + page_slot)
-
-        # Calculate source address in paged buffer
         src_token_idx = page_id * PAGE_SIZE + token_in_page
 
-        # Copy token data (2D: hidden dimension)
         elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
         need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
         num_iters = elements_per_thread + (1 if need_mask else 0)
-
-        # Use int64 for address math to avoid int32 overflow when indices get large.
         src_token_idx_i64 = src_token_idx.to(tl.int64)
         token_idx_i64 = token_idx.to(tl.int64)
         src_base = src_ptr + src_token_idx_i64 * HIDDEN_SIZE
@@ -242,22 +303,14 @@ def _paged_stash_pop_kernel(
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
 
-        # First token in page: release page back to free list
         if token_in_page == 0:
-            # Write page ID back to free list at tail position (with wraparound)
-            write_idx = (free_list_tail + page_slot) % free_list_capacity
+            write_idx = (tail + page_slot) % cap
             tl.store(free_list_ptr + write_idx, page_id)
-
-        # Stride to next token for this block
         token_idx += num_blocks
 
-    # Calculate and store new free list tail (only block 0)
-    # We returned pages, so advance tail forward (unwrapped: no modulo)
-    # Write to temporary tensor to avoid race conditions
     if pid == 0:
-        required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
-        new_tail = free_list_tail + required_pages
-        tl.store(new_free_list_tail_ptr, new_tail)
+        tl.store(new_free_list_tail_ptr, new_tail_cuda)
+        tl.store(new_free_list_tail_ptr + 1, new_tail_host)
 
 
 class PagedTensor:
@@ -315,6 +368,8 @@ class PagedTensor:
 
         # Page record: stores which pages are being used for this tensor
         self.page_record = torch.zeros(self.max_num_pages, dtype=torch.int64, device=self.device)
+        # Set by copy kernel: 0 = data in CUDA stash, 1 = data in host (pinned) stash
+        self.spilled_to_host = torch.zeros(1, dtype=torch.int64, device=self.device)
 
     @property
     def schedule_layer(self):
@@ -322,12 +377,7 @@ class PagedTensor:
         return self.schedule_layer_no
 
     def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Offload the paged tensor to paged stash buffer.
-
-        Args:
-            paged_stash_buffer: The paged stash buffer to offload to
-            max_blocks: Maximum number of blocks for Triton kernel
-        """
+        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full)."""
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
@@ -338,49 +388,48 @@ class PagedTensor:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
 
-        # Get 1D tensor
         tensor_to_copy = self._tensor
-
-        # Determine grid size
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
-        # Create temporary tensor for new head
-        new_free_list_head = torch.empty(1, dtype=torch.int64, device=self.device)
+        new_free_list_head = torch.empty(2, dtype=torch.int64, device=self.device)
+        has_host = 1 if paged_stash_buffer.host_buffer is not None else 0
+        host_dst = (
+            paged_stash_buffer.host_buffer
+            if paged_stash_buffer.host_buffer is not None
+            else paged_stash_buffer.cuda_buffer
+        )
 
-        # Launch paged stash copy kernel
         _paged_stash_copy_kernel[grid](
-            tensor_to_copy.view(paged_stash_buffer.buffer.dtype),
-            paged_stash_buffer.buffer,
+            tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
+            paged_stash_buffer.cuda_buffer,
+            host_dst,
             num_tokens_tensor,
-            paged_stash_buffer.free_list,
+            paged_stash_buffer.free_list_cuda,
+            paged_stash_buffer.free_list_host,
             paged_stash_buffer.free_list_head,
             paged_stash_buffer.free_list_tail,
             paged_stash_buffer.free_list_capacity,
-            self.page_record,  # Triton kernel will populate page_record
+            self.page_record,
             paged_stash_buffer.overflow,
+            self.spilled_to_host,
             new_free_list_head,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
+            HAS_HOST_BUFFER=has_host,
         )
-
-        # Update free list head
+        # if self.spilled_to_host.item() == 1:
+        #     print(f"PagedTensor {self.layer_name} spilled to host", flush=True)
+        # else:
+        #     print(f"PagedTensor {self.layer_name} stashed to cuda", flush=True)
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
-
-        # Save reference to original tensor
         self._original_tensor = self._tensor
         self._tensor = None
 
     def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Reload the paged tensor from paged stash buffer.
-
-        Args:
-            paged_stash_buffer: The paged stash buffer to reload from
-            max_blocks: Maximum number of blocks for Triton kernel
-        """
-        # Allocate output tensor
+        """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host)."""
         self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
         tensor_to_reload = self._tensor
 
@@ -390,22 +439,26 @@ class PagedTensor:
         else:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
-        # Determine grid size
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
-        # Create temporary tensor for new tail
-        new_free_list_tail = torch.empty(1, dtype=torch.int64, device=self.device)
-
-        # Launch paged stash pop kernel
+        new_free_list_tail = torch.empty(2, dtype=torch.int64, device=self.device)
+        host_src = (
+            paged_stash_buffer.host_buffer
+            if paged_stash_buffer.host_buffer is not None
+            else paged_stash_buffer.cuda_buffer
+        )
         _paged_stash_pop_kernel[grid](
-            paged_stash_buffer.buffer,
-            tensor_to_reload.view(paged_stash_buffer.buffer.dtype),
+            paged_stash_buffer.cuda_buffer,
+            host_src,
+            tensor_to_reload.view(paged_stash_buffer.cuda_buffer.dtype),
             num_tokens_tensor,
-            self.page_record,  # Triton kernel will read from page_record
-            paged_stash_buffer.free_list,
-            paged_stash_buffer.free_list_head,
+            self.page_record,
+            self.spilled_to_host,
+            paged_stash_buffer.overflow,
+            paged_stash_buffer.free_list_cuda,
+            paged_stash_buffer.free_list_host,
             paged_stash_buffer.free_list_tail,
             paged_stash_buffer.free_list_capacity,
             new_free_list_tail,
@@ -414,7 +467,6 @@ class PagedTensor:
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        # Update free list tail
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
 
 
@@ -682,17 +734,28 @@ class PagedStashManager:
         if not max_tokens_dict:
             max_tokens_dict = self.max_tokens_across_vp_stages
 
+        cpu_size_factor = float(os.getenv('STASH_BUFFER_CPU_SIZE_FACTOR', '0'))
         for dtype, hidden_size in max_tokens_dict:
             if dtype not in self.stash_buffers:
                 self.stash_buffers[dtype] = {}
             assert hidden_size not in self.stash_buffers[dtype]
-            num_tokens = int(
-                max_tokens_dict[dtype, hidden_size] * scale
-            )
+            num_tokens = int(max_tokens_dict[dtype, hidden_size] * scale)
+            num_tokens_host = int(max_tokens_dict[dtype, hidden_size] * cpu_size_factor) if cpu_size_factor > 0 else 0
+            buf_dtype = torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
-                num_tokens, hidden_size, self.page_size, self.device, self.overflow, torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
+                num_tokens,
+                hidden_size,
+                self.page_size,
+                self.device,
+                self.overflow,
+                buf_dtype,
+                num_tokens_host=num_tokens_host,
             )
-            print (f'allocate_stash_buffers num_tokens: {self.stash_buffers[dtype][hidden_size].buffer.shape}-{self.stash_buffers[dtype][hidden_size].dtype} ({dtype})')
+            sb = self.stash_buffers[dtype][hidden_size]
+            msg = f'allocate_stash_buffers cuda: {sb.cuda_buffer.shape}'
+            if sb.host_buffer is not None:
+                msg += f' host: {sb.host_buffer.shape}'
+            print(f'{msg} dtype={sb.dtype} ({dtype})')
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
