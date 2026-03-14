@@ -31,7 +31,7 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
 from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, gather_uneven_dtensor_to_full_tensor
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
 from megatron.core.dist_checkpointing.serialization import (
     get_default_load_sharded_strategy,
@@ -399,7 +399,7 @@ def convert_checkpoint(
         _free_up_some_gpu_memory()
         layers = {}
         for i, v in enumerate(split_dtensor(value, 1, dim=0)):
-            v = gather_uneven_dtensor_to_full_tensor(v).reshape(
+            v = redistribute_uneven_dtensor_to_replicated(v).reshape(
                 orig_shape[1:] if orig_shape else value.shape[1:]
             ).redistribute(placements=[Shard(0)])
 
@@ -428,7 +428,7 @@ def convert_checkpoint(
             else:
                 raise ValueError(f"Unexpected expert layer key: {layer_key}")
 
-            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight)
+            expert_weight = redistribute_uneven_dtensor_to_replicated(expert_weight)
             expert_shape = orig_shape[1:] if orig_shape else value.shape[1:]
             # Handle optimizer states for expert linear_fc2 when ETP is enabled
             if (
@@ -472,7 +472,7 @@ def convert_checkpoint(
         """
         Split SwiGLU weights into separate tensors.
         """
-        value = gather_uneven_dtensor_to_full_tensor(value)
+        value = redistribute_uneven_dtensor_to_replicated(value)
         swiglu_w_and_v = {}
         w, v = torch.chunk(value, 2, dim=0)
         w = w.redistribute(placements=[Shard(0)])
@@ -531,7 +531,7 @@ def convert_checkpoint(
                 split_tensors = split_expert_weights(new_key, value, orig_shape)
             else:
                 if orig_shape:
-                    value = gather_uneven_dtensor_to_full_tensor(value)
+                    value = redistribute_uneven_dtensor_to_replicated(value)
                     # Handle optimizer states with partition_dim=1 when TP is enabled
                     if (
                         new_key.startswith("optimizer.state.")
