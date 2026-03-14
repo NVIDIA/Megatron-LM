@@ -22,7 +22,9 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = await request.get_json()
+        req = await request.get_json(force=True)
+        if req is None:
+            return "Invalid or missing JSON body", 400
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
