@@ -222,5 +222,5 @@ products:
   - test_case: [deepseek_proxy_fsdp_ep2_fsdp2]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, weekly]
+        scope: [mr]
         platforms: [dgx_gb200]
