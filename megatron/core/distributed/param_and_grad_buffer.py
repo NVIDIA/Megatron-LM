@@ -117,7 +117,6 @@ class _ParamAndGradBucket:
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
-        self._layerwise_src_buffer = None
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
@@ -334,44 +333,38 @@ class _ParamAndGradBucketGroup:
                 param_dtype = bucket.params_list[0].dtype
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
-                    # All ranks have empty params for this bucket — skip.
                     bucket.layerwise_gather_list = None
                     continue
 
-                # Flatten local params.  Detach from the autograd graph because
-                # start_param_sync can be called during the forward pass (where
-                # autograd is active) and all_gather will write into gather_list
-                # entries in-place.
                 local_size = bucket.layerwise_param_flat_sizes[local_rank]
+                total_gather_size = sum(bucket.layerwise_param_flat_sizes)
+
+                # Reuse grad_data as the all_gather receive buffer; it is idle
+                # during forward and grad_dtype.element_size >= param_dtype.
+                reuse_buf = bucket.grad_data.view(param_dtype)
+                assert reuse_buf.numel() >= total_gather_size
+
+                # Partition reuse_buf into contiguous per-rank receive slices.
+                gather_list = []
+                offset = 0
+                for i in range(dp_size):
+                    size = bucket.layerwise_param_flat_sizes[i]
+                    gather_list.append(reuse_buf[offset : offset + size])
+                    offset += size
+                local_slot_view = gather_list[local_rank]
+
+                # Flatten local params and copy into the local rank's slot.
+                # Detach from autograd since start_param_sync may be called
+                # during the forward pass where autograd is active.
                 if local_size > 0:
                     flat_local_params = _flatten_dense_tensors(
                         bucket.layerwise_params_list[local_rank]
                     ).detach()
-                else:
-                    flat_local_params = torch.empty(
-                        0, device=bucket.grad_data.device, dtype=param_dtype
-                    )
-                # Keep flat_local_params alive until the async operation completes.
-                bucket._layerwise_src_buffer = flat_local_params
-
-                # Allocate per-rank receive buffers with actual sizes (no padding).
-                # Reuse flat_local_params for local_rank's slot to avoid an extra allocation.
-                gather_list = []
-                for i in range(dp_size):
-                    if i == local_rank:
-                        gather_list.append(flat_local_params)
-                    else:
-                        gather_list.append(
-                            torch.empty(
-                                bucket.layerwise_param_flat_sizes[i],
-                                device=flat_local_params.device,
-                                dtype=flat_local_params.dtype,
-                            )
-                        )
+                    local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
-                    gather_list, flat_local_params, group=group, async_op=async_op
+                    gather_list, local_slot_view, group=group, async_op=async_op
                 )
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)
@@ -392,7 +385,6 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
-                    bucket._layerwise_src_buffer = None
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -502,7 +494,6 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
-                    bucket._layerwise_src_buffer = None
             else:
                 fp8_params = []
                 for bucket in self.buckets:
@@ -700,7 +691,6 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
-            bucket._layerwise_src_buffer = None
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False

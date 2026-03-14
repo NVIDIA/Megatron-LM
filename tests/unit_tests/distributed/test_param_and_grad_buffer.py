@@ -407,7 +407,6 @@ class TestFreeOverlapBuffers:
             # Simulate buffers that would be allocated by start_param_sync.
             for bucket in bg.buckets:
                 bucket.layerwise_gather_list = [torch.empty(8), torch.empty(8)]
-                bucket._layerwise_src_buffer = torch.empty(16)
 
             bg.free_overlap_buffers()
 
@@ -415,9 +414,6 @@ class TestFreeOverlapBuffers:
                 assert (
                     bucket.layerwise_gather_list is None
                 ), "layerwise_gather_list should be None after free_overlap_buffers"
-                assert (
-                    bucket._layerwise_src_buffer is None
-                ), "_layerwise_src_buffer should be None after free_overlap_buffers"
 
         Utils.destroy_model_parallel()
 
@@ -446,7 +442,6 @@ class TestFreeOverlapBuffers:
             assert bg.param_gather_handle is None
             for bucket in bg.buckets:
                 assert bucket.layerwise_gather_list is None
-                assert bucket._layerwise_src_buffer is None
 
             # Should not raise.
             bg.free_overlap_buffers()
