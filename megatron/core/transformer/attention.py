@@ -694,6 +694,7 @@ class Attention(MegatronModule, ABC):
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
+            softmax_scale=getattr(self, "softmax_scale", self.config.softmax_scale),
         )
         return out
 
@@ -803,6 +804,8 @@ class Attention(MegatronModule, ABC):
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
+            elif self.config.softmax_scale is not None:
+                softmax_scale = self.config.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
             if HAVE_FA3:
@@ -874,6 +877,7 @@ class Attention(MegatronModule, ABC):
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
                     "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    "softmax_scale": getattr(self, "softmax_scale", self.config.softmax_scale),
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
