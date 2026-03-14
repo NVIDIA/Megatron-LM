@@ -798,6 +798,47 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
+    def _handle_failed_request(self, request_id: int):
+        """Handle a failed request by sending the reply immediately.
+
+        The request is added to failed_request_ids so that the next bookkeeping pass can return it.
+        """
+        request_entry = self.requests[request_id]
+        request = request_entry.record[-1]
+
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} failed to be added to the engine due to errors. "
+                f"Prompt Tokens: {len(request.prompt_tokens)} "
+                f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                f"Max sequence length: {self.context.max_sequence_length} "
+                f"Chunked prefill enabled: {self.enable_chunked_prefill}"
+            )
+
+        request.status = Status.FAILED
+        request.add_event_fail()
+        self.failed_request_ids.append(request_id)
+
+        # Send the reply immediately, because it may never get a chance to be sent again.
+        if self.use_coordinator and self.is_mp_coordinator:
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [request_entry.record.merge().serialize()]],
+                use_bin_type=True,
+            )
+            self.socket_for_receiving_requests.send(payload)
+        elif not self.use_coordinator:
+            if request.prompt is None:
+                request.prompt = self.controller.tokenizer.detokenize(
+                    request.prompt_tokens.tolist()
+                )
+            if request.generated_tokens:
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
+            else:
+                request.generated_text = ""
+        request_entry.future.set_result(request_entry.record)
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -874,16 +915,10 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ) or (request.sampling_params.num_tokens_to_generate < 0):
-            logging.error(
-                f"{request_id=} Invalid number of tokens to generate. Prompt len: {len(request.prompt_tokens)}, tokens to generate: {request.sampling_params.num_tokens_to_generate}, max seq len: {self.context.max_sequence_length}."
-            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
-            logging.error(
-                f"{request_id=} Prompt is longer than context.max_tokens. Prompt tokens: {len(request.prompt_tokens)}, context.max_tokens: {self.context.max_tokens}, chunked_prefill: {self.enable_chunked_prefill}"
-            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
@@ -898,14 +933,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
-            self.failed_request_ids.append(request_id)
-            if self.rank == 0:
-                warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors. "
-                    f"Prompt Tokens: {len(request.prompt_tokens)} "
-                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
-                    f"Max sequence length: {self.context.max_sequence_length} "
-                )
+            self._handle_failed_request(request_id)
 
         return self.requests[request_id].future
 
@@ -1616,14 +1644,14 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
 
-        # Failed requests.
+        # Failed requests. Status and events were already set in _handle_failed_request;
+        # here we just clean up the entry and include it in finished_request_records.
         for failed_request_id in self.failed_request_ids:
             failed_entry = self.requests.pop(failed_request_id)
-            failed_request = failed_entry.record[-1]
-            failed_request.status = Status.FAILED
-            failed_request.add_event_fail()
             finished_request_records.append(failed_entry.record)
-            failed_entry.future.set_result(failed_entry.record)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
         range_pop()
 
@@ -1644,17 +1672,20 @@ class DynamicInferenceEngine(AbstractEngine):
             range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
-        if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
-            range_push("coordinator_communication")
-            payload = msgpack.packb(
-                [
-                    Headers.ENGINE_REPLY.value,
-                    [r.merge().serialize() for r in finished_request_records],
-                ],
-                use_bin_type=True,
-            )
-            self.socket_for_receiving_requests.send(payload)
-            range_pop()
+        # Failed request replies were already sent in _handle_failed_request,
+        # so only send completed records here.
+        if self.use_coordinator and self.is_mp_coordinator:
+            records_to_send = [
+                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+            ]
+            if records_to_send:
+                range_push("coordinator_communication")
+                payload = msgpack.packb(
+                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                    use_bin_type=True,
+                )
+                self.socket_for_receiving_requests.send(payload)
+                range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
