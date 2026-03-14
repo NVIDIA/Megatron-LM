@@ -3151,7 +3151,7 @@ def _add_experimental_args(parser):
     group.add_argument('--megatron-fsdp-main-grads-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16'],
                        help="Data type for the main gradient buffer utilized for distributed optimization "
                             "with Megatron-FSDP.")
-    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='fp32', choices=['fp32', 'fp16', 'bf16'],
+    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='bf16', choices=['fp32', 'fp16', 'bf16'],
                         help="When using Megatron-FSDP, this controls the data-type used when communicating "
                              "model gradients during FSDP.")
     
