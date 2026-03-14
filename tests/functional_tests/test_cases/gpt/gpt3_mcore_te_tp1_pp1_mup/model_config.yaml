@@ -54,4 +54,5 @@ MODEL_ARGS:
   # MuP (Maximal Update Parameterization) args
   --use-mup: true
   --mup-base-hidden-size: 256
+  --async-save: true
 TEST_TYPE: regular
