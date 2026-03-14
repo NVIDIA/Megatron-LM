@@ -715,7 +715,7 @@ class TestRLUtils:
         """
 
         world_size, dp, tp, pp = initialize_model_parallel
-        micro_batch_size = 2
+        micro_batch_size = 1
         self.create_test_args(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
