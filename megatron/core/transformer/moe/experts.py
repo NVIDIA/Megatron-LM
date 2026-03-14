@@ -59,6 +59,20 @@ try:
 except ImportError:
     HAVE_FLASHINFER = False
 
+try:
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        grouped_gemm_batch_invariant,
+        is_batch_invariant_mode_enabled,
+    )
+
+    HAVE_BATCH_INVARIANT = True
+except ImportError:
+    HAVE_BATCH_INVARIANT = False
+
+    def is_batch_invariant_mode_enabled():
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -621,6 +635,67 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         return fc2_output, None
 
+    def _triton_batch_invariant_forward(
+        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+    ):
+        """Batch-invariant grouped GEMM forward using Triton kernel.
+
+        Provides deterministic results regardless of batch composition by using
+        a pre-scheduled tile assignment that is independent of dynamic batching.
+        """
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        if not tokens_per_expert.is_cuda:
+            tokens_per_expert = tokens_per_expert.to(permuted_local_hidden_states.device)
+
+        if self.config.moe_apply_probs_on_input:
+            assert (
+                self.config.moe_router_topk == 1
+            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            original_dtype = permuted_local_hidden_states.dtype
+            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+            permuted_probs = torch.ones_like(permuted_probs)
+
+        if permuted_local_hidden_states.nelement() != 0:
+            batch_sizes = tokens_per_expert.to(torch.int64)
+
+            # fc1: _fc1_weight is [E, out_features, in_features] (TE layout [N, K])
+            # Use trans_b=True since weights are [E, N, K]
+            total_tokens = permuted_local_hidden_states.size(0)
+            fc1_out_features = self._fc1_weight.size(1)
+            fc1_output = torch.empty(
+                total_tokens,
+                fc1_out_features,
+                device=permuted_local_hidden_states.device,
+                dtype=permuted_local_hidden_states.dtype,
+            )
+            grouped_gemm_batch_invariant(
+                permuted_local_hidden_states,
+                self._fc1_weight,
+                fc1_output,
+                batch_sizes,
+                trans_b=True,
+            )
+
+            # Activation with routing probabilities
+            bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
+
+            # fc2: _fc2_weight is [E, out_features, in_features] (TE layout [N, K])
+            fc2_out_features = self._fc2_weight.size(1)
+            fc2_output = torch.empty(
+                total_tokens,
+                fc2_out_features,
+                device=bias_act_output.device,
+                dtype=bias_act_output.dtype,
+            )
+            grouped_gemm_batch_invariant(
+                bias_act_output, self._fc2_weight, fc2_output, batch_sizes, trans_b=True
+            )
+        else:
+            fc2_output = permuted_local_hidden_states
+
+        return fc2_output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -628,12 +703,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward pass with four modes:
 
         - Training: delegates to parent TEGroupedMLP.
         - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
           is not used in this path; the FlashInfer kernel operates directly on
           routing_map.
+        - Inference + batch invariant: Triton grouped GEMM with deterministic
+          tile scheduling for bitwise-reproducible results.
         - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets.
 
         Args:
@@ -654,6 +731,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ), "FlashInfer is not available; cannot use FlashInfer forward pass."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
+            )
+
+        elif is_batch_invariant_mode_enabled():
+            return self._triton_batch_invariant_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
 
         elif self._torch_grouped_mm_available:

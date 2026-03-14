@@ -20,6 +20,7 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "grouped_gemm_batch_invariant",
 ]
 
 
@@ -230,6 +231,209 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
         **configs[dtype],
+    )
+    return c
+
+
+@triton.jit
+def _grouped_gemm_batch_invariant_kernel(
+    # Pointers
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    batch_sizes_ptr,
+    a_offsets_ptr,
+    schedule_ptr,
+    # Dimensions
+    K,
+    N,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    stride_bias_e,
+    stride_bias_n,
+    # Meta
+    num_tiles,
+    # Constants
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Batch-invariant grouped GEMM Triton kernel.
+
+    Each tile is pre-assigned to an (expert, m-block, n-block) triple via a
+    CPU-built schedule tensor.  Persistent-style: program IDs stride over all
+    tiles so that a fixed number of SMs can service an arbitrary tile count.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_groups = tl.num_programs(axis=0)
+    idx = pid.to(tl.int64)
+
+    while idx < num_tiles:
+        # 1. Fetch schedule entry: (expert_idx, pid_m, pid_n)
+        sched_offset = idx * 3
+        expert_idx = tl.load(schedule_ptr + sched_offset).to(tl.int64)
+        pid_m = tl.load(schedule_ptr + sched_offset + 1).to(tl.int64)
+        pid_n = tl.load(schedule_ptr + sched_offset + 2).to(tl.int64)
+
+        current_expert_m = tl.load(batch_sizes_ptr + expert_idx)
+        global_m_start = tl.load(a_offsets_ptr + expert_idx)
+
+        # 2. Compute pointers
+        offs_am = (pid_m * BLOCK_M) + tl.arange(0, BLOCK_M)
+        offs_bn = (pid_n * BLOCK_N) + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (
+            (global_m_start + offs_am[:, None]) * stride_am + offs_k[None, :] * stride_ak
+        )
+        b_ptrs = b_ptr + (
+            expert_idx * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        )
+
+        # 3. Matmul accumulation loop
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            a_mask = (offs_am[:, None] < current_expert_m) & (offs_k[None, :] < (K - k * BLOCK_K))
+            b_mask = (offs_k[:, None] < (K - k * BLOCK_K)) & (offs_bn[None, :] < N)
+
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+            accumulator = tl.dot(a, b, accumulator)
+
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+
+        # 4. Optional bias addition (bias is [Experts, N])
+        if HAS_BIAS:
+            bias_offset = expert_idx * stride_bias_e + offs_bn * stride_bias_n
+            bias = tl.load(bias_ptr + bias_offset, mask=offs_bn < N, other=0.0).to(tl.float32)
+            accumulator += bias[None, :]
+
+        # 5. Store output
+        c_val = accumulator.to(c_ptr.dtype.element_ty)
+
+        offs_cm = (pid_m * BLOCK_M) + tl.arange(0, BLOCK_M)
+        offs_cn = (pid_n * BLOCK_N) + tl.arange(0, BLOCK_N)
+
+        c_ptrs = c_ptr + (
+            (global_m_start + offs_cm[:, None]) * stride_cm + offs_cn[None, :] * stride_cn
+        )
+        c_mask = (offs_cm[:, None] < current_expert_m) & (offs_cn[None, :] < N)
+
+        tl.store(c_ptrs, c_val, mask=c_mask)
+
+        idx += num_pid_groups
+
+
+def _build_grouped_gemm_schedule(batch_sizes_cpu, BLOCK_M, BLOCK_N, N, device):
+    """Build the (expert, m_block, n_block) tile schedule on CPU.
+
+    Returns:
+        schedule: int32 tensor of shape [num_tiles, 3] on ``device``.
+        num_tiles: total number of tiles.
+    """
+    m_blocks_per_expert = (batch_sizes_cpu + BLOCK_M - 1) // BLOCK_M
+    n_blocks = (N + BLOCK_N - 1) // BLOCK_N
+    num_experts = len(batch_sizes_cpu)
+
+    schedule_list = []
+    for e in range(num_experts):
+        m_blks = int(m_blocks_per_expert[e])
+        if m_blks > 0:
+            ms = torch.arange(m_blks, device='cpu')
+            ns = torch.arange(n_blocks, device='cpu')
+            grid_m, grid_n = torch.meshgrid(ms, ns, indexing='ij')
+            expert_col = torch.full_like(grid_m, e)
+            schedule_list.append(
+                torch.stack([expert_col.flatten(), grid_m.flatten(), grid_n.flatten()], dim=1)
+            )
+
+    if not schedule_list:
+        return None, 0
+
+    schedule = torch.cat(schedule_list, dim=0).to(device=device, dtype=torch.int32)
+    return schedule, schedule.size(0)
+
+
+def grouped_gemm_batch_invariant(a, b, c, batch_sizes, bias=None, trans_b=False):
+    """Launch the batch-invariant grouped GEMM Triton kernel.
+
+    Args:
+        a: Concatenated activations, shape ``[total_tokens, K]``.
+        b: Stacked expert weights.  ``[E, K, N]`` when *trans_b* is False,
+           ``[E, N, K]`` when *trans_b* is True.
+        c: Pre-allocated output tensor, shape ``[total_tokens, N]``.
+        batch_sizes: 1-D tensor of length ``E`` with token counts per expert.
+        bias: Optional bias of shape ``[E, N]``.
+        trans_b: If True, ``b`` is ``[E, N, K]`` (standard PyTorch Linear layout).
+    """
+    K = a.size(1)
+    if trans_b:
+        N = b.size(1)
+        stride_be, stride_bn, stride_bk = b.stride(0), b.stride(1), b.stride(2)
+    else:
+        N = b.size(2)
+        stride_be, stride_bn, stride_bk = b.stride(0), b.stride(2), b.stride(1)
+
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+
+    bs_cpu = batch_sizes.cpu()
+    schedule, num_tiles = _build_grouped_gemm_schedule(bs_cpu, BLOCK_M, BLOCK_N, N, a.device)
+    if schedule is None:
+        return c
+
+    num_experts = len(batch_sizes)
+    a_offsets = torch.zeros(num_experts, device=a.device, dtype=torch.int64)
+    if num_experts > 1:
+        a_offsets[1:] = torch.cumsum(batch_sizes[:-1], dim=0)
+
+    NUM_SMS = get_compute_units()
+    grid_size = min(NUM_SMS * 4, num_tiles)
+
+    stride_bias_e, stride_bias_n = (0, 0)
+    if bias is not None:
+        stride_bias_e, stride_bias_n = bias.stride(0), bias.stride(1)
+
+    _grouped_gemm_batch_invariant_kernel[(grid_size,)](
+        a,
+        b,
+        c,
+        bias,
+        batch_sizes,
+        a_offsets,
+        schedule,
+        K,
+        N,
+        a.stride(0),
+        a.stride(1),
+        stride_be,
+        stride_bn,
+        stride_bk,
+        c.stride(0),
+        c.stride(1),
+        stride_bias_e,
+        stride_bias_n,
+        num_tiles,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_SIZE_M=8,
+        NUM_SMS=NUM_SMS,
+        HAS_BIAS=(bias is not None),
+        num_warps=4,
+        num_stages=3,
     )
     return c
 
