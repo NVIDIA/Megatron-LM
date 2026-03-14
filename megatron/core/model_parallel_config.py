@@ -62,11 +62,11 @@ class ModelParallelConfig:
     each rank when using hybrid_context_parallel.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
     """
 
     expert_model_parallel_size: int = 1
