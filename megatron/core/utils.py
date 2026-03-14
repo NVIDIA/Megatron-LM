@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -110,6 +110,62 @@ def null_decorator(*args, **kwargs):
             return func
 
         return inner
+
+
+FP32MatmulPrecT = Literal["highest", "high", "medium"]
+
+
+@contextmanager
+def fp32_matmul_precision(precision: FP32MatmulPrecT = "highest") -> Generator[None, None, None]:
+    """Context manager for setting the precision of float32 matmuls.
+
+    This controls backend choices like TF32 vs full FP32 when the matmul inputs are FP32.
+
+    Args:
+        precision: Precision of matmuls (defaults to "highest")
+    """
+    if not (hasattr(torch, "get_float32_matmul_precision") and hasattr(torch, "set_float32_matmul_precision")):
+        # Older torch versions: no-op.
+        yield
+        return
+
+    prev_val = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev_val)
+
+
+def compute_output_logits_fp32(
+    hidden_states: torch.Tensor,
+    output_layer: Callable,
+    output_weight: Optional[torch.Tensor],
+    runtime_gather_output: Optional[bool],
+) -> torch.Tensor:
+    """Compute output projection logits in FP32.
+
+    This utility ensures both operands for the output projection matmul are FP32 and
+    returns FP32 logits.
+    """
+    hidden_states_fp32 = (
+        hidden_states if hidden_states.dtype == torch.float32 else hidden_states.float()
+    )
+
+    weight = output_weight
+    if weight is None and getattr(output_layer, "weight", None) is not None:
+        weight = output_layer.weight
+    if weight is not None and weight.dtype != torch.float32:
+        weight = weight.float()
+
+    with fp32_matmul_precision("highest"):
+        logits, _ = output_layer(
+            hidden_states_fp32,
+            weight=weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+
+    return logits if logits.dtype == torch.float32 else logits.float()
 
 
 class ExperimentalNotEnabledError(Exception):
