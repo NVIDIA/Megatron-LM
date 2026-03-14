@@ -990,6 +990,15 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    delay_offload_until_cuda_graph: bool = False
+    """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead."""
+
+    delta_offload_bytes_across_pp_ranks: int = 0
+    """Difference of offload bytes across PP ranks to balance the offload load."""
+
+    activation_offload_fraction: float = 1.0
+    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1413,6 +1422,24 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                offload_inside_moe = {"moe_act", "expert_fc1"} & set(self.offload_modules)
+                assert not offload_inside_moe, (
+                    f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
+                    f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
+                    f"so offloading activations inside it is redundant and will cause errors. "
+                    f"Either remove 'moe' from --recompute-modules or remove "
+                    f"{offload_inside_moe} from --offload-modules."
+                )
+            assert (
+                self.min_offloaded_tensor_size >= 0
+            ), "min_offloaded_tensor_size must be non-negative."
+            assert (
+                self.activation_offload_fraction >= 0 and self.activation_offload_fraction <= 1
+            ), "activation_offload_fraction must be in range [0, 1]."
+            assert (
+                self.delta_offload_bytes_across_pp_ranks >= 0
+            ), "delta_offload_bytes_across_pp_ranks must be non-negative."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2008,6 +2035,18 @@ class TransformerConfig(ModelParallelConfig):
                         ) or "moe" not in self.recompute_modules, (
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
+
+            if self.fine_grained_activation_offloading:
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "fine_grained_activation_offloading must be used with TE impl of cuda_graph."
+                assert (
+                    CudaGraphScope.moe not in self.cuda_graph_scope
+                ), "Token-drop MoE is temporarily not supported with activation offloading."
+                assert self.cuda_graph_warmup_steps > 0, (
+                    "cuda_graph_warmup_steps must be greater than 0 when enabling "
+                    "fine-grained activation offloading."
+                )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
