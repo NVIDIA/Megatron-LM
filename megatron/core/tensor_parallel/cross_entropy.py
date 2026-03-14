@@ -25,7 +25,10 @@ class VocabParallelCrossEntropy:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates logits_max."""
 
-        vocab_parallel_logits = vocab_parallel_logits.float()
+        if vocab_parallel_logits.dtype == torch.float32:
+            vocab_parallel_logits = vocab_parallel_logits.clone()
+        else:
+            vocab_parallel_logits = vocab_parallel_logits.float()
         # Maximum value along vocab dimension across all GPUs.
         logits_max = torch.max(vocab_parallel_logits, dim=-1)[0]
 
