@@ -458,6 +458,36 @@ class TestDistributedOptimizer:
 
         Utils.destroy_model_parallel()
 
+    def test_step_excluded_from_fs_model_space_state(self, tmp_path_dist_ckpt):
+        tp, pp, ep = 1, 2, 2
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            expert_model_parallel_size=ep,
+        )
+        initialize_fn = partial(initialize_real_model, is_moe=True)
+        model, optimizer = setup_moe_model_and_optimizer(
+            seed=2, tp=tp, pp=pp, ep=ep, initialize_fn=initialize_fn
+        )
+
+        metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
+        sharded_sd = optimizer.sharded_state_dict(
+            model[0].sharded_state_dict(), metadata=metadata
+        )
+
+        if isinstance(optimizer, ChainedOptimizer):
+            optim_sds = [sharded_sd[idx] for idx in sharded_sd if isinstance(idx, int)]
+        else:
+            optim_sds = [sharded_sd]
+
+        for optim_sd in optim_sds:
+            for param_idx, tensors in optim_sd['param_state'].items():
+                assert 'step' not in tensors, (
+                    f"'step' should be excluded from param_state (param_idx={param_idx})"
+                )
+
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
