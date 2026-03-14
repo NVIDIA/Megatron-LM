@@ -2999,7 +2999,14 @@ def _add_moe_args(parser):
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
-
+    group.add_argument('--moe-token-dispatcher-type', type=str,
+                       choices=['allgather', 'alltoall', 'flex'],
+                       default='allgather',
+                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+    group.add_argument('--moe-alltoall-comm-backend', type=str,
+                       choices=['nccl', 'ucc'],
+                       default='nccl',
+                       help='The communication backend to use for AlltoAll dispatcher. The default is "nccl". Options are "nccl" and "ucc". Only applicable when --moe-token-dispatcher-type is "alltoall".')
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
