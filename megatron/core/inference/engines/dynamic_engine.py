@@ -45,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -360,6 +361,32 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
+            # Pre-compile FlashInfer CUTLASS kernels before the warmup loop.
+            # JIT compilation can take several minutes on first run; doing it here
+            # prevents the warmup progress bar from appearing stuck at 0%.
+            # Only rank 0 compiles to avoid filelock contention across ranks;
+            # other ranks wait for the result via broadcast.
+            error_msg = None
+            if torch.distributed.get_rank() == 0:
+                try:
+                    prewarm_flashinfer_jit()
+                except Exception as e:
+                    error_msg = str(e)
+
+            # Broadcast success/failure to all ranks so they can fail together
+            # instead of hanging at a barrier.
+            result = torch.tensor(
+                [0 if error_msg is None else 1],
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.broadcast(result, src=0)
+            if result.item() == 1:
+                raise RuntimeError(
+                    f"FlashInfer CUTLASS kernel pre-compilation failed on rank 0"
+                    + (f": {error_msg}" if error_msg else "")
+                )
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
