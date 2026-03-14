@@ -85,6 +85,11 @@ try:
             # skip_prompt_log_probs=False ensures the engine computes logprobs for prompt tokens
             skip_prompt_log_probs = not (echo and return_log_probs)
 
+            # Parse stop sequences
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -93,6 +98,7 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                stop_words=stop,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -108,6 +114,7 @@ try:
                 top_n_logprobs=sampling_params.top_n_logprobs,
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                stop_words=sampling_params.stop_words,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
