@@ -113,5 +113,6 @@ if __name__ == "__main__":
 
     with open(args.path_to_sequences_per_dataset_json, "w") as f:
         json.dump(sequence_count_dict, f)
+        f.write("\n")  # End file in newline
 
     print(f"Done! Saving --path-to-sequences-per-dataset file to {args.path_to_sequences_per_dataset_json}")
