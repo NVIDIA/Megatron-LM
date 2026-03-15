@@ -124,14 +124,14 @@ class TestMatchGraphConfigWithEP:
     Uses the world group as the EP group (all 8 GPUs form one EP group).
     """
 
-    def setup_method(self, method):
+    def setup_class(cls):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=Utils.world_size,
         )
 
-    def teardown_method(self, method):
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     @staticmethod
@@ -370,3 +370,102 @@ class TestMatchGraphConfigWithEP:
         result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
         assert result is None, "All-reduce max from oversized rank should cause no match"
+
+
+class TestSpeculativeDecodingBatchDimensions:
+    """Tests for batch dimensions specifically handling speculative decoding."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=Utils.world_size,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _get_ep_group():
+        return ps.get_expert_model_parallel_group()
+
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 5])
+    def test_generate_graphs_with_speculative_tokens(self, num_speculative_tokens):
+        """Verify graph generation strictly adheres to the speculative token multiplier."""
+        graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=TP_SIZE,
+            num_cuda_graphs=4,
+            cuda_graph_max_tokens=MAX_REQUESTS * (num_speculative_tokens + 1),
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=MAX_REQUESTS,
+            max_tokens=MAX_TOKENS,
+            max_sequence_length=MAX_SEQ_LEN,
+            use_cuda_graphs_for_non_decode_steps=True,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+        # For pure decode graphs, token_count must exactly equal decode_req_count * (spec_tokens + 1)
+        decode_graphs = [g for g in graph_list if g.prefill_req_count == 0]
+        assert len(decode_graphs) > 0, "Should generate decode-only graphs"
+
+        for g in decode_graphs:
+            expected_tokens = g.decode_req_count * (num_speculative_tokens + 1)
+            assert g.token_count == expected_tokens, (
+                f"Mismatch in speculative token math: Expected {expected_tokens} tokens "
+                f"for {g.decode_req_count} requests with {num_speculative_tokens} spec tokens, got {g.token_count}."
+            )
+
+    def test_is_valid_with_speculative_tokens(self):
+        """Verify that validation correctly enforces speculative token budgets."""
+        num_speculative_tokens = 4
+        # 10 decode requests * (4 spec + 1 actual) = 50 tokens required.
+
+        # 49 tokens is not enough -> should be invalid
+        bd_invalid = BD(token_count=49, prefill_req_count=0, decode_req_count=10)
+        assert not bd_invalid.is_valid(
+            max_requests=MAX_REQUESTS,
+            max_sequence_length=MAX_SEQ_LEN,
+            num_speculative_tokens=num_speculative_tokens,
+        ), "Should reject batch dimension without enough tokens for speculative budget."
+
+        # Exactly 50 tokens -> should be valid
+        bd_valid = BD(token_count=50, prefill_req_count=0, decode_req_count=10)
+        assert bd_valid.is_valid(
+            max_requests=MAX_REQUESTS,
+            max_sequence_length=MAX_SEQ_LEN,
+            num_speculative_tokens=num_speculative_tokens,
+        ), "Should accept batch dimension with perfectly matched speculative budget."
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, -1])
+    def test_ep_sync_with_speculative_tokens(self, num_cuda_graphs):
+        """Verify matching and EP rank syncing scales correctly with speculative tokens."""
+        ep_group = self._get_ep_group()
+        num_speculative_tokens = 2
+
+        graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=TP_SIZE,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=MAX_REQUESTS * (num_speculative_tokens + 1),
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=MAX_REQUESTS,
+            max_tokens=MAX_TOKENS,
+            max_sequence_length=MAX_SEQ_LEN,
+            use_cuda_graphs_for_non_decode_steps=True,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+        rank = dist.get_rank()
+
+        # Each rank has a different number of decode requests.
+        decode_reqs = (rank + 1) * 2
+        token_count = decode_reqs * (num_speculative_tokens + 1)
+        real = BD(token_count=token_count, prefill_req_count=0, decode_req_count=decode_reqs)
+
+        result = _match(real, graph_list, ep_group=ep_group)
+
+        # All ranks should end up syncing to the maximum requirement and picking the same graph
+        _assert_consistent_across_ranks(result, ep_group)
+        if result is not None:
+            # Confirm the selected graph preserves the speculative token mathematical invariance
+            assert result.token_count == result.decode_req_count * (num_speculative_tokens + 1)
