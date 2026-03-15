@@ -140,6 +140,22 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
+def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+
+    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
+    Before applying the chat template, we must inline those tags back into content.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.pop("reasoning_content", None)
+        if reasoning_content is not None:
+            content = message.get("content") or ""
+            message["content"] = f"<think>{reasoning_content}</think>{content}"
+    return messages
+
+
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -228,6 +244,7 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -441,7 +458,7 @@ try:
             if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
-                message["reasoning"] = metadata["reasoning"]
+                message["reasoning_content"] = metadata["reasoning"]
 
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
