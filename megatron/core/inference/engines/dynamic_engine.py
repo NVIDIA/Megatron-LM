@@ -890,7 +890,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
-                self.controller.tokenize_prompt(stop_word, add_BOS=False)
+                TextGenerationController.tokenize_prompt(
+                    self.controller.tokenizer, stop_word, add_BOS=False
+                )
                 for stop_word in request.sampling_params.stop_words
             ]
             request.stop_word_ids = stop_word_ids
@@ -931,9 +933,13 @@ class DynamicInferenceEngine(AbstractEngine):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
             try:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
+                prompt_token_ids = TextGenerationController.tokenize_prompt(
+                    self.controller.tokenizer, prompt, sampling_params.add_BOS
+                )
             except TypeError:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt)
+                prompt_token_ids = TextGenerationController.tokenize_prompt(
+                    self.controller.tokenizer, prompt
+                )
             tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
             )
@@ -1635,18 +1641,14 @@ class DynamicInferenceEngine(AbstractEngine):
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
-                        request.prompt = self.controller.tokenizer.detokenize(
-                            request.prompt_tokens.tolist()
+                        request.prompt = TextGenerationController.detokenize(
+                            self.controller.tokenizer,
+                            request.prompt_tokens.tolist(),
+                            remove_EOD=False,
                         )
-                    generated_tokens = request.generated_tokens
-                    termination_id = request.sampling_params.termination_id
-                    while (
-                        generated_tokens
-                        and termination_id is not None
-                        and generated_tokens[-1] == termination_id
-                    ):
-                        generated_tokens = generated_tokens[:-1]
-                    request.generated_text = self.controller.tokenizer.detokenize(generated_tokens)
+                    request.generated_text = TextGenerationController.detokenize(
+                        self.controller.tokenizer, request.generated_tokens
+                    )
             range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.

@@ -598,7 +598,7 @@ class TestTextGenerationController:
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(
             [
                 ''.join(random.choices(string.ascii_letters, k=random.randint(1, len(prompt))))
                 for _ in range(len(x))
@@ -611,35 +611,73 @@ class TestTextGenerationController:
             random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
         ]
 
+        tokenizer = self.mock_tokenizer
+
         # Test on a tokenizer that does not add BOS by default
-        no_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert no_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        no_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert no_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert no_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        no_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert no_bos_to_no_bos[0] != tokenizer.bos
+        no_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert no_bos_to_yes_bos[0] == tokenizer.bos
+        assert no_bos_to_yes_bos[1] != tokenizer.bos
 
         # Force the first token to be BOS to emulate a tokenizer that does add BOS by default
-        self.mock_tokenizer.tokenize.return_value[0] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[0] = tokenizer.bos
 
-        yes_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert yes_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        yes_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert yes_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert yes_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        yes_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert yes_bos_to_no_bos[0] != tokenizer.bos
+        yes_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert yes_bos_to_yes_bos[0] == tokenizer.bos
+        assert yes_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test on an input that has had multiple BOS added
-        self.mock_tokenizer.tokenize.return_value[1] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[1] = tokenizer.bos
 
-        many_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert many_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        many_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert many_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert many_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        many_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert many_bos_to_no_bos[0] != tokenizer.bos
+        many_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert many_bos_to_yes_bos[0] == tokenizer.bos
+        assert many_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test the assert triggered when the tokenizer has no bos
-        self.mock_tokenizer.bos = None
+        tokenizer.bos = None
         with pytest.raises(AssertionError):
-            self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+            TextGenerationController.tokenize_prompt(tokenizer, prompt, add_BOS=True)
+
+    @pytest.mark.parametrize("remove_EOD", [True, False])
+    def test_remove_eod_token(self, remove_EOD):
+        self.setup_model(torch.float32)
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(f"T{t}" for t in x)
+
+        tokenizer = self.mock_tokenizer
+        eod = tokenizer.eod
+        detok = TextGenerationController.detokenize
+
+        # No trailing EOD.
+        assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+
+        # Single trailing EOD.
+        result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)
+        assert result == ("T1 T2" if remove_EOD else f"T1 T2 T{eod}")
+
+        # Multiple trailing EOD.
+        result = detok(tokenizer, [1, eod, eod, eod], remove_EOD=remove_EOD)
+        assert result == ("T1" if remove_EOD else f"T1 T{eod} T{eod} T{eod}")
 
     def test_zero_tokens_generated_batch_vs_single(self):
         """
