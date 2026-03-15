@@ -57,6 +57,10 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
+    get_packing_actual_tokens,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
+    get_packing_avg_seq_length,
     update_microbatch_calculator,
 )
 from megatron.rl.agent.api import (
@@ -300,11 +304,22 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Derived throughput metrics (set by training_log, read by RLProfiler)
+        self.tokens_per_sec = None
+        self.tokens_per_sec_per_gpu = None
+        self.actual_tokens_per_sec = None
+        self.actual_tokens_per_sec_per_gpu = None
+        self.packing_efficiency = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.tokens_per_sec = None
+        self.tokens_per_sec_per_gpu = None
+        self.actual_tokens_per_sec = None
+        self.actual_tokens_per_sec_per_gpu = None
+        self.packing_efficiency = None
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
