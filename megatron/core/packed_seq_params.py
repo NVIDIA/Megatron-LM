@@ -58,10 +58,16 @@ class PackedSeqParams:
         if self.seq_idx is not None:
             return  # Already set (e.g. CG dummy PSP with pre-allocated buffer)
 
-        cu_seqlens = (
-            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
-        )
+        cu_seqlens = self.cu_seqlens_q
         if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
+            # Skip seq_idx computation when cu_seqlens has been CG-padded.
+            # CG-padded cu_seqlens contain entries at the global seq_len
+            # (e.g. 262144) while total_tokens is CP-local (e.g. 8192).
+            # In CG mode, seq_idx is managed separately by mamba_layer.py's
+            # _te_cuda_graph_replay via shared CG buffers.
+            if cu_seqlens[-1] > self.total_tokens:
+                return  # CG-padded: skip, let mamba_layer handle seq_idx
+
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )

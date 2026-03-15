@@ -109,10 +109,9 @@ def get_batch(data_iterator, vp_stage=None):
         batch['max_seqlen_tensor'] = max_seqlen[0]
         batch['max_seqlen'] = int(max_seqlen[0].item())
 
-        # In CUDA graph mode, pad cu_seqlens to a fixed size so graph inputs
-        # have constant shape. Without padding, flash_attn_varlen processes only
-        # the actual sequences. With padding, the extra entries are zero-length.
-        # Set --cuda-graph-max-packed-seqs to your dataset max for best CG perf.
+        # CG padding BEFORE CP split: TE and Mamba expect the full (global)
+        # cu_seqlens. The __post_init__ in PackedSeqParams trims entries
+        # > total_tokens when computing seq_idx for the CP-local range.
         args = get_args()
         if getattr(args, 'cuda_graph_impl', 'none') != 'none':
             from megatron.core.packed_seq_params import CUDA_GRAPH_MAX_PACKED_SEQS
@@ -122,11 +121,8 @@ def get_batch(data_iterator, vp_stage=None):
             )
             target_len = max_packed_seqs + 1
             if cu_seqlens.shape[0] <= target_len:
-                # Batch fits in CG bucket -> pad to fixed size for graph replay.
                 cu_seqlens = PackedSeqParams.pad_cu_seqlens(cu_seqlens, target_len)
-            # else: N_docs exceeds CG bucket -> leave cu_seqlens unpadded.
-            # The layer-level fallback in _te_cuda_graph_replay will detect the
-            # size mismatch and route this batch through the non-CG forward path.
+
         batch['cu_seqlens'] = cu_seqlens
 
     if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
@@ -259,6 +255,7 @@ def forward_step(data_iterator, model: MambaModel):
         packed_seq_params = None
     else:
         total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
+
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
