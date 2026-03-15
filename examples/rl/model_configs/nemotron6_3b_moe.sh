@@ -85,7 +85,7 @@ MODEL_OPTIONS="\
   --rl-importance-sampling-truncation-coef 10.0 \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-requests $MAX_INFERENCE_BS \
+  --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --distributed-timeout-minutes 60 \
   --use-mcore-models \

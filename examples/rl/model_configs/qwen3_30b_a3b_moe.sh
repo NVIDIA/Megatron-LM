@@ -37,7 +37,7 @@ ENV_DEPENDENT="\
 MODEL_OPTIONS="
 --seq-length $MAX_SEQ_LENGTH \
 --inference-max-seq-length $MAX_SEQ_LENGTH \
---inference-max-requests $MAX_INFERENCE_BS \
+--inference-max-batch-size $MAX_INFERENCE_BS \
 --pretrained-checkpoint $CHECKPOINT \
 --no-use-tokenizer-model-from-checkpoint-args \
 --seq-length 8192 \

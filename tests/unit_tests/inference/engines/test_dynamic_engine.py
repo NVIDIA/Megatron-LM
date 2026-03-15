@@ -15,9 +15,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import (
-    InferenceConfig,
-    KVCacheManagementMode,
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import (
@@ -31,6 +29,9 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -49,7 +50,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.utils import (
+    get_mamba_inference_state_config_from_model,
+    is_fa_min_version,
+    is_te_min_version,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -241,28 +246,26 @@ class TestDynamicInferenceEngine:
 
         # Inference context.
         context = DynamicInferenceContext(
-            model_config=transformer_config,
-            inference_config=InferenceConfig(
-                max_sequence_length=test_config.max_sequence_length,
-                num_cuda_graphs=test_config.num_cuda_graphs,
-                use_cuda_graphs_for_non_decode_steps=True,
-                buffer_size_gb=test_config.context_buffer_size_gb,
-                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
-                block_size_tokens=test_config.context_block_size_tokens,
-                max_requests=test_config.context_max_requests,
-                max_tokens=test_config.context_max_tokens,
-                mamba_inference_state_config=mamba_inference_state_config,
-                materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
-                kv_cache_management_mode=KVCacheManagementMode(
-                    test_config.kv_cache_management_mode
-                ),
-                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
-                enable_chunked_prefill=test_config.enable_chunked_prefill,
-                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-                # this is for compatibility with the LTS environment
-                unified_memory_level=0,  # unit tests currently broken with UVM
-                track_generated_token_events=test_config.track_generated_token_events,
-            ),
+            params_dtype=transformer_config.params_dtype,
+            num_layers=transformer_config.num_layers
+            // transformer_config.pipeline_model_parallel_size,
+            kv_channels=transformer_config.kv_channels,
+            num_attention_heads=transformer_config.num_query_groups,
+            max_sequence_length=test_config.max_sequence_length,
+            num_cuda_graphs=test_config.num_cuda_graphs,
+            use_cuda_graphs_for_non_decode_steps=True,
+            buffer_size_gb=test_config.context_buffer_size_gb,
+            paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+            block_size_tokens=test_config.context_block_size_tokens,
+            max_requests=test_config.context_max_requests,
+            max_tokens=test_config.context_max_tokens,
+            tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
+            mamba_inference_state_config=mamba_inference_state_config,
+            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            # this is for compatibility with the LTS environment
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
         return context
@@ -402,7 +405,17 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
+
+        # Inference config.
+        inference_config = InferenceWrapperConfig(
+            hidden_size=transformer_config.hidden_size,
+            inference_batch_times_seqlen_threshold=400,
+            fp32_residual_connection=False,
+            params_dtype=transformer_config.params_dtype,
+            fp8=transformer_config.fp8,
+            padded_vocab_size=test_config.vocab_size,
+        )
 
         # Inference context.
         inference_context = cls._build_inference_context(
@@ -413,7 +426,7 @@ class TestDynamicInferenceEngine:
         )
 
         # Inference model wrapper.
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+        inference_wrapped_model = GPTInferenceWrapper(model, inference_config, inference_context)
 
         # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -434,7 +447,13 @@ class TestDynamicInferenceEngine:
         CudaGraphManager.global_mempool = None
 
         # Inference engine.
-        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
+        engine = DynamicInferenceEngine(
+            text_generation_controller,
+            inference_context,
+            random_seed=test_config.random_seed,
+            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
+            enable_chunked_prefill=test_config.enable_chunked_prefill,
+        )
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)

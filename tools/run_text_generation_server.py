@@ -22,6 +22,9 @@ from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -60,15 +63,27 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
+    inference_wrapper_config = InferenceWrapperConfig(
+        hidden_size=args.hidden_size,
+        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+        fp32_residual_connection=args.fp32_residual_connection,
+        params_dtype=args.params_dtype,
+        padded_vocab_size=args.padded_vocab_size,
+        inference_max_seq_length=args.inference_max_seq_length,
+        inference_max_requests=args.inference_max_batch_size,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
+    )
+    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
     inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_context
+        model, inference_wrapper_config, inference_context
     )
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
     return StaticInferenceEngine(
         text_generation_controller=text_generation_controller,
+        max_batch_size=args.inference_max_batch_size,
     )
 
 
@@ -150,6 +165,14 @@ def main(model_type: str = "gpt"):
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
     model.eval()
+
+    if args.max_batch_size is not None:
+        assert args.inference_max_batch_size is not None
+        args.inference_max_batch_size = max(args.inference_max_batch_size, args.max_batch_size)
+        warnings.warn(
+            "`--max-batch-size` has been deprecated in favor of `--inference-max-requests`, "
+            f"setting maximum batch size to {args.inference_max_batch_size}"
+        )
 
     inference_engine = get_inference_engine(args, model)
 

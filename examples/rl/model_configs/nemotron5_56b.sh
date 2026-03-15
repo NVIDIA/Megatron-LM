@@ -58,7 +58,7 @@ MODEL_OPTIONS="\
   --calculate-per-token-loss \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-requests $MAX_INFERENCE_BS \
+  --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
  --fp8-format hybrid \
     --fp8-amax-history-len 1 \
