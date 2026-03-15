@@ -708,6 +708,16 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
+
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+                req = self.get_request(req_id)
+                if req.finished_chunk_token_count > 0:
+                    req.remaining_prompt_tokens = req.prompt_tokens
+                    req.finished_chunk_token_count = 0
+
+            # Reset the chunked prefill request id
+            self.chunked_prefill_request_id = -1
         else:
             recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
@@ -753,6 +763,13 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -1140,48 +1157,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
-                if (
-                    request_id == self.context.chunked_prefill_request_id
-                    and self.materialize_only_last_token_logits
-                ):
-                    request.prompt_log_probs = []
-                    request.generated_log_probs = []
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    # We only want decode log probs.
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
                 else:
+                    # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
                     total_accumulated = len(request.prompt_log_probs) + len(
                         request.generated_log_probs
                     )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
 
-                    # Handle skip_prompt_log_probs during prefill
-                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token).
-                    # With speculative decoding, decode steps also produce multiple log probs
-                    # (one per accepted token + new sample), so we must check that this is
-                    # actually a prefill step (no generated log probs accumulated yet).
-                    is_prefill_log_probs = len(request.generated_log_probs) == 0
-                    if (
-                        request.sampling_params.skip_prompt_log_probs
-                        and len(request_log_probs) > 1
-                        and is_prefill_log_probs
-                    ):
-                        # Only append the last log prob (first generated token) to generated_log_probs
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        # Vectorized approach: calculate split point and use list slicing
-                        if not request.sampling_params.skip_prompt_log_probs:
-                            # Calculate how many log probs go to prompt vs generated
-                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                            # Batch extend instead of individual appends
-                            if split_idx > 0:
-                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                            if split_idx < len(request_log_probs):
-                                request.generated_log_probs.extend(request_log_probs[split_idx:])
-                        else:
-                            # All log probs go to generated
-                            request.generated_log_probs.extend(request_log_probs)
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1464,12 +1463,19 @@ class DynamicInferenceEngine(AbstractEngine):
                                 pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
 
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
-                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
-                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce
+                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
+                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
+                    # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - chunk_length == 1 and chunk_length > 1:
-                        chunk_length -= 1
+                    if remaining_len - chunk_length == 1:
+                        if chunk_length > 1:
+                            chunk_length -= 1
+                        else:
+                            # We only have space for 1 token, but remaining is 2.
+                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
+                            can_schedule = False
+                            break
 
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
@@ -1649,7 +1655,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)

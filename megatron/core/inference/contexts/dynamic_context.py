@@ -1836,7 +1836,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
-
         # If tensor state is deallocated, do not add request.
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
@@ -1844,9 +1843,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Chunk length.
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
-
-        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
-        is_chunked_prefill = req.finished_chunk_token_count > 0
 
         assert chunk_length > 0, "Chunk length is 0"
         assert (
@@ -1885,19 +1881,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_allocator.update_timestamps(matched_tensor)
 
-        # when a request already starts chunked prefill, it is exactly the last request in the current system
-        # (see dynamic_engine.py, schedule_chunked_prefill invariants)
-        # no need to update count, as it is already here
-        if is_chunked_prefill:
-            current_id = self.total_request_count - 1
-            # Overwrite the last token, which is the useless token from chunked prefill
-            chunked_prefill_offset = 1 + self.num_speculative_tokens
-            self.active_token_count -= chunked_prefill_offset
-            assert (
-                self.request_ids[current_id] == req.request_id
-            ), "Continuation current_id mismatch"
-        else:
-            current_id = self.total_request_count
+        # Note that we decremented the total_request_count for the chunked prefill request
+        # in update_requests, so setting current_id to the total_request_count will again
+        # make the last request the continuing chunked prefill request if one exists.
+        current_id = self.total_request_count
 
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
@@ -2002,7 +1989,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Range 2: newly allocated (non-matched) blocks that are now complete
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
-        if self.is_hybrid_model and not is_chunked_prefill:
+        if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
@@ -2015,7 +2002,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_token_count += effective_chunk_length
         self.lifetime_prefill_token_count += effective_chunk_length
-        self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
+        self.total_request_count += 1
         self.num_prefill_requests += 1
 
     def _move_book_keeping_tensors(
@@ -2048,7 +2035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
     def _swap_book_keeping_tensors(
-        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+        self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
     ):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
@@ -2058,11 +2045,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
-        tensor_swap(next_tokens, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+
+        if next_tokens is not None:
+            tensor_swap(next_tokens, src_idxs, dst_idxs)
 
         if new_speculative_tokens is not None:
             # new_speculative_tokens has request dimension as second dimension,
@@ -2075,13 +2064,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
-    def get_index_of_chunked_prefill_request(self) -> int:
-        """Get the index of the chunked prefill request in the context.
+    def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
+        """
+        Get the index of the chunked prefill request in the context.
+
+        If `safe` is True, then clamp the search space to the current total request count.
+        Otherwise, expand the search beyond the current total request count.
 
         Return:
             (int) Index of the chunked prefill request, or -1 if none exists.
         """
-        return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+        if self.chunked_prefill_request_id == -1:
+            return -1
+
+        request_ids = self.request_ids
+        if safe:
+            request_ids = request_ids[: self.total_request_count]
+
+        matches = torch.where(request_ids == self.chunked_prefill_request_id)[0]
+        if len(matches) > 0:
+            return matches[0].item()
+        return -1
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
@@ -2357,20 +2360,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
-
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
-        # All request that were in prefill become decode requests
-        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = (
-            0  # TODO : Check how this works with chunked prefill
-        )
-        if self.chunked_prefill_request_id != -1:
-            active_requests_mask[-1] = (
-                1  # must keep this, next iteration will add a new chunk to it
-            )
+        # All request that were in prefill become decode requests.
+        # For the chunked prefill request we will overwrite this the next time add_request
+        # is called on that request.
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
+
+        if (
+            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
+        ) != -1:
+            # Chunked prefill request was active this step.
+            # We must keep it active so that the next iteration will add a new chunk to it.
+            active_requests_mask[-1] = 1
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -2386,7 +2391,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = active_request_count + self.paused_request_count
 
         # 2. If no paused requests are present and no active requests we release memory and reset.
-        if active_request_count + self.paused_request_count == 0:
+        # Note that this requires no pending chunked prefill request
+        if (
+            active_request_count + self.paused_request_count == 0
+            and self.get_index_of_chunked_prefill_request(safe=False) == -1
+        ):
             if finished_request_count > 0:
                 finished_idxs = (
                     torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
@@ -2462,10 +2471,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
 
-            if self.chunked_prefill_request_id != -1:
-                # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
+            # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
+            if (
+                chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
+            ) != -1:
                 active_requests_requiring_new_block[
-                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                    chunked_prefill_request_idx - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
             else:
                 max_allowed_active = min(
@@ -2552,17 +2563,48 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count, newly_paused_request_ids
         )
 
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+        assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
+            "active_request_count == %d with no hidden chunked prefill." % active_request_count
+        )
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([self.total_request_count - 1]),
-                next_tokens=next_tokens,
-                new_speculative_tokens=new_speculative_tokens,
-            )
+        if (
+            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=False)
+        ) != -1:
+            if chunked_prefill_request_idx < self.total_request_count:
+                # Chunked prefill request was active this step.
+                # Swap to the end of active, then hide it out of bounds.
+                self._swap_book_keeping_tensors(
+                    src_idxs=torch.tensor(
+                        [chunked_prefill_request_idx], device=self.request_ids.device
+                    ),
+                    dst_idxs=torch.tensor(
+                        [self.total_request_count - 1], device=self.request_ids.device
+                    ),
+                    next_tokens=next_tokens,
+                    new_speculative_tokens=new_speculative_tokens,
+                )
+
+                # Explicitly decrement the active and total request counts here so that the chunked
+                # prefill request metadata is not updated. This will all be restored when the next
+                # chunk is added through add_request.
+                active_request_count -= 1
+                self.total_request_count -= 1
+            else:
+                # Chunked prefill request was inactive/hidden this step.
+                # Pull it to the new boundary so it doesn't drift.
+                if chunked_prefill_request_idx != self.total_request_count:
+                    self._swap_book_keeping_tensors(
+                        src_idxs=torch.tensor(
+                            [chunked_prefill_request_idx], device=self.request_ids.device
+                        ),
+                        dst_idxs=torch.tensor(
+                            [self.total_request_count], device=self.request_ids.device
+                        ),
+                        next_tokens=None,  # Do not swap next_tokens as these indices are out of bounds
+                        new_speculative_tokens=None,
+                    )
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         assert self.total_request_count == active_request_count + self.paused_request_count

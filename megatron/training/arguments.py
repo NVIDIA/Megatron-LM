@@ -407,24 +407,7 @@ def validate_args(args, defaults={}):
                     )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
-        num_generated_samples_per_inference_iteration = (
-            args.grpo_samples_per_iteration * args.grpo_iterations)
 
-        # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
-        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
-            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
-
-        # For now only exit/checkpoint on iterations where we generate data. We don't currently
-        # have a way to checkpoint the generated data.
-        num_training_iterations_per_inference_iteration = (
-            num_generated_samples_per_inference_iteration // args.global_batch_size)
-        if args.exit_interval is not None:
-            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
-                f"exit_interval should be divisible by number of global batches per inference iteration."
-        if args.save_interval is not None:
-            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
-                f"save_interval should be divisible by number of global batches per inference iteration."
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
@@ -540,6 +523,26 @@ def validate_args(args, defaults={}):
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
+
+    if args.perform_rl_step:
+        num_generated_samples_per_inference_iteration = (
+            args.grpo_samples_per_iteration * args.grpo_iterations)
+
+        # Ensure that the number of prompts we collect is a multiple of the global batch size.
+        # TODO: Make this account for batch size rampup?
+        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
+            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
+
+        # For now only exit/checkpoint on iterations where we generate data. We don't currently
+        # have a way to checkpoint the generated data.
+        num_training_iterations_per_inference_iteration = (
+            num_generated_samples_per_inference_iteration // args.global_batch_size)
+        if args.exit_interval is not None:
+            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"exit_interval should be divisible by number of global batches per inference iteration."
+        if args.save_interval is not None:
+            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"save_interval should be divisible by number of global batches per inference iteration."
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
@@ -988,7 +991,8 @@ def validate_args(args, defaults={}):
     args.variable_seq_lengths = False
 
     # Iteration-based training.
-    if args.train_iters:
+    # Skip these checks when skip_train is set: LR config is irrelevant.
+    if args.train_iters and not args.skip_train:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
         assert args.train_samples is None, \
@@ -1004,7 +1008,7 @@ def validate_args(args, defaults={}):
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
 
     # Sample-based training.
-    if args.train_samples:
+    if args.train_samples and not args.skip_train:
         # If we use sample-based training, make sure the
         # iteration-based options are off.
         assert args.train_iters is None, \
@@ -1411,9 +1415,15 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    if args.skip_train and not args.no_load_optim:
+    # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
+    # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
+    if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
+    if args.skip_train and args.perform_rl_step and args.no_load_optim and args.rl_offload_optimizer_during_inference:
+        assert False, \
+            '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
+            '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
     # Muon optimizer check
     if 'muon' in args.optimizer:
