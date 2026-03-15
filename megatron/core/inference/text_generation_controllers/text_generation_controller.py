@@ -1586,7 +1586,7 @@ class TextGenerationController:
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
-        on ranks that do not have any real requests."""
+        on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
@@ -1631,6 +1631,7 @@ class TextGenerationController:
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
+    @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
         """Run dummy MTP forward passes to participate in EP collectives.
 
