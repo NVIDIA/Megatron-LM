@@ -195,16 +195,16 @@ def _unpermute_tokens_kernel(
     expert_out_ptr, probs_ptr, src_idx_ptr, output_ptr,
     hidden_dim, BLOCK_H: tl.constexpr,
 ):
-    """Accumulate weighted expert outputs back to original token positions."""
+    """Accumulate weighted expert outputs back to original token positions in fp32."""
     row = tl.program_id(0)
     tok = tl.load(src_idx_ptr + row)
     if tok < 0:
         return
-    prob = tl.load(probs_ptr + row)
+    prob = tl.load(probs_ptr + row)  # fp32
     for h in tl.range(0, hidden_dim, BLOCK_H):
         o = h + tl.arange(0, BLOCK_H)
         m = o < hidden_dim
-        v = tl.load(expert_out_ptr + row * hidden_dim + o, mask=m)
+        v = tl.load(expert_out_ptr + row * hidden_dim + o, mask=m).to(tl.float32)
         tl.atomic_add(output_ptr + tok * hidden_dim + o, v * prob, mask=m)
 
 
@@ -212,9 +212,16 @@ def unpermute_tokens(
     expert_output: torch.Tensor, permuted_probs: torch.Tensor,
     permutation_map: torch.Tensor, num_tokens: int,
 ) -> torch.Tensor:
-    """Unpermute expert outputs back to original token order."""
+    """Unpermute expert outputs back to original token order.
+
+    Accumulates in fp32 to avoid precision loss from multiple topk atomic adds.
+    Returns fp32 output.
+    """
+    assert permuted_probs.dtype == torch.float32, (
+        f"permuted_probs must be fp32, got {permuted_probs.dtype}"
+    )
     output_size, hidden_dim = expert_output.shape
-    output = torch.zeros(num_tokens, hidden_dim, dtype=expert_output.dtype, device=expert_output.device)
+    output = torch.zeros(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     _unpermute_tokens_kernel[(output_size,)](
         expert_output, permuted_probs, permutation_map,

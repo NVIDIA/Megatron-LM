@@ -1170,12 +1170,13 @@ class TransformerConfig(ModelParallelConfig):
                     "Inference-optimized MoE layers do not support padded "
                     "routing map for quantization."
                 )
+            if self.moe_router_dtype != "fp32":
+                raise ValueError(
+                    "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
+                    "to avoid costly dtype conversions during decode."
+                )
             if self.inference_grouped_gemm_backend == 'auto':
-                if self.moe_router_dtype != "fp32":
-                    raise ValueError(
-                        "inference_grouped_gemm_backend='auto' requires --moe-router-dtype=fp32 "
-                        "to avoid costly dtype conversions during decode."
-                    )
+               
                 if self.gated_linear_unit and self.cuda_graph_impl == "local":
                     raise ValueError(
                         "inference_grouped_gemm_backend='auto' does not yet support CUDA graphs "
