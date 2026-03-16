@@ -287,6 +287,7 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.fsdp_post_backward_gradient_hooks = None
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -336,6 +337,32 @@ class TransformerLayerNode(ScheduleNode):
                 module.backward_dw()
             torch.cuda.nvtx.range_pop()
 
+        # Setup delayed wgrad for Megatron FSDP by collecting gradient acc
+        # hooks if there is `.grad` attribute attached to param.
+        if self.fsdp_post_backward_gradient_hooks is None:
+            self.fsdp_post_backward_gradient_hooks = []
+            for module in self.bwd_dw_callables:
+                for param in module.parameters():
+                    # Collect hook only if the gradient is generated in current
+                    # TransformerLayerNode, because the fsdp_grad_acc hook needs
+                    # to be executed right after `backward_dw` finishes.
+                    # For example: Shared expert's hook should be collected in
+                    # `attn` Node, even if the param belongs to `mlp` Node.
+                    if (
+                        getattr(param, "post_wgrad_grad_acc_hook", False)
+                        and param.requires_grad
+                        and param.grad is not None
+                    ):
+                        self.fsdp_post_backward_gradient_hooks.append(
+                            param.post_wgrad_grad_acc_hook
+                        )
+
+        # Execute gradient accumulation hooks for Megatron FSDP.
+        if self.fsdp_post_backward_gradient_hooks:
+            with torch.cuda.stream(self.stream):
+                for hook in self.fsdp_post_backward_gradient_hooks:
+                    hook()
+
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
         if self.manual_release_grads:
@@ -377,10 +404,13 @@ class _BackwardDWWrapper:
         self.layer = layer
         self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
+        self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
             )
+            if layer.mlp.use_shared_expert:
+                self.submodules.append(layer.mlp.shared_experts)
         else:
             self.shared_expert_dw_callable = None
         self.cuda_graph_scope = layer.config.cuda_graph_scope
@@ -401,6 +431,11 @@ class _BackwardDWWrapper:
     def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
         """Store the CUDA graphed backward weight gradient callable."""
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
+
+    def parameters(self):
+        for module in self.submodules:
+            for param in module.parameters():
+                yield param
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
