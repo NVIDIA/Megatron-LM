@@ -98,14 +98,18 @@ def _mxfp8_quant_swizzle_kernel(
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
-    # Compute swizzled offsets for each scale element
-    # divide scales into 128x4 macro tiles
-    # then flatten each tile.
+    # Compute swizzled offsets for each scale element.
+    #
+    # The scale matrix [M, K//32] is divided into 128×4 macro-tiles.
+    # Within each tile, rows are split into 4 groups of 32 (group = local_row // 32).
+    # Rather than flattening row-major, the layout interleaves groups so that
+    # rows 32 apart are adjacent in memory:
+    #
+    #   offset = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
     macro_row_block = row // 128
     macro_col_block = col_offs // 4
     local_row = row % 128
     local_col = col_offs % 4
-    # each group of 32 elements shares the same scale
     group = local_row // 32
     sub_row = local_row % 32
     tile_idx = macro_row_block * n_col_blocks + macro_col_block
