@@ -57,4 +57,5 @@ MODEL_ARGS:
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
+  --async-save: true
 TEST_TYPE: regular
