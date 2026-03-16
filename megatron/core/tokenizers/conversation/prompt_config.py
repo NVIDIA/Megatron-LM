@@ -3,10 +3,10 @@
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-
 # ---------------------------------------------------------------------------
 # Library-agnostic helpers for resolving token attributes
 # ---------------------------------------------------------------------------
+
 
 def _token_to_id(tokenizer, token: str) -> int:
     """Resolve a token string to its ID, working with any tokenizer library.
@@ -117,6 +117,7 @@ nemotron_aligned_custom_template = "{{- bos_token}}{% for message in messages %}
 # ---------------------------------------------------------------------------
 # Prompt format registry
 # ---------------------------------------------------------------------------
+
 
 def _build_sft_nemotron_nano_v2(tokenizer):
     return PromptConfig(

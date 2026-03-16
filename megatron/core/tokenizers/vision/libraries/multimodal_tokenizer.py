@@ -3,10 +3,7 @@
 from typing import Dict, List, Union
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
-from megatron.core.tokenizers.conversation import (
-    PROMPT_FORMAT_REGISTRY,
-    tokenize_conversation,
-)
+from megatron.core.tokenizers.conversation import PROMPT_FORMAT_REGISTRY, tokenize_conversation
 
 try:
     import transformers

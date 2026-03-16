@@ -69,12 +69,11 @@ def _build_library_kwargs(args):
 
     if lib in ('huggingface', 'megatron'):
         # Special case for BertWordPieceCase: add extra_id tokens.
-        if getattr(args, 'tokenizer_type', None) == 'BertWordPieceCase' or getattr(
-            args, 'tokenizer_model', None
-        ) == 'BertWordPieceCase':
-            build_kwargs['additional_special_tokens'] = [
-                f'<extra_id_{i}>' for i in range(100)
-            ]
+        if (
+            getattr(args, 'tokenizer_type', None) == 'BertWordPieceCase'
+            or getattr(args, 'tokenizer_model', None) == 'BertWordPieceCase'
+        ):
+            build_kwargs['additional_special_tokens'] = [f'<extra_id_{i}>' for i in range(100)]
         else:
             build_kwargs['additional_special_tokens'] = (
                 args.tokenizer_special_tokens if args.tokenizer_special_tokens else []

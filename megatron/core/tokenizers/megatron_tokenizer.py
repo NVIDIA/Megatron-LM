@@ -8,14 +8,7 @@ from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
-TEXT_LIBRARIES = [
-    "sentencepiece",
-    "huggingface",
-    "megatron",
-    "tiktoken",
-    "byte-level",
-    "null-text",
-]
+TEXT_LIBRARIES = ["sentencepiece", "huggingface", "megatron", "tiktoken", "byte-level", "null-text"]
 VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
 logger = logging.getLogger(__name__)
