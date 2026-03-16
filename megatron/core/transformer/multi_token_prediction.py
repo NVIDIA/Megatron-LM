@@ -749,6 +749,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
@@ -807,6 +808,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
+            tp_group=pg_collection.tp if pg_collection is not None else None,
         )
 
         # Build inner layers: two possible paths
@@ -838,6 +840,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
+                pg_collection=pg_collection,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -909,7 +912,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
         # the gradient in backward pass and was therefore incorrect in this context.
         # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        hidden_states = gather_from_tensor_model_parallel_region(
+            hidden_states, group=self.tp_group
+        )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states)

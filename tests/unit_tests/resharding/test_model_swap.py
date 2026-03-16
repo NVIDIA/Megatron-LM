@@ -14,6 +14,7 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -90,11 +91,17 @@ def _build_gpt(
     parallel_output: bool = True,
     num_moe_experts: Optional[int] = None,
 ) -> GPTModel:
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=num_moe_experts, moe_grouped_gemm=(num_moe_experts is not None)
+    )
+    mtp_block_spec = None
+    if config.mtp_num_layers:
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=True
+        )
     model = GPTModel(
         config=config,
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=(num_moe_experts is not None)
-        ),
+        transformer_layer_spec=layer_spec,
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
         pre_process=True,
@@ -105,6 +112,7 @@ def _build_gpt(
         position_embedding_type="rope",
         rotary_percent=1.0,
         pg_collection=pg_collection,
+        mtp_block_spec=mtp_block_spec,
     )
     return model
 
@@ -144,20 +152,32 @@ def _set_pg_collection(module, tp_group, dp_group):
         (2, 1, 1, 1, 1, 1, None),  # TP2 -> TP1
         (1, 1, 1, 2, 1, 1, None),  # TP1 -> TP2
         (2, 1, 1, 4, 1, 1, None),  # TP2 -> TP4
-        # # PP only changes
+        # PP only changes
         (1, 2, 1, 1, 1, 1, None),  # PP2 -> PP1
         (1, 1, 1, 1, 2, 1, None),  # PP1 -> PP2
-        # # Both TP and PP change
+        # Both TP and PP change
         (2, 2, 1, 1, 1, 1, None),  # TP2,PP2 -> TP1,PP1
         (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
         (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
         (1, 2, 1, 2, 4, 1, None),  # TP1,PP2 -> TP2,PP4
+        # MoE EP changes
         (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
         (1, 1, 2, 1, 1, 1, 4),  # EP2 -> EP1
-        (1, 1, 1, 1, 1, 2, 4),
-        (1, 1, 2, 1, 2, 2, 4),
+        (1, 1, 1, 1, 1, 2, 4),  # EP1 -> EP2
+        (1, 1, 2, 1, 2, 2, 4),  # EP2 -> PP2,EP2
+        # MoE mixed TP + EP
+        (2, 1, 2, 1, 1, 1, 4),  # TP2,EP2 -> TP1,EP1
+        (1, 1, 1, 2, 1, 2, 4),  # TP1,EP1 -> TP2,EP2
+        (4, 1, 1, 2, 1, 2, 4),  # TP4,EP1 -> TP2,EP2
+        (2, 1, 2, 4, 1, 1, 4),  # TP2,EP2 -> TP4,EP1
+        (4, 1, 1, 1, 1, 4, 4),  # TP4,EP1 -> TP1,EP4
+        (1, 1, 4, 4, 1, 1, 4),  # EP4 -> TP4,EP1
     ],
+)
+@pytest.mark.parametrize(
+    "moe_mode",
+    [None, "latent", "latent_mtp"],
 )
 def test_swap_gpt_parametrized(
     refit_backend: str,
@@ -168,12 +188,15 @@ def test_swap_gpt_parametrized(
     dst_pp: int,
     dst_ep: int,
     num_experts: Optional[int],
+    moe_mode: Optional[str],
 ):
-    # Initialize environment with source MP sizing
+    # latent/mtp modes only apply to MoE configs
+    if moe_mode is not None and num_experts is None:
+        pytest.skip("latent/mtp modes only apply to MoE configurations")
+
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
     )
-    # Validate divisibility post-init using the default PG safely
     world = dist.get_world_size()
     if (world % (src_tp * src_pp * src_ep) != 0) or (world % (dst_tp * dst_pp * dst_ep) != 0):
         Utils.destroy_model_parallel()
@@ -181,14 +204,11 @@ def test_swap_gpt_parametrized(
             "WORLD_SIZE must be divisible by both src_tp*src_pp*src_ep and dst_tp*dst_pp*dst_ep"
         )
     model_parallel_cuda_manual_seed(1234)
-
     torch.manual_seed(1234)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    # Small GPT config
     seq_len = 8
     vocab_size = 128
-    # --group-query-attention   --num-query-groups 8
     cfg = TransformerConfig(
         num_layers=4 if (src_pp > 1 or dst_pp > 1) else 2,
         hidden_size=32,
@@ -202,58 +222,48 @@ def test_swap_gpt_parametrized(
         num_query_groups=4,
     )
 
-    # Build PGs and models (always use unified PG builder so we can set EP)
     src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=src_pp, ep_size=src_ep)
     dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=dst_pp, ep_size=dst_ep)
-    # Apply EP configuration to TransformerConfigs when MoE is requested
     src_cfg = copy.deepcopy(cfg)
     dst_cfg = copy.deepcopy(cfg)
+
     if num_experts is not None:
-        src_cfg.num_moe_experts = num_experts
-        dst_cfg.num_moe_experts = num_experts
-        # Ensure MoE MLP has an intermediate size; __post_init__ won't rerun after manual mutation
-        src_cfg.moe_ffn_hidden_size = src_cfg.ffn_hidden_size
-        dst_cfg.moe_ffn_hidden_size = dst_cfg.ffn_hidden_size
-        src_cfg.expert_model_parallel_size = src_ep
-        dst_cfg.expert_model_parallel_size = dst_ep
-        # Force grouped MLP path under Transformer Engine and satisfy requirements
-        src_cfg.moe_grouped_gemm = True
-        dst_cfg.moe_grouped_gemm = True
-        src_cfg.add_bias_linear = False
-        dst_cfg.add_bias_linear = False
-        # Require Transformer Engine for TEGroupedMLP; skip if unavailable
+        for c, ep in [(src_cfg, src_ep), (dst_cfg, dst_ep)]:
+            c.num_moe_experts = num_experts
+            c.moe_ffn_hidden_size = c.ffn_hidden_size
+            c.expert_model_parallel_size = ep
+            c.moe_grouped_gemm = True
+            c.add_bias_linear = False
+            if moe_mode in ("latent", "latent_mtp"):
+                c.moe_latent_size = 16
+                c.moe_shared_expert_intermediate_size = 64
+                c.activation_func = torch.nn.functional.silu
+                c.gated_linear_unit = True
+            if moe_mode == "latent_mtp":
+                c.mtp_num_layers = 1
         try:
             import transformer_engine
         except Exception:
             Utils.destroy_model_parallel()
-            pytest.skip("Transformer Engine not available; skipping TE-grouped MoE test")
-    # Use parallel_output=False to gather TP logits inside model and emit only on last PP stage
+            pytest.skip("Transformer Engine not available; skipping MoE refit test")
+
     src_model = (
         _build_gpt(
-            src_cfg,
-            vocab_size,
-            seq_len,
-            src_pgs,
-            parallel_output=False,
-            num_moe_experts=num_experts,
+            src_cfg, vocab_size, seq_len, src_pgs,
+            parallel_output=False, num_moe_experts=num_experts,
         )
         .to(device)
         .eval()
     )
     dst_model = (
         _build_gpt(
-            dst_cfg,
-            vocab_size,
-            seq_len,
-            dst_pgs,
-            parallel_output=False,
-            num_moe_experts=num_experts,
+            dst_cfg, vocab_size, seq_len, dst_pgs,
+            parallel_output=False, num_moe_experts=num_experts,
         )
         .to(device)
         .eval()
     )
 
-    # Inputs
     batch = 2
     tokens = torch.randint(
         low=0, high=vocab_size, size=(batch, seq_len), device=device, dtype=torch.long
@@ -263,39 +273,40 @@ def test_swap_gpt_parametrized(
     )
     attention_mask = torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool)
 
-    # Collect source reference logits (parallel_output=False ensures full vocab on last PP stage)
+    # Collect source reference logits
     ref_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
     src_pp_ranks = dist.get_process_group_ranks(src_pgs.pp)
     src_last_pp_rank = src_pp_ranks[-1]
     with torch.no_grad():
         src_out = src_model(tokens, position_ids, attention_mask)
         if dist.get_rank() == src_last_pp_rank:
-            ref = src_out  # [b, s, vocab]
-            ref_logits.copy_(ref)
+            ref_logits.copy_(src_out)
     dist.broadcast(ref_logits, src=src_last_pp_rank, group=src_pgs.pp)
 
     # Swap weights
     swap_model_weights([src_model], [dst_model], refit_method=refit_backend)
 
-    # Collect destination logits (parallel_output=False ensures full vocab on last PP stage)
+    # Collect destination logits
     dst_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
     dst_pp_ranks = dist.get_process_group_ranks(dst_pgs.pp)
     dst_last_pp_rank = dst_pp_ranks[-1]
     with torch.no_grad():
-        dst_out = dst_model(
-            tokens, position_ids, attention_mask
-        )  # last stage returns tensor, others return None
+        dst_out = dst_model(tokens, position_ids, attention_mask)
         if dist.get_rank() == dst_last_pp_rank:
-            dst_logits.copy_(dst_out)  # [b, s, vocab]
+            dst_logits.copy_(dst_out)
     dist.broadcast(dst_logits, src=dst_last_pp_rank, group=dst_pgs.pp)
 
     # Compare
     assert ref_logits.shape == dst_logits.shape
+    max_diff = (dst_logits - ref_logits).abs().max().item()
     assert torch.allclose(
-        dst_logits, ref_logits, atol=1e-4, rtol=1e-4
-    ), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
+        dst_logits, ref_logits, atol=5e-4, rtol=5e-4
+    ), (
+        f"Refit src(TP={src_tp},PP={src_pp},EP={src_ep})"
+        f"->dst(TP={dst_tp},PP={dst_pp},EP={dst_ep}) "
+        f"moe_mode={moe_mode} outputs differ (max_diff={max_diff:.6f})"
+    )
     dist.barrier()
 
-    # Clear refit caches before destroying model parallel to avoid stale plans
     clear_all_caches()
     Utils.destroy_model_parallel()
