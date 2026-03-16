@@ -75,10 +75,6 @@ def _mxfp8_quant_swizzle_kernel(
                 ...
                 byte 15: row 96, col 3
 
-
-            Each 16-byte chunk (one sub_row) can be loaded in a single 128-bit
-            memory transaction, which is exactly what cuBLAS does.
-
         The formula to map logical (row, col) → byte offset:
             tile_idx = (row // 128) * n_col_blocks + (col // 4)
             sub_row  = row % 32
