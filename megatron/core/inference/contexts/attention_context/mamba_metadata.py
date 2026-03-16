@@ -180,7 +180,7 @@ class MambaMetadata:
                 # Normalize request IDs to 0-based relative to prefill requests
                 self._seq_idx_buffer[:, :seq_len].copy_(
                     token_to_request_idx[start_prefill_token_idx:end_prefill_token_idx]
-                    - prefill_start_req_idx
+                    - token_to_request_idx[start_prefill_token_idx]
                 )
 
             if padded_token_count > seq_len:

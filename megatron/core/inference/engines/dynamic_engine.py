@@ -736,6 +736,16 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
+
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+                req = self.get_request(req_id)
+                if req.finished_chunk_token_count > 0:
+                    req.remaining_prompt_tokens = req.prompt_tokens
+                    req.finished_chunk_token_count = 0
+
+            # Reset the chunked prefill request id
+            self.chunked_prefill_request_id = -1
         else:
             recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
@@ -781,6 +791,13 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -1050,15 +1067,6 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
 
-                # Track acceptance statistics for logging (decode requests only).
-                # Prefill requests don't propose speculative tokens, so including
-                # them would inflate the proposed count and deflate the rate.
-                # A request in its first generation step (empty generated_tokens)
-                # was in prefill this step.
-                if len(request.generated_tokens) > 0:
-                    self._spec_tokens_proposed += self.num_speculative_tokens
-                    self._spec_tokens_accepted += len(accepted_tokens)
-
                 # The order `accepted_tokens + tokens` is correct here.
                 # `accepted_tokens` contains the sequence of
                 # successfully verified draft tokens. `tokens` (from `sample`) is the
@@ -1128,6 +1136,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
                     request
                 )
+
+                # Track acceptance statistics for logging.
+                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                    self._spec_tokens_proposed += self.num_speculative_tokens - stop_word_hit
+                    self._spec_tokens_accepted += len(accepted_tokens) - stop_word_hit
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1514,12 +1527,19 @@ class DynamicInferenceEngine(AbstractEngine):
                                 pending_block_hashes.add(block_hash)
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
-                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
-                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce
+                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
+                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
+                    # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - prefill_chunk_length == 1 and prefill_chunk_length > 1:
-                        prefill_chunk_length -= 1
+                    if remaining_len - prefill_chunk_length == 1:
+                        if prefill_chunk_length > 1:
+                            prefill_chunk_length -= 1
+                        else:
+                            # We only have space for 1 token, but remaining is 2.
+                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
+                            can_schedule = False
+                            break
 
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
                     self._loop.call_soon_threadsafe(

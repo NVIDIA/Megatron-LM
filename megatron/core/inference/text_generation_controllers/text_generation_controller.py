@@ -580,10 +580,6 @@ class TextGenerationController:
             else:
                 set_decode_expert_padding(unwrapped_model, False)
 
-        # initialize symmetric memory if needed
-        if model_config.transformer_impl == "inference_optimized":
-            context.maybe_initialize_symmetric_memory()
-
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
@@ -839,10 +835,11 @@ class TextGenerationController:
 
         # Compute position IDs for the next tokens.
         # After rewind, request_kv_length_offsets has been adjusted. The actual
-        # KV cache length is: adjusted_offset + (1 + num_speculative_tokens).
+        # KV cache length is: adjusted_offset + processed_tokens.
         # The next position to predict starts at that cache length.
         adjusted_offsets = context.request_kv_length_offsets[active_slice]
-        base_position = adjusted_offsets + (1 + self.num_speculative_tokens)
+        processed_tokens = context.request_query_lengths[active_slice]
+        base_position = adjusted_offsets + processed_tokens
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -1595,11 +1592,6 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
-            # initialize symmetric memory if needed
-            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            model_config = get_model_config(unwrapped_model)
-            if model_config.transformer_impl == "inference_optimized":
-                context.maybe_initialize_symmetric_memory()
             self.inference_wrapped_model.dummy_forward()
 
             # Disable MoE padding for MTP computation
