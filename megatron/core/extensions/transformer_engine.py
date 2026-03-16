@@ -1510,9 +1510,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        # total_tokens, seq_idx, and max_seqlen tensors are only for Mamba / CUDA graph
+        # buffer management and should not be forwarded to TE attention.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("max_seqlen_q_tensor")
+        self.kept_packed_seq_params.discard("max_seqlen_kv_tensor")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later

@@ -82,6 +82,7 @@ def get_batch(data_iterator, vp_stage=None):
         'position_ids': None,
         'cu_seqlens': None,
         'max_seqlen': None,
+        'max_seqlen_tensor': None,
     }
 
     # TODO(duncan): Is there a more efficient way to access is_packed_sequence here?
@@ -102,12 +103,27 @@ def get_batch(data_iterator, vp_stage=None):
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
         cu_seqlens = cu_seqlens[0]
-        batch['cu_seqlens'] = cu_seqlens
 
         max_seqlen = batch['max_seqlen']
         assert max_seqlen.dim() == 1
-        # TODO(duncan): can this be kept as a 0-D tensor?
+        batch['max_seqlen_tensor'] = max_seqlen[0]
         batch['max_seqlen'] = int(max_seqlen[0].item())
+
+        # CG padding BEFORE CP split: TE and Mamba expect the full (global)
+        # cu_seqlens. The __post_init__ in PackedSeqParams trims entries
+        # > total_tokens when computing seq_idx for the CP-local range.
+        args = get_args()
+        if getattr(args, 'cuda_graph_impl', 'none') != 'none':
+            from megatron.core.packed_seq_params import CUDA_GRAPH_MAX_PACKED_SEQS
+
+            max_packed_seqs = (
+                getattr(args, 'cuda_graph_max_packed_seqs', None) or CUDA_GRAPH_MAX_PACKED_SEQS
+            )
+            target_len = max_packed_seqs + 1
+            if cu_seqlens.shape[0] <= target_len:
+                cu_seqlens = PackedSeqParams.pad_cu_seqlens(cu_seqlens, target_len)
+
+        batch['cu_seqlens'] = cu_seqlens
 
     if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
         total_tokens = batch['tokens'].size(1)
@@ -116,6 +132,7 @@ def get_batch(data_iterator, vp_stage=None):
     else:  # packed sequence
         empty_batch['cu_seqlens'] = cu_seqlens
         empty_batch['max_seqlen'] = max_seqlen
+        empty_batch['max_seqlen_tensor'] = batch.get('max_seqlen_tensor', None)
         return empty_batch.values()
 
     if cu_seqlens is None:
@@ -136,7 +153,7 @@ def get_batch(data_iterator, vp_stage=None):
                 cp_rank,
             )
             for key, data in batch.items():
-                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen', 'max_seqlen_tensor'}:
                     continue
                 if data is not None:
                     # On first PP rank, labels and loss_mask can be None.
@@ -231,12 +248,14 @@ def forward_step(data_iterator, model: MambaModel):
             position_ids,
             cu_seqlens,
             max_seqlen,
+            max_seqlen_tensor,
         ) = get_batch(data_iterator, vp_stage)
 
     if cu_seqlens is None:
         packed_seq_params = None
     else:
         total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
+
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
@@ -245,6 +264,8 @@ def forward_step(data_iterator, model: MambaModel):
             cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            max_seqlen_q_tensor=max_seqlen_tensor,
+            max_seqlen_kv_tensor=max_seqlen_tensor,
             total_tokens=total_tokens,
         )
 

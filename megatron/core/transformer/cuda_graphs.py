@@ -1986,8 +1986,15 @@ class TECudaGraphHelper:
                         sample_args_keys = tuple(
                             (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
                         )
+                        def _kwarg_key(k, v):
+                            # Dataclass kwargs (e.g. PackedSeqParams) don't have
+                            # .shape/.dtype/.layout -- key by type name instead.
+                            if is_dataclass(v) and not isinstance(v, type):
+                                return (k, type(v).__name__)
+                            return (k, v.shape, v.dtype, v.layout)
+
                         sample_kwargs_keys = tuple(
-                            (k, v.shape, v.dtype, v.layout)
+                            _kwarg_key(k, v)
                             for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
                         )
                         sample_keys = sample_args_keys + sample_kwargs_keys
