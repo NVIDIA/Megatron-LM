@@ -558,7 +558,8 @@ def test_separate_all_gather_group():
 
     # --- Path 2: explicit ProcessGroupCollection ---
     Utils.initialize_model_parallel(context_parallel_size=world_size)
-    dp_cp_ranks = ps.get_data_parallel_global_ranks(with_context_parallel=True)
+    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
     dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
 
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -584,8 +585,10 @@ def test_expert_all_gather_group():
     )
 
     # Get ranks for both regular and expert AG groups
-    dp_cp_ranks = ps.get_data_parallel_global_ranks(with_context_parallel=True)
-    expt_dp_ranks = ps.get_expert_data_parallel_global_ranks()
+    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+    expt_dp_group = ps.get_expert_data_parallel_group()
+    expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
 
     # Create AG groups for both regular and expert parameters
     dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
