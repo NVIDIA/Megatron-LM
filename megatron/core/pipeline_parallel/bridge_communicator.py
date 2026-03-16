@@ -46,11 +46,7 @@ class BridgeCommunicator:
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
-    # Class-level cache for broadcast process groups. When multiple bridges share
-    # the same rank sets (e.g., dual encoders on the same grid), PyTorch's
-    # new_subgroups_by_enumeration creates separate NCCL communicators for each call
-    # even with identical rank sets. This can cause NCCL initialization hangs.
-    # By caching PGs keyed on their rank sets, we reuse existing communicators.
+    # Cache broadcast PGs to avoid creating duplicate NCCL communicators for identical rank sets.
     _broadcast_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
 
     @classmethod
@@ -163,18 +159,7 @@ class BridgeCommunicator:
 
     @classmethod
     def _get_or_create_broadcast_pg(cls, ranks_list: List[List[int]]):
-        """Get a cached broadcast PG or create a new one.
-
-        Since new_subgroups_by_enumeration is a collective operation (all ranks must call it),
-        caching ensures that when multiple bridges share the same rank sets, they reuse the
-        same NCCL communicator instead of creating duplicates that can cause hangs.
-
-        Args:
-            ranks_list: List of rank groups to create subgroups for.
-
-        Returns:
-            The process group for the current rank's subgroup.
-        """
+        """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
         cache_key = str(sorted([tuple(r) for r in ranks_list]))
         if cache_key not in cls._broadcast_pg_cache:
             pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')

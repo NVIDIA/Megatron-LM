@@ -616,23 +616,8 @@ def forward_backward_no_pipelining(
         )
 
     elif pg_collection is not None:
-        assert hasattr(pg_collection, 'tp')
-        assert hasattr(pg_collection, 'cp')
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. If you are "
-            "using the default process group, please use `parallel_state.get_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group. "
-            "If you are using the default process group, "
-            "please use `parallel_state.get_position_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp')
-        assert hasattr(pg_collection, 'dp_cp')
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
 
     if isinstance(model, list):
         assert len(model) == 1, "non-pipeline-parallel schedule does not support model chunking"
@@ -944,23 +929,8 @@ def forward_backward_pipelining_with_interleaving(
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. If you are "
-            "using the default process group, please use `parallel_state.get_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group."
-            " If you are using the default process group, please use "
-            "`parallel_state.get_position_embedding_group()` "
-            "If you don't need pos_embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have a pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have a dp_cp_group"
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
         tp_group = pg_collection.tp
         cp_group = pg_collection.cp
         cp_size = cp_group.size()
@@ -2104,7 +2074,6 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     elif p2p_communicator is not None and pg_collection is not None:
-        # Custom process groups provided
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
 
         if is_multimodule:
@@ -2118,28 +2087,11 @@ def forward_backward_pipelining_without_interleaving(
             else:
                 # Encoder-only ranks should not use CP loss scaling.
                 cp_size = None
-            # tp_group and cp_group stay None (variable_seq_lengths mode)
 
         elif isinstance(pg_collection, ProcessGroupCollection):
             # Single-module: extract tp/cp groups and cp_size
-            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
-            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
-            assert hasattr(pg_collection, 'embd'), (
-                "pg_collection must have a embd. In previous version, it is used default "
-                "`parallel_state.default_embedding_ranks` to create the process group. "
-                " If you are using the default process group, please use "
-                " `parallel_state.get_embedding_group()` "
-                "If you don't need embd_group, you need to explicitly set it to None."
-            )
-            assert hasattr(pg_collection, 'pos_embd'), (
-                "pg_collection must have a pos_embd. In previous version, it is used default "
-                "`parallel_state.default_position_embedding_ranks` to create the process group. "
-                " If you are using the default process group, please use  "
-                " `parallel_state.get_position_embedding_group()` "
-                "If you don't need pos_embd_group, you need to explicitly set it to None."
-            )
-            assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
-            assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
+            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
             tp_group = pg_collection.tp
             cp_group = pg_collection.cp
             cp_size = cp_group.size()
