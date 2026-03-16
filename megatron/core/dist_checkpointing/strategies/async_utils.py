@@ -493,16 +493,21 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.debug(
-            f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
-        )
+        if torch.distributed.is_initialized():
+            logger.debug(
+                f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
+            )
         if self.process:
             if abort:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
-                )
+                if torch.distributed.is_initialized():
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
+                    )
+                else:
+                    logger.warning("Persistent worker aborted (rank unavailable)")
+
                 self.process.kill()
             else:
                 self._persistent_queue.put('DONE')
