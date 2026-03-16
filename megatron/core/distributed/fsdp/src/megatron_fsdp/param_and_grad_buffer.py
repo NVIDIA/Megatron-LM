@@ -1692,9 +1692,6 @@ class ParamAndGradBuffer:
             if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
                 # Expert-DP group when using EP
                 self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
-            if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP
-                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
             if (
                 self.dist_index.get_fsdp_group(
                     is_expert_parallel=False, independent_all_gather=True
@@ -1717,6 +1714,9 @@ class ParamAndGradBuffer:
                         is_expert_parallel=True, independent_all_gather=True
                     )
                 )
+            if self.dist_index.get_outer_fsdp_group() is not None:
+                # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
+                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
             log_single_rank(
                 logger,
