@@ -1070,10 +1070,9 @@ class TestTextGenerationController:
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
-        mtp_logits = torch.randn(2, 6, self.vocab_size, device='cuda')
 
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-            logits, mtp_logits, input_ids
+            logits, input_ids
         )
 
         # Verify acceptance counts
@@ -1188,8 +1187,6 @@ class TestTextGenerationController:
         # Create random logits
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
-        # MTP logits shape: [num_spec, 8, vocab_size]
-        mtp_logits = torch.randn(num_spec, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
         # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
@@ -1200,7 +1197,7 @@ class TestTextGenerationController:
 
         try:
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-                logits, mtp_logits, input_ids
+                logits, input_ids
             )
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
