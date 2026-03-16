@@ -29,12 +29,20 @@ try:
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
-    from emerging_optimizers.scalar_optimizers import Lion
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
+
+# TODO: Remove this separate try/except once the next version of emerging_optimizers
+# (which includes Lion) is released. Then Lion can be imported in the block above.
+try:
+    from emerging_optimizers.scalar_optimizers import Lion
+
+    HAVE_LION = True
+except ImportError:
+    HAVE_LION = False
 
 
 logger = logging.getLogger(__name__)
@@ -188,6 +196,11 @@ def get_megatron_muon_optimizer(
     config.optimizer = config.muon_scalar_optimizer
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
+    if config.muon_scalar_optimizer == 'lion':
+        assert HAVE_LION, (
+            "Lion optimizer requires a version of 'emerging_optimizers' that includes Lion. "
+            "Please upgrade to use --muon-scalar-optimizer lion."
+        )
 
     # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
     # In theory we can change DDP to enable use muon and dist-opt-adam together
