@@ -23,28 +23,20 @@ def _ceil_div(a, b):
 
 @triton.jit
 def _mxfp8_quant_swizzle_kernel(
-    out_ptr, scale_ptr, src_ptr,
-    K,
-    n_col_blocks,
-    REAL_GROUPS: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_GROUPS: tl.constexpr,
+    out_ptr,        # [M, K] output buffer for float8_e4m3fn quantized data
+    scale_ptr,      # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
+    src_ptr,        # [M, K] input tensor in bf16/fp16/fp32
+    K,              # number of columns in the input (must be divisible by 32)
+    n_col_blocks,   # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
+    REAL_GROUPS: tl.constexpr,   # actual number of scale groups per row (K // 32)
+    BLOCK_K: tl.constexpr,       # next_power_of_2(K) — padded column count for tl.reshape
+    BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
 ):
     """Quantize one row → FP8 e4m3, write scales directly in swizzled layout.
 
-    Grid: (M,) — one program per token/row.
+    Borrowed from the Triton upstream MXFP downcast kernel:
+    https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/numerics_details/mxfp_details/_downcast_to_mxfp.py
 
-    Swizzle layout (cuBLAS 2D blocked):
-      Each 128×4 macro tile is stored as 512 bytes.
-      For scale at (row, col):
-        macro_row_block = row // 128
-        macro_col_block = col // 4
-        local_row = row % 128
-        local_col = col % 4
-        group = local_row // 32
-        sub_row = local_row % 32
-        tile_idx = macro_row_block * n_col_blocks + macro_col_block
-        offset = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
     """
     row = tl.program_id(0)
     src_row = src_ptr + row * K
@@ -61,10 +53,17 @@ def _mxfp8_quant_swizzle_kernel(
     abs_grouped = tl.abs(x_grouped)
     max_vals = tl.max(abs_grouped, axis=1)
 
-    # Scale = 2^ceil(log2(max / 448.0))
+    # 448 is the max representable value in FP8 e4m3.
+    # dequant_scale = min scale s.t. max_val / scale <= 448.
     dequant_scale = max_vals / 448.0
+    # Round up to next power of 2 via integer bit manipulation:
+    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
+    # (exponent-only mask) bumps the exponent if any mantissa bits are set.
+    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
     dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
     dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
     quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
 
     # Quantize

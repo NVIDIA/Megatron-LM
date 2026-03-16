@@ -33,9 +33,6 @@ if not HAVE_TRITON:
 from megatron.core.inference.moe.permute import compute_expert_offsets
 
 
-# =========================================================================== #
-# Pad kernel
-# =========================================================================== #
 @triton.jit
 def _pad_tokens_kernel(
     src_ptr, dst_ptr, perm_map_ptr,
@@ -126,9 +123,6 @@ def pad_to_alignment(
     return padded_hidden, permutation_map, padded_inc
 
 
-# =========================================================================== #
-# Unpad kernel
-# =========================================================================== #
 @triton.jit
 def _unpad_tokens_kernel(
     src_ptr, dst_ptr, perm_map_ptr, probs_ptr,
