@@ -202,7 +202,7 @@ class TextGenerationController:
         Returns:
             str: The detokenized string.
         """
-        if remove_EOD:
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
             while tokens and tokens[-1] == tokenizer.eod:
                 tokens = tokens[:-1]
 
@@ -2469,7 +2469,7 @@ class TextGenerationController:
 
             return_segments = sampling_params.return_segments
             detokenize_streaming_text = not getattr(
-                sampling_params, "nodetokenize_streaming_text", False
+                sampling_params, "no_detokenize_streaming_text", False
             )
 
             generated_tokens = tokens[prompt_length : prompt_length + generated_length]
