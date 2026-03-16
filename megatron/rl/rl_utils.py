@@ -1549,9 +1549,7 @@ def prepare_data_for_update(
                 group_stats=group_stats,
                 current_iteration=args.curr_iteration,
                 tokenizer=tokenizer,
-                example_group=example_group,
-                wandb_writer=wandb_writer,
-                tb_writer=tb_writer,
+                example_groups=example_groups,
             )
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
