@@ -53,4 +53,5 @@ MODEL_ARGS:
   --account-for-loss-in-pipeline-split: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: regular
