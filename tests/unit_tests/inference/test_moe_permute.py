@@ -13,16 +13,6 @@ Tests cover:
 import pytest
 import torch
 
-# All tests require CUDA + Triton
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-    pytest.mark.internal,
-]
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────
 
 def _ref_tokens_per_expert(routing_map, local_expert_start, num_local_experts):
     """PyTorch reference for compute_local_tokens_per_expert."""
@@ -53,11 +43,7 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
     routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
     return hidden, probs, routing_map
 
-
-# ──────────────────────────────────────────────────────────────────────
-# compute_local_tokens_per_expert
-# ──────────────────────────────────────────────────────────────────────
-
+@pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 
     @pytest.mark.parametrize("num_tokens", [1, 4, 16, 64, 128, 256, 512])
@@ -114,10 +100,7 @@ class TestComputeLocalTokensPerExpert:
         assert result.sum().item() == local_mask.sum().item()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# compute_expert_offsets
-# ──────────────────────────────────────────────────────────────────────
-
+@pytest.mark.internal
 class TestComputeExpertOffsets:
 
     @pytest.mark.parametrize("alignment", [1, 8, 16, 32, 64, 128])
@@ -181,9 +164,6 @@ class TestComputeExpertOffsets:
             )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# permute_tokens
-# ──────────────────────────────────────────────────────────────────────
 
 class TestPermuteTokens:
 
@@ -314,11 +294,7 @@ class TestPermuteTokens:
                 torch.testing.assert_close(perm_h[i], hidden[src])
                 break
 
-
-# ──────────────────────────────────────────────────────────────────────
-# unpermute_tokens
-# ──────────────────────────────────────────────────────────────────────
-
+@pytest.mark.internal
 class TestUnpermuteTokens:
 
     def test_weighted_scatter(self):
@@ -401,11 +377,7 @@ class TestUnpermuteTokens:
             atol=1e-4, rtol=1e-4,
         )
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Permute -> Unpermute roundtrip
-# ──────────────────────────────────────────────────────────────────────
-
+@pytest.mark.internal
 class TestPermuteUnpermuteRoundtrip:
 
     @pytest.mark.parametrize("num_tokens,hidden_dim,topk,num_experts,alignment", [
