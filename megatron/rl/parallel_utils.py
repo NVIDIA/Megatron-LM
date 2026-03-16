@@ -6,7 +6,12 @@ Utilities for building process groups for RL inference models with custom parall
 
 from typing import Optional
 
-import torch.distributed as dist
+try:
+    import torch.distributed as dist
+    HAS_TORCH_DISTRIBUTED = True
+except ImportError:
+    HAS_TORCH_DISTRIBUTED = False
+    dist = None
 
 from megatron.core import mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -70,6 +75,9 @@ def build_inference_pg_collection(
     assert expt_dp_size >= 1 and (expt_tp_size * ep_size * expt_dp_size * pp_size) == world_size, (
         f"World size ({world_size}) must be divisible by expt_tp*ep*pp ({expt_tp_size * ep_size * pp_size})"
     )
+
+    if not HAS_TORCH_DISTRIBUTED:
+        raise ImportError("torch.distributed is required for building inference process groups.")
 
     rank = dist.get_rank()
 
