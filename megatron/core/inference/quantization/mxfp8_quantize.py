@@ -34,26 +34,56 @@ def _mxfp8_quant_swizzle_kernel(
 ):
     """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
 
-    We use round up in scale calculation. see: Mishra et al., Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
+    We use round up in scale calculation. see: Mishra et al., 
+    Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
 
     The implementation borrows code from the triton upstream MXFP downcast kernel:
     https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/numerics_details/mxfp_details/_downcast_to_mxfp.py
 
     Note on swizzled scale layout (torch.nn.functional.SwizzleType.SWIZZLE_32_4_4):
-        Scales are stored in a separate 1D array in the cuBLAS "blocked" layout,
-        also called the swizzled layout. Instead of a simple row-major order, scales
-        are grouped into 128x4 macro-tiles (128 rows by 4 scale columns), where each
-        macro-tile is flattened into a contiguous 512-byte block.
 
-        Given a scale at logical position (row, col) in the [M, K//32] scale matrix:
-            macro_row_block = row // 128       # which macro-tile row
-            macro_col_block = col // 4         # which macro-tile column
-            local_row       = row % 128        # row within the macro-tile
-            local_col       = col % 4          # column within the macro-tile
-            group           = local_row // 32  # sub-group within the tile (0..3)
-            sub_row         = local_row % 32   # row within the sub-group
+        Background: In MXFP8, every group of 32 elements shares one 1-byte scale
+        (an e8m0 exponent). For an [M, K] matrix, this gives an [M, K//32] scale
+        matrix. cuBLAS doesn't read these scales in simple row-major order — it
+        expects a "swizzled" layout optimized for its internal access patterns.
 
-            tile_idx = macro_row_block * n_col_blocks + macro_col_block
+        Step 1 — Divide into macro-tiles:
+            The scale matrix is partitioned into 128-row x 4-col macro-tiles.
+            Each tile is stored as a contiguous 512-byte (128 x 4) block.
+
+        Step 2 — Interleave within each tile:
+            Within a macro-tile, the 128 rows are NOT stored sequentially.
+            Instead, they are split into 4 groups of 32 rows:
+                group 0: rows   0- 31
+                group 1: rows  32- 63
+                group 2: rows  64- 95
+                group 3: rows  96-127
+
+            Rows with the same position within their group (same "sub_row")
+            are placed next to each other. So the memory layout is:
+
+            Concretely, for sub_row=0:
+                byte 0:  row  0, col 0
+                byte 1:  row  0, col 1
+                byte 2:  row  0, col 2
+                byte 3:  row  0, col 3
+                byte 4:  row 32, col 0
+                byte 5:  row 32, col 1
+                byte 6:  row 32, col 2
+                byte 7:  row 32, col 3
+                byte 8:  row 64, col 0
+                ...
+                byte 15: row 96, col 3
+
+
+            Each 16-byte chunk (one sub_row) can be loaded in a single 128-bit
+            memory transaction, which is exactly what cuBLAS does.
+
+        The formula to map logical (row, col) → byte offset:
+            tile_idx = (row // 128) * n_col_blocks + (col // 4)
+            sub_row  = row % 32
+            group    = (row % 128) // 32
+            local_col = col % 4
             offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
     """
