@@ -34,7 +34,7 @@ def _mxfp8_quant_swizzle_kernel(
 ):
     """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
 
-    We use round up in scale calculation. see: Mishra et al., 
+    We use round up in scale calculation. see: Mishra et al.,
     Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
 
     The implementation borrows code from the triton upstream MXFP downcast kernel:
