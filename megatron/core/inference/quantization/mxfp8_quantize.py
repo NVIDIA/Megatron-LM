@@ -32,10 +32,29 @@ def _mxfp8_quant_swizzle_kernel(
     BLOCK_K: tl.constexpr,  # next_power_of_2(K) — padded column count for tl.reshape
     BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
 ):
-    """Quantize one row → FP8 e4m3, write scales directly in swizzled layout.
+    """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
 
-    Borrowed from the Triton upstream MXFP downcast kernel:
+    We use round up in scale calculation. see: Mishra et al., Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
+
+    The implementation borrows code from the triton upstream MXFP downcast kernel:
     https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/numerics_details/mxfp_details/_downcast_to_mxfp.py
+
+    Note on swizzled scale layout (torch.nn.functional.SwizzleType.SWIZZLE_32_4_4):
+        Scales are stored in a separate 1D array in the cuBLAS "blocked" layout,
+        also called the swizzled layout. Instead of a simple row-major order, scales
+        are grouped into 128x4 macro-tiles (128 rows by 4 scale columns), where each
+        macro-tile is flattened into a contiguous 512-byte block.
+
+        Given a scale at logical position (row, col) in the [M, K//32] scale matrix:
+            macro_row_block = row // 128       # which macro-tile row
+            macro_col_block = col // 4         # which macro-tile column
+            local_row       = row % 128        # row within the macro-tile
+            local_col       = col % 4          # column within the macro-tile
+            group           = local_row // 32  # sub-group within the tile (0..3)
+            sub_row         = local_row % 32   # row within the sub-group
+
+            tile_idx = macro_row_block * n_col_blocks + macro_col_block
+            offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
     """
     row = tl.program_id(0)
