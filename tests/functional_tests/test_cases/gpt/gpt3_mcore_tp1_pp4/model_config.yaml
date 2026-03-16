@@ -49,4 +49,5 @@ MODEL_ARGS:
   --bf16: true
   --apply-query-key-layer-scaling: true
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: regular

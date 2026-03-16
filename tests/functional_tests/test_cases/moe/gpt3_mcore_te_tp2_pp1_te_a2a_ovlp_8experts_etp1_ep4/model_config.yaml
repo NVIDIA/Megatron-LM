@@ -63,4 +63,5 @@ MODEL_ARGS:
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
   --exit-interval: 50
+  --async-save: true
 TEST_TYPE: regular

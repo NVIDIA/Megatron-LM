@@ -2,6 +2,7 @@
 
 import json
 import os
+import runpy
 import sys
 import tempfile
 
@@ -203,6 +204,38 @@ def test_preprocess_data_gpt():
         do_test_preprocess_data(temp_dir, extra_args=gpt_args)
 
 
+def test_preprocess_data_gpt_optimal_workers():
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        # gpt specific args
+        gpt_args = [
+            "--input",
+            "/opt/data/datasets/dclm/dclm.jsonl",
+            "--output-prefix",
+            f"{temp_dir}/optimal_workers",
+            "--tokenizer-type",
+            "GPT2BPETokenizer",
+            "--vocab-file",
+            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
+            "--merge-file",
+            "/opt/data/tokenizers/megatron/gpt2-merges.txt",
+            "--append-eod",
+            "--workers",
+            "2",
+            "--log-interval",
+            "1",
+            "--find-optimal-num-workers",
+            "--workers-to-check",
+            "2",
+            "4",
+            "8",
+            "--max-documents",
+            "1002",
+        ]
+        sys.argv = ["/opt/megatron-lm/tools/preprocess_data.py"] + gpt_args
+        runpy.run_path("/opt/megatron-lm/tools/preprocess_data.py", run_name="__main__")
+
+
 def bert_vocab(odir):
     if os.path.exists(__LOCAL_BERT_VOCAB):
         return __LOCAL_BERT_VOCAB
@@ -241,3 +274,4 @@ def test_preprocess_data_bert():
 if __name__ == "__main__":
     test_preprocess_data_gpt()
     test_preprocess_data_bert()
+    test_preprocess_data_gpt_optimal_workers()

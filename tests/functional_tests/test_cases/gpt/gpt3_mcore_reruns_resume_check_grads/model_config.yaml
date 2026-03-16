@@ -88,6 +88,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --dist-ckpt-optim-fully-reshardable: true
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+  --async-save: true
   # data settings
   --data-cache-path: ${DATA_CACHE_PATH}
   --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
