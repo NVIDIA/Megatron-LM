@@ -576,8 +576,8 @@ class GPTPipeline(Pipeline):
             "16",
             "--micro-batch-size",
             "1",  # single sample generated.
-            "--tokenizer-type",
-            "NullTokenizer",
+            "--tokenizer-library",
+            "null",
             "--vocab-size",
             "127",  # ... NullTokenizer adds +1 EOD token.
             "--make-vocab-size-divisible-by",
@@ -623,8 +623,10 @@ class LLaVAPipeline(Pipeline):
             "1024",
             "--micro-batch-size",
             "1",  # single sample generated.
-            "--tokenizer-type",
-            "NullMultimodalTokenizer",
+            "--tokenizer-library",
+            "null",
+            "--tokenizer-mode",
+            "multimodal",
             "--vocab-size",
             "127",  # ... NullTokenizer adds +1 EOD token.
             "--make-vocab-size-divisible-by",

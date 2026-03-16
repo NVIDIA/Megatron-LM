@@ -14,7 +14,6 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
         ("null-text", "NullTokenizer"),
-        ("sft", "SFTTokenizer"),
     ]
 )
 
@@ -34,6 +33,8 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 chat_template (str): tokenizer chat template.
         """
 
+        config.setdefault('class_name', self.__class__.__name__)
+        config.setdefault('class_path', self.__class__.__module__)
         super().__init__(path, config, **kwargs)
         self._tokenizer = self._restore_model(**kwargs)
         self.additional_args = kwargs
@@ -49,6 +50,18 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             self.chat_template = tokenizer_template
         else:
             self.chat_template = kwargs_template
+
+        # SFT prompt config: when prompt_format is provided, SFT conversation
+        # tokenization becomes available on any text tokenizer library.
+        from megatron.core.tokenizers.conversation import PROMPT_FORMAT_REGISTRY, PromptConfig
+
+        prompt_format = kwargs.get('prompt_format', None)
+        if prompt_format is not None:
+            if prompt_format not in PROMPT_FORMAT_REGISTRY:
+                raise NotImplementedError(f"unknown prompt format: {prompt_format}")
+            self._prompt_config = PROMPT_FORMAT_REGISTRY[prompt_format](self._tokenizer)
+        else:
+            self._prompt_config = None
 
     def _restore_model(self, **kwargs) -> MegatronTokenizerTextAbstract:
         """Returns tokenizer library object."""
@@ -116,7 +129,9 @@ class MegatronTokenizerText(MegatronTokenizerBase):
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
-        """Convert a conversation to tokens. Needed for SFTTokenizer.
+        """Convert a conversation to tokens.
+
+        Requires ``--tokenizer-prompt-format`` to be configured (SFT mode).
 
         Args:
             conversation (List[Dict]): Sequence of system/user/assistant messages.
@@ -130,14 +145,20 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
 
-        if self.library == 'sft':
-            return self._tokenizer.tokenize_conversation(
-                conversation=conversation,
-                return_target=return_target,
-                add_generation_prompt=add_generation_prompt,
+        if self._prompt_config is None:
+            raise RuntimeError(
+                "tokenize_conversation requires --tokenizer-prompt-format to be configured. "
+                f"Current library: {self.library}"
             )
-        else:
-            raise NotImplementedError("This method is supported only for SFTTokenizer.")
+        from megatron.core.tokenizers.conversation import tokenize_conversation
+
+        return tokenize_conversation(
+            tokenizer=self._tokenizer,
+            conversation=conversation,
+            prompt_config=self._prompt_config,
+            return_target=return_target,
+            add_generation_prompt=add_generation_prompt,
+        )
 
     def save_pretrained(self, path: str) -> None:
         """
@@ -211,17 +232,23 @@ class MegatronTokenizerText(MegatronTokenizerBase):
     @property
     def pad(self) -> int:
         """Returns id of padding token."""
+        if self._prompt_config is not None:
+            return self._prompt_config.pad_token_id
         return self._tokenizer.pad_id
 
     @property
     def pad_id(self) -> int:
         """Returns id of padding token. Need for NeMo."""
+        if self._prompt_config is not None:
+            return self._prompt_config.pad_token_id
         return self._tokenizer.pad_id
 
     @property
     def eod(self) -> int:
         """Returns id of end of document token."""
-        return self._tokenizer.eod
+        if hasattr(self._tokenizer, 'eod'):
+            return self._tokenizer.eod
+        return self._tokenizer.eos_id
 
     @property
     def bos(self) -> int:

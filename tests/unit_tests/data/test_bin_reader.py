@@ -165,7 +165,9 @@ def test_bin_reader():
             path_to_raws,
             path_to_data,
             extra_args=[
-                "--tokenizer-type",
+                "--tokenizer-library",
+                "megatron",
+                "--tokenizer-model",
                 "GPT2BPETokenizer",
                 "--vocab-file",
                 gpt2_vocab(temp_dir),

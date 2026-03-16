@@ -27,6 +27,8 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
                 model_type (str): type of the model to be used with tokenizer.
         """
 
+        config.setdefault('class_name', self.__class__.__name__)
+        config.setdefault('class_path', self.__class__.__module__)
         super().__init__(path, config, **kwargs)
         self._tokenizer = self._restore_model(**kwargs)
         self.path = path

@@ -38,7 +38,7 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --no-masked-softmax-fusion: true
   --attention-softmax-in-fp32: true
-  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-library: huggingface
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
   --vocab-size: 151936
   --make-vocab-size-divisible-by: 128

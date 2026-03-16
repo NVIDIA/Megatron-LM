@@ -38,7 +38,8 @@ MODEL_ARGS:
   # Data args
   --data-path: ${DATA_BLEND}
   --vocab-file: ${DATA_PATH}/text/the_pile/t5_shard00/bert-large-cased-vocab.txt
-  --tokenizer-type: BertWordPieceCase
+  --tokenizer-library: megatron
+  --tokenizer-model: BertWordPieceCase
   --split: 99982,9,9
   --data-cache-path: ${DATA_CACHE_PATH}
   --vocab-extra-ids: 100

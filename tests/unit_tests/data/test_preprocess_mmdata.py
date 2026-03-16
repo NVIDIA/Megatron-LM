@@ -199,7 +199,9 @@ def test_preprocess_mmdata():
         gpt_args = [
             "--pad-length",
             "1024",
-            "--tokenizer-type",
+            "--tokenizer-library",
+            "megatron",
+            "--tokenizer-model",
             "GPT2BPETokenizer",
             "--vocab-file",
             gpt2_vocab(temp_dir),

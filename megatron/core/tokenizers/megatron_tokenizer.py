@@ -4,21 +4,9 @@ import importlib
 import json
 import logging
 import os
-from collections import OrderedDict
 from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
-
-TOKENIZER_MAPPING_NAMES = OrderedDict(
-    [
-        ("default-text", "DefaultTokenizerText"),
-        ("gpt", "GPTTokenizer"),
-        ("mamba", "MambaTokenizer"),
-        ("bert", "BertTokenizer"),
-        ("t5", "T5Tokenizer"),
-        ("default-vision", "DefaultTokenizerVision"),
-    ]
-)
 
 TEXT_LIBRARIES = [
     "sentencepiece",
@@ -27,7 +15,6 @@ TEXT_LIBRARIES = [
     "tiktoken",
     "byte-level",
     "null-text",
-    "sft",
 ]
 VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
@@ -117,8 +104,7 @@ class MegatronTokenizer:
             tokenizer_path (str): path to tokenizer model.
             tokenizer_library (str): tokenizer model library.
             model_type (str): type of the model to be used with tokenizer.
-                list of available model types: [gpt, bert, t5, mamba, default].
-                `DefaultTokenizerText` will be used if model_type is not specified.
+                Kept for backward compatibility but no longer used for class resolution.
             tokenizer_class (MegatronTokenizerBase): pre-defined tokenizer class.
             chat_template (str): tokenizer chat template in jinja format.
             overwrite (bool): overwrites existing metadata file if set to True.
@@ -129,7 +115,6 @@ class MegatronTokenizer:
             MegatronTokenizer.write_metadata(
                 tokenizer_path='/path/to/tokenzier/model',
                 tokenizer_library='sentencepiece',
-                model_type='llama',
             )
         """
 
@@ -187,29 +172,30 @@ def _get_metadata_path(tokenizer_path: str) -> str:
 
 def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
     """
-    Returns a class which corresponds to choosen tokenizer model type.
+    Returns a class which corresponds to the tokenizer type (text or vision).
+
+    The model_type field in metadata is ignored since model-specific wrapper classes
+    have been removed. All text tokenizers use MegatronTokenizerText and all vision
+    tokenizers use MegatronTokenizerVision directly.
 
     Args:
         library (str): tokenizer library.
         metadata (dict): tokenizer metadata.
 
     Returns:
-        MegatronTokenizerBase: class for choosen tokenizer model type.
+        MegatronTokenizerBase: class for the tokenizer.
     """
     # Return tokenizer class if it was specified in metadata.
-    if metadata.get('tokenizer_class', None):
-        return getattr(metadata['tokenizer_class_path'], metadata['tokenizer_class_name'])
+    if metadata.get('class_name', None) and metadata.get('class_path', None):
+        module = importlib.import_module(metadata['class_path'])
+        return getattr(module, metadata['class_name'])
 
-    # Define tokenizer type
-    tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'
+    # Resolve based on library type (text vs vision).
+    if library in TEXT_LIBRARIES:
+        from megatron.core.tokenizers.text.text_tokenizer import MegatronTokenizerText
 
-    module_name = f"megatron.core.tokenizers.{tokenizer_type}.models"
-    models = importlib.import_module(module_name)
+        return MegatronTokenizerText
+    else:
+        from megatron.core.tokenizers.vision.vision_tokenizer import MegatronTokenizerVision
 
-    model_type = metadata.get("model_type", None)
-    if model_type is None:
-        model_type = f"default-{tokenizer_type}"
-
-    tokenizer_cls = getattr(models, TOKENIZER_MAPPING_NAMES[model_type])
-
-    return tokenizer_cls
+        return MegatronTokenizerVision

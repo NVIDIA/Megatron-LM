@@ -13,7 +13,6 @@ except ImportError:
     pass
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
-from .chat_template import MegatronTokenizerChatTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +72,7 @@ def reload_mergeable_ranks(
     return ranks
 
 
-class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemplate):
+class TikTokenTokenizer(MegatronTokenizerTextAbstract):
     """TikTokenTokenizer https://github.com/openai/tiktoken."""
 
     def __init__(

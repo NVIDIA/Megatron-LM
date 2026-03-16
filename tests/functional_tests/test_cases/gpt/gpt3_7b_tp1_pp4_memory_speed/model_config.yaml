@@ -27,7 +27,7 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --tokenizer-type: NullTokenizer
+  --tokenizer-library: null
   --vocab-size: 131072
   --mock-data: true
   --split: 949,50,1

@@ -23,7 +23,7 @@ MODEL_ARGS:
   --lr-decay-iters: 2200
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-library: huggingface
   --tokenizer-model: llava-hf/llava-1.5-7b-hf
   --distributed-backend: nccl
   --lr: 0.001

@@ -367,11 +367,11 @@ def test_null_multimodal_tokenizer():
 
 
 def test_sft_tokenizer():
-    """Test SFTTokenizer."""
+    """Test SFT tokenization via MegatronTokenizerText with prompt_format."""
     prompt_format = "nemotron-nano-v2"
     tokenizer = MegatronTokenizer.from_pretrained(
         tokenizer_path="/opt/data/tokenizers/multimodal",
-        metadata_path={"library": "sft"},
+        metadata_path={"library": "huggingface"},
         prompt_format=prompt_format,
     )
 
