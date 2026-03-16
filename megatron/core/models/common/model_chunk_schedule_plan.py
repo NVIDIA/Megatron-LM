@@ -52,10 +52,6 @@ class TransformerLayerSchedulePlan:
     mlp = None
     moe_combine = None
     mtp_post_process = None
-    # Optional per-layer FSDP parameter release callbacks, wired when
-    # FSDP optim_grads_params is used with the EP overlap schedule.
-    on_forward_done = None
-    on_backward_done = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
@@ -176,6 +172,38 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
+    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
+        """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
+
+        The EP overlap schedule bypasses the normal FSDP forward/backward hooks
+        (registered on the FSDP unit module) because it calls sub-modules directly
+        instead of going through TransformerLayer.forward(). This method attaches
+        explicit release hooks to individual schedule nodes so that all-gathered
+        parameters are freed at the right time.
+
+        Args:
+            post_forward_hook: Callable(module) that releases forward-pass params
+                (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
+            post_backward_hook: Callable(module) that releases backward-pass params
+                (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+        """
+        fsdp_module = self.layer
+
+        # After the last backward op (attn), release backward-pass params.
+        self.attn.set_fsdp_post_backward_reshard_hook(lambda: post_backward_hook(fsdp_module))
+
+        # Determine the last node in forward order.
+        if isinstance(self.mtp_post_process, NoopScheduleNode):
+            if isinstance(self.moe_combine, NoopScheduleNode):
+                last_fwd_node = self.mlp
+            else:
+                last_fwd_node = self.moe_combine
+        else:
+            last_fwd_node = self.mtp_post_process
+
+        # After the last forward op, release forward-pass params.
+        last_fwd_node.set_fsdp_post_forward_reshard_hook(lambda: post_forward_hook(fsdp_module))
+
     def get_fp8_context(self):
         """
         Get the fp8 context for the transformer layer.
@@ -245,8 +273,6 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
                 f_input = f_layer.mtp_post_process.forward(f_input)
-            if f_layer.on_forward_done is not None:
-                f_layer.on_forward_done(f_layer.layer)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
@@ -255,8 +281,6 @@ class TransformerLayerSchedulePlan:
         # for overlapping with the p2p comm
         if b_layer is not None and not is_last_layer_in_bwd:
             b_layer.attn.backward_dw()
-            if b_layer.on_backward_done is not None:
-                b_layer.on_backward_done(b_layer.layer)
 
         return f_input, b_grad
 
@@ -528,8 +552,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if b_num_layers > 0:
             assert b_layer is not None
             b_layer.attn.backward_dw()
-            if b_layer.on_backward_done is not None:
-                b_layer.on_backward_done(b_layer.layer)
             b_layer.release_state()
 
         # post process forward
