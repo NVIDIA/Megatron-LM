@@ -525,25 +525,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
-    def _mcore_fused_moe_forward(
-        self, hidden_states, probs,
-        routing_map=None, tokens_per_expert=None, skip_permute=False,
-    ):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
-        local_expert_start = self.ep_group.rank() * self.num_local_experts
-        output = mcore_fused_moe(
-            hidden_states,
-            probs,
-            self._fc1_weight,
-            self._fc2_weight,
-            activation_type=self._mcore_activation_type,
-            num_local_experts=self.num_local_experts,
-            local_expert_start=local_expert_start,
-            routing_map=routing_map,
-            tokens_per_expert=tokens_per_expert,
-            skip_permute=skip_permute,
-        )
-        return output, None
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA-graphed iteration mode."""
@@ -605,7 +586,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         This allows:
         - TE's forward to work correctly (same Parameter objects, same internal state)
         - Training updates to flow through (param.data is a view into the big tensor)
-        - torch._grouped_mm / FlashInfer to use the big tensor directly
+        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -653,46 +634,26 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ep_rank=self.ep_group.rank(),
         )[0]
         return output, None
-
-    def _torch_grouped_mm_forward(
-        self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+    
+    def _mcore_fused_moe_forward(
+        self, hidden_states, probs,
+        routing_map=None, tokens_per_expert=None, skip_permute=False,
     ):
-        permuted_probs = permuted_probs.unsqueeze(-1)
-        if not tokens_per_expert.is_cuda:
-            tokens_per_expert = tokens_per_expert.to('cuda')
-
-        if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            permuted_probs = torch.ones_like(permuted_probs)
-
-        if permuted_local_hidden_states.nelement() != 0:
-            # Use pre-concatenated weights (built during init/load)
-            # _fc1_weight shape: [num_experts, ffn_hidden * (2 if gated else 1), hidden_size]
-            # _fc2_weight shape: [num_experts, hidden_size, ffn_hidden]
-            # Compute cumulative offsets on GPU (no host sync!)
-            # offs[i] = end index of expert i's tokens
-            offs = tokens_per_expert.cumsum(0).to(torch.int32)
-
-            fc1_output = torch.nn.functional.grouped_mm(
-                permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
-            )
-
-            # Activation with routing probabilities
-            bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
-
-            fc2_output = torch.nn.functional.grouped_mm(
-                bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
-            )
-        else:
-            # No tokens allocated - return empty tensor with correct shape
-            fc2_output = permuted_local_hidden_states
-
-        return fc2_output, None
+        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = mcore_fused_moe(
+            hidden_states,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+            routing_map=routing_map,
+            tokens_per_expert=tokens_per_expert,
+            skip_permute=skip_permute,
+        )
+        return output, None
 
     def forward(
         self,
@@ -733,6 +694,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         resolved_backend = resolve_inference_grouped_gemm_backend(
             self.inference_grouped_gemm_backend,
             self.is_inference_cuda_graphed_iteration,
+            is_mxfp8=self.config.fp8_recipe == "mxfp8",
         )
 
         if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -742,20 +704,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
-            if self.is_inference_cuda_graphed_iteration:
-                assert routing_map is not None, (
-                    "routing_map is required for mcore_fused_moe forward pass."
-                )
-                return self._mcore_fused_moe_forward(
-                    permuted_local_hidden_states, permuted_probs,
-                    routing_map=routing_map,
-                )
-            else:
-                return self._mcore_fused_moe_forward(
-                    permuted_local_hidden_states, permuted_probs,
-                    tokens_per_expert=tokens_per_expert,
-                    skip_permute=True,
-                )
+            return self._mcore_fused_moe_forward(
+                permuted_local_hidden_states, permuted_probs,
+                routing_map=routing_map, tokens_per_expert=tokens_per_expert, 
+                skip_permute=(not self.is_inference_cuda_graphed_iteration),
+            )
         elif resolved_backend == InferenceGroupedGemmBackend.TE:
             return super().forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs

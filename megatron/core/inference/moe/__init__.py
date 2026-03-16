@@ -16,6 +16,7 @@ class InferenceGroupedGemmBackend(enum.Enum):
 def resolve_inference_grouped_gemm_backend(
     backend: str,
     is_cuda_graphed: bool,
+    is_mxfp8: bool = False,
 ) -> InferenceGroupedGemmBackend:
     """Resolve the grouped GEMM backend to use for the current iteration.
 
@@ -25,13 +26,20 @@ def resolve_inference_grouped_gemm_backend(
     Args:
         backend: One of 'auto', 'torch', 'te'.
         is_cuda_graphed: Whether this is a CUDA-graphed iteration.
-
+        is_mxfp8: Whether the model is using MXFP8 quantization (affects auto backend choice).
     Returns:
         An InferenceGroupedGemmBackend enum value.
     """
     if backend == 'auto':
         if is_cuda_graphed:
-            return InferenceGroupedGemmBackend.FLASHINFER
+            if is_mxfp8:
+                assert hasattr(torch.nn.functional, 'scaled_grouped_mm'), (
+                    "Auto backend selection for MXFP8 requires torch.nn.functional.scaled_grouped_mm. "
+                    "Install PyTorch 2.10+."
+                )
+                return InferenceGroupedGemmBackend.TORCH
+            else:
+                return InferenceGroupedGemmBackend.FLASHINFER
         else:
             if hasattr(torch.nn.functional, 'grouped_mm'):
                 return InferenceGroupedGemmBackend.TORCH

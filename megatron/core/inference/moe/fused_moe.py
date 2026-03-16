@@ -136,7 +136,7 @@ def mcore_fused_moe(
         assert routing_map is None, (
             "routing_map must be None when skip_permute=True"
         )
-        work_hidden, permutation_map, offs = pad_to_alignment(
+        permute_hidden_states, permutation_map, offs = pad_to_alignment(
             hidden_states, tokens_per_expert, expert_alignment,
         )
         permuted_probs = None
@@ -145,7 +145,7 @@ def mcore_fused_moe(
         assert routing_map is not None, (
             "routing_map is required when skip_permute=False"
         )
-        work_hidden, permuted_probs, permutation_map, offs = permute_tokens(
+        permute_hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
             hidden_states, probs, routing_map,
             local_expert_start, num_local_experts,
             alignment=expert_alignment,
@@ -153,8 +153,8 @@ def mcore_fused_moe(
 
     # --- FC1 -> activation -> FC2 ---
     if use_mxfp8:
-        work_hidden = MXFP8Tensor.from_bf16(work_hidden, backend="triton")
-    fc1_output = mm_fn(work_hidden, fc1_weight, offs)
+        permute_hidden_states = MXFP8Tensor.from_bf16(permute_hidden_states, backend="triton")
+    fc1_output = mm_fn(permute_hidden_states, fc1_weight, offs)
     activated = activation_func(fc1_output, permutation_map)
     if use_mxfp8:
         activated = MXFP8Tensor.from_bf16(activated, backend="triton")

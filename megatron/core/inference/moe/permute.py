@@ -36,20 +36,26 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
-# =========================================================================== #
-# Token count kernel
-# =========================================================================== #
 @triton.jit
 def _count_local_tokens_kernel(
-    routing_map_ptr, tokens_per_expert_ptr, total_pairs,
-    local_expert_start, num_local_experts: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    routing_map_ptr,            # [num_tokens * topk] flattened expert assignments
+    tokens_per_expert_ptr,      # [num_local_experts] output counters (zeroed by caller)
+    total_pairs,                # num_tokens * topk — total (token, topk) pairs
+    local_expert_start,         # first global expert index owned by this rank
+    num_local_experts: tl.constexpr,  # number of experts on this rank
+    BLOCK_SIZE: tl.constexpr,         # number of pairs processed per program
 ):
-    """Count tokens assigned to each local expert."""
+    """Count tokens routed to experts on this rank, ignoring tokens routed elsewhere.
+
+    Each program processes BLOCK_SIZE (token, topk) pairs. Tokens assigned to
+    experts outside [local_expert_start, local_expert_start + num_local_experts)
+    are silently skipped.
+    """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < total_pairs
     expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+    # Map global expert IDs to local indices; non-local experts become negative
     local_ids = expert_ids - local_expert_start
     is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
     tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
@@ -71,18 +77,25 @@ def compute_local_tokens_per_expert(
     return tokens_per_expert
 
 
-# =========================================================================== #
-# Expert offset computation
-# =========================================================================== #
 @triton.jit
 def _prefix_sum_kernel(
-    tokens_per_expert_ptr, exclusive_offsets_ptr, inclusive_offsets_ptr,
-    num_local_experts, alignment: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    tokens_per_expert_ptr,      # [num_local_experts] raw token counts
+    exclusive_offsets_ptr,      # [num_local_experts] output: exclusive prefix sum of aligned counts
+    inclusive_offsets_ptr,       # [num_local_experts] output: inclusive prefix sum of aligned counts
+    num_local_experts,          # number of experts on this rank
+    alignment: tl.constexpr,    # per-expert alignment (counts rounded up to this multiple)
+    BLOCK_SIZE: tl.constexpr,   # next_power_of_2(num_local_experts) for tl.cumsum
 ):
-    """Exclusive and inclusive prefix sums of aligned token counts."""
+    """Exclusive and inclusive prefix sums of aligned token counts.
+
+    Each expert's token count is rounded up to the nearest multiple of
+    `alignment` (experts with 0 tokens stay at 0). The inclusive offsets
+    are used as `offs` by grouped_mm / scaled_grouped_mm.
+    """
     r = tl.arange(0, BLOCK_SIZE)
     mask = r < num_local_experts
     h = tl.load(tokens_per_expert_ptr + r, mask=mask, other=0)
+    # Round up non-zero counts to alignment boundary
     if alignment > 1:
         h = tl.where(h > 0, ((h + alignment - 1) // alignment) * alignment, h)
     inc = tl.cumsum(h, axis=0)
@@ -95,27 +108,38 @@ def compute_expert_offsets(
 ) -> tuple:
     """Compute exclusive and inclusive prefix sums of aligned token counts."""
     n = tokens_per_expert.shape[0]
-    exc = torch.empty_like(tokens_per_expert)
-    inc = torch.empty_like(tokens_per_expert)
+    exclusive_cumsum = torch.empty_like(tokens_per_expert)
+    inclusive_cumsum = torch.empty_like(tokens_per_expert)
     _prefix_sum_kernel[(1,)](
-        tokens_per_expert, exc, inc, n, alignment,
+        tokens_per_expert, exclusive_cumsum, inclusive_cumsum, n, alignment,
         BLOCK_SIZE=triton.next_power_of_2(n),
     )
-    return exc, inc
+    return exclusive_cumsum, inclusive_cumsum
 
 
-# =========================================================================== #
-# Permute / unpermute kernels
-# =========================================================================== #
 @triton.jit
 def _permute_tokens_kernel(
-    hidden_ptr, probs_ptr, routing_map_ptr,
-    out_hidden_ptr, out_probs_ptr, out_src_idx_ptr, counters_ptr,
-    num_tokens, hidden_dim, topk: tl.constexpr,
-    local_expert_start, num_local_experts: tl.constexpr,
-    BLOCK_H: tl.constexpr,
+    hidden_ptr,         # [num_tokens, hidden_dim] input hidden states
+    probs_ptr,          # [num_tokens, topk] routing probabilities
+    routing_map_ptr,    # [num_tokens, topk] expert assignments (global IDs)
+    out_hidden_ptr,     # [output_size, hidden_dim] output: permuted hidden states
+    out_probs_ptr,      # [output_size] output: permuted probabilities
+    out_src_idx_ptr,    # [output_size] output: permutation_map (original token index, -1 for padding)
+    counters_ptr,       # [num_local_experts] exclusive offsets, atomically incremented to assign positions
+    num_tokens,         # number of input tokens
+    hidden_dim,         # hidden dimension
+    topk: tl.constexpr,              # number of expert choices per token
+    local_expert_start,               # first global expert index on this rank
+    num_local_experts: tl.constexpr,  # number of experts on this rank
+    BLOCK_H: tl.constexpr,           # tile size for copying hidden_dim
 ):
-    """Permute tokens into expert-grouped order."""
+    """Permute tokens into expert-grouped order.
+
+    Grid: one program per (token, topk) pair. Each program looks up the assigned
+    expert, skips non-local experts, then atomically claims a position within
+    that expert's block and copies the hidden state + prob + source index.
+    """
+    # Each program handles one (token, topk) pair
     pair = tl.program_id(0)
     tok = pair // topk
     k = pair % topk
@@ -123,15 +147,19 @@ def _permute_tokens_kernel(
         return
     eid = tl.load(routing_map_ptr + tok * topk + k)
     lid = eid - local_expert_start
+    # Skip tokens routed to non-local experts
     if lid < 0 or lid >= num_local_experts:
         return
+    # Atomically claim a position within this expert's aligned block
     pos = tl.atomic_add(counters_ptr + lid, 1)
+    # Copy hidden state row
     for h in tl.range(0, hidden_dim, BLOCK_H):
         o = h + tl.arange(0, BLOCK_H)
         m = o < hidden_dim
         tl.store(out_hidden_ptr + pos * hidden_dim + o,
                  tl.load(hidden_ptr + tok * hidden_dim + o, mask=m), mask=m)
     tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+    # Record source token index for unpermute
     tl.store(out_src_idx_ptr + pos, tok)
 
 
@@ -166,10 +194,17 @@ def permute_tokens(
     num_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
 
+    # Count how many (token, topk) pairs are routed to each local expert.
+    # Non-local experts are ignored. Result is [num_local_experts] int32.
     tokens_per_expert = compute_local_tokens_per_expert(
         routing_map, local_expert_start, num_local_experts,
     )
-    padded_exc, padded_inc = compute_expert_offsets(
+
+    # exclusive_expert_offsets[i] = start of expert i's block in the padded output.
+    #   Used as the initial counter for atomic position assignment in the permute kernel.
+    # inclusive_expert_offsets[i] = end of expert i's block (= start of expert i+1).
+    #   Passed as `offs` to grouped_mm / scaled_grouped_mm to delimit expert boundaries.
+    exclusive_expert_offsets, inclusive_expert_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=alignment,
     )
     output_size = (
@@ -184,29 +219,39 @@ def permute_tokens(
     _permute_tokens_kernel[(num_tokens * topk,)](
         hidden_states, probs, routing_map,
         permuted_hidden, permuted_probs, permutation_map,
-        padded_exc, num_tokens, hidden_dim, topk,
+        exclusive_expert_offsets, num_tokens, hidden_dim, topk,
         local_expert_start, num_local_experts, BLOCK_H=BLOCK_H,
     )
-    return permuted_hidden, permuted_probs, permutation_map, padded_inc
+    return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
 
 
 @triton.jit
 def _unpermute_tokens_kernel(
-    expert_out_ptr, probs_ptr, src_idx_ptr, output_ptr,
-    hidden_dim, BLOCK_H: tl.constexpr,
+    expert_out_ptr,     # [output_size, hidden_dim] expert outputs in permuted order
+    probs_ptr,          # [output_size] fp32 routing probabilities (permuted)
+    src_idx_ptr,        # [output_size] permutation_map: original token index, or -1 for padding
+    output_ptr,         # [num_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
+    hidden_dim,         # hidden dimension
+    BLOCK_H: tl.constexpr,  # tile size for processing hidden_dim
 ):
-    """Accumulate weighted expert outputs back to original token positions in fp32."""
+    """Scatter weighted expert outputs back to original token positions.
+
+    Grid: one program per row of expert_out. Padding rows (src_idx == -1) are
+    skipped. Multiple topk selections for the same token are accumulated via
+    atomic adds. All arithmetic is in fp32 to avoid precision loss.
+    """
     row = tl.program_id(0)
-    tok = tl.load(src_idx_ptr + row)
-    if tok < 0:
+    source_idx = tl.load(src_idx_ptr + row)
+    # Skip padding rows
+    if source_idx < 0:
         return
     prob = tl.load(probs_ptr + row)  # fp32
     for h in tl.range(0, hidden_dim, BLOCK_H):
-        o = h + tl.arange(0, BLOCK_H)
-        m = o < hidden_dim
-        v = tl.load(expert_out_ptr + row * hidden_dim + o, mask=m).to(tl.float32)
-        tl.atomic_add(output_ptr + tok * hidden_dim + o, v * prob, mask=m)
-
+        offsets = h + tl.arange(0, BLOCK_H)
+        m = offsets < hidden_dim
+        # Upcast bf16 expert output to fp32 before multiply + accumulate
+        v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
+        tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
 
 def unpermute_tokens(
     expert_output: torch.Tensor, permuted_probs: torch.Tensor,
