@@ -27,7 +27,6 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
-    compute_mtp_inference_logits,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -631,21 +630,10 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            # The new process_mtp_loss function doesn't handle mtp_logits_cache,
-            # so we manually generate and cache MTP logits when in inference mode.
-            if in_inference_mode:
-                if is_spec_decode:
-                    # Cache decoder hidden states for serial MTP computation
-                    # after speculative token verification.
-                    self._decoder_hidden_states_cache = hidden_states
-                else:
-                    hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
-                        hidden_states=hidden_states,
-                        mtp_num_layers=self.config.mtp_num_layers,
-                        output_layer=self.output_layer,
-                        output_weight=output_weight,
-                        runtime_gather_output=runtime_gather_output,
-                    )
+            if in_inference_mode or is_spec_decode:
+                # Cache decoder hidden states for serial MTP computation
+                # after speculative token verification.
+                self._decoder_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(

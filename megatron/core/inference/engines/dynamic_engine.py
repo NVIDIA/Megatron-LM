@@ -1139,8 +1139,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Track acceptance statistics for logging.
                 if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
-                    self._spec_tokens_proposed += self.num_speculative_tokens - stop_word_hit
-                    self._spec_tokens_accepted += len(accepted_tokens) - stop_word_hit
+                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
+                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
+
+                    self._spec_tokens_proposed += actual_proposed
+                    self._spec_tokens_accepted += actual_accepted
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)

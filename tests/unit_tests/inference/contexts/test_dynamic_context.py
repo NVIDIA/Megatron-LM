@@ -2021,7 +2021,7 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_chunked_prefill_hidden_state_prevents_token_bloat(self):
         """
-        Test that hiding the chunked prefill request in Version 2 effectively prevents
+        Test that hiding the chunked prefill request effectively prevents
         'dummy' speculative tokens from bloating the active_token_count, and that the
         next chunk seamlessly appends without needing legacy offset subtractions.
         """

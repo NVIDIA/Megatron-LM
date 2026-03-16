@@ -1499,6 +1499,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        requires_mamba_state_extraction = False
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+            requires_mamba_state_extraction = (
+                self.mamba_slot_allocator.get_intermediate_offsets() is not None
+            )
+
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
@@ -1506,6 +1512,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
+            requires_mamba_state_extraction=requires_mamba_state_extraction,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1622,18 +1629,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._use_triton_conv1d_this_step = True
             else:
                 self._use_triton_conv1d_this_step = self.use_triton_conv1d
-
-            # Fall back to eager mode when intermediate Mamba states need to
-            # be extracted. Intermediate state extraction uses Python loops
-            # with variable-size tensors and .item() calls that cannot be
-            # captured in a CUDA graph. First unique prompts (which need
-            # intermediate states) run eager; subsequent duplicates and
-            # decode steps use CUDA graphs.
-            if self._using_cuda_graph_this_step and self.mamba_slot_allocator is not None:
-                intermediate_offsets = self.mamba_slot_allocator.get_intermediate_offsets()
-                if intermediate_offsets is not None:
-                    self._using_cuda_graph_this_step = False
-                    self._use_triton_conv1d_this_step = self.use_triton_conv1d
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
