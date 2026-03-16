@@ -384,10 +384,11 @@ class MixedPrecisionPolicy:
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
       depending on the network domain (NVLink or IB), and can enable mixed-precision
-      communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support
-      FP32 reduction even though we have BF16 input and output communication buffers.
-      If set to None, the main_grads_dtype is used. Defaults to torch.float32. If using
-      `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating
-      `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.
-      Defaults to None.
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
