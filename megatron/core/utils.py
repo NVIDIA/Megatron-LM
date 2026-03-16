@@ -2045,12 +2045,9 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        try:
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-            )
-        except Exception as e:
-            print(f"cu_seqlens_padded: {cu_seqlens_padded} tokens: {batch['tokens'].size(1)} cp_size: {cp_size} cp_rank: {cp_rank}")
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+        )
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
                 continue
@@ -2075,7 +2072,9 @@ def get_batch_on_this_hybrid_cp_rank(
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
-    assert local_cp_size is not None, "local_cp_size must be provided when using Hybrid Context Parallel"
+    assert (
+        local_cp_size is not None
+    ), "local_cp_size must be provided when using Hybrid Context Parallel"
     if cp_group is None:
         # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
         if local_cp_size >= 1:
@@ -2096,7 +2095,9 @@ def get_batch_on_this_hybrid_cp_rank(
         batch[key] = torch.stack([data], 0)
 
     assert cp_group is not None, "No valid cp_group found when using Hybrid Context Parallel"
-    batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen, cp_group.size(), cp_group.rank())
+    batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        batch, cu_seqlens, cu_seqlens_padded, max_seqlen, cp_group.size(), cp_group.rank()
+    )
     packed_seq_params.local_cp_size = local_cp_size
     packed_seq_params.cp_group = cp_group
 

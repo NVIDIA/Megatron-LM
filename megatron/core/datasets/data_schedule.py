@@ -1,13 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
 
 
 class HybridCPDataLoaderWrapper:
@@ -266,9 +266,7 @@ class HybridCPDataLoaderWrapper:
         return batch_unpacked
 
     def _pack_sequences(
-        self,
-        samples: List[Dict[str, torch.Tensor]],
-        local_cp_size: torch.Tensor,
+        self, samples: List[Dict[str, torch.Tensor]], local_cp_size: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         def _pack_tensors(tensors):
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
@@ -278,7 +276,7 @@ class HybridCPDataLoaderWrapper:
             # Or local_cp_size * tp_size * 2 when using sequence parallel
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             if self.config.sequence_parallel:
-                #TODO (pmannan): Remove parallel_state usage and pass pg_collection instead
+                # TODO (pmannan): Remove parallel_state usage and pass pg_collection instead
                 pad_granularity = local_cp_size * tp_size * 2
             else:
                 pad_granularity = local_cp_size * 2
@@ -288,14 +286,18 @@ class HybridCPDataLoaderWrapper:
                 seq_pad_len = (pad_granularity - mod_token_count) % pad_granularity
 
             total_seq_len = seq_len + seq_pad_len
-            
+
             # MXFP8 BLOCK_SIZE is 32 and sequence after sharding should be divisible
             if self.config.fp8 is not None and self.config.fp8_recipe == "mxfp8":
                 pad_granularity = 32
-            if self.config.moe_token_dispatcher_type == "flex" and self.config.moe_flex_dispatcher_backend == "hybridep":
-                # HybridEP requires MAX_NUM_OF_TOKENS_PER_RANK to be divisible by NUM_OF_TOKENS_PER_CHUNK (128)
+            if (
+                self.config.moe_token_dispatcher_type == "flex"
+                and self.config.moe_flex_dispatcher_backend == "hybridep"
+            ):
+                # HybridEP requires MAX_NUM_OF_TOKENS_PER_RANK to be divisible
+                # by NUM_OF_TOKENS_PER_CHUNK (128)
                 pad_granularity = 128
-            
+
             sharded_tensor_shape = total_seq_len // (local_cp_size * tp_size)
             mod_token_count = sharded_tensor_shape % pad_granularity
             sharded_pad_len = 0
@@ -305,7 +307,9 @@ class HybridCPDataLoaderWrapper:
             return sharded_pad_len + seq_pad_len
 
         # Get the padded lengths of all sub-samples being packed
-        sample_padded_lens = torch.tensor([s["tokens"].shape[0] for s in samples], dtype=torch.int32)
+        sample_padded_lens = torch.tensor(
+            [s["tokens"].shape[0] for s in samples], dtype=torch.int32
+        )
 
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
         labels = _pack_tensors([sample["labels"] for sample in samples])
@@ -313,33 +317,58 @@ class HybridCPDataLoaderWrapper:
         position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
 
         # Create the cu_seqlens_padded tensor
-        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
+        cu_seqlens_padded = torch.empty(
+            1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32
+        )
         cu_seqlens_padded[0, 0] = 0
         cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
 
         pad_len = _get_pad_len(tokens.shape[0], local_cp_size)
         if pad_len > 0:
-            tokens = torch.cat([tokens, torch.zeros(pad_len, dtype=tokens.dtype, device=tokens.device)])
-            labels = torch.cat([labels, torch.zeros(pad_len, dtype=labels.dtype, device=labels.device)])
-            loss_mask = torch.cat([loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype, device=loss_mask.device)])
-            position_ids = torch.cat([position_ids, torch.tensor(range(position_ids[-1] + 1, position_ids[-1] + 1 + pad_len), dtype=position_ids.dtype, device=position_ids.device)])
-            sample_padded_lens = torch.cat([sample_padded_lens, torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device)])
+            tokens = torch.cat(
+                [tokens, torch.zeros(pad_len, dtype=tokens.dtype, device=tokens.device)]
+            )
+            labels = torch.cat(
+                [labels, torch.zeros(pad_len, dtype=labels.dtype, device=labels.device)]
+            )
+            loss_mask = torch.cat(
+                [loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype, device=loss_mask.device)]
+            )
+            position_ids = torch.cat(
+                [
+                    position_ids,
+                    torch.tensor(
+                        range(position_ids[-1] + 1, position_ids[-1] + 1 + pad_len),
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                    ),
+                ]
+            )
+            sample_padded_lens = torch.cat(
+                [
+                    sample_padded_lens,
+                    torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device),
+                ]
+            )
             cu_seqlens_padded[:, -1:] = cu_seqlens_padded[:, -1:] + pad_len
-        
+
         new_sample = {}
         new_sample["tokens"] = tokens
         new_sample["labels"] = labels
         new_sample["loss_mask"] = loss_mask
         new_sample["position_ids"] = position_ids
         if local_cp_size is not None:
-            new_sample["local_cp_size"] = torch.tensor(local_cp_size, device=torch.cuda.current_device(), dtype=torch.int32)
+            new_sample["local_cp_size"] = torch.tensor(
+                local_cp_size, device=torch.cuda.current_device(), dtype=torch.int32
+            )
 
         # new_sample["cu_seqlens_padded"] = cu_seqlens_padded
         # We set cu_seqlens to cu_seqlens_padded here
-        # we don't provide cu_seqlens_padded here because `get_batch_on_this_tp_rank` does not consider it
-        # at the moment. It is assumed that any necessary padding will be after data is loaded in.
-        # TODO(pmannan): We need to be able to differentiate if the original data_iterator is providing
-        # padded samples or valid lengths.
+        # we don't provide cu_seqlens_padded here because `get_batch_on_this_tp_rank` does not
+        # consider it at the moment.
+        # It is assumed that any necessary padding will be after data is loaded in.
+        # TODO(pmannan): We need to be able to differentiate if the original data_iterator
+        # is providing padded samples or valid lengths.
         new_sample["cu_seqlens"] = cu_seqlens_padded
         max_seqlen = torch.max(torch.diff(cu_seqlens_padded[0])).to(dtype=torch.int32)
         new_sample["max_seqlen"] = max_seqlen
@@ -359,8 +388,9 @@ class HybridCPDataLoaderWrapper:
             grouped_samples: List of length `num_microbatches`. Each element is the `samples` list
                 (list[sample]) for that microbatch, where `sample` is the dict returned by
                 `dataset.__getitem__`.
-            sample_id_groups: List of length `num_microbatches`. Each element is the `sample_id_groups` list
-                (list[sample_id]) for that microbatch, where `sample_id` is the id of the sub-sample.
+            sample_id_groups: List of length `num_microbatches`.
+                Each element is the `sample_id_groups` list (list[sample_id]) for that microbatch,
+                where `sample_id` is the id of the sub-sample.
 
         Returns:
             new_samples: list of packed samples (dicts) length == num_micro_batches.
@@ -373,7 +403,7 @@ class HybridCPDataLoaderWrapper:
             local_cp_size = -1
             # sample_id_groups = [[[0, 1, 2], [0, 1, 2]], [[3, 4, 5], [6, 7, 8]]]
             # Indicates the sub-sample ids per microbatch for each DPxCP rank.
-            for sub_sample_id in sample_id_groups[i][hdp_rank]: # i:0 hdp_rank:0 [[0, 1, 2]]
+            for sub_sample_id in sample_id_groups[i][hdp_rank]:  # i:0 hdp_rank:0 [[0, 1, 2]]
                 # sub_sample_id: 0 / 1 / 2
                 partner_cp_size = len(
                     [True for sample_ids in sample_id_groups[i] if sub_sample_id in sample_ids]
@@ -382,7 +412,9 @@ class HybridCPDataLoaderWrapper:
                 if local_cp_size == -1:
                     local_cp_size = partner_cp_size
                 else:
-                    assert local_cp_size == partner_cp_size, f"\
+                    assert (
+                        local_cp_size == partner_cp_size
+                    ), f"\
                         found sample within a packed microbatch with different local_cp_size: \
                         {local_cp_size} != {partner_cp_size}"
 
@@ -390,7 +422,7 @@ class HybridCPDataLoaderWrapper:
             new_samples.append(new_sample)
 
         return new_samples
-    
+
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
@@ -437,11 +469,9 @@ class HybridCPDataLoaderWrapper:
         ]
 
         new_samples = self._build_packed_microbatches(
-            grouped_samples=grouped_samples,
-            sample_id_groups=sample_id_groups,
-            hdp_rank=hdp_rank
+            grouped_samples=grouped_samples, sample_id_groups=sample_id_groups, hdp_rank=hdp_rank
         )
 
         new_data_iterator = RerunDataIterator(iter(new_samples))
-        
+
         return new_data_iterator, sample_id_groups

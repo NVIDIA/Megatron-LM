@@ -60,7 +60,9 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
+        _flash_attn_forward,
+    )
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -71,7 +73,9 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            _flash_attn_forward,
+        )
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -926,7 +930,9 @@ class Attention(MegatronModule, ABC):
         """
         # here we need to set the right cp group for dynamic-cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in Hybrid Context Parallel mode"
+            assert (
+                packed_seq_params.cp_group is not None
+            ), "cp_group must be set in Hybrid Context Parallel mode"
             self.pg_collection.cp = packed_seq_params.cp_group
 
         # Check if we need to skip RoPE

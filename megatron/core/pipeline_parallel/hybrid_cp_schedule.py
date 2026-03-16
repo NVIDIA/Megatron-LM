@@ -8,11 +8,10 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-# Number of forward groups (logically equivalent to num_microbatches) used in the most 
-# recent hybrid CP step. 
+# Number of forward groups (logically equivalent to num_microbatches) used in the most
+# recent hybrid CP step.
 # Set each iteration so that training.py can use it for loss scaling.
 _num_total_groups: int = 0
 
@@ -20,6 +19,7 @@ _num_total_groups: int = 0
 def get_num_total_groups() -> int:
     """Return the num_total_groups value from the most recent hybrid CP step."""
     return _num_total_groups
+
 
 class BalancedCPScheduler:
     """
@@ -65,7 +65,9 @@ class BalancedCPScheduler:
         # This is a temporary fix to ensure that expert ranks run in sync.
         # TODO(pmannan): Remove this hack after fixing the hang issue.
         # This is sufficient to get most of the benefits of HybridCP
-        min_cp_size = max(1, self.config.expert_model_parallel_size / self.config.tensor_model_parallel_size)
+        min_cp_size = max(
+            1, self.config.expert_model_parallel_size / self.config.tensor_model_parallel_size
+        )
         return int(max(min_cp_size, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank)))))
 
     def make_buckets_equal(
@@ -354,9 +356,10 @@ class BalancedCPScheduler:
                 proj_slack = max(proj_times) - min(proj_times)
 
                 # Check if trimming the workload helps imbalance
-                # TODO(pmannan): Once support for sequence packing is added, 
+                # TODO(pmannan): Once support for sequence packing is added,
                 # Make sure that the trimming logic supports removing all sequences added
-                # unless this is called each time we add a sequence. Then safe to remove the last sequence only.
+                # unless this is called each time we add a sequence.
+                # Then safe to remove the last sequence only.
                 if proj_slack < cur_slack:
                     sample_id_to_remove = sample_ids_per_gpu[max_r][-1]
                     for r in members:
@@ -562,7 +565,6 @@ def hybrid_context_parallel_forward_backward(
         # assert n > 0, "there should be at least 1 num_microbatches"
         return n
 
-
     # We get data once per global batch and schedule the sub-samples.
     hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
     is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
@@ -576,7 +578,7 @@ def hybrid_context_parallel_forward_backward(
 
     num_total_groups = None
     if is_first_tp_rank:
-        num_total_groups = len(sample_id_groups) # equivalent to num_microbatches
+        num_total_groups = len(sample_id_groups)  # equivalent to num_microbatches
 
     # TODO(pmannan): This is now equivalent to regular no pipeline schedule.
     # Remove this special forward_backward_func and merge with forward_backward_no_pipelining.
@@ -589,7 +591,9 @@ def hybrid_context_parallel_forward_backward(
     global _num_total_groups
     _num_total_groups = num_total_groups
 
-    num_samples_this_group = [1 for _ in range(num_total_groups)] # After sequence packing, each group has only one sub-sample
+    num_samples_this_group = [
+        1 for _ in range(num_total_groups)
+    ]  # After sequence packing, each group has only one sub-sample
 
     current_microbatch = 0
 

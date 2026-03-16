@@ -223,7 +223,7 @@ def get_tokens_per_expert_and_token_count(
 
     reduce_group can be either a single ProcessGroup or a list of ProcessGroups.
     When a list is provided (e.g. for hybrid context parallel), sequential all-reduces are
-    performed across each group in order. The caller is responsible for ordering; 
+    performed across each group in order. The caller is responsible for ordering;
     all-reduce is commutative so the order does not affect correctness, only potential performance.
 
     Example — hybrid context parallel:

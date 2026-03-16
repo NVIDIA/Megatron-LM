@@ -63,7 +63,7 @@ class RouterInterface(Protocol):
     """Interface for the router used in an MoELayer."""
 
     def forward(
-        self, input: torch.Tensor, /, packed_seq_params=None,
+        self, input: torch.Tensor, /, packed_seq_params=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 

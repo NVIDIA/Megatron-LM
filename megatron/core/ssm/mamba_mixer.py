@@ -406,7 +406,7 @@ class MambaMixer(MegatronModule):
         # Allows for dynamic CP group selection based on the true length of samples in the batch.
         if packed_seq_params is not None and packed_seq_params.cp_group is not None:
             self.cp.set_context_parallel_group(packed_seq_params.cp_group)
-        
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
