@@ -345,6 +345,10 @@ class TestMXFP8Tensor:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 FlashInfer comparison requires Blackwell (SM 100+)",
+)
 class TestTritonVsFlashinfer:
 
     @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (64, 256), (128, 2688), (256, 1856)])
