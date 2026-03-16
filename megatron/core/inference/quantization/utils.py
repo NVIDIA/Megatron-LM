@@ -29,7 +29,7 @@ except ImportError:
     HAVE_TORCH_SCALED_MM = False
 
 
-def _verify_te_to_flashinfer_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tensor) -> None:
+def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tensor) -> None:
     # Sanity check: compare the first logical block (32 values)
     # Slice logical dimensions first to naturally handle any data swizzling/strides
     te_block = te_dequantized[0, :32].float()
@@ -81,14 +81,9 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer")
                 # Undo the TE quantization and re-quantize
                 # Note that this introduces a one-time overhead but avoids any
                 # numerical differences between TE and mcore MXFP8 formats
-                if rank == 0:
-                    logging.info(f"Quantizing parameter {key} from TE MXFP8 to {backend} MXFP8Tensor")
                 te_dequantized = val.dequantize()
                 mcore_quantized = MXFP8Tensor.from_bf16(te_dequantized, backend=backend)
-
-                _verify_te_to_flashinfer_mxfp8_conversion(te_dequantized, mcore_quantized)
-                if rank == 0:
-                    logging.info(f"Successfully quantized {key} to {backend} MXFP8Tensor")
+                _verify_te_to_mcore_mxfp8_conversion(te_dequantized, mcore_quantized)
                 del model._parameters[key]
                 setattr(model, key, mcore_quantized)
 
@@ -205,7 +200,7 @@ def quantize_params_to_mxfp8(
 
                 # Verify correctness for TEMXFP8Tensor inputs
                 if HAVE_TE and isinstance(val, TEMXFP8Tensor):
-                    _verify_te_to_flashinfer_mxfp8_conversion(bf16_data, mcore_tensor)
+                    _verify_te_to_mcore_mxfp8_conversion(bf16_data, mcore_tensor)
 
                 persistent_buffers[fqn] = mcore_tensor
 

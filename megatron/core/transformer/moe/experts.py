@@ -519,9 +519,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _resolve_mcore_activation_type(self):
         """Map megatron activation config to mcore_fused_moe ActivationType."""
         func = self.config.activation_func
-        if func == F.silu:
-            return McoreActivationType.SWIGLU
-        elif func == squared_relu:
+        if func == squared_relu:
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
@@ -652,6 +650,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             tokens_per_expert=tokens_per_expert,
             skip_permute=skip_permute,
+            disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
         )
         return output, None
 

@@ -19,10 +19,7 @@ try:
     import triton
     import triton.language as tl
 
-    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
-        HAVE_TRITON = False
-    else:
-        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+    HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
 
@@ -273,3 +270,160 @@ def unpermute_tokens(
         output, hidden_dim, BLOCK_H=BLOCK_H,
     )
     return output
+
+
+@triton.jit
+def _permute_quantize_mxfp8_kernel(
+    hidden_ptr, probs_ptr, routing_map_ptr,
+    out_fp8_ptr, out_scale_ptr, out_probs_ptr, out_src_idx_ptr,
+    counters_ptr,
+    num_tokens, K,
+    n_col_blocks,
+    topk: tl.constexpr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """Fused permute + MXFP8 quantize + swizzle in one kernel.
+
+    Grid: (num_tokens * topk,) — one program per (token, k) pair.
+    Reads BF16 from source token, quantizes to FP8 e4m3, writes FP8 data +
+    swizzled e8m0 scales to the permuted write position.
+    """
+    pair = tl.program_id(0)
+    tok = pair // topk
+    k = pair % topk
+    if tok >= num_tokens:
+        return
+    eid = tl.load(routing_map_ptr + tok * topk + k)
+    lid = eid - local_expert_start
+    if lid < 0 or lid >= num_local_experts:
+        return
+
+    pos = tl.atomic_add(counters_ptr + lid, 1)
+
+    # Load full row from source token
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Per-group-of-32 quantization
+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+    abs_grouped = tl.abs(x_grouped)
+    max_vals = tl.max(abs_grouped, axis=1)
+
+    dequant_scale = max_vals / 448.0
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+    quantized = x_grouped * quant_scale[:, None]
+    quantized_flat = tl.reshape(quantized, [BLOCK_K])
+    out_fp8 = quantized_flat.to(tl.float8e4nv)
+
+    # Store FP8 data at permuted position
+    tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
+
+    # Store swizzled scales at permuted position
+    scale_exp = (dequant_exp >> 23).to(tl.uint8)
+    col_offs = tl.arange(0, BLOCK_GROUPS)
+    col_mask = col_offs < REAL_GROUPS
+
+    macro_row_block = pos // 128
+    macro_col_block = col_offs // 4
+    local_row = pos % 128
+    local_col = col_offs % 4
+    group = local_row // 32
+    sub_row = local_row % 32
+    tile_idx = macro_row_block * n_col_blocks + macro_col_block
+    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+
+    tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+    # Store prob and source index
+    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+    tl.store(out_src_idx_ptr + pos, tok)
+
+
+def permute_and_quantize_mxfp8(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    alignment: int = 128,
+) -> tuple:
+    """Fused permute + MXFP8 quantize + swizzle.
+
+    Self-contained API matching permute_tokens: computes token counts, aligned
+    expert offsets, output sizing, permutation, and MXFP8 quantization in a
+    single kernel launch.
+
+    Args:
+        hidden_states: [num_tokens, hidden_size] BF16 input.
+        probs: [num_tokens, topk] routing probabilities.
+        routing_map: [num_tokens, topk] expert assignments.
+        local_expert_start: first global expert index on this rank.
+        num_local_experts: number of experts on this rank.
+        alignment: per-expert token alignment (default 128, required for MXFP8 swizzle).
+
+    Returns:
+        (permuted_mxfp8, permuted_probs, permutation_map, inclusive_offsets)
+        - permuted_mxfp8: MXFP8Tensor with .data [output_size, K] and .scale (swizzled)
+        - permuted_probs: [output_size] routing probs
+        - permutation_map: [output_size] int32, original token index or -1 for padding
+        - inclusive_offsets: [num_local_experts] int32 cumulative offsets for scaled_grouped_mm
+    """
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    num_tokens, K = hidden_states.shape
+    topk = probs.shape[1]
+    assert K % 32 == 0
+
+    # Count how many (token, topk) pairs are routed to each local expert.
+    tokens_per_expert = compute_local_tokens_per_expert(
+        routing_map, local_expert_start, num_local_experts,
+    )
+
+    # exclusive_expert_offsets[i] = start of expert i's block in the padded output.
+    # inclusive_expert_offsets[i] = end of expert i's block (= start of expert i+1).
+    exclusive_expert_offsets, inclusive_expert_offsets = compute_expert_offsets(
+        tokens_per_expert, alignment=alignment,
+    )
+    output_size = (
+        num_tokens * min(topk, num_local_experts)
+        + alignment * num_local_experts
+    )
+
+    scale_cols = K // 32
+    n_row_blocks = _ceil_div(output_size, 128)
+    n_col_blocks = _ceil_div(scale_cols, 4)
+    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+
+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)
+    permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
+    permutation_map = torch.full((output_size,), -1, dtype=torch.int32, device=probs.device)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_GROUPS = BLOCK_K // 32
+
+    _permute_quantize_mxfp8_kernel[(num_tokens * topk,)](
+        hidden_states, probs, routing_map,
+        out_fp8, out_scale, permuted_probs, permutation_map,
+        exclusive_expert_offsets,
+        num_tokens, K, n_col_blocks,
+        topk, local_expert_start, num_local_experts,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_GROUPS,
+    )
+
+    permuted_mxfp8 = MXFP8Tensor(
+        data=out_fp8,
+        scale=out_scale.view(torch.float8_e8m0fnu),
+        backend="triton",
+    )
+    return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets

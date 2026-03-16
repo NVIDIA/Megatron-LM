@@ -16,60 +16,76 @@ except ImportError:
 
 
 @triton.jit
-def ld_128(ptr, mask, multicast_op: tl.constexpr):
+def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = False):
     """
-    Loads 128 bits (8 x bf16) from memory into registers.
+    Loads 128 bits from memory into registers.
 
     This function abstracts two distinct hardware behaviors based on `multicast_op`:
 
     1.  **Standard Load (`multicast_op=False`)**:
         -   **Semantics:** Local Global Memory Load.
         -   **Action:** Reads 128 bits from `ptr` in global memory into the local register file.
-        -   **Use Case:** Standard tensor processing.
 
     2.  **Multicast Reduce-Load (`multicast_op=True`)**:
         -   **Semantics:** "Pull" Reduction over NVLink.
         -   **Action:** Simultaneously reads 128 bits from the *same* address across all peer GPUs
-            in the multicast group, sums them (add reduction), and loads the result into the
-            local register file.
+            in the multicast group, sums them, and loads the result into the local register file.
         -   **Hardware:** Uses `multimem.ld_reduce` (Hopper+).
-        -   **Use Case:** The "Reduce" step in collective operations.
+        -   When `reduce_f32=False` (default): bf16x2 addition with f32 accumulation
+            (128 bits = 8 x bf16, 2 per register).
+        -   When `reduce_f32=True`: native f32 addition
+            (128 bits = 4 x fp32, 1 per register).
 
     Args:
         ptr: Memory pointer to the source buffer.
         mask: Boolean predicate. If False, the operation is skipped (no-op).
         multicast_op (tl.constexpr): Toggles between standard load (False)
-        and multicast-reduce (True).
+            and multicast-reduce (True).
+        reduce_f32 (tl.constexpr): When True and multicast_op=True, uses f32 reduction
+            instead of bf16x2 reduction. Default False.
 
     Returns:
         Four 32-bit registers (tl.uint32), representing 128 bits of loaded data.
-        Note: When interpreting as bf16, this equates to 8 values (2 per register).
     """
-    # PTX Assembly Logic:
-    # 1. @$5: Predication. Only execute if argument 5 (mask) is True (1).
-    # 2. Opcode Selection:
-    #    - 'multimem.ld_reduce...add.v4.bf16x2': Hardware-accelerated reduction across peers.
-    #    - 'ld.global...v4.u32': Standard 128-bit memory read.
-    # 3. Operands:
-    #    - {$0, $1, $2, $3}: Destination registers (Output).
-    #    - [$4]: Source memory address (Input).
     if multicast_op:
-        return tl.inline_asm_elementwise(
-            """
-            {
-                .reg .pred %p0;
-                setp.ne.s32 %p0, $5, 1;
-                @%p0 bra end;
-                multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
-                end:
-            }
-            """,
-            "=r,=r,=r,=r,l,r",
-            args=[ptr, mask.to(tl.int32)],
-            dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
-            is_pure=True,
-            pack=1,
-        )
+        if reduce_f32:
+            # fp32 reduction: multimem.ld_reduce.add.v4.f32
+            # Each 128-bit load reduces 4 x fp32 values across peers.
+            return tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .pred %p0;
+                    setp.ne.s32 %p0, $5, 1;
+                    @%p0 bra end;
+                    multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {$0, $1, $2, $3}, [$4];
+                    end:
+                }
+                """,
+                "=r,=r,=r,=r,l,r",
+                args=[ptr, mask.to(tl.int32)],
+                dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            # bf16x2 reduction with f32 accumulation: multimem.ld_reduce.add.acc::f32.v4.bf16x2
+            # Each 128-bit load reduces 8 x bf16 values (packed as 4 x bf16x2) across peers.
+            return tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .pred %p0;
+                    setp.ne.s32 %p0, $5, 1;
+                    @%p0 bra end;
+                    multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
+                    end:
+                }
+                """,
+                "=r,=r,=r,=r,l,r",
+                args=[ptr, mask.to(tl.int32)],
+                dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+                is_pure=True,
+                pack=1,
+            )
     else:
         return tl.inline_asm_elementwise(
             """

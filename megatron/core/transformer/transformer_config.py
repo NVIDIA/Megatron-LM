@@ -932,6 +932,12 @@ class TransformerConfig(ModelParallelConfig):
     - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
     """
 
+    inference_moe_disable_fused_quant_kernels: bool = False
+    """When False (default), use fused kernels that combine permute/activation with
+    MXFP8 quantization + swizzle into a single kernel launch. Only applies when
+    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
+    launches (useful for debugging)."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -1175,16 +1181,16 @@ class TransformerConfig(ModelParallelConfig):
                     "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-            if self.inference_grouped_gemm_backend == 'auto':
+           
                
-                if self.gated_linear_unit and self.cuda_graph_impl == "local":
-                    raise ValueError(
-                        "inference_grouped_gemm_backend='auto' does not yet support CUDA graphs "
-                        "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
-                        "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
-                        "graphs (--cuda-graph-impl=none) or use a non-gated activation "
-                        "(e.g. squared_relu)."
-                    )
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
+                raise ValueError(
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
+                )
             
         
             assert self.inference_grouped_gemm_backend in (

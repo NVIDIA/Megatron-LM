@@ -163,7 +163,7 @@ class TestMxfp8Quantize:
         assert triton_data.shape == (M, K)
         assert triton_data.dtype == torch.float8_e4m3fn
         torch.testing.assert_close(
-            triton_data.float(), ref_data.float(), atol=0, rtol=0,
+            triton_data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0,
         )
 
     @pytest.mark.parametrize("M,K", [
@@ -224,7 +224,7 @@ class TestMxfp8Quantize:
         x = torch.full((M, K), 1.0, device="cuda", dtype=torch.bfloat16)
         data, _ = mxfp8_quantize(x)
         _, ref_data = ref_to_mxfp(x)
-        torch.testing.assert_close(data.float(), ref_data.float(), atol=0, rtol=0)
+        torch.testing.assert_close(data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_input_dtypes(self, dtype):
@@ -246,7 +246,7 @@ class TestMxfp8Quantize:
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         data, _ = mxfp8_quantize(x)
         _, ref_data = ref_to_mxfp(x)
-        torch.testing.assert_close(data.float(), ref_data.float(), atol=0, rtol=0)
+        torch.testing.assert_close(data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0)
 
     @pytest.mark.parametrize("seed", [0, 7, 42, 123, 999])
     def test_reproducible(self, seed):
@@ -257,7 +257,7 @@ class TestMxfp8Quantize:
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
         d1, s1 = mxfp8_quantize(x)
         d2, s2 = mxfp8_quantize(x)
-        torch.testing.assert_close(d1.float(), d2.float(), atol=0, rtol=0)
+        torch.testing.assert_close(d1.view(torch.uint8), d2.view(torch.uint8), atol=0, rtol=0)
         torch.testing.assert_close(s1.view(torch.uint8), s2.view(torch.uint8), atol=0, rtol=0)
 
 
@@ -285,7 +285,7 @@ class TestMXFP8Tensor:
         assert tensor.data.shape == (M, K)
         assert tensor.data.dtype == torch.float8_e4m3fn
         assert tensor.backend == "triton"
-        torch.testing.assert_close(tensor.data.float(), ref_data.float(), atol=0, rtol=0)
+        torch.testing.assert_close(tensor.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0)
 
     @pytest.mark.parametrize("M,K", [
         (16, 128),
@@ -419,3 +419,259 @@ class TestTritonVsFlashinfer:
             flashinfer_tensor.scale.view(torch.uint8),
             atol=0, rtol=0,
         )
+
+def _make_permutation_map(M, num_padding=0):
+    """Create a permutation_map with optional padding rows at the end."""
+    real = torch.arange(M - num_padding, dtype=torch.int32, device="cuda")
+    pad = torch.full((num_padding,), -1, dtype=torch.int32, device="cuda")
+    return torch.cat([real, pad])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# squared_relu_and_quantize_mxfp8 vs PyTorch reference
+# ──────────────────────────────────────────────────────────────────────
+
+class TestSquaredReluAndQuantizeMxfp8:
+    """Compare fused squared_relu + mxfp8 quantize against PyTorch reference.
+
+    Reference: torch.relu(x.float()).pow(2).to(bf16) -> ref_to_mxfp -> ref_swizzle.
+    The fused kernel computes squared ReLU in fp32 and quantizes to MXFP8 in one pass,
+    so the PyTorch fp32 reference is the correct baseline (not the unfused Triton path
+    which has an intermediate bf16 roundtrip).
+    """
+
+    @pytest.mark.parametrize("M,K", [
+        (1, 32),
+        (4, 64),
+        (16, 128),
+        (32, 256),
+        (64, 128),
+        (128, 128),
+        (128, 256),
+        (128, 2688),
+        (256, 1856),
+        (512, 2688),
+    ])
+    def test_data_matches_pytorch_ref(self, M, K):
+        """Fused FP8 data matches PyTorch squared ReLU + ref_to_mxfp."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        # PyTorch reference: squared ReLU in fp32, then downcast to bf16, then quantize
+        activated_ref = torch.relu(x.float()).pow(2)
+        _, ref_data = ref_to_mxfp(activated_ref)
+
+        # Fused kernel
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+
+        torch.testing.assert_close(
+            fused_result.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0,
+        )
+
+    @pytest.mark.parametrize("M,K", [
+        (1, 32),
+        (16, 128),
+        (128, 128),
+        (128, 2688),
+        (256, 1856),
+    ])
+    def test_scales_match_pytorch_ref(self, M, K):
+        """Fused swizzled scales match PyTorch ref_to_mxfp + ref_swizzle."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        # PyTorch reference
+        activated_ref = torch.relu(x.float()).pow(2)
+        ref_scales_2d, _ = ref_to_mxfp(activated_ref)
+        ref_swizzled = ref_swizzle(ref_scales_2d)
+
+        # Fused kernel
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+
+        torch.testing.assert_close(
+            fused_result.scale.view(torch.uint8),
+            ref_swizzled.view(torch.uint8),
+            atol=0, rtol=0,
+        )
+
+    @pytest.mark.parametrize("M,K,num_padding", [
+        (32, 128, 8),
+        (64, 256, 16),
+        (128, 128, 32),
+        (128, 2688, 64),
+        (256, 1856, 128),
+    ])
+    def test_real_rows_match_pytorch_ref_with_padding(self, M, K, num_padding):
+        """Real rows match PyTorch reference even when padding rows are present."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M, num_padding=num_padding)
+
+        # PyTorch reference (only real rows)
+        real_rows = M - num_padding
+        activated_ref = torch.relu(x[:real_rows].float()).pow(2)
+        _, ref_data = ref_to_mxfp(activated_ref)
+
+        # Fused kernel
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+
+        torch.testing.assert_close(
+            fused_result.data[:real_rows].view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# permute_and_quantize_mxfp8
+# ──────────────────────────────────────────────────────────────────────
+
+class TestPermuteAndQuantizeMxfp8:
+    """Compare fused permute + mxfp8 quantize against PyTorch reference.
+
+    PyTorch reference:
+    1. For each real row, quantize the source token with ref_to_mxfp
+    2. Compare FP8 data per source token
+    Structural checks (permutation_map, probs, offsets) verified independently.
+    """
+
+    def _make_inputs(self, num_tokens, K, topk, num_experts, seed=42):
+        torch.manual_seed(seed)
+        hidden = torch.randn(num_tokens, K, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
+        routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
+        return hidden, probs, routing_map
+
+    @pytest.mark.parametrize("num_tokens,K,topk,num_experts", [
+        (4, 128, 2, 4),
+        (16, 128, 2, 8),
+        (32, 256, 4, 8),
+        (64, 128, 6, 8),
+        (64, 2688, 8, 128),
+        (128, 1856, 4, 32),
+    ])
+    def test_data_matches_pytorch_ref(self, num_tokens, K, topk, num_experts):
+        """For each real row, fused FP8 data matches ref_to_mxfp of the source token."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
+
+        fused_mxfp8, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, alignment=128,
+        )
+
+        # For each real row, quantize the source token with PyTorch ref and compare
+        for i in range(fused_perm_map.shape[0]):
+            src = fused_perm_map[i].item()
+            if src < 0:
+                continue
+            _, ref_data = ref_to_mxfp(hidden[src].unsqueeze(0))
+            torch.testing.assert_close(
+                fused_mxfp8.data[i].view(torch.uint8),
+                ref_data.squeeze(0).view(torch.uint8),
+                atol=0, rtol=0,
+                msg=f"Row {i} (src={src}) FP8 data mismatch vs PyTorch ref",
+            )
+
+    @pytest.mark.parametrize("num_tokens,K,topk,num_experts", [
+        (16, 128, 2, 8),
+        (32, 256, 4, 8),
+        (64, 2688, 8, 128),
+    ])
+    def test_batch_data_matches_pytorch_ref(self, num_tokens, K, topk, num_experts):
+        """Batch comparison: gather all real rows, quantize as batch, compare."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
+
+        fused_mxfp8, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, alignment=128,
+        )
+
+        real_mask = fused_perm_map >= 0
+        real_indices = real_mask.nonzero(as_tuple=True)[0]
+        if len(real_indices) == 0:
+            return
+
+        src_tokens = fused_perm_map[real_indices].long()
+        permuted_bf16 = hidden[src_tokens]
+
+        _, ref_data = ref_to_mxfp(permuted_bf16)
+
+        torch.testing.assert_close(
+            fused_mxfp8.data[real_indices].view(torch.uint8),
+            ref_data.view(torch.uint8),
+            atol=0, rtol=0,
+        )
+
+    @pytest.mark.parametrize("num_tokens,K,topk,num_experts", [
+        (16, 128, 2, 8),
+        (32, 256, 4, 8),
+        (64, 2688, 8, 128),
+    ])
+    def test_correct_token_count(self, num_tokens, K, topk, num_experts):
+        """Number of real rows equals total (token, topk) pairs routed to local experts."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
+
+        _, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, alignment=128,
+        )
+
+        real_count = (fused_perm_map >= 0).sum().item()
+        # All experts are local, so every pair should appear
+        assert real_count == num_tokens * topk
+
+    @pytest.mark.parametrize("num_tokens,K,topk,num_experts,local_start,num_local", [
+        (64, 128, 4, 8, 2, 3),
+        (64, 256, 4, 8, 0, 4),
+        (128, 128, 8, 128, 96, 32),
+    ])
+    def test_expert_subset(self, num_tokens, K, topk, num_experts, local_start, num_local):
+        """Fused kernel correctly handles local expert subsets."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
+
+        _, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, local_start, num_local, alignment=128,
+        )
+
+        real_count = (fused_perm_map >= 0).sum().item()
+        local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
+        expected_count = local_mask.sum().item()
+        assert real_count == expected_count
+
+    def test_returns_mxfp8_tensor(self):
+        """Result is an MXFP8Tensor with correct backend."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        hidden, probs, routing_map = self._make_inputs(16, 128, 2, 4)
+        result, _, _, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, 4, alignment=128,
+        )
+        assert isinstance(result, MXFP8Tensor)
+        assert result.backend == "triton"
+        assert result.data.dtype == torch.float8_e4m3fn
+
+    @pytest.mark.parametrize("alignment", [128])
+    def test_offsets_aligned(self, alignment):
+        """Inclusive offsets are multiples of alignment."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(64, 128, 4, 8)
+        _, _, _, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, 8, alignment=alignment,
+        )
+        for i in range(offs.shape[0]):
+            assert offs[i].item() % alignment == 0, (
+                f"Offset {i}={offs[i].item()} not aligned to {alignment}"
+            )
