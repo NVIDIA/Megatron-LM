@@ -10,7 +10,7 @@ Usage:
     tracker = get_mfu_tracker()
     tracker.add_inference_flops(flops, time_s)
     tracker.add_training_flops(flops, time_s)
-    report = tracker.get_report(gpu_peak_tflops, world_size)
+    report = tracker.get_report(gpu_peak_tflops)
 """
 
 import threading
@@ -97,12 +97,13 @@ class MFUTracker:
             self._iter_logprob_time = 0.0
             self._iter_real_training_tokens = 0
 
-    def get_report(self, gpu_peak_tflops: float, world_size: int) -> dict:
+    def get_report(self, gpu_peak_tflops: float) -> dict:
         """Compute MFU breakdown.
+
+        All FLOPs stored in this tracker are per-GPU.
 
         Args:
             gpu_peak_tflops: Peak BF16 TFLOP/s for one GPU.
-            world_size: Number of GPUs.
 
         Returns:
             dict with keys: inference_tflops, inference_time, inference_mfu,
@@ -124,33 +125,32 @@ class MFUTracker:
         def _mfu(tflops, time_s):
             if time_s <= 0 or gpu_peak_tflops <= 0:
                 return 0.0
-            throughput_per_gpu = tflops / (time_s * world_size)
-            return throughput_per_gpu / gpu_peak_tflops * 100.0
+            return tflops / time_s / gpu_peak_tflops * 100.0
 
-        def _toks_per_sec_per_gpu(tokens, time_s):
+        def _toks_per_sec(tokens, time_s):
             if time_s <= 0:
                 return 0.0
-            return tokens / (time_s * world_size)
+            return tokens / time_s
 
         return {
             'inference_tflops': inf_tflops,
             'inference_time': inf_time,
             'inference_tokens': inf_tokens,
-            'inference_throughput': inf_tflops / (inf_time * world_size) if inf_time > 0 else 0,
+            'inference_throughput': inf_tflops / inf_time if inf_time > 0 else 0,
             'inference_mfu': _mfu(inf_tflops, inf_time),
-            'inference_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(inf_tokens, inf_time),
+            'inference_toks_per_sec_per_gpu': _toks_per_sec(inf_tokens, inf_time),
             'training_tflops': train_tflops,
             'training_time': train_time,
             'training_tokens': train_tokens,
-            'training_throughput': train_tflops / (train_time * world_size) if train_time > 0 else 0,
+            'training_throughput': train_tflops / train_time if train_time > 0 else 0,
             'training_mfu': _mfu(train_tflops, train_time),
-            'training_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(train_tokens, train_time),
+            'training_toks_per_sec_per_gpu': _toks_per_sec(train_tokens, train_time),
             'total_tflops': total_tflops,
             'total_time': total_time,
             'total_tokens': total_tokens,
-            'total_throughput': total_tflops / (total_time * world_size) if total_time > 0 else 0,
+            'total_throughput': total_tflops / total_time if total_time > 0 else 0,
             'total_mfu': _mfu(total_tflops, total_time),
-            'total_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(total_tokens, total_time),
+            'total_toks_per_sec_per_gpu': _toks_per_sec(total_tokens, total_time),
         }
 
 
