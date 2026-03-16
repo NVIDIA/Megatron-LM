@@ -377,10 +377,7 @@ class DynamicInferenceRequest(InferenceRequest):
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            if isinstance(self.prompt_tokens, torch.Tensor):
-                self.remaining_prompt_tokens = self.prompt_tokens.clone()
-            else:
-                self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
 
         # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
         if (
@@ -786,6 +783,8 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
