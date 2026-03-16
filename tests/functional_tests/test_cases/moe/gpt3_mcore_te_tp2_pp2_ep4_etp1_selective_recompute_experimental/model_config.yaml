@@ -126,6 +126,7 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 50
   --overlap-moe-expert-parallel-comm: true
+  --async-save: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
   - "iteration-time"
