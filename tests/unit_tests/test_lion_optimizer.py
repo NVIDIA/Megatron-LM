@@ -60,24 +60,24 @@ class TestLionOptimizerConfig:
     """Tests for Lion config plumbing that do not require emerging_optimizers."""
 
     def test_lion_config_fields_exist(self):
-        """Config should accept lion_beta1, lion_beta2, and muon_nonlinear_optimizer."""
+        """Config should accept lion_beta1, lion_beta2, and muon_scalar_optimizer."""
         config = OptimizerConfig(
             optimizer="lion",
             lr=1e-4,
             lion_beta1=0.92,
             lion_beta2=0.97,
-            muon_nonlinear_optimizer="lion",
+            muon_scalar_optimizer="lion",
         )
         assert config.lion_beta1 == 0.92
         assert config.lion_beta2 == 0.97
-        assert config.muon_nonlinear_optimizer == "lion"
+        assert config.muon_scalar_optimizer == "lion"
 
     def test_lion_config_defaults(self):
         """Config defaults should match expected Lion defaults."""
         config = OptimizerConfig()
         assert config.lion_beta1 == 0.95
         assert config.lion_beta2 == 0.98
-        assert config.muon_nonlinear_optimizer == "adam"
+        assert config.muon_scalar_optimizer == "adam"
 
     @patch("torch.distributed.get_world_size", return_value=1)
     @patch(

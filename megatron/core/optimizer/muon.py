@@ -185,7 +185,7 @@ def get_megatron_muon_optimizer(
     # TODO: Mutating config.optimizer is a side effect; clean up after
     # https://github.com/NVIDIA/Megatron-LM/pull/3638 lands.
     # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
-    config.optimizer = config.muon_nonlinear_optimizer
+    config.optimizer = config.muon_scalar_optimizer
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
@@ -230,7 +230,7 @@ def get_megatron_muon_optimizer(
                     opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
     nonlinear_init_state_fn = (
-        lion_init_state_fn if config.muon_nonlinear_optimizer == 'lion' else adam_init_state_fn
+        lion_init_state_fn if config.muon_scalar_optimizer == 'lion' else adam_init_state_fn
     )
 
     optimizers = []
