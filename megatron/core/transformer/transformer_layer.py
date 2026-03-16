@@ -1433,8 +1433,12 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        for name, attr in self.token_dispatcher_attrs.items():
-            setattr(self.mlp.token_dispatcher, name, attr)
+        for attr_name, attr in self.token_dispatcher_attrs.items():
+            hier_attr_name = attr_name.split('.')
+            obj = self.mlp.token_dispatcher
+            for name in hier_attr_name[:-1]:
+                obj = getattr(obj, name)
+            setattr(obj, hier_attr_name[-1], attr)
 
         self.mlp.fwd_execution_map = "expert_compute"
         return self.mlp(None, intermediate_tensors=(hidden_states, probs))
