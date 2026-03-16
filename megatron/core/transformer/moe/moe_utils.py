@@ -1286,9 +1286,11 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         int: The alignment size for quantization.
     """
     if config.fp8:
-        return get_fp8_align_size(config.fp8_recipe)
+        # CUTLASS kernel for MXFP8 grouped GEMM assumes 256 alignment
+        return 256
     elif config.fp4:
-        return get_fp4_align_size(config.fp4_recipe)
+        # CUTLASS kernel for NVFP4 grouped GEMM assumes 256 alignment
+        return 256
     return 16
 
 
