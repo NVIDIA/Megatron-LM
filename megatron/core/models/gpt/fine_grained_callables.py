@@ -433,6 +433,12 @@ class _BackwardDWWrapper:
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
     def parameters(self):
+        """Returns an iterator over module parameters.
+
+        This method mimics the behavior of torch.nn.Module.parameters() by yielding
+        all parameters from the submodules managed by this wrapper. It is used to
+        collect parameters that require gradient computation during the backward pass.
+        """
         for module in self.submodules:
             for param in module.parameters():
                 yield param
