@@ -2187,8 +2187,8 @@ def training_log(
             # Per-iteration toks/s/GPU breakdown (uses real tokens when seq packing is active)
             train_tps = effective_tokens / (training_only_time * ws) if training_only_time > 0 else 0.0
             inf_tps = iter_inference_tokens / (iter_inference_time * ws) if iter_inference_time > 0 else 0.0
-            total_tps = (effective_tokens + iter_inference_tokens) / (elapsed_time_per_iteration * ws)
-            e2e_tps = effective_tokens / (elapsed_time_per_iteration * ws)
+            total_tps = (effective_tokens + iter_inference_tokens) / (elapsed_time_per_iteration * ws) if elapsed_time_per_iteration > 0 else 0.0
+            e2e_tps = effective_tokens / (elapsed_time_per_iteration * ws) if elapsed_time_per_iteration > 0 else 0.0
 
             if has_tracker:
                 log_string += (

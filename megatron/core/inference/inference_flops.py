@@ -226,6 +226,7 @@ class InferenceFLOPsCalculator:
             mamba_head_dim=getattr(args, 'mamba_head_dim', 64) or 64,
             mamba_state_dim=getattr(args, 'mamba_state_dim', 128) or 128,
             mamba_num_groups=getattr(args, 'mamba_num_groups', 8) or 8,
+            d_conv=getattr(args, 'mamba_d_conv', 4) or 4,
             num_experts=getattr(args, 'num_experts', 0) or 0,
             moe_router_topk=getattr(args, 'moe_router_topk', 1) or 1,
             moe_ffn_hidden_size=getattr(args, 'moe_ffn_hidden_size', 0) or 0,
