@@ -510,9 +510,7 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.debug(
-            f"PersistentAsyncCaller: {_get_rank_or_unknown()}, Destroying Async Caller"
-        )
+        logger.debug(f"PersistentAsyncCaller: {_get_rank_or_unknown()}, Destroying Async Caller")
         if self.process:
             if abort:
                 log_single_rank(
