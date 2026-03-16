@@ -2162,7 +2162,9 @@ def training_log(
                 try:
                     from megatron.training.mfu_tracker import get_mfu_tracker
                     tracker = get_mfu_tracker()
-                    training_flops = num_floating_point_operations(args, batch_size)
+                    # num_floating_point_operations returns cluster-total FLOPs;
+                    # normalize to per-GPU to match inference FLOPs (already per-GPU).
+                    training_flops = num_floating_point_operations(args, batch_size) / args.world_size
                     iter_inference_time = tracker.get_iter_inference_time()
                     iter_inference_flops = tracker.get_iter_inference_flops()
                     iter_inference_tokens = tracker.get_iter_inference_tokens()
@@ -2204,14 +2206,15 @@ def training_log(
                 if has_tracker:
                     if iter_inference_time > 0:
                         inference_mfu = (
-                            iter_inference_flops / (iter_inference_time * ws)
+                            iter_inference_flops / iter_inference_time
                             / 1e12 / args._gpu_peak_tflops * 100.0
                         )
-                    total_mfu = (
-                        (training_flops + iter_inference_flops)
-                        / (elapsed_time_per_iteration * ws)
-                        / 1e12 / args._gpu_peak_tflops * 100.0
-                    )
+                    if elapsed_time_per_iteration > 0:
+                        total_mfu = (
+                            (training_flops + iter_inference_flops)
+                            / elapsed_time_per_iteration
+                            / 1e12 / args._gpu_peak_tflops * 100.0
+                        )
                     log_string += (
                         f', infer {inference_mfu:.1f}%'
                         f', total {total_mfu:.1f}%'
