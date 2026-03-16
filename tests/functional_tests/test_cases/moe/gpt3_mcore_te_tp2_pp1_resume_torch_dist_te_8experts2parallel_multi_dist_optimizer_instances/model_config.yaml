@@ -60,4 +60,5 @@ MODEL_ARGS:
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
   --num-distributed-optimizer-instances: 2
+  --async-save: true
 TEST_TYPE: ckpt-resume
