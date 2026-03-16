@@ -100,6 +100,7 @@ class TestMambaMetadata:
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -124,6 +125,7 @@ class TestMambaMetadata:
             [0, 1, -1, -1], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -144,6 +146,7 @@ class TestMambaMetadata:
         # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+
         assert metadata_context.batch_indices_chunked_prefill is None
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.cu_seqlens is None
@@ -242,7 +245,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 30], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -288,7 +291,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [1, 1], dtype=torch.int32, device=metadata_context.device
+            [1, 10], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -334,7 +337,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [1, 2], dtype=torch.int32, device=metadata_context.device
+            [1, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -375,7 +378,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
-            [2, 2], dtype=torch.int32, device=metadata_context.device
+            [2, 60], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
@@ -426,3 +429,51 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.device_chunked_prefill, expected_device_chunked_prefill)
 
         assert metadata_context.device_decode_prefill is None
+
+    # -------------------------------------------------------------------------
+    # Scenario 5: Paused Requests (Absolute vs Relative Indices)
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_with_paused_requests_absolute_indices(self, metadata_context):
+        """
+        Test that seq_idx correctly normalizes to 0-based indices when paused
+        requests exist, meaning absolute request IDs are > 0.
+        """
+        # Simulate 2 paused requests, meaning active requests start at index 2
+        # We'll use 2 active prefill requests of lengths 10 and 20.
+        paused_request_count = 2
+        seq_lengths = [10, 20]
+
+        # Absolute request indices: 2 and 3
+        token_to_req = [2] * 10 + [3] * 20
+        token_to_req_tensor = torch.tensor(
+            token_to_req, dtype=torch.int32, device=metadata_context.device
+        )
+
+        # Active mamba slots matching the absolute request IDs
+        active_mamba_indices = torch.tensor(
+            [2, 3], dtype=torch.int32, device=metadata_context.device
+        )
+
+        # cu_seqlens is always local to the active slice passed in
+        cu_seqlens = torch.tensor([0, 10, 30], dtype=torch.int32, device=metadata_context.device)
+
+        dims = InferenceBatchDimensions(token_count=30, prefill_req_count=2, decode_req_count=0)
+
+        metadata_context.update(
+            active_mamba_indices=active_mamba_indices,
+            token_to_request_idx=token_to_req_tensor,
+            cu_seqlens=cu_seqlens,
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+        )
+
+        # The key assertion: seq_idx should be strictly 0-based relative
+        # to the buffer (0s and 1s), despite the absolute request IDs being 2 and 3.
+        expected_seq_idx_0 = torch.zeros((1, 10), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx_1 = torch.ones((1, 20), dtype=torch.int32, device=metadata_context.device)
+        expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
+
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)

@@ -1,0 +1,60 @@
+name: Claude Complexity Label
+
+on:
+  pull_request_target:
+    types: [ready_for_review]
+
+jobs:
+  label-complexity:
+    name: Label PR Complexity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Complexity Analysis
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.PAT }}
+          prompt: |
+            REPO: ${{ env.REPO }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
+
+            You are a PR complexity analyzer. Your job is to analyze the diff of this PR and apply exactly one complexity label.
+
+            STEPS:
+            1. Get the PR diff by running: gh pr diff $PR_NUMBER --repo $REPO
+            2. Analyze every changed line (added or removed) in the diff and classify each as one of:
+               - "docs-only": changes to docstrings, comments (lines starting with # or //), documentation files (.md, .rst, .txt), or similar non-functional text
+               - "test": changes in test files (files with "test" in the name/path, or inside a tests/ directory)
+               - "real code": all other changes (functional source code)
+            3. Compute "real code line changes" using this formula:
+               real_code_line_changes = (number of real code lines changed) + (number of test lines changed / 10)
+               Count both added and removed lines. Do not count unchanged context lines. Do not count comments or docstrings.
+            4. Remove any previously applied complexity or docs-only labels:
+               gh pr edit $PR_NUMBER --repo $REPO --remove-label "complexity: low,complexity: medium,complexity: high,docs-only"
+            5. Apply exactly ONE label using the gh CLI:
+               - If there are ZERO real code lines and ZERO test lines (only docs-only changes), apply label "docs-only":
+                 gh pr edit $PR_NUMBER --repo $REPO --add-label "docs-only"
+               - If real_code_line_changes < 100, apply label "complexity: low":
+                 gh pr edit $PR_NUMBER --repo $REPO --add-label "complexity: low"
+               - If real_code_line_changes >= 100 and < 500, apply label "complexity: medium":
+                 gh pr edit $PR_NUMBER --repo $REPO --add-label "complexity: medium"
+               - If real_code_line_changes >= 500, apply label "complexity: high":
+                 gh pr edit $PR_NUMBER --repo $REPO --add-label "complexity: high"
+
+            Do NOT post any comments on the PR. Only apply the label.
+          claude_args: |
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr view:*)"
