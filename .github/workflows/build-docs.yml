@@ -12,50 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Copyright check
+name: Build docs
 
 on:
   push:
     branches:
+      - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
-  merge_group:
-    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
-    if: github.repository == 'NVIDIA/Megatron-LM'
 
-  copyright-check:
+  build-docs:
     needs: [pre-flight]
-    if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
-      || needs.pre-flight.outputs.is_merge_group == 'true'
-      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-      && github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.66.7
+    if: needs.pre-flight.outputs.is_deployment_workflow != 'true'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
-  copyright-check-summary:
-    needs: [pre-flight, copyright-check]
+  build-docs-summary:
+    needs: [pre-flight, build-docs]
     if: |
       (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || always()
       )
       && !cancelled()
-      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Result
+      - name: Get workflow result
+        id: result
+        shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
+          RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
