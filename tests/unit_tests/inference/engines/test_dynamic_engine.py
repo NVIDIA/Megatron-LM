@@ -8,6 +8,7 @@ import types
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
+from unittest import mock
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -40,6 +42,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
@@ -123,6 +126,7 @@ class DynamicEngineTestConfig:
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
+    enable_prefix_caching: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
         default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
@@ -138,19 +142,22 @@ class DynamicEngineTestConfig:
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
-
-    fp8: bool = False
+    num_speculative_tokens: int = 0
 
     def __post_init__(self):
 
         # Compute max_sequence_length.
-        assert self.max_sequence_length is None
-        assert self.num_tokens_to_generate is None or self.num_tokens_total is None
-        if self.num_tokens_to_generate is not None:
-            self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
-        else:
-            assert self.num_tokens_total is not None
-            self.max_sequence_length = self.num_tokens_total
+        if self.max_sequence_length is None:
+            assert self.num_tokens_to_generate is None or self.num_tokens_total is None
+            if self.num_tokens_to_generate is not None:
+                self.max_sequence_length = (
+                    self.max_prompt_length
+                    + self.num_tokens_to_generate
+                    + self.num_speculative_tokens
+                )
+            else:
+                assert self.num_tokens_total is not None
+                self.max_sequence_length = self.num_tokens_total + self.num_speculative_tokens
 
         # Default paused buffer size.
         if self.context_paused_buffer_size_gb is None:
@@ -258,10 +265,12 @@ class TestDynamicInferenceEngine:
                 ),
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
+                num_speculative_tokens=test_config.num_speculative_tokens,
             ),
         )
 
@@ -295,6 +304,7 @@ class TestDynamicInferenceEngine:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
+                mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
@@ -336,6 +346,14 @@ class TestDynamicInferenceEngine:
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec()
 
+            # MTP block spec (needed for speculative decoding).
+            mtp_block_spec = None
+            if test_config.num_speculative_tokens > 0:
+                use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
+                mtp_block_spec = get_gpt_mtp_block_spec(
+                    config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
+                )
+
             # GPT model.
             model = GPTModel(
                 config=transformer_config,
@@ -345,6 +363,7 @@ class TestDynamicInferenceEngine:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                mtp_block_spec=mtp_block_spec,
             ).cuda()
         elif test_config.model_provider == "mamba":
             pp_size = test_config.pipeline_model_parallel_size
@@ -354,6 +373,7 @@ class TestDynamicInferenceEngine:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+                mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 mamba_num_heads=16,
                 num_attention_heads=16,
@@ -389,8 +409,9 @@ class TestDynamicInferenceEngine:
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
-                hybrid_attention_ratio=0.3,
-                hybrid_mlp_ratio=0.3,
+                hybrid_layer_pattern=(
+                    "M*-" if pp_size == 1 else "M*-|M*-"
+                ),  # 3 or 6 layers (2 PP stages)
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
@@ -455,7 +476,7 @@ class TestDynamicInferenceEngine:
         # Suspend + resume.
         if (
             env.config.suspend_resume_interval is not None
-            and env.engine.step_count % env.config.suspend_resume_interval == 0
+            and env.engine.context.step_count % env.config.suspend_resume_interval == 0
         ):
             suspend_resume_mems = {}
             suspend_resume_mems["start"] = torch.cuda.memory_stats()
@@ -463,7 +484,7 @@ class TestDynamicInferenceEngine:
             suspend_resume_mems["mid"] = torch.cuda.memory_stats()
             env.engine.resume()  # resume.
             suspend_resume_mems["end"] = torch.cuda.memory_stats()
-            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+            env.mem_usage["suspend_resume"][env.engine.context.step_count] = suspend_resume_mems
 
         # Nothing done?
         finished_request_records = result["finished_request_records"]
@@ -1532,26 +1553,45 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
-    def test_chunked_prefill_with_log_probs(self):
+    def test_chunked_prefill_with_log_probs(
+        self, materialize_only_last_token_logits: bool, skip_prompt_log_probs: bool
+    ):
         """
-        Test that chunked prefill correctly handles log probs with materialize_only_last_token_logits.
-        This verifies that intermediate log probs are properly discarded during chunked prefill.
+        Test that chunked prefill correctly handles log probs across all branches
+        of the log-prob accumulation logic.
         When materialize_only_last_token_logits=True, skip_prompt_log_probs must be True.
         """
+        if materialize_only_last_token_logits and not skip_prompt_log_probs:
+            with pytest.raises(AssertionError, match="only last token logits are materialized"):
+                self._run_test(
+                    num_requests=1,
+                    min_prompt_length=1200,
+                    max_prompt_length=1200,
+                    num_tokens_to_generate=8,
+                    materialize_only_last_token_logits=True,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    model_provider="gpt",
+                    context_block_size_tokens=256,
+                    context_max_tokens=1000,
+                    enable_chunked_prefill=True,
+                )
+            return
+
         prompt_length = 1200
         num_tokens_to_generate = 8
 
-        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True
-        # This is the only valid combination for chunked prefill with last-token-only logits
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
             max_prompt_length=prompt_length,
             num_tokens_to_generate=num_tokens_to_generate,
-            materialize_only_last_token_logits=True,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             return_log_probs=True,
-            skip_prompt_log_probs=True,
+            skip_prompt_log_probs=skip_prompt_log_probs,
             model_provider="gpt",
             context_block_size_tokens=256,
             context_max_tokens=1000,
@@ -1572,11 +1612,17 @@ class TestDynamicInferenceEngine:
                 f"generated log probs, got {len(request.generated_log_probs)}"
             )
 
-            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
-            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
-                f"Request {request.request_id}: prompt_log_probs should be empty when "
-                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
-            )
+            if skip_prompt_log_probs:
+                assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                    f"Request {request.request_id}: prompt_log_probs should be empty when "
+                    f"skip_prompt_log_probs=True, but got "
+                    f"{len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
+                )
+            else:
+                assert len(request.prompt_log_probs) == prompt_length - 1, (
+                    f"Request {request.request_id}: Expected {prompt_length - 1} "
+                    f"prompt log probs, got {len(request.prompt_log_probs)}"
+                )
 
             # Validate each generated log prob
             for i, log_prob in enumerate(request.generated_log_probs):
@@ -1733,7 +1779,7 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.step_count
+        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
@@ -1773,7 +1819,7 @@ class TestDynamicInferenceEngine:
         engine = env.engine
         context = engine.context
 
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         deallocates = kv_cache_management_mode != "persist"
@@ -1796,7 +1842,7 @@ class TestDynamicInferenceEngine:
 
         # Suspend.
         engine.suspend()
-        assert engine.is_suspended
+        assert engine.state == EngineState.SUSPENDED
         assert not context.is_tensor_state_allocated
 
         gc.collect()
@@ -1826,7 +1872,7 @@ class TestDynamicInferenceEngine:
 
         # Resume.
         engine.resume()
-        assert not engine.is_suspended
+        assert engine.state != EngineState.SUSPENDED
         assert context.is_tensor_state_allocated
 
         if deallocates and not uses_tms:

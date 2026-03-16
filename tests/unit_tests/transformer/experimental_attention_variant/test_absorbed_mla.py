@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
-from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import pytest
@@ -22,6 +21,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
@@ -125,9 +125,9 @@ def get_mock_mla_config(
     context_parallel_size: int,
     sequence_parallel: bool,
     recompute_mla_up_proj: bool,
-) -> SimpleNamespace:
+) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
-    return SimpleNamespace(
+    return MLATransformerConfig(
         multi_latent_attention=True,
         hidden_size=7168,
         num_attention_heads=128,
@@ -234,7 +234,6 @@ def get_mla_submodules(
 # TODO: Consider using get_gpt_layer_with_transformer_engine_spec from
 #       megatron.core.models.gpt.gpt_layer_specs to simplify submodule setup and cover real specs.
 # TODO: Add test case to cover TP > 1 but SP = False.
-
 
 @pytest.mark.parametrize("tp_cp_sp", [[1, 1, False], [2, 1, True], [1, 2, False], [2, 2, True]])
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
