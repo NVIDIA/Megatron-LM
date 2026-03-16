@@ -9,6 +9,7 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
+    are_tensors_nvls_eligible,
     fused_multimem_rs_add_norm_ag,
     multimem_all_gather,
     multimem_reduce_scatter,
@@ -16,7 +17,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer_tp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -108,6 +109,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
+        self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
+
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
@@ -120,7 +123,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         symm_mem_buffer_dims = list(x.size())
         symm_mem_buffer_dims[0] *= self.tp_size
-        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
+        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
         )
         return symm_mem_buffer
@@ -133,16 +136,14 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.tp_size == 1:
             return x
 
-        # 1. check if bf16
-        is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if hopper or newer
-        is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        # 3. check if symmetric memory buffer is available
-        has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
-        can_use_custom_nvls_collectives = (
-            is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
+        # Check input only: if input is 16-byte divisible, the output
+        # (world_size * input) is too.
+        can_use_nvls = (
+            self.triton_nvls_kernels_allowed
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
         )
-        if can_use_custom_nvls_collectives:
+        if can_use_nvls:
             # do multimem all gather
             multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
             return symm_mem_buffer["tensor"]
@@ -221,6 +222,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
+        self.triton_nvls_kernels_allowed = not getattr(
+            config, 'inference_disable_triton_nvls_kernels', False
+        )
+
         # Placeholder for next layer norm weights for fused
         # reduce-scatter + add + rms-norm + all-gather
         self.next_layer_norm_weights = None
@@ -233,27 +238,27 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
-        # 1. check if bf16
-        is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if mxfp8
         use_mxfp8 = self.config.fp8_recipe == "mxfp8"
-        # 3. check if hopper or newer
-        is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        # 4. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
             # Remove batch dimension for FlashInfer mxfp8
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
-        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
+        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
         )
-        has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
-        can_use_custom_nvls_collectives = (
-            is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
+
+        # RS requires bf16 (hardware multimem reduce is bf16-only).
+        # Check the matmul output shape: if it is NVLS-eligible, the RS output
+        # (world_size times smaller on dim 0) is too.
+        can_use_nvls = (
+            self.triton_nvls_kernels_allowed
+            and x.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
         )
 
-        if can_use_custom_nvls_collectives:
+        if can_use_nvls:
             # Write output of matmul directly onto the symmetric memory buffer
 
             x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
