@@ -398,7 +398,7 @@ class MambaModel(LanguageModule):
                 and inference_context.num_speculative_tokens > 0
             )
 
-        mtp_forward_ran = self.mtp_process and not is_spec_decode
+        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -414,7 +414,7 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and (mtp_forward_ran or is_spec_decode):
+        if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
