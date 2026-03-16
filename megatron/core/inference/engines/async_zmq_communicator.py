@@ -99,7 +99,10 @@ class AsyncZMQCommunicator:
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
             self.bcast_sock.send(struct.pack(fmt, *maxes))
             if not async_op:
-                await asyncio.sleep(0)  # Yield control once to ensure that other coroutines can run. This might be needed for colocated RL.
+                await asyncio.sleep(
+                    0
+                )  # Yield control once to ensure that other coroutines can run.
+                # This might be needed for colocated RL.
             return maxes[0] if n == 1 else maxes
 
         else:
@@ -113,12 +116,13 @@ class AsyncZMQCommunicator:
                         msg = self.bcast_sock.recv()
                     result = struct.unpack(fmt, msg)
                     if not async_op:
-                        await asyncio.sleep(0)  # Yield control once to ensure that other coroutines can run. This might be needed for colocated RL.
+                        await asyncio.sleep(
+                            0
+                        )  # Yield control once to ensure that other coroutines can run.
+                        # This might be needed for colocated RL.
                     return result[0] if n == 1 else result
                 except zmq.Again:
                     await asyncio.sleep(0.001)
-        
-        
 
     def close(self):
         """

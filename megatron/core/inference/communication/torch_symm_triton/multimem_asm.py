@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# pylint: disable=line-too-long
 
 # Adapted from https://github.com/yifuwang/symm-mem-recipes.git
 
@@ -76,7 +77,7 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
                     .reg .pred %p0;
                     setp.ne.s32 %p0, $5, 1;
                     @%p0 bra end;
-                    multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
+                    multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4]; # pylint: disable=line-too-long
                     end:
                 }
                 """,

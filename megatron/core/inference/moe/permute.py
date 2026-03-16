@@ -11,7 +11,6 @@ Includes:
 from unittest.mock import MagicMock
 
 import torch
-from packaging import version
 
 from megatron.core.utils import null_decorator
 
@@ -35,12 +34,12 @@ def _ceil_div(a, b):
 
 @triton.jit
 def _count_local_tokens_kernel(
-    routing_map_ptr,            # [num_tokens * topk] flattened expert assignments
-    tokens_per_expert_ptr,      # [num_local_experts] output counters (zeroed by caller)
-    total_pairs,                # num_tokens * topk — total (token, topk) pairs
-    local_expert_start,         # first global expert index owned by this rank
+    routing_map_ptr,  # [num_tokens * topk] flattened expert assignments
+    tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
+    total_pairs,  # num_tokens * topk — total (token, topk) pairs
+    local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
-    BLOCK_SIZE: tl.constexpr,         # number of pairs processed per program
+    BLOCK_SIZE: tl.constexpr,  # number of pairs processed per program
 ):
     """Count tokens routed to experts on this rank, ignoring tokens routed elsewhere.
 
@@ -59,29 +58,31 @@ def _count_local_tokens_kernel(
 
 
 def compute_local_tokens_per_expert(
-    routing_map: torch.Tensor, local_expert_start: int, num_local_experts: int,
+    routing_map: torch.Tensor, local_expert_start: int, num_local_experts: int
 ) -> torch.Tensor:
     """Count tokens routed to each local expert."""
     total_pairs = routing_map.numel()
-    tokens_per_expert = torch.zeros(
-        num_local_experts, dtype=torch.int32, device=routing_map.device,
-    )
+    tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
     BLOCK = 256
     _count_local_tokens_kernel[(_ceil_div(total_pairs, BLOCK),)](
-        routing_map, tokens_per_expert, total_pairs,
-        local_expert_start, num_local_experts, BLOCK_SIZE=BLOCK,
+        routing_map,
+        tokens_per_expert,
+        total_pairs,
+        local_expert_start,
+        num_local_experts,
+        BLOCK_SIZE=BLOCK,
     )
     return tokens_per_expert
 
 
 @triton.jit
 def _prefix_sum_kernel(
-    tokens_per_expert_ptr,      # [num_local_experts] raw token counts
-    exclusive_offsets_ptr,      # [num_local_experts] output: exclusive prefix sum of aligned counts
-    inclusive_offsets_ptr,       # [num_local_experts] output: inclusive prefix sum of aligned counts
-    num_local_experts,          # number of experts on this rank
-    alignment: tl.constexpr,    # per-expert alignment (counts rounded up to this multiple)
-    BLOCK_SIZE: tl.constexpr,   # next_power_of_2(num_local_experts) for tl.cumsum
+    tokens_per_expert_ptr,  # [num_local_experts] raw token counts
+    exclusive_offsets_ptr,  # [num_local_experts] output: exclusive prefix sum of aligned counts
+    inclusive_offsets_ptr,  # [num_local_experts] output: inclusive prefix sum of aligned counts
+    num_local_experts,  # number of experts on this rank
+    alignment: tl.constexpr,  # per-expert alignment (counts rounded up to this multiple)
+    BLOCK_SIZE: tl.constexpr,  # next_power_of_2(num_local_experts) for tl.cumsum
 ):
     """Exclusive and inclusive prefix sums of aligned token counts.
 
@@ -100,15 +101,17 @@ def _prefix_sum_kernel(
     tl.store(inclusive_offsets_ptr + r, inc, mask=mask)
 
 
-def compute_expert_offsets(
-    tokens_per_expert: torch.Tensor, alignment: int = 1,
-) -> tuple:
+def compute_expert_offsets(tokens_per_expert: torch.Tensor, alignment: int = 1) -> tuple:
     """Compute exclusive and inclusive prefix sums of aligned token counts."""
     n = tokens_per_expert.shape[0]
     exclusive_cumsum = torch.empty_like(tokens_per_expert)
     inclusive_cumsum = torch.empty_like(tokens_per_expert)
     _prefix_sum_kernel[(1,)](
-        tokens_per_expert, exclusive_cumsum, inclusive_cumsum, n, alignment,
+        tokens_per_expert,
+        exclusive_cumsum,
+        inclusive_cumsum,
+        n,
+        alignment,
         BLOCK_SIZE=triton.next_power_of_2(n),
     )
     return exclusive_cumsum, inclusive_cumsum
@@ -116,19 +119,20 @@ def compute_expert_offsets(
 
 @triton.jit
 def _permute_tokens_kernel(
-    hidden_ptr,         # [num_tokens, hidden_dim] input hidden states
-    probs_ptr,          # [num_tokens, topk] routing probabilities
-    routing_map_ptr,    # [num_tokens, topk] expert assignments (global IDs)
-    out_hidden_ptr,     # [output_size, hidden_dim] output: permuted hidden states
-    out_probs_ptr,      # [output_size] output: permuted probabilities
-    out_src_idx_ptr,    # [output_size] output: permutation_map (original token index, -1 for padding)
-    counters_ptr,       # [num_local_experts] exclusive offsets, atomically incremented to assign positions
-    num_tokens,         # number of input tokens
-    hidden_dim,         # hidden dimension
-    topk: tl.constexpr,              # number of expert choices per token
-    local_expert_start,               # first global expert index on this rank
+    hidden_ptr,  # [num_tokens, hidden_dim] input hidden states
+    probs_ptr,  # [num_tokens, topk] routing probabilities
+    routing_map_ptr,  # [num_tokens, topk] expert assignments (global IDs)
+    out_hidden_ptr,  # [output_size, hidden_dim] output: permuted hidden states
+    out_probs_ptr,  # [output_size] output: permuted probabilities
+    out_src_idx_ptr,  # [output_size] output: permutation_map (original token index, -1 for padding)
+    counters_ptr,  # [num_local_experts] exclusive offsets,
+    # atomically incremented to assign positions
+    num_tokens,  # number of input tokens
+    hidden_dim,  # hidden dimension
+    topk: tl.constexpr,  # number of expert choices per token
+    local_expert_start,  # first global expert index on this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
-    BLOCK_H: tl.constexpr,           # tile size for copying hidden_dim
+    BLOCK_H: tl.constexpr,  # tile size for copying hidden_dim
 ):
     """Permute tokens into expert-grouped order.
 
@@ -153,17 +157,22 @@ def _permute_tokens_kernel(
     for h in tl.range(0, hidden_dim, BLOCK_H):
         o = h + tl.arange(0, BLOCK_H)
         m = o < hidden_dim
-        tl.store(out_hidden_ptr + pos * hidden_dim + o,
-                 tl.load(hidden_ptr + tok * hidden_dim + o, mask=m), mask=m)
+        tl.store(
+            out_hidden_ptr + pos * hidden_dim + o,
+            tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+            mask=m,
+        )
     tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
     # Record source token index for unpermute
     tl.store(out_src_idx_ptr + pos, tok)
 
 
 def permute_tokens(
-    hidden_states: torch.Tensor, probs: torch.Tensor,
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
     routing_map: torch.Tensor,
-    local_expert_start: int, num_local_experts: int,
+    local_expert_start: int,
+    num_local_experts: int,
     alignment: int = 1,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
@@ -194,7 +203,7 @@ def permute_tokens(
     # Count how many (token, topk) pairs are routed to each local expert.
     # Non-local experts are ignored. Result is [num_local_experts] int32.
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts,
+        routing_map, local_expert_start, num_local_experts
     )
 
     # exclusive_expert_offsets[i] = start of expert i's block in the padded output.
@@ -202,33 +211,41 @@ def permute_tokens(
     # inclusive_expert_offsets[i] = end of expert i's block (= start of expert i+1).
     #   Passed as `offs` to grouped_mm / scaled_grouped_mm to delimit expert boundaries.
     exclusive_expert_offsets, inclusive_expert_offsets = compute_expert_offsets(
-        tokens_per_expert, alignment=alignment,
+        tokens_per_expert, alignment=alignment
     )
-    output_size = (
-        num_tokens * min(topk, num_local_experts)
-        + alignment * num_local_experts
-    )
+    output_size = num_tokens * min(topk, num_local_experts) + alignment * num_local_experts
 
-    permuted_hidden = torch.empty(output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    permuted_hidden = torch.empty(
+        output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
+    )
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
     permutation_map = torch.full((output_size,), -1, dtype=torch.int32, device=probs.device)
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     _permute_tokens_kernel[(num_tokens * topk,)](
-        hidden_states, probs, routing_map,
-        permuted_hidden, permuted_probs, permutation_map,
-        exclusive_expert_offsets, num_tokens, hidden_dim, topk,
-        local_expert_start, num_local_experts, BLOCK_H=BLOCK_H,
+        hidden_states,
+        probs,
+        routing_map,
+        permuted_hidden,
+        permuted_probs,
+        permutation_map,
+        exclusive_expert_offsets,
+        num_tokens,
+        hidden_dim,
+        topk,
+        local_expert_start,
+        num_local_experts,
+        BLOCK_H=BLOCK_H,
     )
     return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
 
 
 @triton.jit
 def _unpermute_tokens_kernel(
-    expert_out_ptr,     # [output_size, hidden_dim] expert outputs in permuted order
-    probs_ptr,          # [output_size] fp32 routing probabilities (permuted)
-    src_idx_ptr,        # [output_size] permutation_map: original token index, or -1 for padding
-    output_ptr,         # [num_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
-    hidden_dim,         # hidden dimension
+    expert_out_ptr,  # [output_size, hidden_dim] expert outputs in permuted order
+    probs_ptr,  # [output_size] fp32 routing probabilities (permuted)
+    src_idx_ptr,  # [output_size] permutation_map: original token index, or -1 for padding
+    output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
+    hidden_dim,  # hidden dimension
     BLOCK_H: tl.constexpr,  # tile size for processing hidden_dim
 ):
     """Scatter weighted expert outputs back to original token positions.
@@ -250,34 +267,42 @@ def _unpermute_tokens_kernel(
         v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
         tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
 
+
 def unpermute_tokens(
-    expert_output: torch.Tensor, permuted_probs: torch.Tensor,
-    permutation_map: torch.Tensor, num_tokens: int,
+    expert_output: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    permutation_map: torch.Tensor,
+    num_tokens: int,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
     Accumulates in fp32 to avoid precision loss from multiple topk atomic adds.
     Returns fp32 output.
     """
-    assert permuted_probs.dtype == torch.float32, (
-        f"permuted_probs must be fp32, got {permuted_probs.dtype}"
-    )
+    assert (
+        permuted_probs.dtype == torch.float32
+    ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
     output_size, hidden_dim = expert_output.shape
     output = torch.zeros(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     _unpermute_tokens_kernel[(output_size,)](
-        expert_output, permuted_probs, permutation_map,
-        output, hidden_dim, BLOCK_H=BLOCK_H,
+        expert_output, permuted_probs, permutation_map, output, hidden_dim, BLOCK_H=BLOCK_H
     )
     return output
 
 
 @triton.jit
 def _permute_quantize_mxfp8_kernel(
-    hidden_ptr, probs_ptr, routing_map_ptr,
-    out_fp8_ptr, out_scale_ptr, out_probs_ptr, out_src_idx_ptr,
+    hidden_ptr,
+    probs_ptr,
+    routing_map_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    out_probs_ptr,
+    out_src_idx_ptr,
     counters_ptr,
-    num_tokens, K,
+    num_tokens,
+    K,
     n_col_blocks,
     topk: tl.constexpr,
     local_expert_start,
@@ -384,18 +409,15 @@ def permute_and_quantize_mxfp8(
 
     # Count how many (token, topk) pairs are routed to each local expert.
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts,
+        routing_map, local_expert_start, num_local_experts
     )
 
     # exclusive_expert_offsets[i] = start of expert i's block in the padded output.
     # inclusive_expert_offsets[i] = end of expert i's block (= start of expert i+1).
     exclusive_expert_offsets, inclusive_expert_offsets = compute_expert_offsets(
-        tokens_per_expert, alignment=alignment,
+        tokens_per_expert, alignment=alignment
     )
-    output_size = (
-        num_tokens * min(topk, num_local_experts)
-        + alignment * num_local_experts
-    )
+    output_size = num_tokens * min(topk, num_local_experts) + alignment * num_local_experts
 
     scale_cols = K // 32
     n_row_blocks = _ceil_div(output_size, 128)
@@ -411,19 +433,26 @@ def permute_and_quantize_mxfp8(
     BLOCK_GROUPS = BLOCK_K // 32
 
     _permute_quantize_mxfp8_kernel[(num_tokens * topk,)](
-        hidden_states, probs, routing_map,
-        out_fp8, out_scale, permuted_probs, permutation_map,
+        hidden_states,
+        probs,
+        routing_map,
+        out_fp8,
+        out_scale,
+        permuted_probs,
+        permutation_map,
         exclusive_expert_offsets,
-        num_tokens, K, n_col_blocks,
-        topk, local_expert_start, num_local_experts,
+        num_tokens,
+        K,
+        n_col_blocks,
+        topk,
+        local_expert_start,
+        num_local_experts,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
     )
 
     permuted_mxfp8 = MXFP8Tensor(
-        data=out_fp8,
-        scale=out_scale.view(torch.float8_e8m0fnu),
-        backend="triton",
+        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton"
     )
     return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets

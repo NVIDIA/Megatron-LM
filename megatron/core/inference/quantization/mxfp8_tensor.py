@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 
 try:
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
@@ -14,7 +12,9 @@ try:
 except ImportError:
     HAVE_FLASHINFER = False
 
-from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize as mcore_mxfp8_quantize
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    mxfp8_quantize as mcore_mxfp8_quantize,
+)
 
 
 def _ceil_div(a, b):
@@ -25,7 +25,7 @@ def _ceil_div(a, b):
 class MXFP8Tensor:
     """MXFP8 tensor wrapper storing quantized fp8_e4m3 data and swizzled e8m0 scales."""
 
-    data: torch.Tensor   # [M, K] fp8_e4m3fn
+    data: torch.Tensor  # [M, K] fp8_e4m3fn
     scale: torch.Tensor  # 1D, swizzled cuBLAS blocked layout, e8m0
     backend: Optional[str] = None  # quantization backend: 'flashinfer' or 'triton'
 

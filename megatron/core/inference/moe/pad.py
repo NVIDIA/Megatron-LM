@@ -35,9 +35,12 @@ from megatron.core.inference.moe.permute import compute_expert_offsets
 
 @triton.jit
 def _pad_tokens_kernel(
-    src_ptr, dst_ptr, perm_map_ptr,
+    src_ptr,
+    dst_ptr,
+    perm_map_ptr,
     tpe_ptr,  # tokens_per_expert [num_experts]
-    hidden_dim, num_experts: tl.constexpr,
+    hidden_dim,
+    num_experts: tl.constexpr,
     alignment: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
@@ -59,7 +62,11 @@ def _pad_tokens_kernel(
             expert_id = e
         if expert_id < 0:
             unpadded_start += count
-            aligned = tl.where(count > 0, ((count + alignment - 1) // alignment) * alignment, tl.zeros([], dtype=tl.int32))
+            aligned = tl.where(
+                count > 0,
+                ((count + alignment - 1) // alignment) * alignment,
+                tl.zeros([], dtype=tl.int32),
+            )
             padded_start += aligned
 
     if expert_id < 0:
@@ -75,14 +82,15 @@ def _pad_tokens_kernel(
     for h in tl.range(0, hidden_dim, BLOCK_H):
         o = h + tl.arange(0, BLOCK_H)
         m = o < hidden_dim
-        tl.store(dst_ptr + dst_row * hidden_dim + o,
-                 tl.load(src_ptr + row * hidden_dim + o, mask=m), mask=m)
+        tl.store(
+            dst_ptr + dst_row * hidden_dim + o,
+            tl.load(src_ptr + row * hidden_dim + o, mask=m),
+            mask=m,
+        )
 
 
 def pad_to_alignment(
-    hidden_states: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    alignment: int,
+    hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor, alignment: int
 ) -> tuple:
     """Pad already-permuted tokens so each expert's block is aligned.
 
@@ -106,18 +114,23 @@ def pad_to_alignment(
     padded_total = int(padded_inc[-1].item())
 
     padded_hidden = torch.zeros(
-        padded_total, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device,
+        padded_total, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
     )
     permutation_map = torch.full(
-        (padded_total,), -1, dtype=torch.int32, device=hidden_states.device,
+        (padded_total,), -1, dtype=torch.int32, device=hidden_states.device
     )
 
     if total_tokens > 0:
         BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
         _pad_tokens_kernel[(total_tokens,)](
-            hidden_states, padded_hidden, permutation_map,
+            hidden_states,
+            padded_hidden,
+            permutation_map,
             tokens_per_expert,
-            hidden_dim, num_experts, alignment, BLOCK_H=BLOCK_H,
+            hidden_dim,
+            num_experts,
+            alignment,
+            BLOCK_H=BLOCK_H,
         )
 
     return padded_hidden, permutation_map, padded_inc
@@ -125,8 +138,12 @@ def pad_to_alignment(
 
 @triton.jit
 def _unpad_tokens_kernel(
-    src_ptr, dst_ptr, perm_map_ptr, probs_ptr,
-    hidden_dim, has_probs: tl.constexpr,
+    src_ptr,
+    dst_ptr,
+    perm_map_ptr,
+    probs_ptr,
+    hidden_dim,
+    has_probs: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """Copy one real (non-padding) row from padded to unpadded layout.
@@ -167,14 +184,18 @@ def unpad_from_alignment(
     """
     hidden_dim = padded_output.shape[1]
     output = torch.zeros(
-        original_size, hidden_dim, dtype=padded_output.dtype, device=padded_output.device,
+        original_size, hidden_dim, dtype=padded_output.dtype, device=padded_output.device
     )
     has_probs = probs is not None
     if padded_output.shape[0] > 0:
         BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
         _unpad_tokens_kernel[(padded_output.shape[0],)](
-            padded_output, output, permutation_map,
+            padded_output,
+            output,
+            permutation_map,
             probs if has_probs else padded_output,  # dummy pointer when no probs
-            hidden_dim, has_probs, BLOCK_H=BLOCK_H,
+            hidden_dim,
+            has_probs,
+            BLOCK_H=BLOCK_H,
         )
     return output

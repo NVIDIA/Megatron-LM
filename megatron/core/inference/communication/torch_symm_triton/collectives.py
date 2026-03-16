@@ -333,12 +333,13 @@ def multimem_reduce_scatter(
     Supports bfloat16 and float32 dtypes.
     """
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
-    assert input_tensor.dtype in (torch.bfloat16, torch.float32), (
-        f"Only bfloat16 and float32 are supported, got {input_tensor.dtype}"
-    )
-    assert input_tensor.dtype == output_tensor.dtype, (
-        f"Input and output dtypes must match: {input_tensor.dtype} vs {output_tensor.dtype}"
-    )
+    assert input_tensor.dtype in (
+        torch.bfloat16,
+        torch.float32,
+    ), f"Only bfloat16 and float32 are supported, got {input_tensor.dtype}"
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), f"Input and output dtypes must match: {input_tensor.dtype} vs {output_tensor.dtype}"
     assert are_tensors_nvls_eligible(
         output_tensor
     ), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."

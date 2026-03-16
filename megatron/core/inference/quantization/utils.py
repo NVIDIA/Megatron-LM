@@ -21,8 +21,8 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 try:
-    from torch.nn.functional import scaled_mm as torch_scaled_mm
     from torch.nn.functional import ScalingType, SwizzleType
+    from torch.nn.functional import scaled_mm as torch_scaled_mm
 
     HAVE_TORCH_SCALED_MM = True
 except ImportError:
@@ -62,6 +62,7 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer")
     """
     assert HAVE_TE
     import logging
+
     rank = torch.distributed.get_rank()
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
@@ -172,7 +173,7 @@ def quantize_params_to_mxfp8(
     for child_name, child_module in model.named_children():
         child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
         quantize_params_to_mxfp8(
-            child_module, persistent_buffers, _prefix=child_prefix, backend=backend,
+            child_module, persistent_buffers, _prefix=child_prefix, backend=backend
         )
 
     # Process parameters owned directly by this module
@@ -214,8 +215,7 @@ def quantize_params_to_mxfp8(
 def _mm_mxfp8_flashinfer(x_mxfp8: MXFP8Tensor, weight: MXFP8Tensor, out=None):
     """MXFP8 matmul via FlashInfer."""
     return flashinfer_mm_mxfp8(
-        x_mxfp8.data, weight.data.T, x_mxfp8.scale, weight.scale,
-        out_dtype=torch.bfloat16, out=out,
+        x_mxfp8.data, weight.data.T, x_mxfp8.scale, weight.scale, out_dtype=torch.bfloat16, out=out
     )
 
 
@@ -224,8 +224,10 @@ def _mm_mxfp8_torch(x_mxfp8: MXFP8Tensor, weight: MXFP8Tensor, out=None):
     result = torch_scaled_mm(
         x_mxfp8.data,
         weight.data.t(),
-        x_mxfp8.scale_2d(), ScalingType.BlockWise1x32,
-        weight.scale, ScalingType.BlockWise1x32,
+        x_mxfp8.scale_2d(),
+        ScalingType.BlockWise1x32,
+        weight.scale,
+        ScalingType.BlockWise1x32,
         swizzle_a=SwizzleType.SWIZZLE_32_4_4,
         swizzle_b=SwizzleType.SWIZZLE_32_4_4,
         output_dtype=torch.bfloat16,
@@ -243,9 +245,9 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
     pre-quantized. Dispatches to FlashInfer or torch based on weight.backend.
     """
     backend = weight.backend
-    assert backend is not None, (
-        "weight.backend is None — was the weight created via MXFP8Tensor.from_bf16?"
-    )
+    assert (
+        backend is not None
+    ), "weight.backend is None — was the weight created via MXFP8Tensor.from_bf16?"
 
     x_squeezed = x.squeeze(1)
     x_mxfp8 = MXFP8Tensor.from_bf16(x_squeezed, backend=backend)
@@ -254,9 +256,9 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 matmul"
         result = _mm_mxfp8_flashinfer(x_mxfp8, weight, out=out)
     elif backend == "triton":
-        assert HAVE_TORCH_SCALED_MM, (
-            "torch.nn.functional.scaled_mm with ScalingType/SwizzleType not available"
-        )
+        assert (
+            HAVE_TORCH_SCALED_MM
+        ), "torch.nn.functional.scaled_mm with ScalingType/SwizzleType not available"
         result = _mm_mxfp8_torch(x_mxfp8, weight, out=out)
     else:
         raise ValueError(f"Unknown MXFP8 backend: '{backend}'")

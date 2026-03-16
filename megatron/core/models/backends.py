@@ -36,7 +36,6 @@ except ImportError:
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
-    TEColumnParallelLinear,
     TEDotProductAttention,
     TELinear,
     TENorm,

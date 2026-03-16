@@ -282,7 +282,8 @@ class InferenceConfig:
     consisting of the string label, the target dtype, and whether to store the data on GPU.
     """
 
-    use_synchronous_zmq_collectives: bool = False 
-    """Whether to use synchronous ZMQ collectives for inference. If True, the all_reduce_max operation
-    will be performed synchronously, which can help reduce performance variability for MoEs.
+    use_synchronous_zmq_collectives: bool = False
+    """Whether to use synchronous ZMQ collectives for inference. If True, the 
+    all_reduce_max operation will be performed synchronously, which can help reduce 
+    performance variability for MoEs.
     """

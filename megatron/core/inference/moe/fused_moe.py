@@ -15,7 +15,11 @@ from megatron.core.inference.moe.activations import (
     squared_relu_and_quantize_mxfp8,
 )
 from megatron.core.inference.moe.pad import pad_to_alignment, unpad_from_alignment
-from megatron.core.inference.moe.permute import permute_tokens, unpermute_tokens, permute_and_quantize_mxfp8
+from megatron.core.inference.moe.permute import (
+    permute_and_quantize_mxfp8,
+    permute_tokens,
+    unpermute_tokens,
+)
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 try:
@@ -26,7 +30,8 @@ except ImportError:
     HAVE_GROUPED_MM = False
 
 try:
-    from torch.nn.functional import scaled_grouped_mm, ScalingType, SwizzleType
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_grouped_mm
+
     HAVE_SCALED_GMM = True
 except ImportError:
     HAVE_SCALED_GMM = False
@@ -34,33 +39,35 @@ except ImportError:
 
 class ActivationType(Enum):
     """Activation functions supported by mcore_fused_moe."""
+
     SQUARED_RELU = "squared_relu"
 
 
 def _bf16_grouped_mm(
-    x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor,
+    x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
     """BF16 grouped GEMM using torch.nn.functional.grouped_mm."""
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
-def _mxfp8_grouped_mm(
-    act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor,
-) -> torch.Tensor:
+def _mxfp8_grouped_mm(act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor) -> torch.Tensor:
     """MXFP8 scaled_grouped_mm with pre-quantized activations and weights."""
     return scaled_grouped_mm(
-        act.data, weight.data.transpose(1, 2),
-        act.scale_2d(), ScalingType.BlockWise1x32,
-        weight.scale, ScalingType.BlockWise1x32,
-        swizzle_a=SwizzleType.SWIZZLE_32_4_4, swizzle_b=SwizzleType.SWIZZLE_32_4_4,
-        offs=offs, output_dtype=torch.bfloat16,
+        act.data,
+        weight.data.transpose(1, 2),
+        act.scale_2d(),
+        ScalingType.BlockWise1x32,
+        weight.scale,
+        ScalingType.BlockWise1x32,
+        swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+        swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+        offs=offs,
+        output_dtype=torch.bfloat16,
     )
 
-def _get_activation_func(
-    activation_type: ActivationType,
-    fused_quant: bool = False,
-) -> Callable:
+
+def _get_activation_func(activation_type: ActivationType, fused_quant: bool = False) -> Callable:
     """Resolve ActivationType enum to a concrete kernel.
 
     If fused_quant=True, returns the fused activation + MXFP8 quantize kernel.
@@ -117,9 +124,9 @@ def mcore_fused_moe(
     Returns:
         [num_tokens, hidden_size] BF16 output.
     """
-    assert hidden_states.dtype == torch.bfloat16, (
-        f"mcore_fused_moe requires bf16 input, got {hidden_states.dtype}"
-    )
+    assert (
+        hidden_states.dtype == torch.bfloat16
+    ), f"mcore_fused_moe requires bf16 input, got {hidden_states.dtype}"
 
     num_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
@@ -127,14 +134,18 @@ def mcore_fused_moe(
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
 
     if use_mxfp8:
-        assert HAVE_SCALED_GMM, "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
+        assert (
+            HAVE_SCALED_GMM
+        ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _mxfp8_grouped_mm
         # scaled_grouped_mm requires each expert's token count aligned to 32,
         # but swizzled MXFP8 scales require alignment to 128. Use 128 to
         # satisfy both constraints.
         expert_alignment = 128
     else:
-        assert HAVE_GROUPED_MM, "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
+        assert (
+            HAVE_GROUPED_MM
+        ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _bf16_grouped_mm
         expert_alignment = 16
 
@@ -142,33 +153,33 @@ def mcore_fused_moe(
 
     # --- Pre-processing: permute or pad ---
     if skip_permute:
-        assert tokens_per_expert is not None, (
-            "tokens_per_expert is required when skip_permute=True"
-        )
+        assert tokens_per_expert is not None, "tokens_per_expert is required when skip_permute=True"
         tokens_per_expert = tokens_per_expert.cuda().int()
-        assert routing_map is None, (
-            "routing_map must be None when skip_permute=True"
-        )
+        assert routing_map is None, "routing_map must be None when skip_permute=True"
         hidden_states, permutation_map, offs = pad_to_alignment(
-            hidden_states, tokens_per_expert, expert_alignment,
+            hidden_states, tokens_per_expert, expert_alignment
         )
         permuted_probs = None
 
     else:
-        assert routing_map is not None, (
-            "routing_map is required when skip_permute=False"
-        )
+        assert routing_map is not None, "routing_map is required when skip_permute=False"
         if use_fused_quant:
             # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
             hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
-                hidden_states, probs, routing_map,
-                local_expert_start, num_local_experts,
+                hidden_states,
+                probs,
+                routing_map,
+                local_expert_start,
+                num_local_experts,
                 alignment=expert_alignment,
             )
         else:
             hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
-                hidden_states, probs, routing_map,
-                local_expert_start, num_local_experts,
+                hidden_states,
+                probs,
+                routing_map,
+                local_expert_start,
+                num_local_experts,
                 alignment=expert_alignment,
             )
 

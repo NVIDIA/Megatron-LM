@@ -1181,8 +1181,7 @@ class TransformerConfig(ModelParallelConfig):
                     "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-           
-               
+
             if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
                     "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
@@ -1191,13 +1190,8 @@ class TransformerConfig(ModelParallelConfig):
                     "graphs (--cuda-graph-impl=none) or use a non-gated activation "
                     "(e.g. squared_relu)."
                 )
-            
-        
-            assert self.inference_grouped_gemm_backend in (
-                'auto',
-                'torch',
-                'te',
-            ), (
+
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
             )

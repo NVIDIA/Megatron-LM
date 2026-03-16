@@ -8,13 +8,13 @@ wasted computation on aligned-but-empty expert slots.
 from unittest.mock import MagicMock
 
 import torch
-from packaging import version
 
 from megatron.core.utils import null_decorator
 
 try:
     import triton
     import triton.language as tl
+
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
@@ -30,10 +30,7 @@ def _ceil_div(a, b):
 
 
 @triton.jit
-def _squared_relu_kernel(
-    input_ptr, output_ptr, src_idx_ptr, M, N,
-    BLOCK_N: tl.constexpr,
-):
+def _squared_relu_kernel(input_ptr, output_ptr, src_idx_ptr, M, N, BLOCK_N: tl.constexpr):
     """Squared ReLU that skips padding rows (permutation_map == -1)."""
     row = tl.program_id(0)
     if tl.load(src_idx_ptr + row) < 0:
@@ -46,22 +43,21 @@ def _squared_relu_kernel(
         tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
 
 
-def padded_squared_relu(
-    x: torch.Tensor, permutation_map: torch.Tensor
-) -> torch.Tensor:
+def padded_squared_relu(x: torch.Tensor, permutation_map: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation that skips padding rows."""
     M, N = x.shape
     out = torch.zeros(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
-    _squared_relu_kernel[(M,)](
-        x, out, permutation_map, M, N, BLOCK_N=BLOCK_N,
-    )
+    _squared_relu_kernel[(M,)](x, out, permutation_map, M, N, BLOCK_N=BLOCK_N)
     return out
 
 
 @triton.jit
 def _squared_relu_quantize_kernel(
-    input_ptr, out_fp8_ptr, out_scale_ptr, src_idx_ptr,
+    input_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    src_idx_ptr,
     K,
     n_col_blocks,
     skip_padding: tl.constexpr,
@@ -123,9 +119,7 @@ def _squared_relu_quantize_kernel(
 
 
 def squared_relu_and_quantize_mxfp8(
-    x: torch.Tensor,
-    permutation_map: torch.Tensor,
-    skip_padding: bool = True,
+    x: torch.Tensor, permutation_map: torch.Tensor, skip_padding: bool = True
 ):
     """Fused squared ReLU + MXFP8 quantize + swizzle.
 
@@ -157,16 +151,16 @@ def squared_relu_and_quantize_mxfp8(
     BLOCK_GROUPS = BLOCK_K // 32
 
     _squared_relu_quantize_kernel[(M,)](
-        x, out_fp8, out_scale, permutation_map,
-        K, n_col_blocks,
+        x,
+        out_fp8,
+        out_scale,
+        permutation_map,
+        K,
+        n_col_blocks,
         skip_padding,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
     )
 
-    return MXFP8Tensor(
-        data=out_fp8,
-        scale=out_scale.view(torch.float8_e8m0fnu),
-        backend="triton",
-    )
+    return MXFP8Tensor(data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton")

@@ -2087,7 +2087,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
-            await self.world_zmq_communicator.all_reduce_max(1, async_op=(not self.use_synchronous_zmq_collectives))
+            await self.world_zmq_communicator.all_reduce_max(
+                1, async_op=(not self.use_synchronous_zmq_collectives)
+            )
         range_pop()
 
     @trace_async_exceptions

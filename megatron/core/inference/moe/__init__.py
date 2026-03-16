@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
+
 import torch
+
 from .fused_moe import ActivationType, mcore_fused_moe
 
 
@@ -14,9 +16,7 @@ class InferenceGroupedGemmBackend(enum.Enum):
 
 
 def resolve_inference_grouped_gemm_backend(
-    backend: str,
-    is_cuda_graphed: bool,
-    is_mxfp8: bool = False,
+    backend: str, is_cuda_graphed: bool, is_mxfp8: bool = False
 ) -> InferenceGroupedGemmBackend:
     """Resolve the grouped GEMM backend to use for the current iteration.
 
@@ -34,8 +34,9 @@ def resolve_inference_grouped_gemm_backend(
         if is_cuda_graphed:
             if is_mxfp8:
                 assert hasattr(torch.nn.functional, 'scaled_grouped_mm'), (
-                    "Auto backend selection for MXFP8 requires torch.nn.functional.scaled_grouped_mm. "
-                    "Install PyTorch 2.10+."
+                    "Auto backend selection for MXFP8 requires "
+                    "torch.nn.functional.scaled_grouped_mm. "
+                    "Please install PyTorch 2.10+."
                 )
                 return InferenceGroupedGemmBackend.TORCH
             else:

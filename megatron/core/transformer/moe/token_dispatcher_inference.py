@@ -305,7 +305,11 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         output = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
         # Check output only: if output is 16-byte divisible, input (world_size * output) is too.
-        nvls_eligible = self.triton_nvls_kernels_allowed and output.dtype in (torch.bfloat16, torch.float32) and are_tensors_nvls_eligible(output)
+        nvls_eligible = (
+            self.triton_nvls_kernels_allowed
+            and output.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(output)
+        )
         rs_buffer = None
 
         if nvls_eligible:

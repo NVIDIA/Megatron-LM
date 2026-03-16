@@ -23,13 +23,13 @@ def _ceil_div(a, b):
 
 @triton.jit
 def _mxfp8_quant_swizzle_kernel(
-    out_ptr,        # [M, K] output buffer for float8_e4m3fn quantized data
-    scale_ptr,      # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
-    src_ptr,        # [M, K] input tensor in bf16/fp16/fp32
-    K,              # number of columns in the input (must be divisible by 32)
-    n_col_blocks,   # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
-    REAL_GROUPS: tl.constexpr,   # actual number of scale groups per row (K // 32)
-    BLOCK_K: tl.constexpr,       # next_power_of_2(K) — padded column count for tl.reshape
+    out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
+    scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
+    src_ptr,  # [M, K] input tensor in bf16/fp16/fp32
+    K,  # number of columns in the input (must be divisible by 32)
+    n_col_blocks,  # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
+    REAL_GROUPS: tl.constexpr,  # actual number of scale groups per row (K // 32)
+    BLOCK_K: tl.constexpr,  # next_power_of_2(K) — padded column count for tl.reshape
     BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
 ):
     """Quantize one row → FP8 e4m3, write scales directly in swizzled layout.
@@ -87,7 +87,7 @@ def _mxfp8_quant_swizzle_kernel(
     local_row = row % 128
     local_col = col_offs % 4
     # each group of 32 elements shares the same scale
-    group = local_row // 32 
+    group = local_row // 32
     sub_row = local_row % 32
     tile_idx = macro_row_block * n_col_blocks + macro_col_block
     swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
@@ -123,8 +123,11 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     BLOCK_GROUPS = BLOCK_K // 32
 
     _mxfp8_quant_swizzle_kernel[(M,)](
-        out_data, out_scale, x,
-        K, n_col_blocks,
+        out_data,
+        out_scale,
+        x,
+        K,
+        n_col_blocks,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,

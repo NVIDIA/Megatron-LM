@@ -269,11 +269,11 @@ class MoELayer(BaseMoELayer):
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
             if config.inference_grouped_gemm_backend == 'auto':
-                assert (
-                    HAVE_FLASHINFER
-                ), (
-                    "inference_grouped_gemm_backend='auto' requires flashinfer-python. "
-                    "Install flashinfer-python or set inference_grouped_gemm_backend to 'torch' or 'te'."
+                assert HAVE_FLASHINFER, (
+                    "inference_grouped_gemm_backend='auto'"
+                    "requires flashinfer-python. "
+                    "Install flashinfer-python or set "
+                    "inference_grouped_gemm_backend to 'torch' or 'te'."
                 )
                 if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
                     warnings.warn(
