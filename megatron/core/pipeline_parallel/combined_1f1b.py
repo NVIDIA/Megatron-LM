@@ -15,7 +15,7 @@ from megatron.core.utils import get_attr_wrapped_model
 Shape = Union[List[int], torch.Size]
 
 
-def _find_megatron_fsdp(model):
+def find_megatron_fsdp(model):
     """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
     try:
         from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
@@ -62,7 +62,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     """
 
     set_streams()
-    fsdp_wrapper = _find_megatron_fsdp(model)
+    fsdp_wrapper = find_megatron_fsdp(model)
 
     if fsdp_wrapper is not None:
         # The overlap schedule bypasses MegatronFSDP.forward(), which normally
@@ -94,8 +94,6 @@ def combined_1f1b_schedule_for_no_pipelining(
     with no_sync_func():
         for i in range(num_microbatches - 1):
             total_num_tokens += num_tokens
-            if fsdp_wrapper is not None:
-                fsdp_wrapper.overlap_pre_backward()
             output_tensor, num_tokens, _ = combined_forward_backward_step(
                 forward_step_func,
                 data_iterator,
@@ -112,14 +110,11 @@ def combined_1f1b_schedule_for_no_pipelining(
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
                 current_microbatch=(i + 1),
+                fsdp_wrapper=fsdp_wrapper,
             )
-            if fsdp_wrapper is not None:
-                fsdp_wrapper.overlap_post_backward()
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
     # Run computation for last microbatch out of context handler (want to synchronize gradients).
-    if fsdp_wrapper is not None:
-        fsdp_wrapper.overlap_pre_backward()
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
         data_iterator,
@@ -132,9 +127,8 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor,  # b_output_tensor
         output_tensor_grad,  # b_output_tensor_grad
         config,
+        fsdp_wrapper=fsdp_wrapper,
     )
-    if fsdp_wrapper is not None:
-        fsdp_wrapper.overlap_post_backward()
     return forward_data_store, total_num_tokens
 
 
@@ -209,7 +203,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     f_microbatch_id = None
     input_tensor = None
     if f_virtual_microbatch_id is not None:
-        f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
+        f_microbatch_id = get_microbatch_id_min_model_chunk(f_virtual_microbatch_id, forward=True)
     if f_virtual_microbatch_id is not None:
         f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
         input_tensor = forward_step_helper_preprocess(
@@ -286,6 +280,7 @@ def combined_forward_backward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    fsdp_wrapper=None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -330,6 +325,9 @@ def combined_forward_backward_step(
     ), "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
 
     from .schedules import set_current_microbatch
+
+    if fsdp_wrapper is not None and b_model is not None:
+        fsdp_wrapper.pre_backward()
 
     if f_model is not None and config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -379,12 +377,14 @@ def combined_forward_backward_step(
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
-        _fsdp = _find_megatron_fsdp(f_model)
-        if _fsdp is not None:
+        fsdp_wrapper = find_megatron_fsdp(f_model)
+        if fsdp_wrapper is not None:
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
-                layer_plan.on_forward_done = _fsdp.overlap_release_fsdp_unit_forward_params
-                layer_plan.on_backward_done = _fsdp.overlap_release_fsdp_unit_backward_params
+                layer_plan.set_fsdp_reshard_hooks(
+                    fsdp_wrapper.post_forward_release_module,
+                    fsdp_wrapper.post_backward_release_module,
+                )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
@@ -480,5 +480,8 @@ def combined_forward_backward_step(
 
         if unwrap_input_tensor_grad:
             input_tensor_grad = input_tensor_grad[0]
+
+    if fsdp_wrapper is not None and b_model is not None:
+        fsdp_wrapper.post_backward()
 
     return output_tensor, num_tokens, input_tensor_grad

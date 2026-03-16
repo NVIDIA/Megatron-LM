@@ -265,13 +265,17 @@ class TransformerLayerNode(ScheduleNode):
             bwd_dw_callables (list): List of weight gradient functions for the layer.
             extra_args (dict): Extra arguments for the node: is_moe, config.
         """
-        # determine whether to free input memory
+        # Determine whether to free input memory
         config = extra_args.get("config", None)
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
         free_input = should_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
+
+        # Megatron-FSDP hooks setup.
+        self.is_layer_first_node = None
+        self.is_layer_last_node = None
 
         super().__init__(
             weak_method(self.forward_impl),
@@ -327,6 +331,18 @@ class TransformerLayerNode(ScheduleNode):
         # return grads for record stream
         return grads
 
+    def forward(self, *inputs):
+        output = super().forward(*inputs)
+        if self.is_layer_last_node:
+            self._fsdp_post_forward_reshard_hook()
+        return output
+
+    def backward(self, *output_grad):
+        grads = super().backward(*output_grad)
+        if not self.delay_wgrad_compute and self.is_layer_first_node:
+            self._fsdp_post_backward_reshard_hook()
+        return grads
+
     def backward_dw(self):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
@@ -363,6 +379,10 @@ class TransformerLayerNode(ScheduleNode):
                 for hook in self.fsdp_post_backward_gradient_hooks:
                     hook()
 
+        # Execute resharding hook for Megatron FSDP.
+        if self.is_layer_first_node:
+            self._fsdp_post_backward_reshard_hook()
+
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
         if self.manual_release_grads:
@@ -371,6 +391,16 @@ class TransformerLayerNode(ScheduleNode):
         self.output_grads = None
 
         self.bwd_dw_callables = None
+
+    def set_fsdp_post_forward_reshard_hook(self, hook):
+        """Register a hook to release FSDP params after this node's forward pass."""
+        self.is_layer_last_node = True
+        self._fsdp_post_forward_reshard_hook = hook
+
+    def set_fsdp_post_backward_reshard_hook(self, hook):
+        """Register a hook to release FSDP params after this node's backward pass."""
+        self.is_layer_first_node = True
+        self._fsdp_post_backward_reshard_hook = hook
 
     def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
