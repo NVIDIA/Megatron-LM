@@ -16,6 +16,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
@@ -32,11 +33,14 @@ from tests.unit_tests.test_utilities import Utils
 # ============================================================================
 
 
+_active_grids: list = []
+
+
 def create_hypercomm_grid(offset=0, tp=1, pp=1, dp=1):
     """Create a HyperCommGrid with specified parallelism."""
     grid = HyperCommGrid(
-        shape=[tp, 1, pp, dp, 1],  # [tp, cp, pp, dp, ep]
-        dim_names=["tp", "cp", "pp", "dp", "ep"],
+        shape=[tp, 1, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
+        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
         rank_offset=offset,
         backend="nccl",
     )
@@ -46,7 +50,17 @@ def create_hypercomm_grid(offset=0, tp=1, pp=1, dp=1):
     grid.create_pg(["dp"])
     grid.create_pg(["dp", "cp"])
     grid.create_pg(["ep"])
+    grid.create_pg(["expt_dp"])
+    _active_grids.append(grid)
     return grid
+
+
+def destroy_all_grids():
+    """Destroy all tracked grids and bridge communicator PGs."""
+    for grid in _active_grids:
+        grid.destroy()
+    _active_grids.clear()
+    BridgeCommunicator.destroy_broadcast_pgs()
 
 
 def get_pg_collection(grid):
@@ -58,7 +72,11 @@ def get_pg_collection(grid):
     pg_collection.ep = grid.get_pg("ep")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
+    pg_collection.expt_dp = grid.get_pg("expt_dp")
     return pg_collection
+
+
+_embedding_pg_cache: dict = {}
 
 
 def add_embedding_groups(pg_collection):
@@ -67,13 +85,19 @@ def add_embedding_groups(pg_collection):
         return pg_collection
 
     pp_ranks = sorted(dist.get_process_group_ranks(pg_collection.pp))
-    pos_embd_ranks = [pp_ranks[0]]
-    embd_ranks = [pp_ranks[0]]
-    if pp_ranks[-1] != pp_ranks[0]:
-        embd_ranks.append(pp_ranks[-1])
+    cache_key = tuple(pp_ranks)
 
-    pos_embd_pg = dist.new_group(ranks=pos_embd_ranks)
-    embd_pg = dist.new_group(ranks=embd_ranks)
+    if cache_key not in _embedding_pg_cache:
+        pos_embd_ranks = [pp_ranks[0]]
+        embd_ranks = [pp_ranks[0]]
+        if pp_ranks[-1] != pp_ranks[0]:
+            embd_ranks.append(pp_ranks[-1])
+        _embedding_pg_cache[cache_key] = (
+            dist.new_group(ranks=pos_embd_ranks),
+            dist.new_group(ranks=embd_ranks),
+        )
+
+    pos_embd_pg, embd_pg = _embedding_pg_cache[cache_key]
 
     # Always set pos_embd and embd (to group or None)
     pg_collection.pos_embd = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
@@ -138,9 +162,10 @@ def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size):
         pg_collection = add_embedding_groups(get_pg_collection(grid))
         module = create_transformer_block(hidden_size, pg_collection)
     else:
+        pg_collection = None
         module = None
 
-    return module, grid
+    return module, grid, pg_collection
 
 
 # ============================================================================
@@ -165,16 +190,18 @@ class MultiModuleModel(torch.nn.Module):
         # Create encoders
         self.encoders = {}
         self.encoder_grids = {}
+        self.encoder_pg_collections = {}
         for enc_cfg in encoder_configs:
             name = enc_cfg['name']
-            module, grid = create_module_with_grid(
+            module, grid, pg_col = create_module_with_grid(
                 enc_cfg['tp'], enc_cfg['pp'], enc_cfg['dp'], enc_cfg['grid_offset'], hidden_size
             )
             self.encoders[name] = module
             self.encoder_grids[name] = grid
+            self.encoder_pg_collections[name] = pg_col
 
         # Create LLM
-        self.llm, self.llm_grid = create_module_with_grid(
+        self.llm, self.llm_grid, self.llm_pg_collection = create_module_with_grid(
             llm_config['tp'],
             llm_config['pp'],
             llm_config['dp'],
@@ -185,8 +212,10 @@ class MultiModuleModel(torch.nn.Module):
         # Track all modules for gradient sync
         self.modules_and_grids = []
         for name, module in self.encoders.items():
-            self.modules_and_grids.append((module, self.encoder_grids[name]))
-        self.modules_and_grids.append((self.llm, self.llm_grid))
+            self.modules_and_grids.append(
+                (module, self.encoder_grids[name], self.encoder_pg_collections[name])
+            )
+        self.modules_and_grids.append((self.llm, self.llm_grid, self.llm_pg_collection))
 
         # Input tensors for pipeline stages
         self.input_tensors = {name: None for name in self.encoders.keys()}
@@ -200,7 +229,7 @@ class MultiModuleModel(torch.nn.Module):
     def no_sync(self):
         """No-sync context for all active modules."""
         contexts = []
-        for module, grid in self.modules_and_grids:
+        for module, grid, _pg in self.modules_and_grids:
             if module is not None and self.is_rank_in_grid(grid):
                 contexts.append(module.no_sync())
 
@@ -215,16 +244,15 @@ class MultiModuleModel(torch.nn.Module):
     @property
     def ddp_config(self):
         """Get DDP config from first active module."""
-        for module, grid in self.modules_and_grids:
+        for module, grid, _pg in self.modules_and_grids:
             if module is not None and self.is_rank_in_grid(grid):
                 return module.ddp_config
         raise AttributeError(f"No active modules on rank {self.rank}")
 
     def finalize_model_grads(self, *args, **kwargs):
         """Finalize gradients for all active modules."""
-        for module, grid in self.modules_and_grids:
+        for module, grid, pg_collection in self.modules_and_grids:
             if module is not None and self.is_rank_in_grid(grid):
-                pg_collection = add_embedding_groups(get_pg_collection(grid))
                 finalize_model_grads([module], num_tokens=None, pg_collection=pg_collection)
 
     def set_input_tensor(self, input_tensor):
@@ -377,14 +405,15 @@ def run_multimodule_schedule_test(
             data_iterator = DataIterator(hidden_size, seq_length, micro_batch_size)
 
     # Build MultiModuleProcessGroupCollection for current rank
+    # Reuse pg_collections already created during model init (avoid creating duplicate PGs)
     rank = dist.get_rank()
     module_pgs = {}
     language_model_module_name = None
     for name, grid in model.encoder_grids.items():
         if grid.rank_offset <= rank < grid.rank_offset + grid.size:
-            module_pgs[name] = add_embedding_groups(get_pg_collection(grid))
+            module_pgs[name] = model.encoder_pg_collections[name]
     if model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size:
-        module_pgs['llm'] = add_embedding_groups(get_pg_collection(model.llm_grid))
+        module_pgs['llm'] = model.llm_pg_collection
         language_model_module_name = 'llm'
 
     pg_collection = MultiModuleProcessGroupCollection(
@@ -443,6 +472,9 @@ class TestMultimoduleSchedules:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        destroy_all_grids()
 
     def test_single_encoder_2gpu(self):
         """Test single encoder + LLM on 2 GPUs (no PP)."""

@@ -53,6 +53,14 @@ class BridgeCommunicator:
     # By caching PGs keyed on their rank sets, we reuse existing communicators.
     _broadcast_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
 
+    @classmethod
+    def destroy_broadcast_pgs(cls):
+        """Destroy all cached broadcast process groups."""
+        for pg in cls._broadcast_pg_cache.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        cls._broadcast_pg_cache.clear()
+
     def __init__(
         self,
         src_grid: HyperCommGrid,
