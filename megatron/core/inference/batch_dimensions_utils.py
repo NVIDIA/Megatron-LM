@@ -558,6 +558,9 @@ class CUDAGraphBatchDimensionBuilder:
         if explicit_chunked_prefill and real_batch_dim.prefill_req_count > 0:
             return None
 
+        if requires_mamba_state_extraction:
+            return None
+
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable
         graph_batch_dims_applicable = [
