@@ -302,7 +302,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self._spec_tokens_accepted = 0
         self._spec_steps = 0
 
-        # Prefix caching coordination state.
+        # Prefix caching tracking.
+        self._prefix_cache_hits = 0
+        self._prefix_cache_blocks_matched = 0
+        self._prefix_cache_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -1733,6 +1736,15 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send(payload)
             range_pop()
 
+        # Drain prefix cache hit counters from context into engine accumulators.
+        if self.context.enable_prefix_caching:
+            self._prefix_cache_hits += self.context.prefix_cache_hits
+            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
+            self._prefix_cache_tokens_skipped += self.context.prefix_cache_tokens_skipped
+            self.context.prefix_cache_hits = 0
+            self.context.prefix_cache_blocks_matched = 0
+            self.context.prefix_cache_tokens_skipped = 0
+
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
@@ -1761,6 +1773,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
                 metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
                 metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+
+            # Add prefix caching metrics.
+            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+                metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
+                metrics['inference/prefix_cache_blocks_matched'] = int(
+                    self._prefix_cache_blocks_matched
+                )
+                metrics['inference/prefix_cache_tokens_skipped'] = int(
+                    self._prefix_cache_tokens_skipped
+                )
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
@@ -1819,6 +1841,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
+            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+                output_str += (
+                    " ... prefix cache: %d hits, %d blocks matched, %d tokens skipped"
+                    % (
+                        self._prefix_cache_hits,
+                        self._prefix_cache_blocks_matched,
+                        self._prefix_cache_tokens_skipped,
+                    )
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
@@ -1828,6 +1859,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._spec_tokens_proposed = 0
                 self._spec_tokens_accepted = 0
                 self._spec_steps = 0
+
+            # Reset prefix caching accumulators after both wandb and console logging.
+            if self.context.enable_prefix_caching:
+                self._prefix_cache_hits = 0
+                self._prefix_cache_blocks_matched = 0
+                self._prefix_cache_tokens_skipped = 0
 
         return {
             "active_request_ids": active_request_ids,
