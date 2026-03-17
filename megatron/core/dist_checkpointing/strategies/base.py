@@ -2,6 +2,8 @@
 
 """ Strategies base interfaces. """
 
+import logging
+
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
@@ -10,6 +12,8 @@ from typing import Any, DefaultDict, Union
 
 from ..mapping import CheckpointingException, ShardedStateDict
 from .async_utils import AsyncCallsQueue, AsyncRequest
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyAction(Enum):
@@ -28,23 +32,15 @@ async_calls = AsyncCallsQueue()
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
-    error_hint: str = ""
-    try:
-        error_hint = ' Please use PyTorch version >=2.1'
-        from .torch import register_default_torch_strategies
+    from .torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 
-        register_default_torch_strategies()
-    except ImportError as e:
-        raise CheckpointingException(
-            f'Cannot import a default strategy for: {(action.value, backend, version)}. '
-            f'Error: {e}. Hint: {error_hint}'
-        ) from e
-    try:
-        return default_strategies[action.value][(backend, version)]
-    except KeyError as e:
-        raise CheckpointingException(
-            f'Cannot find a default strategy for: {(action.value, backend, version)}'
-        ) from e
+    if backend != 'torch_dist':
+        logger.warning(f'{backend} is not supported')
+    if action == StrategyAction.LOAD_SHARDED:
+        return TorchDistLoadShardedStrategy()
+    else:
+        assert action == StrategyAction.SAVE_SHARDED, f'{action} is not supported'
+        return TorchDistSaveShardedStrategy()
 
 
 def register_default_strategy(
