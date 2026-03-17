@@ -38,7 +38,7 @@ except ImportError:
 # TODO: Remove this separate try/except once the next version of emerging_optimizers
 # (which includes Lion) is released. Then Lion can be imported in the block above.
 try:
-    from emerging_optimizers.scalar_optimizers import Lion
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
     HAVE_LION = True
 except ImportError:
