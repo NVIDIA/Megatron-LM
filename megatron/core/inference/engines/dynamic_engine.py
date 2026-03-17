@@ -1609,6 +1609,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
+        self.context.prefix_cache_lru_clock += 1
 
         range_pop()
 
@@ -2247,6 +2248,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

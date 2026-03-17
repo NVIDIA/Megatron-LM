@@ -255,8 +255,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_triton_conv1d = inference_config.use_triton_conv1d
         self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
 
-        # Step counter (used for LRU timestamps in prefix caching)
+        # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+
+        # Separate monotonic clock for prefix caching LRU eviction ordering.
+        # Incremented each engine step but kept independent so the engine step
+        # counter is not overloaded with cache-eviction semantics.
+        self.prefix_cache_lru_clock = 0
 
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
@@ -1696,8 +1701,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter
+        # Reset step counter and LRU clock
         self.step_count = 0
+        self.prefix_cache_lru_clock = 0
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1

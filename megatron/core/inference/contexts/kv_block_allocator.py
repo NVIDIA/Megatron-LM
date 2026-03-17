@@ -321,7 +321,7 @@ class KVBlockAllocator:
             or block_ids.numel() == 0
         ):
             return
-        self.block_timestamps[block_ids] = self.context.step_count
+        self.block_timestamps[block_ids] = self.context.prefix_cache_lru_clock
 
     def get_evictable_block_count(self) -> Tensor:
         """Get count of cached blocks that can be evicted (ref_count == 0, hash set).
