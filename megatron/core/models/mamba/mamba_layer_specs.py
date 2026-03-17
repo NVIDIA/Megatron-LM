@@ -158,20 +158,6 @@ mamba_inference_stack_spec = ModuleSpec(
                 mamba_bda=get_bias_dropout_add,
             ),
         ),
-        gdn_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                self_attention=ModuleSpec(
-                    module=GatedDeltaNet,
-                    submodules=GatedDeltaNetSubmodules(
-                        in_proj=TELayerNormColumnParallelLinear,
-                        out_norm=TENorm,
-                        out_proj=TERowParallelLinear,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-            ),
-        ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
         # Using the TE spec because we had problems getting the non-TE spec
         # working
