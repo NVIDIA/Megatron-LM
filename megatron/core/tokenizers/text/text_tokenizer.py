@@ -70,10 +70,14 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
+        # Filter out mode-level kwargs consumed by MegatronTokenizerText, not the library.
+        _MODE_KWARGS = ('prompt_format',)
+        library_kwargs = {k: v for k, v in kwargs.items() if k not in _MODE_KWARGS}
+
         if self.library in ['byte-level', 'null-text']:
-            return library_class(**kwargs)
+            return library_class(**library_kwargs)
         else:
-            return library_class(self.path, **kwargs)
+            return library_class(self.path, **library_kwargs)
 
     def tokenize(self, text: str) -> List[int]:
         """

@@ -499,7 +499,7 @@ class TestArgumentGroupFactoryArgparseMeta:
 
     def test_choices_override(self):
         """Test that argparse_meta can override choices."""
-        parser = ArgumentParser()
+        parser = ArgumentParser(exit_on_error=False)
         factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
 
         factory.build_group(parser, title="Test Group")
@@ -509,7 +509,7 @@ class TestArgumentGroupFactoryArgparseMeta:
         assert args.custom_choices == "option2"
 
         # Invalid choice should fail
-        with pytest.raises(SystemExit):
+        with pytest.raises(ArgumentError):
             parser.parse_args(['--custom-choices', 'invalid_option'])
 
     def test_dest_override(self):

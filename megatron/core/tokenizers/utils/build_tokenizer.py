@@ -18,7 +18,7 @@ def build_tokenizer(args, **kwargs):
     build_kwargs.update(_build_mode_kwargs(args))
     build_kwargs.update(kwargs)  # Allow caller overrides
 
-    if args.tokenizer_metadata:
+    if getattr(args, 'tokenizer_metadata', None):
         metadata = args.tokenizer_metadata
     else:
         metadata = {'library': _resolve_library(args)}
