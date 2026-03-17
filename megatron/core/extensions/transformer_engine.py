@@ -1539,13 +1539,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
-            # Save original parallel_mode before clearing it for explicit_expert_comm.
-            # When explicit_expert_comm is True, Megatron handles TP communication externally
-            # and passes parallel_mode=None to TE. This causes TE to set partition_dim=0 on
-            # all weights (its default for non-parallel mode). We need to fix this after init
-            # so that refit/resharding can correctly identify which dimension is TP-partitioned.
-            original_parallel_mode = parallel_mode
-
             if self.explicit_expert_comm:
                 if parallel_mode == "column":
                     output_size = divide(output_size, tp_size)
@@ -1575,15 +1568,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_quant_params: Optional[TEQuantizationParams] = None
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
-
-            # Fix partition_dim when explicit_expert_comm cleared parallel_mode.
-            # TE defaults to partition_dim=0 when parallel_mode=None, but row-parallel
-            # weights are partitioned along dim=1 (input dimension).
-            if self.explicit_expert_comm and original_parallel_mode == "row":
-                for i in range(num_gemms):
-                    weight = getattr(self, f"weight{i}", None)
-                    if weight is not None and hasattr(weight, "partition_dim"):
-                        weight.partition_dim = 1
 
             def merge_extra_states(
                 self,
