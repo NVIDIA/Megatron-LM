@@ -344,7 +344,7 @@ def main():
     # Auto-detect Megatron-LM directory
     if args.megatron_dir is None:
         args.megatron_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), os.path.pardir)
+            os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
         )
     print(f"Megatron-LM directory: {args.megatron_dir}")
     print(f"Output directory: {args.output_dir}")

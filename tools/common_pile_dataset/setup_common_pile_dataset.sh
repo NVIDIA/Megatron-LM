@@ -77,7 +77,7 @@ fi
 
 # Use the script from the repo if we didn't have it locally
 if [ -z "${DATASET_SCRIPT}" ]; then
-    DATASET_SCRIPT="${MEGATRON_DIR}/tools/create_common_pile_ci_dataset.py"
+    DATASET_SCRIPT="${MEGATRON_DIR}/tools/common_pile_dataset/create_common_pile_ci_dataset.py"
     if [ ! -f "${DATASET_SCRIPT}" ]; then
         echo "ERROR: create_common_pile_ci_dataset.py not found"
         exit 1
