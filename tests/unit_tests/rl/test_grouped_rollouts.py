@@ -10,6 +10,7 @@ from megatron.rl.agent.api import (
     GroupedRolloutRequest,
     Rollout,
     RolloutGenerator,
+    RolloutGroup,
 )
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
@@ -76,7 +77,7 @@ class TestGroupedRollouts:
 
         assert len(groups) == expected_count
         if expected_batch_ids is not None:
-            assert [g[0].batch_id for g in groups] == expected_batch_ids
+            assert [g.batch_id for g in groups] == expected_batch_ids
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):

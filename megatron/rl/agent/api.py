@@ -58,6 +58,25 @@ class Rollout(AgentBaseModel):
     num_evictions: list[int]
 
 
+class RolloutGroup:
+    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
+    __slots__ = ('rollouts', 'batch_id', 'index_in_batch')
+
+    def __init__(self, rollouts, batch_id=0, index_in_batch=0):
+        self.rollouts = rollouts
+        self.batch_id = batch_id
+        self.index_in_batch = index_in_batch
+
+    def __iter__(self):
+        return iter(self.rollouts)
+
+    def __len__(self):
+        return len(self.rollouts)
+
+    def __getitem__(self, idx):
+        return self.rollouts[idx]
+
+
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
 
@@ -188,7 +207,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.
-        grouped_rollouts: asyncio_Queue[list[Rollout]] = asyncio_Queue(
+        grouped_rollouts: asyncio_Queue[RolloutGroup] = asyncio_Queue(
             maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
@@ -217,10 +236,9 @@ class GroupedRolloutGenerator(Agent, ABC):
                 not request.filter_groups_with_same_reward
                 or np.std([r.reward for r in group]) > 1e-6
             ):
-                for rollout in group:
-                    rollout.index_in_batch = index_in_batch
-                    rollout.batch_id = batch_id
-                await grouped_rollouts.put(group)
+                await grouped_rollouts.put(
+                    RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
+                )
                 return True
             return False
 
@@ -252,7 +270,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         try:
             next_batch_id = 0
-            pending: dict[int, list[list[Rollout]]] = {}
+            pending: dict[int, list[RolloutGroup]] = {}
             while True:
                 try:
                     group = await grouped_rollouts.get()
@@ -260,10 +278,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                     break
                 if request.enforce_order:
                     # Accumulate groups and enforce submission order across batches.
-                    pending.setdefault(group[0].batch_id, []).append(group)
+                    pending.setdefault(group.batch_id, []).append(group)
                     while len(pending.get(next_batch_id, [])) >= groups_per_worker:
                         batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g[0].index_in_batch)
+                        batch.sort(key=lambda g: g.index_in_batch)
                         next_batch_id += 1
                         for g in batch:
                             yield g
