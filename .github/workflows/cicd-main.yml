@@ -34,6 +34,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+  container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
 
 jobs:
   is-not-external-contributor:
@@ -43,7 +44,7 @@ jobs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || '' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
@@ -313,9 +314,20 @@ jobs:
 
   cicd-container-build:
     needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cloud: aws
+            registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+            runner: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+          - cloud: gcp
+            registry: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
+            runner: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+    runs-on: ${{ matrix.runner }}
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      (matrix.cloud == 'aws' || needs.is-not-external-contributor.outputs.is_maintainer == 'true')
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
@@ -401,7 +413,7 @@ jobs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "type=registry,ref=${{ env.container-registry }}/megatron-lm:$number-buildcache,mode=max"
+              echo "type=registry,ref=${{ matrix.registry }}/megatron-lm:$number-buildcache,mode=max"
             done)
 
           echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -438,15 +450,15 @@ jobs:
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
           cache-from: |
-            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-            type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:main-buildcache,mode=max
             ${{ steps.cache_from.outputs.LAST_PRS }}
           cache-to: |
-            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           no-cache: false
           tags: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+            ${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+            ${{ matrix.registry }}/megatron-lm:${{ github.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
@@ -804,7 +816,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ github.sha }}
           is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
           is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
           platform: dgx_gb200
