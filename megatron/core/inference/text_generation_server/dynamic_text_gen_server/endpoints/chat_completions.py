@@ -8,6 +8,7 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -230,7 +231,10 @@ try:
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            if hasattr(tokenizer, 'apply_chat_template'):
+            if (
+                hasattr(tokenizer, 'apply_chat_template')
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
                 prompt_tokens = tokenizer.apply_chat_template(
                     template_messages,
                     tokenize=True,
@@ -371,13 +375,9 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge().serialize()
-
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in result.items()
-            }
+        for result_item in batch_results:
+            result = result_item if isinstance(result_item, dict) else result_item.serialize()
+            result = unwrap_serialized_tensors(result)
 
             if result["status"] == "FAILED":
                 if result["sampling_params"]["num_tokens_to_generate"] <= 0:

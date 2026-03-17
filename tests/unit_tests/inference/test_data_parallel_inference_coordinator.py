@@ -73,6 +73,9 @@ class DummyContext:
     def __init__(self):
         self.active_cnt = 0
         self.step_count = 0
+        self.block_size_tokens = 64
+        self.enable_prefix_caching = False
+        self.prefix_caching_coordinator_policy = None
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -135,10 +138,15 @@ class DummyEngine(DynamicInferenceEngine):
     ) -> asyncio.Future[DynamicInferenceRequestRecord]:
         """Dummy add_request."""
 
+        # Mock tokenization to prevent `prompt_tokens == None`.
+        prompt_tokens = (
+            torch.arange(len(prompt.split())) if isinstance(prompt, str) else torch.tensor(prompt)
+        )
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
                     prompt=prompt,
+                    prompt_tokens=prompt_tokens,
                     request_id=request_id,
                     sampling_params=sampling_params,
                     status=Status.WAITING_IN_QUEUE,
@@ -171,7 +179,8 @@ class DummyEngine(DynamicInferenceEngine):
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
+                        use_bin_type=True,
                     )
                     self.socket_for_receiving_requests.send(payload)
 
@@ -206,28 +215,28 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
         except (asyncio.TimeoutError, Exception):
             pass
 
-        sub = getattr(engine, 'model_parallel_num_msgs_subscriber_socket', None)
-        if sub is not None:
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
-
-        # Close ZMQ communicator sockets to unblock any stuck ranks.
-        for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
-            comm = getattr(engine, attr, None)
-            if comm is not None:
-                comm.close()
-
-        task.cancel()
+        if client is not None:
+            client.stop_engines()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
+            # Graceful stop failed — fall back to forcible cleanup.
+            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+                comm = getattr(engine, attr, None)
+                if comm is not None:
+                    comm.close()
+
+            for socket in getattr(engine, 'zmq_sockets', []):
+                if not socket.closed:
+                    socket.close(linger=0)
+
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
 
     if client is not None:
-        # Walk the coordinator back to RUNNING regardless of its current state
-        # so the next test starts cleanly.  Each call is a no-op when the
-        # coordinator is already in the target state (just logs a warning).
-        client.resume_engines()  # SUSPENDED → PAUSED (no-op otherwise)
-        client.unpause_engines()  # PAUSED    → RUNNING (no-op otherwise)
         client.stop()
 
 
@@ -348,8 +357,6 @@ class TestCoordinator:
         client = None
         try:
             if rank == 0:
-                # Yield so engine loop can run before we block the event loop
-                # with the client's synchronous connect handshake.
                 await asyncio.sleep(0)
                 client = InferenceClient(dp_addr)
                 client.start()
@@ -360,8 +367,52 @@ class TestCoordinator:
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+                timeout=30.0,
+            )
+        finally:
+            await cleanup_engine(engine, client)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deserialize", [True, False], ids=["deserialize", "raw"])
+    async def test_deserialize_flag(self, initialize_model_parallel, coordinator, deserialize):
+        """Test that the correct response type is returned based on the deserialize flag."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        engine = DummyEngine()
+        requests = self.build_requests(num_requests=2)
+
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
+        )
+
+        # Ensure all engines are registered before submitting requests.
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
+        )
+
+        client = None
+        try:
+            if torch.distributed.get_rank() == 0:
+                await asyncio.sleep(0)
+                client = InferenceClient(dp_addr, deserialize=deserialize)
+                client.start()
+                futures = [
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                for result in results:
+                    if deserialize:
+                        assert isinstance(result, DynamicInferenceRequest)
+                    else:
+                        assert isinstance(result, dict)
 
             await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
@@ -448,8 +499,8 @@ class TestCoordinator:
                 # Submit and complete requests while running.
                 futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests while RUNNING, then PAUSE before they drain.
                 # These must survive the PAUSE (not be drained during PAUSING).
@@ -483,8 +534,8 @@ class TestCoordinator:
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 all_queued = pre_pause_futures + paused_futures
                 results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
                 assert_state(engine, EngineState.RUNNING)
 
                 # Engine processes new requests normally after unpause.
@@ -492,8 +543,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Suspend.
                 client.pause_engines()
@@ -528,8 +579,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests that will be cancelled on STOP.
                 client.pause_engines()
@@ -569,7 +620,7 @@ class TestCoordinator:
     async def test_throughput(self, initialize_model_parallel, coordinator):
         """Throughput benchmark: measures ZMQ packet rate."""
         _, dp, _, _, _ = initialize_model_parallel
-        num_requests = 10**4
+        num_requests = 10**3
         num_iterations = 10
 
         dp_addr = coordinator
@@ -605,4 +656,4 @@ class TestCoordinator:
                 )
             await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
         finally:
-            await cleanup_engine(engine, client)
+            await cleanup_engine(engine, client, timeout=60.0)

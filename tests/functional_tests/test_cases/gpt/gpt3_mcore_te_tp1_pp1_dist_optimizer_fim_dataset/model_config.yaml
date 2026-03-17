@@ -53,4 +53,5 @@ MODEL_ARGS:
   --fim-data: true
   --fim-rate: 0.5
   --fim-spm-rate: 0.5
+  --async-save: true
 TEST_TYPE: regular

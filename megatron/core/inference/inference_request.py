@@ -46,6 +46,21 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def unwrap_serialized_tensors(serialized_request: dict) -> dict:
+    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+
+    Args:
+        serialized_request (dict): A dict produced by `serialize()`.
+
+    Returns:
+        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+    """
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in serialized_request.items()
+    }
+
+
 # class syntax
 class Status(Enum):
     """Enum for status"""
@@ -362,13 +377,14 @@ class DynamicInferenceRequest(InferenceRequest):
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
 
-        # Compute block hashes for prefix matching
+        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
         if (
             self.enable_prefix_caching
             and self.block_size_tokens is not None
             and self.prompt_tokens is not None
+            and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
 
@@ -767,6 +783,9 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request
