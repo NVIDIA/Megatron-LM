@@ -18,28 +18,12 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.utils import log_single_rank
 
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
-
-
-def _get_rank_or_unknown() -> str:
-    """Return the current distributed rank as a string, or '?' if unavailable.
-
-    During Python interpreter shutdown the distributed process group may already
-    be destroyed by the time ``__del__`` / ``close()`` runs.  Calling
-    ``torch.distributed.get_rank()`` in that situation raises ``ValueError``.
-    This helper lets callers embed the rank in log messages without risking an
-    unhandled exception.
-    """
-    try:
-        if torch.distributed.is_initialized():
-            return str(torch.distributed.get_rank())
-    except Exception:
-        pass
-    return "?"
 
 
 def _set_process_qos(cpu_priority: int, io_priority: Optional[int]) -> None:
@@ -340,12 +324,10 @@ class TemporalAsyncCaller(AsyncCaller):
                 the checkpoint async process needs to be aborted.
         """
         if self.process:
-            logger.debug(f"rank: {_get_rank_or_unknown()}, joining self.process")
+            logger.debug(f"rank: {safe_get_rank()}, joining self.process")
             if abort:
                 log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Temporal worker aborted in rank {_get_rank_or_unknown()}",
+                    logger, logging.WARNING, f"Temporal worker aborted in rank {safe_get_rank()}"
                 )
                 self.process.kill()
             else:
@@ -510,13 +492,11 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.debug(f"PersistentAsyncCaller: {_get_rank_or_unknown()}, Destroying Async Caller")
+        logger.debug(f"PersistentAsyncCaller: {safe_get_rank()}, Destroying Async Caller")
         if self.process:
             if abort:
                 log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Persistent worker aborted in rank {_get_rank_or_unknown()}",
+                    logger, logging.WARNING, f"Persistent worker aborted in rank {safe_get_rank()}"
                 )
                 self.process.kill()
             else:

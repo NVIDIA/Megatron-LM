@@ -15,31 +15,7 @@ import torch
 from megatron.core.dist_checkpointing.strategies.async_utils import (
     PersistentAsyncCaller,
     TemporalAsyncCaller,
-    _get_rank_or_unknown,
 )
-
-
-class TestGetRankOrUnknown:
-    """Unit tests for the ``_get_rank_or_unknown`` helper."""
-
-    def test_returns_rank_when_initialised(self):
-        """When distributed is initialised the rank should be returned."""
-        with (
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_rank", return_value=7),
-        ):
-            assert _get_rank_or_unknown() == "7"
-
-    def test_returns_unknown_when_not_initialised(self):
-        """When the process group is already torn down, return '?'."""
-        with mock.patch("torch.distributed.is_initialized", return_value=False):
-            assert _get_rank_or_unknown() == "?"
-
-    def test_returns_unknown_on_exception(self):
-        """If ``is_initialized`` itself raises (e.g. interpreter teardown),
-        the helper should still return '?' without propagating."""
-        with mock.patch("torch.distributed.is_initialized", side_effect=RuntimeError("shutdown")):
-            assert _get_rank_or_unknown() == "?"
 
 
 class TestPersistentAsyncCallerShutdown:
