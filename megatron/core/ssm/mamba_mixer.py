@@ -503,27 +503,14 @@ class MambaMixer(MegatronModule):
             else:
                 zxBCdt_prefill = zxBCdt
 
-            intermediate_offsets = (
-                context.mamba_slot_allocator.get_intermediate_offsets()
-                if context.mamba_slot_allocator is not None
-                else None
-            )
-            result = self._dynamic_inference_prefill(
+            mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
+            y_prefill = self._dynamic_inference_prefill(
                 zxBCdt_prefill,
                 context,
                 conv_state,
                 ssm_state,
-                intermediate_token_offsets=intermediate_offsets,
+                mamba_layer_idx=mamba_layer_idx,
             )
-            if isinstance(result, tuple):
-                y_prefill, intermediate_states = result
-                mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-                if context.mamba_slot_allocator is not None:
-                    context.mamba_slot_allocator.buffer_intermediate_states(
-                        mamba_layer_idx, intermediate_states
-                    )
-            else:
-                y_prefill = result
 
         # Merge decode and prefill results if necessary
         if y_decode is not None and y_prefill is not None:
@@ -558,14 +545,18 @@ class MambaMixer(MegatronModule):
         context: DynamicInferenceContext,
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
-        intermediate_token_offsets: Optional[List[List[int]]] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
+        mamba_layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
         """Helper to run dynamic inference prefill.
 
         All prefill requests (including chunked prefill) are processed together
         through the unified varlen path. Uses precomputed metadata from
         MambaMetadata.update() to avoid .item() calls and data-dependent
         control flow, enabling CUDA graph compatibility.
+
+        Intermediate state extraction (for Mamba prefix caching) is performed
+        inside _ssm_prefill via pre-allocated output buffers, making it fully
+        CUDA graph compatible.
         """
         metadata = context.mamba_metadata
         real_prefill_count = context.batch_dimensions.prefill_req_count
@@ -585,14 +576,28 @@ class MambaMixer(MegatronModule):
 
         use_triton_conv1d = context._use_triton_conv1d_this_step
 
-        result = self._ssm_prefill(
+        # Prepare intermediate extraction buffers (always passed, CUDA graph compat)
+        slot_allocator = context.mamba_slot_allocator
+        intermediate_chunk_indices = metadata.intermediate_chunk_indices
+        intermediate_abs_positions = metadata.intermediate_abs_positions
+        intermediate_ssm_out = None
+        intermediate_conv_out = None
+        if slot_allocator is not None and mamba_layer_idx is not None:
+            intermediate_ssm_out = slot_allocator._intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = slot_allocator._intermediate_conv_out[mamba_layer_idx]
+
+        y_prefill = self._ssm_prefill(
             zxBCdt,
             conv_state=conv_state,
             ssm_state=ssm_state,
             seq_idx=seq_idx,
             cu_seqlens=cu_seqlens,
             batch_indices=batch_indices,
-            intermediate_token_offsets=intermediate_token_offsets,
+            intermediate_chunk_indices=intermediate_chunk_indices,
+            intermediate_abs_positions=intermediate_abs_positions,
+            intermediate_ssm_out=intermediate_ssm_out,
+            intermediate_conv_out=intermediate_conv_out,
+            conv_gather_offsets=metadata._conv_gather_offsets,
             use_triton_conv1d=use_triton_conv1d,
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
@@ -603,14 +608,6 @@ class MambaMixer(MegatronModule):
             conv_seq_start=metadata.conv_seq_start,
         )
 
-        if intermediate_token_offsets is not None:
-            y_prefill, intermediate_states = result
-        else:
-            y_prefill = result
-            intermediate_states = None
-
-        if intermediate_states is not None:
-            return y_prefill, intermediate_states
         return y_prefill
 
     def _decode(
@@ -711,7 +708,11 @@ class MambaMixer(MegatronModule):
         seq_idx: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         batch_indices: Optional[torch.Tensor] = None,
-        intermediate_token_offsets: Optional[List[List[int]]] = None,
+        intermediate_chunk_indices: Optional[torch.Tensor] = None,
+        intermediate_abs_positions: Optional[torch.Tensor] = None,
+        intermediate_ssm_out: Optional[torch.Tensor] = None,
+        intermediate_conv_out: Optional[torch.Tensor] = None,
+        conv_gather_offsets: Optional[torch.Tensor] = None,
         use_triton_conv1d: bool = False,
         cu_chunk_seqlens: Optional[torch.Tensor] = None,
         last_chunk_indices: Optional[torch.Tensor] = None,
@@ -720,7 +721,7 @@ class MambaMixer(MegatronModule):
         real_token_count: Optional[int] = None,
         conv_seq_idx: Optional[torch.Tensor] = None,
         conv_seq_start: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List]]:
+    ) -> torch.Tensor:
         """
         Performs SSM computation for inference prefill step.
 
@@ -733,9 +734,16 @@ class MambaMixer(MegatronModule):
             cu_seqlens: Cumulative sequence lengths for variable-length sequences.
             batch_indices: A map from batch id to position in the Mamba state tensors for
                 dynamic inference.
-            intermediate_token_offsets: Per-request list of token offsets (relative to
-                sequence start) at which to extract intermediate SSM and conv states.
-                Offsets must be multiples of chunk_size.
+            intermediate_chunk_indices: Pre-allocated tensor of chunk indices for
+                intermediate state extraction (fixed size, padded with 0).
+            intermediate_abs_positions: Pre-allocated tensor of absolute token
+                positions for conv state extraction (fixed size, padded with d_conv).
+            intermediate_ssm_out: Output buffer for extracted SSM states
+                [max_intermediate_count, *ssm_shape].
+            intermediate_conv_out: Output buffer for extracted conv states
+                [max_intermediate_count, *conv_shape].
+            conv_gather_offsets: Constant tensor [-d_conv, ..., -1] for gathering
+                conv states.
             cu_chunk_seqlens: Precomputed chunk boundaries from MambaMetadata.
             last_chunk_indices: Precomputed last chunk index per sequence.
             seq_idx_for_varlen: Precomputed request ID per chunk.
@@ -745,9 +753,8 @@ class MambaMixer(MegatronModule):
             conv_seq_start: Precomputed per-token request start for Triton conv1d.
 
         Returns:
-            If intermediate_token_offsets is None: output tensor of shape (l, b, d).
-            If provided: (output, intermediate_states_per_request) where each entry is
-            (ssm_states, conv_states) or None.
+            Output tensor of shape (l, b, d). Intermediate states (if any) are
+            written directly to intermediate_ssm_out and intermediate_conv_out.
         """
         is_dynamic_batching = seq_idx is not None
 
@@ -798,7 +805,7 @@ class MambaMixer(MegatronModule):
             )
             conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
-            xBC_pre_conv = xBC if intermediate_token_offsets is not None else None
+            xBC_pre_conv = xBC if intermediate_conv_out is not None else None
             if use_triton_conv1d:
                 from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
@@ -908,52 +915,17 @@ class MambaMixer(MegatronModule):
             # boundaries) remain zero, which is safe for RMSNorm and downstream ops.
             y = torch.zeros_like(x)
 
-            intermediate_chunk_indices = None
-            per_request_intermediate_counts = []
-
             if cu_chunk_seqlens is not None:
                 # Use precomputed chunk metadata (CUDA graph compatible, no .item())
-                # Build intermediate chunk indices if needed (eager mode only,
-                # since Step 6 forces eager when intermediate states are required)
-                if intermediate_token_offsets is not None:
-                    seqlens = cu_seqlens_list
-                    num_real_seqs = len(seqlens) - 1
-                    intermediate_chunk_indices_list = []
-                    cumulative_chunks = 0
-                    for i in range(num_real_seqs):
-                        seq_len = seqlens[i + 1] - seqlens[i]
-                        num_chunks = max(1, (seq_len + self.chunk_size - 1) // self.chunk_size)
-                        first_chunk_idx = cumulative_chunks
-                        offsets = intermediate_token_offsets[i]
-                        count = 0
-                        for offset in offsets:
-                            assert offset > 0 and offset <= seq_len, (
-                                f"intermediate offset {offset} out of range for "
-                                f"sequence {i} with length {seq_len}"
-                            )
-                            assert offset % self.chunk_size == 0, (
-                                f"intermediate offset {offset} is not a multiple "
-                                f"of chunk_size {self.chunk_size}"
-                            )
-                            chunk_idx = first_chunk_idx + (offset // self.chunk_size) - 1
-                            intermediate_chunk_indices_list.append(chunk_idx)
-                            count += 1
-                        per_request_intermediate_counts.append(count)
-                        cumulative_chunks += num_chunks
-                    if intermediate_chunk_indices_list:
-                        intermediate_chunk_indices = cu_seqlens.new_tensor(
-                            intermediate_chunk_indices_list, dtype=torch.int64
-                        )
+                pass
             else:
                 # Fallback: build chunk metadata from cu_seqlens (non-precomputed)
                 chunk_boundaries = [0]
                 last_chunk_indices_list = []
-                intermediate_chunk_indices_list = []
                 num_seqs = cu_seqlens.numel() - 1
                 for i in range(num_seqs):
                     start = cu_seqlens[i].item()
                     end = cu_seqlens[i + 1].item()
-                    first_chunk_idx = len(chunk_boundaries) - 1
                     pos = start + self.chunk_size
                     while pos < end:
                         chunk_boundaries.append(pos)
@@ -961,31 +933,8 @@ class MambaMixer(MegatronModule):
                     chunk_boundaries.append(end)
                     last_chunk_indices_list.append(len(chunk_boundaries) - 2)
 
-                    if intermediate_token_offsets is not None:
-                        seq_len = end - start
-                        offsets = intermediate_token_offsets[i]
-                        count = 0
-                        for offset in offsets:
-                            assert offset > 0 and offset <= seq_len, (
-                                f"intermediate offset {offset} out of range for "
-                                f"sequence {i} with length {seq_len}"
-                            )
-                            assert offset % self.chunk_size == 0, (
-                                f"intermediate offset {offset} is not a multiple "
-                                f"of chunk_size {self.chunk_size}"
-                            )
-                            chunk_idx = first_chunk_idx + (offset // self.chunk_size) - 1
-                            intermediate_chunk_indices_list.append(chunk_idx)
-                            count += 1
-                        per_request_intermediate_counts.append(count)
-
                 cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
                 last_chunk_indices = cu_seqlens.new_tensor(last_chunk_indices_list)
-
-                if intermediate_token_offsets is not None and intermediate_chunk_indices_list:
-                    intermediate_chunk_indices = cu_seqlens.new_tensor(
-                        intermediate_chunk_indices_list, dtype=torch.int64
-                    )
 
                 seq_idx_for_varlen = None
                 if seq_idx is not None:
@@ -1028,38 +977,22 @@ class MambaMixer(MegatronModule):
 
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
-            # Assemble per-request intermediate states (SSM + conv)
-            if intermediate_chunk_indices is not None:
-                conv_dim = xBC_pre_conv.shape[-1]
-                intermediate_states_per_request = []
-                ssm_offset = 0
-                num_real_seqs = (
-                    len(cu_seqlens_list) - 1
-                    if cu_seqlens_list is not None
-                    else cu_seqlens.numel() - 1
-                )
-                for i in range(num_real_seqs):
-                    count = per_request_intermediate_counts[i]
-                    if count == 0:
-                        intermediate_states_per_request.append(None)
-                    else:
-                        req_ssm = intermediate_ssm_states[ssm_offset : ssm_offset + count]
-                        # Extract conv states: last d_conv tokens of pre-conv xBC at each offset
-                        req_conv_list = []
-                        seq_start = (
-                            cu_seqlens_list[i]
-                            if cu_seqlens_list is not None
-                            else cu_seqlens[i].item()
-                        )
-                        for offset in intermediate_token_offsets[i]:
-                            abs_pos = seq_start + offset
-                            conv_state_at_offset = xBC_pre_conv[
-                                0, abs_pos - self.d_conv : abs_pos, :
-                            ].t()
-                            req_conv_list.append(conv_state_at_offset)
-                        req_conv = torch.stack(req_conv_list)
-                        intermediate_states_per_request.append((req_ssm, req_conv))
-                        ssm_offset += count
+            # Write intermediate states to pre-allocated output buffers
+            # All tensor ops, no Python loops, fully CUDA graph compatible
+            if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
+                intermediate_ssm_out.copy_(intermediate_ssm_states)
+
+                # Vectorized conv state extraction
+                # intermediate_abs_positions: [max_intermediate_count]
+                # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
+                gather_positions = (
+                    intermediate_abs_positions.unsqueeze(1).long()
+                    + conv_gather_offsets.unsqueeze(0).long()
+                )  # [max_intermediate_count, d_conv]
+                intermediate_conv = xBC_pre_conv[0, gather_positions, :]
+                # [max_intermediate_count, d_conv, conv_dim]
+                intermediate_conv_out.copy_(intermediate_conv.transpose(1, 2))
+                # [max_intermediate_count, conv_dim, d_conv]
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
@@ -1094,8 +1027,6 @@ class MambaMixer(MegatronModule):
             z = self.cp.post_conv_ssm(z)
             y = self.norm(y, z)
 
-        if intermediate_token_offsets is not None and is_dynamic_batching:
-            return y, intermediate_states_per_request
         return y
 
     def _ssm_decode(

@@ -794,15 +794,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx3.add_request(req3)
         assert ctx3.mamba_slot_allocator._eos_cache_block_id[1] is not None
 
-        # buffer and clear intermediate states
+        # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()
         msa4 = ctx4.mamba_slot_allocator
-        dummy = [None, ("ssm", "conv")]
-        msa4.buffer_intermediate_states(0, dummy)
-        msa4.buffer_intermediate_states(1, dummy)
-        assert len(msa4._intermediate_buffer) == 2
-        msa4._intermediate_buffer.clear()
-        assert len(msa4._intermediate_buffer) == 0
+        assert msa4._intermediate_ssm_out.shape[0] == ctx4.num_mamba_layers
+        assert msa4._intermediate_conv_out.shape[0] == ctx4.num_mamba_layers
+        assert msa4._intermediate_ssm_out.shape[1] == msa4.max_intermediate_count
 
         # store_from_live copies all layers
         ctx5 = self._mctx()

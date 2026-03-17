@@ -70,7 +70,19 @@ class MambaSlotAllocator:
         self._intermediate_offsets: list = [None] * context.max_requests
         self._intermediate_block_ids: list = [None] * context.max_requests
         self._eos_cache_block_id: list = [None] * context.max_requests
-        self._intermediate_buffer: dict = {}
+
+        # Pre-allocated output buffers for CUDA graph compatible extraction
+        self.max_intermediate_count = 3 * context.max_requests
+        self._intermediate_ssm_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
+            dtype=ssm_states_dtype,
+            device=device,
+        )
+        self._intermediate_conv_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
+            dtype=conv_states_dtype,
+            device=device,
+        )
 
     # =========================================================================
     # Slot management
@@ -358,27 +370,20 @@ class MambaSlotAllocator:
 
         return result if has_any else None
 
-    def buffer_intermediate_states(
-        self, mamba_layer_idx: int, intermediate_states_per_request: list
-    ) -> None:
-        """Buffer intermediate states from a single Mamba layer's forward pass.
-
-        Args:
-            mamba_layer_idx: The Mamba layer index.
-            intermediate_states_per_request: Per-request list of
-                (ssm_states, conv_states) tuples or None.
-        """
-        self._intermediate_buffer[mamba_layer_idx] = intermediate_states_per_request
-
     def commit_intermediate_states(self) -> None:
-        """Commit buffered intermediate states to the Mamba cache.
+        """Commit intermediate states from pre-allocated output buffers to cache.
 
-        Called after the forward pass completes. For each prefill request:
-        - Intermediate states at kv_divergence/last_aligned: allocate cache slot,
-          write state, register hash in hash_to_block_id.
+        Called after the forward pass (including CUDA graph replay) completes.
+        Reads SSM states from _intermediate_ssm_out and conv states from
+        _intermediate_conv_out, which were written by GPU ops inside the graph.
+
+        For each prefill request:
+        - Intermediate states at extraction offsets: allocate cache slot,
+          copy from output buffers, register hash.
         - Block-aligned EOS: copy final state from live buffer to cache slot.
         """
         ctx = self.context
+        metadata = ctx.mamba_metadata
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count == 0:
             self._clear_intermediate_state()
@@ -387,32 +392,42 @@ class MambaSlotAllocator:
         active_start = ctx.paused_request_count
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
-        has_buffer = bool(self._intermediate_buffer)
 
+        # Commit intermediate states from output buffers
+        intermediate_count = metadata.intermediate_count
+        if intermediate_count > 0:
+            per_request_counts = metadata.per_request_intermediate_counts
+            ssm_offset = 0
+            req_batch_idx = 0
+            for count in per_request_counts:
+                ctx_idx = prefill_start + req_batch_idx
+                block_ids = self._intermediate_block_ids[ctx_idx]
+
+                if count > 0 and block_ids is not None:
+                    for j in range(count):
+                        bid = block_ids[j]
+                        slot = self.allocate_slot(bid)
+
+                        # Copy states from output buffers for all layers
+                        for layer_idx in range(self.num_mamba_layers):
+                            self.ssm_states[layer_idx, slot].copy_(
+                                self._intermediate_ssm_out[layer_idx, ssm_offset + j]
+                            )
+                            self.conv_states[layer_idx, slot].copy_(
+                                self._intermediate_conv_out[layer_idx, ssm_offset + j]
+                            )
+
+                        # Register in mamba hash map
+                        block_hash = ctx.kv_block_allocator.block_hashes[bid].item()
+                        if block_hash > 0:
+                            self.register_block_hash(bid, block_hash)
+
+                ssm_offset += count
+                req_batch_idx += 1
+
+        # Handle block-aligned EOS: copy final state from live buffer
         for req_batch_idx in range(prefill_count):
             ctx_idx = prefill_start + req_batch_idx
-            offsets = self._intermediate_offsets[ctx_idx]
-            block_ids = self._intermediate_block_ids[ctx_idx]
-
-            # Commit intermediate states from forward pass
-            if offsets is not None and block_ids is not None and has_buffer:
-                for offset_idx in range(len(offsets)):
-                    bid = block_ids[offset_idx]
-                    slot = self.allocate_slot(bid)
-
-                    # Write states from each mamba layer
-                    for layer_idx, states_list in self._intermediate_buffer.items():
-                        if states_list[req_batch_idx] is not None:
-                            ssm_states, conv_states = states_list[req_batch_idx]
-                            self.ssm_states[layer_idx, slot].copy_(ssm_states[offset_idx])
-                            self.conv_states[layer_idx, slot].copy_(conv_states[offset_idx])
-
-                    # Register in mamba hash map
-                    block_hash = ctx.kv_block_allocator.block_hashes[bid].item()
-                    if block_hash > 0:
-                        self.register_block_hash(bid, block_hash)
-
-            # Handle block-aligned EOS: copy final state from live buffer
             eos_bid = self._eos_cache_block_id[ctx_idx]
             if eos_bid is not None:
                 slot = self.allocate_slot(eos_bid)
@@ -425,7 +440,6 @@ class MambaSlotAllocator:
 
     def _clear_intermediate_state(self) -> None:
         """Clear all per-request intermediate state tracking."""
-        self._intermediate_buffer.clear()
         ctx = self.context
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count > 0:
@@ -450,7 +464,8 @@ class MambaSlotAllocator:
         )
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self._intermediate_buffer.clear()
+        self._intermediate_ssm_out.zero_()
+        self._intermediate_conv_out.zero_()
         for i in range(self.context.max_requests):
             self._intermediate_offsets[i] = None
             self._intermediate_block_ids[i] = None

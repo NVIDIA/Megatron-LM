@@ -637,7 +637,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -764,6 +766,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
 
         # Allocate large non-graphed buffers.
@@ -1508,12 +1511,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        requires_mamba_state_extraction = False
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
-            requires_mamba_state_extraction = (
-                self.mamba_slot_allocator.get_intermediate_offsets() is not None
-            )
-
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
@@ -1521,7 +1518,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
-            requires_mamba_state_extraction=requires_mamba_state_extraction,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1622,6 +1618,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
+            intermediate_offsets = None
+            if self.mamba_slot_allocator is not None:
+                intermediate_offsets = self.mamba_slot_allocator.get_intermediate_offsets()
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
@@ -1629,6 +1628,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
+                intermediate_token_offsets=intermediate_offsets,
             )
 
             # Auto-enable Triton conv1d for CUDA graph steps. The per-request
