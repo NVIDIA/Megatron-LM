@@ -1843,13 +1843,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_steps,
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += (
-                    " ... prefix cache: %d hits, %d blocks matched, %d tokens skipped"
-                    % (
-                        self._prefix_cache_hits,
-                        self._prefix_cache_blocks_matched,
-                        self._prefix_cache_tokens_skipped,
-                    )
+                output_str += " ... prefix cache: %d hits, %d blocks matched, %d tokens skipped" % (
+                    self._prefix_cache_hits,
+                    self._prefix_cache_blocks_matched,
+                    self._prefix_cache_tokens_skipped,
                 )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
