@@ -72,13 +72,18 @@ class ModelParallelConfig:
     Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
     """
 
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
+    The maximum is always context_parallel_size."""
+
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
 
-    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
     """
     Scheduler for sequence packing and dynamic context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
     expert_model_parallel_size: int = 1
@@ -432,6 +437,37 @@ class ModelParallelConfig:
                     "Please use dynamic_context_parallel only."
                 )
             self.dynamic_context_parallel = True
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    'Dynamic context parallelism requires '
+                    'sequence_packing_scheduler=default_dynamic_cp'
+                )
+
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size must be >= 1, "
+                    f"got {self.min_dynamic_context_parallel_size}"
+                )
+
+            if self.min_dynamic_context_parallel_size > self.context_parallel_size:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size ({self.min_dynamic_context_parallel_size}) "
+                    f"must be <= context_parallel_size ({self.context_parallel_size}), "
+                    f"since context_parallel_size is the maximum dynamic CP group size."
+                )
+
+            if self.min_dynamic_context_parallel_size > 1:
+                warnings.warn(
+                    f"min_dynamic_context_parallel_size is set to {self.min_dynamic_context_parallel_size}. "
+                    f"Dynamic CP groups will range from {self.min_dynamic_context_parallel_size} "
+                    f"to {self.context_parallel_size} (context_parallel_size). "
+                    f"This may cause padding overhead for short sequences.",
+                    UserWarning,
+                )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
