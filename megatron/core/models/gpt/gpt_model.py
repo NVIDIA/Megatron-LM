@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -540,15 +540,12 @@ class GPTModel(LanguageModule):
             and not self.config.fallback_to_eager_attn
             and attention_mask.shape[2] > 1
         ):
+            assert attention_mask.dim() == 4, "TE fused attention only supports 4D attention mask."
             assert (
                 packed_seq_params is None
             ), "TE fused attention with attention mask is not supported for packed sequences."
-            assert attention_mask.dim() == 4, "TE fused attention only supports 4D attention mask."
-            if hasattr(packed_seq_params, 'cp_group'):
-                cp_size = packed_seq_params.cp_group.size()
-            elif hasattr(packed_seq_params, 'local_cp_size'):
-                cp_size = packed_seq_params.local_cp_size
-            elif self.pg_collection.cp is not None:
+            # TODO(yuzhongw, tailaim): support dynamic CP in the future.
+            if self.pg_collection.cp is not None:
                 cp_size = self.pg_collection.cp.size()
             else:
                 cp_size = self.config.context_parallel_size

@@ -456,21 +456,14 @@ class TestGPTWithDynamicInference:
 @pytest.mark.skipif(
     not is_te_min_version("1.2.0"), reason="TE fused attention test requires TE >= 1.2.0"
 )
-@pytest.mark.parametrize(
-    "attn_mask_type",
-    [
-        AttnMaskType.no_mask,
-        AttnMaskType.causal,
-    ],
-)
+@pytest.mark.parametrize("attn_mask_type", [AttnMaskType.no_mask, AttnMaskType.causal])
 def test_gptmodel_te_fused_attention_mask_matches_local_attention_mask(
     attn_mask_type: AttnMaskType,
 ):
-    """Red test for step-3: expected to fail before mask->bias conversion is added in GPTModel."""
+    """Verify TE fused attention with mask->bias conversion matches native attention."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         seed = 1234
-        torch.manual_seed(seed)
         model_parallel_cuda_manual_seed(seed)
 
         seq_len = 4096
