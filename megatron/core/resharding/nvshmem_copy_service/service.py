@@ -22,6 +22,7 @@ except ImportError:
     HAVE_NVSHMEM = False
 
 import torch
+
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
