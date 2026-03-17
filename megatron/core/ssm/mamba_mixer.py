@@ -253,11 +253,11 @@ class MambaMixer(MegatronModule):
         # per-component blocks rather than doing a contiguous concat.
         # partition_sizes lists the per-TP-rank block sizes along partition_dim.
         in_proj_partition_sizes = [
-            self.d_inner_local_tp,                  # z
-            self.d_inner_local_tp,                  # x
-            self.ngroups_local_tp * self.d_state,   # B
-            self.ngroups_local_tp * self.d_state,   # C
-            self.nheads_local_tp,                   # dt
+            self.d_inner_local_tp,  # z
+            self.d_inner_local_tp,  # x
+            self.ngroups_local_tp * self.d_state,  # B
+            self.ngroups_local_tp * self.d_state,  # C
+            self.nheads_local_tp,  # dt
         ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
 

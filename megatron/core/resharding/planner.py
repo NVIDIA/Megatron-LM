@@ -444,77 +444,63 @@ def build_centralized_reshard_plan(
                 src_param_metadata[key] = []
             src_param_metadata[key].append(metadata)
 
-    # Build the plan on global rank 0 and broadcast to all ranks.
-    # Wrap in try/except so that errors on rank 0 are broadcast to all ranks
-    # instead of causing a deadlock (other ranks would block in broadcast forever).
-    error_msg = [None]
+    # Build the plan on global rank 0 and broadcast to all ranks
     if my_global_rank == 0:
-        try:
-            plans_for_all_ranks = {r: ReshardPlan([], []) for r in range(world_size)}
-            # Global monotonically increasing ID for non-local transfers.
-            # This is shared between the corresponding send/recv ops so that
-            # NVSHMEM can build schedule.
-            next_task_id = 0
+        plans_for_all_ranks = {r: ReshardPlan([], []) for r in range(world_size)}
+        # Global monotonically increasing ID for non-local transfers.
+        # This is shared between the corresponding send/recv ops so that
+        # NVSHMEM can build schedule.
+        next_task_id = 0
 
-            # Pipeline-parallel (PP) "mapping" is handled implicitly.
-            # Each rank contributes metadata only for the parameters it actually owns
-            # (i.e., the module partitioning for its PP stage). When PP sizes differ
-            # between source and destination, we don't compute an explicit stage-to-stage
-            # mapping here; instead, we iterate destination ranks and plan copies for the
-            # parameters present on those ranks. Any source rank that has the same logical
-            # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
-            # and TP slicing is applied when applicable.
-            for dst_rank in range(world_size):
-                dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
-                for resolved_name, dst_metadata in dst_rank_params.items():
-                    src_meta_list = src_param_metadata.get(resolved_name)
-                    if not src_meta_list:
-                        raise RuntimeError(
-                            f"Destination parameter '{resolved_name}' on rank {dst_rank} "
-                            "not found in source model."
-                        )
-                    # Choose a representative source metadata with DP round-robin balancing
-                    src_metadata = select_src_metadata_balanced(
-                        src_meta_list, dst_metadata, dst_rank
+        # Pipeline-parallel (PP) "mapping" is handled implicitly.
+        # Each rank contributes metadata only for the parameters it actually owns
+        # (i.e., the module partitioning for its PP stage). When PP sizes differ
+        # between source and destination, we don't compute an explicit stage-to-stage
+        # mapping here; instead, we iterate destination ranks and plan copies for the
+        # parameters present on those ranks. Any source rank that has the same logical
+        # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
+        # and TP slicing is applied when applicable.
+        for dst_rank in range(world_size):
+            dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
+            for resolved_name, dst_metadata in dst_rank_params.items():
+                src_meta_list = src_param_metadata.get(resolved_name)
+                if not src_meta_list:
+                    raise RuntimeError(
+                        f"Destination parameter '{resolved_name}' on rank {dst_rank} "
+                        "not found in source model."
                     )
-                    sources = _determine_source_ranks_for_dst_param(
-                        resolved_name, src_metadata, dst_metadata, dst_rank
-                    )
-                    for src_rank, src_slice, dst_slice in sources:
-                        task_id = next_task_id
-                        next_task_id += 1
+                # Choose a representative source metadata with DP round-robin balancing
+                src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
+                for src_rank, src_slice, dst_slice in sources:
+                    task_id = next_task_id
+                    next_task_id += 1
 
-                        plans_for_all_ranks[dst_rank].recv_ops.append(
-                            TransferOp(
-                                param_name=dst_metadata.name,
-                                peer_rank=src_rank,
-                                is_send=False,
-                                my_slice=dst_slice,
-                                peer_slice=src_slice,
-                                task_id=task_id,
-                            )
+                    plans_for_all_ranks[dst_rank].recv_ops.append(
+                        TransferOp(
+                            param_name=dst_metadata.name,
+                            peer_rank=src_rank,
+                            is_send=False,
+                            my_slice=dst_slice,
+                            peer_slice=src_slice,
+                            task_id=task_id,
                         )
-                        plans_for_all_ranks[src_rank].send_ops.append(
-                            TransferOp(
-                                param_name=src_metadata.name,
-                                peer_rank=dst_rank,
-                                is_send=True,
-                                my_slice=src_slice,
-                                peer_slice=dst_slice,
-                                task_id=task_id,
-                            )
+                    )
+                    plans_for_all_ranks[src_rank].send_ops.append(
+                        TransferOp(
+                            param_name=src_metadata.name,
+                            peer_rank=dst_rank,
+                            is_send=True,
+                            my_slice=src_slice,
+                            peer_slice=dst_slice,
+                            task_id=task_id,
                         )
-            plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
-        except Exception as e:
-            logger.error(f"Rank 0: Plan building failed: {e}")
-            plans_list = [None] * world_size
-            error_msg = [str(e)]
+                    )
+        plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
     else:
         plans_list = [None] * world_size
-    # Broadcast error status first so all ranks can raise together
-    torch.distributed.broadcast_object_list(error_msg, group_src=0, group=group)
-    if error_msg[0] is not None:
-        raise RuntimeError(f"Reshard plan building failed on rank 0: {error_msg[0]}")
     # Use group_src= (group rank) instead of src= (default PG global rank) to support
     # cross-cluster ProcessGroups where members share the same default PG rank.
     torch.distributed.broadcast_object_list(plans_list, group_src=0, group=group)

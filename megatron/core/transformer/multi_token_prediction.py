@@ -912,14 +912,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
         # the gradient in backward pass and was therefore incorrect in this context.
         # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(
-            hidden_states, group=self.tp_group
-        )
+        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(
-                hidden_states, group=self.tp_group
-            )
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
         return hidden_states
 
     def _proj_and_transformer_layer(

@@ -32,6 +32,16 @@ try:
 except Exception:
     has_nvshmem = False
 
+try:
+    import mamba_ssm  # noqa: F401
+
+    from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+    from megatron.core.models.mamba.mamba_model import MambaModel
+
+    has_mamba_deps = True
+except Exception:
+    has_mamba_deps = False
+
 
 def _build_pg_collection(
     tp_size: int, pp_size: int = None, ep_size: int = 1
@@ -117,6 +127,39 @@ def _build_gpt(
     return model
 
 
+def _build_mamba(
+    config: TransformerConfig,
+    vocab_size: int,
+    seq_len: int,
+    pg_collection,
+    hybrid_layer_pattern: str,
+    parallel_output: bool = True,
+):
+    model = MambaModel(
+        config=config,
+        mamba_stack_spec=mamba_stack_spec,
+        vocab_size=vocab_size,
+        max_sequence_length=seq_len,
+        hybrid_layer_pattern=hybrid_layer_pattern,
+        pre_process=True,
+        post_process=True,
+        fp16_lm_cross_entropy=False,
+        parallel_output=parallel_output,
+        share_embeddings_and_output_weights=False,
+        pg_collection=pg_collection,
+    )
+    return model
+
+
+def _mamba_layer_pattern(base: str, num_layers: int, pp_size: int) -> str:
+    """Build hybrid_layer_pattern with '|' pipeline stage boundaries."""
+    layers_per_stage = num_layers // pp_size
+    unit_len = len(base)
+    repeats_per_stage = layers_per_stage // unit_len
+    stage = base * repeats_per_stage
+    return "|".join([stage] * pp_size)
+
+
 def _mp_config() -> ModelParallelConfig:
     return ModelParallelConfig(
         params_dtype=torch.float32,
@@ -146,38 +189,42 @@ def _set_pg_collection(module, tp_group, dp_group):
     ],
 )
 @pytest.mark.parametrize(
-    "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
+    "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts,moe_mode",
     [
-        # TP only changes
-        (2, 1, 1, 1, 1, 1, None),  # TP2 -> TP1
-        (1, 1, 1, 2, 1, 1, None),  # TP1 -> TP2
-        (2, 1, 1, 4, 1, 1, None),  # TP2 -> TP4
-        # PP only changes
-        (1, 2, 1, 1, 1, 1, None),  # PP2 -> PP1
-        (1, 1, 1, 1, 2, 1, None),  # PP1 -> PP2
-        # Both TP and PP change
-        (2, 2, 1, 1, 1, 1, None),  # TP2,PP2 -> TP1,PP1
-        (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
-        (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
-        (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
-        (1, 2, 1, 2, 4, 1, None),  # TP1,PP2 -> TP2,PP4
-        # MoE EP changes
-        (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
-        (1, 1, 2, 1, 1, 1, 4),  # EP2 -> EP1
-        (1, 1, 1, 1, 1, 2, 4),  # EP1 -> EP2
-        (1, 1, 2, 1, 2, 2, 4),  # EP2 -> PP2,EP2
-        # MoE mixed TP + EP
-        (2, 1, 2, 1, 1, 1, 4),  # TP2,EP2 -> TP1,EP1
-        (1, 1, 1, 2, 1, 2, 4),  # TP1,EP1 -> TP2,EP2
-        (4, 1, 1, 2, 1, 2, 4),  # TP4,EP1 -> TP2,EP2
-        (2, 1, 2, 4, 1, 1, 4),  # TP2,EP2 -> TP4,EP1
-        (4, 1, 1, 1, 1, 4, 4),  # TP4,EP1 -> TP1,EP4
-        (1, 1, 4, 4, 1, 1, 4),  # EP4 -> TP4,EP1
+        # ---- Non-MoE: TP only changes ----
+        (2, 1, 1, 1, 1, 1, None, None),  # TP2 -> TP1
+        (1, 1, 1, 2, 1, 1, None, None),  # TP1 -> TP2
+        (2, 1, 1, 4, 1, 1, None, None),  # TP2 -> TP4
+        # ---- Non-MoE: PP only changes ----
+        (1, 2, 1, 1, 1, 1, None, None),  # PP2 -> PP1
+        (1, 1, 1, 1, 2, 1, None, None),  # PP1 -> PP2
+        # ---- Non-MoE: Both TP and PP change ----
+        (2, 2, 1, 1, 1, 1, None, None),  # TP2,PP2 -> TP1,PP1
+        (1, 1, 1, 2, 2, 1, None, None),  # TP1,PP1 -> TP2,PP2
+        (2, 1, 1, 1, 2, 1, None, None),  # TP2,PP1 -> TP1,PP2
+        (1, 2, 1, 2, 1, 1, None, None),  # TP1,PP2 -> TP2,PP1
+        (1, 2, 1, 2, 4, 1, None, None),  # TP1,PP2 -> TP2,PP4
+        # ---- MoE: EP changes (standard) ----
+        (1, 1, 2, 1, 1, 4, 4, None),  # EP2 -> EP4
+        (1, 1, 2, 1, 1, 1, 4, None),  # EP2 -> EP1
+        (1, 1, 1, 1, 1, 2, 4, None),  # EP1 -> EP2
+        (1, 1, 2, 1, 2, 2, 4, None),  # EP2 -> PP2,EP2
+        # ---- MoE: mixed TP + EP (standard) ----
+        (2, 1, 2, 1, 1, 1, 4, None),  # TP2,EP2 -> TP1,EP1
+        (1, 1, 1, 2, 1, 2, 4, None),  # TP1,EP1 -> TP2,EP2
+        (4, 1, 1, 2, 1, 2, 4, None),  # TP4,EP1 -> TP2,EP2
+        (2, 1, 2, 4, 1, 1, 4, None),  # TP2,EP2 -> TP4,EP1
+        (4, 1, 1, 1, 1, 4, 4, None),  # TP4,EP1 -> TP1,EP4
+        (1, 1, 4, 4, 1, 1, 4, None),  # EP4 -> TP4,EP1
+        # ---- MoE latent: representative configs ----
+        (1, 1, 2, 1, 1, 1, 4, "latent"),  # EP2 -> EP1
+        (2, 1, 2, 1, 1, 1, 4, "latent"),  # TP2,EP2 -> TP1,EP1
+        (1, 1, 1, 2, 1, 2, 4, "latent"),  # TP1,EP1 -> TP2,EP2
+        # ---- MoE latent + MTP: representative configs ----
+        (1, 1, 1, 1, 1, 2, 4, "latent_mtp"),  # EP1 -> EP2
+        (2, 1, 2, 1, 1, 1, 4, "latent_mtp"),  # TP2,EP2 -> TP1,EP1
+        (1, 1, 1, 2, 1, 2, 4, "latent_mtp"),  # TP1,EP1 -> TP2,EP2
     ],
-)
-@pytest.mark.parametrize(
-    "moe_mode",
-    [None, "latent", "latent_mtp"],
 )
 def test_swap_gpt_parametrized(
     refit_backend: str,
@@ -190,9 +237,6 @@ def test_swap_gpt_parametrized(
     num_experts: Optional[int],
     moe_mode: Optional[str],
 ):
-    # latent/mtp modes only apply to MoE configs
-    if moe_mode is not None and num_experts is None:
-        pytest.skip("latent/mtp modes only apply to MoE configurations")
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
@@ -203,12 +247,15 @@ def test_swap_gpt_parametrized(
         pytest.skip(
             "WORLD_SIZE must be divisible by both src_tp*src_pp*src_ep and dst_tp*dst_pp*dst_ep"
         )
+
     model_parallel_cuda_manual_seed(1234)
     torch.manual_seed(1234)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
+    # Small GPT config
     seq_len = 8
     vocab_size = 128
+    # --group-query-attention   --num-query-groups 8
     cfg = TransformerConfig(
         num_layers=4 if (src_pp > 1 or dst_pp > 1) else 2,
         hidden_size=32,
@@ -222,8 +269,10 @@ def test_swap_gpt_parametrized(
         num_query_groups=4,
     )
 
+    # Build PGs and models (always use unified PG builder so we can set EP)
     src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=src_pp, ep_size=src_ep)
     dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=dst_pp, ep_size=dst_ep)
+    # Apply EP configuration to TransformerConfigs when MoE is requested
     src_cfg = copy.deepcopy(cfg)
     dst_cfg = copy.deepcopy(cfg)
 
@@ -249,21 +298,30 @@ def test_swap_gpt_parametrized(
 
     src_model = (
         _build_gpt(
-            src_cfg, vocab_size, seq_len, src_pgs,
-            parallel_output=False, num_moe_experts=num_experts,
+            src_cfg,
+            vocab_size,
+            seq_len,
+            src_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
         )
         .to(device)
         .eval()
     )
     dst_model = (
         _build_gpt(
-            dst_cfg, vocab_size, seq_len, dst_pgs,
-            parallel_output=False, num_moe_experts=num_experts,
+            dst_cfg,
+            vocab_size,
+            seq_len,
+            dst_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
         )
         .to(device)
         .eval()
     )
 
+    # Inputs
     batch = 2
     tokens = torch.randint(
         low=0, high=vocab_size, size=(batch, seq_len), device=device, dtype=torch.long
@@ -299,12 +357,144 @@ def test_swap_gpt_parametrized(
     # Compare
     assert ref_logits.shape == dst_logits.shape
     max_diff = (dst_logits - ref_logits).abs().max().item()
-    assert torch.allclose(
-        dst_logits, ref_logits, atol=5e-4, rtol=5e-4
-    ), (
+    assert torch.allclose(dst_logits, ref_logits, atol=5e-4, rtol=5e-4), (
         f"Refit src(TP={src_tp},PP={src_pp},EP={src_ep})"
         f"->dst(TP={dst_tp},PP={dst_pp},EP={dst_ep}) "
         f"moe_mode={moe_mode} outputs differ (max_diff={max_diff:.6f})"
+    )
+    dist.barrier()
+
+    # Clear refit caches before destroying model parallel to avoid stale plans
+    clear_all_caches()
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
+@pytest.mark.parametrize(
+    "src_tp,src_pp,dst_tp,dst_pp",
+    [
+        # TP only changes (exercises block-interleaved planner for Mamba in_proj)
+        (2, 1, 1, 1),  # TP2 -> TP1
+        (1, 1, 2, 1),  # TP1 -> TP2
+        (2, 1, 4, 1),  # TP2 -> TP4
+        # TP + PP change together
+        (1, 1, 2, 2),  # TP1,PP1 -> TP2,PP2
+        (2, 1, 1, 2),  # TP2,PP1 -> TP1,PP2
+    ],
+)
+def test_swap_mamba_parametrized(
+    refit_backend: str, src_tp: int, src_pp: int, dst_tp: int, dst_pp: int
+):
+    if not has_mamba_deps:
+        pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
+    )
+    world = dist.get_world_size()
+    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
+        Utils.destroy_model_parallel()
+        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
+
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Small Mamba config — use "M*" hybrid pattern to test both Mamba layers
+    # (block-interleaved in_proj resharding) and attention layers together.
+    seq_len = 8
+    vocab_size = 128
+    base_pattern = "M*"
+    # Ensure enough layers for both PP configs (at least len(base_pattern) per stage)
+    min_layers = max(src_pp, dst_pp) * len(base_pattern)
+    num_layers = max(min_layers, 4 if (src_pp > 1 or dst_pp > 1) else 2)
+    # Round up to be divisible by both pp_size * unit_len
+    from math import lcm
+
+    factor = lcm(src_pp, dst_pp) * len(base_pattern)
+    num_layers = ((num_layers + factor - 1) // factor) * factor
+
+    cfg = TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=256,
+        num_attention_heads=8,
+        num_query_groups=4,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+    src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=src_pp)
+    dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=dst_pp)
+
+    src_pattern = _mamba_layer_pattern(base_pattern, num_layers, src_pp)
+    dst_pattern = _mamba_layer_pattern(base_pattern, num_layers, dst_pp)
+
+    src_model = (
+        _build_mamba(cfg, vocab_size, seq_len, src_pgs, src_pattern, parallel_output=False)
+        .to(device)
+        .eval()
+    )
+    dst_model = (
+        _build_mamba(cfg, vocab_size, seq_len, dst_pgs, dst_pattern, parallel_output=False)
+        .to(device)
+        .eval()
+    )
+
+    # Inputs
+    batch = 2
+    tokens = torch.randint(
+        low=0, high=vocab_size, size=(batch, seq_len), device=device, dtype=torch.long
+    )
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    )
+    attention_mask = torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool)
+
+    # Collect source reference logits
+    ref_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    src_pp_ranks = dist.get_process_group_ranks(src_pgs.pp)
+    src_last_pp_rank = src_pp_ranks[-1]
+    with torch.no_grad():
+        src_out = src_model(tokens, position_ids, attention_mask)
+        if dist.get_rank() == src_last_pp_rank:
+            ref_logits.copy_(src_out)
+    dist.broadcast(ref_logits, src=src_last_pp_rank, group=src_pgs.pp)
+
+    # Swap weights
+    swap_model_weights([src_model], [dst_model], refit_method=refit_backend)
+
+    # Collect destination logits
+    dst_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    dst_pp_ranks = dist.get_process_group_ranks(dst_pgs.pp)
+    dst_last_pp_rank = dst_pp_ranks[-1]
+    with torch.no_grad():
+        dst_out = dst_model(tokens, position_ids, attention_mask)
+        if dist.get_rank() == dst_last_pp_rank:
+            dst_logits.copy_(dst_out)
+    dist.broadcast(dst_logits, src=dst_last_pp_rank, group=dst_pgs.pp)
+
+    # Compare
+    assert ref_logits.shape == dst_logits.shape
+    max_diff = (dst_logits - ref_logits).abs().max().item()
+    assert torch.allclose(dst_logits, ref_logits, atol=5e-4, rtol=5e-4), (
+        f"Mamba refit src(TP={src_tp},PP={src_pp})"
+        f"->dst(TP={dst_tp},PP={dst_pp}) "
+        f"outputs differ (max_diff={max_diff:.6f})"
     )
     dist.barrier()
 
