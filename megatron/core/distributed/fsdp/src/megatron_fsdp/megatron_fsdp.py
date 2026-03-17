@@ -42,6 +42,32 @@ from .utils import FSDPDistributedIndex
 logger = logging.getLogger(__name__)
 
 
+def _resolve_suggested_communication_unit_size(
+    ddp_config: "DistributedDataParallelConfig",
+    bucket_size: Optional[int],
+    total_param_elements: int,
+    total_fsdp_module: int,
+) -> int:
+    """Pick a communication window without over-prefetching the model."""
+    suggested_communication_unit_size = ddp_config.suggested_communication_unit_size
+    if suggested_communication_unit_size is not None:
+        return suggested_communication_unit_size
+
+    if (
+        ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        and total_fsdp_module > 0
+    ):
+        # Keep roughly two FSDP units in flight: the current unit plus the next one.
+        suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
+    elif bucket_size is not None:
+        suggested_communication_unit_size = bucket_size
+    else:
+        suggested_communication_unit_size = 1_000_000_000
+
+    # Cap the communication window to 1B elements.
+    return min(1_000_000_000, suggested_communication_unit_size)
+
+
 try:
     # Default to Megatron-LM FW.
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -386,31 +412,35 @@ class MegatronFSDP(torch.nn.Module):
         )
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
-        if suggested_communication_unit_size is None:
-            if self.data_parallel_sharding_strategy == "optim_grads_params":
-                total_param_elements = 0
-                total_fsdp_module = 0
-                for module in self.module.modules():
-                    if isinstance(module, tuple(self.fsdp_unit_modules)):
-                        total_fsdp_module += 1
-                        total_param_elements += sum(p.numel() for p in module.parameters())
-                # The suggested size is twice the number of elements in the FSDP modules.
-                # This ensures we process the current FSDP module and attempt to prefetch
-                # the next FSDP module, making the flow of communication better.
-                suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
-            elif self.bucket_size is not None:
-                suggested_communication_unit_size = self.bucket_size
-            else:
-                suggested_communication_unit_size = 1_000_000_000
+        total_param_elements = 0
+        total_fsdp_module = 0
+        if self.data_parallel_sharding_strategy == "optim_grads_params":
+            for module in self.module.modules():
+                if isinstance(module, tuple(self.fsdp_unit_modules)):
+                    total_fsdp_module += 1
+                    total_param_elements += sum(p.numel() for p in module.parameters())
 
-            # Cap to 1B elements.
-            suggested_communication_unit_size = max(
-                1_000_000_000, suggested_communication_unit_size
-            )
+        suggested_communication_unit_size = _resolve_suggested_communication_unit_size(
+            ddp_config=self.ddp_config,
+            bucket_size=self.bucket_size,
+            total_param_elements=total_param_elements,
+            total_fsdp_module=total_fsdp_module,
+        )
 
         self.suggested_RS_queue_capacity = suggested_communication_unit_size
         self.suggested_AG_prefetch_size = suggested_communication_unit_size // 2
+
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = None
+        print(f"[DEBUG][FSDP][Rank {rank}] num_buckets: {self.param_and_grad_buffer.num_buckets}")
+        print(f"[DEBUG][FSDP][Rank {rank}] total_fsdp_module: {total_fsdp_module}")
+        avg_param_elements = (
+            total_param_elements // total_fsdp_module if total_fsdp_module > 0 else None
+        )
+        print(f"[DEBUG][FSDP][Rank {rank}] total_param_elements: {avg_param_elements}")
+        print(f"[DEBUG][FSDP][Rank {rank}] suggested_AG_prefetch_size: {self.suggested_AG_prefetch_size}")
 
         if self.data_parallel_sharding_strategy == "optim_grads_params":
             override_sharded_param_methods_with_safety_checks(
