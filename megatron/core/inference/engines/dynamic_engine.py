@@ -890,9 +890,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
-                self.controller.tokenize_prompt(
-                    self.controller.tokenizer, stop_word, add_BOS=False
-                )
+                self.controller.tokenize_prompt(self.controller.tokenizer, stop_word, add_BOS=False)
                 for stop_word in request.sampling_params.stop_words
             ]
             request.stop_word_ids = stop_word_ids
