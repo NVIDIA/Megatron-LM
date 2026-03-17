@@ -2216,6 +2216,12 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
+        if self.inference_disable_torch_grouped_mm:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_torch_grouped_mm is only supported "
+                "for inference_optimized transformer implementation."
+            )
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
