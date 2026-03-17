@@ -185,7 +185,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
-        super().__init__(
+        # Use explicit class call instead of super() so that subclasses with
+        # multiple inheritance (e.g. TensorParallelAdaptiveMuon) don't route
+        # through an intermediate class that doesn't accept scaled_orthogonalize_fn.
+        OrthogonalizedOptimizer.__init__(
+            self,
             params,
             lr,
             momentum,
@@ -255,8 +259,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         self,
         params: ParamsT,
         lr: float = 3e-4,
-        momentum_beta: float = 0.95,
-        use_nesterov: bool = True,
+        momentum: float = 0.95,
+        nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
@@ -268,7 +272,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -277,17 +281,20 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             self,
             params,
             lr=lr,
-            momentum_beta=momentum_beta,
+            momentum=momentum,
+            nesterov=nesterov,
             weight_decay=weight_decay,
-            use_nesterov=use_nesterov,
             use_decoupled_weight_decay=use_decoupled_weight_decay,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
             num_ns_steps=num_ns_steps,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
-            mode=mode,
+            tp_mode=tp_mode,
         )
         self.moment2_method = moment2_method
 
@@ -363,7 +370,7 @@ _EMERGING_OPTIMIZERS = {
 # Register soap with default config
 # TODO(skyw): register all emerging optimizers.
 if HAVE_EMERGING_OPTIMIZERS:
-    for eopt_name in registry.get_optimizer_names():
+    for eopt_name in registry.get_optimizer_name_list():
         if eopt_name in _EMERGING_OPTIMIZERS:
             # skip already registered local versions, e.g. TensorParallel versions.
             continue
