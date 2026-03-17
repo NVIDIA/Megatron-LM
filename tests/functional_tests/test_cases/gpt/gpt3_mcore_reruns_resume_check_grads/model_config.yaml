@@ -9,7 +9,6 @@ MODEL_ENV_VARS:
   MODEL_ARGS:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 1
-  --use-persistent-ckpt-worker: true
   MODEL_ARGS_10:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 2
@@ -90,6 +89,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
   --async-save: true
+  --use-persistent-ckpt-worker: true
   # data settings
   --data-cache-path: ${DATA_CACHE_PATH}
   --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
@@ -115,7 +115,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --context-parallel-size: 1
   --pipeline-model-parallel-size: 1
-  --use-persistent-ckpt-worker: true
 MODEL_ARGS_2:
   <<: *BASE_MODEL_ARGS
   #########################################################
