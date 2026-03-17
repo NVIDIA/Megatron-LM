@@ -169,7 +169,7 @@ def _multimem_reduce_scatter_kernel(
 ):
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
-    When REDUCE_F32=True, uses f32 reduction instead of bf16x2 reduction.
+    When REDUCE_F32=True, uses fp32 reduction instead of bf16x2 reduction.
     """
     symm_mem_sync(
         signal_pad_ptrs,
