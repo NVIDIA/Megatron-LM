@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections.abc import Callable
 import copy
 import logging
-from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -98,20 +97,28 @@ class GroupedMLP(MegatronModule):
         ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
+        glu_interleave_size = self.config.moe_mlp_glu_interleave_size
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
+            if glu_interleave_size is not None and (
+                not isinstance(glu_interleave_size, int) or glu_interleave_size <= 0
+            ):
+                raise ValueError(
+                    "`moe_mlp_glu_interleave_size` must be a positive integer or None, "
+                    f"got {glu_interleave_size!r}."
+                )
 
             @jit_fuser
             def glu(x):
                 # Undo interleaving if needed
-                if self.config.moe_mlp_glu_interleave_size is not None:
+                if glu_interleave_size is not None:
                     shape = x.size()
                     x = x.reshape(
                         -1,
-                        shape[-1] // (2 * self.config.moe_mlp_glu_interleave_size),
+                        shape[-1] // (2 * glu_interleave_size),
                         2,
-                        self.config.moe_mlp_glu_interleave_size,
+                        glu_interleave_size,
                     )
                     x = x.transpose(1, 2)
                     x = x.reshape(shape)
@@ -148,6 +155,19 @@ class GroupedMLP(MegatronModule):
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
+        if (
+            self.config.gated_linear_unit
+            and glu_interleave_size is not None
+            and self.config.moe_ffn_hidden_size % (tp_size * glu_interleave_size) != 0
+        ):
+            raise ValueError(
+                "Unsupported `moe_mlp_glu_interleave_size`: expected "
+                "`moe_ffn_hidden_size` to be divisible by "
+                "`expert_tensor_parallel_size * moe_mlp_glu_interleave_size`. "
+                f"Got moe_ffn_hidden_size={self.config.moe_ffn_hidden_size}, "
+                f"expert_tensor_parallel_size={tp_size}, "
+                f"moe_mlp_glu_interleave_size={glu_interleave_size}."
+            )
 
         fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
@@ -727,14 +747,24 @@ class TEGroupedMLP(MegatronModule):
 
             set_save_original_input(self.linear_fc1)
 
+        # Fused implementation with Transformer Engine op fuser API
+        if self.config.use_transformer_engine_op_fuser:
+            assert self._is_fused_impl_supported(), "Fused GroupedMLP is not supported for this configuration."
+        self._with_fused_impl: bool = self._is_fused_impl_supported() and self.config.use_transformer_engine_op_fuser
+        self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        if self.config.gated_linear_unit and self.config.moe_mlp_glu_interleave_size is not None and not self._with_fused_impl:
+            logger.warning(
+                "`moe_mlp_glu_interleave_size=%s` is enabled, but fused MoE MLP implementation "
+                "is not supported for this configuration. The non-fused path may incur extra "
+                "tensor reordering/copy overhead each forward pass.",
+                self.config.moe_mlp_glu_interleave_size,
+            )
+
         if self.config.fp8 or self.config.fp4:
             assert HAVE_TE, "FP8 and FP4 requires TE."
-            self.quantization_padding = Fp8Padding(self.num_local_experts)
-            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
-
-        # Fused implementation with Transformer Engine op fuser API
-        self._with_fused_impl: bool = self._is_fused_impl_supported()
-        self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+            align_size = 256 if self._with_fused_impl else None
+            self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
+            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts, align_size=align_size)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -851,7 +881,7 @@ class TEGroupedMLP(MegatronModule):
         for idx in range(self.linear_fc2.num_gemms):
             if not fc2_single_grouped_parameter:
                 setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
-            if self.linear_fc1.use_bias:
+            if self.linear_fc2.use_bias:
                 setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
         ops.append(op)
 
@@ -904,15 +934,12 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        padding_align_size = None
         if self.config.moe_router_padding_for_quantization:
             # Padding has already been applied in router
             pass
         elif self.config.fp8 or self.config.fp4:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
-            padding_align_size = 256  # Requirement for grouped GEMM
-            self.quantization_padding.align_size = padding_align_size
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
@@ -936,7 +963,6 @@ class TEGroupedMLP(MegatronModule):
 
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
-            self.quantization_unpadding.align_size = padding_align_size
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
         return output
