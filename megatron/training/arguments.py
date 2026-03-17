@@ -1387,6 +1387,8 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
+        assert args.async_strategy in ["nvrx", "mcore"], \
+            f"async_strategy {args.async_strategy} is not supported. Available strategies: nvrx, mcore."
         
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:

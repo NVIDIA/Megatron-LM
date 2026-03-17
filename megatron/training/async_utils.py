@@ -7,27 +7,23 @@ the async checkpoint save calls.
 import logging
 import time
 
-from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
-from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue, AsyncRequest
-from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
-    _results_queue,
-    get_write_results_queue,
-)
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
 # Singleton manager of async calls
-# The default is `TemporalAsyncCaller` (persistent=False)
-_async_calls_queue = None # AsyncCallsQueue(persistent=False)
+_async_calls_queue = None
 
 
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     global _async_calls_queue
     args = get_args()
+    async_strategy, imports = get_async_strategy(args.async_strategy)
+    AsyncCallsQueue = imports["AsyncCallsQueue"]
+    get_write_results_queue = imports["get_write_results_queue"]
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
     time_start = time.time()
@@ -35,11 +31,15 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         print(f"init_persistent_async_worker: {rank}, Starting Async Caller", flush=True)
     _async_calls_queue = AsyncCallsQueue(persistent=True)
     # initialize the persistent caller with QoS priorities from args
-    # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
+    kwargs = {}
+    if async_strategy == "mcore":
+        # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
+        kwargs["mp_mode"] = mp_mode
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=args.async_ckpt_cpu_priority,
         io_priority=args.async_ckpt_io_priority,
+        **kwargs,
     )
     # initialize ckpt write results queue
     get_write_results_queue('fork')
@@ -104,4 +104,5 @@ def reset_persistent_async_worker():
         del _results_queue
     _results_queue = None
     _async_calls_queue = None
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    _, imports = get_async_strategy()
+    imports["CachedMetadataFileSystemReader"].clear_metadata_cache()

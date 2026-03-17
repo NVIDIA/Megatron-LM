@@ -441,6 +441,9 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
+    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
+    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
