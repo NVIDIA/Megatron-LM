@@ -1377,7 +1377,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         N_prefill = target_dims.prefill_req_count
         N_total = N_decode + N_prefill
         T = target_dims.token_count
-        tokens_per_request = self.num_speculative_tokens + 1
+        tokens_per_decode_request = self.num_speculative_tokens + 1
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
         # 1. Request counts and token count.
@@ -1388,11 +1388,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 2. Per-request state consumed by mha_metadata.update().
         if N_decode > 0:
-            self.request_query_lengths[0:N_decode] = tokens_per_request
+            self.request_query_lengths[0:N_decode] = tokens_per_decode_request
 
         # Prefill requests: distribute remaining tokens evenly.
         if N_prefill > 0:
-            prefill_tokens = T - (N_decode * tokens_per_request)
+            prefill_tokens = T - (N_decode * tokens_per_decode_request)
             tokens_per_prefill = prefill_tokens // N_prefill
             remainder = prefill_tokens % N_prefill
             self.request_query_lengths[N_decode:N_total] = tokens_per_prefill
@@ -1406,11 +1406,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
 
-        decode_tokens_total = N_decode * tokens_per_request
+        decode_tokens_total = N_decode * tokens_per_decode_request
         if decode_tokens_total > 0:
             self.token_to_local_position_within_kv_block[0:decode_tokens_total] = (
                 torch.arange(decode_tokens_total, device=self.token_to_block_idx.device)
-                % tokens_per_request
+                % tokens_per_decode_request
             )
 
         if N_prefill > 0:
@@ -1430,7 +1430,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         device=self.token_to_request_idx.device,
                         dtype=self.token_to_request_idx.dtype,
                     ),
-                    tokens_per_request,
+                    tokens_per_decode_request,
                 )
 
             # Prefill tokens: distribute among prefill requests.
