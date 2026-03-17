@@ -1355,7 +1355,7 @@ def prepare_data_for_update(
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
-        if args.rl_use_sequence_packing:
+        if sequence_packing:
             with nvtx_range("rl/sequence-packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
@@ -1942,11 +1942,11 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-                with nvtx_range("rl/onload/grad-buffers", time=True):
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
                     model_for_grad_offload = training_model if training_model is not None else model
                     model_for_grad_offload[0].restore_grad_buffers()
-                with nvtx_range("rl/onload/optimizer-state", time=True):
+                with nvtx_range("rl/restore/optimizer-state", time=True):
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
