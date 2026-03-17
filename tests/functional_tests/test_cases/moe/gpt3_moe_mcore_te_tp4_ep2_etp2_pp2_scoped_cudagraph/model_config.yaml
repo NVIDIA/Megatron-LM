@@ -86,6 +86,7 @@ MODEL_ARGS:
   --ckpt-fully-parallel-load: true
   --ckpt-format: torch_dist
   --ckpt-assume-constant-structure: true
+  --async-save: true
 TEST_TYPE: ckpt-resume
 METRICS:
   # - "iteration-time"

@@ -475,12 +475,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             pg_collection=pg_collection,
         )
 
-        # TE's GroupedLinear stores per-expert weights as separate parameters
-        # (weight0, weight1, ..., weight{n-1}). We stack them into contiguous tensors
-        # of shape [num_experts, out_features, in_features] for torch._grouped_mm and
-        # FlashInfer's cutlass_fused_moe. Per-expert views are registered so that
-        # load_state_dict still writes into the contiguous buffers.
-        self._build_concatenated_weights()
+        # Concatenated weights are built lazily on first forward to ensure
+        # checkpoint loading has already populated the per-expert parameters.
+        self._concatenated_weights_built = False
 
         self.is_inference_cuda_graphed_iteration = False
 
@@ -518,16 +515,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Disable CUDA-graphed iteration mode."""
         self.is_inference_cuda_graphed_iteration = False
 
+    @torch.inference_mode(False)
     def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors with per-expert views for checkpoint compatibility.
+        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
 
         Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Replaces TE's individual weight{i}
-        parameters with views into these tensors.
+        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
+        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
+        to be a view into the contiguous buffer. The nn.Parameter objects themselves
+        remain untouched in TE's module, preserving FP8 scaling state, etc.
 
         This allows:
-        - load_state_dict to load into weight{i} views -> writes into big tensor
-        - forward() to use big tensor directly with torch._grouped_mm or FlashInfer
+        - TE's forward to work correctly (same Parameter objects, same internal state)
+        - Training updates to flow through (param.data is a view into the big tensor)
+        - torch._grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -540,19 +541,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
         _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
 
-        # Copy existing TE weights into big tensors, then replace with views
+        # Copy existing TE weights into big tensors, then point param.data to the views
         for i in range(self.num_local_experts):
-            # Copy initialized data
-            _fc1_weight[i].copy_(getattr(self.linear_fc1, f'weight{i}').data)
-            _fc2_weight[i].copy_(getattr(self.linear_fc2, f'weight{i}').data)
+            fc1_param = getattr(self.linear_fc1, f'weight{i}')
+            fc2_param = getattr(self.linear_fc2, f'weight{i}')
 
-            # Delete TE's original parameters
-            delattr(self.linear_fc1, f'weight{i}')
-            delattr(self.linear_fc2, f'weight{i}')
+            # Copy initialized data into contiguous buffer
+            _fc1_weight[i].copy_(fc1_param.data)
+            _fc2_weight[i].copy_(fc2_param.data)
 
-            # Register views as parameters (checkpoint loads will write into big tensor)
-            self.linear_fc1.register_parameter(f'weight{i}', torch.nn.Parameter(_fc1_weight[i]))
-            self.linear_fc2.register_parameter(f'weight{i}', torch.nn.Parameter(_fc2_weight[i]))
+            # Redirect param.data to view into contiguous buffer.
+            # The nn.Parameter object stays the same — TE's internal state is preserved.
+            fc1_param.data = _fc1_weight[i]
+            fc2_param.data = _fc2_weight[i]
 
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
@@ -639,10 +640,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
+
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        elif self.is_inference_cuda_graphed_iteration:
+        # Lazily build concatenated weights on first forward (after checkpoint load)
+        if not self._concatenated_weights_built:
+            assert (
+                not self.training
+            ), "Concatenated weights must be built before training forward pass."
+            self._build_concatenated_weights()
+            self._concatenated_weights_built = True
+
+        if self.is_inference_cuda_graphed_iteration:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert (
                 HAVE_FLASHINFER
@@ -650,12 +660,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-
         elif self._torch_grouped_mm_available:
             return self._torch_grouped_mm_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
-
         else:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
