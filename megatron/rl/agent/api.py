@@ -219,7 +219,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                 or np.std([r.reward for r in group]) > 1e-6
             ):
                 for rollout in group:
-                    rollout.submission_index = batch_id * groups_per_worker + index_in_batch
+                    rollout.index_in_batch = index_in_batch
                     rollout.batch_id = batch_id
                 await grouped_rollouts.put(group)
                 return True
@@ -264,7 +264,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                     pending.setdefault(group[0].batch_id, []).append(group)
                     while len(pending.get(next_batch_id, [])) >= groups_per_worker:
                         batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g[0].submission_index)
+                        batch.sort(key=lambda g: g[0].index_in_batch)
                         next_batch_id += 1
                         for g in batch:
                             yield g
