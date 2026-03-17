@@ -869,11 +869,6 @@ class MambaMixer(MegatronModule):
                 )
             xBC = rearrange(xBC, "b d l -> b l d").contiguous()
 
-        """
-        if torch.distributed.get_rank() == 0:
-            print(f"Layer {self.layer_number}: xBC post conv={xBC}, conv_state[batch_indices] post conv={conv_state[batch_indices]}")
-        """
-
         x, B, C = torch.split(
             xBC,
             [
@@ -997,11 +992,6 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
-            """
-            if torch.distributed.get_rank() == 0:
-                print(f"Layer {self.layer_number}: x before SSM={x}")
-            """
-
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
@@ -1095,11 +1085,6 @@ class MambaMixer(MegatronModule):
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
-
-        """
-        if torch.distributed.get_rank() == 0:
-            print(f"Layer {self.layer_number}: y post SSM={y}, ssm_state[batch_indices] post SSM={ssm_state[batch_indices]}")
-        """
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)
