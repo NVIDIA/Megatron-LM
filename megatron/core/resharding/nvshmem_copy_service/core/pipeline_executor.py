@@ -221,10 +221,10 @@ class PipelineExecutor:
             nvtx_range_pop("Step 4b: Barrier")
 
             # Step 5: Wait for async pack to complete (double-buffer safety)
-            torch.cuda.nvtx.range_push("Step 5: Wait Pack")
+            nvtx_range_push("Step 5: Wait Pack")
             if has_next_send:
                 self.pack_events[(i + 1) % 2].synchronize()
-            nvtx_range_pop("Step 5: Wait Async")
+            nvtx_range_pop("Step 5: Wait Pack")
 
             nvtx_range_pop(nvtx_iter_msg)
 
