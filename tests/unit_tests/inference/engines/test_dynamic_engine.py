@@ -557,7 +557,8 @@ class TestDynamicInferenceEngine:
 
         return env
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         set_rounder(64)
         Utils.destroy_model_parallel()
 

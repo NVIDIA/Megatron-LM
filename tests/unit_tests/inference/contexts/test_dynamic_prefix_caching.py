@@ -24,13 +24,15 @@ from tests.unit_tests.test_utilities import Utils
 
 class PrefixCachingTestBase:
 
-    def setup_method(self, method):
+    @classmethod
+    def setup_class(cls):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     @staticmethod

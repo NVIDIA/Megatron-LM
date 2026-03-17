@@ -37,13 +37,25 @@ def rounder_override(n):
 
 class TestDynamicContext:
 
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
-
-        self.pp_size = pipeline_parallel_size
-
+        Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def _restore_model_parallel(self):
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
 
@@ -108,14 +120,14 @@ class TestDynamicContext:
         )
         return dynamic_context
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -150,7 +162,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     def test_is_static_batching(self):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -167,7 +179,7 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -191,7 +203,6 @@ class TestDynamicContext:
     @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_request_overflow(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -221,7 +232,6 @@ class TestDynamicContext:
     @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_token_overflow_error(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -250,7 +260,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -325,7 +334,7 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_allocate_and_release_memory_blocks(self, is_hybrid_model):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -374,7 +383,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_add_request(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -447,7 +455,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_populates_state(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -546,7 +553,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_hybrid_allocates_mamba(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -577,7 +583,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_decode_does_not_count_as_prefill(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -604,7 +609,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -805,7 +809,6 @@ class TestDynamicContext:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_blocks_for_finished_requests(self, is_hybrid_model):
         """Test that memory blocks are correctly released for finished requests."""
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -882,7 +885,6 @@ class TestDynamicContext:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_finished_requests_with_multiple_blocks(self, is_hybrid_model):
         """Test that all memory blocks are correctly released for finished requests that use multiple blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -956,7 +958,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         if not is_hybrid_model:
             # If not hybrid, mamba_states_cache should fail
@@ -1031,7 +1032,7 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_calculate_and_store_log_probs(self):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -1316,6 +1317,8 @@ class TestDynamicContext:
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
 
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
     @rounder_override(64)
@@ -1323,7 +1326,6 @@ class TestDynamicContext:
         """
         Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
         """
-        self._setup_model_parallel_group(1, 1)
 
         buffer_gb = 0.05
         paused_gb = 0.01
@@ -1418,6 +1420,8 @@ class TestDynamicContext:
         with pytest.raises(AssertionError):
             DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -1430,7 +1434,6 @@ class TestDynamicContext:
         the same observable state as the slow path
         (add_dummy_requests_for_cudagraph_capture(min(cuda_graph_dims))).
         """
-        self._setup_model_parallel_group(1, 1)
 
         ctx = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1528,6 +1531,8 @@ class TestDynamicContext:
         # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
         assert dynamic_context.num_attention_heads_per_partition == 1
 
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     def test_chunked_prefill_state_preserved_across_decode_completions(self):
@@ -1536,7 +1541,6 @@ class TestDynamicContext:
         finish (causing the context boundary to shrink), the hidden chunked request
         is safely pulled to the new boundary so it doesn't lose its KV blocks or Mamba slot.
         """
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1640,7 +1644,6 @@ class TestDynamicContext:
         3. All remaining active decode requests finish in the same step
         4. active_request_count becomes 0 — the code must not assert-fail
         """
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1718,7 +1721,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1773,7 +1775,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_boundary_crossing(self):
         """Test token block assignment when speculative tokens cross a KV block boundary."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1846,7 +1847,6 @@ class TestDynamicContext:
         Test that speculative tokens are correctly saved and concatenated
         when requests are temporarily paused.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1916,7 +1916,7 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_tokens_less_than_block_size_assert(self):
-        self._setup_model_parallel_group(1, 1)
+
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
@@ -1935,7 +1935,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_swap_book_keeping_tensors_with_speculative_tokens(self):
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1969,7 +1968,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_update_requests_with_finished_requests_and_speculative_tokens(self):
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2025,7 +2023,6 @@ class TestDynamicContext:
         'dummy' speculative tokens from bloating the active_token_count, and that the
         next chunk seamlessly appends without needing legacy offset subtractions.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2099,7 +2096,6 @@ class TestDynamicContext:
         """Test that swapping a chunked prefill request to the end of the buffer
         correctly brings along the 2D speculative tokens for the other decode requests.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2178,7 +2174,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_with_prefix_caching_shared_blocks(self):
         """Test that prefix caching correctly shares blocks when speculative decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2234,7 +2229,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_with_prefix_caching_kv_offset(self):
         """Test that KV offset accounts for prefix skip when spec decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2281,7 +2275,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_update_then_release_with_prefix_caching(self):
         """Test that update_requests with spec tokens + block release respects ref counts."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2339,7 +2332,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_boundary_crossing_with_prefix_caching(self):
         """Test block boundary crossing from speculative tokens does not corrupt shared blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2417,7 +2409,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_chunked_prefill_prefix_caching_from_hidden_state(self):
         """Test prefix caching matching safely resolves from the hidden boundary state."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2493,7 +2484,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_prefix_caching_check_availability_with_speculative(self):
         """Test check_availability accounts for prefix match when spec decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2541,7 +2531,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_prefix_match_exact_block_boundary(self):
         """Test prefix matching when the shared prefix is an exact multiple of the block size."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2601,7 +2590,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_eviction_with_shared_prefix_blocks(self):
         """Test that evicting a request drops ref counts correctly without destroying shared blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2676,7 +2664,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_oom_during_speculative_boundary_crossing(self):
         """Test boundary crossing with speculative tokens pauses the request gracefully when KV cache is full, keeping other requests active."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2751,7 +2738,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_chunked_prefill_meets_prefix_caching(self):
         """Test that chunks in a chunked-prefill pipeline properly hit the prefix cache mid-flight."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2

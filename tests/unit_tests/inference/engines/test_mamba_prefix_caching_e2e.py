@@ -31,6 +31,7 @@ registration, skip counts) and output correctness (generated
 tokens match between pc=off and pc=on).
 """
 
+import os
 import random
 import types
 
@@ -91,7 +92,8 @@ def set_rounder(value):
 class TestMambaPrefixCachingE2E:
     """End-to-end test for Mamba prefix caching with a real hybrid model."""
 
-    def setup_method(self, method):
+    @classmethod
+    def setup_class(cls):
         Utils.initialize_model_parallel()
         random.seed(123)
         torch.manual_seed(123)
@@ -99,7 +101,18 @@ class TestMambaPrefixCachingE2E:
             seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
         )
 
-    def teardown_method(self, method):
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     def _create_model(self, num_cuda_graphs=None):

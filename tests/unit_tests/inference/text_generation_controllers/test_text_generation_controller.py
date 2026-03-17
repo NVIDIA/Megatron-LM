@@ -136,7 +136,8 @@ class TestTextGenerationController:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     def test_sample_from_logits(self):
