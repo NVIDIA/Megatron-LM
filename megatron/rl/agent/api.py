@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
 
@@ -58,14 +59,13 @@ class Rollout(AgentBaseModel):
     num_evictions: list[int]
 
 
+@dataclass(slots=True)
 class RolloutGroup:
     """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
-    __slots__ = ('rollouts', 'batch_id', 'index_in_batch')
 
-    def __init__(self, rollouts, batch_id=0, index_in_batch=0):
-        self.rollouts = rollouts
-        self.batch_id = batch_id
-        self.index_in_batch = index_in_batch
+    rollouts: list[Rollout]
+    batch_id: int = 0
+    index_in_batch: int = 0
 
     def __iter__(self):
         return iter(self.rollouts)
