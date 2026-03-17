@@ -84,11 +84,6 @@ RL_LOGGABLE_TIMER_NAMES = [
     'rl/offload-kv-cache-after-inference',
     'rl/restore-kv-cache-before-inference',
     # Fine-grained offload/restore breakdown
-    'offload/cuda-synchronize',
-    'offload/free-buffers',
-    'offload/empty-cache',
-    'restore/allocate-buffers',
-    'restore/cuda-synchronize',
     'rl/restore/grad-buffers',
     'rl/restore/optimizer-state',
     'rl/restore/wait-for-transfers',
