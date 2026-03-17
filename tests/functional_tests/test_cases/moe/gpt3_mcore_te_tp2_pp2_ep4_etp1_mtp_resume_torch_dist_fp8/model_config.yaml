@@ -125,6 +125,7 @@ MODEL_ARGS:
   --fp8-format: hybrid
   --fp8-recipe: tensorwise
   --exit-interval: 50
+  --async-save: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
   - "iteration-time"

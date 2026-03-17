@@ -51,4 +51,5 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: flash
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: frozen-resume

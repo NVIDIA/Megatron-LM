@@ -87,6 +87,102 @@ class TestFullyShardedDataParallel:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def _build_fsdp_model(
+        self,
+        grad_reduce_in_fp32=False,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=None,
+        grad_comm_dtype=None,
+    ):
+        """Helper to construct a FullyShardedDataParallel with the given dtype args."""
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+        )
+        model = TestModel(input_dim=13, output_dim=17).cuda()
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model,
+            fsdp_unit_modules=[torch.nn.Linear],
+            main_params_dtype=main_params_dtype,
+            main_grads_dtype=main_grads_dtype,
+            grad_comm_dtype=grad_comm_dtype,
+        )
+        return fsdp_model
+
+    def test_fsdp_mp_policy_with_default_args(self):
+        """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model()
+        assert fsdp_model.mp_policy.main_params_dtype == torch.float32
+        assert fsdp_model.mp_policy.main_grads_dtype is None
+        assert fsdp_model.mp_policy.grad_comm_dtype is None
+
+    @pytest.mark.parametrize(
+        ("main_params_dtype", "main_grads_dtype", "grad_comm_dtype"),
+        [
+            (torch.bfloat16, None, None),
+            (torch.float16, torch.float32, None),
+            (torch.float32, torch.bfloat16, torch.bfloat16),
+            (None, None, None),
+        ],
+    )
+    def test_fsdp_mp_policy_with_custom_dtypes(
+        self, main_params_dtype, main_grads_dtype, grad_comm_dtype
+    ):
+        """Test that FullyShardedDataParallel forwards custom dtypes to mp_policy correctly."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            main_params_dtype=main_params_dtype,
+            main_grads_dtype=main_grads_dtype,
+            grad_comm_dtype=grad_comm_dtype,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == main_params_dtype
+        assert fsdp_model.mp_policy.main_grads_dtype == main_grads_dtype
+        assert fsdp_model.mp_policy.grad_comm_dtype == grad_comm_dtype
+
+    def test_fsdp_mp_policy_grad_reduce_in_fp32_overrides_dtypes(self):
+        """Test that grad_reduce_in_fp32=True forces main_grads and grad_comm to fp32."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            grad_reduce_in_fp32=True,
+            main_params_dtype=torch.bfloat16,
+            main_grads_dtype=torch.bfloat16,
+            grad_comm_dtype=torch.float16,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.main_grads_dtype == torch.float32
+        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float32
+
+    def test_fsdp_mp_policy_grad_reduce_in_fp32_disabled_preserves_dtypes(self):
+        """Test that grad_reduce_in_fp32=False preserves the user-specified grads/comm dtypes."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            grad_reduce_in_fp32=False,
+            main_params_dtype=torch.bfloat16,
+            main_grads_dtype=torch.bfloat16,
+            grad_comm_dtype=torch.float16,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.main_grads_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float16
+
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",

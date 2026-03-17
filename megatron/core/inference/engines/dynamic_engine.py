@@ -275,6 +275,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -707,6 +708,16 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
+
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+                req = self.get_request(req_id)
+                if req.finished_chunk_token_count > 0:
+                    req.remaining_prompt_tokens = req.prompt_tokens
+                    req.finished_chunk_token_count = 0
+
+            # Reset the chunked prefill request id
+            self.chunked_prefill_request_id = -1
         else:
             recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
@@ -752,6 +763,13 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -810,6 +828,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 future=self._loop.create_future(),
             )
             request.add_event_add_engine()  # Record when request enters engine
+
+            # Stamp new request with the current generation epoch.
+            if self._generation_epoch is not None:
+                epoch = self._generation_epoch
+                request.policy_epoch = [(0, epoch)]
+                request.kv_cache_epoch = [(0, epoch)]
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -884,7 +908,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
                 warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
+                    f"Request {request_id} failed to be added to the engine due to errors. "
+                    f"Prompt Tokens: {len(request.prompt_tokens)} "
+                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                    f"Max sequence length: {self.context.max_sequence_length} "
                 )
 
         return self.requests[request_id].future
@@ -1130,48 +1157,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
-                if (
-                    request_id == self.context.chunked_prefill_request_id
-                    and self.materialize_only_last_token_logits
-                ):
-                    request.prompt_log_probs = []
-                    request.generated_log_probs = []
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    # We only want decode log probs.
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
                 else:
+                    # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
                     total_accumulated = len(request.prompt_log_probs) + len(
                         request.generated_log_probs
                     )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
 
-                    # Handle skip_prompt_log_probs during prefill
-                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token).
-                    # With speculative decoding, decode steps also produce multiple log probs
-                    # (one per accepted token + new sample), so we must check that this is
-                    # actually a prefill step (no generated log probs accumulated yet).
-                    is_prefill_log_probs = len(request.generated_log_probs) == 0
-                    if (
-                        request.sampling_params.skip_prompt_log_probs
-                        and len(request_log_probs) > 1
-                        and is_prefill_log_probs
-                    ):
-                        # Only append the last log prob (first generated token) to generated_log_probs
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        # Vectorized approach: calculate split point and use list slicing
-                        if not request.sampling_params.skip_prompt_log_probs:
-                            # Calculate how many log probs go to prompt vs generated
-                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                            # Batch extend instead of individual appends
-                            if split_idx > 0:
-                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                            if split_idx < len(request_log_probs):
-                                request.generated_log_probs.extend(request_log_probs[split_idx:])
-                        else:
-                            # All log probs go to generated
-                            request.generated_log_probs.extend(request_log_probs)
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1454,12 +1463,19 @@ class DynamicInferenceEngine(AbstractEngine):
                                 pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
 
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
-                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
-                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce
+                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
+                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
+                    # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - chunk_length == 1 and chunk_length > 1:
-                        chunk_length -= 1
+                    if remaining_len - chunk_length == 1:
+                        if chunk_length > 1:
+                            chunk_length -= 1
+                        else:
+                            # We only have space for 1 token, but remaining is 2.
+                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
+                            can_schedule = False
+                            break
 
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
@@ -1616,6 +1632,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
         range_pop()
 
         # Detokenize all finished requests if not using
@@ -1638,7 +1655,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
@@ -1893,9 +1913,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
 
-        # First pass: add all requests and detect staleness increments.
+        # First pass: add requests.
         # Control signals are queued for the second pass.
-        has_staleness_increment = False
+        new_generation_epoch = None
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1905,16 +1925,29 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
-            elif header == Headers.INCREMENT_STALENESS:
-                has_staleness_increment = True
+            elif header == Headers.SET_GENERATION_EPOCH:
+                new_generation_epoch = data[1]
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
 
-        if has_staleness_increment:
-            waiting = set(self.waiting_request_ids)
-            for request_id, entry in self.requests.items():
-                entry.record.increment_staleness(policy_only=request_id in waiting)
+        if new_generation_epoch is not None:
+            self._generation_epoch = new_generation_epoch
+            # Stamp all active requests with the new epoch.
+            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, new_generation_epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

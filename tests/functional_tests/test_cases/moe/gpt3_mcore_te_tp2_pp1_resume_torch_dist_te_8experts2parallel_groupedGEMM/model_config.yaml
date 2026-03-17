@@ -56,4 +56,5 @@ MODEL_ARGS:
   --bf16: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
+  --async-save: true
 TEST_TYPE: ckpt-resume
