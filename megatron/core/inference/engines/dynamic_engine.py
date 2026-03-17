@@ -890,7 +890,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
-                TextGenerationController.tokenize_prompt(
+                self.controller.tokenize_prompt(
                     self.controller.tokenizer, stop_word, add_BOS=False
                 )
                 for stop_word in request.sampling_params.stop_words
@@ -933,11 +933,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
             try:
-                prompt_token_ids = TextGenerationController.tokenize_prompt(
+                prompt_token_ids = self.controller.tokenize_prompt(
                     self.controller.tokenizer, prompt, sampling_params.add_BOS
                 )
             except TypeError:
-                prompt_token_ids = TextGenerationController.tokenize_prompt(
+                prompt_token_ids = self.controller.tokenize_prompt(
                     self.controller.tokenizer, prompt
                 )
             tokens = torch.tensor(
@@ -1641,12 +1641,12 @@ class DynamicInferenceEngine(AbstractEngine):
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
-                        request.prompt = TextGenerationController.detokenize(
+                        request.prompt = self.controller.detokenize(
                             self.controller.tokenizer,
                             request.prompt_tokens.tolist(),
                             remove_EOD=False,
                         )
-                    request.generated_text = TextGenerationController.detokenize(
+                    request.generated_text = self.controller.detokenize(
                         self.controller.tokenizer, request.generated_tokens
                     )
             range_pop()
