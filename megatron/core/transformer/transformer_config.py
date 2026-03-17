@@ -2468,7 +2468,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"got '{self.moe_token_dispatcher_type}'"
             )
 
-            supported_schedulers = ['dp_balanced']
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if (
                 self.sequence_packing_scheduler is not None
                 and self.sequence_packing_scheduler not in supported_schedulers

@@ -419,16 +419,20 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, max_cp_size=None):
     """
     Creates groups required for dynamic DPxCP.
-    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Creates a new group for every power of 2 from min_cp_size up to max_cp_size.
+    max_cp_size defaults to len(ranks) (the full DPxCP group size).
     Returns a dictionary indexed by group size.
     """
+    if max_cp_size is None:
+        max_cp_size = len(ranks)
     dynamic_dp_cp_groups = {}
-    # Generate group for every power of 2 up to the number of CP ranks
-    # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))]
+    group_sizes = [
+        2**i for i in range(int(log2(len(ranks))))
+        if 2**i >= min_cp_size and 2**i <= max_cp_size
+    ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -554,6 +558,7 @@ def initialize_model_parallel(
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
@@ -948,16 +953,21 @@ def initialize_model_parallel(
             ), "Dynamic context parallel requires an even number of ranks"
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
-                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+                    rank,
+                    ranks_with_cp,
+                    get_nccl_options("dp_cp", nccl_comm_cfgs),
+                    min_cp_size=min_dynamic_context_parallel_size,
+                    max_cp_size=context_parallel_size,
                 )
             )
 
-        # PyTorch is performing lazy initialization of the communicator group.
-        # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
-        group_sizes = [2**i for i in range(0, int(log2(data_parallel_size_with_cp)))]
-        if group_sizes[-1] * 2 == data_parallel_size_with_cp:
-            group_sizes.append(data_parallel_size_with_cp)
+        group_sizes = [
+            2**i for i in range(int(log2(data_parallel_size_with_cp)))
+            if 2**i >= min_dynamic_context_parallel_size and 2**i <= context_parallel_size
+        ]
+        if context_parallel_size == data_parallel_size_with_cp:
+            group_sizes.append(context_parallel_size)
         for group_size in group_sizes:
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
@@ -2077,6 +2087,9 @@ def destroy_model_parallel():
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+
+    global _DYNAMIC_DP_CP_GROUPS
+    _DYNAMIC_DP_CP_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
