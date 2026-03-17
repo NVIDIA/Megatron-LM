@@ -377,13 +377,13 @@ def combined_forward_backward_step(
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
-        fsdp_wrapper = find_megatron_fsdp(f_model)
-        if fsdp_wrapper is not None:
+        forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        if forward_fsdp_wrapper is not None:
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
                 layer_plan.set_fsdp_reshard_hooks(
-                    fsdp_wrapper.post_forward_release_module,
-                    fsdp_wrapper.post_backward_release_module,
+                    forward_fsdp_wrapper.post_forward_release_module,
+                    forward_fsdp_wrapper.post_backward_release_module,
                 )
 
     # backward preprocess, the same as the backward_step()
