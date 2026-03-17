@@ -131,9 +131,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if (
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-            and ddp_config.fsdp_double_buffer
         ):
-            ddp_config.fsdp_double_buffer_pool_size = 3
+            assert self.fsdp_unit_modules == [TransformerLayer], (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+            )
+            if ddp_config.fsdp_double_buffer:
+                ddp_config.fsdp_double_buffer_pool_size = 3
 
         super().__init__(
             config=config,

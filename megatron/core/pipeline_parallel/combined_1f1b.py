@@ -198,6 +198,18 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     """
 
     set_streams()
+
+    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
+    # _replace_param_with_raw_if_needed() and root pre/post_backward() are not
+    # handled for multi-chunk models in this path.
+    if isinstance(model, (list, tuple)):
+        for m in model:
+            assert find_megatron_fsdp(m) is None, (
+                "EP overlap 1F1B with FSDP is not supported for interleaved "
+                "pipeline parallelism (virtual_pipeline_model_parallel_size > 1). "
+                "Use pipeline_model_parallel_size=1 or disable FSDP."
+            )
+
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -377,8 +389,13 @@ def combined_forward_backward_step(
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
+        # Only needed for optim_grads_params strategy (where params are sharded).
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
-        if forward_fsdp_wrapper is not None:
+        if (
+            forward_fsdp_wrapper is not None
+            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
+            == "optim_grads_params"
+        ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
                 layer_plan.set_fsdp_reshard_hooks(

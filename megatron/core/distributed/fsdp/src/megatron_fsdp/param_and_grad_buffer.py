@@ -3782,7 +3782,7 @@ class AllGatherPipeline:
             if len(double_buf_units) > pool_size:
                 raise ValueError(
                     f"{double_buf_units} FSDP units were requested, "
-                    f"but the buffer pool (size={pool_size}) can support "
+                    f"but the buffer pool can support "
                     f"no more than {pool_size} FSDP units."
                 )
 

@@ -748,7 +748,6 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-
             return args, kwargs
 
         @torch.compiler.disable
