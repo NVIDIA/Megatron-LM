@@ -64,7 +64,7 @@ class KernelLauncher:
         self,
         gpu_plan: Tuple[Any, Any, Any, int],
         pack_stream,
-        torch_pack_stream: torch.cuda.ExternalStream,
+        torch_pack_stream_wrapper: torch.cuda.ExternalStream,
         pack_event: torch.cuda.Event,
     ) -> None:
         """
@@ -75,7 +75,7 @@ class KernelLauncher:
                 as CuPy arrays
             pack_stream: CUDA stream (cuda.core.experimental.Stream) - unused,
                 kept for compatibility
-            torch_pack_stream: PyTorch external stream wrapper
+            torch_pack_stream_wrapper: PyTorch external stream wrapper
             pack_event: CUDA event to record after kernel launch
         """
         nvtx.range_push("Launch Pack Kernel")
@@ -101,13 +101,13 @@ class KernelLauncher:
         )
         nvtx.range_pop()
         # Record event on PyTorch stream
-        pack_event.record(stream=torch_pack_stream)
+        pack_event.record(stream=torch_pack_stream_wrapper)
 
     def launch_unpack(
         self,
         gpu_plan: Tuple[Any, Any, Any, int],
         unpack_stream,
-        torch_unpack_stream: torch.cuda.ExternalStream,
+        torch_unpack_stream_wrapper: torch.cuda.ExternalStream,
         unpack_event: torch.cuda.Event,
     ) -> None:
         """
@@ -118,7 +118,7 @@ class KernelLauncher:
                 as CuPy arrays
             unpack_stream: CUDA stream (cuda.core.experimental.Stream) - unused,
             kept for compatibility
-            torch_unpack_stream: PyTorch external stream wrapper
+            torch_unpack_stream_wrapper: PyTorch external stream wrapper
             unpack_event: CUDA event to record after kernel launch
         """
         nvtx.range_push("Launch Unpack Kernel")
@@ -144,4 +144,4 @@ class KernelLauncher:
         )
         nvtx.range_pop()
         # Record event on PyTorch stream
-        unpack_event.record(stream=torch_unpack_stream)
+        unpack_event.record(stream=torch_unpack_stream_wrapper)

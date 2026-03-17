@@ -36,12 +36,12 @@ except ImportError:
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
-    TEColumnParallelLinear,
     TEDotProductAttention,
     TELinear,
     TENorm,
 )
 from megatron.core.tensor_parallel.inference_layers import (
+    InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
@@ -72,7 +72,9 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
+    ) -> LayerNormBuilder:
         """Which module for layernorm"""
         ...
 
@@ -113,7 +115,9 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return None
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
+    ) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if rms_norm:
             # Matching get_gpt_layer_local_spec.
@@ -148,7 +152,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module TE backend uses"""
-        return TEColumnParallelLinear
+        return InferenceColumnParallelLinear
 
     def row_parallel_linear(self) -> type:
         """Which row parallel linear module TE backend uses"""
@@ -162,7 +166,9 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
+    ) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used

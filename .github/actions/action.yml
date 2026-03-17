@@ -59,7 +59,7 @@ runs:
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v6
 
     - name: Change ownership of /home/runner/
       shell: bash

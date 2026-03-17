@@ -228,6 +228,9 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    num_speculative_tokens: int = 0
+    """The number of speculative tokens to generate for decode steps."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
@@ -277,4 +280,10 @@ class InferenceConfig:
     """
     A list of the per-request metadata types to track. Each entry is a tuple
     consisting of the string label, the target dtype, and whether to store the data on GPU.
+    """
+
+    use_synchronous_zmq_collectives: bool = False
+    """Whether to use synchronous ZMQ collectives for inference. If True, the 
+    all_reduce_max operation will be performed synchronously, which can help reduce 
+    performance variability for MoEs.
     """
