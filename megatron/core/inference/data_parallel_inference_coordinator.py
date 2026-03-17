@@ -507,8 +507,13 @@ class DataParallelInferenceCoordinator:
             finished_request["prompt"] = TextGenerationController.detokenize(
                 self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
             )
+        detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
+            "detokenize_stop_sequence", False
+        )
         finished_request["generated_text"] = TextGenerationController.detokenize(
-            self.tokenizer, finished_request["generated_tokens"]
+            self.tokenizer,
+            finished_request["generated_tokens"],
+            remove_EOD=not detokenize_stop_sequence,
         )
 
     @classmethod

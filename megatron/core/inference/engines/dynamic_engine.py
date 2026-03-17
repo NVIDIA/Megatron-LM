@@ -1316,9 +1316,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 for i in range(self.num_speculative_tokens + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        if i > 0:
-                            request.generated_tokens = request.generated_tokens[:-i]
-                        return True, i
+                        trim = (
+                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
+                        )
+                        if trim > 0:
+                            request.generated_tokens = request.generated_tokens[:-trim]
+                        return True, trim
         return False, 0
 
     def get_prefix_coordination_metrics(self) -> dict:
@@ -1645,7 +1648,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             remove_EOD=False,
                         )
                     request.generated_text = self.controller.detokenize(
-                        self.controller.tokenizer, request.generated_tokens
+                        self.controller.tokenizer,
+                        request.generated_tokens,
+                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
 
