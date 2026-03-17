@@ -312,24 +312,44 @@ jobs:
           cd megatron-bridge
           git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
 
+  cicd-compute-build-matrix:
+    runs-on: ubuntu-latest
+    needs: [is-not-external-contributor]
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+    steps:
+      - name: Compute build matrix
+        id: compute
+        env:
+          IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+          SELECTED_RUNNER_GB200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+          REGISTRY_AWS: ${{ env.container-registry }}
+          REGISTRY_GCP: ${{ env.container-registry-gb200 }}
+        run: |
+          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" == "true" ]; then
+            GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "$SELECTED_RUNNER_GB200" \
+              '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
+              '{"include": [$aws, $gcp]}')
+          else
+            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" '{"include": [$aws]}')
+          fi
+          echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
+
   cicd-container-build:
-    needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
+    needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue, cicd-compute-build-matrix]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - cloud: aws
-            registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-            runner: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-          - cloud: gcp
-            registry: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
-            runner: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+      matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     if: |
-      (matrix.cloud == 'aws' || needs.is-not-external-contributor.outputs.is_maintainer == 'true')
-      && needs.is-not-external-contributor.result != 'cancelled'
+      needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-compute-build-matrix.result != 'cancelled'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
