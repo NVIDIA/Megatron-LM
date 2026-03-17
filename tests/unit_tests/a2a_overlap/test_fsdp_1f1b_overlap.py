@@ -137,7 +137,7 @@ class TestFSDP1F1BOverlap:
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize(
         "recompute_modules",
-        [[]["core_attn", "mla_up_proj", "layernorm", "moe_act", "mlp", "shared_experts"]],
+        [[], ["core_attn", "mla_up_proj", "layernorm", "moe_act", "mlp", "shared_experts"]],
     )
     def test_fsdp_1f1b_training_step(
         self, dispatcher_type, fp8_flag, shared_expert_intermediate_size, recompute_modules
