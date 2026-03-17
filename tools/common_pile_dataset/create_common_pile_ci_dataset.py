@@ -505,6 +505,10 @@ def main():
         if os.path.exists(intermediate):
             print(f"  Removing intermediate JSONL: {intermediate}")
             os.remove(intermediate)
+        ss_intermediate = os.path.join(args.output_dir, "common_pile_raw_ss.jsonl")
+        if os.path.exists(ss_intermediate):
+            print(f"  Removing sentence-split JSONL: {ss_intermediate}")
+            os.remove(ss_intermediate)
 
     all_ok = verify_output(args.output_dir)
 
