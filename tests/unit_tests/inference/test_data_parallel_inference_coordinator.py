@@ -16,6 +16,7 @@ import torch
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
@@ -117,6 +118,28 @@ class DummyEngine(DynamicInferenceEngine):
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
+
+        # ZMQ-based world barrier (async-friendly, no NCCL).
+        self.zmq_context = zmq.Context()
+        total_world_size = torch.distributed.get_world_size()
+        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+        self.use_synchronous_zmq_collectives = False
+        # Duplicate communicator for test sync points that may run
+        # concurrently with engine-internal _world_barrier() calls.
+        self.duplicate_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+
+    async def _world_barrier(self, use_duplicate_communicator=False):
+        """World barrier with option to use a separate communicator.
+
+        When use_duplicate_communicator=True, uses a dedicated communicator
+        that won't collide with the engine loop's internal barrier calls.
+        """
+        comm = (
+            self.duplicate_zmq_communicator
+            if use_duplicate_communicator
+            else self.world_zmq_communicator
+        )
+        await comm.all_reduce_max(1)
 
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
@@ -350,9 +373,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
-        )
+        await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
 
         client = None
         try:
@@ -370,10 +391,7 @@ class TestCoordinator:
                 for result in results:
                     assert result["status"] == Status.COMPLETED.name
 
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
         finally:
             await cleanup_engine(engine, client)
 
@@ -393,9 +411,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
-        )
+        await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
 
         client = None
         try:
@@ -414,10 +430,7 @@ class TestCoordinator:
                     else:
                         assert isinstance(result, dict)
 
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
         finally:
             await cleanup_engine(engine, client)
 
@@ -472,9 +485,9 @@ class TestCoordinator:
             )
 
             # Synchronize all ranks so every engine has registered.
+            # Use duplicate communicator to avoid colliding with engine-internal barriers.
             await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
+                engine._world_barrier(use_duplicate_communicator=True), timeout=30.0
             )
 
             if rank == 0:
@@ -593,8 +606,7 @@ class TestCoordinator:
 
             # Synchronize all ranks before STOP.
             await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
+                engine._world_barrier(use_duplicate_communicator=True), timeout=30.0
             )
 
             if rank == 0:
@@ -633,7 +645,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+        await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
 
         client = None
         try:
@@ -654,6 +666,6 @@ class TestCoordinator:
                     f"ZMQ throughput: {total / elapsed_ms:.2f} requests/ms "
                     f"({total} reqs in {elapsed_ms:.0f} ms)"
                 )
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+            await asyncio.wait_for(engine._world_barrier(), timeout=30.0)
         finally:
             await cleanup_engine(engine, client, timeout=60.0)
