@@ -66,6 +66,8 @@ MODEL_ARGS:
   --incoming-requests-per-step: 32 
   --inference-repeat-n: 3
   --no-record-throughput: true
+  --mamba-inference-conv-states-dtype: fp32
+  --mamba-inference-ssm-states-dtype: fp32
 METRICS:
   - "generated_tokens"
   - "logprobs"
