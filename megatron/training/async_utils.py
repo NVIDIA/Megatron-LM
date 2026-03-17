@@ -93,7 +93,7 @@ def is_empty_async_queue() -> bool:
     return _async_calls_queue.get_num_unfinalized_calls() == 0
 
 
-def reset_persistent_async_worker():
+def reset_persistent_async_worker(async_strategy):
     global _async_calls_queue, _results_queue
     
     if _async_calls_queue is not None:
@@ -104,5 +104,5 @@ def reset_persistent_async_worker():
         del _results_queue
     _results_queue = None
     _async_calls_queue = None
-    _, imports = get_async_strategy()
-    imports["CachedMetadataFileSystemReader"].clear_metadata_cache()
+    _, module = get_async_strategy(async_strategy, "CachedMetadataFileSystemReader")
+    module.clear_metadata_cache()

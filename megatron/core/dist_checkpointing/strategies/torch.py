@@ -992,7 +992,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
 
-def get_async_strategy(async_strategy: str = "nvrx") -> str:
+def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> str:
     """Returns async strategy and related async imported modules"""
     if async_strategy == "nvrx":
         try:
@@ -1040,7 +1040,9 @@ def get_async_strategy(async_strategy: str = "nvrx") -> str:
     else:
         raise TypeError(f"async_strategy {async_strategy} is not supported. Available strategies: nvrx, mcore.")
 
-    return async_strategy, imports
+    modules = imports if not module else imports[module]
+
+    return async_strategy, modules
 
 
 def _import_mcore_async() -> dict:
