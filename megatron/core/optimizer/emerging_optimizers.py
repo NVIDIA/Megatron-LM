@@ -341,7 +341,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
-    kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
     return kwargs
 
