@@ -1,13 +1,5 @@
 [
     {
-        "user": "asolergi-nv",
-        "date": "2026-02-25"
-    },
-    {
-        "user": "BoxiangW",
-        "date": "2026-03-04"
-    },
-    {
         "user": "maanug-nv",
         "date": "2026-03-11"
     },
@@ -16,11 +8,11 @@
         "date": "2026-03-18"
     },
     {
-        "user": "gautham-kollu",
+        "user": "janEbert",
         "date": "2026-03-25"
     },
     {
-        "user": "janEbert",
+        "user": "gautham-kollu",
         "date": "2026-04-01"
     },
     {
@@ -46,5 +38,13 @@
     {
         "user": "dimapihtar",
         "date": "2026-05-13"
+    },
+    {
+        "user": "gautham-kollu",
+        "date": "2026-05-20"
+    },
+    {
+        "user": "ilml",
+        "date": "2026-05-27"
     }
 ]

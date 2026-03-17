@@ -226,13 +226,13 @@ class MambaMetadata:
             seq_len = end_regular_prefill_token_idx - start_regular_prefill_token_idx
 
             if seq_len > 0:
-                # We subtract start_regular_prefill_req_idx to normalize request IDs to
-                # 0-based relative to this buffer
+                # We subtract token_to_request_idx[start_regular_prefill_req_idx] to normalize
+                # request IDs to 0-based relative to this buffer
                 self._seq_idx_buffer[:, :seq_len].copy_(
                     token_to_request_idx[
                         start_regular_prefill_token_idx:end_regular_prefill_token_idx
                     ]
-                    - start_regular_prefill_req_idx
+                    - token_to_request_idx[start_regular_prefill_token_idx]
                 )
 
             if padded_token_count > seq_len:
@@ -259,12 +259,17 @@ class MambaMetadata:
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = real_decode_count
+            self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
             # This describes the number of items in the prefill tensor relative to the
             # decode tensor. If chunked prefill is present, it is included in the
             # "prefill" part of the main split.
-            self._device_decode_prefill_buffer[1] = regular_prefill_count + (
-                1 if has_chunked_prefill_req else 0
+            self._device_decode_prefill_buffer[1] = (
+                cu_seqlens[
+                    real_decode_count
+                    + regular_prefill_count
+                    + (1 if has_chunked_prefill_req else 0)
+                ]
+                - cu_seqlens[real_decode_count]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
