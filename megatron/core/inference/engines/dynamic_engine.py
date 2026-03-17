@@ -305,7 +305,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
-        self._prefix_cache_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -1741,10 +1740,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self._prefix_cache_tokens_skipped += self.context.prefix_cache_tokens_skipped
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
-            self.context.prefix_cache_tokens_skipped = 0
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1780,9 +1777,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
                 metrics['inference/prefix_cache_blocks_matched'] = int(
                     self._prefix_cache_blocks_matched
-                )
-                metrics['inference/prefix_cache_tokens_skipped'] = int(
-                    self._prefix_cache_tokens_skipped
                 )
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
@@ -1843,10 +1837,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_steps,
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched, %d tokens skipped" % (
+                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
-                    self._prefix_cache_tokens_skipped,
                 )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
@@ -1862,7 +1855,6 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
-                self._prefix_cache_tokens_skipped = 0
 
         return {
             "active_request_ids": active_request_ids,
