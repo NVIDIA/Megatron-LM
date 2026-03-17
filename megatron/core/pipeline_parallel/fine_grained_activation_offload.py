@@ -867,6 +867,8 @@ class ChunkOffloadHandler:
         # Respect tensor's offload preference if specified
         if hasattr(tensor, "offloading_activation") and not tensor.offloading_activation:
             return False
+        if getattr(tensor, "_TE_do_not_offload", False):
+            return False
         return True
 
     def bulk_offload_group(self):
