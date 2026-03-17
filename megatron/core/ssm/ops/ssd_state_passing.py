@@ -7,16 +7,20 @@ import torch
 import triton
 import triton.language as tl
 
+from megatron.core.ssm.ops.determinism import autotune_configs
+
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 64}),
-        triton.Config({"BLOCK_SIZE": 128}),
-        triton.Config({"BLOCK_SIZE": 256}),
-        triton.Config({"BLOCK_SIZE": 512}),
-        triton.Config({"BLOCK_SIZE": 1024}),
-        triton.Config({"BLOCK_SIZE": 2048}),
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({"BLOCK_SIZE": 64}),
+            triton.Config({"BLOCK_SIZE": 128}),
+            triton.Config({"BLOCK_SIZE": 256}),
+            triton.Config({"BLOCK_SIZE": 512}),
+            triton.Config({"BLOCK_SIZE": 1024}),
+            triton.Config({"BLOCK_SIZE": 2048}),
+        ]
+    ),
     key=["dim"],
 )
 @triton.jit

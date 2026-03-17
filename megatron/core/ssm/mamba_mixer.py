@@ -786,8 +786,17 @@ class MambaMixer(MegatronModule):
             )
             tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
-            conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
-            conv_bias = self.cp.get_conv1d_bias()
+            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+            # tensors to the conv state dtype for causal_conv1d_varlen_fn and then cast xBC
+            # back to the original dtype
+            xBC_dtype = xBC.dtype
+            conv_state_dtype = conv_state.dtype
+
+            xBC = xBC.to(conv_state_dtype)
+            conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w").to(
+                conv_state_dtype
+            )
+            conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
             xBC_pre_conv = xBC if intermediate_token_offsets is not None else None
             if use_triton_conv1d:
@@ -803,7 +812,7 @@ class MambaMixer(MegatronModule):
                     precomputed_seq_idx=conv_seq_idx,
                     precomputed_seq_start=conv_seq_start,
                 )
-                xBC = xBC_out.unsqueeze(0)
+                xBC = xBC_out.to(xBC_dtype).unsqueeze(0)
             else:
                 # causal_conv1d_fn cannot accept both seq_idx and
                 # initial_states simultaneously. Using seq_idx with packed sequences
@@ -835,7 +844,7 @@ class MambaMixer(MegatronModule):
                         initial_states=init_r,
                     )
                     xBC_out[:, start:end, :] = xBC_r.transpose(1, 2).contiguous()
-                xBC = xBC_out
+                xBC = xBC_out.to(xBC_dtype)
         else:
             # Non-dynamic-batching path (static batching / training fallback)
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
@@ -859,6 +868,11 @@ class MambaMixer(MegatronModule):
                     seq_idx=seq_idx,
                 )
             xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+
+        """
+        if torch.distributed.get_rank() == 0:
+            print(f"Layer {self.layer_number}: xBC post conv={xBC}, conv_state[batch_indices] post conv={conv_state[batch_indices]}")
+        """
 
         x, B, C = torch.split(
             xBC,
@@ -983,6 +997,11 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            """
+            if torch.distributed.get_rank() == 0:
+                print(f"Layer {self.layer_number}: x before SSM={x}")
+            """
+
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
@@ -1076,6 +1095,11 @@ class MambaMixer(MegatronModule):
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
+
+        """
+        if torch.distributed.get_rank() == 0:
+            print(f"Layer {self.layer_number}: y post SSM={y}, ssm_state[batch_indices] post SSM={ssm_state[batch_indices]}")
+        """
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)

@@ -10,14 +10,18 @@ import torch
 import triton
 import triton.language as tl
 
+from megatron.core.ssm.ops.determinism import autotune_configs
+
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_T": 128, "BLOCK_C": 64}, num_warps=4),
-        triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
-        triton.Config({"BLOCK_T": 256, "BLOCK_C": 64}, num_warps=4),
-        triton.Config({"BLOCK_T": 256, "BLOCK_C": 128}, num_warps=8),
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({"BLOCK_T": 128, "BLOCK_C": 64}, num_warps=4),
+            triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
+            triton.Config({"BLOCK_T": 256, "BLOCK_C": 64}, num_warps=4),
+            triton.Config({"BLOCK_T": 256, "BLOCK_C": 128}, num_warps=8),
+        ]
+    ),
     key=["conv_dim"],
 )
 @triton.jit
