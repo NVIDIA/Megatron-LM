@@ -123,6 +123,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
+  --async-save: true
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"

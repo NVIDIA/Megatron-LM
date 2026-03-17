@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
-import os
 import socket
 import struct
 import time
@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -19,6 +20,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -30,6 +32,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -38,10 +42,18 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.inference.utils import (
+    Counter,
+    await_process_call,
+    set_inference_cuda_graphed_iteration_for_ep_inference,
+    unset_inference_cuda_graphed_iteration_for_ep_inference,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
+    deprecate_args,
     experimental_api,
     get_asyncio_loop,
     get_pg_rank,
@@ -89,6 +101,30 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
+DEPRECATED_ARGS = [
+    "enable_cuda_graph",
+    "random_seed",
+    "track_paused_request_events",
+    "enable_chunked_prefill",
+    "inference_logging_step_interval",
+    "pg_collection",
+]
+
+
+class EngineState(Enum):
+    """State machine for the inference engine."""
+
+    RUNNING = auto()  # Processing requests
+    PAUSING = auto()  # PAUSE received; waiting for EP consensus + world barrier
+    PAUSED = auto()  # Globally confirmed idle
+    UNPAUSING = auto()  # UNPAUSE received; waiting for world barrier
+    SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
+    SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
+    RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
+    RESUMED = auto()  # GPU onloaded, all ranks confirmed; cleared on next SUSPEND
+    STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
+    STOPPED = auto()  # All ranks confirmed; teardown complete
+
 
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
@@ -131,24 +167,22 @@ class DynamicInferenceEngine(AbstractEngine):
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
-        random_seed (Optional[int]): Use a random seed if you want deterministic
-            results. Defaults to None.
-        inference_logging_step_interval (int): The step interval at which to log
-        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
-    def __init__(
-        self,
-        controller: TextGenerationController,
-        context: DynamicInferenceContext,
-        enable_cuda_graph: Optional[bool] = None,
-        random_seed: Optional[int] = None,
-        *,
-        track_paused_request_events: bool = False,
-        enable_chunked_prefill: bool = True,
-        inference_logging_step_interval: int = 0,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-    ):
+    # Map stable states to their corresponding asyncio events.
+    _STATE_EVENTS = (
+        EngineState.RUNNING,
+        EngineState.PAUSED,
+        EngineState.SUSPENDED,
+        EngineState.RESUMED,
+        EngineState.STOPPED,
+    )
+
+    @deprecate_args(
+        *DEPRECATED_ARGS,
+        message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
+    )
+    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
 
         assert isinstance(
             controller, TextGenerationController
@@ -156,40 +190,42 @@ class DynamicInferenceEngine(AbstractEngine):
         assert isinstance(
             context, DynamicInferenceContext
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
-        assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        # Deprecate `enable_cuda_graph`.
-        if enable_cuda_graph is not None:
-            warnings.warn(
-                "The `enable_cuda_graph` argument is deprecated and will be "
-                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
-                "read directly from the transformer config object."
-            )
-            self.enable_cuda_graph = enable_cuda_graph
-        else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
+        model_config = controller.inference_wrapped_model.model.config
+        inference_config = context.config
 
-        if pg_collection is not None:
-            self.pg_collection = pg_collection
+        if inference_config.pg_collection is not None:
+            self.pg_collection = inference_config.pg_collection
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.random_seed = random_seed
-        self.track_paused_request_events = track_paused_request_events
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.inference_logging_step_interval = inference_logging_step_interval
-        self.unified_memory_level = context.unified_memory_level
 
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
 
+        assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
+
+        if self.num_speculative_tokens > 0:
+            assert (
+                self.num_speculative_tokens <= self.controller.num_mtp_heads
+            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+            assert (
+                not self.materialize_only_last_token_logits
+            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
+
+        self.track_paused_request_events = inference_config.track_paused_request_events
+        self.track_generated_token_events = inference_config.track_generated_token_events
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.metrics_writer = inference_config.metrics_writer
+        self.logging_step_interval = inference_config.logging_step_interval
+        self.unified_memory_level = inference_config.unified_memory_level
+        self.cuda_graph_impl = model_config.cuda_graph_impl
+        self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
         self.reset()
 
@@ -199,12 +235,12 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
-        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+        if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logging.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
                 context.metrics_writer.define_metric(
@@ -234,6 +270,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Request state.
         self.request_counter = Counter()
         self.finished_request_count = 0
+        self.evicted_request_count = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -245,7 +282,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
-        self.step_count = 0
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
@@ -253,17 +289,35 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
-        self.suspend_signal = False
-        self.is_suspended = False
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        self.state = EngineState.RUNNING
+        self._state_events[EngineState.RUNNING].set()
+        self._pending_signals = deque()
+
         self.resume_request_ids = None
+
+        # Speculative decoding acceptance tracking.
+        self._spec_tokens_proposed = 0
+        self._spec_tokens_accepted = 0
+        self._spec_steps = 0
+
+        # Prefix caching coordination state.
+        self._prefix_coordination_waits = 0
 
         # Coordinator state.
         self.use_coordinator = False
+
+    async def wait_until(self, state: EngineState):
+        """Wait until the engine reaches the given state.
+
+        Only stable states (RUNNING, PAUSED, SUSPENDED, RESUMED,
+        STOPPED) are supported.  Transient states (PAUSING, SUSPENDING,
+        RESUMING, STOPPING) are not directly waitable.
+        """
+        event = self._state_events.get(state)
+        if event is None:
+            raise ValueError(f"Cannot wait for transient state {state}")
+        await event.wait()
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -278,10 +332,17 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.cuda_graph_impl != "local":
             return
 
+        if (
+            CudaGraphScope.full_iteration in self.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
+        ):
+            warnings.warn(
+                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
+                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
+            )
+
         context = self.context
         controller = self.controller
-
-        config = controller.inference_wrapped_model.inference_wrapper_config
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -289,6 +350,16 @@ class DynamicInferenceEngine(AbstractEngine):
         logging.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
+
+        # Enable inference dispatcher for EP during graph capture
+        model_config = controller.inference_wrapped_model.model.config
+        is_inference_optimized_ep = (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.expert_model_parallel_size > 1
+        )
+        if is_inference_optimized_ep:
+            unwrapped_model = controller.inference_wrapped_model.model
+            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -306,10 +377,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Enable routing recording during warmup if routing replay is enabled.
+            # This ensures the record_indices copy operation is captured in the CUDA graph.
+            model_config = controller.inference_wrapped_model.model.config
+            if model_config.moe_enable_routing_replay:
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
             context.reset()
+
+        # Disable inference dispatcher after graph capture
+        if is_inference_optimized_ep:
+            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         # Memory usage.
         time_end = time.time()
@@ -338,9 +419,10 @@ class DynamicInferenceEngine(AbstractEngine):
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
-        inference_coordinator_port: int,
+        inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
@@ -368,11 +450,20 @@ class DynamicInferenceEngine(AbstractEngine):
         (`self.run_engine`) as a background asyncio task.
 
         Args:
-            inference_coordinator_port (int): The network port where the central
+            inference_coordinator_port (int | None): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+                If None, a random available port will be selected.
+                If not None, the coordinator will attempt to bind to this port, but should it
+                not succeed (e.g., if the port is already in use), it may bind to a different port.
+                The actual port used is returned by this method.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+
+        Returns:
+            inference_coordinator_addresss (str): The network address of the central
+                `InferenceCoordinator`, which may not have the same port as what the user requested
+                with `inference_coordinator_port`.
         """
 
         assert HAVE_ZMQ, (
@@ -383,7 +474,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        self.zmq_context = zmq.Context().instance()
+        self.zmq_context = zmq.Context.instance()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
@@ -400,23 +491,49 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
+        local_ip = socket.gethostname()
+
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
+            deterministic_mode = torch.are_deterministic_algorithms_enabled()
+            dp_pipe, dp_process_pipe = spawn_context.Pipe()
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
+                    dp_process_pipe,
                     coordinator_ready_event,
-                    inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
+                    self.controller.tokenizer,
+                    inference_coordinator_port,
+                    deterministic_mode,
+                    self.context.block_size_tokens,
+                    self.context.enable_prefix_caching,
+                    self.context.prefix_caching_coordinator_policy,
+                    coordinator_schedule_output_path,
                 ),
             )
             self.inference_coordinator_process.start()
+            await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
+            dp_addr = dp_pipe.recv()
+            dp_pipe.close()
+
+            # Check if the port number is not inference_coordinator_port
+            actual_port = int(dp_addr.rsplit(":", 1)[-1])
+            if inference_coordinator_port != None and actual_port != inference_coordinator_port:
+                logging.warning(
+                    f"Requested InferenceCoordinator port {inference_coordinator_port} "
+                    f"but got port {actual_port} instead. This happens if the request port "
+                    f"is already in use."
+                )
+        elif not launch_inference_coordinator:
+            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+        else:
+            dp_addr = None
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            local_ip = socket.gethostname()
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
@@ -429,12 +546,13 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
+        bcast = [dp_addr]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        [dp_addr] = bcast
         bcast = [mp_req_addr, mp_len_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr, mp_len_addr] = bcast
 
-        ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        dp_addr = f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
@@ -482,13 +600,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=self.pg_collection.ep
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
-            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
-            logging.info("Inference co-ordinator is ready to receive requests!")
+        # initialize zmq-based world communicator for consensus barriers
+        total_world_size = torch.distributed.get_world_size()
+        if total_world_size > 1:
+            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
 
-        # Finally run the engine infinite loop
+        if launch_inference_coordinator and self.is_dp_coordinator:
+            await await_process_call(
+                coordinator_ready_event.wait, self.inference_coordinator_process
+            )
+            logging.info("Inference co-ordinator is ready to receive requests!")
+            logging.info(f"Data parallel coordinator can be found at {dp_addr}")
+
+        # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+
+        return dp_addr
 
     @contextmanager
     @staticmethod
@@ -510,12 +638,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
+            range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
+            range_pop()
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -554,42 +684,58 @@ class DynamicInferenceEngine(AbstractEngine):
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
 
-        # Skip if already suspended, which can happen when using the inference
-        # coordinator.
-        if self.is_suspended:
+        # Skip if already suspended or in the process of suspending.
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = True
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_all_tensors()
+            self.context.deallocate_inference_state_buffers()
 
-        # Delete cuda graphs when not using unified memory at all (level 0). For
-        # levels 1 and 2, the context's tensors maintain static memory addresses,
-        # so the cuda graphs are re-used.
-        if self.unified_memory_level == 0:
+        if (
+            self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+            and not self.context.static_kv_memory_pointers
+        ):
             delete_cuda_graphs()
 
-        # Maintain references to requests before reset.
+        # Build the list of requests to re-add on resume.
+        # All waiting requests are always included; active requests are included
+        # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
+        if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            recompute_active_ids = active_request_ids
+
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+                req = self.get_request(req_id)
+                if req.finished_chunk_token_count > 0:
+                    req.remaining_prompt_tokens = req.prompt_tokens
+                    req.finished_chunk_token_count = 0
+
+            # Reset the chunked prefill request id
+            self.chunked_prefill_request_id = -1
+        else:
+            recompute_active_ids = set()
+        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend requests objects.
-        for request_id in active_request_ids:
-            self.requests[request_id].record.suspend()
+        # Checkpoint active requests that are marked for recompute.
+        for request_id in recompute_active_ids:
+            self.requests[request_id].record.checkpoint()
+
+        # If we are not using the inference coordinator, we need to manually handle state.
+        if not self.use_coordinator:
+            self.state = EngineState.SUSPENDED
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        # Skip if not suspended, which can happen when using the inference
-        # coordinator.
-        if not self.is_suspended:
+        # Skip if not suspended or in the process of suspending.
+        if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = False
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
@@ -599,27 +745,30 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.allocate_all_tensors(is_init=False)
+            self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
-            # Reset context and request data.
-            self.context.reset()
-
-            # Create cuda graphs (before adding requests, to be in decode mode).
-            # Only create cuda graphs when not using unified memory at all (level
-            # 0). For levels 1 and 2, the context's tensors maintain static
-            # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0:
+            if (
+                self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+                and not self.context.static_kv_memory_pointers
+            ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests.
+            # Re-add requests saved during suspend.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -635,8 +784,13 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         )
 
-        # Notify event loop.
-        self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
+        # If we are not using the inference coordinator, we need to manually handle state.
+        if not self.use_coordinator:
+            self.state = EngineState.RUNNING
+            # Notify the condition variable that run_engine() waits on.
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task, self._notify_cond_for_new_request()
+            )
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -672,6 +826,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
             )
+            request.add_event_add_engine()  # Record when request enters engine
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -688,7 +843,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            assert not self.context.materialize_only_last_token_logits, (
+            assert not self.materialize_only_last_token_logits, (
                 "Prompt log probs cannot be calculated if only last token logits are materialized. "
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
@@ -698,6 +853,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
+            request.sampling_params.num_tokens_total = None
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
@@ -717,11 +873,17 @@ class DynamicInferenceEngine(AbstractEngine):
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
-        ):
+        ) or (request.sampling_params.num_tokens_to_generate < 0):
+            logging.error(
+                f"{request_id=} Invalid number of tokens to generate. Prompt len: {len(request.prompt_tokens)}, tokens to generate: {request.sampling_params.num_tokens_to_generate}, max seq len: {self.context.max_sequence_length}."
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            logging.error(
+                f"{request_id=} Prompt is longer than context.max_tokens. Prompt tokens: {len(request.prompt_tokens)}, context.max_tokens: {self.context.max_tokens}, chunked_prefill: {self.enable_chunked_prefill}"
+            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
@@ -737,6 +899,13 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
         else:
             self.failed_request_ids.append(request_id)
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} failed to be added to the engine due to errors. "
+                    f"Prompt Tokens: {len(request.prompt_tokens)} "
+                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                    f"Max sequence length: {self.context.max_sequence_length} "
+                )
 
         return self.requests[request_id].future
 
@@ -788,6 +957,8 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            enable_prefix_caching=self.context.enable_prefix_caching,
         )
 
         # Add request.
@@ -797,10 +968,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
+        evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
+        accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -808,11 +982,16 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
+            evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
-            sample: (torch.Tensor): The newly generated tokens for each request
+            sample: Tensor: The newly generated token for each request
+            accepted_tokens: Tensor: The additional accepted tokens for each request
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
+                pre-mapped by request_id. Each value is a tensor of shape
+                [num_tokens_this_step, num_layers, topk].
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -821,29 +1000,122 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
+        if evict_request_ids is not None:
+            self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        block_allocator = self.context.block_allocator
 
-        for req_idx, (request_id, token, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
+        # Pre-compute step-level block stats (before the per-request loop)
+        if self.track_generated_token_events:
+            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            if block_allocator.enable_prefix_caching:
+                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            else:
+                blocks_hashed_active = blocks_allocated
+                blocks_ref_count = None
+
+        # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
+        # empty lists for each request, so the zip produces the correct number of iterations
+        accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+
+        if self.num_speculative_tokens > 0 and accepted_tokens is not None:
+            self._spec_steps += 1
+
+        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+
+            # Ensure tokens is always a list for consistent handling
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+
             request: DynamicInferenceRequest = self.get_request(request_id)
+
+            if self.num_speculative_tokens > 0:
+                accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
+
+                # Track acceptance statistics for logging (decode requests only).
+                # Prefill requests don't propose speculative tokens, so including
+                # them would inflate the proposed count and deflate the rate.
+                # A request in its first generation step (empty generated_tokens)
+                # was in prefill this step.
+                if len(request.generated_tokens) > 0:
+                    self._spec_tokens_proposed += self.num_speculative_tokens
+                    self._spec_tokens_accepted += len(accepted_tokens)
+
+                # The order `accepted_tokens + tokens` is correct here.
+                # `accepted_tokens` contains the sequence of
+                # successfully verified draft tokens. `tokens` (from `sample`) is the
+                # brand new token generated by the target model based on that accepted prefix.
+                # Therefore, the newly sampled token must go at the end of the sequence.
+                tokens = accepted_tokens + tokens
+
+            num_stop_word_trim = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
+                # If the request already has more tokens, then we only append as much as is necessary
+                if (
+                    len(request.generated_tokens) + len(tokens)
+                    >= request.sampling_params.num_tokens_to_generate
+                ):
+                    tokens = tokens[
+                        : request.sampling_params.num_tokens_to_generate
+                        - len(request.generated_tokens)
+                    ]
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.generated_tokens.append(token)
+                    is_first_token = len(request.generated_tokens) == 0
+                    request.generated_tokens += tokens
+                    first_token_event = None
+                    if self.track_generated_token_events:
+                        for token in tokens:
+                            if block_allocator.enable_prefix_caching:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                    blocks_ref_count=blocks_ref_count,
+                                )
+                            else:
+                                event = request.add_event_generated_token(
+                                    token,
+                                    blocks_total=block_allocator.total_count,
+                                    blocks_hashed_total=blocks_allocated,
+                                    blocks_hashed_active=blocks_hashed_active,
+                                )
+                            if first_token_event is None:
+                                first_token_event = event
+                    if is_first_token:
+                        if not self.track_generated_token_events:
+                            first_token_event = DynamicInferenceEvent(
+                                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                                payload={"token_id": tokens[0]},
+                            )
+                        request.ttft = (
+                            first_token_event.timestamp - request.event_add_engine.timestamp
+                        )
                     if request.tpot is None:
                         request.tpot = []
-                    request.tpot.append(step_time)
+                    per_token_step_time = step_time / len(tokens)
+                    request.tpot.extend([per_token_step_time] * len(tokens))
 
-                # Check for stop words (after token is appended)
-                stop_word_hit = self._check_stop_words_for_request_post_append(request)
+                # Check for stop words (after token is appended).
+                # With speculative decoding, a stop word may end before the last
+                # appended token. The check truncates generated_tokens in-place and
+                # returns how many trailing tokens were removed so we can also trim
+                # the corresponding log probs below.
+                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
+                    request
+                )
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
+                    request.add_event_finish()
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -862,6 +1134,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
+            # When a stop word was found mid-speculative-batch, trim log probs
+            # and top_n_logprobs to match the truncated generated_tokens.
+            if num_stop_word_trim > 0:
+                if request_log_probs is not None:
+                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+
             # Process log_probs if available (unified for both regular and chunked prefill)
             if request_log_probs is not None:
                 # Initialize lists if they don't exist
@@ -870,40 +1150,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
-                if (
-                    request_id == self.context.chunked_prefill_request_id
-                    and self.context.materialize_only_last_token_logits
-                ):
-                    request.prompt_log_probs = []
-                    request.generated_log_probs = []
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_log_probs) == 0
+
+                if request.sampling_params.skip_prompt_log_probs:
+                    # We only want decode log probs.
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
                 else:
+                    # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
                     total_accumulated = len(request.prompt_log_probs) + len(
                         request.generated_log_probs
                     )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
 
-                    # Handle skip_prompt_log_probs during prefill
-                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
-                    # only process the last one (first generated token)
-                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
-                        # Only append the last log prob (first generated token) to generated_log_probs
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        # Vectorized approach: calculate split point and use list slicing
-                        if not request.sampling_params.skip_prompt_log_probs:
-                            # Calculate how many log probs go to prompt vs generated
-                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                            # Batch extend instead of individual appends
-                            if split_idx > 0:
-                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                            if split_idx < len(request_log_probs):
-                                request.generated_log_probs.extend(request_log_probs[split_idx:])
-                        else:
-                            # All log probs go to generated
-                            request.generated_log_probs.extend(request_log_probs)
+                    if split_idx > 0:
+                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                    if split_idx < len(request_log_probs):
+                        request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -940,6 +1210,40 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+            # Process routing indices if available (keyed by request_id)
+            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
+            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            if (
+                routing_indices_per_request is not None
+                and request_id in routing_indices_per_request
+            ):
+                step_routing = routing_indices_per_request[
+                    request_id
+                ]  # [num_tokens, num_layers, topk]
+                if request.routing_indices is None:
+                    request.routing_indices = step_routing.clone()
+                else:
+                    request.routing_indices = torch.cat(
+                        [request.routing_indices, step_routing], dim=0
+                    )
+
+        # Handle evicted requests.
+        if evict_request_ids is not None and evict_request_ids.numel() > 0:
+
+            evict_request_ids = evict_request_ids.tolist()
+
+            # Insert into waiting_request_ids after any chunk prefill request.
+            self.waiting_request_ids.extendleft(evict_request_ids)
+            if self.context.chunked_prefill_request_id != -1:
+                chunked_prefill_id = self.waiting_request_ids[len(evict_request_ids)]
+                del self.waiting_request_ids[len(evict_request_ids)]
+                self.waiting_request_ids.appendleft(chunked_prefill_id)
+
+            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
+            for request_id in evict_request_ids:
+                self.requests[request_id].record.checkpoint()
+                self.get_request(request_id).add_event_evict()
+
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
@@ -968,33 +1272,58 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
-    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
+    def _check_stop_words_for_request_post_append(
+        self, request: DynamicInferenceRequest
+    ) -> Tuple[bool, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
-        been appended to request.generated_tokens.
+        been appended to request.generated_tokens. In the speculative decoding case,
+        multiple tokens may have been appended at once. If a stop word is found in the
+        middle of the speculative tokens, the trailing tokens after the stop word are
+        truncated from generated_tokens.
+
+        With speculative decoding, multiple tokens are appended at once. The stop word
+        may end before the last appended token, leaving extra tokens that must be
+        trimmed. When this happens, generated_tokens is truncated in-place and the
+        number of trimmed tokens is returned so the caller can also trim log probs.
 
         Args:
             request: The request to check.
 
         Returns:
-            bool: True if the generated sequence ends with a stop word, False otherwise.
+            Tuple of (stop_word_hit, num_tokens_trimmed):
+                stop_word_hit: True if the generated sequence contains a stop word.
+                num_tokens_trimmed: Number of tokens removed from the end of
+                    generated_tokens (0 when the stop word is at the very end
+                    or when no stop word was found).
         """
-        # Check if request has stop words configured
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False
+            return False, 0
 
         generated_tokens = request.generated_tokens
 
-        # Check if the sequence ends with any stop word
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
-                    return True
+                # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
+                # Speculative decoding can append multiple tokens at once, so the stop
+                # word might end at any position within the newly appended tokens.
+                for i in range(self.num_speculative_tokens + 1):
+                    end_idx = -i if i > 0 else None
+                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
+                        if i > 0:
+                            request.generated_tokens = request.generated_tokens[:-i]
+                        return True, i
+        return False, 0
 
-        return False
+    def get_prefix_coordination_metrics(self) -> dict:
+        """Return prefix caching coordination metrics.
+
+        Returns:
+            Dict with coordination stats including the number of scheduling waits.
+        """
+        return {"waits": self._prefix_coordination_waits}
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1007,21 +1336,47 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
+
+            # Check for conflicting block hashes.
+            if prefix_caching_enabled:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(self.waiting_request_ids.popleft())
+                    continue
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                # Add these hashes to pending.
+                if prefix_caching_enabled:
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
+                req.add_event_add_context()
                 self.waiting_request_ids.popleft()
             else:
                 break
+
+        # Prepend pending request ids to waiting queue.
+        if prefix_caching_enabled and pending_request_ids:
+            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     def schedule_chunked_prefill(self):
         """
@@ -1038,6 +1393,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
@@ -1046,6 +1405,21 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+
+            # Check for conflicting block hashes.
+            if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
+                        self.waiting_request_ids.popleft()
+                    )
+                    continue
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -1058,19 +1432,44 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    # Add these hashes to pending.
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add()
+                    req.add_event_add_context()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
                 elif token_partially_can_be_added:
+                    # Add these hashes to pending.
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
+
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce
+                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
+                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
+                    # with the Flash Attention kernel.
+                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                    if remaining_len - chunk_length == 1:
+                        if chunk_length > 1:
+                            chunk_length -= 1
+                        else:
+                            # We only have space for 1 token, but remaining is 2.
+                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
+                            can_schedule = False
+                            break
+
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1082,7 +1481,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float, int]:
+        # Prepend pending request ids to waiting queue.
+        if prefix_caching_enabled and pending_request_ids:
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            if is_continuing_chunked_prefill:
+                chunked_request_id = self.waiting_request_ids.popleft()
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+                self.waiting_request_ids.appendleft(chunked_request_id)
+            else:
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
@@ -1095,8 +1504,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # If suspended, no stepping.
-        if self.is_suspended:
-            raise EngineSuspendedError(self.step_count)
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            raise EngineSuspendedError(self.context.step_count)
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1105,7 +1514,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
-            "max_active_requests": self.context.max_active_requests,
+            "max_requests": self.context.max_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1121,15 +1530,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        self.step_count += 1
+        self.context.step_count += 1
 
         range_pop()
 
         if (
-            self.inference_logging_step_interval > 0
-            and self.step_count > 0
-            and self.step_count % self.inference_logging_step_interval == 0
-            and self.context.metrics_writer is not None
+            self.logging_step_interval > 0
+            and self.context.step_count > 0
+            and self.context.step_count % self.logging_step_interval == 0
+            and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
         else:
@@ -1138,6 +1547,7 @@ class DynamicInferenceEngine(AbstractEngine):
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
+            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1149,10 +1559,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
-        return result, context_state, step_time, self.step_count
+        return result, context_state, step_time
 
     async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1160,7 +1570,6 @@ class DynamicInferenceEngine(AbstractEngine):
             step_result (Optional[Dict]): The result of the step.
             context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
-            step_count (int): The count of the step.
 
         Returns:
             A dictionary containing:
@@ -1170,15 +1579,19 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
+        range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
             active_request_ids = step_result["active_request_ids"]
-            newly_paused_request_ids = step_result["newly_paused_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
+            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
+            evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
+            accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1186,16 +1599,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Mark requests finished.
-            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
-            # Add finished events.
+            # Process finished requests (adds FINISH events and returns records).
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
+                evict_request_ids,
                 step_time,
                 sample,
+                accepted_tokens,
                 log_probs,
                 top_n_logprobs,
+                routing_indices_per_request,
             )
 
         else:
@@ -1211,33 +1625,45 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+        range_pop()
 
-        # Detokenize all finished requests (critical for InferenceClient, which
-        # doesn't necessarily have the tokenizer).
-        for record in finished_request_records:
-            for request in record.requests:
-                if request.prompt is None:
-                    request.prompt = self.controller.tokenizer.detokenize(
-                        request.prompt_tokens.tolist()
+        # Detokenize all finished requests if not using
+        # the coordinator. Otherwise, the coordinator will
+        # overlap detokenization with the engine.
+        if not self.use_coordinator:
+            range_push("detokenization")
+            for record in finished_request_records:
+                for request in record.requests:
+                    if request.prompt is None:
+                        request.prompt = self.controller.tokenizer.detokenize(
+                            request.prompt_tokens.tolist()
+                        )
+                    request.generated_text = self.controller.tokenizer.detokenize(
+                        request.generated_tokens
                     )
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
+            range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
+            range_push("coordinator_communication")
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.merge().serialize() for r in finished_request_records],
+                ],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
+            range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
+                'inference/inference_step': int(
+                    self.inference_step_offset + int(self.context.step_count)
+                ),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -1251,30 +1677,36 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
-                self.context.metrics_writer.log(metrics, commit=True)
+            # Add speculative decoding acceptance metrics.
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+                metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
+                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+                self.metrics_writer.log(metrics, commit=True)
             else:
-                raise ValueError(
-                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
-                )
+                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
         if (
-            self.inference_logging_step_interval > 0
-            and step_count % self.inference_logging_step_interval == 0
+            self.logging_step_interval > 0
+            and self.context.step_count % self.logging_step_interval == 0
         ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
-                "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d ... "
+                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
+                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    step_count,
+                    self.context.step_count,
                     datetime.now().strftime("%H:%M:%S"),
-                    step_time,
+                    step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
@@ -1288,10 +1720,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_active_requests"],
+                    context_state["max_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
+                    context_state["evicted_request_count"],
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
@@ -1301,9 +1734,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
+                    spec_rate,
+                    self._spec_tokens_accepted,
+                    self._spec_tokens_proposed,
+                    self._spec_steps,
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
+
+            # Reset speculative decoding accumulators after both wandb and console logging.
+            if self.num_speculative_tokens > 0:
+                self._spec_tokens_proposed = 0
+                self._spec_tokens_accepted = 0
+                self._spec_steps = 0
 
         return {
             "active_request_ids": active_request_ids,
@@ -1331,11 +1778,29 @@ class DynamicInferenceEngine(AbstractEngine):
         # Keep for compatibility with current test suite.
         return ret
 
+    def _run_coroutine_sync(self, coro):
+        """Run a coroutine synchronously, handling the case when already in an event loop.
+
+        This method safely runs an async coroutine from synchronous code, even when
+        called from within an already running event loop (e.g., when used with async
+        frameworks like pytriton).
+        """
+        try:
+            # Check if there's already a running event loop
+            asyncio.get_running_loop()
+            # We're inside a running loop - run in a separate thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        except RuntimeError:
+            # No running loop - safe to use run_until_complete
+            return self._loop.run_until_complete(coro)
+
     def step_modern(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step())
+        return self._run_coroutine_sync(self.async_step())
 
     def step_legacy(
         self, sampling_params: SamplingParams
@@ -1346,7 +1811,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step())
+        result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
@@ -1405,7 +1870,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        torch.cuda.nvtx.range_push("drain_zmq_socket")
+        range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -1438,72 +1903,106 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        torch.cuda.nvtx.range_pop()
+        range_pop()
+
+        # First pass: add all requests and detect staleness increments.
+        # Control signals are queued for the second pass.
+        has_staleness_increment = False
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
-
-            if self.received_stop:
-                assert (
-                    header == Headers.STOP_ACK
-                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
-
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
-            elif header == Headers.PAUSE:
-                # Pause thyself.
-                self.received_pause = True
-                self.running.clear()
-                # Send PAUSE_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.STOP:
-                # Stop thyself.
-                self.received_stop = True
-                self.running.clear()
-                # Send STOP_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.PAUSE_ACK:
-                self.paused.set()
-                self.received_pause = False
-            elif header == Headers.STOP_ACK:
-                self.stopped.set()
-                self.received_stop = False
+                range_pop()
+            elif header == Headers.INCREMENT_STALENESS:
+                has_staleness_increment = True
+            else:
+                # Control signal: queue for second pass.
+                self._pending_signals.append(message)
+
+        if has_staleness_increment:
+            waiting = set(self.waiting_request_ids)
+            for request_id, entry in self.requests.items():
+                entry.record.increment_staleness(policy_only=request_id in waiting)
+
+        # Second pass: apply at most one control signal (the engine loop
+        # processes one state transition per iteration).
+        if self._pending_signals:
+            message = self._pending_signals.popleft()
+            data = msgpack.unpackb(message, raw=False)
+            header = Headers(data[0])
+
+            if header == Headers.PAUSE:
+                if self.state == EngineState.RUNNING:
+                    self.state = EngineState.PAUSING
+                    self._state_events[EngineState.RUNNING].clear()
+                # Any other state can safely ignore PAUSE.
+
             elif header == Headers.UNPAUSE:
-                self.paused.clear()
-                self.running.set()
+                assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
+                self.state = EngineState.UNPAUSING
+
             elif header == Headers.SUSPEND:
-                self.suspend_signal = True
+                assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
+                self._state_events[EngineState.RESUMED].clear()
+                self.suspend()
+                self.state = EngineState.SUSPENDING
+
             elif header == Headers.RESUME:
-                self.suspend_signal = False
+                assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
+                self._state_events[EngineState.SUSPENDED].clear()
+                self.resume()
+                self.state = EngineState.RESUMING
+
             elif header == Headers.STOP:
-                self.received_stop = True
+                assert self.state in (
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
+                ), f"Received STOP in state {self.state}"
+                if self.state == EngineState.SUSPENDED:
+                    self._state_events[EngineState.SUSPENDED].clear()
+                self.state = EngineState.STOPPING
+
             else:
                 raise UnknownHeaderError(header)
 
         return len(all_messages)
 
-    def stop(self):
-        """
-        Stops the inference engine by terminating the inference coordinator process
-        if it exists, and destroys the model parallel state.
-        This method ensures that any running inference coordinator subprocess
-        is properly terminated, and cleans up resources associated with
-        model parallelism.
-        """
+    async def shutdown(self):
+        """Shut down the engine and clean up ZMQ resources.
 
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.join()
-        for socket in self.zmq_sockets:
-            socket.close()
+        Called from the engine loop's finally block after the loop exits.
+        """
+        self.state = EngineState.STOPPED
+
+        # Cleanup the request futures.
+        for entry in self.requests.values():
+            if not entry.future.done():
+                entry.future.cancel()
+
+        # ZMQ cleanup; designed to be idempotent.
+        sock = getattr(self, 'socket_for_receiving_requests', None)
+        if sock is not None and not sock.closed:
+            try:
+                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+            except Exception:
+                pass
+        for socket in getattr(self, 'zmq_sockets', []):
+            socket.close(linger=0)
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+        if hasattr(self, "world_zmq_communicator"):
+            self.world_zmq_communicator.close()
+        if not self.zmq_context.closed:
+            self.zmq_context.term()
+
+        # Set the stopped state at the very end.
+        self._state_events[EngineState.STOPPED].set()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1516,7 +2015,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            not self.is_suspended
+                            self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
@@ -1527,110 +2026,144 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def _ep_group_has_work(self, local_work: int) -> bool:
-        """Determines if there are some pending requests in the expert parallel group this
-        rank is a part of.
-        Args:
-            local_work (int): The local work count for this rank. This is a sum of active
-            and waiting requests.
-        Returns:
-            bool: True if there is some work in the EP group, False otherwise.
-        """
-        range_push("_ep_group_has_work")
+    async def _ep_establish_consensus(
+        self, local_work: int, signal_consensus: bool
+    ) -> tuple[int, bool]:
+        """EP all-reduce to share work counts and pause consensus.
 
-        is_stopped = self.stopped.is_set() or self.received_stop
-        is_paused = self.paused.is_set() or self.received_pause
-        is_suspended = self.suspend_signal
-        if is_stopped or is_paused or is_suspended:
-            # Signals can be received asynchronously on EP ranks.
-            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
-            # is yet to receive the signal.
-            # So this is an *attempt* to process the signal. This rank has received the signal
-            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
-            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
-            # and we will defer processing the signal.
-            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
-            local_work = 0
+        All-reduces two integers at once:
+        - local_work: actual pending request count (always >= 0).
+        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+
+        Using max for both:
+        - max(work) > 0 means at least one EP peer has real work.
+        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
+          Any RUNNING peer contributes 0, pulling the max to 0.
+
+        Args:
+            local_work: Pending request count for this rank.
+            signal_consensus: True if this rank is ready to pause.
+        Returns:
+            (global_work, all_pausing): max work across EP, and whether
+            all peers signaled consensus.
+        """
+        range_push("_ep_establish_consensus")
+
+        consensus_val = -1 if signal_consensus else 0
+
+        # Signals can be received asynchronously on EP ranks.
+        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
+        # So this is an *attempt* to process the signal. This rank has received the signal
+        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
+        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
+        # will be zero and we will defer processing the signal.
+        # When all ranks receive the signal, global consensus will be -1 and we can process.
 
         if self.ep_world_size > 1:
-            # Perform all-reduce to get max global work across EP group.
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop is megatron-rl.
-            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
+            # We have tried that and it blocks the event loop in megatron-rl.
+            global_work, global_consensus = (
+                await self.expert_parallel_zmq_communicator.all_reduce_max(
+                    local_work, consensus_val
+                )
+            )
         else:
-            max_global_work = local_work
+            global_work, global_consensus = local_work, consensus_val
 
         range_pop()
-        return max_global_work > 0
+        return global_work, global_consensus == -1
+
+    async def _world_barrier(self):
+        """World-wide ZMQ all-reduce barrier for global rank consensus.
+
+        Used for all state transitions that require global synchronization:
+        PAUSING → PAUSED, UNPAUSING → RUNNING, SUSPENDING → SUSPENDED,
+        RESUMING → PAUSED, and STOPPING → STOPPED.
+
+        No-op when world_size == 1 (communicator is not created).
+        """
+        range_push("world_barrier")
+        if hasattr(self, 'world_zmq_communicator'):
+            await self.world_zmq_communicator.all_reduce_max(1)
+        range_pop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
-        """Continually steps the engine asynchronously."""
+        """Continually steps the engine asynchronously.
+
+        State-dependent behavior:
+        - RUNNING: EP all-reduce to check for work, then step or idle.
+        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
+        - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
+        - STOPPED: Teardown and exit.
+        """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+
         try:
             while True:
                 self.schedule_requests()
 
-                # for the cases below (no active requests, or undergoing a state-change)
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
+                if self.state in (EngineState.RUNNING, EngineState.PAUSING):
+                    local_pending = self.context.get_active_request_count() + len(
+                        self.waiting_request_ids
+                    )
+                    global_work, all_pausing = await self._ep_establish_consensus(
+                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    )
 
-                local_pending_requests = self.context.get_active_request_count() + len(
-                    self.waiting_request_ids
-                )
-                # 1. Check for work availability (Consensus Step)
-                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
-
-                # 2. Dummy Work Logic (Keep group alive if peers have work)
-                if ep_group_has_work and local_pending_requests == 0:
-                    # run dummy forward pass if EP group as a whole has work,
-                    # but this rank does not have any work.
-                    self.controller.dummy_forward()
-                    continue
-
-                # 3. No work in EP group
-                # We handle control signals (PAUSE/STOP/SUSPEND) only when
-                # the entire EP group has received the signal. It is important to
-                # not process these signals immediately upon receipt, because
-                # other ranks in the EP group may not have received them yet.
-                # If we exit prematurely, other ranks will deadlock at the all-to-all.
-                # We use self._ep_group_has_work() to build consensus across the EP group
-                # as to when it is safe to process these signals. The function returns False
-                # when all ranks have received the signal.
-                if not ep_group_has_work:
-                    # Priority A: STOP
-                    if self.stopped.is_set():
-                        if self.rank == 0:
-                            logging.info("Stopping engine.")
-                        self.stop()
-                        break
-
-                    # Priority B: SUSPEND
-                    if self.suspend_signal:
-                        self.suspend()
+                    if all_pausing:
+                        # All EP peers are PAUSING: pause immediately.
+                        await self._world_barrier()
+                        self.state = EngineState.PAUSED
+                        self._state_events[EngineState.PAUSED].set()
+                    elif global_work > 0:
+                        # At least one EP peer has work: all must participate.
+                        if local_pending > 0:
+                            await self.async_step()
+                        else:
+                            # Dummy forward to participate in the EP collective.
+                            self.step_start_event.record()
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            self.context.step_count += 1
                     else:
-                        self.resume()
+                        # No work, but not all pausing: idle.
+                        await asyncio.sleep(0.02)
 
-                    # Priority C: PAUSE or no work - nothing needs to be done
-                    # To avoid flooding the TP publisher socket with packets,
-                    # we sleep for 20 ms here.
-                    # todo [Siddharth]: Can this hardcoded sleep be avoided
-                    # with asyncio zmq sockets?
-                    await asyncio.sleep(0.02)  # Yield to event loop
-                    continue
+                elif self.state == EngineState.PAUSED:
+                    await asyncio.sleep(0.02)
 
-                await self.async_step()
+                elif self.state == EngineState.UNPAUSING:
+                    await self._world_barrier()
+                    self.state = EngineState.RUNNING
+                    self._state_events[EngineState.PAUSED].clear()
+                    self._state_events[EngineState.RUNNING].set()
 
-        except asyncio.CancelledError:
-            pass
+                elif self.state == EngineState.SUSPENDING:
+                    await self._world_barrier()
+                    self.state = EngineState.SUSPENDED
+                    self._state_events[EngineState.SUSPENDED].set()
+
+                elif self.state == EngineState.SUSPENDED:
+                    await asyncio.sleep(0.02)
+
+                elif self.state == EngineState.RESUMING:
+                    await self._world_barrier()
+                    self.state = EngineState.PAUSED
+                    self._state_events[EngineState.RESUMED].set()
+
+                elif self.state == EngineState.STOPPING:
+                    await self._world_barrier()
+                    if self.rank == 0:
+                        logging.info("Stopping engine.")
+                    break
+
+        finally:
+            await self.shutdown()

@@ -599,7 +599,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 2,
+        thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):
@@ -658,6 +658,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+
+        if self.separation_hint is not None and self.thread_count <= 1:
+            self.thread_count = 2
+
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
             checkpoint_dir,
@@ -697,8 +701,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer,
             None,
             coordinator,
+            # flatten_sharded_tensors=False: MCore doesn't use nested ShardedTensors (FSDP 2D),
+            # so skip the expensive traverse_state_dict copy in _flatten_sharded_tensors
             planner=MCoreSavePlanner(
-                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
+                dedup_replicated_tensors=not self.keep_only_main_replica,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
@@ -755,7 +763,7 @@ def _get_filesystem_reader(
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
-        return CachedMetadataFileSystemReader(checkpoint_dir)
+        return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
 
     return FileSystemReader(checkpoint_dir)
 
@@ -763,8 +771,9 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self):
+    def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
+        self.cache_metadata = cache_metadata
         super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -795,20 +804,23 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
-        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
         checkpoint.load(
             pyt_state_dict,
             fsr,
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
             no_dist=True,
         )
 
-        self.cached_global_metadata = (
-            fsr.read_metadata()
-        )  # no storage interaction thanks to caching
+        if self.cache_metadata:
+            self.cached_global_metadata = (
+                fsr.read_metadata()
+            )  # no storage interaction thanks to caching
 
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict

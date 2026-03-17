@@ -174,6 +174,17 @@ class Timer(TimerBase):
         self._elapsed = 0.0
         self._started = False
 
+    def set_elapsed(self, value):
+        """Directly set the elapsed time.
+
+        This is useful for injecting pre-computed timing values (e.g., startup
+        timestamps) into the timer so they can be reported via timers.log().
+
+        Args:
+            value (float): The elapsed time value in seconds.
+        """
+        self._elapsed = value
+
     def elapsed(self, reset=True, barrier=False):
         """Calculates the elapsed time and restarts timer.
 

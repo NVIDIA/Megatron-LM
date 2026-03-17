@@ -76,9 +76,6 @@ class GPTModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask,
-                retriever_input_ids=None,
-                retriever_position_ids=None,
-                retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_context=None, *, inference_params=None):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -87,9 +84,6 @@ class GPTModel(MegatronModule):
             input_ids,
             position_ids,
             attention_mask,
-            retriever_input_ids=retriever_input_ids,
-            retriever_position_ids=retriever_position_ids,
-            retriever_attn_mask=retriever_attn_mask,
             inference_context=inference_context)
 
         if self.post_process:

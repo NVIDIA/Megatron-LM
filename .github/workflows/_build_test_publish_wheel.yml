@@ -17,8 +17,6 @@ on:
         type: boolean
         default: true
     secrets:
-      TWINE_USERNAME:
-        required: true
       TWINE_PASSWORD:
         required: true
 
@@ -45,7 +43,7 @@ jobs:
       PUBLISH_DRYRUN: ${{ inputs.dry-run }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref }}
 
@@ -74,7 +72,7 @@ jobs:
             rm LICENSE || true
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
               for python_version in cp310 cp311 cp312 cp313; do \
-                /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools>=80.0.0" build; \
+                /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools<80.0.0,>=77.0.0" build; \
               done && \
               for python_version in cp310 cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/python -m build; \
@@ -138,7 +136,7 @@ jobs:
           test "${{ steps.build-wheel.outputs.expected-release-number }}" == "$RELEASE_NUMBER"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
@@ -147,7 +145,6 @@ jobs:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
     if: inputs.no-publish == false
-    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'main' || 'public' }}
     strategy:
       fail-fast: false
       matrix:
@@ -157,12 +154,12 @@ jobs:
           - PACKAGE: megatron-core
             PLATFORM: amd64
           - PACKAGE: megatron-fsdp
-            IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+            PLATFORM: amd64
     env:
       PACKAGE: ${{ matrix.PACKAGE }}
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
@@ -170,10 +167,22 @@ jobs:
 
       - name: Publish wheels
         env:
-          TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+          TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
+          PLATFORM: ${{ matrix.PLATFORM }}
         run: |
-          ls -al dist/$PACKAGE*
+
+          # Delete sdist for arm64 since we already upload it with amd64.
+          if [ "$PLATFORM" == "arm64" ]; then
+            rm dist/*.tar.gz
+          fi
+
+          ls -al dist/
           pip install twine
-          twine upload -r $TWINE_REPOSITORY -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/$PACKAGE*
+          twine upload \
+            --verbose \
+            -r $TWINE_REPOSITORY \
+            -u $TWINE_USERNAME \
+            -p $TWINE_PASSWORD \
+            dist/*

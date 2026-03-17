@@ -3,7 +3,9 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -64,7 +66,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, post_attn, dispatch, moe, combine, post_process = callables
+    attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
@@ -76,24 +78,16 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         node.chunk_state.model = dummy_model
 
         # attn fwd
-        hidden_states = attn(node, input_tensors[i])
-
-        # post attn fwd
-        local_tokens, probs = post_attn(node, hidden_states)
+        local_tokens, probs = attn(node, input_tensors[i])
 
         # dispatch fwd
         dispatched_tokens = dispatch(node, local_tokens, probs)
 
         # moe fwd
-        expert_outputs = moe(node, dispatched_tokens)
-        if model.mlp.use_shared_expert:
-            expert_output, shared_expert_output = expert_outputs
-        else:
-            expert_output = expert_outputs
-            shared_expert_output = None
+        expert_output = moe(node, dispatched_tokens)
 
         # combine fwd
-        hidden_states = combine(node, expert_output, shared_expert_output)
+        hidden_states = combine(node, expert_output)
 
         # loss
         output_tensors.append(hidden_states)
@@ -148,13 +142,13 @@ class TestTransformerLayerSubmoduleCallables:
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
                 num_experts=8,
                 moe_grouped_gemm=grouped_gemm,
                 qk_layernorm=True,
                 multi_latent_attention=True,
             )
-            model = TransformerLayer(config, transformer_layer_spec.submodules)
+            model = TransformerLayer(config, transformer_layer_submodules)
 
             params = reset_model(model)
             input_tensors = [build_data() for _ in range(microbatches)]

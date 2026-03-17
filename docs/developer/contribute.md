@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Contributing to Megatron-LM
 
 This document outlines the processes and policies for issues and pull requests by non-NVIDIA contributors to the Megatron-LM GitHub repository.
@@ -46,11 +55,11 @@ You should receive a response within 2 business days.
 
 ### I need help, who should I ping?
 
-Use [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall).
+Use [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall).
 
 ### If my issue or PR isn't getting attention, what should I do?
 
-After 2 business days, tag the user [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall).
+After 2 business days, tag the user [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall).
 
 ### Is there a policy for issues and PRs that haven't been touched in X days? Should they be closed?
 

@@ -8,7 +8,8 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -17,7 +18,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.utils import get_asyncio_loop, get_mamba_inference_state_config_from_model
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -42,8 +43,6 @@ class StaticInferenceEngine(AbstractEngine):
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         max_batch_size (int, optional): The maximum number of requests to process at once.
-            Will be set from the InferenceWrapperConfig in `text_generation_controller` by
-            default.
         random_seed (int, optional): Use a random seed if you want deterministic
             results. Defaults to None.
     """
@@ -69,53 +68,55 @@ class StaticInferenceEngine(AbstractEngine):
                 DeprecationWarning,
             )
 
-        inference_wrapper_config = (
-            text_generation_controller.inference_wrapped_model.inference_wrapper_config
-        )
         self.controller = text_generation_controller
+        self.inference_wrapped_model = self.controller.inference_wrapped_model
+        self.config = self.inference_wrapped_model.config
         self.random_seed = random_seed or 1234
 
-        inference_max_batch_size = inference_wrapper_config.inference_max_requests
+        # Store original context in case we need to fall back to legacy static engine
+        original_context = self.inference_wrapped_model.inference_context
+        assert original_context is not None
+        assert isinstance(original_context, StaticInferenceContext)
+
         if max_batch_size is None:
-            max_batch_size = inference_max_batch_size
-        elif max_batch_size > inference_max_batch_size:
+            max_batch_size = original_context.max_batch_size
+        elif max_batch_size > original_context.max_batch_size:
             warnings.warn(
                 f"Engine `max_batch_size` ({max_batch_size}) > "
-                f"`inference_max_requests` in `inference_wrapper_config` "
-                f"({inference_max_batch_size}); setting `max_batch_size` to "
-                f"{inference_max_batch_size}",
+                f"`context.max_batch_size` in `inference_wrapped_model.inference_context` "
+                f"({original_context.max_batch_size}); setting `max_batch_size` to "
+                f"{original_context.max_batch_size}",
                 UserWarning,
             )
-            max_batch_size = inference_max_batch_size
+            max_batch_size = original_context.max_batch_size
 
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
-        # Store original context in case we need to fall back to legacy static engine
-        original_context = text_generation_controller.inference_wrapped_model.inference_context
-
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
-            text_generation_controller.inference_wrapped_model.model
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+            self.inference_wrapped_model.model
         )
 
         try:
             if not legacy:
-                dynamic_context = DynamicInferenceContext.from_config(
-                    inference_config=inference_wrapper_config,
-                    model=text_generation_controller.inference_wrapped_model.model,
-                    max_batch_size=max_batch_size,
-                    buffer_size_gb=buffer_size_gb,
-                    num_cuda_graphs=1,
-                    mamba_inference_state_config=mamba_inference_state_config,
+                dynamic_context = DynamicInferenceContext(
+                    model_config=self.config,
+                    inference_config=InferenceConfig(
+                        max_sequence_length=original_context.max_sequence_length,
+                        buffer_size_gb=buffer_size_gb,
+                        mamba_inference_state_config=mamba_inference_state_config,
+                        max_requests=max_batch_size,
+                        num_cuda_graphs=1,
+                        block_size_tokens=256,
+                        unified_memory_level=0,
+                    ),
                 )
+
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()
                 self.controller._init_dynamic_sampling_tensors()
 
                 self.dynamic_engine = DynamicInferenceEngine(
-                    controller=self.controller,
-                    random_seed=self.random_seed,
-                    context=dynamic_context,
-                    enable_cuda_graph=True,
+                    controller=self.controller, context=dynamic_context
                 )
         except Exception as e:
             # Get exception details for better debugging
@@ -229,13 +230,20 @@ class StaticInferenceEngine(AbstractEngine):
         if prompts:
             if add_BOS:
                 sampling_params.add_BOS = True
-            return self.dynamic_engine.generate(prompts=prompts, sampling_params=sampling_params)
+            request_records = self.dynamic_engine.generate(
+                prompts=prompts, sampling_params=sampling_params
+            )
         elif inference_requests:
             prompts = [request.prompt for request in inference_requests]
             sampling_params = inference_requests[0].sampling_params
             if add_BOS:
                 sampling_params.add_BOS = True
-            return self.dynamic_engine.generate(prompts=prompts, sampling_params=sampling_params)
+            request_records = self.dynamic_engine.generate(
+                prompts=prompts, sampling_params=sampling_params
+            )
+
+        # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.
+        return [record.merge() for record in request_records]
 
     def generate_using_legacy_static_engine(
         self,

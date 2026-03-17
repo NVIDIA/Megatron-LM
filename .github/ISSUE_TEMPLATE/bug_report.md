@@ -9,7 +9,7 @@ assignees: ''
 
 **Describe the bug**
 
-A clear and concise description of what the bug is. Tag the [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall) 
+A clear and concise description of what the bug is. Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) 
 to get oncall's attention to this issue.
 
 **Steps/Code to reproduce bug**

@@ -21,13 +21,13 @@ This guide for Megatron Core walks you through the following tasks:
 
     git clone https://github.com/NVIDIA/Megatron-LM.git
     cd Megatron-LM
-    pip install -U setuptools packaging
-    pip install --no-build-isolation .[dev]
+    pip install uv
+    uv pip install -e .
     ```
 
     <br>
 
-For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/Installation_Guide.md)
+For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html).
 
 ### Write Your First Training Loop
 

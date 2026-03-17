@@ -69,7 +69,6 @@ ARGS=" \
     --tiktoken-pattern v2 \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --distributed-timeout-minutes 2400 \
-    --transformer-impl local \
     --use-flash-attn \
     --inference-rng-tracker \
     \
@@ -95,6 +94,11 @@ fi
 if [[ -v PROMPTS ]]; then
     ARGS+=" \
         --prompts ${PROMPTS} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
+elif [[ -v PROMPT_FILE ]]; then
+    ARGS+=" \
+        --prompt-file ${PROMPT_FILE} \
         --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
     "
 else

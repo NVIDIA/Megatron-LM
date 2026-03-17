@@ -32,6 +32,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Miscellaneous.
 : ${USE_COORDINATOR=0}
 : ${ENGINE=dynamic}
+: ${NPROC_PER_NODE=1}
 : ${EXTRA_ARGS=""}
 # NSIGHT_PREFIX=/path/to/nsight/profile
 
@@ -83,6 +84,11 @@ if [[ -v PROMPTS ]]; then
         --prompts ${PROMPTS} \
         --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
     "
+elif [[ -v PROMPT_FILE ]]; then
+    ARGS+=" \
+        --prompt-file ${PROMPT_FILE} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
 else
     ARGS+=" \
         --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT} \
@@ -96,7 +102,7 @@ fi
 if [[ "${USE_COORDINATOR}" == "0" ]]; then
     CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
 else
-    CMD="python -um examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
+    CMD="python -m torch.distributed.run --nproc-per-node ${NPROC_PER_NODE} -m examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
 fi
 
 if [[ -v NSIGHT_PREFIX ]]; then
