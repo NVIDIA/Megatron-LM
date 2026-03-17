@@ -1380,6 +1380,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         tokens_per_decode_request = self.num_speculative_tokens + 1
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
+        # Token distribution scheme:
+        #   - Decode requests each get exactly `tokens_per_decode_request` tokens
+        #     (i.e. 1 + num_speculative_tokens).
+        #   - The remaining tokens (T - N_decode * tokens_per_decode_request) are
+        #     divided evenly across prefill requests, with any remainder added to
+        #     the last prefill request.
+        # This mirrors the distribution in add_dummy_requests_for_cudagraph_capture
+        # (which distributes remainder starting from the first request instead) but
+        # the exact per-request sizes don't matter here — only the totals need to
+        # match the CUDA graph dimensions so the captured graph replays correctly.
+
         # 1. Request counts and token count.
         #    With speculative decoding each decode request has (num_speculative_tokens + 1) tokens.
         self.total_request_count = N_total
