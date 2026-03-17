@@ -224,6 +224,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
+        self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -275,6 +276,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -827,6 +829,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 future=self._loop.create_future(),
             )
             request.add_event_add_engine()  # Record when request enters engine
+
+            # Stamp new request with the current generation epoch.
+            if self._generation_epoch is not None:
+                epoch = self._generation_epoch
+                request.policy_epoch = [(0, epoch)]
+                request.kv_cache_epoch = [(0, epoch)]
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -1625,6 +1633,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
         range_pop()
 
         # Detokenize all finished requests if not using
@@ -1905,9 +1914,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
 
-        # First pass: add all requests and detect staleness increments.
+        # First pass: add requests.
         # Control signals are queued for the second pass.
-        has_staleness_increment = False
+        new_generation_epoch = None
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1917,16 +1926,29 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
-            elif header == Headers.INCREMENT_STALENESS:
-                has_staleness_increment = True
+            elif header == Headers.SET_GENERATION_EPOCH:
+                new_generation_epoch = data[1]
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
 
-        if has_staleness_increment:
-            waiting = set(self.waiting_request_ids)
-            for request_id, entry in self.requests.items():
-                entry.record.increment_staleness(policy_only=request_id in waiting)
+        if new_generation_epoch is not None:
+            self._generation_epoch = new_generation_epoch
+            # Stamp all active requests with the new epoch.
+            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, new_generation_epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).
@@ -2066,7 +2088,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # We have tried that and it blocks the event loop in megatron-rl.
             global_work, global_consensus = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val
+                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
                 )
             )
         else:
@@ -2086,7 +2108,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
-            await self.world_zmq_communicator.all_reduce_max(1)
+            await self.world_zmq_communicator.all_reduce_max(
+                1, async_op=(not self.use_synchronous_zmq_collectives)
+            )
         range_pop()
 
     @trace_async_exceptions

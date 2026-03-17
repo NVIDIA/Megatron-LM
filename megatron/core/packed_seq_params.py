@@ -49,6 +49,13 @@ class PackedSeqParams:
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
+            # Clamp to non-negative: cu_seqlens_q_padded may not be strictly
+            # monotonic when context parallelism slices sequences across ranks,
+            # or when padded cumulative lengths exceed total_tokens (e.g. the
+            # appended total_tokens sentinel is smaller than cu_seqlens[-1]
+            # due to padding). In either case the diff can go negative, which
+            # causes torch.repeat_interleave to fail.
+            seq_lengths = seq_lengths.clamp(min=0)
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
             self.seq_idx = (
                 torch.repeat_interleave(
