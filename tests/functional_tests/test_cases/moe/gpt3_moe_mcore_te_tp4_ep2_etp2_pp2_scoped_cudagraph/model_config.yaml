@@ -87,7 +87,6 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --ckpt-assume-constant-structure: true
   --async-save: true
-  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume
 METRICS:
   # - "iteration-time"

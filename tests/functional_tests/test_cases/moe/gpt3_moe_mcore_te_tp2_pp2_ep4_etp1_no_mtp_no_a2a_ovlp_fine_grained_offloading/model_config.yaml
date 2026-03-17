@@ -128,7 +128,6 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 50
   --async-save: true
-  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
   - "lm loss"
