@@ -456,12 +456,6 @@ def test_packing_observability_metrics():
         # total_actual = sum(seq_lengths) = 22, capacity = 2 * 16 * 4 = 128
         assert eff == pytest.approx(22 / 128)
 
-    # None context returns zero for all metrics
-    assert sequence_packing_utils.get_packing_actual_tokens(None) == 0
-    assert sequence_packing_utils.get_packing_compute_tokens(None) == 0
-    assert sequence_packing_utils.get_packing_efficiency(None) == 0.0
-    assert sequence_packing_utils.get_packing_avg_seq_length(None) == 0.0
-
 
 @pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
 def test_cu_seqlens_size(num_sequences):

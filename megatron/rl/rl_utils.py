@@ -307,6 +307,8 @@ class RLRuntimeState:
         # Derived throughput metrics (set by training_log, read by RLProfiler)
         self.tokens_per_sec = None
         self.tokens_per_sec_per_gpu = None
+        self.compute_tokens_per_sec = None
+        self.compute_tokens_per_sec_per_gpu = None
         self.actual_tokens_per_sec = None
         self.actual_tokens_per_sec_per_gpu = None
         self.packing_efficiency = None
@@ -317,6 +319,8 @@ class RLRuntimeState:
         self.last_collection_iteration = iteration
         self.tokens_per_sec = None
         self.tokens_per_sec_per_gpu = None
+        self.compute_tokens_per_sec = None
+        self.compute_tokens_per_sec_per_gpu = None
         self.actual_tokens_per_sec = None
         self.actual_tokens_per_sec_per_gpu = None
         self.packing_efficiency = None

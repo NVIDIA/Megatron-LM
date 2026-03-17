@@ -1184,19 +1184,11 @@ def get_packing_actual_tokens(packing_context: PackingContext) -> int:
     Returns:
         Total number of actual tokens across all bins on this rank.
     """
-    if packing_context is None or packing_context.packing_info is None:
-        return 0
-
-    packing_info = packing_context.packing_info
-    my_bin_seq_indices = packing_info.bin_seq_indices
-
-    # Sum the actual sequence lengths for all sequences in bins assigned to this rank
-    actual_tokens = sum(
-        packing_info.seq_lengths[idx]
-        for indices in my_bin_seq_indices
+    return sum(
+        packing_context.packing_info.seq_lengths[idx]
+        for indices in packing_context.packing_info.bin_seq_indices
         for idx in indices
     )
-    return actual_tokens
 
 
 def get_packing_compute_tokens(packing_context: PackingContext) -> int:
@@ -1208,11 +1200,7 @@ def get_packing_compute_tokens(packing_context: PackingContext) -> int:
     Returns:
         Total compute tokens (num_bins * bin_size) on this rank.
     """
-    if packing_context is None or packing_context.packed_trajs is None:
-        return 0
-
-    packed_trajs = packing_context.packed_trajs
-    return packed_trajs.shape[0] * packed_trajs.shape[1]
+    return packing_context.packed_trajs.shape[0] * packing_context.packed_trajs.shape[1]
 
 
 def get_packing_efficiency(packing_context: PackingContext) -> float:
@@ -1224,13 +1212,10 @@ def get_packing_efficiency(packing_context: PackingContext) -> float:
     Returns:
         Packing efficiency as a float between 0 and 1.
     """
-    if packing_context is None or packing_context.packing_info is None:
-        return 0.0
-
     total_actual_tokens = sum(packing_context.packing_info.seq_lengths)
     num_ranks = mpu.get_data_parallel_world_size()
-    bins_per_rank = packing_context.packed_trajs.shape[0] if packing_context.packed_trajs is not None else 0
-    bin_size = packing_context.packed_trajs.shape[1] if packing_context.packed_trajs is not None else 0
+    bins_per_rank = packing_context.packed_trajs.shape[0]
+    bin_size = packing_context.packed_trajs.shape[1]
     total_capacity = bins_per_rank * bin_size * num_ranks
 
     if total_capacity == 0:
@@ -1241,11 +1226,8 @@ def get_packing_efficiency(packing_context: PackingContext) -> float:
 
 def get_packing_avg_seq_length(packing_context: PackingContext) -> float:
     """Get the average sequence length across all sequences in the packing context."""
-    if packing_context is None or packing_context.packing_info is None:
-        return 0.0
-
     seq_lengths = packing_context.packing_info.seq_lengths
-    if not seq_lengths or len(seq_lengths) == 0:
+    if not seq_lengths:
         return 0.0
 
     return sum(seq_lengths) / len(seq_lengths)
