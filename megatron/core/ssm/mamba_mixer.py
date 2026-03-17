@@ -913,9 +913,7 @@ class MambaMixer(MegatronModule):
                     cumulative_chunks = 0
                     for i in range(num_real_seqs):
                         seq_len = seqlens[i + 1] - seqlens[i]
-                        num_chunks = max(
-                            1, (seq_len + self.chunk_size - 1) // self.chunk_size
-                        )
+                        num_chunks = max(1, (seq_len + self.chunk_size - 1) // self.chunk_size)
                         first_chunk_idx = cumulative_chunks
                         offsets = intermediate_token_offsets[i]
                         count = 0
