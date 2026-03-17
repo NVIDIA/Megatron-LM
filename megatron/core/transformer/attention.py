@@ -1420,8 +1420,10 @@ class SelfAttention(Attention):
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
                 self.world_size // self.config.num_query_groups
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
@@ -1478,7 +1480,7 @@ class SelfAttention(Attention):
             # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
             # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
             # This is step 4 in the list of steps above.
-            idx = get_tensor_model_parallel_rank() % (
+            idx = get_pg_rank(self.pg_collection.tp) % (
                 self.world_size // self.config.num_query_groups
             )
             size = self.num_attention_heads_per_partition // (

@@ -917,7 +917,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+            hidden_states = scatter_to_sequence_parallel_region(
+                hidden_states, group=self.tp_group
+            )
         return hidden_states
 
     def _proj_and_transformer_layer(

@@ -44,6 +44,11 @@ class ParameterMetadata:
     is_tp: bool = False
     partition_dim: int = 0
     partition_stride: int = 1
+    # For parameters that pack multiple independently-sharded components of
+    # different sizes (e.g. Mamba in_proj packs z, x, B, C, dt).  When present,
+    # lists the per-TP-rank block sizes along partition_dim.  The refit planner
+    # interleaves these blocks rather than doing a simple contiguous concat.
+    partition_sizes: list[int] | None = None
 
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
@@ -258,6 +263,9 @@ def extract_param_metadata(
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
+    partition_sizes = getattr(param, 'partition_sizes', None)
+    if partition_sizes is not None:
+        partition_sizes = list(partition_sizes)
 
     # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
     # and requires partition_stride=2 for correct resharding. New models set this at construction
@@ -318,6 +326,7 @@ def extract_param_metadata(
         is_tp=is_tp,
         partition_dim=partition_dim,
         partition_stride=partition_stride,
+        partition_sizes=partition_sizes,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,

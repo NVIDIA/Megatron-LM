@@ -29,7 +29,7 @@ from megatron.core.utils import (
     is_using_quantization_scales,
     log_single_rank,
 )
-
+import torch
 logger = logging.getLogger(__name__)
 
 

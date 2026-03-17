@@ -152,6 +152,126 @@ def _plan_multi_dim_lcm(
     return ops
 
 
+def _plan_block_interleaved(
+    param_name: str,
+    src_metadata: ParameterMetadata,
+    dst_metadata: ParameterMetadata,
+    descriptors: list[ShardingDescriptor],
+    my_global_rank: int,
+) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
+    """
+    Block-interleaved TP planner for parameters with ``partition_sizes``.
+
+    When a parameter packs multiple independently-sharded components of
+    *different* sizes (e.g. Mamba in_proj packs z, x, B, C, dt), a simple
+    contiguous concat produces the wrong layout.  This function treats each
+    block independently: it gathers (or scatters) each block across TP ranks
+    before moving to the next block.
+
+    ``partition_sizes`` lists the per-TP-rank block sizes along the partition
+    dim.  Block *i* occupies ``[sum(sizes[:i]), sum(sizes[:i+1]))`` in the
+    local tensor on every TP rank.  In the *full* (TP-gathered) tensor, block
+    *i* occupies ``[sum(full_sizes[:i]), sum(full_sizes[:i+1]))`` where
+    ``full_sizes[i] = sizes[i] * src_tp_world``.
+    """
+    if not descriptors or descriptors[0].name != "tp":
+        return []
+    d = descriptors[0]
+    if my_global_rank not in d.dst_dim_ranks:
+        return []
+
+    dim = d.dim
+    src_shape = tuple(src_metadata.shape)
+    dst_shape = tuple(dst_metadata.shape)
+    src_world = len(d.src_dim_ranks)
+    dst_world = len(d.dst_dim_ranks)
+    dst_local_rank = _get_rank_in_group(my_global_rank, d.dst_dim_ranks)
+
+    # Use partition_sizes from whichever side has it (prefer src)
+    src_sizes = src_metadata.partition_sizes
+    dst_sizes = dst_metadata.partition_sizes
+
+    if src_sizes is None and dst_sizes is None:
+        raise RuntimeError(f"{param_name}: _plan_block_interleaved called without partition_sizes")
+
+    # Derive the full (un-sharded) block sizes
+    if src_sizes is not None:
+        num_blocks = len(src_sizes)
+        full_sizes = [s * src_world for s in src_sizes]
+    else:
+        num_blocks = len(dst_sizes)
+        full_sizes = [s * dst_world for s in dst_sizes]
+
+    # Compute per-rank block sizes for both sides
+    if src_sizes is None:
+        src_sizes = [f // src_world for f in full_sizes]
+    if dst_sizes is None:
+        dst_sizes = [f // dst_world for f in full_sizes]
+
+    # Validate conservation
+    for i in range(num_blocks):
+        if src_sizes[i] * src_world != dst_sizes[i] * dst_world:
+            raise RuntimeError(
+                f"{param_name}: block {i} size mismatch: "
+                f"src_sizes[{i}]={src_sizes[i]}*{src_world} != "
+                f"dst_sizes[{i}]={dst_sizes[i]}*{dst_world}"
+            )
+
+    ops: list[tuple[int, tuple[slice, ...], tuple[slice, ...]]] = []
+
+    # For each block, compute the transfer ops independently
+    src_block_offset = 0  # cumulative offset in source local tensor
+    dst_block_offset = 0  # cumulative offset in destination local tensor
+
+    for blk in range(num_blocks):
+        src_blk_sz = src_sizes[blk]  # per-src-rank size of this block
+        dst_blk_sz = dst_sizes[blk]  # per-dst-rank size of this block
+        full_blk_sz = full_sizes[blk]
+
+        # Within this block, use simple LCM tiling (stride=1)
+        Ns = src_world
+        Nd = dst_world
+        g = math.gcd(Ns, Nd)
+        L = (Ns // g) * Nd
+        if full_blk_sz % L != 0:
+            raise RuntimeError(
+                f"{param_name}: block {blk} full_size {full_blk_sz} not divisible by LCM {L}"
+            )
+        unit = full_blk_sz // L
+        cps = L // Ns
+        cpd = L // Nd
+
+        # This dst rank's segment within the block
+        g_dst_seg = dst_local_rank
+        for off in range(cpd):
+            g_micro = g_dst_seg * cpd + off
+            s_idx = g_micro // cps
+            in_seg = g_micro % cps
+            src_owner_in_dim = s_idx % src_world
+            src_global_rank = d.src_dim_ranks[src_owner_in_dim]
+            src_local_seg_idx = s_idx // src_world
+            src_start = src_block_offset + src_local_seg_idx * (cps * unit) + in_seg * unit
+            dst_start = dst_block_offset + off * unit
+
+            src_slice = [slice(None)] * len(src_shape)
+            dst_slice = [slice(None)] * len(dst_shape)
+            src_slice[dim] = slice(src_start, src_start + unit)
+            dst_slice[dim] = slice(dst_start, dst_start + unit)
+            ops.append((src_global_rank, tuple(src_slice), tuple(dst_slice)))
+
+        src_block_offset += src_blk_sz
+        dst_block_offset += dst_blk_sz
+
+    # Stable sort by destination offset
+    def dst_key(op):
+        _, _, dsl = op
+        s = dsl[dim]
+        return s.start if isinstance(s, slice) else 0
+
+    ops.sort(key=dst_key)
+    return ops
+
+
 def _finalize_dp_transfers(
     param_name: str,
     src_metadata: ParameterMetadata,
@@ -210,6 +330,16 @@ def _determine_source_ranks_for_dst_param(
     # Regular TP/DP planning with EP-resolved metadata
     descriptors = _build_descriptors_for_param(src_metadata=src_metadata, dst_metadata=dst_metadata)
     if descriptors:
+        # Use block-interleaved planner when partition_sizes is present
+        # (e.g. Mamba in_proj packs components of different sizes)
+        if src_metadata.partition_sizes is not None or dst_metadata.partition_sizes is not None:
+            return _plan_block_interleaved(
+                param_name=param_name,
+                src_metadata=src_metadata,
+                dst_metadata=dst_metadata,
+                descriptors=descriptors,
+                my_global_rank=my_global_rank,
+            )
         return _plan_multi_dim_lcm(
             param_name=param_name,
             src_metadata=src_metadata,
@@ -314,63 +444,77 @@ def build_centralized_reshard_plan(
                 src_param_metadata[key] = []
             src_param_metadata[key].append(metadata)
 
-    # Build the plan on global rank 0 and broadcast to all ranks
+    # Build the plan on global rank 0 and broadcast to all ranks.
+    # Wrap in try/except so that errors on rank 0 are broadcast to all ranks
+    # instead of causing a deadlock (other ranks would block in broadcast forever).
+    error_msg = [None]
     if my_global_rank == 0:
-        plans_for_all_ranks = {r: ReshardPlan([], []) for r in range(world_size)}
-        # Global monotonically increasing ID for non-local transfers.
-        # This is shared between the corresponding send/recv ops so that
-        # NVSHMEM can build schedule.
-        next_task_id = 0
+        try:
+            plans_for_all_ranks = {r: ReshardPlan([], []) for r in range(world_size)}
+            # Global monotonically increasing ID for non-local transfers.
+            # This is shared between the corresponding send/recv ops so that
+            # NVSHMEM can build schedule.
+            next_task_id = 0
 
-        # Pipeline-parallel (PP) "mapping" is handled implicitly.
-        # Each rank contributes metadata only for the parameters it actually owns
-        # (i.e., the module partitioning for its PP stage). When PP sizes differ
-        # between source and destination, we don't compute an explicit stage-to-stage
-        # mapping here; instead, we iterate destination ranks and plan copies for the
-        # parameters present on those ranks. Any source rank that has the same logical
-        # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
-        # and TP slicing is applied when applicable.
-        for dst_rank in range(world_size):
-            dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
-            for resolved_name, dst_metadata in dst_rank_params.items():
-                src_meta_list = src_param_metadata.get(resolved_name)
-                if not src_meta_list:
-                    raise RuntimeError(
-                        f"Destination parameter '{resolved_name}' on rank {dst_rank} "
-                        "not found in source model."
+            # Pipeline-parallel (PP) "mapping" is handled implicitly.
+            # Each rank contributes metadata only for the parameters it actually owns
+            # (i.e., the module partitioning for its PP stage). When PP sizes differ
+            # between source and destination, we don't compute an explicit stage-to-stage
+            # mapping here; instead, we iterate destination ranks and plan copies for the
+            # parameters present on those ranks. Any source rank that has the same logical
+            # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
+            # and TP slicing is applied when applicable.
+            for dst_rank in range(world_size):
+                dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
+                for resolved_name, dst_metadata in dst_rank_params.items():
+                    src_meta_list = src_param_metadata.get(resolved_name)
+                    if not src_meta_list:
+                        raise RuntimeError(
+                            f"Destination parameter '{resolved_name}' on rank {dst_rank} "
+                            "not found in source model."
+                        )
+                    # Choose a representative source metadata with DP round-robin balancing
+                    src_metadata = select_src_metadata_balanced(
+                        src_meta_list, dst_metadata, dst_rank
                     )
-                # Choose a representative source metadata with DP round-robin balancing
-                src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-                sources = _determine_source_ranks_for_dst_param(
-                    resolved_name, src_metadata, dst_metadata, dst_rank
-                )
-                for src_rank, src_slice, dst_slice in sources:
-                    task_id = next_task_id
-                    next_task_id += 1
+                    sources = _determine_source_ranks_for_dst_param(
+                        resolved_name, src_metadata, dst_metadata, dst_rank
+                    )
+                    for src_rank, src_slice, dst_slice in sources:
+                        task_id = next_task_id
+                        next_task_id += 1
 
-                    plans_for_all_ranks[dst_rank].recv_ops.append(
-                        TransferOp(
-                            param_name=dst_metadata.name,
-                            peer_rank=src_rank,
-                            is_send=False,
-                            my_slice=dst_slice,
-                            peer_slice=src_slice,
-                            task_id=task_id,
+                        plans_for_all_ranks[dst_rank].recv_ops.append(
+                            TransferOp(
+                                param_name=dst_metadata.name,
+                                peer_rank=src_rank,
+                                is_send=False,
+                                my_slice=dst_slice,
+                                peer_slice=src_slice,
+                                task_id=task_id,
+                            )
                         )
-                    )
-                    plans_for_all_ranks[src_rank].send_ops.append(
-                        TransferOp(
-                            param_name=src_metadata.name,
-                            peer_rank=dst_rank,
-                            is_send=True,
-                            my_slice=src_slice,
-                            peer_slice=dst_slice,
-                            task_id=task_id,
+                        plans_for_all_ranks[src_rank].send_ops.append(
+                            TransferOp(
+                                param_name=src_metadata.name,
+                                peer_rank=dst_rank,
+                                is_send=True,
+                                my_slice=src_slice,
+                                peer_slice=dst_slice,
+                                task_id=task_id,
+                            )
                         )
-                    )
-        plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
+            plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
+        except Exception as e:
+            logger.error(f"Rank 0: Plan building failed: {e}")
+            plans_list = [None] * world_size
+            error_msg = [str(e)]
     else:
         plans_list = [None] * world_size
+    # Broadcast error status first so all ranks can raise together
+    torch.distributed.broadcast_object_list(error_msg, group_src=0, group=group)
+    if error_msg[0] is not None:
+        raise RuntimeError(f"Reshard plan building failed on rank 0: {error_msg[0]}")
     # Use group_src= (group rank) instead of src= (default PG global rank) to support
     # cross-cluster ProcessGroups where members share the same default PG rank.
     torch.distributed.broadcast_object_list(plans_list, group_src=0, group=group)

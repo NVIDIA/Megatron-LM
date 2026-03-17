@@ -247,6 +247,19 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
+        # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
+        # component is independently TP-sharded but with different sizes.  When
+        # resharding across different TP sizes the planner must interleave
+        # per-component blocks rather than doing a contiguous concat.
+        # partition_sizes lists the per-TP-rank block sizes along partition_dim.
+        in_proj_partition_sizes = [
+            self.d_inner_local_tp,                  # z
+            self.d_inner_local_tp,                  # x
+            self.ngroups_local_tp * self.d_state,   # B
+            self.ngroups_local_tp * self.d_state,   # C
+            self.nheads_local_tp,                   # dt
+        ]
+        setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
 
         if not self.use_mem_eff_path:
             log_single_rank(
@@ -273,7 +286,20 @@ class MambaMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "partition_dim", 0)
+            # partition_sizes describes the per-TP-rank block sizes along the
+            # partition dim.  conv1d packs [x, B, C] whose local sizes differ,
+            # so a plain contiguous concat would produce the wrong layout when
+            # resharding across different TP sizes.
+            conv_partition_sizes = [
+                self.d_inner_local_tp,
+                self.ngroups_local_tp * self.d_state,
+                self.ngroups_local_tp * self.d_state,
+            ]
+            setattr(self.conv1d.weight, "partition_sizes", conv_partition_sizes)
+            setattr(self.conv1d.bias, "partition_sizes", conv_partition_sizes)
             if self.config.perform_initialization:
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -298,6 +324,7 @@ class MambaMixer(MegatronModule):
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias = nn.Parameter(inv_dt)
             setattr(self.dt_bias, "tensor_model_parallel", True)
+            setattr(self.dt_bias, "partition_dim", 0)
 
             # A parameter
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
@@ -309,7 +336,7 @@ class MambaMixer(MegatronModule):
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
-
+            setattr(self.A_log, "partition_dim", 0)
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -318,7 +345,7 @@ class MambaMixer(MegatronModule):
             )
         )  # Keep in fp32
         setattr(self.D, "tensor_model_parallel", True)
-
+        setattr(self.D, "partition_dim", 0)
         if self.rmsnorm:
             assert RMSNormGated is not None
             self.norm = ExtendedRMSNorm(
@@ -330,7 +357,7 @@ class MambaMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
             setattr(self.norm.weight, "tensor_model_parallel", True)
-
+            setattr(self.norm.weight, "partition_dim", 0)
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
         self.out_proj = build_module(
