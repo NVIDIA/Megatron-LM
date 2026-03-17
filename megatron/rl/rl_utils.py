@@ -63,9 +63,11 @@ from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
+    GroupedRollouts,
     RewardEvaluationResult,
     Rollout,
     RolloutGroup,
+    Rollouts,
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
@@ -265,8 +267,6 @@ def verify_model_weights_swap(
         if inf_was_training:
             inf_core.train()
 
-Rollouts = list[TokenRollout | Rollout]
-GroupedRollouts = list[RolloutGroup]
 
 
 @dataclass(slots=True)

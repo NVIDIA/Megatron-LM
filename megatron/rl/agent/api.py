@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
 
@@ -59,24 +58,6 @@ class Rollout(AgentBaseModel):
     num_evictions: list[int]
 
 
-@dataclass(slots=True)
-class RolloutGroup:
-    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
-
-    rollouts: list[Rollout]
-    batch_id: int = 0
-    index_in_batch: int = 0
-
-    def __iter__(self):
-        return iter(self.rollouts)
-
-    def __len__(self):
-        return len(self.rollouts)
-
-    def __getitem__(self, idx):
-        return self.rollouts[idx]
-
-
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
 
@@ -90,6 +71,29 @@ class TokenRollout(AgentBaseModel):
     kv_cache_staleness: list[list[int]]
     completed_at_step: list[int]
     num_evictions: list[int]
+
+
+Rollouts = list[TokenRollout | Rollout]
+
+
+class RolloutGroup(AgentBaseModel):
+    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
+
+    rollouts: Rollouts
+    batch_id: int = 0
+    index_in_batch: int = 0
+
+    def __iter__(self):
+        return iter(self.rollouts)
+
+    def __len__(self):
+        return len(self.rollouts)
+
+    def __getitem__(self, idx):
+        return self.rollouts[idx]
+
+
+GroupedRollouts = list[RolloutGroup]
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -270,7 +274,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         try:
             next_batch_id = 0
-            pending: dict[int, list[RolloutGroup]] = {}
+            pending: dict[int, GroupedRollouts] = {}
             while True:
                 try:
                     group = await grouped_rollouts.get()
