@@ -398,3 +398,27 @@ def save(
     async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     return async_request
+
+
+def get_default_save_sharded_strategy(
+    backend: str = 'torch_dist', version: int = 1
+) -> TorchDistSaveShardedStrategy:
+    """Get default save sharded strategy."""
+    logger.warning(
+        'megatron.core.dist_checkpointing.serialization.get_default_save_sharded_strategy '
+        'is deprecated and will be removed in the future releases. Please, use '
+        'megatron.core.dist_checkpointing.strategies.torch.TorchDistSaveShardedStrategy '
+        'to get the default save sharded strategy.'
+    )
+    return TorchDistSaveShardedStrategy()
+
+
+def get_default_load_sharded_strategy(checkpoint_dir: str) -> TorchDistLoadShardedStrategy:
+    """Get default load sharded strategy."""
+    logger.warning(
+        'megatron.core.dist_checkpointing.serialization.get_default_load_sharded_strategy '
+        'is deprecated and will be removed in the future releases. Please, use '
+        'megatron.core.dist_checkpointing.strategies.torch.TorchDistLoadShardedStrategy '
+        'to get the default load sharded strategy.'
+    )
+    return TorchDistLoadShardedStrategy()
