@@ -85,7 +85,7 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.mixer.d_state = self.d_state
         self.mixer.d_conv = self.d_conv
         self.mixer.headdim = self.headdim
-        self.mixer.mamba_chunk_size = 256
+        self.mixer.chunk_size = 256
         self.mixer.activation = "silu"
         self.mixer.act = nn.SiLU()
         self.mixer.D_has_hdim = False
