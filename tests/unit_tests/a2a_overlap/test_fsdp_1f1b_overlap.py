@@ -134,13 +134,21 @@ class TestFSDP1F1BOverlap:
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
+    @pytest.mark.parametrize(
+        "sharding_strategy", ["optim_grads_params", "optim_grads"]
+    )
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize(
         "recompute_modules",
         [[], ["core_attn", "mla_up_proj", "layernorm", "moe_act", "mlp", "shared_experts"]],
     )
     def test_fsdp_1f1b_training_step(
-        self, dispatcher_type, fp8_flag, shared_expert_intermediate_size, recompute_modules
+        self,
+        dispatcher_type,
+        fp8_flag,
+        sharding_strategy,
+        shared_expert_intermediate_size,
+        recompute_modules,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -175,7 +183,11 @@ class TestFSDP1F1BOverlap:
             ref_model = _build_gpt_model(ref_config)
             init_params = reset_model(ref_model)
 
-            ref_fsdp = fully_shard_model(module=ref_model, fsdp_unit_modules=[TransformerLayer])
+            ref_fsdp = fully_shard_model(
+                module=ref_model,
+                fsdp_unit_modules=[TransformerLayer],
+                zero_dp_strategy=sharding_strategy,
+            )
             ref_opt = torch.optim.SGD(ref_fsdp.parameters(), lr=LR)
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
@@ -188,6 +200,7 @@ class TestFSDP1F1BOverlap:
                 module=test_model,
                 fsdp_unit_modules=[TransformerLayer],
                 enable_fine_grained_param_gather=True,
+                zero_dp_strategy=sharding_strategy,
             )
             test_opt = torch.optim.SGD(test_fsdp.parameters(), lr=LR)
             test_opt = fully_shard_optimizer(optimizer=test_opt)
