@@ -65,7 +65,7 @@ class MambaInferenceStateConfig:
             mamba_chunk_size = 128
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.mamba_chunk_size
+                    mamba_chunk_size = layer.mixer.chunk_size
                     break
             return cls(
                 layer_type_list=layer_type_list,
