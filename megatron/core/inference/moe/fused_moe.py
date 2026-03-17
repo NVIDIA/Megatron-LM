@@ -184,18 +184,18 @@ def mcore_fused_moe(
             )
 
     # --- FC1 -> activation -> FC2 ---
-    if use_mxfp8 and not use_fused_quant:
-        # Separate quantize for permuted hidden states
+    # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
+    # produces MXFP8Tensor directly; skip_permute path always needs separate quant).
+    needs_quant = use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor)
+    if needs_quant:
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
-    # At this point hidden_states is MXFP8Tensor (if mxfp8) or bf16 Tensor
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
-    activated = activation_func(fc1_output, permutation_map)
-    if use_mxfp8 and not use_fused_quant:
-        # Separate quantize for activated output
-        activated = MXFP8Tensor.from_bf16(activated, backend="triton")
-    fc2_output = mm_fn(activated, fc2_weight, offs)
-
+    activation_out = activation_func(fc1_output, permutation_map)
+    # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
+    if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
+        activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
+    fc2_output = mm_fn(activation_out, fc2_weight, offs)
     # --- Post-processing: unpermute or unpad ---
     if skip_permute:
         probs_1d = probs.squeeze(-1) if probs.dim() > 1 else probs
