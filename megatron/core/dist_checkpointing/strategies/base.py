@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, DefaultDict, Union
 
-from ..mapping import CheckpointingException, ShardedStateDict
+from ..mapping import ShardedStateDict
 from .async_utils import AsyncCallsQueue, AsyncRequest
 
 logger = logging.getLogger(__name__)
