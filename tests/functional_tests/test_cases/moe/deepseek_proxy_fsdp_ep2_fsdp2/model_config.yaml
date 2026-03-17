@@ -9,6 +9,7 @@ ENV_VARS:
 
 MODEL_ARGS:
 
+  --use-persistent-ckpt-worker: true
 # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1

@@ -91,6 +91,7 @@ MODEL_ARGS:
   --exit-interval: 51000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
   --async-save: true
+  --use-persistent-ckpt-worker: true
 METRICS:
   - "iteration-time"
   - "lm loss"

@@ -9,6 +9,7 @@ MODEL_ENV_VARS:
   MODEL_ARGS:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 1
+  --use-persistent-ckpt-worker: true
   MODEL_ARGS_10:
     # DP=1, TP=1, CP=1, PP=1
     GPUS_PER_NODE: 2
@@ -114,6 +115,7 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --context-parallel-size: 1
   --pipeline-model-parallel-size: 1
+  --use-persistent-ckpt-worker: true
 MODEL_ARGS_2:
   <<: *BASE_MODEL_ARGS
   #########################################################
