@@ -26,12 +26,19 @@ Index storage optimization:
 import io
 import logging
 import os
+import tarfile
 import warnings
+from contextlib import nullcontext
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+try:
+  import zstandard
+except ImportError:
+  zstandard = None
 
 from megatron.core import parallel_state
 from megatron.core.msc_utils import open_file
@@ -145,20 +152,16 @@ class LogitsSaverHooks:
         self._hook_handles: List[Any] = []
 
         # Zstd compression setup
-        self._zstd_compressor = None
-        if compress_zstd:
-            try:
-                import zstandard
-
-                self._zstd_compressor = zstandard.ZstdCompressor(level=3)
-            except ModuleNotFoundError:
-                warnings.warn(
-                    "zstandard package not found; disabling zstd compression for log-probs."
-                )
+        if zstandard is not None:
+            self._zstd_compressor = zstandard.ZstdCompressor(level=3)
+        else:
+            warnings.warn(
+                "zstandard package not found; disabling zstd compression for log-probs."
+            )
+            self._zstd_compressor = None
 
         # Create save directory if needed
-        if "://" not in self.save_dir:
-            os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)
 
     def get_forward_hook(self) -> Callable:
         """Returns the forward hook to accumulate logits.
@@ -408,6 +411,55 @@ class LogitsSaverHooks:
             f.write(data)
 
 
+#################################################
+# Loading utilities
+#################################################
+
+
+def _decompress_zstd(data: bytes) -> bytes:
+    """Decompress zstd-compressed bytes."""
+    if zstandard is None:
+        raise RuntimeError("zstandard package required to read compressed log-probs files")
+    return zstandard.ZstdDecompressor().decompress(data)
+
+
+def _read_logprobs_data(folder: str, base_filename: str) -> Optional[bytes]:
+    """Read a log-probs file from an iteration folder or its tar archive."""
+    tar_path = folder + ".tar"
+    folder_name = os.path.basename(folder)
+
+    if os.path.isdir(folder):
+        archive_ctx = nullcontext()
+
+        def resolve(name: str) -> Optional[bytes]:
+            path = os.path.join(folder, name)
+            if not os.path.exists(path):
+                return None
+            with open_file(path, 'rb') as f:
+                return f.read()
+
+    elif os.path.isfile(tar_path):
+        archive = tarfile.open(tar_path, "r")
+        archive_ctx = archive
+
+        def resolve(name: str) -> Optional[bytes]:
+            try:
+                member = archive.extractfile(f"{folder_name}/{name}")
+            except KeyError:
+                return None
+            return member.read() if member is not None else None
+
+    else:
+        return None
+
+    with archive_ctx:
+        for suffix in [".pt.zst", ".pt"]:
+            raw = resolve(base_filename + suffix)
+            if raw is None:
+                continue
+            return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
+
+
 def load_log_probs_by_rank(
     save_dir: str,
     iteration: int,
@@ -440,35 +492,13 @@ def load_log_probs_by_rank(
     folder, base_filename = _format_folder_and_filename(
         save_dir, iteration, tp_rank, cp_rank, dp_rank,
     )
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"Iteration folder not found: {folder}")
-
-    # Check for both compressed and uncompressed files
-    filepath = None
-    for suffix in [".pt.zst", ".pt"]:
-        candidate = os.path.join(folder, base_filename + suffix)
-        if os.path.exists(candidate):
-            filepath = candidate
-            break
-    if filepath is None:
+    data = _read_logprobs_data(folder, base_filename)
+    if data is None:
         raise FileNotFoundError(
             f"No log-probs file found for tp_rank={tp_rank}, cp_rank={cp_rank}, "
-            f"dp_rank={dp_rank} in folder: {folder}"
+            f"dp_rank={dp_rank} at iteration {iteration} "
+            f"(checked folder {folder} and tar {folder}.tar)"
         )
-
-    # Check for compression
-    if filepath.endswith('.zst'):
-        try:
-            import zstandard
-        except ModuleNotFoundError:
-            raise RuntimeError("zstandard package required to read compressed log-probs files")
-
-        with open_file(filepath, 'rb') as f:
-            decompressor = zstandard.ZstdDecompressor()
-            data = decompressor.decompress(f.read())
-    else:
-        with open_file(filepath, 'rb') as f:
-            data = f.read()
 
     # Load tensors
     tensors = torch.load(io.BytesIO(data), weights_only=True)

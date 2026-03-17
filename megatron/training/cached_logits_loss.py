@@ -50,14 +50,20 @@ Usage example
     #   loss, num_tokens, report = loss_func(loss_mask, output_tensor, model)
 """
 
-import glob
 import logging
+import os
+import re
 from typing import Iterator, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 import torch.utils.data
+
+try:
+  import zstandard
+except ImportError:
+  zstandard = None
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
@@ -78,9 +84,9 @@ class _TeacherDataset(torch.utils.data.Dataset):
     ``__getitem__(iteration)`` loads this rank's saved shard file for the
     requested iteration via :func:`load_log_probs_by_rank`.
 
-    ``__len__`` returns the number of ``logprobs_iter*`` sub-folders present
-    in *logprobs_dir*, which corresponds to the number of iterations whose
-    teacher log-probs have been written to disk.
+    ``__len__`` returns the iteration number one greater than the largest ``logprobs_iter*`` sub-folder detected
+    in *logprobs_dir*. This ensures correct indexing even if not all iterations are present, as it reflects
+    the true range of iteration numbers with available teacher log-prob data.
     """
 
     def __init__(
@@ -95,8 +101,14 @@ class _TeacherDataset(torch.utils.data.Dataset):
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
 
-        # Count saved-iteration folders
-        self._len = len(glob.glob(f"{self.logprobs_dir}/{FOLDER_NAMES_PREFIX}*"))
+        # Set length to largest iteration folder name detected
+        iter_numbers = []
+        for fname in os.listdir(self.logprobs_dir):
+            if match := re.match(rf"{FOLDER_NAMES_PREFIX}(\d+)", fname):
+                iter_numbers.append(int(match.group(1)))
+        if not iter_numbers:
+            raise ValueError(f"No iteration folders found in {self.logprobs_dir}")
+        self._len = max(iter_numbers) + 1
 
     def __len__(self) -> int:
         return self._len
@@ -239,6 +251,8 @@ class CachedLogitsKDLoss:
 
     def _init_dataloader(self, start_iteration: int) -> None:
         """Create the DataLoader starting from *start_iteration*."""
+        if len(self._dataset) <= start_iteration:
+            raise ValueError(f"Start iteration {start_iteration} greater than dataset length {len(self._dataset)}")
         # Sampler emits the actual iteration numbers to index dataset correctly
         sampler = range(start_iteration, len(self._dataset))
         loader = torch.utils.data.DataLoader(
@@ -263,6 +277,12 @@ class CachedLogitsKDLoss:
                 f"No more teacher log-prob data available in "
                 f"{self.logprobs_dir}.  The DataLoader has been exhausted."
             )
+        except Exception as e:
+            if zstandard is not None and isinstance(e, zstandard.ZstdError):
+                # We skip the loss on these rare missing shards later.
+                values_list, indices_list = None, None
+            else:
+                raise
         self._current_values = values_list
         self._current_indices = indices_list
         self._microbatch_counter = 0
@@ -307,6 +327,18 @@ class CachedLogitsKDLoss:
         if microbatch_idx is None:
             microbatch_idx = self._microbatch_counter
             self._microbatch_counter += 1
+
+        # If any TP rank failed to load teacher data (e.g. ZstdError), skip KD for the whole TP group.
+        local_missing = self._current_values is None or self._current_indices is None
+        missing_any_tp = torch.tensor(
+            [local_missing], device=student_logits.device, dtype=torch.bool
+        )
+        if self.tp_size > 1:
+            dist.all_reduce(missing_any_tp, op=dist.ReduceOp.BOR, group=self.tp_group)
+        if missing_any_tp.item():
+            logger.warning(f"Skipping KD for TP rank {self.tp_rank} due to missing teacher data for iteration {iteration}")
+            # Sum over vocab so shape matches topk_kl_div (B, S); *0 keeps a grad path from logits.
+            return (student_logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
 
         if microbatch_idx >= len(self._current_values):
             raise IndexError(
