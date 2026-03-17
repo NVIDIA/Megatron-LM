@@ -21,9 +21,9 @@ _async_calls_queue = None
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     global _async_calls_queue
     args = get_args()
-    async_strategy, imports = get_async_strategy(args.async_strategy)
-    AsyncCallsQueue = imports["AsyncCallsQueue"]
-    get_write_results_queue = imports["get_write_results_queue"]
+    async_strategy, async_modules = get_async_strategy(args.async_strategy)
+    AsyncCallsQueue = async_modules["AsyncCallsQueue"]
+    get_write_results_queue = async_modules["get_write_results_queue"]
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
     time_start = time.time()
