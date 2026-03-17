@@ -68,7 +68,7 @@ def _filter_configs_by_block_sizes(configs):
     env_filters = {}
     for env_key, env_val in os.environ.items():
         if env_key.startswith(prefix + "BLOCK") and env_val:
-            kwarg_name = env_key[len(prefix):]
+            kwarg_name = env_key[len(prefix) :]
             env_filters[kwarg_name] = int(env_val)
     if not env_filters:
         return None
