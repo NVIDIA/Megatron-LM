@@ -3,7 +3,6 @@
 """ Strategies base interfaces. """
 
 import logging
-
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
