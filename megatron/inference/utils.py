@@ -69,8 +69,17 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        quantize_model_to_mxfp8(unwrap_model(model))
-
+        backend = args.inference_grouped_gemm_backend
+        if backend == "auto":
+            quant_backend = "flashinfer"
+        elif backend == "torch":
+            quant_backend = "triton"
+        elif backend == "te":
+            raise ValueError(
+                "MXFP8 quantization is not supported with "
+                "inference_grouped_gemm_backend='te'."
+            )
+        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
 
@@ -353,6 +362,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
+        use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
     )
 
 

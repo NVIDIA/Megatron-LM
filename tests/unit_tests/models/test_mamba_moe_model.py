@@ -282,8 +282,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
-    "inference_disable_torch_grouped_mm": False,
     "inference_disable_triton_nvls_kernels": False,
+    "inference_grouped_gemm_backend": "auto",
+    "inference_moe_disable_fused_quant_kernels": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

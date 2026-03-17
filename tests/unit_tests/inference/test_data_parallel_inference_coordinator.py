@@ -16,6 +16,7 @@ import torch
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
@@ -118,6 +119,12 @@ class DummyEngine(DynamicInferenceEngine):
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
+
+        # ZMQ-based world barrier (async-friendly, no NCCL).
+        self.zmq_context = zmq.Context()
+        total_world_size = torch.distributed.get_world_size()
+        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+        self.use_synchronous_zmq_collectives = False
 
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
@@ -262,6 +269,20 @@ def initialize_model_parallel(request, monkeypatch):
     Utils.destroy_model_parallel()
 
 
+@pytest.fixture
+def test_case_communicator():
+    """A separate ZMQ communicator for test sync barriers.
+
+    Use this instead of engine._world_barrier() when the engine loop may be
+    calling _world_barrier() concurrently (e.g. during state transitions).
+    """
+    ctx = zmq.Context()
+    comm = AsyncZMQCommunicator(ctx, process_group=None)
+    yield comm
+    comm.close()
+    ctx.term()
+
+
 @pytest.fixture(scope="class")
 def coordinator():
     """Launch a single coordinator process for the entire test class.
@@ -338,7 +359,9 @@ class TestCoordinator:
         ],
         indirect=["initialize_model_parallel"],
     )
-    async def test_parallel_configs(self, initialize_model_parallel, coordinator):
+    async def test_parallel_configs(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
         """Test coordinator with various TP, PP, and EP configurations."""
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
@@ -351,9 +374,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
-        )
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
         client = None
         try:
@@ -371,10 +392,7 @@ class TestCoordinator:
                 for result in results:
                     assert result["status"] == Status.COMPLETED.name
 
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client)
 
@@ -382,7 +400,9 @@ class TestCoordinator:
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     @pytest.mark.parametrize("deserialize", [True, False], ids=["deserialize", "raw"])
-    async def test_deserialize_flag(self, initialize_model_parallel, coordinator, deserialize):
+    async def test_deserialize_flag(
+        self, initialize_model_parallel, coordinator, test_case_communicator, deserialize
+    ):
         """Test that the correct response type is returned based on the deserialize flag."""
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
@@ -394,9 +414,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
-        )
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
         client = None
         try:
@@ -415,10 +433,7 @@ class TestCoordinator:
                     else:
                         assert isinstance(result, dict)
 
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client)
 
@@ -430,7 +445,9 @@ class TestCoordinator:
         [pytest.param((2, 2, 2), id="tp2-pp2-ep2")],
         indirect=["initialize_model_parallel"],
     )
-    async def test_control_logic_lifecycle(self, initialize_model_parallel, coordinator):
+    async def test_control_logic_lifecycle(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
         """Comprehensive lifecycle test for the engine state machine."""
         # States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
         PAUSED_FAMILY = {
@@ -473,10 +490,8 @@ class TestCoordinator:
             )
 
             # Synchronize all ranks so every engine has registered.
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            # Use test_case_communicator to avoid colliding with engine-internal barriers.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
             if rank == 0:
                 client = InferenceClient(dp_addr)
@@ -593,10 +608,7 @@ class TestCoordinator:
                 ]
 
             # Synchronize all ranks before STOP.
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
             if rank == 0:
                 # Verify doomed futures are still pending.
@@ -618,7 +630,7 @@ class TestCoordinator:
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
-    async def test_throughput(self, initialize_model_parallel, coordinator):
+    async def test_throughput(self, initialize_model_parallel, coordinator, test_case_communicator):
         """Throughput benchmark: measures ZMQ packet rate."""
         _, dp, _, _, _ = initialize_model_parallel
         num_requests = 10**3
@@ -634,7 +646,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
         client = None
         try:
@@ -655,6 +667,6 @@ class TestCoordinator:
                     f"ZMQ throughput: {total / elapsed_ms:.2f} requests/ms "
                     f"({total} reqs in {elapsed_ms:.0f} ms)"
                 )
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client, timeout=60.0)
