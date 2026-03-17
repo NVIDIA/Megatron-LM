@@ -1567,37 +1567,53 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
         )
 
-    # Map deprecated --tokenizer-type to new --tokenizer-library + --tokenizer-mode.
-    _TOKENIZER_TYPE_TO_LIBRARY_MODE = {
-        'BertWordPieceLowerCase': ('megatron', 'text'),
-        'BertWordPieceCase': ('megatron', 'text'),
-        'GPT2BPETokenizer': ('megatron', 'text'),
-        'SentencePieceTokenizer': ('sentencepiece', 'text'),
-        'GPTSentencePieceTokenizer': ('sentencepiece', 'text'),
-        'Llama2Tokenizer': ('sentencepiece', 'text'),
-        'HuggingFaceTokenizer': ('huggingface', 'text'),
-        'TikTokenizer': ('tiktoken', 'text'),
-        'MultimodalTokenizer': ('huggingface', 'multimodal'),
-        'SFTTokenizer': ('huggingface', 'sft'),
-        'NullTokenizer': ('null', 'text'),
-        'NullMultimodalTokenizer': ('null', 'multimodal'),
+    # Map deprecated --tokenizer-type to new --tokenizer-library.
+    _TOKENIZER_TYPE_TO_LIBRARY = {
+        'BertWordPieceLowerCase': 'megatron',
+        'BertWordPieceCase': 'megatron',
+        'GPT2BPETokenizer': 'megatron',
+        'SentencePieceTokenizer': 'sentencepiece',
+        'GPTSentencePieceTokenizer': 'sentencepiece',
+        'Llama2Tokenizer': 'sentencepiece',
+        'HuggingFaceTokenizer': 'huggingface',
+        'TikTokenizer': 'tiktoken',
+        'MultimodalTokenizer': 'multimodal',
+        'SFTTokenizer': 'huggingface',
+        'NullTokenizer': 'null',
+        'NullMultimodalTokenizer': 'null-multimodal',
     }
     if args.tokenizer_type is not None and args.tokenizer_library is None:
         warn_rank_0(
             "--tokenizer-type is deprecated and will be removed in a future release. "
-            "Use --tokenizer-library and --tokenizer-mode instead."
+            "Use --tokenizer-library instead."
         )
-        lib, mode = _TOKENIZER_TYPE_TO_LIBRARY_MODE[args.tokenizer_type]
-        args.tokenizer_library = lib
-        args.tokenizer_mode = mode
+        args.tokenizer_library = _TOKENIZER_TYPE_TO_LIBRARY[args.tokenizer_type]
 
     # Map deprecated --sft-tokenizer-prompt-format to --tokenizer-prompt-format.
+    # Only applies when using the deprecated --tokenizer-type SFTTokenizer.
     if (
-        getattr(args, 'tokenizer_mode', 'text') == 'sft'
+        getattr(args, 'tokenizer_type', None) == 'SFTTokenizer'
         and getattr(args, 'sft_tokenizer_prompt_format', None)
         and not args.tokenizer_prompt_format
     ):
         args.tokenizer_prompt_format = args.sft_tokenizer_prompt_format
+
+    # Map deprecated --tokenizer-mode to new flags.
+    _mode = getattr(args, 'tokenizer_mode', 'text')
+    if _mode != 'text':
+        warn_rank_0(
+            "--tokenizer-mode is deprecated and will be removed in a future release. "
+            "SFT: use --tokenizer-prompt-format instead. "
+            "Multimodal: use --tokenizer-library multimodal instead."
+        )
+        if _mode == 'multimodal' and args.tokenizer_library not in ('multimodal', 'null-multimodal'):
+            args.tokenizer_library = (
+                'null-multimodal' if args.tokenizer_library == 'null' else 'multimodal'
+            )
+        if _mode == 'sft' and not args.tokenizer_prompt_format:
+            args.tokenizer_prompt_format = getattr(
+                args, 'sft_tokenizer_prompt_format', 'nemotron-h-aligned'
+            )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2693,13 +2709,17 @@ def _add_tokenizer_args(parser):
     # --- New preferred flags ---
     group.add_argument('--tokenizer-library', type=str, default=None,
                        choices=['huggingface', 'sentencepiece', 'tiktoken',
-                                'megatron', 'byte-level', 'null'],
+                                'megatron', 'byte-level', 'null',
+                                'multimodal', 'null-multimodal'],
                        help='Tokenizer backend library. Preferred over --tokenizer-type.')
+    group.add_argument('--tokenizer-prompt-format', type=str, default=None,
+                       help='Prompt format for conversation tokenization (SFT / multimodal).')
+
+    # --- Deprecated mode flag (mapped to --tokenizer-library + --tokenizer-prompt-format) ---
     group.add_argument('--tokenizer-mode', type=str, default='text',
                        choices=['text', 'sft', 'multimodal'],
-                       help='Tokenizer operating mode (text, sft, or multimodal).')
-    group.add_argument('--tokenizer-prompt-format', type=str, default=None,
-                       help='Prompt format for SFT or multimodal tokenization.')
+                       help='Deprecated. Use --tokenizer-library and '
+                            '--tokenizer-prompt-format instead.')
 
     # --- Vocabulary ---
     group.add_argument('--vocab-size', type=int, default=None,
@@ -2716,7 +2736,7 @@ def _add_tokenizer_args(parser):
                        help='Number of additional vocabulary tokens. '
                             'They are used for span masking in the T5 model')
 
-    # --- Legacy --tokenizer-type (deprecated, use --tokenizer-library + --tokenizer-mode) ---
+    # --- Legacy --tokenizer-type (deprecated, use --tokenizer-library) ---
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
@@ -2731,7 +2751,7 @@ def _add_tokenizer_args(parser):
                                 'NullTokenizer',
                                 'NullMultimodalTokenizer',
                                 'SFTTokenizer'],
-                       help='Deprecated. Use --tokenizer-library and --tokenizer-mode instead.')
+                       help='Deprecated. Use --tokenizer-library instead.')
 
     # --- Common ---
     group.add_argument('--tokenizer-model', type=str, default=None,

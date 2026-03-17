@@ -7,15 +7,18 @@ from megatron.core.tokenizers import MegatronTokenizer
 
 logger = logging.getLogger(__name__)
 
+# Libraries that map to MegatronTokenizerVision (everything else is text).
+_MULTIMODAL_LIBRARIES = {'multimodal', 'null-multimodal'}
+
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer from command-line arguments.
 
-    Uses --tokenizer-library and --tokenizer-mode (new API) or falls back to
-    --tokenizer-type (deprecated, mapped in argument validation).
+    Uses --tokenizer-library (and optionally --tokenizer-prompt-format) or
+    falls back to --tokenizer-type (deprecated, mapped in argument validation).
     """
     build_kwargs = _build_library_kwargs(args)
-    build_kwargs.update(_build_mode_kwargs(args))
+    build_kwargs.update(_build_prompt_kwargs(args))
     build_kwargs.update(kwargs)  # Allow caller overrides
 
     if getattr(args, 'tokenizer_metadata', None):
@@ -36,17 +39,10 @@ def build_tokenizer(args, **kwargs):
 
 
 def _resolve_library(args):
-    """Map tokenizer-library + tokenizer-mode to the internal library string."""
-    mode = getattr(args, 'tokenizer_mode', 'text')
+    """Map CLI --tokenizer-library value to the internal library string."""
     lib = getattr(args, 'tokenizer_library', None)
 
-    if mode == 'sft':
-        # SFT is now a capability, not a library. Use the actual library.
-        # Default to 'huggingface' for backward compat.
-        return lib or 'huggingface'
-    elif mode == 'multimodal':
-        return 'multimodal' if lib != 'null' else 'null-multimodal'
-    elif lib == 'null':
+    if lib == 'null':
         return 'null-text'
     return lib
 
@@ -95,28 +91,34 @@ def _build_library_kwargs(args):
             build_kwargs['vocab_size'] = args.vocab_size
         build_kwargs['num_special_tokens'] = getattr(args, 'tiktoken_num_special_tokens', 1000)
         build_kwargs['special_tokens'] = args.tokenizer_special_tokens
-    elif lib == 'null':
+    elif lib in ('null', 'null-multimodal'):
         if getattr(args, 'vocab_size', None):
             build_kwargs['vocab_size'] = args.vocab_size
 
     return build_kwargs
 
 
-def _build_mode_kwargs(args):
-    """Build kwargs specific to the tokenizer mode."""
-    build_kwargs = {}
-    mode = getattr(args, 'tokenizer_mode', 'text')
+def _build_prompt_kwargs(args):
+    """Build prompt_format and multimodal kwargs based on the tokenizer library.
 
-    if mode == 'sft':
-        prompt_format = getattr(args, 'tokenizer_prompt_format', None)
-        if prompt_format is None:
-            prompt_format = getattr(args, 'sft_tokenizer_prompt_format', 'nemotron-h-aligned')
+    Text libraries always receive a prompt_format (defaulting to "default"),
+    which enables tokenize_conversation() on every text tokenizer.
+    Multimodal libraries receive prompt_format plus vision-specific kwargs.
+    """
+    build_kwargs = {}
+    lib = getattr(args, 'tokenizer_library', None)
+
+    prompt_format = getattr(args, 'tokenizer_prompt_format', None)
+
+    if lib in _MULTIMODAL_LIBRARIES:
         build_kwargs['prompt_format'] = prompt_format
-    elif mode == 'multimodal':
-        build_kwargs['prompt_format'] = getattr(args, 'tokenizer_prompt_format', None)
         build_kwargs['special_tokens'] = getattr(args, 'special_tokens', [])
         build_kwargs['image_tag_type'] = getattr(args, 'image_tag_type', '')
         build_kwargs['force_system_message'] = getattr(args, 'force_system_message', False)
+    else:
+        # All text tokenizers get prompt_format; "default" enables
+        # tokenize_conversation() with skip_masking=True (no-op for pretraining).
+        build_kwargs['prompt_format'] = prompt_format or 'default'
 
     return build_kwargs
 

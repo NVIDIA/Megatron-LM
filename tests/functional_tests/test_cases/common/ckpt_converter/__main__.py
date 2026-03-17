@@ -624,9 +624,7 @@ class LLaVAPipeline(Pipeline):
             "--micro-batch-size",
             "1",  # single sample generated.
             "--tokenizer-library",
-            "null",
-            "--tokenizer-mode",
-            "multimodal",
+            "null-multimodal",
             "--vocab-size",
             "127",  # ... NullTokenizer adds +1 EOD token.
             "--make-vocab-size-divisible-by",
