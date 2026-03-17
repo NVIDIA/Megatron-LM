@@ -61,11 +61,6 @@ RL_LOGGABLE_TIMER_NAMES = [
     "rl/offload-kv-cache-after-inference",
     "rl/restore-kv-cache-before-inference",
     # Fine-grained offload/restore breakdown
-    "offload/cuda-synchronize",
-    "offload/free-buffers",
-    "offload/empty-cache",
-    "restore/allocate-buffers",
-    "restore/cuda-synchronize",
     "rl/restore/grad-buffers",
     "rl/restore/optimizer-state",
     "rl/restore/wait-for-transfers",
@@ -169,7 +164,9 @@ class IterationProfile:
     global_batch_size: Optional[int] = None
     tokens_per_sec: Optional[float] = None
     tokens_per_sec_per_gpu: Optional[float] = None
-    # Actual tokens metrics (for sequence packing - counts real tokens, not padding)
+    # Sequence packing metrics
+    compute_tokens_per_sec: Optional[float] = None
+    compute_tokens_per_sec_per_gpu: Optional[float] = None
     actual_tokens_per_sec: Optional[float] = None
     actual_tokens_per_sec_per_gpu: Optional[float] = None
     packing_efficiency: Optional[float] = None
@@ -189,6 +186,8 @@ class IterationProfile:
             "global_batch_size": self.global_batch_size,
             "tokens_per_sec": self.tokens_per_sec,
             "tokens_per_sec_per_gpu": self.tokens_per_sec_per_gpu,
+            "compute_tokens_per_sec": self.compute_tokens_per_sec,
+            "compute_tokens_per_sec_per_gpu": self.compute_tokens_per_sec_per_gpu,
             "actual_tokens_per_sec": self.actual_tokens_per_sec,
             "actual_tokens_per_sec_per_gpu": self.actual_tokens_per_sec_per_gpu,
             "packing_efficiency": self.packing_efficiency,
@@ -346,6 +345,8 @@ class RLProfiler:
         # observability code in training_log, runs before this call).
         tokens_per_sec = None
         tokens_per_sec_per_gpu = None
+        compute_tokens_per_sec = None
+        compute_tokens_per_sec_per_gpu = None
         actual_tokens_per_sec = None
         actual_tokens_per_sec_per_gpu = None
         packing_efficiency = None
@@ -353,6 +354,8 @@ class RLProfiler:
             rs = get_rl_runtime_state()
             tokens_per_sec = getattr(rs, 'tokens_per_sec', None)
             tokens_per_sec_per_gpu = getattr(rs, 'tokens_per_sec_per_gpu', None)
+            compute_tokens_per_sec = getattr(rs, 'compute_tokens_per_sec', None)
+            compute_tokens_per_sec_per_gpu = getattr(rs, 'compute_tokens_per_sec_per_gpu', None)
             actual_tokens_per_sec = getattr(rs, 'actual_tokens_per_sec', None)
             actual_tokens_per_sec_per_gpu = getattr(rs, 'actual_tokens_per_sec_per_gpu', None)
             packing_efficiency = getattr(rs, 'packing_efficiency', None)
