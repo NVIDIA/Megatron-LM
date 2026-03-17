@@ -190,9 +190,7 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            # do it in a side stream
-            with torch.cuda.stream(torch.cuda.Stream()):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
