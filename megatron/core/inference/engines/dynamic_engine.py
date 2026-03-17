@@ -632,9 +632,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            self.world_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=torch.distributed.group.WORLD
-            )
+            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
