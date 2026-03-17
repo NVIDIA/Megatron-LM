@@ -41,7 +41,6 @@ class GroupedRolloutRequest(Request):
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    generation_batch_size: int = 1
     enforce_order: bool = False
 
 
@@ -194,12 +193,12 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # generation_batch_size controls how many groups each worker generates and yields together.
-        # When it's set to 1, the semaphore is a no-op.
-        groups_per_worker = request.generation_batch_size
+        # num_groups controls how many groups each worker generates and yields together.
+        # When it's 1, the semaphore is a no-op.
+        groups_per_worker = request.num_groups
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with generation_batch_size > 1."
+                "Cannot use filter_groups_with_same_reward with num_groups > 1."
         assert self.parallel_generation_tasks >= groups_per_worker, \
             f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
         num_workers = self.parallel_generation_tasks // groups_per_worker
@@ -207,7 +206,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         if unused:
             logging.warning(
                 f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                f"divisible by generation_batch_size ({groups_per_worker}); "
+                f"divisible by num_groups ({groups_per_worker}); "
                 f"{unused} generation task(s) will be unused."
             )
         submission_gate = asyncio.Semaphore(num_workers)
@@ -270,7 +269,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                             yield g
                         submission_gate.release()
                 else:
-                    # Yield in completion order, no HOL blocking.
+                    # Yield groups as soon as they're completed.
                     yield group
                     submission_gate.release()
         finally:

@@ -50,7 +50,7 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "num_slow_calls, streaming, generation_batch_size, expected_count, expected_batch_ids",
+        "num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids",
         [
             pytest.param(0, False, 1, 8, None, id="non_batched"),
             pytest.param(4, False, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
@@ -58,16 +58,15 @@ class TestGroupedRollouts:
         ],
     )
     async def test_get_grouped_rollouts(
-        self, num_slow_calls, streaming, generation_batch_size, expected_count, expected_batch_ids
+        self, num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids
     ):
         gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
         request = GroupedRolloutRequest(
-            num_groups=4,
+            num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
             streaming=streaming,
-            generation_batch_size=generation_batch_size,
-            enforce_order=generation_batch_size > 1,
+            enforce_order=num_groups > 1,
         )
         groups = []
         async for group in gen.get_grouped_rollouts(request):
@@ -104,7 +103,6 @@ class TestGroupedRollouts:
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
             streaming=False,
-            generation_batch_size=1,
             enforce_order=False,
         )
         groups = []
@@ -116,6 +114,6 @@ class TestGroupedRollouts:
         env_ids = [g[0].env_id for g in groups]
         assert sorted(env_ids) == ["a", "a", "a", "b"]
         for sub_req in captured:
-            assert sub_req.generation_batch_size == sub_req.num_groups
+            assert sub_req.num_groups in (1, 3)  # distributed proportionally by weight
             assert sub_req.enforce_order == request.enforce_order
             assert sub_req.streaming == request.streaming

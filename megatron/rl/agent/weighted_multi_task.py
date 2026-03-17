@@ -202,7 +202,6 @@ class WeightedMultiTask(
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
-                    generation_batch_size=num_groups,
                     enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
