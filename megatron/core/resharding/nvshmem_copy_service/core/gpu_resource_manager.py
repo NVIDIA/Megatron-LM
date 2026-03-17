@@ -10,9 +10,14 @@ and event lifecycle.
 import logging
 from typing import Dict, Optional
 
+from ..compat import ensure_nvshmem_compat, get_cuda_core_device_class
+
+ensure_nvshmem_compat()
+
 try:
     import nvshmem.core
-    from cuda.core.experimental import Device
+
+    Device = get_cuda_core_device_class()
 
     HAVE_NVSHMEM = True
 except ImportError:
@@ -40,19 +45,23 @@ class GPUResourceManager:
         self.copy_stream = None
 
         # PyTorch stream wrappers
-        self.torch_pack_stream = None
-        self.torch_unpack_stream = None
-        self.torch_send_stream = None
-        self.torch_copy_stream = None
+        self.torch_pack_stream_wrapper = None
+        self.torch_unpack_stream_wrapper = None
+        self.torch_send_stream_wrapper = None
+        self.torch_copy_stream_wrapper = None
 
         # Stream name to PyTorch stream mapping
         self._torch_streams: Dict[str, torch.cuda.ExternalStream] = {}
 
-    def init(self) -> None:
+    def init(self, group=None) -> None:
         """
         Initialize NVSHMEM, CUDA device, and streams.
 
         Expects torch.distributed to be already initialized.
+
+        Args:
+            group: Optional ProcessGroup for distributed operations.
+                   If None, uses the default process group.
         """
         if self.initialized:
             return
@@ -75,9 +84,12 @@ class GPUResourceManager:
         self.device = Device(local_rank)
         self.device.set_current()
 
-        # Extract rank, nranks from the default process group
-        num_ranks = dist.get_world_size()
-        rank_id = dist.get_rank()
+        # Extract rank, nranks from the process group.
+        # Use group.rank()/size() instead of dist.get_rank(group=) because
+        # dist.get_rank(group=) maps via the default PG rank, which is wrong
+        # for cross-cluster ProcessGroups where workers share default PG rank 0.
+        num_ranks = group.size() if group is not None else dist.get_world_size()
+        rank_id = group.rank() if group is not None else dist.get_rank()
 
         # Create/Broadcast UniqueID using broadcast_object_list
         uniqueid = nvshmem.core.get_unique_id(empty=True)
@@ -87,11 +99,11 @@ class GPUResourceManager:
         else:
             broadcast_objects = [None]
 
-        # Broadcast ID to all ranks using the default group
-        dist.broadcast_object_list(broadcast_objects, src=0)
+        # Broadcast ID to all ranks
+        dist.broadcast_object_list(broadcast_objects, src=0, group=group)
 
         # Barrier to ensure everyone has the ID before NVSHMEM init
-        dist.barrier()
+        dist.barrier(group=group)
 
         # Initialize NVSHMEM with the broadcasted UID
         nvshmem.core.init(
@@ -119,17 +131,17 @@ class GPUResourceManager:
         _, send_stream_ptr = self.send_stream.__cuda_stream__()
         _, copy_stream_ptr = self.copy_stream.__cuda_stream__()
 
-        self.torch_pack_stream = torch.cuda.ExternalStream(pack_stream_ptr)
-        self.torch_unpack_stream = torch.cuda.ExternalStream(unpack_stream_ptr)
-        self.torch_send_stream = torch.cuda.ExternalStream(send_stream_ptr)
-        self.torch_copy_stream = torch.cuda.ExternalStream(copy_stream_ptr)
+        self.torch_pack_stream_wrapper = torch.cuda.ExternalStream(pack_stream_ptr)
+        self.torch_unpack_stream_wrapper = torch.cuda.ExternalStream(unpack_stream_ptr)
+        self.torch_send_stream_wrapper = torch.cuda.ExternalStream(send_stream_ptr)
+        self.torch_copy_stream_wrapper = torch.cuda.ExternalStream(copy_stream_ptr)
 
         # Build stream mapping
         self._torch_streams = {
-            "pack": self.torch_pack_stream,
-            "unpack": self.torch_unpack_stream,
-            "send": self.torch_send_stream,
-            "copy": self.torch_copy_stream,
+            "pack": self.torch_pack_stream_wrapper,
+            "unpack": self.torch_unpack_stream_wrapper,
+            "send": self.torch_send_stream_wrapper,
+            "copy": self.torch_copy_stream_wrapper,
         }
 
         logger.info("Stream mapping built")
@@ -171,18 +183,19 @@ class GPUResourceManager:
 
     def create_events(self, num_events: int = 2):
         """
-        Create double-buffered CUDA events for pack and unpack operations.
+        Create double-buffered CUDA events for pack, unpack, and barrier operations.
 
         Args:
             num_events: Number of events to create for each type
                 (default: 2 for double buffering)
 
         Returns:
-            tuple: (pack_events, unpack_events) lists of torch.cuda.Event
+            tuple: (pack_events, unpack_events, barrier_events) lists of torch.cuda.Event
         """
         pack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
         unpack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
-        return pack_events, unpack_events
+        barrier_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
+        return pack_events, unpack_events, barrier_events
 
     def finalize(self) -> None:
         """Cleanup resources (streams are automatically managed by CUDA)."""

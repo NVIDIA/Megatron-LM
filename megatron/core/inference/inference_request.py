@@ -5,6 +5,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
+from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -45,6 +46,21 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def unwrap_serialized_tensors(serialized_request: dict) -> dict:
+    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+
+    Args:
+        serialized_request (dict): A dict produced by `serialize()`.
+
+    Returns:
+        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+    """
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in serialized_request.items()
+    }
+
+
 # class syntax
 class Status(Enum):
     """Enum for status"""
@@ -54,6 +70,61 @@ class Status(Enum):
     ACTIVE_BUT_NOT_GENERATING_TOKENS = 3
     COMPLETED = 4
     FAILED = 5
+
+
+# =========================================================================
+# Hash computation for prefix caching
+# =========================================================================
+
+# Constants for hash computation
+# Using 2^61 - 1 (Mersenne prime) for ~10^18 hash space, reducing collision probability
+# from ~10^-9 to ~10^-18 compared to the previous prime (1000000007).
+HASH_PRIME = 2305843009213693951
+HASH_BASE = 31
+
+_hash_powers: Optional[torch.Tensor] = None
+
+
+def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+    """Compute hashes for all complete blocks in a prompt in one batched operation.
+
+    Reshapes prompt tokens into [num_blocks, block_size], computes all per-block
+    token hashes via a single GPU matmul, transfers results with one .tolist() call,
+    and chains parent hashes on CPU.
+
+    Args:
+        prompt_tokens: All prompt token IDs, shape [seq_len].
+        block_size: Number of tokens per block.
+
+    Returns:
+        List of positive integer hash values (1 to HASH_PRIME), one per complete block.
+    """
+    num_complete_blocks = len(prompt_tokens) // block_size
+    if num_complete_blocks == 0:
+        return []
+
+    global _hash_powers
+    if _hash_powers is None or _hash_powers.shape[0] != block_size:
+        positions = torch.arange(block_size, device=prompt_tokens.device, dtype=torch.int64)
+        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+
+    # Reshape to [num_blocks, block_size] (zero-copy view) and compute all token hashes
+    blocks = prompt_tokens[: num_complete_blocks * block_size].view(num_complete_blocks, block_size)
+    token_hashes = (blocks.to(torch.int64) * _hash_powers).sum(dim=1) % HASH_PRIME
+
+    # Single GPU→CPU transfer
+    token_hashes_list = token_hashes.tolist()
+
+    # Chain parent hashes on CPU (C-level accumulate, no Python loop)
+    hashes = list(
+        accumulate(
+            token_hashes_list,
+            lambda parent, th: (parent * HASH_BASE + th) % HASH_PRIME + 1,
+            initial=0,
+        )
+    )[1:]
+
+    return hashes
 
 
 @dataclass(kw_only=True)
@@ -287,8 +358,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
-    policy_staleness: Optional[torch.Tensor] = None
-    kv_cache_staleness: Optional[torch.Tensor] = None
+    policy_epoch: Optional[list[tuple[int, int]]] = None
+    kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
@@ -296,10 +367,37 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
+    # Prefix caching fields
+    block_size_tokens: Optional[int] = None  # Block size for hash computation
+    enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+
+    # Computed field - not passed by caller
+    precomputed_block_hashes: List[int] = field(default_factory=list)
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
+
+        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+            and not self.precomputed_block_hashes
+        ):
+            self._compute_block_hashes()
+
+    def _compute_block_hashes(self) -> None:
+        """Compute hashes for all complete blocks in the prompt.
+
+        After this call:
+        - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
+        - precomputed_block_hashes is [hash1, ...] for N complete blocks
+        """
+        self.precomputed_block_hashes = compute_block_hashes_batched(
+            self.prompt_tokens, self.block_size_tokens
+        )
 
     @property
     def remaining_prompt_length(self):
@@ -410,13 +508,33 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add 'add_context' event - called when request is added to context for prefill."""
         return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
 
-    def add_event_generated_token(self, token: int):
+    def add_event_generated_token(
+        self,
+        token: int,
+        blocks_total: Optional[int] = None,
+        blocks_hashed_total: Optional[int] = None,
+        blocks_hashed_active: Optional[int] = None,
+        blocks_ref_count: Optional[int] = None,
+    ):
         """Add 'generated_token' event - records each generated token.
 
         Args:
             token (int): The token ID that was generated.
+            blocks_total (int): Total block capacity from allocator.
+            blocks_hashed_total (int): All allocated (hashed) blocks.
+            blocks_hashed_active (int): Blocks with ref_count > 0.
+            blocks_ref_count (int): Sum of block ref counts from allocator.
         """
-        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, {"token_id": token})
+        payload = {"token_id": token}
+        if blocks_total is not None:
+            payload["blocks_total"] = blocks_total
+        if blocks_hashed_total is not None:
+            payload["blocks_hashed_total"] = blocks_hashed_total
+        if blocks_hashed_active is not None:
+            payload["blocks_hashed_active"] = blocks_hashed_active
+        if blocks_ref_count is not None:
+            payload["blocks_ref_count"] = blocks_ref_count
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
 
     def add_event_pause(self):
         """Add 'pause' event."""
@@ -493,53 +611,6 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    @staticmethod
-    def _update_staleness_tensor(
-        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True
-    ) -> torch.Tensor:
-        """Update a per-token staleness tensor, extending with zeros if needed.
-
-        Args:
-            tensor: Existing staleness tensor, or None to create a new one.
-            total_tokens: Expected length of the tensor after update.
-            increment: If True, increment all values by 1 (including new positions).
-        """
-        if tensor is None:
-            tensor = torch.zeros(total_tokens, dtype=torch.int32, device='cpu')
-        elif len(tensor) < total_tokens:
-            tensor = torch.cat(
-                (
-                    tensor,
-                    torch.zeros(
-                        total_tokens - len(tensor), dtype=tensor.dtype, device=tensor.device
-                    ),
-                ),
-                dim=0,
-            )
-        if increment:
-            tensor = tensor + 1
-        return tensor
-
-    def increment_staleness(self, policy_only: bool = False):
-        """Increment per-token staleness counters in-place.
-
-        Each call indicates that a training step has occurred since these tokens
-        were generated. Tokens not yet tracked are initialized to 1.
-
-        Args:
-            policy_only: If True, only increment policy_staleness. Use this for
-                evicted requests that have no KV cache to age.
-        """
-        request = self[-1]
-        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        request.policy_staleness = self._update_staleness_tensor(
-            request.policy_staleness, total_tokens, increment=True
-        )
-        if not policy_only:
-            request.kv_cache_staleness = self._update_staleness_tensor(
-                request.kv_cache_staleness, total_tokens, increment=True
-            )
-
     def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
         """Maintain reference to previous request, and then append a new request
         that concatenates the previous prompt and generations.
@@ -550,23 +621,12 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        total_tokens = len(old_request.prompt_tokens) + len(old_request.generated_tokens)
+        # Carry forward policy_epoch as-is.
+        policy_epoch = old_request.policy_epoch
 
-        # Carry forward policy_staleness without incrementing.
-        policy_staleness = (
-            self._update_staleness_tensor(
-                old_request.policy_staleness, total_tokens, increment=False
-            )
-            if old_request.policy_staleness is not None
-            else None
-        )
-
-        # Reset kv_cache_staleness to 0.
-        kv_cache_staleness = (
-            self._update_staleness_tensor(None, total_tokens, increment=False)
-            if old_request.kv_cache_staleness is not None
-            else None
-        )
+        # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
+        # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
+        kv_cache_epoch = None
 
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
@@ -597,8 +657,8 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -635,14 +695,8 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        # Ensure staleness tensors are always materialized (zeros if never incremented).
-        total_tokens = len(prompt_tokens) + len(generated_tokens)
-        policy_staleness = self._update_staleness_tensor(
-            self.requests[-1].policy_staleness, total_tokens, increment=False
-        )
-        kv_cache_staleness = self._update_staleness_tensor(
-            self.requests[-1].kv_cache_staleness, total_tokens, increment=False
-        )
+        policy_epoch = self.requests[-1].policy_epoch
+        kv_cache_epoch = self.requests[-1].kv_cache_epoch
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -657,14 +711,17 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request

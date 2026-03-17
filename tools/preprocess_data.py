@@ -11,9 +11,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import time
 import gzip
 import glob
-import torch
-import numpy as np
 import multiprocessing
+import numpy as np
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
@@ -113,6 +112,7 @@ class Partition(object):
     def __init__(self, args, workers):
         self.args = args
         self.workers = workers
+        self.performance = []
 
     def print_processing_stats(self, count, proc_start, total_bytes_processed):
         if count % self.args.log_interval == 0:
@@ -122,6 +122,8 @@ class Partition(object):
             print(f"Processed {count} documents",
                   f"({count/elapsed} docs/s, {mbs} MB/s).",
                   file=sys.stderr)
+            if self.args.find_optimal_num_workers:
+                self.performance.append(count/elapsed)
 
     def split_sentences(self, file_name):
         input_file_name, output_file_name = file_name
@@ -143,6 +145,8 @@ class Partition(object):
         fin.close()
         fout.close()
 
+        pool.close()
+        pool.join()
 
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
@@ -178,13 +182,21 @@ class Partition(object):
         total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+            if self.args.find_optimal_num_workers and i > self.args.max_documents:
+                break
+            else:
+                total_bytes_processed += bytes_processed
+                for key in doc.keys():
+                    builders[key].add_document(doc[key], sentence_lens[key])
+                self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
         builders[key].finalize(output_idx_files[key])
+
+        pool.close()
+        pool.join()
+
+        return self.performance
 
 
 def get_args():
@@ -212,6 +224,19 @@ def get_args():
                        help=('Number of worker processes to launch.'
                              'A good default for fast pre-processing '
                              'is: (workers * partitions) = available CPU cores.'))
+    group.add_argument('--find-optimal-num-workers', action='store_true',
+                       help=('Find optimal number of workers.'
+                             'Script will run few small jobs with '
+                             'different number of workers to define '
+                             'optimal number of workers in terms of performance.'))
+    group.add_argument('--workers-to-check', nargs='+', type=int, default=[16, 32, 64],
+                       help=('list of workers to run data processing with '
+                             'to find optimal number of workers. '
+                             'Works only when --find-optimal-num-workers is enabled. '))
+    group.add_argument('--max-documents', type=int, default=100_000,
+                       help=('Maximum number of documents to preprocess '
+                             'to find  optimal number of workers.'
+                             'Works only when --find-optimal-num-workers is enabled.'))
     group.add_argument('--partitions', type=int, default=1,
                         help='Number of file partitions')
     group.add_argument('--log-interval', type=int, default=1000,
@@ -253,143 +278,197 @@ def check_files_exist(in_ss_out_names, key, num_partitions):
     return True
 
 
+def find_optimal_num_workers(performance, partitions):
+    """Parses saved .json files with perf. numbers and prints optimal number of workers"""
+    results = []
+
+    # each file assumed to contain a single {workers: [perf_list]}
+    for workers, perf_list in performance.items():
+        workers = int(workers)
+        avg_perf = np.mean(perf_list)
+        results.append((workers, avg_perf))
+
+    # sort by average performance (descending: fastest first)
+    results.sort(key=lambda x: x[1], reverse=True)
+    
+    print("\n-----------------------------------")
+    print("Performance results (fastest → slowest):")
+    for i, (workers, avg_perf) in enumerate(results):
+        print(f"{i+1}. {workers * partitions} workers → avg. docs/s: {avg_perf:.4f}")
+    
+    best_workers, best_perf = results[0]
+
+    print("\n-----------------------------------")
+    print(
+        f"The most optimal num of workers is {best_workers * partitions} "
+        f"with avg. preprocessed docs/s: {best_perf:.4f}."
+    )
+    print("-----------------------------------")
+
+
 def main():
     args = get_args()
 
-    if args.split_sentences:
-        if nltk_available:
-            nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
+    workers = args.workers_to_check if args.find_optimal_num_workers else [args.workers]
+    for num_workers in workers:
+        if num_workers % args.partitions != 0:
+            print(
+                f"Removing num_workers ({num_workers}) from workers list "
+                f"because it's not divisible by num_partitions ({args.partitions})"
+            )
+            workers.remove(num_workers)
+    assert workers, "Please, provide valid number of workers which is divisible by number of partitions."
+    if args.find_optimal_num_workers:
+        args.log_interval = 1000
+
+    performance = {}
+    for num_workers in workers:
+        print(f"Processing data with {num_workers} workers.")
+        if args.split_sentences:
+            if nltk_available:
+                nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
+            else:
+                raise Exception(
+                    "nltk library required for sentence splitting is not available.")
+
+        in_ss_out_names = []
+        if args.partitions == 1:
+            file_name, extension = os.path.splitext(args.input)
+            sentence_split_file = file_name + "_ss" + extension
+            file_names = {
+                'partition': args.input,
+                'sentence_split': sentence_split_file,
+                'output_prefix': args.output_prefix}
+            in_ss_out_names.append(file_names)
         else:
-            raise Exception(
-                "nltk library required for sentence splitting is not available.")
+            in_file_names = glob.glob(args.input)
 
-    in_ss_out_names = []
-    if args.partitions == 1:
-        file_name, extension = os.path.splitext(args.input)
-        sentence_split_file = file_name + "_ss" + extension
-        file_names = {
-            'partition': args.input,
-            'sentence_split': sentence_split_file,
-            'output_prefix': args.output_prefix}
-        in_ss_out_names.append(file_names)
-    else:
-        in_file_names = glob.glob(args.input)
+            # Count total number of lines across .jsonl files
+            if args.keep_sequential_samples:
+                total_sample_count = 0
+                for filename in in_file_names:
+                    with open(filename, "r") as fin:
+                        for fc, _ in enumerate(fin):
+                            pass
+                    total_sample_count += (fc + 1)
+                partition_size = math.ceil(total_sample_count / args.partitions)
 
-        # Count total number of lines across .jsonl files
-        if args.keep_sequential_samples:
-            total_sample_count = 0
-            for filename in in_file_names:
-                with open(filename, "r") as fin:
-                    for fc, _ in enumerate(fin):
-                        pass
-                total_sample_count += (fc + 1)
-            partition_size = math.ceil(total_sample_count / args.partitions)
+            # create .jsonl parition files
+            for idx in range(args.partitions):
+                in_ss_out_name = get_file_name(args, idx)
+                in_ss_out_names.append(in_ss_out_name)
 
-        # create .jsonl parition files
-        for idx in range(args.partitions):
-            in_ss_out_name = get_file_name(args, idx)
-            in_ss_out_names.append(in_ss_out_name)
+            # check to see if paritions were already created
+            partitions_present = check_files_exist(in_ss_out_names, 'partition', args.partitions)
 
-        # check to see if paritions were already created
-        partitions_present = check_files_exist(in_ss_out_names, 'partition', args.partitions)
+            # check to see if paritions with split sentences already created
+            split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
+
+            if not partitions_present and not split_sentences_present:
+                # populate .jsonl partition files from parent files
+                partitioned_input_files = []
+                for idx in range(args.partitions):
+                    partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
+                    partitioned_input_files.append(partitioned_input_file)
+
+                index = 0
+                if args.keep_sequential_samples: line_count = 0
+                for in_file_name in in_file_names:
+                    # support for gzip files
+                    if in_file_name.endswith(".gz"):
+                        fin = gzip.open(in_file_name, 'rt')
+                    else:
+                        fin = open(in_file_name, 'r', encoding='utf-8')
+
+                    for line in fin:
+                        partitioned_input_files[index].write(line)
+                        if args.keep_sequential_samples:
+                            line_count += 1
+                            if line_count % partition_size == 0:
+                                index += 1
+                        else:
+                            index = (index + 1)%args.partitions
+
+                    fin.close()
+
+                for idx in range(args.partitions):
+                    partitioned_input_files[idx].close()
+
+        partition = Partition(args, num_workers//args.partitions)
 
         # check to see if paritions with split sentences already created
         split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
 
-        if not partitions_present and not split_sentences_present:
-            # populate .jsonl partition files from parent files
-            partitioned_input_files = []
-            for idx in range(args.partitions):
-                partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
-                partitioned_input_files.append(partitioned_input_file)
+        # split sentences in partition files
+        if args.split_sentences and not split_sentences_present:
+            processes = []
+            for name in in_ss_out_names:
+                p = multiprocessing.Process(target=partition.split_sentences,
+                                            args=((name['partition'], name['sentence_split']),))
+                p.start()
+                processes.append(p)
 
-            index = 0
-            if args.keep_sequential_samples: line_count = 0
-            for in_file_name in in_file_names:
-                # support for gzip files
-                if in_file_name.endswith(".gz"):
-                    fin = gzip.open(in_file_name, 'rt')
-                else:
-                    fin = open(in_file_name, 'r', encoding='utf-8')
+            for p in processes:
+                p.join()
 
-                for line in fin:
-                    partitioned_input_files[index].write(line)
-                    if args.keep_sequential_samples:
-                        line_count += 1
-                        if line_count % partition_size == 0:
-                            index += 1
-                    else:
-                        index = (index + 1)%args.partitions
+            if args.partitions == 1:
+                continue
 
-                fin.close()
+        def process_json_file(name, q, input_key):
+            worker_performance = partition.process_json_file((name[input_key], name['output_prefix']))
+            q.put(worker_performance)
 
-            for idx in range(args.partitions):
-                partitioned_input_files[idx].close()
-
-    assert args.workers % args.partitions == 0
-    partition = Partition(args, args.workers//args.partitions)
-
-    # check to see if paritions with split sentences already created
-    split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
-
-    # split sentences in partition files
-    if args.split_sentences and not split_sentences_present:
+        # encode partition files in parallel
         processes = []
+        input_key = 'sentence_split' if args.split_sentences else 'partition'
+        q = multiprocessing.Queue()
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=partition.split_sentences,
-                                        args=((name['partition'], name['sentence_split']),))
+            p = multiprocessing.Process(target=process_json_file, args=(name, q, input_key))
+
             p.start()
             processes.append(p)
+
+        for _ in processes:
+            worker_performance = q.get()
+            if args.find_optimal_num_workers:
+                performance[num_workers] = worker_performance
 
         for p in processes:
             p.join()
 
         if args.partitions == 1:
-            return
+            continue
 
+        # merge bin/idx partitions
+        level = "document"
+        if args.split_sentences:
+            level = "sentence"
 
-    # encode partition files in parallel
-    processes = []
-    input_key = 'sentence_split' if args.split_sentences else 'partition'
-    for name in in_ss_out_names:
-        p = multiprocessing.Process(target=partition.process_json_file,
-                                    args=((name[input_key], name['output_prefix']),))
-        p.start()
-        processes.append(p)
+        output_bin_files = {}
+        output_idx_files = {}
+        builders = {}
+        tokenizer = build_tokenizer(args)
 
-    for p in processes:
-        p.join()
+        for key in args.json_keys:
+            output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
+                                                        key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
+                                                        key, level)
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
+                output_bin_files[key],
+                dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
+            )
 
-    if args.partitions == 1:
-        return
+            for name in in_ss_out_names:
+                parition_output_prefix = name['output_prefix']
+                full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
+                                                                key, level)
+                builders[key].add_index(full_partition_output_prefix)
+            builders[key].finalize(output_idx_files[key])
 
-    # merge bin/idx partitions
-    level = "document"
-    if args.split_sentences:
-        level = "sentence"
-
-    output_bin_files = {}
-    output_idx_files = {}
-    builders = {}
-    tokenizer = build_tokenizer(args)
-
-    for key in args.json_keys:
-        output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
-                                                      key, level)
-        output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
-                                                      key, level)
-        builders[key] = indexed_dataset.IndexedDatasetBuilder(
-            output_bin_files[key],
-            dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
-        )
-
-        for name in in_ss_out_names:
-            parition_output_prefix = name['output_prefix']
-            full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
-                                                             key, level)
-            builders[key].add_index(full_partition_output_prefix)
-        builders[key].finalize(output_idx_files[key])
-
+    # Find the most optimal number of workers
+    if args.find_optimal_num_workers:
+        find_optimal_num_workers(performance, args.partitions)
 
 if __name__ == '__main__':
 
