@@ -193,19 +193,22 @@ class TransformerLayerSchedulePlan:
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
         """
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        assert isinstance(self.layer, TransformerLayer), (
+            f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"but got {type(self.layer).__name__}."
+        )
         fsdp_module = self.layer
 
         # After the last backward op (attn), release backward-pass params.
         self.attn.set_fsdp_post_backward_reshard_hook(lambda: post_backward_hook(fsdp_module))
 
         # Determine the last node in forward order.
-        if isinstance(self.mtp_post_process, NoopScheduleNode):
-            if isinstance(self.moe_combine, NoopScheduleNode):
-                last_fwd_node = self.mlp
-            else:
-                last_fwd_node = self.moe_combine
+        if isinstance(self.moe_combine, NoopScheduleNode):
+            last_fwd_node = self.mlp
         else:
-            last_fwd_node = self.mtp_post_process
+            last_fwd_node = self.moe_combine
 
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_fsdp_post_forward_reshard_hook(lambda: post_forward_hook(fsdp_module))
