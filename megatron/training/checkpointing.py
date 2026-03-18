@@ -1179,9 +1179,6 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(
         checkpoint_name, cache_metadata=args.ckpt_assume_constant_structure
     )
-    # Set proper async strategy
-    if hasattr(load_strategy, "async_strategy"):
-        load_strategy.async_strategy = args.async_strategy
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
