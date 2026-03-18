@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import contextlib
 import gc
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -102,7 +102,7 @@ def _overlap_train_step(model, optimizer, config, data):
         collect_non_loss_data=False,
         first_val_step=None,
         forward_only=False,
-        no_sync_func=contextlib.nullcontext,
+        no_sync_func=nullcontext,
         total_num_tokens=torch.zeros([], dtype=torch.int, device="cuda"),
         check_first_val_step=lambda cond: cond,
     )
@@ -134,21 +134,40 @@ class TestFSDP1F1BOverlap:
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    @pytest.mark.parametrize(
-        "sharding_strategy", ["optim_grads_params", "optim_grads"]
-    )
+    @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
+    def test_fsdp_1f1b_training_step(
+        self, dispatcher_type, fp8_flag, sharding_strategy, shared_expert_intermediate_size
+    ):
+        self._run_test_helper(
+            dispatcher_type, fp8_flag, sharding_strategy, shared_expert_intermediate_size
+        )
+
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize(
         "recompute_modules",
         [[], ["core_attn", "mla_up_proj", "layernorm", "moe_act", "mlp", "shared_experts"]],
     )
-    def test_fsdp_1f1b_training_step(
+    @pytest.mark.parametrize(
+        "offload_modules",
+        [[], ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]],
+    )
+    def test_fsdp_1f1b_memory_opt(self, recompute_modules, offload_modules):
+        self._run_test_helper(
+            dispatcher_type="alltoall",
+            sharding_strategy="optim_grads_params",
+            recompute_modules=recompute_modules,
+            offload_modules=offload_modules,
+        )
+
+    def _run_test_helper(
         self,
-        dispatcher_type,
-        fp8_flag,
-        sharding_strategy,
-        shared_expert_intermediate_size,
-        recompute_modules,
+        dispatcher_type="alltoall",
+        fp8_flag=None,
+        sharding_strategy="optim_grads_params",
+        shared_expert_intermediate_size=None,
+        recompute_modules=None,
+        offload_modules=None,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -174,6 +193,9 @@ class TestFSDP1F1BOverlap:
         if recompute_modules:
             extra_kwargs["recompute_granularity"] = "selective"
             extra_kwargs["recompute_modules"] = recompute_modules
+        if offload_modules:
+            extra_kwargs["fine_grained_activation_offloading"] = True
+            extra_kwargs["offload_modules"] = offload_modules
 
         with deterministic_mode():
             data = _build_data()
