@@ -8,8 +8,7 @@ ENV_VARS:
   NCCL_ALGO: Ring
 
 MODEL_ARGS:
-
-# Distributed args
+  # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
@@ -27,18 +26,17 @@ MODEL_ARGS:
   --use-megatron-fsdp: true
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
-  
+
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
 
-# Precision
+  # Precision
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
   --fp8-param-gather: true
 
-
-# Training args
+  # Training args
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
@@ -59,7 +57,6 @@ MODEL_ARGS:
   --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
   --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
-
 
   # Network: 2 layers — first dense, second MoE
   --num-layers: 2
@@ -139,7 +136,6 @@ MODEL_ARGS:
   --exit-interval: 50
 TEST_TYPE: regular
 METRICS:
-  - "iteration-time"
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
