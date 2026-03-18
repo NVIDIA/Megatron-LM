@@ -119,6 +119,7 @@ class _StubEngine(DynamicInferenceEngine):
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
         self.requests = {}
+        self._generation_epoch = None
 
 
 class TestPrefixCachingCore(PrefixCachingTestBase):
