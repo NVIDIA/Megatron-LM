@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, override
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -304,7 +304,6 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             group.setdefault("eps", eps)
 
     @torch.no_grad()  # type: ignore[misc]
-    @override
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Step function"""
         return AdaptiveMuon.step(self, closure)
