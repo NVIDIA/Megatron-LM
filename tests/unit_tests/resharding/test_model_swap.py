@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
+import gc
 import os
 import types
+from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import pytest
@@ -91,6 +93,16 @@ def _build_pg_collection(
         dp_cp=dp_cp_group,
         tp_dp_cp=tp_dp_cp_group,
     )
+
+
+def _destroy_pg_collection(pgc: ProcessGroupCollection):
+    """Destroy all process groups in a ProcessGroupCollection to free NCCL communicator memory."""
+    destroyed = set()
+    for f in fields(pgc):
+        pg = getattr(pgc, f.name, None)
+        if pg is not None and id(pg) not in destroyed:
+            destroyed.add(id(pg))
+            dist.destroy_process_group(pg)
 
 
 def _build_gpt(
@@ -364,9 +376,15 @@ def test_swap_gpt_parametrized(
     )
     dist.barrier()
 
+    # Free GPU memory to prevent OOM across the many parametrized test cases
+    del src_model, dst_model
     # Clear refit caches before destroying model parallel to avoid stale plans
     clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
     Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize(
@@ -498,5 +516,11 @@ def test_swap_mamba_parametrized(
     )
     dist.barrier()
 
+    # Free GPU memory to prevent OOM across the many parametrized test cases
+    del src_model, dst_model
     clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
     Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
