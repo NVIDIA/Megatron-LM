@@ -2325,12 +2325,14 @@ def training_log(
                 try:
                     from megatron.training.mfu_tracker import get_mfu_tracker
                     tracker = get_mfu_tracker()
-                    # num_floating_point_operations returns cluster-total FLOPs;
-                    # normalize to per-GPU to match inference FLOPs (already per-GPU).
+                    # Normalize to per-GPU to match inference FLOPs (already per-GPU).
                     training_flops = num_floating_point_operations(args, batch_size) / args.world_size
-                    iter_inference_time = tracker.get_iter_inference_time()
-                    iter_inference_flops = tracker.get_iter_inference_flops()
-                    iter_inference_tokens = tracker.get_iter_inference_tokens()
+                    # Normalize tracker totals to per-iteration averages (the
+                    # tracker accumulates across the entire log_interval window,
+                    # but training_only_time is computed per-iteration).
+                    iter_inference_time = tracker.get_iter_inference_time() / total_iterations
+                    iter_inference_flops = tracker.get_iter_inference_flops() / total_iterations
+                    iter_inference_tokens = tracker.get_iter_inference_tokens() / total_iterations
                     real_training_tokens = tracker.get_iter_real_training_tokens()
                     if real_training_tokens > 0:
                         effective_tokens = real_training_tokens
@@ -3355,6 +3357,17 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
+
+            # Save MFU tracker per-iteration state before eval so that
+            # eval inference (which goes through the same engine) does not
+            # pollute training throughput / MFU metrics.
+            _mfu_snapshot = None
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                _mfu_snapshot = get_mfu_tracker().save_iter()
+            except Exception:
+                pass
+
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
@@ -3395,6 +3408,13 @@ def train(
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
             one_logger_utils.track_e2e_metrics()
+
+            # Restore MFU tracker state to discard eval's inference contributions.
+            if _mfu_snapshot is not None:
+                try:
+                    get_mfu_tracker().restore_iter(_mfu_snapshot)
+                except Exception:
+                    pass
 
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
