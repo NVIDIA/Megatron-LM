@@ -22,8 +22,10 @@ from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.soap import SOAP
+    from emerging_optimizers.scalar_optimizers import Lion
 else:
     SOAP = None
+    Lion = None
 
 # Skip all tests in this file for LTS versions
 pytestmark = pytest.mark.skipif(
@@ -1399,3 +1401,174 @@ class TestSoapOptimizerMultiRank:
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
             get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+
+
+# ===========================================================================
+# Lion optimizer tests
+# ===========================================================================
+
+skip_no_lion = pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
+)
+
+
+@skip_no_lion
+def test_lion_optimizer_smoke():
+    """Smoke test for Lion optimizer."""
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = Lion(params=[model.weight], lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01)
+
+    assert optimizer is not None
+    assert hasattr(optimizer, 'param_groups')
+    assert len(optimizer.param_groups) > 0
+
+    input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), "Weight should be updated after optimizer step"
+
+    optimizer.zero_grad()
+    assert model.weight.grad is None or torch.all(
+        model.weight.grad == 0
+    ), "Gradients should be zeroed"
+
+    state_dict = optimizer.state_dict()
+    assert 'state' in state_dict
+    assert 'param_groups' in state_dict
+    optimizer.load_state_dict(state_dict)
+
+
+@skip_no_lion
+def test_lion_optimizer_multiple_steps():
+    """Test Lion optimizer across multiple optimization steps."""
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = Lion(params=[model.weight], lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01)
+
+    weights_history = [model.weight.data.clone()]
+
+    for i in range(3):
+        input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        optimizer.step()
+        optimizer.zero_grad()
+        weights_history.append(model.weight.data.clone())
+
+    for i in range(len(weights_history) - 1):
+        assert not torch.equal(
+            weights_history[i], weights_history[i + 1]
+        ), f"Weight should change at step {i}"
+
+
+@skip_no_lion
+@pytest.mark.parametrize("betas", [(0.9, 0.99), (0.95, 0.999), (0.5, 0.9)])
+def test_lion_optimizer_betas(betas):
+    """Test Lion optimizer with different beta values."""
+    model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = Lion(params=[model.weight], lr=1e-4, betas=betas)
+
+    input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with betas={betas}"
+
+
+@skip_no_lion
+@pytest.mark.parametrize("weight_decay", [0.0, 0.01, 0.1])
+def test_lion_optimizer_weight_decay(weight_decay):
+    """Test Lion optimizer with different weight decay values."""
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = Lion(params=[model.weight], lr=1e-4, betas=(0.9, 0.99), weight_decay=weight_decay)
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with weight_decay={weight_decay}"
+
+
+@skip_no_lion
+@pytest.mark.parametrize("weight_decay_method", ["decoupled", "l2"])
+def test_lion_optimizer_weight_decay_method(weight_decay_method):
+    """Test Lion optimizer with different weight decay methods."""
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = Lion(
+        params=[model.weight],
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0.01,
+        weight_decay_method=weight_decay_method,
+    )
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with weight_decay_method={weight_decay_method}"
+
+
+@skip_no_lion
+def test_lion_optimizer_multi_layer_net():
+    """Test Lion optimizer with the multi-layer Net model."""
+    model = Net().cuda()
+    model.requires_grad_(True)
+
+    optimizer = Lion(params=model.parameters(), lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01)
+
+    input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_params = {name: p.data.clone() for name, p in model.named_parameters()}
+    optimizer.step()
+
+    params_updated = 0
+    for name, param in model.named_parameters():
+        if not torch.equal(param.data, original_params[name]):
+            params_updated += 1
+
+    assert params_updated > 0, "At least some parameters should be updated after optimizer step"

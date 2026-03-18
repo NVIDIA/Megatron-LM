@@ -29,8 +29,9 @@ try:
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
-    # It is necessary to import SOAP for the registry to work.
+    # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
