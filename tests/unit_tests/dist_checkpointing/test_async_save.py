@@ -1,8 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import sys
 from unittest import mock
 
 import pytest
-import sys
 import torch
 from torch.distributed.checkpoint import CheckpointException
 
@@ -10,7 +10,10 @@ from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy, get_async_strategy
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistSaveShardedStrategy,
+    get_async_strategy,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -58,10 +61,7 @@ class TestAsyncSave:
             # async
             async_calls = AsyncCallsQueue(persistent)
             async_request = save(
-                sharded_state_dict,
-                async_ckpt_dir,
-                async_sharded_save=True,
-                async_strategy="mcore"
+                sharded_state_dict, async_ckpt_dir, async_sharded_save=True, async_strategy="mcore"
             )
             async_calls.schedule_async_request(async_request)
 
@@ -72,7 +72,9 @@ class TestAsyncSave:
             async_calls.maybe_finalize_async_calls(blocking=True)
 
             # load and compare
-            loaded_async_state_dict = load(sharded_state_dict, async_ckpt_dir, async_strategy="mcore")
+            loaded_async_state_dict = load(
+                sharded_state_dict, async_ckpt_dir, async_strategy="mcore"
+            )
             loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir)
             diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
             assert not any(map(bool, diffs)), diffs
@@ -113,7 +115,7 @@ class TestAsyncSave:
 
         FileSystemWriterAsync.write_preloaded_data = orig_fn
         Utils.destroy_model_parallel()
-    
+
     @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
     def test_get_async_strategy(self, async_strategy):
         strategy, modules = get_async_strategy(async_strategy)
@@ -126,8 +128,12 @@ class TestAsyncSave:
 
     @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
     def test_get_async_strategy_no_nvrx_installed(self, async_strategy):
-        with mock.patch.dict('sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}):
-            from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest as MCoreAsyncRequest
+        with mock.patch.dict(
+            'sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}
+        ):
+            from megatron.core.dist_checkpointing.strategies.async_utils import (
+                AsyncRequest as MCoreAsyncRequest,
+            )
 
             strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
 
