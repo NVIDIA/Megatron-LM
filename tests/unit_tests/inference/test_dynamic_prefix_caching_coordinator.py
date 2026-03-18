@@ -13,11 +13,13 @@ from collections import deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
 
+import numpy as np
 import msgpack
 import pytest
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -51,6 +53,12 @@ DEFAULT_PORT = 46582
 ZMQ_FLAKY_SHUTDOWN = True
 
 BLOCK_SIZE = 4
+
+
+def _set_hash_rank(coordinator, h, rank_identity, timestamp):
+    """Test helper: set a hash→rank timestamp via HashRankTable."""
+    rank_idx = coordinator.identity_to_rank_index[rank_identity]
+    coordinator.hash_table.set(h, rank_idx, timestamp)
 
 
 class DummyTokenizer:
@@ -219,15 +227,18 @@ def make_coordinator_direct(
         coordinator.identities_of_data_parallel_ranks
     )
 
-    coordinator.hash_to_rank_info = {}
+    n_ranks = data_parallel_size
+    coordinator.hash_table = HashRankTable(n_ranks)
     coordinator._round_robin_idx = 0
-    coordinator._assignment_counter = 0
-    coordinator._rank_pending_count = {}
 
     sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
     coordinator.identity_to_rank_index = {
         identity: idx for idx, identity in enumerate(sorted_identities)
     }
+
+    coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
+    coordinator._identities_list = list(sorted_identities)
+    coordinator._active_mask = np.ones(n_ranks, dtype=bool)
 
     return coordinator
 
@@ -310,7 +321,7 @@ class TestCoordinatorPrefixRouting:
         # Give all ranks a non-zero pending count so _get_idle_rank doesn't
         # short-circuit to the lowest-index idle rank.
         for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._rank_pending_count[identity] = 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
 
         rank1 = coordinator.get_best_data_parallel_rank(hashes)
         rank2 = coordinator.get_best_data_parallel_rank(hashes)
@@ -328,15 +339,15 @@ class TestCoordinatorPrefixRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Ensure no rank is idle so prefix-matching logic is exercised.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # rank_0 has first block only.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
 
         # rank_1 has first two blocks.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
-        coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_1] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
+        _set_hash_rank(coordinator, hashes[1], rank_1, 1)
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -352,13 +363,13 @@ class TestCoordinatorPrefixRouting:
 
         # Give both ranks non-zero pending counts so the idle-rank shortcut
         # doesn't fire and the prefix-affinity logic (with timestamps) is used.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # Both ranks have both blocks, but rank_1 has higher timestamps.
         for h in hashes:
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 5
+            _set_hash_rank(coordinator, h, rank_0, 1)
+            _set_hash_rank(coordinator, h, rank_1, 5)
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
@@ -367,7 +378,7 @@ class TestCoordinatorPrefixRouting:
         """Empty hash list falls back to round-robin."""
         coordinator = make_coordinator_direct()
         for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._rank_pending_count[identity] = 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
         rank1 = coordinator.get_best_data_parallel_rank([])
         rank2 = coordinator.get_best_data_parallel_rank([])
         assert rank1 != rank2
@@ -376,7 +387,7 @@ class TestCoordinatorPrefixRouting:
         """With prefix caching disabled, always uses round-robin."""
         coordinator = make_coordinator_direct(enable_prefix_caching=False)
         for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._rank_pending_count[identity] = 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
         rank1 = coordinator.get_best_data_parallel_rank([1, 2, 3])
         rank2 = coordinator.get_best_data_parallel_rank([1, 2, 3])
         assert rank1 != rank2
@@ -391,18 +402,21 @@ class TestCoordinatorShadowState:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
-        assert all(rank_0 in coordinator.hash_to_rank_info[h] for h in [100, 200, 300])
+        assert all(
+            coordinator.hash_table.has(h, coordinator.identity_to_rank_index[rank_0])
+            for h in [100, 200, 300]
+        )
 
     def test_update_rank_hashes_increments_counter(self):
         """Each call to _update_rank_hashes increments the assignment counter."""
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
-        assert coordinator._assignment_counter == 0
+        assert coordinator.hash_table.assignment_counter == 0
         coordinator._update_rank_hashes(rank_0, [100])
-        assert coordinator._assignment_counter == 1
+        assert coordinator.hash_table.assignment_counter == 1
         coordinator._update_rank_hashes(rank_0, [200])
-        assert coordinator._assignment_counter == 2
+        assert coordinator.hash_table.assignment_counter == 2
 
     def test_timestamps_updated_on_reassignment(self):
         """Re-assigning a hash to the same rank updates its timestamp."""
@@ -410,10 +424,10 @@ class TestCoordinatorShadowState:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts1 = coordinator.hash_to_rank_info[100][rank_0]
+        ts1 = coordinator.hash_table.get_timestamp(100, coordinator.identity_to_rank_index[rank_0])
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts2 = coordinator.hash_to_rank_info[100][rank_0]
+        ts2 = coordinator.hash_table.get_timestamp(100, coordinator.identity_to_rank_index[rank_0])
 
         assert ts2 > ts1
 
@@ -424,7 +438,10 @@ class TestCoordinatorShadowState:
 
         coordinator._update_rank_hashes(rank_0, [10, 20])
         coordinator._update_rank_hashes(rank_0, [30, 40])
-        assert all(rank_0 in coordinator.hash_to_rank_info[h] for h in [10, 20, 30, 40])
+        assert all(
+            coordinator.hash_table.has(h, coordinator.identity_to_rank_index[rank_0])
+            for h in [10, 20, 30, 40]
+        )
 
     def test_hash_can_appear_in_multiple_ranks(self):
         """The same hash can be owned by multiple ranks."""
@@ -435,8 +452,8 @@ class TestCoordinatorShadowState:
         coordinator._update_rank_hashes(rank_0, [100])
         coordinator._update_rank_hashes(rank_1, [100])
 
-        assert rank_0 in coordinator.hash_to_rank_info[100]
-        assert rank_1 in coordinator.hash_to_rank_info[100]
+        assert coordinator.hash_table.has(100, coordinator.identity_to_rank_index[rank_0])
+        assert coordinator.hash_table.has(100, coordinator.identity_to_rank_index[rank_1])
 
     def test_routing_then_state_update_flow(self):
         """Full flow: compute hashes, route, update state, then re-route to same rank."""
@@ -525,11 +542,11 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Ensure no rank is idle so prefix-matching logic is exercised.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # Only rank_1 has the first block.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
 
         selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
@@ -545,15 +562,15 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Ensure no rank is idle so prefix-matching logic is exercised.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # rank_0 has first block only, with higher timestamp.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
+        _set_hash_rank(coordinator, hashes[0], rank_0, 10)
 
         # rank_1 has all three blocks, but lower timestamp on first block.
         for h in hashes:
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
+            _set_hash_rank(coordinator, h, rank_1, 1)
 
         # rank_0 wins because it has higher recency on the first block.
         # Caller truncates to [:1] before calling get_best_data_parallel_rank.
@@ -570,12 +587,12 @@ class TestFirstPrefixBlockRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Ensure no rank is idle so prefix-matching logic is exercised.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # Both ranks have the first block.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 3
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 7
+        _set_hash_rank(coordinator, hashes[0], rank_0, 3)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 7)
 
         selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
@@ -589,11 +606,11 @@ class TestFirstPrefixBlockRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
         # rank_0 has block 1 (second block), but not block 0.
-        coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_0] = 1
+        _set_hash_rank(coordinator, hashes[1], rank_0, 1)
 
         # Mark all ranks as busy so _get_idle_rank doesn't short-circuit.
         for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._rank_pending_count[identity] = 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
 
         # No rank has the first block, so round-robin.
         r1 = coordinator.get_best_data_parallel_rank(hashes[:1])
@@ -611,9 +628,9 @@ class TestFirstPrefixBlockRouting:
 
         # Ensure no rank is idle so prefix-matching logic is exercised.
         for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._rank_pending_count[identity] = 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
 
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
 
         selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
@@ -634,16 +651,16 @@ class TestLoadAwarePrefixRouting:
 
         # All three ranks have both blocks cached with the same timestamp.
         for h in hashes:
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_2] = 1
+            _set_hash_rank(coordinator, h, rank_0, 1)
+            _set_hash_rank(coordinator, h, rank_1, 1)
+            _set_hash_rank(coordinator, h, rank_2, 1)
 
         # Simulate sending 6 requests. With load-aware routing, they should
         # spread across ranks rather than all going to one.
         assigned_ranks = []
         for _ in range(6):
             rank = coordinator.get_best_data_parallel_rank(hashes)
-            coordinator._rank_pending_count[rank] = coordinator._rank_pending_count.get(rank, 0) + 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] += 1
             assigned_ranks.append(rank)
 
         # Each rank should get exactly 2 of the 6 requests.
@@ -664,12 +681,12 @@ class TestLoadAwarePrefixRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Both ranks have the prefix. rank_1 has a higher (more recent) timestamp.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 10
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 10)
 
         # But rank_1 already has 5 pending requests while rank_0 has only 1.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 5
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 5
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_0
@@ -683,21 +700,21 @@ class TestLoadAwarePrefixRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
 
         # Simulate assigning a request to rank_0.
-        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
         coordinator.request_id_to_rank = {42: rank_0}
 
         # Simulate completion: decrement pending count.
         assigned_rank = coordinator.request_id_to_rank.pop(42, None)
-        if assigned_rank is not None and assigned_rank in coordinator._rank_pending_count:
-            coordinator._rank_pending_count[assigned_rank] = max(
-                0, coordinator._rank_pending_count[assigned_rank] - 1
-            )
+        if assigned_rank is not None:
+            idx = coordinator.identity_to_rank_index.get(assigned_rank)
+            if idx is not None:
+                coordinator._pending_counts[idx] = max(0, coordinator._pending_counts[idx] - 1)
 
-        assert coordinator._rank_pending_count[rank_0] == 0
+        assert coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] == 0
 
     def test_equal_load_falls_back_to_recency(self):
         """With equal pending counts, the most recent timestamp wins."""
@@ -709,10 +726,10 @@ class TestLoadAwarePrefixRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Equal pending counts (both 1), but rank_0 has higher timestamp.
-        coordinator._rank_pending_count[rank_0] = 1
-        coordinator._rank_pending_count[rank_1] = 1
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_0, 10)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_0
@@ -731,11 +748,11 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has the prefix but is heavily loaded (9/10 slots used).
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator._rank_pending_count[rank_0] = 9
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 9
 
         # rank_1 has no prefix match but is idle.
-        coordinator._rank_pending_count[rank_1] = 0
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
 
         # alpha=1.0: score(rank_0) = 1*1 + 0*0.1 = 1.0
         #            score(rank_1) = 1*0 + 0*1.0 = 0.0
@@ -752,11 +769,11 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has the prefix but is heavily loaded.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator._rank_pending_count[rank_0] = 8
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 8
 
         # rank_1 has no prefix match but is nearly idle.
-        coordinator._rank_pending_count[rank_1] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # alpha=0.0: score(rank_0) = 0*1 + 1*(2/10) = 0.2
         #            score(rank_1) = 0*0 + 1*(9/10) = 0.9
@@ -773,11 +790,11 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has prefix match, 7 pending (3 free).
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator._rank_pending_count[rank_0] = 7
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 7
 
         # rank_1 has no prefix match, 0 pending (10 free).
-        coordinator._rank_pending_count[rank_1] = 0
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
 
         # alpha=0.5: score(rank_0) = 0.5*1 + 0.5*(3/10) = 0.5 + 0.15 = 0.65
         #            score(rank_1) = 0.5*0 + 0.5*(10/10) = 0.0 + 0.5  = 0.5
@@ -794,11 +811,11 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_0 has prefix match, 10 pending (0 free).
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator._rank_pending_count[rank_0] = 10
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 10
 
         # rank_1 has no prefix match, 0 pending (10 free).
-        coordinator._rank_pending_count[rank_1] = 0
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
 
         # alpha=0.5: score(rank_0) = 0.5*1 + 0.5*(0/10) = 0.5
         #            score(rank_1) = 0.5*0 + 0.5*(10/10) = 0.5
@@ -816,10 +833,10 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # Both ranks have prefix match and same load.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
-        coordinator._rank_pending_count[rank_0] = 5
-        coordinator._rank_pending_count[rank_1] = 5
+        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 5
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 5
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_0
@@ -838,15 +855,15 @@ class TestScoringFunctionRouting:
 
         # All three ranks have both blocks cached.
         for h in hashes:
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
-            coordinator.hash_to_rank_info.setdefault(h, {})[rank_2] = 1
+            _set_hash_rank(coordinator, h, rank_0, 1)
+            _set_hash_rank(coordinator, h, rank_1, 1)
+            _set_hash_rank(coordinator, h, rank_2, 1)
 
         # Simulate sending 6 requests.
         assigned_ranks = []
         for _ in range(6):
             rank = coordinator.get_best_data_parallel_rank(hashes)
-            coordinator._rank_pending_count[rank] = coordinator._rank_pending_count.get(rank, 0) + 1
+            coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] += 1
             assigned_ranks.append(rank)
 
         from collections import Counter
@@ -867,11 +884,11 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # rank_1 has the prefix match and 1 pending.
-        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
-        coordinator._rank_pending_count[rank_1] = 1
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         # rank_0 is idle - should be selected first (original behaviour).
-        coordinator._rank_pending_count[rank_0] = 0
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 0
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_0
@@ -886,8 +903,8 @@ class TestScoringFunctionRouting:
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
         # No prefix matches for either rank.
-        coordinator._rank_pending_count[rank_0] = 5
-        coordinator._rank_pending_count[rank_1] = 2
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 5
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 2
 
         # alpha=0.5: score(rank_0) = 0 + 0.5*(5/10) = 0.25
         #            score(rank_1) = 0 + 0.5*(8/10) = 0.4

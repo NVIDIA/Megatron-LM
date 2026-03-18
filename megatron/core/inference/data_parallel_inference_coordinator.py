@@ -11,9 +11,11 @@ from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
 
+import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 
@@ -191,9 +193,6 @@ class DataParallelInferenceCoordinator:
         self.block_size_tokens = block_size_tokens
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
-        self.hash_to_rank_info = {}  # Dict[int, Dict[bytes, int]]: hash → {rank → timestamp}
-        self._assignment_counter = 0
-        self._rank_pending_count = {}  # Dict[bytes, int]: rank identity → in-flight request count
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
         self.max_requests = max_requests
 
@@ -206,6 +205,15 @@ class DataParallelInferenceCoordinator:
         self.identity_to_rank_index = {
             identity: idx for idx, identity in enumerate(sorted_identities)
         }
+
+        # Numpy arrays for vectorized scoring (indexed by rank index).
+        n_ranks = len(sorted_identities)
+        self._identities_list = list(sorted_identities)  # rank_index → identity
+        self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
+        self._active_mask = np.ones(n_ranks, dtype=bool)
+
+        # Hash → rank timestamp table for prefix cache affinity routing.
+        self.hash_table = HashRankTable(n_ranks)
 
     def get_next_data_parallel_rank(self):
         """
@@ -224,6 +232,9 @@ class DataParallelInferenceCoordinator:
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
+        idx = self.identity_to_rank_index.get(identity)
+        if idx is not None:
+            self._active_mask[idx] = False
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -269,14 +280,11 @@ class DataParallelInferenceCoordinator:
         An idle rank is one with zero pending requests. Ties are broken by
         deterministic rank index (lowest wins) so behavior is predictable.
         """
-        idle_ranks = [
-            identity
-            for identity in self.identities_of_data_parallel_ranks
-            if self._rank_pending_count.get(identity, 0) == 0
-        ]
-        if not idle_ranks:
+        idle_mask = self._active_mask & (self._pending_counts == 0)
+        if not np.any(idle_mask):
             return None
-        return min(idle_ranks, key=lambda r: self.identity_to_rank_index[r])
+        # np.argmax on a bool array returns the first True index (lowest rank index).
+        return self._identities_list[int(np.argmax(idle_mask))]
 
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity and load.
@@ -305,43 +313,27 @@ class DataParallelInferenceCoordinator:
                 return idle_rank
             return self.get_next_data_parallel_rank()
 
-        # When max_requests is available, use scoring function across all ranks.
+        # When max_requests is available, use vectorized scoring across all ranks.
         if self.max_requests is not None and self.max_requests > 0:
             alpha = self.prefix_caching_routing_alpha
 
-            # Build the set of hashes for quick lookup.
-            request_hash_set = set(request_hashes)
+            # Build match vector: 1.0 for ranks that have any matching hash.
+            match = self.hash_table.match_vector(request_hashes)
 
-            best_rank = None
-            best_score = -1.0
+            # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
+            free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(
+                np.float64
+            )
+            scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
 
-            for identity in self.identities_of_data_parallel_ranks:
-                # Determine prefix match (binary).
-                match = 0.0
-                rank_has_match = any(
-                    identity in self.hash_to_rank_info.get(h, {}) for h in request_hash_set
-                )
-                if rank_has_match:
-                    match = 1.0
+            # Mask out inactive ranks.
+            scores[~self._active_mask] = -1.0
 
-                # Compute normalized load (free capacity fraction).
-                pending = self._rank_pending_count.get(identity, 0)
-                free_slots = max(0, self.max_requests - pending)
-                normalized_load = free_slots / self.max_requests
-
-                score = alpha * match + (1.0 - alpha) * normalized_load
-
-                # Tiebreak: prefer lower rank index for determinism.
-                rank_idx = self.identity_to_rank_index[identity]
-                if score > best_score or (
-                    score == best_score
-                    and rank_idx < self.identity_to_rank_index.get(best_rank, float('inf'))
-                ):
-                    best_score = score
-                    best_rank = identity
-
-            if best_rank is not None:
-                return best_rank
+            # np.argmax returns the first max index, which is the lowest rank index
+            # among ties — matching the desired deterministic tiebreaking.
+            best_idx = int(np.argmax(scores))
+            if scores[best_idx] >= 0.0:
+                return self._identities_list[best_idx]
             return self.get_next_data_parallel_rank()
 
         # Fallback: max_requests not set, use original idle-first + prefix affinity.
@@ -351,14 +343,19 @@ class DataParallelInferenceCoordinator:
 
         # Reverse scan: first match is the longest prefix (parent-chained hashes).
         for h in reversed(request_hashes):
-            rank_info = self.hash_to_rank_info.get(h)
-            if rank_info:
-                # Among ranks sharing this prefix, pick the least-loaded one.
-                # Ties on load are broken by most-recent timestamp (higher is better).
-                best_rank = min(
-                    rank_info, key=lambda r: (self._rank_pending_count.get(r, 0), -rank_info[r])
-                )
-                return best_rank
+            timestamps = self.hash_table.get_row(h)
+            if timestamps is None:
+                continue
+            active_indices = np.nonzero(timestamps)[0]
+            if len(active_indices) == 0:
+                continue
+            # Among ranks sharing this prefix, pick the least-loaded one.
+            # Ties on load are broken by most-recent timestamp (higher is better).
+            best_idx = int(min(
+                active_indices,
+                key=lambda i: (self._pending_counts[i], -timestamps[i]),
+            ))
+            return self._identities_list[best_idx]
 
         return self.get_next_data_parallel_rank()
 
@@ -369,10 +366,8 @@ class DataParallelInferenceCoordinator:
             rank_identity: ZMQ identity of the target rank.
             request_hashes: List of block hashes assigned to this rank.
         """
-        self._assignment_counter += 1
-        ts = self._assignment_counter
-        for h in request_hashes:
-            self.hash_to_rank_info.setdefault(h, {})[rank_identity] = ts
+        rank_idx = self.identity_to_rank_index[rank_identity]
+        self.hash_table.record(rank_idx, request_hashes)
 
     def start(self):
         """
@@ -393,6 +388,9 @@ class DataParallelInferenceCoordinator:
             if serialized_payload == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
+                    idx = self.identity_to_rank_index.get(sender_identity)
+                    if idx is not None:
+                        self._active_mask[idx] = True
                 continue
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
@@ -465,9 +463,7 @@ class DataParallelInferenceCoordinator:
                     return
 
                 self.request_id_to_rank[request_id] = next_identity
-                self._rank_pending_count[next_identity] = (
-                    self._rank_pending_count.get(next_identity, 0) + 1
-                )
+                self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
                 if request_hashes:
                     self._update_rank_hashes(next_identity, request_hashes)
                 if self.schedule_records is not None:
@@ -548,10 +544,10 @@ class DataParallelInferenceCoordinator:
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
                     assigned_rank = self.request_id_to_rank.pop(fid, None)
-                    if assigned_rank is not None and assigned_rank in self._rank_pending_count:
-                        self._rank_pending_count[assigned_rank] = max(
-                            0, self._rank_pending_count[assigned_rank] - 1
-                        )
+                    if assigned_rank is not None:
+                        idx = self.identity_to_rank_index.get(assigned_rank)
+                        if idx is not None:
+                            self._pending_counts[idx] = max(0, self._pending_counts[idx] - 1)
 
                     self.router_socket.send_multipart(
                         [
