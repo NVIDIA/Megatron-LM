@@ -307,7 +307,6 @@ class TestPagedStashingOverBudget:
 
         assert tokens_per_expert is not None
         tokens_per_ep_rank = tokens_per_expert.sum().item()
-        overload_factor = tokens_per_ep_rank / (seq_length * topk)
         over_budget_tensor = container.moe_layer.token_dispatcher.check_over_budget()
         over_budget = over_budget_tensor.item() if over_budget_tensor is not None else False
 

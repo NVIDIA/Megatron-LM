@@ -1107,6 +1107,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_paged_stash: bool = False
     """If True, enable paged stash for MoE expert activations."""
 
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
     stash_modules: Optional[list[str]] = None
     """The MoE submodules to stash activations for.
     choices: "expert_fc1", "moe_act", "expert_fc2".
@@ -1115,6 +1118,10 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc2": stash the input of the expert fc2 part.
     """
 
+    stash_buffer_size_factor: Union[float, Tuple[float, float]] = 1.10
+    """Scale factor(s) for paged stash buffer allocation. A single float sets the CUDA buffer factor
+    (CPU buffer disabled). Two numbers (cuda, cpu) set both: e.g. (1.10, 0.5) for 10% CUDA headroom
+    and 0.5x host buffer. For CUDA, sign selects sizing: positive = avg-based, negative = actual-max."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
