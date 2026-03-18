@@ -2762,7 +2762,7 @@ requires-dist = [
     { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
     { name = "nv-grouped-gemm", marker = "extra == 'lts'", specifier = "~=1.1" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=v0.5.0" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=63154570cea17f8805a7fd15cc3b8cc2919ba575" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
     { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -3868,7 +3868,7 @@ wheels = [
 [[package]]
 name = "nvidia-resiliency-ext"
 version = "0.5.0"
-source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=v0.5.0#5eb5f7ec84e9aa1bf45c403b06d6ef766ea6784a" }
+source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=63154570cea17f8805a7fd15cc3b8cc2919ba575" }
 dependencies = [
     { name = "defusedxml" },
     { name = "nv-one-logger-core" },
