@@ -283,7 +283,8 @@ class GroupedRolloutGenerator(Agent, ABC):
                 if request.enforce_order:
                     # Accumulate groups and enforce submission order across batches.
                     pending.setdefault(group.batch_id, []).append(group)
-                    while len(pending.get(next_batch_id, [])) >= groups_per_worker:
+                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
+                        assert l == groups_per_worker
                         batch = pending.pop(next_batch_id)
                         batch.sort(key=lambda g: g.index_in_batch)
                         next_batch_id += 1
