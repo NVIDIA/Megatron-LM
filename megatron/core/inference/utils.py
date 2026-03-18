@@ -1,8 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 import multiprocessing
 import sys
+import time
 
 import torch
 
@@ -153,6 +155,32 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
         if hasattr(router, "config"):
             router.config.moe_expert_capacity_factor = capacity_factor
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
+
+
+def prewarm_flashinfer_jit():
+    """Pre-compile FlashInfer CUTLASS fused MoE kernels if not already cached.
+
+    FlashInfer uses JIT compilation via ninja to build CUTLASS kernels on first use.
+    This can take several minutes and blocks CUDA graph warmup. This function triggers
+    the compilation early so the cached .so is ready before the warmup loop.
+    """
+    try:
+        from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    except ImportError:
+        return
+
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+    logging.info(
+        "Pre-compiling FlashInfer CUTLASS kernels for sm_%s "
+        "(one-time cost, may take several minutes)...",
+        device_arch,
+    )
+    t0 = time.time()
+    get_cutlass_fused_moe_module(device_arch)
+    logging.info(
+        "FlashInfer CUTLASS kernel compilation finished in %.1f seconds.", time.time() - t0
+    )
 
 
 def set_inference_cuda_graphed_iteration_for_ep_inference(model):

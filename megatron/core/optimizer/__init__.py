@@ -33,6 +33,13 @@ except ImportError:
 
         USING_PYTORCH_OPTIMIZER = True
 
+try:
+    from emerging_optimizers.scalar_optimizers import Lion
+
+    HAVE_LION = True
+except ImportError:
+    HAVE_LION = False
+
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
@@ -542,6 +549,25 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)
+
+        elif config.optimizer == 'lion':
+            if not HAVE_LION:
+                raise ImportError(
+                    "Lion optimizer requires the 'emerging_optimizers' package. "
+                    "Please install it to use --optimizer lion."
+                )
+            optimizer = Lion(
+                param_groups,
+                lr=config.lr,
+                betas=(config.lion_beta1, config.lion_beta2),
+                weight_decay=config.weight_decay,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(
