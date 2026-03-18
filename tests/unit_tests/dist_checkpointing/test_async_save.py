@@ -125,7 +125,11 @@ class TestAsyncSave:
         assert type(module) is not dict
 
     @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
-    def test_get_async_strategy_no_nvrx_installed(self, monkeypatch, async_strategy):
+    def test_get_async_strategy_no_nvrx_installed(self, async_strategy):
         with mock.patch.dict('sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}):
+            from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest as MCoreAsyncRequest
+
             strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
+
             assert strategy == "mcore"
+            assert module == MCoreAsyncRequest
