@@ -194,7 +194,7 @@ class SFTTokenizer:
                 text, return_target=False, add_generation_prompt=True
             ).tolist()
 
-        return self._tokenizer.encode(text)
+        return self._tokenizer.encode(text, add_special_tokens=False)
 
     def tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""

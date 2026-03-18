@@ -68,6 +68,7 @@ class SFTDatasetConfig(GPTDatasetConfig):
     tool_call_start_tokens: List[int] = field(init=False, default=None)
     tool_call_end_tokens: List[int] = field(init=False, default=None)
     tool_response_start_tokens: List[int] = field(init=False, default=None)
+    tool_response_end_tokens: List[int] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -97,6 +98,7 @@ class SFTDatasetConfig(GPTDatasetConfig):
             self.tool_call_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_start_str)
             self.tool_call_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_end_str)
             self.tool_response_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_start_str)
+            self.tool_response_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_end_str)
 
 
 class SFTDataset(MegatronDataset):
