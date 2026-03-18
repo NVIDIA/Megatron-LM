@@ -19,18 +19,17 @@ jobs:
     steps:
       - name: Check for tracking state and trigger sync
         run: |
-          MARKER="<!-- claude-pr-state:"
+          BOT_USER=$(gh api user --jq '.login')
 
-          COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body')
+          STATE_JSON=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"${BOT_USER}\" and (.body | contains(\"<!-- claude-pr-state:\"))) | .body] | last // empty" \
+            | grep -o '<!-- claude-pr-state: .*-->' \
+            | sed 's/<!-- claude-pr-state: //' | sed 's/ -->//' || true)
 
-          TRACKING_COMMENT=$(echo "$COMMENTS" | grep -o "${MARKER} .*-->" | tail -1 || true)
-
-          if [ -z "$TRACKING_COMMENT" ]; then
+          if [ -z "$STATE_JSON" ]; then
             echo "No Claude tracking state found on PR #${PR_NUMBER}. Skipping."
             exit 0
           fi
-
-          STATE_JSON=$(echo "$TRACKING_COMMENT" | sed "s/${MARKER} //" | sed 's/ -->//')
 
           TRACKING=$(echo "$STATE_JSON" | jq -r '.tracking')
 
