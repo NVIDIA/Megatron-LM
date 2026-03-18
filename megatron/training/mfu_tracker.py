@@ -97,6 +97,30 @@ class MFUTracker:
             self._iter_logprob_time = 0.0
             self._iter_real_training_tokens = 0
 
+    def save_iter(self) -> dict:
+        """Snapshot per-iteration accumulators so they can be restored later.
+
+        Used around evaluation to prevent eval inference from polluting
+        training throughput metrics.
+        """
+        with self._lock:
+            return {
+                'inference_flops': self._iter_inference_flops,
+                'inference_time': self._iter_inference_time,
+                'inference_tokens': self._iter_inference_tokens,
+                'logprob_time': self._iter_logprob_time,
+                'real_training_tokens': self._iter_real_training_tokens,
+            }
+
+    def restore_iter(self, snapshot: dict):
+        """Restore per-iteration accumulators from a previous snapshot."""
+        with self._lock:
+            self._iter_inference_flops = snapshot['inference_flops']
+            self._iter_inference_time = snapshot['inference_time']
+            self._iter_inference_tokens = snapshot['inference_tokens']
+            self._iter_logprob_time = snapshot['logprob_time']
+            self._iter_real_training_tokens = snapshot['real_training_tokens']
+
     def get_report(self, gpu_peak_tflops: float) -> dict:
         """Compute MFU breakdown.
 

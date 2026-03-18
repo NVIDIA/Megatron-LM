@@ -119,3 +119,10 @@ class TestMFUTracking:
         tracker.reset_iter()
         assert tracker.get_iter_inference_flops() == 0.0
         assert tracker.get_report(gpu_peak_tflops=peak)['total_tflops'] == total_tflops
+
+        # save_iter / restore_iter round-trips correctly
+        tracker.add_inference_flops(1e12, 1.0, tokens=10)
+        snapshot = tracker.save_iter()
+        tracker.add_inference_flops(9e12, 9.0, tokens=90)
+        tracker.restore_iter(snapshot)
+        assert tracker.get_iter_inference_flops() == 1e12
