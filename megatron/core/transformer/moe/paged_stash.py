@@ -1080,7 +1080,8 @@ class PagedStashRunner:
         # Set grad to zero.
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
-        self.optimizer.zero_grad()
+        if self.optimizer is not None:
+            self.optimizer.zero_grad()
 
         #_handle_mxfp8_param_buffer_copy
         if self.copy_main_params:
@@ -1090,11 +1091,12 @@ class PagedStashRunner:
             # Handle both ChainedOptimizer and direct DistributedOptimizer cases
             # Note: FSDP's DistributedOptimizer doesn't have shard_fp32_from_float16_groups,
             # so we check for this attribute before calling _copy_main_params_to_param_buffer
-            if hasattr(self.optimizer, 'chained_optimizers'):
-                for optim_instance in self.optimizer.chained_optimizers:
-                    _try_copy_main_params(optim_instance)
-            else:
-                _try_copy_main_params(self.optimizer)
+            if self.optimizer is not None:
+                if hasattr(self.optimizer, 'chained_optimizers'):
+                    for optim_instance in self.optimizer.chained_optimizers:
+                        _try_copy_main_params(optim_instance)
+                else:
+                    _try_copy_main_params(self.optimizer)
 
         # Delete the CUDA graph
         if isinstance(self.forward_backward_func, FullCudaGraphWrapper):
