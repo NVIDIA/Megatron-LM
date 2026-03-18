@@ -117,7 +117,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr, mr-github-broken]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute]
     products:
@@ -266,7 +266,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:

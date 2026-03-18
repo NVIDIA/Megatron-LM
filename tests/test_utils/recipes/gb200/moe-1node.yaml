@@ -58,7 +58,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2]
+  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node]
     products:
       - environment: [dev]
         scope: [mr-github]

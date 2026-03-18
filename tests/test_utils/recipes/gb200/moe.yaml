@@ -180,12 +180,12 @@ products:
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-slim]
+        scope: [mr, mr-slim]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-slim]
+        scope: [mr, mr-slim]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
     products:
