@@ -13,6 +13,7 @@ import msgpack
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -670,3 +671,151 @@ class TestCoordinator:
             await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client, timeout=60.0)
+
+
+def _make_routing_coordinator(
+    num_ranks=4,
+    enable_prefix_caching=False,
+    policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+):
+    """Create a coordinator with fake rank identities for routing-only tests.
+
+    Bypasses ZMQ entirely — only the routing / scheduling attributes are set up.
+    """
+    coord = object.__new__(DataParallelInferenceCoordinator)
+    identities = [f"rank-{i}".encode() for i in range(num_ranks)]
+    coord.identities_of_data_parallel_ranks = deque(identities)
+    coord.identity_to_rank_index = {ident: idx for idx, ident in enumerate(identities)}
+    coord._rank_pending_count = {}
+    coord._round_robin_idx = 0
+    coord.enable_prefix_caching = enable_prefix_caching
+    coord.prefix_caching_coordinator_policy = policy
+    coord.hash_to_rank_info = {}
+    coord._assignment_counter = 0
+    coord.block_size_tokens = 64
+    return coord
+
+
+class TestIdleRankPrioritization:
+    """Unit tests for the idle-rank-first routing guarantee."""
+
+    def test_idle_rank_chosen_over_round_robin(self):
+        """When one rank is idle, it must be chosen regardless of round-robin state."""
+        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
+        # Give ranks 0 and 1 some load; rank 2 stays idle.
+        coord._rank_pending_count[b"rank-0"] = 2
+        coord._rank_pending_count[b"rank-1"] = 1
+
+        for _ in range(5):
+            chosen = coord.get_best_data_parallel_rank([])
+            assert chosen == b"rank-2"
+
+    def test_idle_rank_tie_broken_by_rank_index(self):
+        """When multiple ranks are idle, the lowest rank index wins."""
+        coord = _make_routing_coordinator(num_ranks=4)
+        # Only rank 1 is busy; ranks 0, 2, 3 are idle.
+        coord._rank_pending_count[b"rank-1"] = 5
+
+        chosen = coord.get_best_data_parallel_rank([])
+        assert chosen == b"rank-0"
+
+    def test_all_idle_returns_lowest_rank(self):
+        """When all ranks are idle (fresh start), rank 0 is selected."""
+        coord = _make_routing_coordinator(num_ranks=4)
+
+        chosen = coord.get_best_data_parallel_rank([])
+        assert chosen == b"rank-0"
+
+    def test_falls_back_to_round_robin_when_no_idle(self):
+        """When all ranks have load and prefix caching is off, round-robin is used."""
+        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
+        for ident in coord.identities_of_data_parallel_ranks:
+            coord._rank_pending_count[ident] = 1
+
+        # Round-robin should cycle through ranks.
+        results = [coord.get_best_data_parallel_rank([]) for _ in range(6)]
+        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-0", b"rank-1", b"rank-2"]
+
+    def test_falls_back_to_prefix_policy_when_no_idle(self):
+        """When all ranks are busy, prefix-cache affinity routing is used."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        for ident in coord.identities_of_data_parallel_ranks:
+            coord._rank_pending_count[ident] = 1
+
+        # Seed a hash on rank-2 so prefix routing prefers it.
+        fake_hash = 12345
+        coord.hash_to_rank_info[fake_hash] = {b"rank-2": 1}
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-2"
+
+    def test_idle_rank_beats_prefix_affinity(self):
+        """An idle rank must win even when another rank has a prefix match."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        # Rank 1 has the prefix cached but is busy; rank 2 is idle.
+        coord._rank_pending_count[b"rank-0"] = 2
+        coord._rank_pending_count[b"rank-1"] = 1
+
+        fake_hash = 99999
+        coord.hash_to_rank_info[fake_hash] = {b"rank-1": 1}
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-2"
+
+    def test_idle_rank_with_first_prefix_block_policy(self):
+        """Idle rank takes priority even under FIRST_PREFIX_BLOCK policy."""
+        coord = _make_routing_coordinator(
+            num_ranks=2,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        )
+        coord._rank_pending_count[b"rank-0"] = 3
+        # rank-1 is idle
+
+        fake_hash = 42
+        coord.hash_to_rank_info[fake_hash] = {b"rank-0": 1}
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_idle_rank_with_round_robin_policy(self):
+        """Idle rank takes priority even when policy is ROUND_ROBIN."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN,
+        )
+        coord._rank_pending_count[b"rank-0"] = 1
+        coord._rank_pending_count[b"rank-1"] = 1
+        # rank-2 is idle
+
+        # Advance round-robin so it would normally pick rank-0.
+        coord._round_robin_idx = 0
+
+        chosen = coord.get_best_data_parallel_rank([])
+        assert chosen == b"rank-2"
+
+    def test_pending_count_zero_explicit(self):
+        """A rank with an explicit pending count of 0 is treated as idle."""
+        coord = _make_routing_coordinator(num_ranks=2)
+        coord._rank_pending_count[b"rank-0"] = 1
+        coord._rank_pending_count[b"rank-1"] = 0  # Explicitly set to 0.
+
+        chosen = coord.get_best_data_parallel_rank([])
+        assert chosen == b"rank-1"
+
+    def test_get_idle_rank_returns_none_when_all_busy(self):
+        """_get_idle_rank returns None when every rank has load."""
+        coord = _make_routing_coordinator(num_ranks=2)
+        coord._rank_pending_count[b"rank-0"] = 1
+        coord._rank_pending_count[b"rank-1"] = 3
+
+        assert coord._get_idle_rank() is None

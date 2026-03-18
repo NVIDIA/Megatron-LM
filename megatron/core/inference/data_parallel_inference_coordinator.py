@@ -255,8 +255,27 @@ class DataParallelInferenceCoordinator:
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
+    def _get_idle_rank(self):
+        """Return the idle rank with the lowest rank index, or None if all ranks are busy.
+
+        An idle rank is one with zero pending requests. Ties are broken by
+        deterministic rank index (lowest wins) so behavior is predictable.
+        """
+        idle_ranks = [
+            identity
+            for identity in self.identities_of_data_parallel_ranks
+            if self._rank_pending_count.get(identity, 0) == 0
+        ]
+        if not idle_ranks:
+            return None
+        return min(idle_ranks, key=lambda r: self.identity_to_rank_index[r])
+
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity.
+
+        If any rank has zero pending requests it is always selected first
+        (ties broken by lowest rank index), regardless of routing policy.
+        Otherwise the chosen routing policy is used.
 
         Iterates request hashes in reverse order and picks the rank that cached
         the longest matching prefix (the furthest hash found). Since hashes are
@@ -271,6 +290,11 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
+        # Always prioritize completely idle ranks regardless of routing policy.
+        idle_rank = self._get_idle_rank()
+        if idle_rank is not None:
+            return idle_rank
+
         if (
             not self.enable_prefix_caching
             or not request_hashes
