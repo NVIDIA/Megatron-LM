@@ -252,9 +252,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
-        self.use_triton_conv1d = inference_config.use_triton_conv1d
-        self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
-
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
@@ -1630,14 +1627,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_token_offsets=intermediate_offsets,
             )
 
-            # Auto-enable Triton conv1d for CUDA graph steps. The per-request
-            # conv loop launches a variable number of kernels with .item()
-            # calls, which is incompatible with CUDA graph capture/replay.
-            if self._using_cuda_graph_this_step:
-                self._use_triton_conv1d_this_step = True
-            else:
-                self._use_triton_conv1d_this_step = self.use_triton_conv1d
-
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
                 self.moe_routing_metadata.enable_static_buffer_recording()
@@ -1707,7 +1696,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self._use_triton_conv1d_this_step = self.use_triton_conv1d
         self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0

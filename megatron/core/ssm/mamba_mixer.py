@@ -574,8 +574,6 @@ class MambaMixer(MegatronModule):
         # Output y is initialized to zeros in _ssm_prefill so padding
         # positions remain zero (safe for RMSNorm and downstream ops).
 
-        use_triton_conv1d = context._use_triton_conv1d_this_step
-
         # Prepare intermediate extraction buffers (always passed, CUDA graph compat)
         slot_allocator = context.mamba_slot_allocator
         intermediate_chunk_indices = metadata.intermediate_chunk_indices
@@ -598,7 +596,6 @@ class MambaMixer(MegatronModule):
             intermediate_ssm_out=intermediate_ssm_out,
             intermediate_conv_out=intermediate_conv_out,
             conv_gather_offsets=metadata._conv_gather_offsets,
-            use_triton_conv1d=use_triton_conv1d,
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
             seq_idx_for_varlen=metadata.seq_idx_for_varlen,
@@ -713,7 +710,6 @@ class MambaMixer(MegatronModule):
         intermediate_ssm_out: Optional[torch.Tensor] = None,
         intermediate_conv_out: Optional[torch.Tensor] = None,
         conv_gather_offsets: Optional[torch.Tensor] = None,
-        use_triton_conv1d: bool = False,
         cu_chunk_seqlens: Optional[torch.Tensor] = None,
         last_chunk_indices: Optional[torch.Tensor] = None,
         seq_idx_for_varlen: Optional[torch.Tensor] = None,
@@ -806,52 +802,19 @@ class MambaMixer(MegatronModule):
             conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
             xBC_pre_conv = xBC if intermediate_conv_out is not None else None
-            if use_triton_conv1d:
-                from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+            from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
-                xBC_out = causal_conv1d_varlen_fn(
-                    x=xBC.squeeze(0).contiguous(),
-                    weight=conv_weight,
-                    bias=conv_bias,
-                    cu_seqlens=cu_seqlens,
-                    initial_states=initial_conv_states,
-                    activation=self.activation,
-                    precomputed_seq_idx=conv_seq_idx,
-                    precomputed_seq_start=conv_seq_start,
-                )
-                xBC = xBC_out.to(xBC_dtype).unsqueeze(0)
-            else:
-                # causal_conv1d_fn cannot accept both seq_idx and
-                # initial_states simultaneously. Using seq_idx with packed sequences
-                # zeroes the conv state at sequence boundaries instead of using the
-                # cached initial states. We must loop over requests individually,
-                # passing initial_states per-request with channels-last layout.
-                # This loop launches a variable number of kernels and uses .item(),
-                # so it is incompatible with CUDA graph capture/replay.
-                assert not torch.cuda.is_current_stream_capturing(), (
-                    "Per-request conv1d loop is not CUDA-graph compatible. "
-                    "Enable use_triton_conv1d or set num_cuda_graphs=None."
-                )
-                num_requests = cu_seqlens.shape[0] - 1
-                xBC_out = xBC.clone()
-                for r in range(num_requests):
-                    start = cu_seqlens[r].item()
-                    end = cu_seqlens[r + 1].item()
-                    if start == end:
-                        continue
-                    # xBC is (1, total_tokens, conv_dim); slice gives channels-last via transpose
-                    xBC_r = xBC[:, start:end, :].transpose(1, 2)  # channels-last (1, C, L)
-                    init_r = initial_conv_states[r : r + 1]  # (1, conv_dim, d_conv-1)
-                    init_r = init_r.permute(0, 2, 1).contiguous().transpose(1, 2)  # channels-last
-                    xBC_r = causal_conv1d_fn(
-                        x=xBC_r,
-                        weight=conv_weight,
-                        bias=conv_bias,
-                        activation=self.activation,
-                        initial_states=init_r,
-                    )
-                    xBC_out[:, start:end, :] = xBC_r.transpose(1, 2).contiguous()
-                xBC = xBC_out.to(xBC_dtype)
+            xBC_out = causal_conv1d_varlen_fn(
+                x=xBC.squeeze(0).contiguous(),
+                weight=conv_weight,
+                bias=conv_bias,
+                cu_seqlens=cu_seqlens,
+                initial_states=initial_conv_states,
+                activation=self.activation,
+                precomputed_seq_idx=conv_seq_idx,
+                precomputed_seq_start=conv_seq_start,
+            )
+            xBC = xBC_out.to(xBC_dtype).unsqueeze(0)
         else:
             # Non-dynamic-batching path (static batching / training fallback)
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
