@@ -77,6 +77,7 @@ class DummyContext:
         self.block_size_tokens = 64
         self.enable_prefix_caching = False
         self.prefix_caching_coordinator_policy = None
+        self.prefix_cache_lru_clock = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
