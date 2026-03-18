@@ -85,13 +85,18 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
-    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def async_save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        async_strategy: str = "nvrx",
+    ):
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(
                 f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
             )
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
+        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         self.apply_saving_parallelization(sharded_state_dict)

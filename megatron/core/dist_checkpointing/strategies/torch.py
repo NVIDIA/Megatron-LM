@@ -608,7 +608,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
-        async_strategy: Optional[str] = "nvrx",
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -627,7 +626,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
-        self.async_strategy = async_strategy
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -653,7 +651,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.validated_loaded_metadata_reuse = False
 
     def async_save(
-        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, async_strategy: str = "nvrx",
     ) -> AsyncRequest | NVRxAsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -675,16 +673,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             self.thread_count = 2
 
         # Get async modules
-        self.async_strategy, modules = get_async_strategy(self.async_strategy)
+        async_strategy, modules = get_async_strategy(async_strategy)
         async_writer = modules["FileSystemWriterAsync"]
         save_state_dict_async_plan = modules["save_state_dict_async_plan"]
-        if self.async_strategy == "nvrx":
+        print(async_strategy, save_state_dict_async_plan, async_writer)
+        if async_strategy == "nvrx":
             checkpointable_metadata_cache = modules["CheckpointMetadataCache"]
 
         async_writer_kwargs = {}
         state_dict_saver_kwargs = {}
 
-        if self.async_strategy == "nvrx":
+        if async_strategy == "nvrx":
             if self._metadata_cache is None:
                 self._metadata_cache = checkpointable_metadata_cache()
                 if self.cached_global_metadata is not None:
@@ -737,7 +736,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             **state_dict_saver_kwargs,
         )
 
-        if self.async_strategy == "mcore":
+        if async_strategy == "mcore":
             # MCore's async implementation
             (
                 save_state_dict_ret,
@@ -776,14 +775,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                         save_state_dict_ret = list(save_state_dict_ret)
                         save_state_dict_ret[1] = self.cached_global_metadata
 
-        return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+        return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret, async_strategy)
 
-    def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest | NVRxAsyncRequest:
+    def _get_save_and_finalize_callbacks(
+        self,
+        writer,
+        save_state_dict_ret,
+        async_strategy,
+    ) -> AsyncRequest | NVRxAsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
 
         # get async modules
-        self.async_strategy, modules = get_async_strategy(self.async_strategy)
+        _, modules = get_async_strategy(async_strategy)
         async_request = modules["AsyncRequest"]
         save_state_dict_async_finalize = modules["save_state_dict_async_finalize"]
 
@@ -813,10 +817,9 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, async_strategy: str = "nvrx"):
+    def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        self.async_strategy = async_strategy
         super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
