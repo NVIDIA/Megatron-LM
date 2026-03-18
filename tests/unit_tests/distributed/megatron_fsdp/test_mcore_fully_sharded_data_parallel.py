@@ -225,6 +225,52 @@ class TestFullyShardedDataParallel:
                 msg=f"Parameters for {name1} don't match",
             )
 
+    def test_fsdp_expt_device_mesh(self):
+        """Test that expt_device_mesh is None for dense models and not None for MoE models."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+        )
+        input_dim, output_dim = 13, 17
+
+        # Dense model: expt_device_mesh should not be built without MoE config
+        dense_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        dense_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        fsdp_dense = FullyShardedDataParallel(
+            config=dense_config,
+            ddp_config=fsdp_config,
+            module=dense_model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        assert (
+            fsdp_dense.megatron_fsdp_dist_index.expt_device_mesh is None
+        ), "Dense model: expt_device_mesh should be None"
+        fsdp_dense.stop_communication()
+
+        # MoE model: expt_device_mesh should be built when num_moe_experts is set
+        moe_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1, num_moe_experts=4
+        )
+        moe_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        fsdp_moe = FullyShardedDataParallel(
+            config=moe_config,
+            ddp_config=fsdp_config,
+            module=moe_model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        assert (
+            fsdp_moe.megatron_fsdp_dist_index.expt_device_mesh is not None
+        ), "MoE model: expt_device_mesh should not be None"
+        fsdp_moe.stop_communication()
+
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
