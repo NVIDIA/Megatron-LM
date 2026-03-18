@@ -1313,15 +1313,15 @@ class ParameterGroup:
             Buffer used to store main model weights for data-parallel operations.
         main_grad_buffer (Optional[DataParallelBuffer]):
             Buffer used to store main gradients for data-parallel operations.
-        hsdp_wbuf (Optional[DataParallelBuffer]):
-            Buffer for weights used in Hybrid Sharded Data Parallel (HSDP).
-            Exists only if full sharding (HFSDP) is enabled in HSDP.
-        hsdp_wtbuf (Optional[DataParallelBuffer]):
-            Buffer for transpose weights used in HSDP.
-            Exists only if full sharding (HFSDP) is enabled in HSDP.
-        hsdp_gbuf (Optional[DataParallelBuffer]):
-            Buffer for gradients used in HSDP.
-            Exists only if full sharding (HFSDP) is enabled in HSDP.
+        hfsdp_helper_wbuf (Optional[DataParallelBuffer]):
+            Inner-DP helper buffer that owns persistent HFSDP parameter shards.
+            Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
+        hfsdp_helper_wtbuf (Optional[DataParallelBuffer]):
+            Inner-DP helper buffer that stores transpose weights for FP8/MXFP8.
+            Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
+        hfsdp_helper_gbuf (Optional[DataParallelBuffer]):
+            Inner-DP helper buffer that owns persistent HFSDP gradient shards.
+            Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
         hsdp_comm_gbuf (Optional[DataParallelBuffer]):
             Extra buffer to allocate buffers that enable custom gradient
             communication data-types when using HSDP or HFSDP only.
@@ -1339,9 +1339,9 @@ class ParameterGroup:
     transpose_weight_buffer: Optional[DataParallelBuffer] = None
     main_weight_buffer: Optional[DataParallelBuffer] = None
     main_grad_buffer: Optional[DataParallelBuffer] = None
-    hsdp_wbuf: Optional[DataParallelBuffer] = None
-    hsdp_wtbuf: Optional[DataParallelBuffer] = None
-    hsdp_gbuf: Optional[DataParallelBuffer] = None
+    hfsdp_helper_wbuf: Optional[DataParallelBuffer] = None
+    hfsdp_helper_wtbuf: Optional[DataParallelBuffer] = None
+    hfsdp_helper_gbuf: Optional[DataParallelBuffer] = None
     hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
 
@@ -2321,27 +2321,27 @@ class ParamAndGradBuffer:
             if should_create_hfsdp_helper_buffers:
                 # Initialize the HSDP weight buffer.
                 wbuf = group.model_weight_buffer
-                group.hsdp_wbuf = _create_hfsdp_helper_buffer(
+                group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
                     group.model_weight_buffer,
                     inner_dp_group=inner_dp_group,
                     is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
                 )
 
                 if group.transpose_weight_buffer is not None:
-                    group.hsdp_wtbuf = _create_hfsdp_helper_buffer(
+                    group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(
                         group.transpose_weight_buffer,
                         inner_dp_group=inner_dp_group,
                         is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
                     )
 
                 if should_create_grad_buffer_or_main_weight_buffer:
-                    group.hsdp_gbuf = _create_hfsdp_helper_buffer(
+                    group.hfsdp_helper_gbuf = _create_hfsdp_helper_buffer(
                         group.main_grad_buffer,
                         inner_dp_group=inner_dp_group,
                         is_data_distributed=is_grad_buffer_distributed and inner_dp_group.size() > 1,
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
-                    buffer_size[group.main_grad_buffer.dtype] += group.hsdp_gbuf.data_size
+                    buffer_size[group.main_grad_buffer.dtype] += group.hfsdp_helper_gbuf.data_size
 
             # Only create an extra grad comm buffer for HSDP.
             if should_create_grad_buffer_or_main_weight_buffer and self.dist_index.use_hybrid_fsdp:
@@ -2416,9 +2416,9 @@ class ParamAndGradBuffer:
             wbuf = group.model_weight_buffer
             if wbuf:
                 with self.mem_alloc_context():
-                    if group.hsdp_wbuf:
+                    if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
-                            group.hsdp_wbuf,
+                            group.hfsdp_helper_wbuf,
                             wbuf,
                             mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
@@ -2433,9 +2433,9 @@ class ParamAndGradBuffer:
             tbuf = group.transpose_weight_buffer
             if tbuf:
                 with self.mem_alloc_context():
-                    if group.hsdp_wbuf:
+                    if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
-                            group.hsdp_wtbuf,
+                            group.hfsdp_helper_wtbuf,
                             tbuf,
                             mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
@@ -2641,21 +2641,21 @@ class ParamAndGradBuffer:
                 continue
             # Allocate the main grad buffer data, and attach it to the main grad buffer.
             with self.mem_alloc_context():
-                if group.hsdp_gbuf:
+                if group.hfsdp_helper_gbuf:
                     _init_hfsdp_helper_and_dp_buffer_data(
-                        group.hsdp_gbuf,
+                        group.hfsdp_helper_gbuf,
                         gbuf,
                         mem_alloc=_alloc,
                         outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
                     )
-                    group.hsdp_gbuf.data.zero_()
+                    group.hfsdp_helper_gbuf.data.zero_()
                 else:
                     # When not using HSDP, the main buffer shards across the FSDP group.
                     gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
                     gbuf.data.zero_()
             for item_id, p in enumerate(group.params):
                 # Attach the main grad buffer data and metadata to the parameter.
-                p._gbuf = group.hsdp_gbuf if group.hsdp_gbuf else gbuf
+                p._gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else gbuf
                 p._item_id = item_id
 
                 def main_grad_getter(p):
@@ -2724,9 +2724,9 @@ class ParamAndGradBuffer:
                     group.transpose_weight_buffer,
                     group.main_weight_buffer,
                     group.main_grad_buffer,
-                    group.hsdp_wbuf,
-                    group.hsdp_wtbuf,
-                    group.hsdp_gbuf,
+                    group.hfsdp_helper_wbuf,
+                    group.hfsdp_helper_wtbuf,
+                    group.hfsdp_helper_gbuf,
                 ]:
                     if buf is None:
                         continue
@@ -2756,8 +2756,8 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             if group.main_grad_buffer:
                 group.main_grad_buffer.data.zero_()
-            if group.hsdp_gbuf:
-                group.hsdp_gbuf.data.zero_()
+            if group.hfsdp_helper_gbuf:
+                group.hfsdp_helper_gbuf.data.zero_()
 
     def _init_distributed_params(self):
         """
@@ -3565,7 +3565,7 @@ class GradReducePipeline:
         """Get the FSDP buffer for the given bucket ID."""
         param_group = self.buffer.parameter_groups[bucket_id]
         if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
-            return param_group.hsdp_gbuf
+            return param_group.hfsdp_helper_gbuf
         return param_group.main_grad_buffer
 
     def _bucket_group_gradient_reduce(
@@ -4203,9 +4203,9 @@ class AllGatherPipeline:
         param_group = self.buffer.parameter_groups[bucket_id]
         if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
             if bwd and param_group.transpose_weight_buffer is not None:
-                return param_group.hsdp_wtbuf
+                return param_group.hfsdp_helper_wtbuf
             else:
-                return param_group.hsdp_wbuf
+                return param_group.hfsdp_helper_wbuf
         if bwd and param_group.transpose_weight_buffer is not None:
             return param_group.transpose_weight_buffer
         else:
