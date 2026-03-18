@@ -7,10 +7,17 @@ the async checkpoint save calls.
 import logging
 import time
 
+from abc import ABC
+
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
+except (ImportError, ModuleNotFoundError):
+    NVRxAsyncRequest = ABC
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +54,11 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
 
 
-def schedule_async_save(async_request: AsyncRequest):
+def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
     """Schedule the async save request.
 
     Args:
-        async_request (AsyncRequest): the async save request.
+        async_request (AsyncRequest | NVRxAsyncRequest): the async save request.
     """
     _async_calls_queue.schedule_async_request(async_request)
 

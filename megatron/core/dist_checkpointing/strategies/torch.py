@@ -60,9 +60,11 @@ from .base import (
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
 try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import CheckpointMetadataCache
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC
+    NVRxAsyncRequest = ABC
 
 try:
     if not torch.cuda.is_available():
@@ -652,7 +654,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
-    ) -> AsyncRequest:
+    ) -> AsyncRequest | NVRxAsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
         Args:
@@ -776,7 +778,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
 
-    def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
+    def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest | NVRxAsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
 
