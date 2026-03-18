@@ -861,7 +861,7 @@ def validate_args(args, defaults={}):
 
     # Map string data-type to torch.dtype.
     dtype_map = {
-        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
+        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None,
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
@@ -960,8 +960,12 @@ def validate_args(args, defaults={}):
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
     
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
-        assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+        if args.fp8 is not None:
+            assert args.transformer_impl == "inference_optimized", \
+                "fp8 with full_iteration_inference CUDA graphs is only supported with " \
+                "--transformer-impl=inference_optimized"
+            assert args.fp8_recipe == "mxfp8", \
+                "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
 
     if args.cuda_graph_impl == 'local':
         assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
@@ -1856,6 +1860,8 @@ def _add_inference_args(parser):
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference SSM states tensor')
+    group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     return parser
 
 
@@ -2181,6 +2187,16 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'lion'],
+                       help='Optimizer for scalar parameters (embeddings, biases, norms) '
+                       'when using muon. Defaults to adam.')
+    group.add_argument('--lion-beta1', type=float, default=0.95,
+                       help='First beta coefficient for Lion optimizer '
+                       '(used in sign update). Default: 0.95.')
+    group.add_argument('--lion-beta2', type=float, default=0.98,
+                       help='Second beta coefficient for Lion optimizer '
+                       '(used in momentum EMA update). Default: 0.98.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2378,7 +2394,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -3145,15 +3161,19 @@ def _add_experimental_args(parser):
                             'the precision in the kernel computation.')
 
     # Megatron-FSDP Arguments
-    group.add_argument('--megatron-fsdp-main-params-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16'],
+    group.add_argument('--megatron-fsdp-main-params-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main weight buffer utilized for distributed optimization "
-                            "and quantization with Megatron-FSDP.")
-    group.add_argument('--megatron-fsdp-main-grads-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16'],
+                            "and quantization with Megatron-FSDP. If 'auto', then the native model parameter "
+                            "data-type will be used for the main weight data-type.")
+    group.add_argument('--megatron-fsdp-main-grads-dtype', default='auto', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main gradient buffer utilized for distributed optimization "
-                            "with Megatron-FSDP.")
-    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='fp32', choices=['fp32', 'fp16', 'bf16'],
+                            "with Megatron-FSDP. If 'auto', then the native model gradient data-type will "
+                            "be used for the main gradient / accumulation data-type.")
+    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
                         help="When using Megatron-FSDP, this controls the data-type used when communicating "
-                             "model gradients during FSDP.")
+                             "model gradients during FSDP. If 'auto', then the main gradient data-type will "
+                             "be used for the gradient communication / reduction data-type. When using NCCL "
+                             "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
     
     return parser
 

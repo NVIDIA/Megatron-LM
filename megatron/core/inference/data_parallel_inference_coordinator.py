@@ -407,7 +407,7 @@ class DataParallelInferenceCoordinator:
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
-                Headers.INCREMENT_STALENESS,
+                Headers.SET_GENERATION_EPOCH,
                 Headers.STOP,
             ):
                 # Start by checking the current state against the control signal.
@@ -448,7 +448,9 @@ class DataParallelInferenceCoordinator:
                     self.state = self.CoordinatorState.STOPPING
 
                 # Broadcast the control signal if we're in a good state.
-                broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
+                # Forward the full deserialized payload so that data-bearing
+                # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
+                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
