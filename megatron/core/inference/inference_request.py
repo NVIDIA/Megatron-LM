@@ -8,6 +8,7 @@ from enum import Enum, auto
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
@@ -44,6 +45,16 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
@@ -180,9 +191,13 @@ class InferenceRequest:
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        # Serialize tensors.
+        # Serialize tensors and numpy arrays.
         obj = {
-            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            k: (
+                ("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray)
+                else v
+            )
             for k, v in obj.items()
         }
         return obj
@@ -221,10 +236,12 @@ class InferenceRequest:
             else SamplingParams.deserialize(obj["inference_parameters"])
         )
 
-        # Deserialize tensors and sampling params.
+        # Deserialize tensors, numpy arrays, and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+            elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -362,8 +379,12 @@ class DynamicInferenceRequest(InferenceRequest):
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
-    routing_indices: Optional[torch.Tensor] = None
+    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps.
+    # Stored as numpy array (int16/int32) on CPU.
+    routing_indices: Optional[np.ndarray] = None
+    # block_cache_key is set when routing_indices are written to block store.
+    # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.
+    block_cache_key: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
@@ -377,14 +398,13 @@ class DynamicInferenceRequest(InferenceRequest):
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = self.prompt_tokens
+            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
-        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
+        # Compute block hashes for prefix matching
         if (
             self.enable_prefix_caching
             and self.block_size_tokens is not None
             and self.prompt_tokens is not None
-            and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
 
@@ -695,8 +715,10 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = np.concatenate(routing_parts)
+        block_cache_key = self.requests[-1].block_cache_key
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -727,12 +749,53 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
-            block_size_tokens=self.requests[0].block_size_tokens,
-            enable_prefix_caching=self.requests[0].enable_prefix_caching,
-            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            block_cache_key=block_cache_key,
         )
 
         return request
+
+    def dump_routing_indices_to_block_store(self, block_store_instance, block_store_instance_rank, block_store_instance_id):
+        """Write routing indices to block store and replace with cache key.
+
+        Mirrors vLLM serving.py _maybe_store_moe_topk_indices.
+        Merges routing_indices across all sub-requests, writes to block store,
+        sets block_cache_key, and clears routing_indices to free memory.
+        """
+        import logging
+        import ray
+
+        parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if not parts:
+            return
+
+        routing_indices = np.concatenate(parts) if len(parts) > 1 else parts[0]
+        req_id = str(self.requests[0].request_id)
+
+        ray.get(
+            block_store_instance.put_numpy.remote(
+                req_id,
+                "moe_topk_indices",
+                routing_indices,
+            )
+        )
+
+        block_cache_key = {
+            "instance_rank": block_store_instance_rank,
+            "instance_id": block_store_instance_id,
+            "req_id": req_id,
+            "key": "moe_topk_indices",
+        }
+
+        logging.info(
+            f"Block store put: req_id={req_id} "
+            f"shape={list(routing_indices.shape)} "
+            f"dtype={routing_indices.dtype}"
+        )
+
+        # Set cache key and clear indices on all sub-requests.
+        for r in self.requests:
+            r.block_cache_key = block_cache_key
+            r.routing_indices = None
 
     def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.

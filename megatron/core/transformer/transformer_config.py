@@ -916,6 +916,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
+    inference_disable_torch_grouped_mm: bool = False
+    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
+    falling back to TE GroupedGEMM. """
+
     inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
@@ -1177,7 +1181,8 @@ class TransformerConfig(ModelParallelConfig):
                     "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-
+           
+               
             if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
                     "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
@@ -1186,8 +1191,13 @@ class TransformerConfig(ModelParallelConfig):
                     "graphs (--cuda-graph-impl=none) or use a non-gated activation "
                     "(e.g. squared_relu)."
                 )
-
-            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+            
+        
+            assert self.inference_grouped_gemm_backend in (
+                'auto',
+                'torch',
+                'te',
+            ), (
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
             )
@@ -2213,6 +2223,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_disable_triton_nvls_kernels is only supported "
+                "for inference_optimized transformer implementation."
+            )
+
+        if self.inference_disable_torch_grouped_mm:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_torch_grouped_mm is only supported "
                 "for inference_optimized transformer implementation."
             )
 
