@@ -2324,21 +2324,24 @@ class ParamAndGradBuffer:
                 group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
                     group.model_weight_buffer,
                     inner_dp_group=inner_dp_group,
-                    is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
+                    is_data_distributed=is_main_weight_buffer_distributed
+                    and inner_dp_group.size() > 1,
                 )
 
                 if group.transpose_weight_buffer is not None:
                     group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(
                         group.transpose_weight_buffer,
                         inner_dp_group=inner_dp_group,
-                        is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
+                        is_data_distributed=is_main_weight_buffer_distributed
+                        and inner_dp_group.size() > 1,
                     )
 
                 if should_create_grad_buffer_or_main_weight_buffer:
                     group.hfsdp_helper_gbuf = _create_hfsdp_helper_buffer(
                         group.main_grad_buffer,
                         inner_dp_group=inner_dp_group,
-                        is_data_distributed=is_grad_buffer_distributed and inner_dp_group.size() > 1,
+                        is_data_distributed=is_grad_buffer_distributed
+                        and inner_dp_group.size() > 1,
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hfsdp_helper_gbuf.data_size
@@ -2420,8 +2423,12 @@ class ParamAndGradBuffer:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wbuf,
                             wbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
-                            outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
+                            mem_alloc=lambda size, dtype: torch.empty(
+                                size, dtype=dtype, device=self.device
+                            ),
+                            outer_dp_group=self.dist_index.get_outer_fsdp_group(
+                                is_expert_parallel=group.is_expert_param
+                            ),
                         )
                     else:
                         # When not using HSDP, the main buffer shards across the FSDP group.
@@ -2437,8 +2444,12 @@ class ParamAndGradBuffer:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
                             tbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
-                            outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
+                            mem_alloc=lambda size, dtype: torch.empty(
+                                size, dtype=dtype, device=self.device
+                            ),
+                            outer_dp_group=self.dist_index.get_outer_fsdp_group(
+                                is_expert_parallel=group.is_expert_param
+                            ),
                         )
                     else:
                         # Initialize the transpose buffer.
@@ -2646,7 +2657,9 @@ class ParamAndGradBuffer:
                         group.hfsdp_helper_gbuf,
                         gbuf,
                         mem_alloc=_alloc,
-                        outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
+                        outer_dp_group=self.dist_index.get_outer_fsdp_group(
+                            is_expert_parallel=group.is_expert_param
+                        ),
                     )
                     group.hfsdp_helper_gbuf.data.zero_()
                 else:

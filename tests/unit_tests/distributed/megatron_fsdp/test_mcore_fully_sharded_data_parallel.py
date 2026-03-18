@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import random
 import copy
+import random
 
 import numpy as np
 import pytest
@@ -12,15 +12,13 @@ from torch.testing import assert_close
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import (
-    HAVE_TE_MXFP8TENSOR
-)
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -763,8 +761,7 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fsdp_double_buffer=False,
+                    data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
                 ),
                 id="optim_grads_params_no_double_buffer",
             ),
@@ -787,7 +784,7 @@ class TestMegatronFSDPE2E:
             distopt_spec_configs = copy.deepcopy(spec_configs)
             distopt_spec_configs["fp8_param_gather"] = False
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True, **distopt_spec_configs,
+                use_distributed_optimizer=True, **distopt_spec_configs
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
