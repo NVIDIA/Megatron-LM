@@ -9,13 +9,12 @@ import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
-import numpy as np
 import msgpack
+import numpy as np
 import pytest
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -25,6 +24,7 @@ from megatron.core.inference.engines.dynamic_engine import (
     EngineState,
     RequestEntry,
 )
+from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (

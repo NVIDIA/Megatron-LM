@@ -321,9 +321,7 @@ class DataParallelInferenceCoordinator:
             match = self.hash_table.match_vector(request_hashes)
 
             # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
-            free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(
-                np.float64
-            )
+            free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
             scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
 
             # Mask out inactive ranks.
@@ -351,10 +349,9 @@ class DataParallelInferenceCoordinator:
                 continue
             # Among ranks sharing this prefix, pick the least-loaded one.
             # Ties on load are broken by most-recent timestamp (higher is better).
-            best_idx = int(min(
-                active_indices,
-                key=lambda i: (self._pending_counts[i], -timestamps[i]),
-            ))
+            best_idx = int(
+                min(active_indices, key=lambda i: (self._pending_counts[i], -timestamps[i]))
+            )
             return self._identities_list[best_idx]
 
         return self.get_next_data_parallel_rank()
