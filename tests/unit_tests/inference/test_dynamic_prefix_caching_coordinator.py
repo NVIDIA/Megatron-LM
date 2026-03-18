@@ -596,9 +596,7 @@ class TestLoadAwarePrefixRouting:
         assigned_ranks = []
         for _ in range(6):
             rank = coordinator.get_best_data_parallel_rank(hashes)
-            coordinator._rank_pending_count[rank] = (
-                coordinator._rank_pending_count.get(rank, 0) + 1
-            )
+            coordinator._rank_pending_count[rank] = coordinator._rank_pending_count.get(rank, 0) + 1
             assigned_ranks.append(rank)
 
         # Each rank should get exactly 2 of the 6 requests.

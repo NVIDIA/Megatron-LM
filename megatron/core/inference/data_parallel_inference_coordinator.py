@@ -285,8 +285,7 @@ class DataParallelInferenceCoordinator:
                 # Among ranks sharing this prefix, pick the least-loaded one.
                 # Ties on load are broken by most-recent timestamp (higher is better).
                 best_rank = min(
-                    rank_info,
-                    key=lambda r: (self._rank_pending_count.get(r, 0), -rank_info[r]),
+                    rank_info, key=lambda r: (self._rank_pending_count.get(r, 0), -rank_info[r])
                 )
                 return best_rank
 
