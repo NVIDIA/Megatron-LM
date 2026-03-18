@@ -17,7 +17,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, is_graph_capturing
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP

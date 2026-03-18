@@ -92,6 +92,27 @@ def _sanitize_messages_for_template(messages):
             sanitized.append(message)
             continue
         msg_copy = dict(message)
+        content = msg_copy.get("content")
+        # OpenAI-style multimodal/text content may arrive as a list of blocks.
+        # HF/Jinja chat templates used by this server expect plain strings.
+        if isinstance(content, list):
+            text_chunks = []
+            for chunk in content:
+                if isinstance(chunk, dict):
+                    if chunk.get("type") == "text":
+                        text_chunks.append(str(chunk.get("text", "")))
+                    elif "text" in chunk:
+                        text_chunks.append(str(chunk.get("text", "")))
+                elif isinstance(chunk, str):
+                    text_chunks.append(chunk)
+            msg_copy["content"] = "".join(text_chunks)
+        elif isinstance(content, dict):
+            msg_copy["content"] = str(content.get("text", ""))
+        elif content is None:
+            msg_copy["content"] = ""
+        elif not isinstance(content, str):
+            msg_copy["content"] = str(content)
+
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
             sanitized_tool_calls = []
