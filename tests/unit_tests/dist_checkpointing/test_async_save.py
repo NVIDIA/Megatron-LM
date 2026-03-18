@@ -102,7 +102,11 @@ class TestAsyncSave:
             if async_save:
                 async_calls = AsyncCallsQueue()
                 async_request = save(
-                    sharded_state_dict, ckpt_dir, save_strategy, async_sharded_save=True
+                    sharded_state_dict,
+                    ckpt_dir,
+                    save_strategy,
+                    async_sharded_save=True,
+                    async_strategy="mcore",
                 )
                 async_calls.schedule_async_request(async_request)
                 async_calls.maybe_finalize_async_calls(blocking=True)
