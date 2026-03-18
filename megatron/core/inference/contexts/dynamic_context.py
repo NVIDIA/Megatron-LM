@@ -252,6 +252,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
+        self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
         self.use_triton_conv1d = inference_config.use_triton_conv1d
         self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
 

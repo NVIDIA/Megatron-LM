@@ -543,6 +543,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.enable_prefix_caching,
                     self.context.prefix_caching_coordinator_policy,
                     coordinator_schedule_output_path,
+                    self.context.prefix_caching_routing_alpha,
+                    self.context.max_requests,
                 ),
             )
             self.inference_coordinator_process.start()

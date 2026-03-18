@@ -260,6 +260,12 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
+    prefix_caching_routing_alpha: float = 0.5
+    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
+    Higher alpha favors prefix cache hits; lower alpha favours load balance.
+    Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
     prefix_caching_mamba_gb: Optional[float] = None
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers

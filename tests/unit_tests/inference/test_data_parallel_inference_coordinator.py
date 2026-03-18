@@ -691,6 +691,8 @@ def _make_routing_coordinator(
     coord.hash_to_rank_info = {}
     coord._assignment_counter = 0
     coord.block_size_tokens = 64
+    coord.prefix_caching_routing_alpha = 0.5
+    coord.max_requests = None
     return coord
 
 

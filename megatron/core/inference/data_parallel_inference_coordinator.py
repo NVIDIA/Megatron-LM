@@ -92,6 +92,8 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        prefix_caching_routing_alpha: float = 0.5,
+        max_requests: int | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -106,6 +108,10 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
+            prefix_caching_routing_alpha (float): Weight for prefix-aware routing score:
+                score = alpha * match + (1 - alpha) * normalized_load.
+            max_requests (Optional[int]): Max concurrent requests per rank, used to
+                compute normalized_load for prefix-aware scoring.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -188,6 +194,8 @@ class DataParallelInferenceCoordinator:
         self.hash_to_rank_info = {}  # Dict[int, Dict[bytes, int]]: hash → {rank → timestamp}
         self._assignment_counter = 0
         self._rank_pending_count = {}  # Dict[bytes, int]: rank identity → in-flight request count
+        self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+        self.max_requests = max_requests
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
@@ -271,18 +279,14 @@ class DataParallelInferenceCoordinator:
         return min(idle_ranks, key=lambda r: self.identity_to_rank_index[r])
 
     def get_best_data_parallel_rank(self, request_hashes):
-        """Select the best DP rank based on prefix cache affinity.
+        """Select the best DP rank based on prefix cache affinity and load.
 
-        If any rank has zero pending requests it is always selected first
-        (ties broken by lowest rank index), regardless of routing policy.
-        Otherwise the chosen routing policy is used.
+        Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
+        where match is 1 if the rank has a prefix hit, 0 otherwise, and
+        normalized_load = free_slots / max_requests (higher means more free capacity).
 
-        Iterates request hashes in reverse order and picks the rank that cached
-        the longest matching prefix (the furthest hash found). Since hashes are
-        parent-chained, finding hash[i] in a rank guarantees hash[0..i-1] are
-        also present. Among ranks that share the longest match, the least-loaded
-        rank (fewest pending requests) is preferred. Ties on load are broken by
-        most-recent timestamp. Falls back to round-robin when no rank matches.
+        When max_requests is not set, falls back to the original behaviour:
+        idle ranks first, then prefix affinity with load-aware tiebreaking.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -290,17 +294,57 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        # Always prioritize completely idle ranks regardless of routing policy.
-        idle_rank = self._get_idle_rank()
-        if idle_rank is not None:
-            return idle_rank
-
         if (
             not self.enable_prefix_caching
             or not request_hashes
             or self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
         ):
+            # For round-robin or when prefix caching is off, still prefer idle ranks.
+            idle_rank = self._get_idle_rank()
+            if idle_rank is not None:
+                return idle_rank
             return self.get_next_data_parallel_rank()
+
+        # When max_requests is available, use scoring function across all ranks.
+        if self.max_requests is not None and self.max_requests > 0:
+            alpha = self.prefix_caching_routing_alpha
+
+            # Build the set of hashes for quick lookup.
+            request_hash_set = set(request_hashes)
+
+            best_rank = None
+            best_score = -1.0
+
+            for identity in self.identities_of_data_parallel_ranks:
+                # Determine prefix match (binary).
+                match = 0.0
+                rank_has_match = any(
+                    identity in self.hash_to_rank_info.get(h, {}) for h in request_hash_set
+                )
+                if rank_has_match:
+                    match = 1.0
+
+                # Compute normalized load (free capacity fraction).
+                pending = self._rank_pending_count.get(identity, 0)
+                free_slots = max(0, self.max_requests - pending)
+                normalized_load = free_slots / self.max_requests
+
+                score = alpha * match + (1.0 - alpha) * normalized_load
+
+                # Tiebreak: prefer lower rank index for determinism.
+                rank_idx = self.identity_to_rank_index[identity]
+                if score > best_score or (score == best_score and rank_idx < self.identity_to_rank_index.get(best_rank, float('inf'))):
+                    best_score = score
+                    best_rank = identity
+
+            if best_rank is not None:
+                return best_rank
+            return self.get_next_data_parallel_rank()
+
+        # Fallback: max_requests not set, use original idle-first + prefix affinity.
+        idle_rank = self._get_idle_rank()
+        if idle_rank is not None:
+            return idle_rank
 
         # Reverse scan: first match is the longest prefix (parent-chained hashes).
         for h in reversed(request_hashes):
@@ -563,6 +607,8 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        prefix_caching_routing_alpha: float = 0.5,
+        max_requests: int | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -581,6 +627,8 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching (bool): Whether prefix caching is enabled.
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
             schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
+            prefix_caching_routing_alpha (float): Weight for prefix-aware routing score.
+            max_requests (Optional[int]): Max concurrent requests per rank.
         """
         coordinator = cls(
             pipe_connection,
@@ -592,6 +640,8 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             schedule_output_path=schedule_output_path,
+            prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            max_requests=max_requests,
         )
         ready_event.set()
         try:
