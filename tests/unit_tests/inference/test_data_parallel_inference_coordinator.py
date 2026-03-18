@@ -797,8 +797,8 @@ class TestIdleRankPrioritization:
         chosen = coord.get_best_data_parallel_rank([fake_hash])
         assert chosen == b"rank-1"
 
-    def test_idle_rank_with_round_robin_policy(self):
-        """Idle rank takes priority even when policy is ROUND_ROBIN."""
+    def test_round_robin_policy_ignores_idle_rank(self):
+        """ROUND_ROBIN policy does naive round-robin regardless of load."""
         coord = _make_routing_coordinator(
             num_ranks=3,
             enable_prefix_caching=True,
@@ -808,11 +808,12 @@ class TestIdleRankPrioritization:
         coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
         # rank-2 is idle
 
-        # Advance round-robin so it would normally pick rank-0.
+        # Round-robin should cycle through ranks regardless of load.
         coord._round_robin_idx = 0
-
-        chosen = coord.get_best_data_parallel_rank([])
-        assert chosen == b"rank-2"
+        identities = list(coord.identities_of_data_parallel_ranks)
+        for i in range(len(identities)):
+            chosen = coord.get_best_data_parallel_rank([99])
+            assert chosen == identities[i]
 
     def test_pending_count_zero_explicit(self):
         """A rank with an explicit pending count of 0 is treated as idle."""

@@ -305,12 +305,11 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if (
-            not self.enable_prefix_caching
-            or not request_hashes
-            or self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN
-        ):
-            # For round-robin or when prefix caching is off, still prefer idle ranks.
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN:
+            return self.get_next_data_parallel_rank()
+
+        if not self.enable_prefix_caching or not request_hashes:
+            # Prefix caching off or no hashes: prefer idle ranks, fall back to round-robin.
             idle_rank = self._get_idle_rank()
             if idle_rank is not None:
                 return idle_rank
