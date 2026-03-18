@@ -303,6 +303,11 @@ class TestCoordinatorPrefixRouting:
         coordinator = make_coordinator_direct()
         hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
 
+        # Give all ranks a non-zero pending count so _get_idle_rank doesn't
+        # short-circuit to the lowest-index idle rank.
+        for identity in coordinator.identities_of_data_parallel_ranks:
+            coordinator._rank_pending_count[identity] = 1
+
         rank1 = coordinator.get_best_data_parallel_rank(hashes)
         rank2 = coordinator.get_best_data_parallel_rank(hashes)
         # Round-robin cycles through ranks.
@@ -348,6 +353,8 @@ class TestCoordinatorPrefixRouting:
     def test_empty_hashes_uses_round_robin(self):
         """Empty hash list falls back to round-robin."""
         coordinator = make_coordinator_direct()
+        for identity in coordinator.identities_of_data_parallel_ranks:
+            coordinator._rank_pending_count[identity] = 1
         rank1 = coordinator.get_best_data_parallel_rank([])
         rank2 = coordinator.get_best_data_parallel_rank([])
         assert rank1 != rank2
@@ -355,6 +362,8 @@ class TestCoordinatorPrefixRouting:
     def test_disabled_prefix_caching_uses_round_robin(self):
         """With prefix caching disabled, always uses round-robin."""
         coordinator = make_coordinator_direct(enable_prefix_caching=False)
+        for identity in coordinator.identities_of_data_parallel_ranks:
+            coordinator._rank_pending_count[identity] = 1
         rank1 = coordinator.get_best_data_parallel_rank([1, 2, 3])
         rank2 = coordinator.get_best_data_parallel_rank([1, 2, 3])
         assert rank1 != rank2
@@ -556,6 +565,10 @@ class TestFirstPrefixBlockRouting:
 
         # rank_0 has block 1 (second block), but not block 0.
         coordinator.hash_to_rank_info.setdefault(hashes[1], {})[rank_0] = 1
+
+        # Mark all ranks as busy so _get_idle_rank doesn't short-circuit.
+        for identity in coordinator.identities_of_data_parallel_ranks:
+            coordinator._rank_pending_count[identity] = 1
 
         # No rank has the first block, so round-robin.
         r1 = coordinator.get_best_data_parallel_rank(hashes[:1])
