@@ -26,7 +26,12 @@ class AsyncZMQCommunicator:
     on the CPU.
     """
 
-    def __init__(self, zmq_context: zmq.Context, process_group: dist.ProcessGroup, hostname: str | None = None):
+    def __init__(
+        self,
+        zmq_context: zmq.Context,
+        process_group: dist.ProcessGroup,
+        hostname: str | None = None,
+    ):
         """
         Constructor for AsyncZMQCommunicator. Sets up ZMQ sockets
         for communication among ranks in the given process group.

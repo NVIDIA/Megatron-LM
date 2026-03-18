@@ -633,14 +633,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname,
+                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
             self.world_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=None, hostname=hostname,
+                self.zmq_context, process_group=None, hostname=hostname
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
