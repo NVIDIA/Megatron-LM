@@ -6,12 +6,25 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-import triton
-import triton.language as tl
 from packaging import version
 
-TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
+try:
+    import triton
+    import triton.language as tl
 
+    TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
+    TRITON3 = False
 
 if TRITON3:
 
@@ -20,7 +33,7 @@ if TRITON3:
         """Optimized softplus."""
         return tl.math.log(tl.math.exp(dt) + 1)
 
-else:
+elif HAVE_TRITON:
 
     @triton.jit
     def softplus(dt):
