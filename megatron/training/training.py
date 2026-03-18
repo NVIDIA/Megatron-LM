@@ -3027,6 +3027,9 @@ def train(
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
             learning_rate = None
+        # Free cached activations on the first iteration to avoid NCCL OOM during logging.
+        if is_first_iteration:
+            torch.cuda.empty_cache()
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
