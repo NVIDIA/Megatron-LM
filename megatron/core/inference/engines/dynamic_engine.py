@@ -962,7 +962,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
-                self.controller.tokenize_prompt(stop_word, add_BOS=False)
+                self.controller.tokenize_prompt(self.controller.tokenizer, stop_word, add_BOS=False)
                 for stop_word in request.sampling_params.stop_words
             ]
             request.stop_word_ids = stop_word_ids
@@ -996,9 +996,13 @@ class DynamicInferenceEngine(AbstractEngine):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
             try:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
+                prompt_token_ids = self.controller.tokenize_prompt(
+                    self.controller.tokenizer, prompt, sampling_params.add_BOS
+                )
             except TypeError:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt)
+                prompt_token_ids = self.controller.tokenize_prompt(
+                    self.controller.tokenizer, prompt
+                )
             tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
             )
@@ -1382,9 +1386,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 for i in range(self.num_speculative_tokens + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        if i > 0:
-                            request.generated_tokens = request.generated_tokens[:-i]
-                        return True, i
+                        trim = (
+                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
+                        )
+                        if trim > 0:
+                            request.generated_tokens = request.generated_tokens[:-trim]
+                        return True, trim
         return False, 0
 
     def get_prefix_coordination_metrics(self) -> dict:
@@ -1760,11 +1767,15 @@ class DynamicInferenceEngine(AbstractEngine):
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
-                        request.prompt = self.controller.tokenizer.detokenize(
-                            request.prompt_tokens.tolist()
+                        request.prompt = self.controller.detokenize(
+                            self.controller.tokenizer,
+                            request.prompt_tokens.tolist(),
+                            remove_EOD=False,
                         )
-                    request.generated_text = self.controller.tokenizer.detokenize(
-                        request.generated_tokens
+                    request.generated_text = self.controller.detokenize(
+                        self.controller.tokenizer,
+                        request.generated_tokens,
+                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
 
