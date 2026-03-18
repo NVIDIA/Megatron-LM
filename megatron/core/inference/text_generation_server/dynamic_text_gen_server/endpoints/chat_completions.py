@@ -8,6 +8,7 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -139,6 +140,22 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
+def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+
+    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
+    Before applying the chat template, we must inline those tags back into content.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.pop("reasoning_content", None)
+        if reasoning_content is not None:
+            content = message.get("content") or ""
+            message["content"] = f"<think>{reasoning_content}</think>{content}"
+    return messages
+
+
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -227,10 +244,14 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            if hasattr(tokenizer, 'apply_chat_template'):
+            if (
+                hasattr(tokenizer, 'apply_chat_template')
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
                 prompt_tokens = tokenizer.apply_chat_template(
                     template_messages,
                     tokenize=True,
@@ -371,13 +392,9 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge().serialize()
-
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in result.items()
-            }
+        for result_item in batch_results:
+            result = result_item if isinstance(result_item, dict) else result_item.serialize()
+            result = unwrap_serialized_tensors(result)
 
             if result["status"] == "FAILED":
                 if result["sampling_params"]["num_tokens_to_generate"] <= 0:
@@ -441,7 +458,7 @@ try:
             if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
-                message["reasoning"] = metadata["reasoning"]
+                message["reasoning_content"] = metadata["reasoning"]
 
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
@@ -468,8 +485,8 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_staleness"] = result["policy_staleness"]
-            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )

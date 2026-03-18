@@ -136,7 +136,8 @@ class TestTextGenerationController:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     def test_sample_from_logits(self):
@@ -1024,3 +1025,348 @@ class TestTextGenerationController:
                 assert (
                     expected == actual
                 ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
+
+    @pytest.mark.internal
+    def test_speculative_verify_tokens(self):
+        """Test consecutive token acceptance logic for speculative decoding."""
+        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+
+        # Enable speculative decoding
+        self.text_generation_controller.num_speculative_tokens = 2
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor(
+            [0, 0], device='cuda'
+        )  # Decode requests
+        ctx.request_query_lengths = torch.tensor(
+            [3, 3], dtype=torch.int32, device='cuda'
+        )  # 1 sampled + 2 spec
+
+        # Init accepted tokens tensors
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Mock inputs: [Req 1 sampled, Req 1 spec1, Req 1 spec2, Req 2 sampled, Req 2 spec1, Req 2 spec2]
+        # Target tokens (what the model was fed): [T0, T1, T2, T3, T4, T5]
+        input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
+
+        # We need the sampling function to return a 1D tensor for base logits,
+        # and a 1D tensor for the flattened MTP logits.
+        def mock_sampling_func(logits, *args, **kwargs):
+            if logits.shape[0] == 6:
+                # Base logits -> return 1D tensor of shape [6]
+                # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
+                # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
+                return torch.tensor([11, 12, 99, 99, 22, 23], dtype=torch.long, device='cuda')
+            else:
+                # MTP logits -> return 1D tensor of shape [12]
+                # The verification logic only uses base tokens, so we can return zeros here.
+                return torch.zeros((12,), dtype=torch.long, device='cuda')
+
+        # Override sampling to return our predictable mock outputs
+        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        # Mock logits matching input shape
+        logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            logits, input_ids
+        )
+
+        # Verify acceptance counts
+        accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
+        assert torch.equal(accepted_counts, torch.tensor([2, 0], device='cuda'))
+
+        # Verify accepted tokens tensor
+        accepted_tokens = self.text_generation_controller._accepted_tokens_per_request[:2]
+        # Req 1 accepted 2 tokens: 11, 12
+        assert torch.equal(accepted_tokens[0], torch.tensor([11, 12], device='cuda'))
+        # Req 2 accepted 0 tokens, should remain -1
+        assert torch.equal(accepted_tokens[1], torch.tensor([-1, -1], device='cuda'))
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_rewind_kv_cache(self, is_hybrid_model):
+        """Test KV cache state is properly rewound for rejected speculative tokens."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=3,
+            block_size_tokens=4,
+            max_requests=16,
+        )
+        self.text_generation_controller.num_speculative_tokens = 3
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+
+        # Initialize allocator and states
+        ctx.kv_block_allocator.total_avail = 100
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device='cuda')
+        ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device='cuda')
+
+        # Req 0: offset 2. Rewinding 2 tokens -> offset 0. No block released.
+        # Req 1: offset 1. Rewinding 3 tokens -> offset 2 (prev block). 1 block released.
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([2, 1], device='cuda')
+        ctx.request_last_kv_block_id[:2] = torch.tensor([50, 60], device='cuda')
+        ctx.request_to_kv_block_ids[:2, :4] = torch.tensor(
+            [[48, 49, 50, -1], [57, 58, 59, 60]], dtype=torch.int, device='cuda'
+        )
+
+        if is_hybrid_model:
+            ctx.is_hybrid_model = True
+            ctx.mamba_metadata = mock.MagicMock()
+            ctx.mamba_metadata.request_to_mamba_state_idx = torch.tensor([0, 1], device='cuda')
+            ctx.mamba_ssm_states = torch.zeros((1, 2, 16), device='cuda')
+            ctx.mamba_intermediate_ssm_states = torch.ones((1, 2, 4, 16), device='cuda') * 99
+            ctx.mamba_conv_states = torch.zeros((1, 2, 8), device='cuda')
+            ctx.mamba_intermediate_conv_states = torch.ones((1, 2, 4, 8), device='cuda') * 77
+
+        # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
+            [1, 0], device='cuda'
+        )
+
+        self.text_generation_controller._rewind_kv_cache()
+
+        # Assert offsets updated
+        assert torch.equal(
+            ctx.request_last_kv_block_offset[:2],
+            torch.tensor([0, 2], dtype=torch.int, device='cuda'),
+        )
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:2], torch.tensor([8, 12], dtype=torch.int, device='cuda')
+        )
+
+        # Assert block counts and IDs updated for boundary crossing
+        assert torch.equal(
+            ctx.request_kv_block_counts[:2], torch.tensor([3, 3], dtype=torch.int, device='cuda')
+        )
+        assert torch.equal(
+            ctx.request_last_kv_block_id[:2], torch.tensor([50, 59], dtype=torch.int, device='cuda')
+        )
+
+        # Assert released block is cleared
+        assert ctx.request_to_kv_block_ids[1, 3].item() == -1
+        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
+
+        if is_hybrid_model:
+            # Check Mamba state was restored from intermediate cache based on accepted counts
+            assert torch.all(ctx.mamba_ssm_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.mamba_ssm_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(ctx.mamba_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.mamba_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
+
+    @pytest.mark.internal
+    def test_speculative_multinomial_sampling(self):
+        """Test that speculative decoding can successfully use non-greedy sampling
+        (top_k > 1, top_p > 0) by flattening 3D MTP logits for torch.multinomial."""
+        num_spec = 3
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=2
+        )
+
+        # Enable speculative decoding
+        self.text_generation_controller.num_speculative_tokens = num_spec
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor(
+            [0, 0], device='cuda'
+        )  # Decode requests
+        # query lengths for decode with spec tokens is (1 + num_spec) = 4
+        ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
+
+        # Setup inputs
+        input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
+
+        # Create random logits
+        # Base logits shape: [1, 8, vocab_size]
+        logits = torch.randn(1, 8, self.vocab_size, device='cuda')
+
+        # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
+        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
+        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+
+        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
+        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+
+        try:
+            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+                logits, input_ids
+            )
+        except RuntimeError as e:
+            if "prob_dist must be 1 or 2 dim" in str(e):
+                pytest.fail("MTP logits were not flattened before calling multinomial sampling.")
+            else:
+                raise e
+
+        # Validate that sampling produced output arrays of the correct sizes
+        active_request_count = ctx.total_request_count
+        sampled_tokens = self.text_generation_controller._sampled_tokens_cuda[:active_request_count]
+        sampled_mtp_tokens = self.text_generation_controller._sampled_mtp_tokens_cuda[
+            :, :active_request_count
+        ]
+
+        assert sampled_tokens.shape == (2,)
+        assert sampled_mtp_tokens.shape == (num_spec, 2)
+
+    @pytest.mark.internal
+    def test_rewind_kv_cache_with_prefix_caching_ref_counts(self):
+        """Test that _rewind_kv_cache correctly decrements ref counts on shared blocks
+        when speculative token rejection causes a block boundary crossing."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            block_size_tokens=4,
+            enable_prefix_caching=True,
+            max_requests=16,
+        )
+
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+
+        # Req 0: 3 blocks, offset 1 in last block. Rewinding 1 token -> no block release.
+        # Req 1: 3 blocks, offset 0 in last block. Rewinding 2 tokens -> crosses back, release block.
+        ctx.request_kv_length_offsets[:2] = torch.tensor([9, 9], device='cuda')
+        ctx.request_kv_block_counts[:2] = torch.tensor([3, 3], device='cuda')
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([1, 0], device='cuda')
+        ctx.request_last_kv_block_id[:2] = torch.tensor([10, 20], device='cuda')
+        ctx.request_to_kv_block_ids[:2, :3] = torch.tensor(
+            [[8, 9, 10], [18, 19, 20]], dtype=torch.int, device='cuda'
+        )
+
+        # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
+        ctx.kv_block_allocator.block_ref_counts[20] = 2
+        ctx.kv_block_allocator.block_ref_counts[10] = 1
+
+        initial_avail = ctx.kv_block_allocator.total_avail
+
+        # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
+            [1, 0], device='cuda'
+        )
+
+        self.text_generation_controller._rewind_kv_cache()
+
+        # Req 1 should have released block 20 (ref count decremented).
+        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
+        # Block 10 should be untouched.
+        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
+
+    @pytest.mark.internal
+    def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
+        """Test that rewinding only releases the last block, never shared prefix blocks."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=3,
+            block_size_tokens=4,
+            max_requests=16,
+        )
+
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+
+        # 4 blocks. Offset 2 in last block. Rewinding 3 crosses into previous block.
+        ctx.request_kv_length_offsets[:1] = torch.tensor([14], device='cuda')
+        ctx.request_kv_block_counts[:1] = torch.tensor([4], device='cuda')
+        ctx.request_last_kv_block_offset[:1] = torch.tensor([2], device='cuda')
+        ctx.request_last_kv_block_id[:1] = torch.tensor([40], device='cuda')
+        ctx.request_to_kv_block_ids[0, :4] = torch.tensor(
+            [10, 20, 30, 40], dtype=torch.int, device='cuda'
+        )
+
+        # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
+        ctx.kv_block_allocator.total_avail = 50
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
+            [0], device='cuda'
+        )
+
+        self.text_generation_controller._rewind_kv_cache()
+
+        # Only block 40 should be released, not blocks 10, 20, or 30.
+        assert ctx.request_kv_block_counts[0].item() == 3
+        assert ctx.request_last_kv_block_id[0].item() == 30
+        assert ctx.request_to_kv_block_ids[0, 3].item() == -1
+        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
+
+        # Prefix blocks remain in request_to_kv_block_ids.
+        assert ctx.request_to_kv_block_ids[0, 0].item() == 10
+        assert ctx.request_to_kv_block_ids[0, 1].item() == 20
+        assert ctx.request_to_kv_block_ids[0, 2].item() == 30
+
+    @pytest.mark.internal
+    def test_speculative_mtp_position_ids_with_prefill(self):
+        """Test that _compute_serial_mtp_and_sample uses the correct position IDs
+        for a mixed batch of prefill and decode requests."""
+        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+
+        self.text_generation_controller.num_speculative_tokens = 2
+        self.text_generation_controller.num_mtp_heads = 2
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+
+        # Req 0: Decode, Req 1: Prefill
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 1], device='cuda')
+
+        # Req 0 has 10 previous tokens, just processed 3 (1 base + 2 spec)
+        # Req 1 has 0 previous tokens, just processed 15 (prefill)
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 0], dtype=torch.int32, device='cuda')
+        ctx.request_query_lengths[:2] = torch.tensor([3, 15], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        # Mock base token sampling (the first tokens fed into MTP)
+        self.text_generation_controller._sampled_tokens_cuda[:2] = torch.tensor(
+            [100, 200], device='cuda'
+        )
+
+        # Mock the MTP computation to record the position_ids it receives
+        unwrapped_model = self.text_generation_controller.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = torch.randn(2, 1, 32, device='cuda')
+        self.text_generation_controller._last_accepted_seq_indices = torch.tensor(
+            [0, 1], device='cuda'
+        )
+
+        captured_position_ids = []
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            captured_position_ids.append(position_ids.clone())
+            return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(
+            side_effect=mock_compute_mtp_single_step
+        )
+
+        # Mock _sample_from_logits_2d to return arbitrary dummy tokens
+        self.text_generation_controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([101, 201], device='cuda')
+        )
+
+        self.text_generation_controller._compute_serial_mtp_and_sample()
+
+        # The base_position for Req 0 should be 10 + 3 = 13
+        # The base_position for Req 1 should be 0 + 15 = 15
+        assert len(captured_position_ids) == 2
+        # Depth 0:
+        assert torch.equal(
+            captured_position_ids[0].squeeze(0), torch.tensor([13, 15], device='cuda')
+        )
+        # Depth 1:
+        assert torch.equal(
+            captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
+        )
