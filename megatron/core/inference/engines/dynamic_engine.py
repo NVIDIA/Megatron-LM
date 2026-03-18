@@ -453,6 +453,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -490,6 +491,9 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to `socket.gethostname()`. Should be set to a routable
+                address in multi-node settings where gethostname() may return 127.0.0.1.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -522,7 +526,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
