@@ -37,7 +37,9 @@ def test_reconfigure_num_microbatches_calculator():
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 16
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, None, None, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        0, [16, 16, 96], 32, 8, 2, None, None, False
+    )
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 16
 
@@ -65,12 +67,16 @@ def test_get_micro_batch_size():
 
 
 def test_update_num_microbatches():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 4, 2, None, None, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        0, [16, 8, 96], 32, 4, 2, None, None, False
+    )
     assert mb_calculator.get_num_microbatches() == 2
     mb_calculator.update_num_microbatches(48, False)
     assert mb_calculator.get_num_microbatches() == 3
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 8, 2, None, None, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        0, [16, 8, 96], 32, 8, 2, None, None, False
+    )
     with pytest.raises(AssertionError):
         mb_calculator.update_num_microbatches(49, True)
 
@@ -135,7 +141,9 @@ class TestRampupBatchsizeNumMicroBatchesCalculator:
 
 
 def test_ramp_up():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, None, None, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        0, [16, 16, 96], 32, 8, 2, None, None, False
+    )
     consumed_samples = 0
     count = 0
     expected_consumed_samples = [0, 16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
@@ -194,10 +202,7 @@ def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small()
     for the new world size.
     """
     calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
-        micro_batch_size=1,
-        data_parallel_size=512,
-        rank=0,
-        schedule="0:256 200000:512 600000:1024",
+        micro_batch_size=1, data_parallel_size=512, rank=0, schedule="0:256 200000:512 600000:1024"
     )
 
     # At consumed_samples=0, batch=256 < micro*dp=512.
