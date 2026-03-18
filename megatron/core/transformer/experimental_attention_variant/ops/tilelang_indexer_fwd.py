@@ -45,9 +45,10 @@ def _get_clean_logits_kernel(threads: int = 512, block_K: int = 4096):
 
 
 def _get_indexer_fwd_kernel(
-    heads: int, index_dim: int, block_N: int = 256, num_stages: int = 3, threads: int = 512
+    heads: int, index_dim: int, block_N: int = 256, num_stages: int = 3, threads: int = 512,
+    use_relu: bool = True,
 ):
-    key = (heads, index_dim, block_N, num_stages, threads)
+    key = (heads, index_dim, block_N, num_stages, threads, use_relu)
     with _tilelang_indexer_fwd_cache_lock:
         kernel = _tilelang_indexer_fwd_kernel_cache.pop(key, None)
         if kernel is None:
@@ -57,13 +58,14 @@ def _get_indexer_fwd_kernel(
                 block_N=block_N,
                 num_stages=num_stages,
                 threads=threads,
+                use_relu=use_relu,
             )
         _cache_put_lru(_tilelang_indexer_fwd_kernel_cache, key, kernel)
         return kernel
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-def tl_indexer_fwd_impl(heads, index_dim, block_N=256, num_stages=3, threads=512, block_Q=None):
+def tl_indexer_fwd_impl(heads, index_dim, block_N=256, num_stages=3, threads=512, block_Q=None, use_relu=True):
     """Build tilelang forward kernel for sparse indexer logits."""
     if block_Q is None:
         block_Q = 128 // heads
@@ -151,7 +153,8 @@ def tl_indexer_fwd_impl(heads, index_dim, block_N=256, num_stages=3, threads=512
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
                     s_reshaped[bn_i, bq_i, h_i] = (
-                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                        (T.max(s_reshaped[bn_i, bq_i, h_i], 0) if use_relu else s_reshaped[bn_i, bq_i, h_i])
+                        * weights[bq_i, h_i]
                     )
 
                 T.reduce_sum(s_reshaped, logits_shared, dim=-1, clear=True)
@@ -197,12 +200,12 @@ def clean_logits_(threads: int = 512, block_K: int = 4096):
     return clean_logits_kernel
 
 
-def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
+def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True, use_relu=True):
     """Run indexer forward kernel and optionally clean logits by row bounds."""
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
 
-    tl_indexer_fwd_kernel = _get_indexer_fwd_kernel(heads=heads, index_dim=index_dim)
+    tl_indexer_fwd_kernel = _get_indexer_fwd_kernel(heads=heads, index_dim=index_dim, use_relu=use_relu)
     logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
     tl_indexer_fwd_kernel(
         q.view(seq_len * heads, index_dim), kv, logits, weights, cu_seqlen_ks, cu_seqlen_ke

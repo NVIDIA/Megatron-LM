@@ -102,6 +102,33 @@ def _fake_lighting_indexer_for_test(
     return topk_scores, topk_idx
 
 
+def _fake_lighting_indexer_without_invalid_slot_mask_for_test(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_w: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    index_topk: int,
+    topk_indices: torch.Tensor | None = None,
+):
+    """Fake fused indexer that leaves invalid top-k slots unmasked."""
+    del topk_indices
+
+    logits = torch.einsum("qhd,kd->qhk", index_q.float(), index_k.float())
+    logits = torch.relu(logits) * index_w.float().unsqueeze(-1)
+    logits = logits.sum(dim=1)
+
+    key_pos = torch.arange(index_k.size(0), dtype=torch.int64, device=logits.device)
+    valid = (key_pos.unsqueeze(0) >= starts.to(torch.int64).unsqueeze(-1)) & (
+        key_pos.unsqueeze(0) < ends.to(torch.int64).unsqueeze(-1)
+    )
+    logits = logits.masked_fill(~valid, float("-inf"))
+
+    topk_k = min(index_topk, logits.size(-1))
+    topk_scores, topk_idx = torch.topk(logits, topk_k, dim=-1)
+    return topk_scores, topk_idx.to(torch.int32)
+
+
 def _fake_fused_scores_indices_for_test(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -452,6 +479,96 @@ class TestDSACPPositionHelpers:
         assert torch.equal(got_idx, ref_idx)
         torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-5)
 
+    def test_fused_topk_sanitizes_invalid_slots(self):
+        """Fused top-k wrapper should convert invalid kernel slots to -1."""
+        sq, skv, bsz, heads, dim = 6, 9, 2, 3, 8
+        topk = 4
+        block_size = 3
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.tensor([1, 2, 2, 3, 3, 4], dtype=torch.int32)
+
+        expected = []
+        for bi in range(bsz):
+            _, ref_idx = _fake_lighting_indexer_for_test(
+                q[:, bi], k[:, bi], weights[:, bi], starts, ends, topk
+            )
+            expected.append(ref_idx)
+        expected = torch.stack(expected, dim=0)
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_without_invalid_slot_mask_for_test,
+        ):
+            got = _fused_qk_topk_lighting(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+            )
+
+        assert got is not None
+        assert torch.equal(got, expected)
+
+    def test_fused_streaming_sparse_kl_sanitizes_invalid_slots(self):
+        """Streaming sparse-KL path should ignore invalid kernel slots beyond row bounds."""
+        sq, skv, bsz, heads, dim = 8, 10, 2, 4, 8
+        topk = 5
+        block_size = 4
+        softmax_scale = dim**-0.5
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        query = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        key = torch.randn(skv, bsz, 1, dim, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.tensor([1, 2, 2, 3, 3, 4, 4, 5], dtype=torch.int32)
+        fake_pg = _FakePGCollection()
+
+        ref_scores, ref_idx = _fake_fused_scores_indices_for_test(
+            q, k, weights, starts, ends, topk, block_size
+        )
+        ref_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=ref_scores,
+            topk_indices=ref_idx,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
+            loss_coeff=1.0,
+            pg_collection=fake_pg,
+        )
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_without_invalid_slot_mask_for_test,
+        ):
+            fused_out = _fused_qk_topk_lighting_with_streaming_sparse_kl(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+                query=query,
+                key=key,
+                softmax_scale=softmax_scale,
+                loss_coeff=1.0,
+                pg_collection=fake_pg,
+            )
+
+        assert fused_out is not None
+        got_idx, got_loss = fused_out
+        assert torch.equal(got_idx, ref_idx)
+        torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-5)
+
     def test_fused_bounds_disable_on_per_batch_mask_mismatch(self):
         """Fused bounds should disable when batched masks are not identical."""
         sq, skv, bsz = 5, 7, 2
@@ -561,6 +678,100 @@ class TestDSAAbsorbedParityCPU:
         out_abs = out_abs.view(sq, bsz, -1)
 
         torch.testing.assert_close(out_abs, out_non_abs, rtol=1e-4, atol=1e-5)
+
+
+class TestDSAIndexerLossRowMaskCPU:
+    """CPU tests for packed-row masking in DSA indexer loss."""
+
+    @staticmethod
+    def _fake_pg_collection():
+        class _FakeTP:
+            @staticmethod
+            def size():
+                return 1
+
+        class _FakeCollection:
+            tp = _FakeTP()
+
+        return _FakeCollection()
+
+    def test_dense_indexer_loss_ignores_padded_rows(self):
+        index_scores = torch.tensor([[[2.0, float("-inf")], [0.1, 0.9]]], dtype=torch.float32)
+        topk_indices = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
+        query = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+        key = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+        mask = torch.tensor([[0.0, float("-inf")], [0.0, 0.0]], dtype=torch.float32)
+
+        masked_loss = compute_dsa_indexer_loss(
+            index_scores=index_scores.clone(),
+            topk_indices=topk_indices,
+            query=query,
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            sparse_loss=False,
+            pg_collection=self._fake_pg_collection(),
+            mask=mask,
+            query_valid_rows=torch.tensor([True, False], dtype=torch.bool),
+        )
+        trimmed_loss = compute_dsa_indexer_loss(
+            index_scores=index_scores[:, :1, :].clone(),
+            topk_indices=topk_indices[:, :1, :].clone(),
+            query=query[:1].clone(),
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            sparse_loss=False,
+            pg_collection=self._fake_pg_collection(),
+            mask=mask[:1],
+        )
+
+        torch.testing.assert_close(masked_loss, trimmed_loss)
+
+    def test_sparse_indexer_loss_ignores_padded_rows(self):
+        index_topk_scores = torch.tensor([[[2.0, float("-inf")], [0.9, 0.1]]], dtype=torch.float32)
+        topk_indices = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
+        query = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+        key = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+
+        masked_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=index_topk_scores.clone(),
+            topk_indices=topk_indices,
+            query=query,
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            pg_collection=self._fake_pg_collection(),
+            query_valid_rows=torch.tensor([True, False], dtype=torch.bool),
+        )
+        trimmed_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=index_topk_scores[:, :1, :].clone(),
+            topk_indices=topk_indices[:, :1, :].clone(),
+            query=query[:1].clone(),
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            pg_collection=self._fake_pg_collection(),
+        )
+
+        torch.testing.assert_close(masked_loss, trimmed_loss)
+
+    def test_naive_topk_masks_all_invalid_slots_with_minus_one(self):
+        q = torch.tensor([[[[1.0]]]], dtype=torch.float32)
+        k = torch.tensor([[[1.0]], [[0.0]], [[0.0]]], dtype=torch.float32)
+        weights = torch.tensor([[[1.0]]], dtype=torch.float32)
+        mask = torch.tensor([[0.0, float("-inf"), float("-inf")]], dtype=torch.float32)
+
+        _, topk_indices = fused_qk_topk_naive(
+            q=q,
+            k=k,
+            weights=weights,
+            index_topk=3,
+            mask=mask,
+        )
+
+        expected = torch.tensor([[[0, -1, -1]]], dtype=torch.int64)
+        torch.testing.assert_close(topk_indices, expected)
 
 
 class TestRotateActivation:
@@ -1119,6 +1330,7 @@ class TestDSAIndexer:
             use_cpu_initialization=True,
             bf16=True,
             params_dtype=torch.bfloat16,
+            layernorm_epsilon=1e-5,
             # MLA specific configs
             q_lora_rank=64,
             kv_lora_rank=64,
@@ -1132,6 +1344,7 @@ class TestDSAIndexer:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=self.index_topk,
+            dsa_indexer_k_norm_epsilon=1e-6,
         )
 
         # Create indexer submodules spec
@@ -1160,6 +1373,52 @@ class TestDSAIndexer:
         assert self.indexer.index_n_heads == 8
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
+        assert self.indexer.k_norm.eps == pytest.approx(1e-6)
+
+    @pytest.mark.parametrize("interleaved", [False, True])
+    def test_dsa_indexer_rope_interleave_follows_config(self, interleaved):
+        """Ensure indexer RoPE uses the model-configured interleave convention."""
+        captured = {}
+
+        def _fake_apply_rotary_pos_emb(x, rotary_pos_emb, **kwargs):
+            captured["mla_rotary_interleaved"] = kwargs["mla_rotary_interleaved"]
+            return x
+
+        self.indexer.config.dsa_indexer_rope_interleaved = interleaved
+
+        x = torch.randn(2, 1, self.indexer.index_n_heads, self.indexer.index_head_dim, dtype=torch.bfloat16)
+        rotary_pos_emb = torch.randn(2, 1, 1, self.config.qk_pos_emb_head_dim, dtype=torch.bfloat16)
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.apply_rotary_pos_emb",
+            side_effect=_fake_apply_rotary_pos_emb,
+        ):
+            out = self.indexer._apply_rope(x, rotary_pos_emb, mscale=1.0)
+
+        assert captured["mla_rotary_interleaved"] is interleaved
+        assert out.shape == x.shape
+
+    @pytest.mark.parametrize("rotate_activation_enabled", [False, True])
+    def test_dsa_indexer_rotate_activation_follows_config(self, rotate_activation_enabled):
+        """Ensure indexer Hadamard rotation can be disabled for GLM5-compatible scoring."""
+        self.indexer.config.dsa_indexer_rotate_activation = rotate_activation_enabled
+
+        x = torch.randn(2, 1, self.config.hidden_size, dtype=torch.bfloat16)
+        qr = torch.randn(2, 1, self.config.q_lora_rank, dtype=torch.bfloat16)
+
+        with (
+            patch.object(self.indexer, "_apply_rope", side_effect=lambda t, *args, **kwargs: t),
+            patch(
+                "megatron.core.transformer.experimental_attention_variant.dsa.rotate_activation",
+                side_effect=lambda t: t,
+            ) as rotate_mock,
+        ):
+            q, k, _ = self.indexer.forward_before_topk(x, qr)
+
+        expected_calls = 2 if rotate_activation_enabled else 0
+        assert rotate_mock.call_count == expected_calls
+        assert q.shape[-1] == self.indexer.index_head_dim
+        assert k.shape[-1] == self.indexer.index_head_dim
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward(self, seqlen):

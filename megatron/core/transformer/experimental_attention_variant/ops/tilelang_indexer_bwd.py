@@ -57,19 +57,20 @@ def _canonical_topk(topk: int, block_i: int = 32) -> int:
     return _round_up(_next_power_of_two(topk), block_i)
 
 
-def _get_indexer_bwd_kernel(heads: int, dim: int, topk: int):
-    key = (heads, dim, topk)
+def _get_indexer_bwd_kernel(heads: int, dim: int, topk: int, use_relu: bool = True):
+    key = (heads, dim, topk, use_relu)
     with _tilelang_indexer_bwd_cache_lock:
         kernel = _tilelang_indexer_bwd_kernel_cache.pop(key, None)
         if kernel is None:
-            kernel = tl_indexer_bwd_impl(heads, dim, topk)
+            kernel = tl_indexer_bwd_impl(heads, dim, topk, use_relu=use_relu)
         _cache_put_lru(_tilelang_indexer_bwd_kernel_cache, key, kernel)
         return kernel
 
 
 @tl.jit(pass_configs=pass_configs)
 def tl_indexer_bwd_impl(
-    heads: int, dim: int, topk: int, block_I: int = 32, num_stages: int = 0, num_threads: int = 128
+    heads: int, dim: int, topk: int, block_I: int = 32, num_stages: int = 0, num_threads: int = 128,
+    use_relu: bool = True,
 ):
     """Build tilelang backward kernel for sparse indexer."""
     assert num_stages == 0
@@ -148,17 +149,16 @@ def tl_indexer_bwd_impl(
                     transpose_B=True,
                     clear_accum=True,
                 )
-                for i, j in T.Parallel(block_I, heads):
-                    logits[i, j] = T.max(logits[i, j], 0)
-
                 d_weights_i = T.alloc_fragment((block_I, pad_heads), accum_dtype)
                 for i, j in T.Parallel(block_I, heads):
-                    d_weights_i[i, j] = grad[i] * logits[i, j]
+                    d_weights_i[i, j] = grad[i] * (T.max(logits[i, j], 0) if use_relu else logits[i, j])
                 T.reduce_sum(d_weights_i, d_weights_frag, dim=0, clear=False)
 
                 for i, j in T.Parallel(block_I, pad_heads):
                     _logits[i, j] = T.if_then_else(
-                        logits[i, j] > 0 and j < heads, grad[i] * weights_shared[j], 0
+                        (logits[i, j] > 0 if use_relu else True) and j < heads,
+                        grad[i] * weights_shared[j],
+                        0,
                     )
                 T.sync_threads()
                 T.gemm(
@@ -195,6 +195,7 @@ def indexer_bwd_interface(
     index_k: torch.Tensor,
     topk_indices: torch.Tensor,
     grad_scores: torch.Tensor,
+    use_relu: bool = True,
 ):
     """Run indexer backward kernel and return gradients for q/w/k."""
     _, head_num, head_dim = index_q.shape
@@ -223,7 +224,7 @@ def indexer_bwd_interface(
     grad_w = torch.empty_like(weights, dtype=torch.float32)
     grad_k = torch.zeros_like(index_k, dtype=torch.float32)
 
-    bwd_kernel = _get_indexer_bwd_kernel(head_num, head_dim, padded_topk)
+    bwd_kernel = _get_indexer_bwd_kernel(head_num, head_dim, padded_topk, use_relu=use_relu)
     bwd_kernel(
         index_q.contiguous(),
         index_k.contiguous(),
