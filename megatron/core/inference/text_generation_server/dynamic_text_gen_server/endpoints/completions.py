@@ -212,8 +212,8 @@ try:
                 }
 
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
-            if result.get("block_cache_key") is not None:
-                cache_key = {"block_cache_key": result["block_cache_key"]}
+            if result.get("routing_block_store_key") is not None:
+                cache_key = {"block_cache_key": result["routing_block_store_key"]}
                 choices[-1]["moe_topk_indices"] = cache_key
                 choices[-1]["prompt_moe_topk_indices"] = cache_key
             elif result["routing_indices"] is not None:

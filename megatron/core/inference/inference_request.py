@@ -11,6 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+try:
+    import ray
+    HAVE_RAY = True
+except ImportError:
+    ray = None
+    HAVE_RAY = False
+
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api
@@ -382,9 +389,9 @@ class DynamicInferenceRequest(InferenceRequest):
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps.
     # Stored as numpy array (int16/int32) on CPU.
     routing_indices: Optional[np.ndarray] = None
-    # block_cache_key is set when routing_indices are written to block store.
+    # routing_block_store_key is set when routing_indices are written to block store.
     # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.
-    block_cache_key: Optional[dict] = None
+    routing_block_store_key: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
@@ -719,7 +726,7 @@ class DynamicInferenceRequestRecord:
         routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
         if routing_parts:
             routing_indices = np.concatenate(routing_parts)
-        block_cache_key = self.requests[-1].block_cache_key
+        routing_block_store_key = self.requests[-1].routing_block_store_key
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -750,7 +757,7 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
-            block_cache_key=block_cache_key,
+            routing_block_store_key=routing_block_store_key,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
@@ -763,10 +770,9 @@ class DynamicInferenceRequestRecord:
 
         Mirrors vLLM serving.py _maybe_store_moe_topk_indices.
         Merges routing_indices across all sub-requests, writes to block store,
-        sets block_cache_key, and clears routing_indices to free memory.
+        sets routing_block_store_key, and clears routing_indices to free memory.
         """
         import logging
-        import ray
 
         parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
         if not parts:
@@ -783,7 +789,7 @@ class DynamicInferenceRequestRecord:
             )
         )
 
-        block_cache_key = {
+        routing_block_store_key = {
             "instance_rank": block_store_instance_rank,
             "instance_id": block_store_instance_id,
             "req_id": req_id,
@@ -791,14 +797,14 @@ class DynamicInferenceRequestRecord:
         }
 
         logging.info(
-            f"Block store put: req_id={req_id} "
-            f"shape={list(routing_indices.shape)} "
-            f"dtype={routing_indices.dtype}"
+            f"NeMo-RL block store put: req_id={req_id} "
+            f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
+            f"instance_id={block_store_instance_id}"
         )
 
         # Set cache key and clear indices on all sub-requests.
         for r in self.requests:
-            r.block_cache_key = block_cache_key
+            r.routing_block_store_key = routing_block_store_key
             r.routing_indices = None
 
     def serialize(self) -> dict:

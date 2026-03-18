@@ -493,8 +493,8 @@ try:
             if current_app.config['verbose']:
                 logging.info(result)
 
-            if result.get("block_cache_key") is not None:
-                cache_key = {"block_cache_key": result["block_cache_key"]}
+            if result.get("routing_block_store_key") is not None:
+                cache_key = {"block_cache_key": result["routing_block_store_key"]}
                 choice_data["moe_topk_indices"] = cache_key
                 choice_data["prompt_moe_topk_indices"] = cache_key
             elif result["routing_indices"] is not None:

@@ -5,8 +5,17 @@ import logging
 import multiprocessing
 import sys
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
+
+try:
+    import ray
+    HAVE_RAY = True
+except ImportError:
+    ray = None
+    HAVE_RAY = False
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
@@ -292,3 +301,50 @@ if sys.version_info < (3, 13):
 else:
     asyncio_QueueShutDown = asyncio.QueueShutDown
     asyncio_Queue = asyncio.Queue
+
+
+@dataclass
+class BlockStoreConnection:
+    """Result of connecting to a Ray block store actor."""
+
+    instance: object  # ray.actor.ActorHandle
+    instance_rank: int
+    instance_id: str
+
+
+def connect_to_ray_block_store(namespace: str = "nemo_rl") -> BlockStoreConnection:
+    """Connect to the NeMo RL DistributedBlockStore Ray actor on this node.
+
+    Mirrors vLLM serving.py block store discovery. Raises RuntimeError
+    if ray is not installed or the actor cannot be found.
+    """
+    assert HAVE_RAY, (
+        "store_routing_indices_in_ray_block_store requires ray. "
+        "Install with: pip install ray"
+    )
+
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=namespace, ignore_reinit_error=True)
+
+    node_ip = ray._private.services.get_node_ip_address()
+    instance_id = f"nemo_rl.block_store.node.{node_ip}"
+
+    try:
+        instance = ray.get_actor(instance_id)
+    except ValueError:
+        raise RuntimeError(
+            f"Block store actor '{instance_id}' not found. "
+            f"Ensure a DistributedBlockStore is running on this node ({node_ip})."
+        )
+
+    runtime_metadata = ray.get(instance.get_runtime_metadata.remote())
+    instance_rank = runtime_metadata["instance_rank"]
+
+    logging.info(
+        f"NeMo-RL router-record block store discovery success: {instance_id} (rank={instance_rank})"
+    )
+    return BlockStoreConnection(
+        instance=instance,
+        instance_rank=instance_rank,
+        instance_id=instance_id,
+    )

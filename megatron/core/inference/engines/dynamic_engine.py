@@ -46,6 +46,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    connect_to_ray_block_store,
     prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -262,31 +263,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Block store for MoE routing replay (mirrors vLLM serving.py).
-        self.block_store_instance = None
-        self.block_store_instance_rank: int | None = None
-        self.block_store_instance_id: str | None = None
+        # Routing indices dtype for numpy storage.
         _num_experts = model_config.num_moe_experts or 0
         self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
-        if model_config.moe_enable_routing_replay:
-            try:
-                import ray
-                if not ray.is_initialized():
-                    ray.init(address="auto", namespace="nemo_rl", ignore_reinit_error=True)
-                node_ip = ray._private.services.get_node_ip_address()
-                instance_id = f"nemo_rl.block_store.node.{node_ip}"
-                self.block_store_instance = ray.get_actor(instance_id)
-                runtime_metadata = ray.get(
-                    self.block_store_instance.get_runtime_metadata.remote()
-                )
-                self.block_store_instance_rank = runtime_metadata["instance_rank"]
-                self.block_store_instance_id = instance_id
-                logging.info(f"Block store discovery success: {instance_id}")
-            except (ValueError, ImportError) as e:
-                logging.warning(f"Block store not available: {e}")
-                self.block_store_instance = None
-                self.block_store_instance_rank = None
-                self.block_store_instance_id = None
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -548,6 +527,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
+
+        # Connect to block store only on the mp coordinator rank.
+        if self.context.config.store_routing_indices_in_ray_block_store:
+            model_config = self.controller.inference_wrapped_model.model.config
+            assert model_config.moe_enable_routing_replay, (
+                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay to be enabled."
+            )
+        if self.context.config.store_routing_indices_in_ray_block_store and self.is_mp_coordinator:
+            conn = connect_to_ray_block_store()
+            self.block_store_instance = conn.instance
+            self.block_store_instance_rank = conn.instance_rank
+            self.block_store_instance_id = conn.instance_id
 
         local_ip = socket.gethostname()
 
@@ -1769,7 +1760,7 @@ class DynamicInferenceEngine(AbstractEngine):
             range_pop()
 
         # Dump routing indices to block store before coordinator communication.
-        if self.block_store_instance is not None and finished_request_records:
+        if getattr(self, 'block_store_instance', None) is not None and finished_request_records:
             for r in finished_request_records:
                 r.dump_routing_indices_to_block_store(
                     self.block_store_instance,
