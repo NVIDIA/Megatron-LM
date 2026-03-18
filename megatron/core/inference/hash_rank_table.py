@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence
 
 import numpy as np
 
@@ -98,6 +98,7 @@ class HashRankTable:
 
     @property
     def n_ranks(self) -> int:
+        """Number of ranks."""
         return self._n_ranks
 
     # ------------------------------------------------------------------
