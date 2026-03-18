@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
-from typing import Any, Tuple, Union
+from typing import Any
 
 import torch
 import triton
@@ -12,15 +12,6 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 
 GLOBAL_BLOCK_SIZE = 1024
 SCALE_INV_BLOCK_SIZE = 32
-
-
-def _normalize_stash_buffer_size_factor(
-    value: Union[float, Tuple[float, float], list],
-) -> Tuple[float, float]:
-    """Normalize stash_buffer_size_factor to (cuda_factor, cpu_factor)."""
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        return (float(value[0]), float(value[1]))
-    return (float(value), 0.0)
 
 
 class PagedStashBuffer:
@@ -720,38 +711,52 @@ class PagedStashManager:
             )
 
     def allocate_stash_buffers(
-        self, stash_buffer_size_factor: Union[float, Tuple[float, float]] = 1.10
+        self,
+        stash_buffer_size_factor_cuda: float = 1.10,
+        stash_buffer_size_factor_cpu: float = 0.0,
     ):
-        """Allocate stash buffers organized by [dtype][hidden_size].
-
-        stash_buffer_size_factor: single float for CUDA factor (CPU disabled), or (cuda, cpu).
-        """
+        """Allocate stash buffers organized by [dtype][hidden_size]."""
         self.stash_buffers = {}
         self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
 
-        cuda_factor, cpu_size_factor = _normalize_stash_buffer_size_factor(stash_buffer_size_factor)
+        cuda_factor = stash_buffer_size_factor_cuda
+        cpu_factor = stash_buffer_size_factor_cpu
 
-        # cuda_factor controls both which sizing signal to use and how much headroom to allocate:
+        # Both factors use the same sign convention:
         # - positive: size based on avg_num_tokens-derived maxima
         # - negative: size based on actual num_tokens-derived maxima (legacy behavior)
-        # In both cases we scale by abs(cuda_factor).
+        # Scale is always abs(factor). For CPU, 0 means no host buffer.
         if cuda_factor >= 0:
             max_tokens_dict = self.max_avg_tokens_across_vp_stages
-            scale = cuda_factor
+            cuda_scale = cuda_factor
         else:
             max_tokens_dict = self.max_tokens_across_vp_stages
-            scale = -cuda_factor
+            cuda_scale = -cuda_factor
 
         # Fallback safety: if avg-based dict is not available/populated yet, use actual-max dict.
         if not max_tokens_dict:
             max_tokens_dict = self.max_tokens_across_vp_stages
 
+        if cpu_factor > 0:
+            host_tokens_dict = self.max_avg_tokens_across_vp_stages or self.max_tokens_across_vp_stages
+            cpu_scale = cpu_factor
+        elif cpu_factor < 0:
+            host_tokens_dict = self.max_tokens_across_vp_stages
+            cpu_scale = -cpu_factor
+        else:
+            host_tokens_dict = None
+            cpu_scale = 0.0
+
         for dtype, hidden_size in max_tokens_dict:
             if dtype not in self.stash_buffers:
                 self.stash_buffers[dtype] = {}
             assert hidden_size not in self.stash_buffers[dtype]
-            num_tokens = int(max_tokens_dict[dtype, hidden_size] * scale)
-            num_tokens_host = int(max_tokens_dict[dtype, hidden_size] * cpu_size_factor) if cpu_size_factor > 0 else 0
+            num_tokens = int(max_tokens_dict[dtype, hidden_size] * cuda_scale)
+            num_tokens_host = (
+                int(host_tokens_dict[dtype, hidden_size] * cpu_scale)
+                if host_tokens_dict is not None and (dtype, hidden_size) in host_tokens_dict
+                else 0
+            )
             buf_dtype = torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
@@ -1025,9 +1030,8 @@ def paged_stash_set_last_layer(is_last_layer=False):
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
-    config: optional TransformerConfig; if provided, stash_buffer_size_factor and
-    moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA only)
-    and page_size 64.
+    config: optional TransformerConfig; if provided, stash_buffer_size_factor_cuda/cpu and
+    moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
@@ -1045,10 +1049,12 @@ def paged_stash_reset(enabled=True, config=None):
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
         print (f'schedule {stash_manager._pp_schedule}')
-        stash_buffer_size_factor = (
-            config.stash_buffer_size_factor if config is not None else 1.10
+        cuda_factor = config.stash_buffer_size_factor_cuda if config is not None else 1.10
+        cpu_factor = config.stash_buffer_size_factor_cpu if config is not None else 0.0
+        stash_manager.allocate_stash_buffers(
+            stash_buffer_size_factor_cuda=cuda_factor,
+            stash_buffer_size_factor_cpu=cpu_factor,
         )
-        stash_manager.allocate_stash_buffers(stash_buffer_size_factor=stash_buffer_size_factor)
     elif stash_manager.status == 'captured':
         pass
 

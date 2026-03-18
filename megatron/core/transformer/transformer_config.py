@@ -1118,10 +1118,13 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc2": stash the input of the expert fc2 part.
     """
 
-    stash_buffer_size_factor: Union[float, Tuple[float, float]] = 1.10
-    """Scale factor(s) for paged stash buffer allocation. A single float sets the CUDA buffer factor
-    (CPU buffer disabled). Two numbers (cuda, cpu) set both: e.g. (1.10, 0.5) for 10% CUDA headroom
-    and 0.5x host buffer. For CUDA, sign selects sizing: positive = avg-based, negative = actual-max."""
+    stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation. Sign selects sizing: positive = avg-based,
+    negative = actual-max. Magnitude is headroom (e.g. 1.10 = 10%)."""
+
+    stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer. Same sign convention as
+    stash_buffer_size_factor_cuda: positive = avg-based, negative = actual-max; scale = abs(factor)."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
