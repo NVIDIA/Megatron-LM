@@ -270,14 +270,23 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            assert (
-                HAVE_FLASHINFER
-            ), "flashinfer-python is required for inference-optimized MoE implementation."
-            if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
-                warnings.warn(
-                    "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                    "The FlashInfer cutlass kernel will be JIT compiled,"
-                    "which may take a long time."
+            if config.inference_grouped_gemm_backend == 'auto':
+                assert HAVE_FLASHINFER, (
+                    "inference_grouped_gemm_backend='auto'"
+                    "requires flashinfer-python. "
+                    "Install flashinfer-python or set "
+                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                )
+                if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
+                    warnings.warn(
+                        "flashinfer-cubin and/or flashinfer-jit-cache not found. "
+                        "The FlashInfer cutlass kernel will be JIT compiled,"
+                        "which may take a long time."
+                    )
+            elif config.inference_grouped_gemm_backend == 'torch':
+                assert hasattr(torch.nn.functional, 'grouped_mm'), (
+                    "inference_grouped_gemm_backend='torch' requires "
+                    "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
                 )
             self._setup_inference_mode(pg_collection)
 
