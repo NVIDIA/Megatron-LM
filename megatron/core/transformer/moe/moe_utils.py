@@ -1356,12 +1356,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
             outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
             valid_cudagraph_attrs = []
             for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
-                hier_attr_name = attr_name.split('.')
-                attr = self.moe_layer.token_dispatcher
-                for name in hier_attr_name:
-                    attr = getattr(attr, name, None)
-                    if attr is None:
-                        break
+                attr = self.moe_layer.token_dispatcher.get_cudagraph_attr(attr_name)
                 if isinstance(attr, torch.Tensor):
                     outputs.append(attr)
                     valid_cudagraph_attrs.append(attr_name)
