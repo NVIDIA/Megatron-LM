@@ -2410,7 +2410,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Inject the parsed stop word IDs
@@ -2493,7 +2495,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word length 3 > num_speculative_tokens (2)
@@ -2578,7 +2582,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word [6] will land in the middle of a speculative batch [5, 6, 7].
