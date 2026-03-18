@@ -218,6 +218,7 @@ def make_coordinator_direct(
     coordinator.hash_to_rank_info = {}
     coordinator._round_robin_idx = 0
     coordinator._assignment_counter = 0
+    coordinator._rank_pending_count = {}
 
     return coordinator
 
@@ -569,3 +570,101 @@ class TestFirstPrefixBlockRouting:
 
         selected = coordinator.get_best_data_parallel_rank(hashes[:1])
         assert selected == rank_1
+
+
+class TestLoadAwarePrefixRouting:
+    """Test that prefix routing spreads load across ranks with the same prefix."""
+
+    def test_spreads_across_ranks_with_same_prefix(self):
+        """When three ranks all cache the same prefix, requests spread by load."""
+        coordinator = make_coordinator_direct(data_parallel_size=3)
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        rank_2 = coordinator.identities_of_data_parallel_ranks[2]
+
+        # All three ranks have both blocks cached with the same timestamp.
+        for h in hashes:
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_1] = 1
+            coordinator.hash_to_rank_info.setdefault(h, {})[rank_2] = 1
+
+        # Simulate sending 6 requests. With load-aware routing, they should
+        # spread across ranks rather than all going to one.
+        assigned_ranks = []
+        for _ in range(6):
+            rank = coordinator.get_best_data_parallel_rank(hashes)
+            coordinator._rank_pending_count[rank] = (
+                coordinator._rank_pending_count.get(rank, 0) + 1
+            )
+            assigned_ranks.append(rank)
+
+        # Each rank should get exactly 2 of the 6 requests.
+        from collections import Counter
+
+        counts = Counter(assigned_ranks)
+        assert counts[rank_0] == 2
+        assert counts[rank_1] == 2
+        assert counts[rank_2] == 2
+
+    def test_load_overrides_recency(self):
+        """A rank with a higher timestamp but more pending requests is not preferred."""
+        coordinator = make_coordinator_direct()
+        tokens = [1, 2, 3, 4]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Both ranks have the prefix. rank_1 has a higher (more recent) timestamp.
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 10
+
+        # But rank_1 already has 5 pending requests while rank_0 has 0.
+        coordinator._rank_pending_count[rank_1] = 5
+
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_0
+
+    def test_pending_count_decremented_on_completion(self):
+        """Completing a request frees capacity on the assigned rank."""
+        coordinator = make_coordinator_direct()
+        tokens = [1, 2, 3, 4]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+
+        # Simulate assigning a request to rank_0.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator.request_id_to_rank = {42: rank_0}
+
+        # Simulate completion: decrement pending count.
+        assigned_rank = coordinator.request_id_to_rank.pop(42, None)
+        if assigned_rank is not None and assigned_rank in coordinator._rank_pending_count:
+            coordinator._rank_pending_count[assigned_rank] = max(
+                0, coordinator._rank_pending_count[assigned_rank] - 1
+            )
+
+        assert coordinator._rank_pending_count[rank_0] == 0
+
+    def test_equal_load_falls_back_to_recency(self):
+        """With equal pending counts, the most recent timestamp wins."""
+        coordinator = make_coordinator_direct()
+        tokens = [1, 2, 3, 4]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Equal pending counts (both 0), but rank_0 has higher timestamp.
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
+        coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
+
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_0

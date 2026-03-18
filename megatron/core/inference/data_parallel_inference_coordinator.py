@@ -175,6 +175,7 @@ class DataParallelInferenceCoordinator:
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
+        self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
@@ -186,6 +187,7 @@ class DataParallelInferenceCoordinator:
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.hash_to_rank_info = {}  # Dict[int, Dict[bytes, int]]: hash → {rank → timestamp}
         self._assignment_counter = 0
+        self._rank_pending_count = {}  # Dict[bytes, int]: rank identity → in-flight request count
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
@@ -259,9 +261,9 @@ class DataParallelInferenceCoordinator:
         Iterates request hashes in reverse order and picks the rank that cached
         the longest matching prefix (the furthest hash found). Since hashes are
         parent-chained, finding hash[i] in a rank guarantees hash[0..i-1] are
-        also present. Among ranks that share the longest match, the most recently
-        assigned rank (highest timestamp) is preferred. Falls back to round-robin
-        when no rank matches.
+        also present. Among ranks that share the longest match, the least-loaded
+        rank (fewest pending requests) is preferred. Ties on load are broken by
+        most-recent timestamp. Falls back to round-robin when no rank matches.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -280,8 +282,12 @@ class DataParallelInferenceCoordinator:
         for h in reversed(request_hashes):
             rank_info = self.hash_to_rank_info.get(h)
             if rank_info:
-                # Pick the most recently assigned rank.
-                best_rank = max(rank_info, key=rank_info.get)
+                # Among ranks sharing this prefix, pick the least-loaded one.
+                # Ties on load are broken by most-recent timestamp (higher is better).
+                best_rank = min(
+                    rank_info,
+                    key=lambda r: (self._rank_pending_count.get(r, 0), -rank_info[r]),
+                )
                 return best_rank
 
         return self.get_next_data_parallel_rank()
@@ -388,6 +394,10 @@ class DataParallelInferenceCoordinator:
                     del self.request_id_to_client_request_id[request_id]
                     return
 
+                self.request_id_to_rank[request_id] = next_identity
+                self._rank_pending_count[next_identity] = (
+                    self._rank_pending_count.get(next_identity, 0) + 1
+                )
                 if request_hashes:
                     self._update_rank_hashes(next_identity, request_hashes)
                 if self.schedule_records is not None:
@@ -467,6 +477,11 @@ class DataParallelInferenceCoordinator:
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
+                    assigned_rank = self.request_id_to_rank.pop(fid, None)
+                    if assigned_rank is not None and assigned_rank in self._rank_pending_count:
+                        self._rank_pending_count[assigned_rank] = max(
+                            0, self._rank_pending_count[assigned_rank] - 1
+                        )
 
                     self.router_socket.send_multipart(
                         [
