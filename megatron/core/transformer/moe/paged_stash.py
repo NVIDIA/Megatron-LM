@@ -9,6 +9,7 @@ import triton.language as tl
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.utils import get_attr_wrapped_model
 
 GLOBAL_BLOCK_SIZE = 1024
 SCALE_INV_BLOCK_SIZE = 32
@@ -1097,14 +1098,17 @@ class PagedStashRunner:
         self.forward_backward_func = forward_backward_func
         self.moe_layers = []
         for model_chunk in self.model:
-            for layer in model_chunk.module.module.decoder.layers:
+            model_with_decoder = get_attr_wrapped_model(
+                model_chunk, "decoder", allow_none=False, return_model_obj=True
+            )
+            for layer in model_with_decoder.decoder.layers:
                 mlp = layer.mlp
                 if hasattr(mlp, 'token_dispatcher') and hasattr(
                     mlp.token_dispatcher, 'check_over_budget'
                 ):
                     self.moe_layers.append(mlp)
-            if model_chunk.module.module.mtp_process:
-                for layer in model_chunk.module.module.mtp.layers:
+            if model_with_decoder.mtp_process:
+                for layer in model_with_decoder.mtp.layers:
                     mlp = layer.mtp_model_layer.mlp
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
                         mlp.token_dispatcher, 'check_over_budget'
