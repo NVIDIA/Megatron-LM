@@ -425,10 +425,8 @@ class TestMuonOptimizerMultiRankTP:
         ), "Weight should be updated with mode=blockwise"
 
 
-@pytest.mark.parametrize(
-    "coefficient_type_and_steps", [("simple", 3), ("quintic", 5), ("polar_express", 8)]
-)
-def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
+@pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
+def test_muon_optimizer_coefficient_types(coefficient_type):
     """Test TensorParallelMuon optimizer with different coefficient types."""
     model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -437,8 +435,8 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        coefficient_type=coefficient_type_and_steps[0],
-        num_ns_steps=coefficient_type_and_steps[1],
+        coefficient_type=coefficient_type,
+        num_ns_steps=_DEFAULT_NS_STEPS,
         pg_collection=None,
         mode="duplicated",
     )
@@ -453,7 +451,7 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
 
     assert not torch.equal(
         model.weight.data, original_weight
-    ), f"Weight should be updated with coefficient_type={coefficient_type_and_steps[0]} and num_ns_steps={coefficient_type_and_steps[1]}"
+    ), f"Weight should be updated with coefficient_type={coefficient_type}"
 
 
 @pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
@@ -674,50 +672,13 @@ def test_validate_coefficient_type_rejects_invalid():
         validate_coefficient_type("nonexistent_type_xyz")
 
 
-# Newton-Schulz step counts known to be compatible with each coefficient type.
-# "custom" is excluded because it requires user-supplied coefficient sets.
-_NS_STEPS_FOR_COEFF_TYPE = {"simple": 3, "quintic": 5, "polar_express": 8, "aol": 4}
+# All non-custom coefficient types supported by emerging_optimizers.
+_TESTABLE_COEFFICIENT_TYPES = [t for t in get_supported_coefficient_types() if t != "custom"]
 
-# Parametrize over all supported types that we know how to configure.
-_TESTABLE_COEFFICIENT_TYPES = [
-    t for t in get_supported_coefficient_types() if t in _NS_STEPS_FOR_COEFF_TYPE
-]
+# A reasonable default NS step count for testing; get_coefficient_iterator
+# cycles/repeats coefficients so any step count works with any type.
+_DEFAULT_NS_STEPS = 5
 
-
-@pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
-def test_muon_optimizer_all_supported_coefficient_types(coefficient_type):
-    """Test TensorParallelMuon optimizer with every dynamically-discovered coefficient type.
-
-    This ensures that when emerging_optimizers adds new coefficient types, they
-    are automatically exercised by these tests.  New types need a corresponding
-    entry in ``_NS_STEPS_FOR_COEFF_TYPE`` to be picked up.
-    """
-    num_ns_steps = _NS_STEPS_FOR_COEFF_TYPE[coefficient_type]
-
-    model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
-    model.requires_grad_(True)
-    model.weight.data.fill_(1.0)
-
-    optimizer = TensorParallelMuon(
-        params=[model.weight],
-        lr=0.01,
-        coefficient_type=coefficient_type,
-        num_ns_steps=num_ns_steps,
-        pg_collection=None,
-        mode="duplicated",
-    )
-
-    input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
-    output = model(input_tensor)
-    loss = output.sum()
-    loss.backward()
-
-    original_weight = model.weight.data.clone()
-    optimizer.step()
-
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with coefficient_type={coefficient_type}"
 
 
 def test_muon_optimizer_invalid_coefficient_type():
@@ -754,11 +715,9 @@ class TestMuonCoefficientTypeMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
-    @pytest.mark.parametrize("coefficient_type", ["simple", "quintic", "polar_express"])
+    @pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
     def test_get_megatron_muon_optimizer_coefficient_type(self, coefficient_type):
         """Test that coefficient_type flows through get_megatron_muon_optimizer."""
-        num_coeffs = _NS_STEPS_FOR_COEFF_TYPE[coefficient_type]
-
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -770,7 +729,7 @@ class TestMuonCoefficientTypeMultiRank:
             bf16=True,
             use_distributed_optimizer=False,
             muon_coefficient_type=coefficient_type,
-            muon_num_ns_steps=num_coeffs,
+            muon_num_ns_steps=_DEFAULT_NS_STEPS,
             muon_tp_mode="duplicated",
         )
 
