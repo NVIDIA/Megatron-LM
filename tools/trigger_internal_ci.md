@@ -33,6 +33,7 @@ export GITLAB_TOKEN=glpat-<your-token>
 ## Usage
 
 ```bash
+python -m pip install python-gitlab
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \
   [--access-token glpat-<your-token>] \

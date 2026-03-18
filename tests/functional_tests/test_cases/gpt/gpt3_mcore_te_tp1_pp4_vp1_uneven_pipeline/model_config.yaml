@@ -52,4 +52,6 @@ MODEL_ARGS:
   --decoder-last-pipeline-num-layers: 2
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular

@@ -147,10 +147,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAInde
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
-    destroy_global_symmetric_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
 
@@ -210,7 +210,7 @@ def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
-    destroy_global_symmetric_memory_buffer()
+    SymmetricMemoryManager.destroy()
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
@@ -1379,12 +1379,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
             # To pass kwargs unique to specific DDP classes.
-            dp_init_kwargs = {}
+            ddp_init_kwargs = {}
             if args.use_megatron_fsdp:
                 # Also pass the mixed-precision arguments for Megatron-FSDP only.
-                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+                ddp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+                ddp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+                ddp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
 
             model = [
                 DP(
@@ -1394,7 +1394,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
+                    **ddp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -3256,16 +3256,14 @@ def evaluate(
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
-                        total_loss_dict[key] = torch.tensor(
-                            [0.0, 0.0], dtype=torch.float
-                        ).cuda()
+                        total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float, device='cuda')
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
                         if args.sft:
                             # normalize over micro batch instead of global
                             val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1]
+                            val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,
