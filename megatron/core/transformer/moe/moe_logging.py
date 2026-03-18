@@ -66,6 +66,215 @@ def destroy_moe_metrics_tracker() -> None:
     _MOE_METRICS_TRACKER = None
 
 
+# ---------------------------------------------------------------------------
+# MoE Overload Factor Tracker (same pattern as MoEMetricsTracker)
+# ---------------------------------------------------------------------------
+_MOE_OVERLOAD_FACTOR_TRACKER: Optional['MoEOverloadFactorTracker'] = None
+
+
+def get_moe_overload_factor_tracker() -> 'MoEOverloadFactorTracker':
+    """Return the global MoE overload factor tracker, creating it lazily if needed."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    if _MOE_OVERLOAD_FACTOR_TRACKER is None:
+        _MOE_OVERLOAD_FACTOR_TRACKER = MoEOverloadFactorTracker()
+    return _MOE_OVERLOAD_FACTOR_TRACKER
+
+
+def set_moe_overload_factor_tracker(tracker: 'MoEOverloadFactorTracker') -> None:
+    """Set the global MoE overload factor tracker."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = tracker
+
+
+def destroy_moe_overload_factor_tracker() -> None:
+    """Reset the global MoE overload factor tracker to ``None``."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = None
+
+
+class MoEOverloadFactorTracker:
+    """Tracker for MoE overload factor metrics.
+
+    Records per-layer tokens-per-EP-rank during forward/backward (via an autograd
+    hook), then report() reduces across TP/EP and DP to compute avg/max/cum
+    overload factors and returns a log string.
+
+    Lifecycle: set_process_groups() and record_fwd/record_bwd during forward
+    (called from SaveOverloadFactorFunction in moe_utils) → report() at step end
+    (sync, aggregate, log, clear) → repeat.
+    """
+
+    def __init__(self) -> None:
+        self._fwd: Dict[int, List[torch.Tensor]] = {}  # layer_idx -> list of [ep_size]
+        self._fwd_bwd: List[torch.Tensor] = []
+        self._tp_ep_group: Optional[torch.distributed.ProcessGroup] = None
+        self._dp_group: Optional[torch.distributed.ProcessGroup] = None
+
+    def set_process_groups(
+        self,
+        tp_ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
+        """Set process groups for reduction (called from router before recording)."""
+        if tp_ep_group is not None:
+            self._tp_ep_group = tp_ep_group
+        if dp_group is not None:
+            self._dp_group = dp_group
+
+    def record_fwd(
+        self, layer_number: Optional[int], local_tokens_per_ep_rank: torch.Tensor
+    ) -> None:
+        """Record forward-pass tokens per EP rank for one layer (called from autograd)."""
+        if layer_number is None:
+            return
+        layer_idx = layer_number - 1
+        if layer_idx not in self._fwd:
+            self._fwd[layer_idx] = []
+        self._fwd[layer_idx].append(local_tokens_per_ep_rank.detach())
+        self._fwd_bwd.append(local_tokens_per_ep_rank.detach())
+
+    def record_bwd(self, local_tokens_per_ep_rank: torch.Tensor) -> None:
+        """Record backward-pass (negated) for fwd_bwd cumsum (called from autograd)."""
+        self._fwd_bwd.append(-local_tokens_per_ep_rank.detach())
+
+    def report(
+        self,
+        iteration: int,
+        writer=None,
+        wandb_writer=None,
+        per_layer_logging: bool = False,
+    ) -> str:
+        """Reduce stored data, compute overload factors, log to TB/W&B, clear, return log string."""
+        if not self._fwd:
+            return ""
+
+        tp_ep_group = self._tp_ep_group
+        dp_group = self._dp_group
+
+        fwd_tensors = []
+        for layer_idx in sorted(self._fwd.keys()):
+            for t in self._fwd[layer_idx]:
+                fwd_tensors.append(t)
+
+        if not fwd_tensors:
+            self.clear()
+            return ""
+
+        num_entries = len(fwd_tensors)
+        num_layers = len(self._fwd)
+        if num_entries % num_layers != 0:
+            raise ValueError(
+                f"Overload factor tracker: num_entries ({num_entries}) must be "
+                f"divisible by num_layers ({num_layers})."
+            )
+
+        # Stack fwd_bwd for cumsum overload factor
+        max_cum_overload_factor = None
+        if self._fwd_bwd:
+            fwd_bwd_stacked = torch.stack(self._fwd_bwd, dim=0)
+            if tp_ep_group is not None:
+                torch.distributed.all_reduce(fwd_bwd_stacked, group=tp_ep_group)
+            cumsum_tokens = fwd_bwd_stacked.cumsum(dim=0)
+            max_cumsum_tokens = cumsum_tokens.max().item()
+            mean_cumsum_max = cumsum_tokens.mean(dim=1).max()
+            local_max_cum_overload_factor = max_cumsum_tokens / (mean_cumsum_max.item() + 1e-8)
+            if dp_group is not None:
+                cum_overload_tensor = torch.tensor(
+                    [local_max_cum_overload_factor], device=fwd_bwd_stacked.device
+                )
+                torch.distributed.all_reduce(
+                    cum_overload_tensor, group=dp_group, op=torch.distributed.ReduceOp.MAX
+                )
+                max_cum_overload_factor = cum_overload_tensor.item()
+            else:
+                max_cum_overload_factor = local_max_cum_overload_factor
+
+        # Stack fwd tensors and reduce over TP x EP, then DP max/avg
+        stacked = torch.stack(fwd_tensors, dim=0)
+        if tp_ep_group is not None:
+            torch.distributed.all_reduce(stacked, group=tp_ep_group)
+
+        if dp_group is not None:
+            max_tokens_per_ep_rank = stacked.clone()
+            torch.distributed.all_reduce(
+                max_tokens_per_ep_rank, group=dp_group, op=torch.distributed.ReduceOp.MAX
+            )
+            avg_tokens_per_ep_rank = stacked.clone()
+            torch.distributed.all_reduce(
+                avg_tokens_per_ep_rank, group=dp_group, op=torch.distributed.ReduceOp.AVG
+            )
+        else:
+            max_tokens_per_ep_rank = stacked
+            avg_tokens_per_ep_rank = stacked
+
+        avg_max_tokens = avg_tokens_per_ep_rank.max(dim=1).values
+        avg_mean_tokens = avg_tokens_per_ep_rank.float().mean(dim=1)
+        avg_overload_factors = avg_max_tokens / (avg_mean_tokens + 1e-8)
+
+        max_max_tokens = max_tokens_per_ep_rank.max(dim=1).values
+        max_mean_tokens = max_tokens_per_ep_rank.float().mean(dim=1)
+        max_overload_factors = max_max_tokens / (max_mean_tokens + 1e-8)
+
+        avg_overload_factor = avg_overload_factors.mean().item()
+        max_overload_factor = max_overload_factors.max().item()
+
+        if writer is not None:
+            writer.add_scalar("moe/avg_overload_factor", avg_overload_factor, iteration)
+            writer.add_scalar("moe/max_overload_factor", max_overload_factor, iteration)
+            if max_cum_overload_factor is not None:
+                writer.add_scalar(
+                    "moe/max_cum_overload_factor", max_cum_overload_factor, iteration
+                )
+        if wandb_writer is not None:
+            wandb_writer.log({"moe/avg_overload_factor": avg_overload_factor}, iteration)
+            wandb_writer.log({"moe/max_overload_factor": max_overload_factor}, iteration)
+            if max_cum_overload_factor is not None:
+                wandb_writer.log(
+                    {"moe/max_cum_overload_factor": max_cum_overload_factor}, iteration
+                )
+
+        if per_layer_logging:
+            entries_per_layer = num_entries // num_layers
+            layer_avg = avg_overload_factors.view(
+                num_layers, entries_per_layer
+            ).mean(dim=1)
+            layer_max = max_overload_factors.view(
+                num_layers, entries_per_layer
+            ).max(dim=1).values
+            for i in range(num_layers):
+                avg_val, max_val = layer_avg[i].item(), layer_max[i].item()
+                if writer is not None:
+                    writer.add_scalar(
+                        f"moe/avg_overload_factor_layer_{i}", avg_val, iteration
+                    )
+                    writer.add_scalar(
+                        f"moe/max_overload_factor_layer_{i}", max_val, iteration
+                    )
+                if wandb_writer is not None:
+                    wandb_writer.log(
+                        {
+                            f"moe/avg_overload_factor_layer_{i}": avg_val,
+                            f"moe/max_overload_factor_layer_{i}": max_val,
+                        },
+                        iteration,
+                    )
+
+        self.clear()
+
+        parts = [
+            f" avg overload factor: {avg_overload_factor:.3f} |",
+            f" max overload factor: {max_overload_factor:.3f} |",
+        ]
+        if max_cum_overload_factor is not None:
+            parts.append(f" max cum overload factor: {max_cum_overload_factor:.3f} |")
+        return "".join(parts)
+
+    def clear(self) -> None:
+        """Clear all stored data (process groups are kept)."""
+        self._fwd.clear()
+        self._fwd_bwd.clear()
+
+
 class MoEMetricsTracker:
     """Tracker for MoE layer-wise metrics.
 

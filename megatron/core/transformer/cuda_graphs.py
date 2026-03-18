@@ -2291,9 +2291,13 @@ class TECudaGraphHelper:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
-        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+        from megatron.core.transformer.moe.moe_logging import (
+            get_moe_metrics_tracker,
+            get_moe_overload_factor_tracker,
+        )
 
         get_moe_metrics_tracker().clear()
+        get_moe_overload_factor_tracker().clear()
         reset_model_temporary_tensors(self.config, self.model)
 
         torch.cuda.synchronize()
