@@ -440,7 +440,7 @@ class HybridCPDataLoaderWrapper:
                         continue
                     sample[key] = sample[key][:-end_sample_token_count]
         return batch
-    
+
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
