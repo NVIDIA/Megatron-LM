@@ -91,7 +91,7 @@ def inprocess_restart(train, args):
     abort = inprocess.Compose(
         inprocess.abort.AbortTransformerEngine(),
         inprocess.abort.AbortTorchDistributed(),
-        AbortCheckpoint(),
+        AbortCheckpoint(args.async_strategy),
         inprocess.nested_restarter.NestedRestarterHandlingStarting(),
     )
     completion = inprocess.nested_restarter.NestedRestarterFinalized()
