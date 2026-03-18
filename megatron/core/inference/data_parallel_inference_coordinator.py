@@ -95,6 +95,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        hostname: str | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -130,7 +131,7 @@ class DataParallelInferenceCoordinator:
         #    the user that had submitted the request originally.
 
         # Get local IP.
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
         # Raise error if the other side of the connection has dropped.
@@ -533,6 +534,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        hostname: str | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -562,6 +564,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             schedule_output_path=schedule_output_path,
+            hostname=hostname,
         )
         ready_event.set()
         try:
