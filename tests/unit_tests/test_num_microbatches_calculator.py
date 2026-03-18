@@ -162,7 +162,6 @@ def test_step_batch_size_schedule_allows_past_entries_smaller_than_dp():
     calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
         micro_batch_size=1,
         data_parallel_size=512,
-        decrease_batch_size_if_needed=False,
         rank=0,
         schedule="0:256 200000:512 600000:1024 1500000:2048 3000000:4096 6000000:6144",
     )
@@ -197,7 +196,6 @@ def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small()
     calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
         micro_batch_size=1,
         data_parallel_size=512,
-        decrease_batch_size_if_needed=False,
         rank=0,
         schedule="0:256 200000:512 600000:1024",
     )
@@ -206,31 +204,6 @@ def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small()
     # consistency_check=True should fail because 256 % 512 != 0.
     with pytest.raises(AssertionError):
         calc.update(0, consistency_check=True)
-
-
-def test_step_batch_size_schedule_decrease_batch_yields_zero_microbatches():
-    """Test that decrease_batch_size_if_needed=True with a batch size smaller
-    than micro_batch_size * data_parallel_size results in num_micro_batches=0.
-
-    This is a silent failure mode: the batch rounds down to 0 and training would
-    fail. The runtime check in setup_model_and_optimizer catches this by asserting
-    num_micro_batches >= 1.
-    """
-    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
-        micro_batch_size=1,
-        data_parallel_size=512,
-        decrease_batch_size_if_needed=True,
-        rank=0,
-        schedule="0:256 200000:512 600000:1024",
-    )
-
-    # At consumed_samples=0, batch=256, rounds down to 0.
-    calc.update(0, consistency_check=True)
-    assert calc.num_micro_batches == 0
-
-    # After progressing past the threshold, batch=512 works.
-    calc.update(200000, consistency_check=True)
-    assert calc.num_micro_batches == 1
 
 
 def test_rampup_consistency_check_fails_when_batch_too_small():
