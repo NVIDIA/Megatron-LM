@@ -875,11 +875,6 @@ class DataParallelBuffer:
         # NOTE: Specifying dp_rank is a tricky thing. Currently, only full-shard
         # hybrid FSDP needs to do this to set dp rank that is different from the group rank.
         if dp_rank is not None:
-            logger.warning(
-                f"[FSDP] DataParallelBuffer[{bucket_id}] initialized with dp_rank={dp_rank}, "
-                f"native dp_rank={torch.distributed.get_rank(data_parallel_group)}, "
-                f"global_rank={torch.distributed.get_rank()}"
-            )
             self.dp_rank = dp_rank
         else:
             self.dp_rank = torch.distributed.get_rank(data_parallel_group)
