@@ -1033,7 +1033,7 @@ class PagedStashRunner:
             if iterator0 is not None:
                 for b in range(num_microbatches):
                     data_list.append(next(iterator0))
-                data_iterator_saved.extend(data_list)
+                data_iterator_saved.append(data_list)
                 data_list = [iter(data_list)]
             else:
                 data_list.append(None)
@@ -1045,11 +1045,11 @@ class PagedStashRunner:
                     data_list_i = []
                     for b in range(num_microbatches):
                         data_list_i.append(next(data_iterator[i]))
-                    data_iterator_saved.extend(data_list_i)
+                    data_iterator_saved.append(iter(data_list_i))
                     data_list.append(iter(data_list_i))
                 else:
                     data_list.append(None)
-        return iter(data_iterator_saved), data_list
+        return data_iterator_saved, data_list
 
     def check_moe_overflow(self):
         # check for paged stash overflow
