@@ -333,7 +333,10 @@ class DataParallelInferenceCoordinator:
 
                 # Tiebreak: prefer lower rank index for determinism.
                 rank_idx = self.identity_to_rank_index[identity]
-                if score > best_score or (score == best_score and rank_idx < self.identity_to_rank_index.get(best_rank, float('inf'))):
+                if score > best_score or (
+                    score == best_score
+                    and rank_idx < self.identity_to_rank_index.get(best_rank, float('inf'))
+                ):
                     best_score = score
                     best_rank = identity
 

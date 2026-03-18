@@ -723,9 +723,7 @@ class TestScoringFunctionRouting:
 
     def test_high_alpha_prefers_prefix_match(self):
         """With alpha=1.0, a rank with a prefix hit is always preferred over a free rank."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=1.0, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=1.0, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
@@ -746,9 +744,7 @@ class TestScoringFunctionRouting:
 
     def test_low_alpha_prefers_free_capacity(self):
         """With alpha=0.0, the rank with the most free capacity is preferred."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=0.0, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
@@ -769,9 +765,7 @@ class TestScoringFunctionRouting:
 
     def test_balanced_alpha_trades_off(self):
         """With alpha=0.5, prefix match and load are balanced."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=0.5, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
@@ -792,9 +786,7 @@ class TestScoringFunctionRouting:
 
     def test_balanced_alpha_prefers_free_when_heavily_loaded(self):
         """With alpha=0.5, a completely free rank beats a nearly-full rank with prefix match."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=0.5, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
@@ -816,9 +808,7 @@ class TestScoringFunctionRouting:
 
     def test_scoring_tiebreak_by_rank_index(self):
         """When scores are equal, the rank with lower index is preferred."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=0.5, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
@@ -856,9 +846,7 @@ class TestScoringFunctionRouting:
         assigned_ranks = []
         for _ in range(6):
             rank = coordinator.get_best_data_parallel_rank(hashes)
-            coordinator._rank_pending_count[rank] = (
-                coordinator._rank_pending_count.get(rank, 0) + 1
-            )
+            coordinator._rank_pending_count[rank] = coordinator._rank_pending_count.get(rank, 0) + 1
             assigned_ranks.append(rank)
 
         from collections import Counter
@@ -890,9 +878,7 @@ class TestScoringFunctionRouting:
 
     def test_scoring_with_no_prefix_match_anywhere(self):
         """When no rank has a prefix match, load alone determines the winner."""
-        coordinator = make_coordinator_direct(
-            prefix_caching_routing_alpha=0.5, max_requests=10
-        )
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
         tokens = [1, 2, 3, 4]
         hashes = coordinator.compute_request_hashes(tokens)
 
