@@ -1838,6 +1838,17 @@ def _add_inference_args(parser):
                        'block hash only. "longest_prefix" routes to the rank with '
                        'the longest matching prefix. "round_robin" ignores prefix '
                        'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=None,
+                       dest='inference_dynamic_batching_prefix_caching_mamba_gb',
+                       help='GPU memory budget (in GB) for the Mamba state cache '
+                       'used by prefix caching on hybrid models. When set, Mamba '
+                       'states at block boundaries are cached for reuse.')
+    group.add_argument('--inference-dynamic-batching-mamba-triton-conv1d',
+                       action='store_true', default=False,
+                       dest='inference_dynamic_batching_mamba_triton_conv1d',
+                       help='Use Triton varlen conv1d kernel for Mamba prefill '
+                       'instead of per-request causal_conv1d_fn calls.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -2187,6 +2198,16 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'lion'],
+                       help='Optimizer for scalar parameters (embeddings, biases, norms) '
+                       'when using muon. Defaults to adam.')
+    group.add_argument('--lion-beta1', type=float, default=0.95,
+                       help='First beta coefficient for Lion optimizer '
+                       '(used in sign update). Default: 0.95.')
+    group.add_argument('--lion-beta2', type=float, default=0.98,
+                       help='Second beta coefficient for Lion optimizer '
+                       '(used in momentum EMA update). Default: 0.98.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2384,7 +2405,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
