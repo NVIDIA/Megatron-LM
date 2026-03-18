@@ -544,7 +544,8 @@ class DataParallelInferenceCoordinator:
                     if assigned_rank is not None:
                         idx = self.identity_to_rank_index.get(assigned_rank)
                         if idx is not None:
-                            self._pending_counts[idx] = max(0, self._pending_counts[idx] - 1)
+                            assert self._pending_counts[idx] >= 1
+                            self._pending_counts[idx] -= 1
 
                     self.router_socket.send_multipart(
                         [
