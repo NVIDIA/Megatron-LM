@@ -743,6 +743,9 @@ class TransformerConfig(ModelParallelConfig):
     ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
+    log_overload_factor: bool = False
+    """When True, log MoE overload factor metrics (avg/max/cum) to TensorBoard/W&B and console.
+    Requires recording routing data during forward/backward; use for debugging or monitoring."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
