@@ -38,9 +38,8 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
                 trajectory=[f"t{idx}"],
                 reward=float(idx),
                 env_id=self.env_id,
-                policy_staleness=[[0]],
-                kv_cache_staleness=[[0]],
-                completed_at_step=[0],
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
                 num_evictions=[0],
             )
             for _ in range(request.rollouts_per_group)
