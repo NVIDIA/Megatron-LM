@@ -676,7 +676,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         async_strategy, modules = get_async_strategy(async_strategy)
         async_writer = modules["FileSystemWriterAsync"]
         save_state_dict_async_plan = modules["save_state_dict_async_plan"]
-        print(async_strategy, save_state_dict_async_plan, async_writer)
         if async_strategy == "nvrx":
             checkpointable_metadata_cache = modules["CheckpointMetadataCache"]
 
@@ -822,7 +821,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.cache_metadata = cache_metadata
         super().__init__()
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+    def load(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        async_strategy: str = "nvrx",
+    ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
         Args:
@@ -853,7 +857,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         fsr = _get_filesystem_reader(
             checkpoint_dir,
             cache_metadata=self.cache_metadata,
-            async_strategy=self.async_strategy,
+            async_strategy=async_strategy,
         )
         checkpoint.load_state_dict(
             pyt_state_dict,
