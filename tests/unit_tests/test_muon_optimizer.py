@@ -674,18 +674,31 @@ def test_validate_coefficient_type_rejects_invalid():
         validate_coefficient_type("nonexistent_type_xyz")
 
 
-@pytest.mark.parametrize("coefficient_type", list(get_supported_coefficient_types()))
+# Newton-Schulz step counts known to be compatible with each coefficient type.
+# "custom" is excluded because it requires user-supplied coefficient sets.
+_NS_STEPS_FOR_COEFF_TYPE = {
+    "simple": 3,
+    "quintic": 5,
+    "polar_express": 8,
+    "aol": 4,
+}
+
+# Parametrize over all supported types that we know how to configure.
+_TESTABLE_COEFFICIENT_TYPES = [
+    t for t in get_supported_coefficient_types()
+    if t in _NS_STEPS_FOR_COEFF_TYPE
+]
+
+
+@pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
 def test_muon_optimizer_all_supported_coefficient_types(coefficient_type):
     """Test TensorParallelMuon optimizer with every dynamically-discovered coefficient type.
 
     This ensures that when emerging_optimizers adds new coefficient types, they
-    are automatically exercised by these tests.
+    are automatically exercised by these tests.  New types need a corresponding
+    entry in ``_NS_STEPS_FOR_COEFF_TYPE`` to be picked up.
     """
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import _COEFFICIENT_SETS
-
-    # Determine a compatible num_ns_steps for this coefficient type.
-    num_coeffs = len(_COEFFICIENT_SETS[coefficient_type])
-    num_ns_steps = num_coeffs  # 1x the set length is always valid
+    num_ns_steps = _NS_STEPS_FOR_COEFF_TYPE[coefficient_type]
 
     model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -750,9 +763,7 @@ class TestMuonCoefficientTypeMultiRank:
     @pytest.mark.parametrize("coefficient_type", ["simple", "quintic", "polar_express"])
     def test_get_megatron_muon_optimizer_coefficient_type(self, coefficient_type):
         """Test that coefficient_type flows through get_megatron_muon_optimizer."""
-        from emerging_optimizers.orthogonalized_optimizers.muon_utils import _COEFFICIENT_SETS
-
-        num_coeffs = len(_COEFFICIENT_SETS[coefficient_type])
+        num_coeffs = _NS_STEPS_FOR_COEFF_TYPE[coefficient_type]
 
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)

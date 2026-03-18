@@ -3,7 +3,7 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -29,7 +29,7 @@ try:
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
-        _COEFFICIENT_SETS,
+        NSCoeffT,
         newton_schulz_tp,
     )
 
@@ -37,7 +37,7 @@ try:
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
-    _COEFFICIENT_SETS = {}
+    NSCoeffT = None  # type: ignore[assignment, misc]
 
 # TODO: Remove this separate try/except once the next version of emerging_optimizers
 # (which includes Lion) is released. Then Lion can be imported in the block above.
@@ -51,19 +51,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Fallback choices if emerging_optimizers is not installed or _COEFFICIENT_SETS is empty.
+# Fallback choices if emerging_optimizers is not installed.
 _FALLBACK_COEFFICIENT_TYPES = ("simple", "quintic", "polar_express")
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
     """Return the coefficient types supported by the installed emerging_optimizers.
 
-    Dynamically reads the keys from ``_COEFFICIENT_SETS`` so that new types
+    Reads the members of the ``NSCoeffT`` Literal type so that new types
     added upstream are automatically available without code changes here.
     Falls back to a hardcoded list when the package is not installed.
     """
-    if _COEFFICIENT_SETS:
-        return tuple(_COEFFICIENT_SETS.keys())
+    if NSCoeffT is not None:
+        args = get_args(NSCoeffT)
+        if args:
+            return args
     return _FALLBACK_COEFFICIENT_TYPES
 
 
