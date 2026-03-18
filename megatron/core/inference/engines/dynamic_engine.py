@@ -31,6 +31,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.inference_flops import InferenceFLOPsCalculator
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
@@ -227,6 +228,22 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
+
+        # Initialize inference FLOPs calculator and GPU peak for MFU reporting.
+        self.flops_calculator = None
+        self.gpu_peak_tflops = 0.0
+        self.cumulative_inference_flops = 0.0
+        self.cumulative_inference_time = 0.0
+        try:
+            from megatron.training.global_vars import get_args
+            from megatron.training.gpu_peak_flops import get_gpu_peak_tflops
+
+            args = get_args()
+            self.flops_calculator = InferenceFLOPsCalculator.from_args(args)
+            self.gpu_peak_tflops = get_gpu_peak_tflops()
+        except Exception as e:
+            logging.warning(f"Could not initialize inference FLOPs calculator: {e}")
+
         # Initialize engine.
         self.reset()
 
@@ -1665,6 +1682,35 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send(payload)
             range_pop()
 
+        # Compute inference FLOPs for this step.
+        step_flops_info = None
+        if self.flops_calculator is not None:
+            batch_dims = self.context.batch_dimensions
+            decode_tokens = batch_dims.decode_req_count if batch_dims else 0
+            prefill_reqs = batch_dims.prefill_req_count if batch_dims else 0
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            prefill_tokens = total_tokens - decode_tokens
+
+            step_flops_info = self.flops_calculator.compute_step_flops(
+                decode_tokens=decode_tokens,
+                prefill_tokens=prefill_tokens,
+                total_tokens=total_tokens,
+                active_blocks=context_state["total_active_used_blocks"],
+                active_reqs=context_state["total_request_count"]
+                - context_state["paused_request_count"],
+                num_prefill_reqs=prefill_reqs,
+            )
+            self.cumulative_inference_flops += step_flops_info['total_flops']
+            self.cumulative_inference_time += step_time
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+
+                get_mfu_tracker().add_inference_flops(
+                    step_flops_info['total_flops'], step_time, tokens=total_tokens
+                )
+            except Exception:
+                pass
+
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
@@ -1677,6 +1723,32 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
             }
+
+            batch_dims = self.context.batch_dimensions
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            if step_time > 0 and total_tokens > 0:
+                metrics['inference/tokens_per_sec_per_gpu'] = float(total_tokens / step_time)
+
+            if step_flops_info is not None:
+                step_tflops = step_flops_info['total_flops'] / 1e12
+                step_throughput = step_tflops / step_time if step_time > 0 else 0
+                metrics['inference/step_flops_tflop'] = float(step_tflops)
+                metrics['inference/throughput_tflops_per_gpu'] = float(step_throughput)
+                metrics['inference/t_avg'] = float(step_flops_info['t_avg'])
+                metrics['inference/cumulative_flops_tflop'] = float(
+                    self.cumulative_inference_flops / 1e12
+                )
+                if self.gpu_peak_tflops > 0:
+                    mfu = step_throughput / self.gpu_peak_tflops * 100.0
+                    cumulative_throughput = (
+                        (self.cumulative_inference_flops / 1e12) / self.cumulative_inference_time
+                        if self.cumulative_inference_time > 0
+                        else 0
+                    )
+                    cumulative_mfu = cumulative_throughput / self.gpu_peak_tflops * 100.0
+                    metrics['inference/mfu_percent'] = float(mfu)
+                    metrics['inference/cumulative_mfu_percent'] = float(cumulative_mfu)
+
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
             for key, value in context_state["kv_stats"].items():
@@ -1751,6 +1823,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
+            batch_dims = self.context.batch_dimensions
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            if step_time > 0 and total_tokens > 0:
+                toks_per_sec_per_gpu = total_tokens / step_time
+                output_str += f" toks/s/GPU: {toks_per_sec_per_gpu:.0f},"
+            if step_flops_info is not None:
+                step_tflops = step_flops_info['total_flops'] / 1e12
+                step_throughput = step_tflops / step_time if step_time > 0 else 0
+                output_str += f" {step_throughput:.1f} TFLOP/s/GPU"
+                if self.gpu_peak_tflops > 0:
+                    mfu = step_throughput / self.gpu_peak_tflops * 100.0
+                    output_str += f", MFU: {mfu:.1f}%"
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)

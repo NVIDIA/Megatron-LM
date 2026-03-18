@@ -65,6 +65,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -2125,11 +2126,131 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+
+            tokens_this_iter = batch_size * args.seq_length
+
+            # Compute and log MFU (Model FLOPs Utilization)
+            if not hasattr(args, '_gpu_peak_tflops'):
+                try:
+                    from megatron.training.gpu_peak_flops import get_gpu_peak_tflops
+                    args._gpu_peak_tflops = get_gpu_peak_tflops()
+                except Exception:
+                    args._gpu_peak_tflops = 0.0
+
+            training_mfu = 0.0
+            inference_mfu = 0.0
+            total_mfu = 0.0
+            has_tracker = False
+            iter_inference_tokens = 0
+            iter_inference_time = 0.0
+            iter_logprob_time = 0.0
+            training_only_time = elapsed_time_per_iteration
+            training_flops = 0.0
+            iter_inference_flops = 0.0
+            effective_tokens = tokens_this_iter
+
+            # Read compute-logprobs time from the existing Megatron timer
+            try:
+                iter_logprob_time = (
+                    timers('compute-logprobs').elapsed(reset=False, barrier=False)
+                    / total_iterations
+                )
+            except Exception:
+                pass
+
+            if args._gpu_peak_tflops > 0:
+                try:
+                    from megatron.training.mfu_tracker import get_mfu_tracker
+                    tracker = get_mfu_tracker()
+                    # Normalize to per-GPU to match inference FLOPs (already per-GPU).
+                    training_flops = num_floating_point_operations(args, batch_size) / args.world_size
+                    # Normalize tracker totals to per-iteration averages (the
+                    # tracker accumulates across the entire log_interval window,
+                    # but training_only_time is computed per-iteration).
+                    iter_inference_time = tracker.get_iter_inference_time() / total_iterations
+                    iter_inference_flops = tracker.get_iter_inference_flops() / total_iterations
+                    iter_inference_tokens = tracker.get_iter_inference_tokens() / total_iterations
+                    real_training_tokens = tracker.get_iter_real_training_tokens()
+                    if real_training_tokens > 0:
+                        effective_tokens = real_training_tokens
+                    training_only_time = max(
+                        elapsed_time_per_iteration - iter_inference_time - iter_logprob_time, 1e-6
+                    )
+                    tracker.add_training_flops(
+                        training_flops, training_only_time, tokens=effective_tokens
+                    )
+                    tracker.reset_iter()
+                    has_tracker = True
+                except Exception:
+                    has_tracker = False
+
+                training_mfu = throughput / args._gpu_peak_tflops * 100.0
+
+            ws = args.world_size
+
+            # Per-iteration toks/s/GPU breakdown (uses real tokens when seq packing is active)
+            train_tps = effective_tokens / (training_only_time * ws) if training_only_time > 0 else 0.0
+            inf_tps = iter_inference_tokens / (iter_inference_time * ws) if iter_inference_time > 0 else 0.0
+            total_tps = (effective_tokens + iter_inference_tokens) / (elapsed_time_per_iteration * ws) if elapsed_time_per_iteration > 0 else 0.0
+            e2e_tps = effective_tokens / (elapsed_time_per_iteration * ws) if elapsed_time_per_iteration > 0 else 0.0
+
+            if has_tracker:
+                log_string += (
+                    f' toks/s/GPU: train {train_tps:.0f}'
+                    f', infer {inf_tps:.0f}'
+                    f', total {total_tps:.0f}'
+                    f', e2e {e2e_tps:.0f} |'
+                )
+
+            # Per-iteration MFU breakdown
+            if args._gpu_peak_tflops > 0:
+                log_string += f' MFU: train {training_mfu:.1f}%'
+                if has_tracker:
+                    if iter_inference_time > 0:
+                        inference_mfu = (
+                            iter_inference_flops / iter_inference_time
+                            / 1e12 / args._gpu_peak_tflops * 100.0
+                        )
+                    if elapsed_time_per_iteration > 0:
+                        total_mfu = (
+                            (training_flops + iter_inference_flops)
+                            / elapsed_time_per_iteration
+                            / 1e12 / args._gpu_peak_tflops * 100.0
+                        )
+                    log_string += (
+                        f', infer {inference_mfu:.1f}%'
+                        f', total {total_mfu:.1f}%'
+                    )
+                log_string += ' |'
+
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar('toks_per_sec_per_gpu/e2e', e2e_tps, iteration)
+                    if has_tracker:
+                        writer.add_scalar('toks_per_sec_per_gpu/training', train_tps, iteration)
+                        writer.add_scalar('toks_per_sec_per_gpu/inference', inf_tps, iteration)
+                        writer.add_scalar('toks_per_sec_per_gpu/total', total_tps, iteration)
+                    if args._gpu_peak_tflops > 0:
+                        writer.add_scalar('mfu/training_percent', training_mfu, iteration)
+                        if has_tracker:
+                            writer.add_scalar('mfu/inference_percent', inference_mfu, iteration)
+                            writer.add_scalar('mfu/total_percent', total_mfu, iteration)
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_log = {
+                        'throughput': throughput,
+                        'toks_per_sec_per_gpu/e2e': e2e_tps,
+                    }
+                    if has_tracker:
+                        wandb_log['toks_per_sec_per_gpu/training'] = train_tps
+                        wandb_log['toks_per_sec_per_gpu/inference'] = inf_tps
+                        wandb_log['toks_per_sec_per_gpu/total'] = total_tps
+                    if args._gpu_peak_tflops > 0:
+                        wandb_log['mfu/training_percent'] = training_mfu
+                        if has_tracker:
+                            wandb_log['mfu/inference_percent'] = inference_mfu
+                            wandb_log['mfu/total_percent'] = total_mfu
+                    wandb_writer.log(wandb_log, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -3049,6 +3170,17 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
+
+            # Save MFU tracker per-iteration state before eval so that
+            # eval inference (which goes through the same engine) does not
+            # pollute training throughput / MFU metrics.
+            _mfu_snapshot = None
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                _mfu_snapshot = get_mfu_tracker().save_iter()
+            except Exception:
+                pass
+
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
@@ -3089,6 +3221,13 @@ def train(
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
             one_logger_utils.track_e2e_metrics()
+
+            # Restore MFU tracker state to discard eval's inference contributions.
+            if _mfu_snapshot is not None:
+                try:
+                    get_mfu_tracker().restore_iter(_mfu_snapshot)
+                except Exception:
+                    pass
 
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
