@@ -524,6 +524,15 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
+    # Step batch size schedule validations.
+    if args.step_batch_size_schedule is not None:
+        assert args.rampup_batch_size is None, (
+            'Cannot specify both --step-batch-size-schedule and --rampup-batch-size'
+        )
+        assert not args.decrease_batch_size_if_needed, (
+            'Cannot specify both --step-batch-size-schedule and --decrease-batch-size-if-needed'
+        )
+
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)

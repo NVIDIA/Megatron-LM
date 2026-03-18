@@ -257,16 +257,6 @@ def _build_num_microbatches_calculator(
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
 
-    # Validate mutually exclusive options
-    if step_batch_size_schedule is not None and rampup_batch_size is not None:
-        raise ValueError(
-            'Cannot specify both --step-batch-size-schedule and --rampup-batch-size'
-        )
-    if step_batch_size_schedule is not None and decrease_batch_size_if_needed:
-        raise ValueError(
-            'Cannot specify both --step-batch-size-schedule and --decrease-batch-size-if-needed'
-        )
-
     # Step batch size schedule
     if step_batch_size_schedule is not None:
         if global_batch_size is not None and rank == 0:
