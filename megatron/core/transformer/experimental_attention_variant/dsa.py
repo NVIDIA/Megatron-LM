@@ -374,6 +374,44 @@ def _extract_query_positions_from_position_ids(
     return query_pos.to(device=device, dtype=torch.int64)
 
 
+def _normalize_query_valid_rows(
+    query_valid_rows: Optional[torch.Tensor], *, b: int, sq: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    """Normalize optional query-row validity mask to shape [b, sq]."""
+    if query_valid_rows is None:
+        return None
+    query_valid_rows = query_valid_rows.to(device=device, dtype=torch.bool)
+    if query_valid_rows.ndim == 1:
+        if query_valid_rows.numel() != sq:
+            raise ValueError(
+                f"query_valid_rows length mismatch: expected {sq}, got {query_valid_rows.numel()}"
+            )
+        return query_valid_rows.unsqueeze(0).expand(b, sq)
+    if query_valid_rows.ndim == 2:
+        if query_valid_rows.shape == (1, sq):
+            return query_valid_rows.expand(b, sq)
+        if query_valid_rows.shape != (b, sq):
+            raise ValueError(
+                f"query_valid_rows shape mismatch: expected {(b, sq)}, got {tuple(query_valid_rows.shape)}"
+            )
+        return query_valid_rows
+    raise ValueError(
+        f"query_valid_rows should be 1D or 2D tensor, got {query_valid_rows.ndim}D."
+    )
+
+
+def _extract_query_valid_rows_from_packed_seq_params(
+    packed_seq_params: Optional[PackedSeqParams], *, b: int, sq: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    """Extract optional real-token query-row mask from packed sequence metadata."""
+    if packed_seq_params is None:
+        return None
+    query_valid_rows = getattr(packed_seq_params, "real_token_mask_q", None)
+    if query_valid_rows is None:
+        return None
+    return _normalize_query_valid_rows(query_valid_rows, b=b, sq=sq, device=device)
+
+
 def _get_packed_qk_cu_seqlens(
     packed_seq_params: PackedSeqParams,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -528,6 +566,30 @@ def _build_fused_indexer_varlen_bounds(
     return starts.to(dtype=torch.int32), ends.to(dtype=torch.int32)
 
 
+def _sanitize_fused_topk_outputs(
+    topk_indices: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    topk_scores: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Mask fused indexer outputs to the valid row-wise [start, end) key range.
+
+    TileLang indexer paths may return arbitrary indices for slots beyond the
+    true number of valid keys when `index_topk` exceeds the row span. Mirror
+    the dense fallback semantics by converting those slots to `-1` / `-inf`.
+    """
+    idx_i64 = topk_indices.to(dtype=torch.int64)
+    starts_i64 = starts.to(device=idx_i64.device, dtype=torch.int64).unsqueeze(-1)
+    ends_i64 = ends.to(device=idx_i64.device, dtype=torch.int64).unsqueeze(-1)
+    valid = (idx_i64 >= starts_i64) & (idx_i64 < ends_i64)
+    sanitized_indices = idx_i64.masked_fill(~valid, -1)
+    if topk_indices.dtype != torch.int64:
+        sanitized_indices = sanitized_indices.to(dtype=topk_indices.dtype)
+    if topk_scores is not None:
+        topk_scores = topk_scores.masked_fill(~valid, float("-inf"))
+    return sanitized_indices, topk_scores
+
+
 def _fused_qk_topk_lighting(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -536,6 +598,7 @@ def _fused_qk_topk_lighting(
     starts: torch.Tensor,
     ends: torch.Tensor,
     block_size: int,
+    use_relu: bool = True,
 ) -> Optional[torch.Tensor]:
     """Run fused tilelang indexer and return top-k indices [b, sq, topk]."""
     if lighting_indexer is None:
@@ -564,6 +627,12 @@ def _fused_qk_topk_lighting(
                 ends[start:end],
                 index_topk,
                 topk_indices=None,
+                use_relu=use_relu,
+            )
+            topk_indices, _ = _sanitize_fused_topk_outputs(
+                topk_indices=topk_indices,
+                starts=starts[start:end],
+                ends=ends[start:end],
             )
             if topk_out is None:
                 topk_out = torch.empty(
@@ -837,9 +906,11 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
     softmax_scale: float,
     loss_coeff: float,
     pg_collection: ProcessGroupCollection,
+    query_valid_rows: Optional[torch.Tensor] = None,
     seq_chunk_size: int = 512,
     head_chunk_size: int = 16,
     topk_chunk_size: int = 1024,
+    use_relu: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Run fused tilelang indexer and stream top-k logits directly into sparse KL accumulation."""
     if lighting_indexer is None:
@@ -858,6 +929,7 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
         return None
     if nk != 1 and nk != np:
         return None
+    query_valid_rows = _normalize_query_valid_rows(query_valid_rows, b=b, sq=sq, device=query.device)
 
     starts = starts.contiguous()
     ends = ends.contiguous()
@@ -893,6 +965,13 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
                 ends[start:end],
                 index_topk,
                 topk_indices=None,
+                use_relu=use_relu,
+            )
+            topk_indices, topk_scores = _sanitize_fused_topk_outputs(
+                topk_indices=topk_indices,
+                starts=starts[start:end],
+                ends=ends[start:end],
+                topk_scores=topk_scores,
             )
 
             if topk_out is None:
@@ -928,6 +1007,14 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
                     sk=sk,
                     hn=hn,
                 )
+                index_logits_chunk = topk_scores[rel_start:rel_end]
+                if query_valid_rows is not None:
+                    row_valid = query_valid_rows[bi, abs_start:abs_end]
+                    if not row_valid.any():
+                        continue
+                    target_chunk = target_chunk[row_valid]
+                    index_logits_chunk = index_logits_chunk[row_valid]
+                    valid_seq = valid_seq[row_valid]
                 (
                     kl_sum,
                     chunk_id,
@@ -937,7 +1024,7 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
                     pending_valid_seq,
                 ) = _enqueue_topk_kl_chunk(
                     target_chunk=target_chunk,
-                    index_logits_chunk=topk_scores[rel_start:rel_end],
+                    index_logits_chunk=index_logits_chunk,
                     valid_seq=valid_seq,
                     slot_prefix="stream_kl_target",
                     chunk_id=chunk_id,
@@ -960,7 +1047,12 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
 
     if topk_out is None:
         return None
-    kl_div = kl_sum / (b * sq)
+    valid_row_count = (
+        query_valid_rows.sum().to(dtype=torch.float32, device=q.device).clamp_min(1.0)
+        if query_valid_rows is not None
+        else torch.tensor(float(b * sq), dtype=torch.float32, device=q.device)
+    )
+    kl_div = kl_sum / valid_row_count
     return topk_out, kl_div * loss_coeff
 
 
@@ -1380,6 +1472,7 @@ def compute_dsa_indexer_loss(
     varlen_starts: Optional[torch.Tensor] = None,
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    query_valid_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -1416,6 +1509,9 @@ def compute_dsa_indexer_loss(
 
     sq, b, np, hn = query.size()
     sk = key.size(0)
+    query_valid_rows = _normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=index_scores.device
+    )
 
     # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
     query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
@@ -1478,8 +1574,14 @@ def compute_dsa_indexer_loss(
     )
 
     # [b, sq, sk] -> [b, sq] -> [1]
-    # Each token has same weight in the loss.
-    kl_div = kl_per_element.sum(dim=-1).mean()
+    # Each real token has the same weight in the loss.
+    kl_per_row = kl_per_element.sum(dim=-1)
+    if query_valid_rows is None:
+        kl_div = kl_per_row.mean()
+    else:
+        valid_row_count = query_valid_rows.sum().to(dtype=torch.float32, device=kl_per_row.device)
+        valid_row_count = valid_row_count.clamp_min(1.0)
+        kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum() / valid_row_count
 
     # Scale by coefficient.
     indexer_loss = kl_div * loss_coeff
@@ -1495,6 +1597,7 @@ def compute_dsa_indexer_loss_topk_sparse(
     softmax_scale: float,
     loss_coeff: float,
     pg_collection: ProcessGroupCollection,
+    query_valid_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute sparse top-k KL loss using fused indexer top-k logits.
 
@@ -1510,6 +1613,9 @@ def compute_dsa_indexer_loss_topk_sparse(
     assert bk == b and hk == hn, "query/key shape mismatch"
     assert index_topk_scores.shape[:2] == (b, sq), "index_topk_scores shape mismatch"
     assert topk_indices.shape[:2] == (b, sq), "topk_indices shape mismatch"
+    query_valid_rows = _normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=query.device
+    )
 
     if nk != 1:
         assert nk == np, "key head count must be 1 (MQA) or match query heads"
@@ -1558,6 +1664,14 @@ def compute_dsa_indexer_loss_topk_sparse(
                 sk=sk,
                 hn=hn,
             )
+            index_logits_chunk = index_topk_scores[bi, s0:s1]
+            if query_valid_rows is not None:
+                row_valid = query_valid_rows[bi, s0:s1]
+                if not row_valid.any():
+                    continue
+                target_chunk = target_chunk[row_valid]
+                index_logits_chunk = index_logits_chunk[row_valid]
+                valid_seq = valid_seq[row_valid]
             (
                 kl_sum,
                 chunk_id,
@@ -1567,7 +1681,7 @@ def compute_dsa_indexer_loss_topk_sparse(
                 pending_valid_seq,
             ) = _enqueue_topk_kl_chunk(
                 target_chunk=target_chunk,
-                index_logits_chunk=index_topk_scores[bi, s0:s1],
+                index_logits_chunk=index_logits_chunk,
                 valid_seq=valid_seq,
                 slot_prefix="topk_sparse_kl_target",
                 chunk_id=chunk_id,
@@ -1588,11 +1702,18 @@ def compute_dsa_indexer_loss_topk_sparse(
         kl_sum=kl_sum,
     )
 
-    kl_div = kl_sum / (b * sq)
+    valid_row_count = (
+        query_valid_rows.sum().to(dtype=torch.float32, device=query.device).clamp_min(1.0)
+        if query_valid_rows is not None
+        else torch.tensor(float(b * sq), dtype=torch.float32, device=query.device)
+    )
+    kl_div = kl_sum / valid_row_count
     return kl_div * loss_coeff
 
 
-def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+def _compute_index_scores(
+    q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, use_relu: bool = True
+) -> torch.Tensor:
     """
     Perform index score using BF16 precision.
 
@@ -1600,7 +1721,7 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
     This is a BF16 implementation of the `fp8_index` logic:
         1. Compute attention scores: q @ k^T;
-        2. Apply ReLU activation;
+        2. Optionally apply ReLU activation (DeepSeek V3.2 only; disabled for GLM5);
         3. Weight by attention weights;
         4. Sum across attention heads.
 
@@ -1617,8 +1738,9 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
     #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
     index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
 
-    # Apply ReLU activation.
-    index_scores = torch.relu(index_scores)
+    # Optionally apply ReLU activation (used by DeepSeek V3.2, not GLM5).
+    if use_relu:
+        index_scores = torch.relu(index_scores)
 
     # Weight each head by attention weights.
     # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
@@ -1644,6 +1766,7 @@ def fused_qk_topk_naive(
     varlen_starts: Optional[torch.Tensor] = None,
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    use_relu: bool = True,
 ):
     """Naive implementation of QK Topk."""
     sk = k.size(0)
@@ -1651,7 +1774,7 @@ def fused_qk_topk_naive(
     # Compute index scores
     # =========================================
     # [batch, seqlen, seqlen]
-    index_scores = _compute_index_scores(q, weights, k)
+    index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)
     if mask is not None and varlen_starts is not None:
         raise ValueError("mask and varlen_starts are mutually exclusive")
     if varlen_starts is not None:
@@ -1671,7 +1794,8 @@ def fused_qk_topk_naive(
     # =========================================
     topk_k = min(index_topk, sk)
     if topk_k > 0:
-        topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+        topk_scores, topk_indices = index_scores.topk(topk_k, dim=-1)
+        topk_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
     else:
         topk_indices = torch.empty(
             index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
@@ -1695,6 +1819,8 @@ def fwd_fused_indexer_loss_naive(
     varlen_starts=None,
     varlen_ends=None,
     key_positions=None,
+    query_valid_rows=None,
+    use_relu: bool = True,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -1706,6 +1832,7 @@ def fwd_fused_indexer_loss_naive(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+        use_relu=use_relu,
     )
 
     indexer_loss = compute_dsa_indexer_loss(
@@ -1721,6 +1848,7 @@ def fwd_fused_indexer_loss_naive(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+        query_valid_rows=query_valid_rows,
     )
 
     return topk_indices, indexer_loss
@@ -1742,6 +1870,8 @@ def bwd_fused_indexer_loss_naive(
     varlen_starts=None,
     varlen_ends=None,
     key_positions=None,
+    query_valid_rows=None,
+    use_relu: bool = True,
 ):
     """Naive implementation of backward pass for indexer loss."""
     query, _ = _ensure_sbhd(query, "query")
@@ -1749,10 +1879,13 @@ def bwd_fused_indexer_loss_naive(
     if mask is not None and varlen_starts is not None:
         raise ValueError("mask and varlen_starts are mutually exclusive")
 
-    index_scores = _compute_index_scores(q, weights, k)  # [B, Sq, Sk]
+    index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)  # [B, Sq, Sk]
 
     sq, b, np, hn = query.size()
     sk = key.size(0)
+    query_valid_rows = _normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=query.device
+    )
 
     # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
     query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
@@ -1835,11 +1968,20 @@ def bwd_fused_indexer_loss_naive(
     grad_kl_div = grad_loss * loss_coeff  # scalar
 
     # Backward through mean: distribute gradient equally
-    grad_kl_per_row = grad_kl_div / (b * sq)  # scalar value for each row
+    valid_row_count = (
+        query_valid_rows.sum().to(dtype=torch.float32, device=attention_scores_normalized.device)
+        if query_valid_rows is not None
+        else torch.tensor(float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device)
+    ).clamp_min(1.0)
+    grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row
 
     # Backward through sum(dim=-1): broadcast back to [b, sq, sk]
     # Each element in a row contributes to the sum, so gradient is same for all
     grad_kl_per_element = grad_kl_per_row.view(1, 1, 1).expand(b, sq, sk)
+    if query_valid_rows is not None:
+        grad_kl_per_element = grad_kl_per_element * query_valid_rows.unsqueeze(-1).to(
+            dtype=grad_kl_per_element.dtype
+        )
 
     # Backward through kl_per_element = target * (log(target) - log(index))
     # ∂kl/∂index_softmax = -target / index_softmax
@@ -1866,6 +2008,8 @@ def bwd_fused_indexer_loss_naive(
         del index_mask
         valid_mask = base_valid_mask  # [b, sq, sk]
     del base_valid_mask
+    if query_valid_rows is not None:
+        valid_mask = valid_mask & query_valid_rows.unsqueeze(-1)
 
     grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
     del valid_mask
@@ -1880,22 +2024,27 @@ def bwd_fused_indexer_loss_naive(
 
     # Compute forward values needed for backward
     scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
-    # Compute relu_mask before relu (saves memory vs keeping both scores and relu output)
-    relu_mask = scores > 0
-    scores_after_relu = torch.relu(scores)
+
+    # Backward through multiplication by weights (with optional ReLU).
+    if use_relu:
+        scores_for_weights = torch.relu(scores)
+        relu_mask = scores > 0
+    else:
+        scores_for_weights = scores
+        relu_mask = None
     del scores
 
-    # Backward through multiplication by weights: index_scores_per_head * weights
-    # ∂L/∂weights = grad * relu_scores (sum over sk)
-    grad_weights = (grad_weighted_scores * scores_after_relu).sum(dim=-1)  # [sq, b, h]
+    # ∂L/∂weights = grad * scores_for_weights (sum over sk)
+    grad_weights = (grad_weighted_scores * scores_for_weights).sum(dim=-1)  # [sq, b, h]
 
-    # ∂L/∂relu_scores = grad * weights
-    grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
-    del grad_weighted_scores, scores_after_relu
+    # ∂L/∂scores = grad * weights
+    grad_scores = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
+    del grad_weighted_scores, scores_for_weights
 
-    # Backward through ReLU
-    grad_scores = grad_scores_after_relu * relu_mask.float()  # [sq, b, h, sk]
-    del grad_scores_after_relu, relu_mask
+    # Backward through ReLU (skip when use_relu=False)
+    if use_relu:
+        grad_scores = grad_scores * relu_mask.float()
+        del relu_mask
 
     # Backward through einsum 'sbhd,tbd->sbht'
     # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
@@ -1927,6 +2076,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         varlen_starts=None,
         varlen_ends=None,
         key_positions=None,
+        query_valid_rows=None,
+        use_relu: bool = True,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -1946,6 +2097,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            query_valid_rows=query_valid_rows,
+            use_relu=use_relu,
         )
 
         # Save for backward (recomputation strategy)
@@ -1958,6 +2111,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.varlen_starts = varlen_starts
         ctx.varlen_ends = varlen_ends
         ctx.key_positions = key_positions
+        ctx.query_valid_rows = query_valid_rows
+        ctx.use_relu = use_relu
 
         return topk_indices, loss
 
@@ -1984,6 +2139,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             varlen_starts=ctx.varlen_starts,
             varlen_ends=ctx.varlen_ends,
             key_positions=ctx.key_positions,
+            query_valid_rows=ctx.query_valid_rows,
+            use_relu=ctx.use_relu,
         )
 
         # query and key are detached in forward, so return None for their gradients
@@ -1991,17 +2148,19 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             grad_q,
             grad_weights,
             grad_k,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # query
+            None,  # key
+            None,  # softmax_scale
+            None,  # topk
+            None,  # loss_coeff
+            None,  # mask
+            None,  # sparse_loss
+            None,  # pg_collection
+            None,  # varlen_starts
+            None,  # varlen_ends
+            None,  # key_positions
+            None,  # query_valid_rows
+            None,  # use_relu
         ]
         return tuple(grads[: len(ctx.needs_input_grad)])
 
@@ -2190,11 +2349,16 @@ class DSAIndexer(MegatronModule):
 
         k_norm_config = copy.copy(self.config)
         k_norm_config.normalization = "LayerNorm"
+        k_norm_eps = (
+            self.config.dsa_indexer_k_norm_epsilon
+            if self.config.dsa_indexer_k_norm_epsilon is not None
+            else self.config.layernorm_epsilon
+        )
         self.k_norm = build_module(
             submodules.k_norm,
             config=k_norm_config,
             hidden_size=self.index_head_dim,
-            eps=self.config.layernorm_epsilon,
+            eps=k_norm_eps,
         )
 
         self.linear_weights_proj = build_module(
@@ -2236,6 +2400,10 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=cu_seqlens,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
+            # # GLM5 uses interleaved RoPE for the DSA indexer, while DeepSeek-V3.2
+            # # keeps the legacy non-interleaved path. Make this behavior
+            # # model-configurable instead of hard-coding a single variant.
+            # mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
         )
         if squeezed_batch_dim:
             x_pe = x_pe.unsqueeze(1)
@@ -2302,8 +2470,9 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # Rotate activation
         # =========================================
-        q = rotate_activation(q)
-        k = rotate_activation(k)
+        if self.config.dsa_indexer_rotate_activation:
+            q = rotate_activation(q)
+            k = rotate_activation(k)
 
         # =========================================
         # Prepare weights for index scores
@@ -2343,7 +2512,10 @@ class DSAIndexer(MegatronModule):
         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
 
         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
+        index_scores, topk_indices = fused_qk_topk_naive(
+            q, k, weights, self.index_topk, mask,
+            use_relu=self.config.dsa_indexer_scoring_relu,
+        )
 
         return index_scores, topk_indices
 
@@ -2687,6 +2859,9 @@ class DSAttention(MegatronModule):
             varlen_starts, varlen_ends, key_positions = varlen_params
         else:
             varlen_starts = varlen_ends = key_positions = None
+        query_valid_rows = _extract_query_valid_rows_from_packed_seq_params(
+            packed_seq_params, b=b, sq=sq, device=query.device
+        )
 
         # ===================================
         # Prepare indexer inputs / top-k
@@ -2729,6 +2904,8 @@ class DSAttention(MegatronModule):
                     softmax_scale=self.softmax_scale,
                     loss_coeff=indexer_loss_coeff,
                     pg_collection=self.indexer.pg_collection,
+                    query_valid_rows=query_valid_rows,
+                    use_relu=self.config.dsa_indexer_scoring_relu,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, indexer_loss = fused_topk_with_loss
@@ -2754,6 +2931,8 @@ class DSAttention(MegatronModule):
                     varlen_starts,
                     varlen_ends,
                     key_positions,
+                    query_valid_rows,
+                    self.config.dsa_indexer_scoring_relu,
                 )
                 indexer_path = "dense_indexer_loss_fallback"
 
@@ -2779,6 +2958,7 @@ class DSAttention(MegatronModule):
                     starts_i32,
                     ends_i32,
                     block_size=max(1, block_size),
+                    use_relu=self.config.dsa_indexer_scoring_relu,
                 )
                 if topk_indices is not None:
                     indexer_path = "fused_topk"
@@ -2793,6 +2973,7 @@ class DSAttention(MegatronModule):
                     varlen_starts=varlen_starts,
                     varlen_ends=varlen_ends,
                     key_positions=key_positions,
+                    use_relu=self.config.dsa_indexer_scoring_relu,
                 )
 
         # ===================================

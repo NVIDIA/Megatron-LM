@@ -15,8 +15,7 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
@@ -476,10 +475,53 @@ class MultiLatentAttention(Attention):
             raise RuntimeError("DSA absorbed path requires linear_kv_up_proj, but it is missing.")
 
         linear_kv_up_proj = self.linear_kv_up_proj
-        if not hasattr(linear_kv_up_proj, "weight") and hasattr(linear_kv_up_proj, "to_wrap"):
-            linear_kv_up_proj = linear_kv_up_proj.to_wrap
+        linear_kv_up_proj_base = getattr(linear_kv_up_proj, "to_wrap", linear_kv_up_proj)
 
-        kv_up_weight = linear_kv_up_proj.weight.view(
+        def _materialize_linear_weight_with_lora(module: torch.nn.Module) -> torch.Tensor:
+            """Return the effective weight, folding in LoRA delta when the linear is wrapped."""
+            if hasattr(module, "weight") and not hasattr(module, "to_wrap"):
+                return module.weight
+
+            to_wrap = getattr(module, "to_wrap", None)
+            adapter = getattr(module, "adapter", None)
+            if to_wrap is None or adapter is None or not hasattr(to_wrap, "weight"):
+                raise RuntimeError(
+                    "DSA absorbed path expected a linear module or LoRA-wrapped linear with "
+                    f"`weight`, got {type(module)}"
+                )
+
+            base_weight = to_wrap.weight
+            if not getattr(module, "_adapter_enabled", True):
+                return base_weight
+
+            linear_in = getattr(adapter, "linear_in", None)
+            linear_out = getattr(adapter, "linear_out", None)
+            alpha = getattr(adapter, "alpha", None)
+            dim = getattr(adapter, "dim", None)
+            if linear_in is None or linear_out is None or alpha is None or dim in (None, 0):
+                return base_weight
+
+            linear_in_weight = linear_in.weight
+            linear_out_weight = linear_out.weight
+            if parallel_state.get_tensor_model_parallel_world_size() > 1:
+                if getattr(adapter, "input_is_parallel", False):
+                    linear_out_weight = gather_from_tensor_model_parallel_region(
+                        linear_out_weight.T
+                    ).T
+                else:
+                    linear_in_weight = gather_from_tensor_model_parallel_region(
+                        linear_in_weight.T
+                    ).T
+
+            base_device = base_weight.device
+            base_dtype = base_weight.dtype
+            lora_delta = (
+                linear_out_weight.to(device=base_device, dtype=torch.float32)
+                @ linear_in_weight.to(device=base_device, dtype=torch.float32)
+            ) * (float(alpha) / float(dim))
+            return (base_weight.float() + lora_delta).to(dtype=base_dtype)
+
+        kv_up_weight = _materialize_linear_weight_with_lora(linear_kv_up_proj).view(
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
             self.config.kv_lora_rank,
@@ -489,13 +531,15 @@ class MultiLatentAttention(Attention):
 
         def _normalize_kv_latent_for_absorption(kv_latent: torch.Tensor) -> torch.Tensor:
             """Match the normalization semantics of linear_kv_up_proj before absorption."""
-            if not hasattr(linear_kv_up_proj, "layer_norm_weight"):
+            if not hasattr(linear_kv_up_proj_base, "layer_norm_weight"):
                 return kv_latent
 
-            weight = linear_kv_up_proj.layer_norm_weight
-            bias = getattr(linear_kv_up_proj, "layer_norm_bias", None)
-            eps = float(linear_kv_up_proj.eps)
-            zero_centered_gamma = bool(getattr(linear_kv_up_proj, "zero_centered_gamma", False))
+            weight = linear_kv_up_proj_base.layer_norm_weight
+            bias = getattr(linear_kv_up_proj_base, "layer_norm_bias", None)
+            eps = float(linear_kv_up_proj_base.eps)
+            zero_centered_gamma = bool(
+                getattr(linear_kv_up_proj_base, "zero_centered_gamma", False)
+            )
             weight_eff = weight + 1.0 if zero_centered_gamma else weight
             src_dtype = kv_latent.dtype
             kv_latent_fp32 = kv_latent.float()
