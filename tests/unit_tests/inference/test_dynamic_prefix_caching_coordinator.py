@@ -323,6 +323,10 @@ class TestCoordinatorPrefixRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
+        # Ensure no rank is idle so prefix-matching logic is exercised.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
+
         # rank_0 has first block only.
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
 
