@@ -28,12 +28,16 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS,
+        newton_schulz_tp,
+    )
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
+    _COEFFICIENT_SETS = {}
 
 # TODO: Remove this separate try/except once the next version of emerging_optimizers
 # (which includes Lion) is released. Then Lion can be imported in the block above.
@@ -46,6 +50,31 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# Fallback choices if emerging_optimizers is not installed or _COEFFICIENT_SETS is empty.
+_FALLBACK_COEFFICIENT_TYPES = ("simple", "quintic", "polar_express")
+
+
+def get_supported_coefficient_types() -> tuple[str, ...]:
+    """Return the coefficient types supported by the installed emerging_optimizers.
+
+    Dynamically reads the keys from ``_COEFFICIENT_SETS`` so that new types
+    added upstream are automatically available without code changes here.
+    Falls back to a hardcoded list when the package is not installed.
+    """
+    if _COEFFICIENT_SETS:
+        return tuple(_COEFFICIENT_SETS.keys())
+    return _FALLBACK_COEFFICIENT_TYPES
+
+
+def validate_coefficient_type(coefficient_type: str) -> None:
+    """Raise ``ValueError`` if *coefficient_type* is not supported."""
+    supported = get_supported_coefficient_types()
+    if coefficient_type not in supported:
+        raise ValueError(
+            f"Unsupported muon coefficient type '{coefficient_type}'. "
+            f"Supported types: {supported}"
+        )
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
@@ -72,6 +101,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        validate_coefficient_type(coefficient_type)
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -288,6 +318,7 @@ def get_megatron_muon_optimizer(
         "use_nesterov": config.muon_use_nesterov,
         "weight_decay": config.weight_decay,
         "fp32_matmul_prec": config.muon_fp32_matmul_prec,
+        "coefficient_type": config.muon_coefficient_type,
         "num_ns_steps": config.muon_num_ns_steps,
         "scale_mode": config.muon_scale_mode,
         "split_qkv": config.muon_split_qkv,

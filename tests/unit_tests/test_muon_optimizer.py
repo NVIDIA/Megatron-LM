@@ -11,7 +11,12 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
+from megatron.core.optimizer.muon import (
+    TensorParallelMuon,
+    get_megatron_muon_optimizer,
+    get_supported_coefficient_types,
+    validate_coefficient_type,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -639,6 +644,146 @@ def test_muon_optimizer_extra_scale_factor():
     assert not torch.equal(
         model.weight.data, original_weight
     ), "Weight should be updated with extra_scale_factor"
+
+
+def test_get_supported_coefficient_types_returns_tuple():
+    """Test that get_supported_coefficient_types returns a non-empty tuple of strings."""
+    supported = get_supported_coefficient_types()
+    assert isinstance(supported, tuple)
+    assert len(supported) > 0
+    for t in supported:
+        assert isinstance(t, str)
+
+
+def test_get_supported_coefficient_types_contains_known_types():
+    """Test that the known coefficient types are present in the supported set."""
+    supported = get_supported_coefficient_types()
+    for expected in ("simple", "quintic", "polar_express"):
+        assert expected in supported, f"Expected '{expected}' in supported types {supported}"
+
+
+def test_validate_coefficient_type_accepts_valid():
+    """Test that validate_coefficient_type does not raise for valid types."""
+    for t in get_supported_coefficient_types():
+        validate_coefficient_type(t)  # should not raise
+
+
+def test_validate_coefficient_type_rejects_invalid():
+    """Test that validate_coefficient_type raises ValueError for an invalid type."""
+    with pytest.raises(ValueError, match="Unsupported muon coefficient type"):
+        validate_coefficient_type("nonexistent_type_xyz")
+
+
+@pytest.mark.parametrize("coefficient_type", list(get_supported_coefficient_types()))
+def test_muon_optimizer_all_supported_coefficient_types(coefficient_type):
+    """Test TensorParallelMuon optimizer with every dynamically-discovered coefficient type.
+
+    This ensures that when emerging_optimizers adds new coefficient types, they
+    are automatically exercised by these tests.
+    """
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import _COEFFICIENT_SETS
+
+    # Determine a compatible num_ns_steps for this coefficient type.
+    num_coeffs = len(_COEFFICIENT_SETS[coefficient_type])
+    num_ns_steps = num_coeffs  # 1x the set length is always valid
+
+    model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = TensorParallelMuon(
+        params=[model.weight],
+        lr=0.01,
+        coefficient_type=coefficient_type,
+        num_ns_steps=num_ns_steps,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with coefficient_type={coefficient_type}"
+
+
+def test_muon_optimizer_invalid_coefficient_type():
+    """Test that TensorParallelMuon raises ValueError for an invalid coefficient_type."""
+    model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+
+    with pytest.raises(ValueError, match="Unsupported muon coefficient type"):
+        TensorParallelMuon(
+            params=[model.weight],
+            lr=0.01,
+            coefficient_type="nonexistent_type_xyz",
+            num_ns_steps=5,
+            pg_collection=None,
+            mode="duplicated",
+        )
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestMuonCoefficientTypeMultiRank:
+    """Test coefficient_type integration through get_megatron_muon_optimizer."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    def create_ddp_model(self, model):
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+    @pytest.mark.parametrize("coefficient_type", ["simple", "quintic", "polar_express"])
+    def test_get_megatron_muon_optimizer_coefficient_type(self, coefficient_type):
+        """Test that coefficient_type flows through get_megatron_muon_optimizer."""
+        from emerging_optimizers.orthogonalized_optimizers.muon_utils import _COEFFICIENT_SETS
+
+        num_coeffs = len(_COEFFICIENT_SETS[coefficient_type])
+
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            muon_coefficient_type=coefficient_type,
+            muon_num_ns_steps=num_coeffs,
+            muon_tp_mode="duplicated",
+        )
+
+        optimizer = get_megatron_muon_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            layer_wise_distributed_optimizer=False,
+        )
+
+        assert optimizer is not None
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        optimizer.step()
 
 
 @pytest.mark.parametrize("num_ns_steps", [5, 15, 25])
