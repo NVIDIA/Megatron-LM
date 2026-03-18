@@ -220,6 +220,11 @@ def make_coordinator_direct(
     coordinator._assignment_counter = 0
     coordinator._rank_pending_count = {}
 
+    sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
+    coordinator.identity_to_rank_index = {
+        identity: idx for idx, identity in enumerate(sorted_identities)
+    }
+
     return coordinator
 
 
