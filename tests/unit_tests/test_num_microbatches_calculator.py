@@ -7,21 +7,21 @@ import megatron.core.num_microbatches_calculator as mb_calculator
 
 def test_init_num_microbatches_calculator():
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, False)
+    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 32
 
     with pytest.raises(AssertionError):
-        mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, False)
+        mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, None, None, False)
 
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 3, True)
+    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 3, None, None, True)
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 32
     assert mb_calculator.get_current_running_global_batch_size() == 24
 
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, None, 33, 8, 2, True)
+    mb_calculator.init_num_microbatches_calculator(0, None, 33, 8, 2, None, None, True)
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 33
     assert mb_calculator.get_current_running_global_batch_size() == 32
@@ -29,52 +29,52 @@ def test_init_num_microbatches_calculator():
 
 def test_reconfigure_num_microbatches_calculator():
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, False)
+    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 32
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 16
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 16
 
 
 def test_get_num_microbatches():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 1
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 3, True)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 3, None, None, True)
     assert mb_calculator.get_num_microbatches() == 1
 
 
 def test_get_current_global_batch_size():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 2, None, None, False)
     assert mb_calculator.get_current_global_batch_size() == 16
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 3, True)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 4, 3, None, None, True)
     assert mb_calculator.get_current_global_batch_size() == 16
     assert mb_calculator.get_current_running_global_batch_size() == 12
 
 
 def test_get_micro_batch_size():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 16, 8, 2, None, None, False)
     assert mb_calculator.get_micro_batch_size() == 8
 
 
 def test_update_num_microbatches():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 4, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 4, 2, None, None, False)
     assert mb_calculator.get_num_microbatches() == 2
     mb_calculator.update_num_microbatches(48, False)
     assert mb_calculator.get_num_microbatches() == 3
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 8, 96], 32, 8, 2, None, None, False)
     with pytest.raises(AssertionError):
         mb_calculator.update_num_microbatches(49, True)
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 32, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, None, 32, 8, 2, None, None, False)
     mb_calculator.update_num_microbatches(16)
     assert mb_calculator.get_num_microbatches() == 2
 
@@ -135,7 +135,7 @@ class TestRampupBatchsizeNumMicroBatchesCalculator:
 
 
 def test_ramp_up():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(0, [16, 16, 96], 32, 8, 2, None, None, False)
     consumed_samples = 0
     count = 0
     expected_consumed_samples = [0, 16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
@@ -145,3 +145,108 @@ def test_ramp_up():
         count += 1
         assert consumed_samples == expected_consumed_samples[count]
         mb_calculator.update_num_microbatches(consumed_samples, True)
+
+
+def test_step_batch_size_schedule_allows_past_entries_smaller_than_dp():
+    """Test that step batch size schedule does not crash when early schedule entries
+    are smaller than micro_batch_size * data_parallel_size.
+
+    This happens when scaling to more GPUs mid-training: the initial batch sizes
+    in the schedule are smaller than the new GPU count can support, but training
+    has progressed past those entries. The divisibility check should only apply
+    to the CURRENT batch size (after checkpoint loading), not all schedule entries.
+    """
+    # micro=1, dp=512, micro*dp=512
+    # Schedule starts at 256 which is < 512, but later entries are fine.
+    # This should NOT raise during construction.
+    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=False,
+        rank=0,
+        schedule="0:256 200000:512 600000:1024 1500000:2048 3000000:4096 6000000:6144",
+    )
+
+    # At init (consumed_samples=0), batch=256 < micro*dp=512.
+    # No consistency_check at init, so no error.
+    assert calc.current_global_batch_size == 256
+
+    # After training past the first entry, batch=512. Consistency check passes.
+    calc.update(200000, consistency_check=True)
+    assert calc.current_global_batch_size == 512
+    assert calc.num_micro_batches == 1
+
+    # Later entries work fine.
+    calc.update(1500000, consistency_check=True)
+    assert calc.current_global_batch_size == 2048
+    assert calc.num_micro_batches == 4
+
+    calc.update(6000000, consistency_check=True)
+    assert calc.current_global_batch_size == 6144
+    assert calc.num_micro_batches == 12
+
+
+def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small():
+    """Test that consistency_check=True raises when current batch size is smaller
+    than micro_batch_size * data_parallel_size.
+
+    This is the scenario caught by the runtime check in setup_model_and_optimizer:
+    GPUs were scaled up but the current schedule entry yields a batch size too small
+    for the new world size.
+    """
+    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=False,
+        rank=0,
+        schedule="0:256 200000:512 600000:1024",
+    )
+
+    # At consumed_samples=0, batch=256 < micro*dp=512.
+    # consistency_check=True should fail because 256 % 512 != 0.
+    with pytest.raises(AssertionError):
+        calc.update(0, consistency_check=True)
+
+
+def test_step_batch_size_schedule_decrease_batch_yields_zero_microbatches():
+    """Test that decrease_batch_size_if_needed=True with a batch size smaller
+    than micro_batch_size * data_parallel_size results in num_micro_batches=0.
+
+    This is a silent failure mode: the batch rounds down to 0 and training would
+    fail. The runtime check in setup_model_and_optimizer catches this by asserting
+    num_micro_batches >= 1.
+    """
+    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=True,
+        rank=0,
+        schedule="0:256 200000:512 600000:1024",
+    )
+
+    # At consumed_samples=0, batch=256, rounds down to 0.
+    calc.update(0, consistency_check=True)
+    assert calc.num_micro_batches == 0
+
+    # After progressing past the threshold, batch=512 works.
+    calc.update(200000, consistency_check=True)
+    assert calc.num_micro_batches == 1
+
+
+def test_rampup_consistency_check_fails_when_batch_too_small():
+    """Test that rampup batch size with consistency_check=True raises when the
+    current ramped-up batch size is smaller than micro_batch_size * data_parallel_size."""
+    calc = mb_calculator.RampupBatchsizeNumMicroBatchesCalculator(
+        global_batch_size=1024,
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=False,
+        rank=0,
+        start_global_batch_size=256,
+        batch_size_increment=256,
+        ramup_samples=768,
+    )
+
+    # At consumed_samples=0, batch=256 < micro*dp=512.
+    with pytest.raises(AssertionError):
+        calc.update(0, consistency_check=True)
