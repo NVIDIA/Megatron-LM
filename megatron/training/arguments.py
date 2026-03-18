@@ -1823,12 +1823,20 @@ def _add_inference_args(parser):
                        'requests with identical prompt prefixes.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
                        type=str, default='ref_zero',
-                       choices=['ref_zero', 'lru'],
+                       choices=['ref_zero', 'lru', 'flop_efficiency'],
                        dest='inference_dynamic_batching_prefix_caching_eviction_policy',
                        help='Eviction policy for prefix caching blocks. '
                        '"ref_zero" (default) immediately returns blocks to the '
                        'free pool when ref_count hits 0. "lru" keeps blocks '
-                       'cached and evicts via LRU only when space is needed.')
+                       'cached and evicts via LRU only when space is needed. '
+                       '"flop_efficiency" uses a utility score combining recency '
+                       'and FLOP efficiency to prefer keeping longer-prefix blocks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-flop-alpha',
+                       type=float, default=1.0,
+                       dest='inference_dynamic_batching_prefix_caching_flop_alpha',
+                       help='Alpha parameter for FLOP_EFFICIENCY eviction policy. '
+                       'Higher values favor keeping longer-prefix blocks. '
+                       '0.0 falls back to pure LRU behavior.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
                        type=str, default='first_prefix_block',
                        choices=['longest_prefix', 'first_prefix_block', 'round_robin'],

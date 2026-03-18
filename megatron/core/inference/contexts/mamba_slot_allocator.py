@@ -117,8 +117,11 @@ class MambaSlotAllocator:
         if candidate_ids.numel() == 0:
             raise RuntimeError("No evictable Mamba cache slots available")
 
-        # Pick block with oldest timestamp if LRU, otherwise just pick first
-        if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        # Pick block with oldest timestamp if LRU/FLOP_EFFICIENCY, otherwise just pick first
+        if self.context.prefix_caching_eviction_policy in (
+            PrefixCachingEvictionPolicy.LRU,
+            PrefixCachingEvictionPolicy.FLOP_EFFICIENCY,
+        ):
             timestamps = kv_alloc.block_timestamps[candidate_ids]
             evict_idx = candidate_ids[torch.argmin(timestamps)].item()
         else:

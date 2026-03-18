@@ -24,6 +24,11 @@ class KVBlockAllocator:
             than `total_count`.
     """
 
+    # Policies that keep blocks cached at ref_count=0 (eviction-based).
+    _CACHING_POLICIES = frozenset(
+        {PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.FLOP_EFFICIENCY}
+    )
+
     def __init__(
         self,
         context: "DynamicInferenceContext",
@@ -33,11 +38,13 @@ class KVBlockAllocator:
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
         ),
+        flop_alpha: float = 1.0,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
+        self.flop_alpha = flop_alpha
         self.on_blocks_deregistered: Optional[Callable] = None
 
         self.total_count = total_count
@@ -67,10 +74,19 @@ class KVBlockAllocator:
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
-            # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            # Only needed in caching policies; RZ mode evicts immediately on ref_count==0
+            if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
                 self.block_timestamps = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+                )
+
+            # Per-block FLOP efficiency for FLOP_EFFICIENCY eviction policy
+            if (
+                self.prefix_caching_eviction_policy
+                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+            ):
+                self.block_flop_efficiency = torch.zeros(
+                    (self.total_count,), dtype=torch.float32, device=torch.cuda.current_device()
                 )
 
     def __str__(self):
@@ -144,7 +160,7 @@ class KVBlockAllocator:
             return True
         if not self.enable_prefix_caching:
             return False
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+        if self.prefix_caching_eviction_policy not in self._CACHING_POLICIES:
             return False  # RZ: no cached blocks to evict
         # Also count evictable cached blocks
         evictable_count = self.get_evictable_block_count()
@@ -165,11 +181,18 @@ class KVBlockAllocator:
         if self.total_avail < num_blocks:
             if (
                 not self.enable_prefix_caching
-                or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+                or self.prefix_caching_eviction_policy not in self._CACHING_POLICIES
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
-            if not self.evict_lru_blocks(blocks_needed_from_eviction):
+            if (
+                self.prefix_caching_eviction_policy
+                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+            ):
+                evicted = self.evict_flop_efficiency_blocks(blocks_needed_from_eviction)
+            else:
+                evicted = self.evict_lru_blocks(blocks_needed_from_eviction)
+            if not evicted:
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
@@ -180,7 +203,7 @@ class KVBlockAllocator:
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
                 self.update_timestamps(block_ids)
 
         return block_ids
@@ -206,7 +229,7 @@ class KVBlockAllocator:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
-            elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            elif self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
                 # Unregistered blocks (hash == -1, ref_count == 0) have no hash
                 # entry to preserve for reuse (e.g., partial blocks at the end of
                 # a request). Return them directly to the free pool so they are not
@@ -252,19 +275,31 @@ class KVBlockAllocator:
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
                 self.block_timestamps.fill_(0)
+            if (
+                self.prefix_caching_eviction_policy
+                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+            ):
+                self.block_flop_efficiency.fill_(0)
 
     # =========================================================================
     # Prefix caching methods
     # =========================================================================
 
-    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_kv_block_hashes(
+        self,
+        block_ids: list[int],
+        block_hashes: list[int],
+        block_indices: Optional[list[int]] = None,
+    ) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Args:
             block_ids: List of block IDs.
             block_hashes: List of computed hash values (same length as block_ids).
+            block_indices: Optional list of 0-based block indices within the request.
+                Used by FLOP_EFFICIENCY policy to compute per-block FLOP efficiency.
         """
         if not block_ids:
             return
@@ -272,6 +307,33 @@ class KVBlockAllocator:
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+
+        # Compute and store per-block FLOP efficiency for FLOP_EFFICIENCY policy
+        if (
+            block_indices is not None
+            and self.prefix_caching_eviction_policy
+            == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+        ):
+            ctx = self.context
+            block_size = ctx.block_size_tokens
+            D = ctx.flop_hidden_size
+            N = ctx.flop_ssm_state_dim
+            num_attn = ctx.flop_num_attn_layers
+            num_mamba = ctx.flop_num_mamba_layers
+            num_mlp = ctx.flop_num_mlp_layers
+
+            for bid, idx in zip(block_ids, block_indices):
+                L = (idx + 1) * block_size
+                total_flops = (
+                    num_attn * (8 * L * D**2 + 4 * L**2 * D)
+                    + num_mamba * (12 * L * D**2 + 16 * L * D * N + 10 * L)
+                    + num_mlp * 16 * L * D**2
+                )
+                total_state = num_attn * 4 * L * D + num_mamba * 2 * D * N
+                if total_state > 0:
+                    self.block_flop_efficiency[bid] = total_flops / total_state
+                else:
+                    self.block_flop_efficiency[bid] = 0.0
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -303,8 +365,13 @@ class KVBlockAllocator:
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
             self.block_timestamps[block_ids] = 0
+        if (
+            self.prefix_caching_eviction_policy
+            == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+        ):
+            self.block_flop_efficiency[block_ids] = 0
 
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
@@ -317,7 +384,7 @@ class KVBlockAllocator:
             block_ids: Tensor of block IDs that were accessed.
         """
         if (
-            self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
+            self.prefix_caching_eviction_policy not in self._CACHING_POLICIES
             or block_ids.numel() == 0
         ):
             return
@@ -353,6 +420,57 @@ class KVBlockAllocator:
         # Sort by timestamp (ascending = oldest first)
         cached_timestamps = self.block_timestamps[cached_block_ids]
         sorted_indices = torch.argsort(cached_timestamps)
+        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+
+        self._deregister_blocks(blocks_to_evict)
+
+        return True
+
+    def evict_flop_efficiency_blocks(self, num_blocks_needed: int) -> bool:
+        """Evict cached blocks using FLOP-efficiency-aware utility scores.
+
+        Combines normalized recency and FLOP efficiency into a utility score:
+            utility = normalized_recency + alpha * normalized_efficiency
+        Evicts blocks with the lowest utility first.
+
+        Args:
+            num_blocks_needed: Number of blocks to evict.
+
+        Returns:
+            True if enough blocks were evicted, False otherwise.
+        """
+        # Find all cached blocks (ref_count == 0, hash != -1)
+        cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
+        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
+
+        if cached_block_ids.numel() < num_blocks_needed:
+            return False  # Not enough cached blocks to evict
+
+        # Gather timestamps and flop efficiency for cached blocks
+        cached_timestamps = self.block_timestamps[cached_block_ids].float()
+        cached_efficiency = self.block_flop_efficiency[cached_block_ids]
+
+        # Min-max normalize timestamps to (0, 1)
+        ts_min = cached_timestamps.min()
+        ts_max = cached_timestamps.max()
+        if ts_max > ts_min:
+            normalized_recency = (cached_timestamps - ts_min) / (ts_max - ts_min)
+        else:
+            normalized_recency = torch.zeros_like(cached_timestamps)
+
+        # Min-max normalize flop efficiency to (0, 1)
+        eff_min = cached_efficiency.min()
+        eff_max = cached_efficiency.max()
+        if eff_max > eff_min:
+            normalized_efficiency = (cached_efficiency - eff_min) / (eff_max - eff_min)
+        else:
+            normalized_efficiency = torch.zeros_like(cached_efficiency)
+
+        # Compute utility score
+        utility = normalized_recency + self.flop_alpha * normalized_efficiency
+
+        # Evict blocks with lowest utility
+        sorted_indices = torch.argsort(utility)
         blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
 
         self._deregister_blocks(blocks_to_evict)

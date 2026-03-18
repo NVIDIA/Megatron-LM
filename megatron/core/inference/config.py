@@ -90,6 +90,10 @@ class PrefixCachingEvictionPolicy(str, Enum):
     LRU = "lru"
     """Keep released blocks in hash table. Evict oldest ref=0 blocks when space is needed."""
 
+    FLOP_EFFICIENCY = "flop_efficiency"
+    """Like LRU, but eviction uses a utility score combining recency and FLOP efficiency.
+    Blocks representing longer prefixes have higher FLOP efficiency and are kept longer."""
+
 
 class PrefixCachingCoordinatorPolicy(str, Enum):
     """Routing policy for the DP inference coordinator with prefix caching."""
@@ -258,6 +262,14 @@ class InferenceConfig:
     `PrefixCachingCoordinatorPolicy` for options.
 
     Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_caching_flop_alpha: float = 1.0
+    """Alpha parameter for FLOP_EFFICIENCY eviction policy. Controls the balance between
+    recency and FLOP efficiency in the utility score. Higher values favor keeping
+    longer-prefix blocks. 0.0 falls back to pure LRU behavior.
+
+    Only applies when prefix_caching_eviction_policy is FLOP_EFFICIENCY.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
