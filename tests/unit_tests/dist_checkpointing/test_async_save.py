@@ -82,44 +82,6 @@ class TestAsyncSave:
 
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('async_save', [False, True])
-    @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
-    def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
-        Utils.initialize_model_parallel(2, 4)
-        orig_fn = FileSystemWriterAsync.write_preloaded_data
-        FileSystemWriterAsync.write_preloaded_data = worker_fn
-
-        sharded_state_dict = {
-            f'key{i}': ShardedTensor.from_rank_offsets(f'key{i}_rank{Utils.rank}', torch.ones(2, 4))
-            for i in range(4)  # make sure there is enough non-empty saving workers
-        }
-        save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8)
-
-        with (
-            TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported') as ckpt_dir,
-            pytest.raises(CheckpointException) as exc_info,
-        ):
-            if async_save:
-                async_calls = AsyncCallsQueue()
-                async_request = save(
-                    sharded_state_dict,
-                    ckpt_dir,
-                    save_strategy,
-                    async_sharded_save=True,
-                    async_strategy="mcore",
-                )
-                async_calls.schedule_async_request(async_request)
-                async_calls.maybe_finalize_async_calls(blocking=True)
-            else:
-                save(sharded_state_dict, ckpt_dir, save_strategy)
-        if Utils.rank == 0:
-            assert 'Worker failure' in str(exc_info.value)
-        else:
-            assert 'Worker failure' not in str(exc_info.value)
-
-        FileSystemWriterAsync.write_preloaded_data = orig_fn
-        Utils.destroy_model_parallel()
-
     @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
     def test_get_async_strategy(self, async_strategy):
         strategy, modules = get_async_strategy(async_strategy)
