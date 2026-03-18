@@ -525,6 +525,7 @@ def hybrid_context_parallel_forward_backward(
     total_num_tokens,
     check_first_val_step,
     model_type,
+    pg_collection,
 ):
     """
     Scheduler for Hybrid Context Parallel.
@@ -567,9 +568,9 @@ def hybrid_context_parallel_forward_backward(
 
     # We get data once per global batch and schedule the sub-samples.
     hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
+    # is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
 
-    if is_first_tp_rank:
+    if data_iterator is not None:
         data = next(data_iterator)
         sample_id_groups = data[1]
         new_data_iterator = data[0]
@@ -577,7 +578,7 @@ def hybrid_context_parallel_forward_backward(
         data, sample_id_groups, new_data_iterator = None, None, None
 
     num_total_groups = None
-    if is_first_tp_rank:
+    if sample_id_groups is not None:
         num_total_groups = len(sample_id_groups)  # equivalent to num_microbatches
 
     # TODO(pmannan): This is now equivalent to regular no pipeline schedule.
@@ -610,6 +611,7 @@ def hybrid_context_parallel_forward_backward(
                     input_tensor,
                     forward_data_store,
                     config,
+                    pg_collection.cp.size(),
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(
                         first_val_step, forward_only, current_microbatch == 0
@@ -635,6 +637,7 @@ def hybrid_context_parallel_forward_backward(
                 input_tensor,
                 forward_data_store,
                 config,
+                pg_collection.cp.size(),
                 collect_non_loss_data,
                 is_first_microbatch=check_first_val_step(
                     first_val_step, forward_only, current_microbatch == 0
@@ -657,6 +660,7 @@ def hybrid_context_parallel_forward_backward(
         input_tensor,
         forward_data_store,
         config,
+        pg_collection.cp.size(),
         collect_non_loss_data,
         is_first_microbatch=check_first_val_step(
             first_val_step, forward_only, current_microbatch == 0

@@ -423,6 +423,24 @@ class HybridCPDataLoaderWrapper:
 
         return new_samples
 
+    def unpad_batch(self, batch):
+        """
+        Removes the end padding from the batch which could lead to an invalid sample.
+        This could be a result of truncation or padding in the dataset.
+        For example, a packed sample is truncated and is left with prompt tokens
+        which leads to a sample with all zero loss mask.
+        We do this before scheduling.
+        """
+        for sample in batch:
+            end_sample_token_count = int(sample["cu_seqlens"][-1] - sample["cu_seqlens"][-2])
+            if sample["loss_mask"][-end_sample_token_count:].sum() == 0:
+                sample["cu_seqlens"][-1] = sample["cu_seqlens"][-2]
+                for key in sample.keys():
+                    if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
+                        continue
+                    sample[key] = sample[key][:-end_sample_token_count]
+        return batch
+    
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
@@ -433,6 +451,7 @@ class HybridCPDataLoaderWrapper:
         else:
             batch = next(self.data_iterator)
         subsample_seqlens = []
+        batch = self.unpad_batch(batch)
         for sample in batch:
             subsample_seqlens.extend(
                 [

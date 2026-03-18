@@ -1061,6 +1061,25 @@ def pretrain(
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
 
+    if args.hybrid_context_parallel:
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        if isinstance(valid_data_iterator, list):
+            valid_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in valid_data_iterator
+            ]
+        elif valid_data_iterator is not None:
+            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, config))
+        if isinstance(test_data_iterator, list):
+            test_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in test_data_iterator
+            ]
+        elif test_data_iterator is not None:
+            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, config))
+
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
@@ -2603,9 +2622,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
-
     if args.run_workload_inspector_server:
         try:
             from workload_inspector.utils.webserver import run_server
@@ -3269,27 +3285,12 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1]
-                            val = val.mean()
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else :
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key] += val
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            val,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True)
+                        )
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
