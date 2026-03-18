@@ -1183,14 +1183,6 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
-                        (
-                            tokens_per_expert.sum()
-                            if (
-                                isinstance(tokens_per_expert, torch.Tensor)
-                                and tokens_per_expert.is_cuda
-                            )
-                            else None
-                        ),
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
