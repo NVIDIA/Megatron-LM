@@ -2019,7 +2019,7 @@ class TransformerConfig(ModelParallelConfig):
             ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
             assert (
                 "moe" not in self.recompute_modules
-            ), '"moe" is not supported in recompute_modules when enabling overlap_moe_expert_parallel_comm'
+            ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
             assert (
