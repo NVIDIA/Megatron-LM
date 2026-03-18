@@ -1321,6 +1321,9 @@ class ParameterGroup:
         hsdp_wbuf (Optional[DataParallelBuffer]):
             Buffer for weights used in Hybrid Sharded Data Parallel (HSDP).
             Exists only if full sharding (HFSDP) is enabled in HSDP.
+        hsdp_wtbuf (Optional[DataParallelBuffer]):
+            Buffer for transpose weights used in HSDP.
+            Exists only if full sharding (HFSDP) is enabled in HSDP.
         hsdp_gbuf (Optional[DataParallelBuffer]):
             Buffer for gradients used in HSDP.
             Exists only if full sharding (HFSDP) is enabled in HSDP.
@@ -1342,6 +1345,7 @@ class ParameterGroup:
     main_weight_buffer: Optional[DataParallelBuffer] = None
     main_grad_buffer: Optional[DataParallelBuffer] = None
     hsdp_wbuf: Optional[DataParallelBuffer] = None
+    hsdp_wtbuf: Optional[DataParallelBuffer] = None
     hsdp_gbuf: Optional[DataParallelBuffer] = None
     hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
@@ -1549,7 +1553,7 @@ def _get_parameter_groups(
     # Set aggregate buckets by FSDP units, i.e. buckets pertaining to the same
     # FSDP unit module and are either expert or non-expert parameters should
     # end up in the same bucket group for NCCL.
-    # Non-FSDP unit parameters will be assigned to the identity bucket group.
+    # Non-FSDP unit module parameters will be assigned to the identity bucket group.
     if bucket_group_by_fsdp_unit:
         bucket_group_map = {}
 
@@ -1942,16 +1946,161 @@ class ParamAndGradBuffer:
                 f"Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}"
             )
 
-        # Only create HSDP buffers if sharding on DP-Outer. Otherwise, no need to all-gather
-        # parameters on DP-Outer, but still need to all-reduce gradients on DP-Outer.
-        should_create_hfsdp_wbuf_and_gbuf = (
+        """
+        Hybrid FSDP (HFSDP) helper buffers for outer-DP optimizer-state sharding.
+
+        Design goal
+        -----------
+        This design extends Megatron-FSDP's Hybrid / Fully Sharded Data Parallelism
+        to support *outer* data-parallel (DP) optimizer-state sharding, without
+        complicating the per-rank model weight / grad views that are used by the
+        forward and backward passes.
+
+        Core idea
+        ---------
+        We introduce two(or three) persistent helper buffers:
+
+        - `hfsdp_helper_wbuf`: stores the *true* persistent parameter payload
+            in the inner-DP layout (Inner-DP param buffer).
+        - `hfsdp_helper_gbuf`: stores the *true* persistent gradient payload
+            in the inner-DP layout (Inner-DP grad buffer).
+        - `hfsdp_helper_wtbuf`: (optional) stores transpose weights in the inner-DP
+            layout for FP8 parameters that require transposition for efficient
+            mixed-precision matmuls.
+
+        These buffers own the real storage for parameters and gradients that
+        participate in HFSDP sharding. The existing model `weight` buffer and
+        `gradient` buffer are simplified to be pure "data-parallel buffers"
+        defined only over the DP dimension, and can alias (view into) the
+        helper buffers. In other words:
+
+        - Helper buffers: inner-DP-aware, persistent, sharded storage.
+        - Model buffers: outer-DP-oriented data-parallel views used for compute,
+            and to give the optimizer access to the relevant shards of the helper
+            buffers when needed.
+
+        By separating **storage** (helper buffers) from **compute views**
+        (model buffers), we can:
+
+        - Keep the model-side DP buffers conceptually simple (they do not need to
+            encode Inner-DP vs Outer-DP tiling).
+        - Implement fully sharded optimizer states over the DP mesh by sharding
+            optimizer states consistently with the model buffers and helper buffers.
+        - Control when and how data is synchronized between inner and outer DP
+            dimensions on each iteration.
+
+        Data flow per iteration
+        -----------------------
+        Compared to the usual Hybrid FSDP data flow (where the last micro-batch
+        backward issues a DP all-reduce on gradients), this design explicitly
+        uses parameter all-gather and gradient reduce-scatter between the DP and
+        inner-DP layouts:
+
+        1. Parameters:
+            - Persistent parameter shards live in `hfsdp_helper_wbuf` in inner-DP
+                layout.
+            - At the beginning of each iteration (before the first micro-batch
+                forward), we all-gather DP-sharded parameters to form the inner-DP
+                parameter shards in `hfsdp_helper_wbuf`, following the standard
+                Hybrid FSDP pattern of making shards "bigger" for compute.
+            - The model weight buffer is set up as a DP-only view on top of
+                these inner-DP shards. It does not own persistent storage.
+
+        2. Gradients:
+            - During backward for each micro-batch, gradients are accumulated into
+                the `hfsdp_helper_gbuf` in inner-DP layout.
+            - On the last micro-batch backward of the iteration, instead of a DP
+                all-reduce, we perform a reduce-scatter that maps the DP gradient
+                layout back into outer-DP gradient shards.
+            - Because the model gradient buffer is a view of `hfsdp_helper_gbuf`
+                in the current design, the reduced / scattered results effectively
+                update both the helper buffer and the model-gradient-buffer view.
+            - The optimizer then reads gradients from model-gradient-buffer view
+                (DP layout) to perform the update.
+
+        3. Optimizer states:
+            - Optimizer states are constructed and kept sharded in the same DP /
+                inner-DP pattern as the helper buffers and their model-buffer views.
+            - Because parameters and gradients are stored persistently in helper
+                buffers and are sharded over DP, the optimizer only ever touches
+                fully sharded tensors. This enables *fully sharded* optimizer
+                states on the DP group (outer-DP sharding in HFSDP).
+            - After the optimizer step, updated parameter shards remain in
+                `hfsdp_helper_wbuf`. At the beginning of the next iteration, the
+                usual all-gather path re-exposes these updated outer-DP shards
+                through the model weight buffer.
+
+        Implementation details
+        ----------------------
+        - `hfsdp_helper_wbuf` / `hfsdp_helper_gbuf` (and optionally
+            `hfsdp_helper_wtbuf`) are allocated as the canonical storage for all
+            HFSDP-managed parameters / gradients. They encode the inner-DP
+            partitioning and are aligned with the DP device mesh used for HFSDP
+            optimizer sharding.
+
+        - The existing Megatron-FSDP weight and grad buffers are repurposed as
+            *outer-DP data-parallel buffers*. They:
+            - Have a shape / layout that only reflects the DP dimension.
+            - Implemented as views into the helper buffers to avoid extra copies.
+            - Serve as the interface tensors that the optimizer code reads from
+                and writes to.
+
+        - Synchronization between helper buffers and model buffers is explicit:
+            - "param sync" path:
+                - At initialization and at the beginning of each iteration, parameters
+                are exposed to the model buffer by all-gathering DP-sharded
+                parameters into inner-DP shards in `hfsdp_helper_wbuf` and then
+                viewing them through the model weight buffer.
+            - "grad sync" path:
+                - At the last micro-batch backward, we reduce-scatter gradients from
+                the inner-DP layout into model gradient buffer as DP shards. Because
+                the model gradient buffer is a view of `hfsdp_helper_gbuf`, the
+                reduced results are immediately visible through the model gradient buffer
+                as well.
+
+        - Outer-DP optimizer-state sharding:
+            - Optimizer state tensors are allocated with the same sharding pattern
+                as the model buffers along the DP dimension. Each rank only owns the
+                local shard of:
+                * its parameters (from `model weight buffer`),
+                * its gradients (from `model gradient buffer`),
+                * and the corresponding optimizer states.
+            - This is conceptually similar to ZeRO-style optimizer sharding, but
+                implemented on top of Megatron-FSDP's buffer / device-mesh abstractions,
+                using the helper buffers as the single source of truth for persistent
+                data.
+
+        Notes for maintainers
+        ---------------------
+        - When adding new parameters to HFSDP, register them with the helper
+            buffers first. The model weight / grad DP buffers should be treated as
+            *views* for compute, not as owners of persistent storage.
+
+        - When changing the DP mesh, inner/outer-DP dimension mapping, or the
+            sharding strategy, verify that:
+            - The helper buffer partitioning matches the intended HFSDP sharding
+                (inner-DP).
+            - The optimizer state partitioning is kept consistent with the model
+                weight and gradient buffer sharding.
+            - The synchronization paths correctly map between inner-DP layout
+                (helper buffers) and DP-only layout (model buffers), including the
+                parameter all-gather at the beginning of the iteration and the
+                gradient reduce-scatter on the last micro-batch backward.
+
+        - Any logic that assumes the model weight or gradient buffers own
+            persistent data should be updated to read/write from the helper
+            buffers instead. The model buffers are intentionally simplified to
+            keep the HFSDP optimizer sharding logic centralized in the helper
+            layer.
+        """
+        should_create_hfsdp_helper_buffers = (
             self.dist_index.use_hybrid_fsdp
             and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
         )
         # DP-Outer sharding is only supported for fully-sharded DP-Shard.
         # NOTE(@cspades): Important guard for HFSDP functionality!
         if (
-            should_create_hfsdp_wbuf_and_gbuf
+            should_create_hfsdp_helper_buffers
             and self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
         ):
             raise NotImplementedError(
@@ -2018,13 +2167,13 @@ class ParamAndGradBuffer:
         # For all bucket groups (partitioned parameter groups)...
         for group_id, group in enumerate(self.parameter_groups):
             main_buf_extra_kwargs = {}
-            if should_create_hfsdp_wbuf_and_gbuf:
+            if should_create_hfsdp_helper_buffers:
                 # DP-Outer + DP-Shard
                 main_buf_dp_group = self.dist_index.get_dp_group(
                     is_expert_parallel=group.is_expert_param
                 )
                 # DP-Shard
-                hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
+                inner_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
                 main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
@@ -2041,7 +2190,7 @@ class ParamAndGradBuffer:
             # operations (main_grad_buffer). This avoids head-of-line blocking between forward
             # all-gather and backward reduce-scatter on the same communicator.
             model_wbuf_dp_group = main_buf_dp_group
-            if not group.is_expert_param and not should_create_hfsdp_wbuf_and_gbuf:
+            if not group.is_expert_param and not should_create_hfsdp_helper_buffers:
                 ag_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=False, independent_all_gather=True
                 )
@@ -2174,68 +2323,27 @@ class ParamAndGradBuffer:
                 buffer_size[group.main_grad_buffer.dtype] += group.main_grad_buffer.data_size
 
             # Initialize the HSDP weight and grad buffers if hsdp full sharding is enabled.
-            if should_create_hfsdp_wbuf_and_gbuf:
+            if should_create_hfsdp_helper_buffers:
                 # Initialize the HSDP weight buffer.
                 wbuf = group.model_weight_buffer
-                group.hsdp_wbuf = DataParallelBuffer(
-                    self.ddp_config,
-                    group.params,
-                    is_data_distributed=is_main_weight_buffer_distributed
-                    and hsdp_buf_dp_group.size() > 1,
-                    dtype=wbuf.dtype,
-                    device=wbuf.device,
-                    data_parallel_group=hsdp_buf_dp_group,
-                    is_transpose_buffer=False,
-                    temporary_bucket_allocator=self.weight_alloc,
-                    bucket_id=group_id,
-                    chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
-                    item_index_map=wbuf.item_index_map,
-                    bucket_index=wbuf.bucket_index,
-                    shard_bucket_index=_get_dp_buffer_shard_bucket_index(
-                        wbuf.bucket_index,
-                        is_data_distributed=is_main_weight_buffer_distributed
-                        and hsdp_buf_dp_group.size() > 1,
-                        data_parallel_world_size=hsdp_buf_dp_group.size(),
-                        data_parallel_rank=hsdp_buf_dp_group.rank(),
-                    ),
+                group.hsdp_wbuf = _create_hfsdp_helper_buffer(
+                    group.model_weight_buffer,
+                    inner_dp_group=inner_dp_group,
+                    is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
                 )
 
                 if group.transpose_weight_buffer is not None:
-                    # TODO(@kunlunl, @cspades): Create a hybrid-sharded transpose buffer
-                    # to map fully-sharded transpose weights to partially-sharded transpose
-                    # weights before and after fully-distributed optimization.
-                    raise NotImplementedError(
-                        "HFSDP (HSDP + fully-sharded optimizer state) doesn't "
-                        "support FP8 recipes that require a transpose buffer."
+                    group.hsdp_wtbuf = _create_hfsdp_helper_buffer(
+                        group.transpose_weight_buffer,
+                        inner_dp_group=inner_dp_group,
+                        is_data_distributed=is_main_weight_buffer_distributed and inner_dp_group.size() > 1,
                     )
 
                 if should_create_grad_buffer_or_main_weight_buffer:
-                    # Initialize the HSDP grad buffer.
-                    gbuf = group.main_grad_buffer
-                    group.hsdp_gbuf = DataParallelBuffer(
-                        self.ddp_config,
-                        group.params,
-                        is_data_distributed=is_grad_buffer_distributed
-                        and hsdp_buf_dp_group.size() > 1,
-                        dtype=gbuf.dtype,
-                        device=gbuf.device,
-                        data_parallel_group=hsdp_buf_dp_group,
-                        is_transpose_buffer=False,
-                        temporary_bucket_allocator=self.main_grad_alloc,
-                        gradient_scaling_factor=gradient_scaling_factor,
-                        bucket_id=group_id,
-                        chunk_size_factor=group.chunk_size_factor,
-                        mem_alloc_context=self.mem_alloc_context,
-                        item_index_map=gbuf.item_index_map,
-                        bucket_index=gbuf.bucket_index,
-                        shard_bucket_index=_get_dp_buffer_shard_bucket_index(
-                            gbuf.bucket_index,
-                            is_data_distributed=is_grad_buffer_distributed
-                            and hsdp_buf_dp_group.size() > 1,
-                            data_parallel_world_size=hsdp_buf_dp_group.size(),
-                            data_parallel_rank=hsdp_buf_dp_group.rank(),
-                        ),
+                    group.hsdp_gbuf = _create_hfsdp_helper_buffer(
+                        group.main_grad_buffer,
+                        inner_dp_group=inner_dp_group,
+                        is_data_distributed=is_grad_buffer_distributed and inner_dp_group.size() > 1,
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hsdp_gbuf.data_size
@@ -2252,7 +2360,7 @@ class ParamAndGradBuffer:
                     is_expert_parallel=group.is_expert_param
                 )
                 hfsdp_kwargs = {}
-                if should_create_hfsdp_wbuf_and_gbuf:
+                if should_create_hfsdp_helper_buffers:
                     hfsdp_kwargs["item_index_map"] = gbuf.item_index_map
                     hfsdp_kwargs["bucket_index"] = gbuf.bucket_index
                     hfsdp_kwargs["shard_bucket_index"] = _get_dp_buffer_shard_bucket_index(
@@ -2314,28 +2422,12 @@ class ParamAndGradBuffer:
             if wbuf:
                 with self.mem_alloc_context():
                     if group.hsdp_wbuf:
-                        # When using HSDP, the hybrid-sharded buffer shards across the FSDP group,
-                        # while the main buffer shards across the larger / more granular DP group.
-                        # The main weight buffer data is a shard of the hybrid-sharded buffer data.
-                        # Because the hybrid buffer data is persistently allocated, the weight and
-                        # gradient memory footprint is similar to not sharding on DP-Outer, i.e.
-                        # replicating on DP-Outer. However, optimizer states based on main buffer
-                        # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
-                        # be sharded persistently upon initialization.
-                        hsdp_wbuf = group.hsdp_wbuf
-                        hsdp_wbuf.init_data(
-                            torch.empty(
-                                hsdp_wbuf.data_size, dtype=hsdp_wbuf.dtype, device=self.device
-                            )
+                        _init_hfsdp_helper_and_dp_buffer_data(
+                            group.hsdp_wbuf,
+                            wbuf,
+                            mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
+                            outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
                         )
-                        outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
-                        wbuf_data = hsdp_wbuf.data[
-                            # Requires FSDP sharding for (DP-Shard, DP-Outer) to cover DP-Shard.
-                            wbuf.data_size
-                            * outer_fsdp_group.rank() : wbuf.data_size
-                            * (outer_fsdp_group.rank() + 1)
-                        ]
-                        wbuf.init_data(wbuf_data)
                     else:
                         # When not using HSDP, the main buffer shards across the FSDP group.
                         wbuf.init_data(
@@ -2347,9 +2439,11 @@ class ParamAndGradBuffer:
             if tbuf:
                 with self.mem_alloc_context():
                     if group.hsdp_wbuf:
-                        raise NotImplementedError(
-                            "HFSDP (HSDP + fully-sharded optimizer state) doesn't "
-                            "support FP8 recipes that require a transpose buffer."
+                        _init_hfsdp_helper_and_dp_buffer_data(
+                            group.hsdp_wtbuf,
+                            tbuf,
+                            mem_alloc=lambda size, dtype: torch.empty(size, dtype=dtype, device=self.device),
+                            outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
                         )
                     else:
                         # Initialize the transpose buffer.
@@ -2553,30 +2647,17 @@ class ParamAndGradBuffer:
             # Allocate the main grad buffer data, and attach it to the main grad buffer.
             with self.mem_alloc_context():
                 if group.hsdp_gbuf:
-                    # When using HSDP, the hybrid-sharded buffer shards across the FSDP group,
-                    # while the main buffer shards across the larger / more granular DP group.
-                    # The main weight buffer data is a shard of the hybrid-sharded buffer data.
-                    # Because the hybrid buffer data is persistently allocated, the weight and
-                    # gradient memory footprint is similar to not sharding on DP-Outer, i.e.
-                    # replicating on DP-Outer. However, optimizer states based on main buffer
-                    # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
-                    # be sharded persistently upon initialization.
-                    hsdp_gbuf = group.hsdp_gbuf
-                    hsdp_gbuf.init_data(_alloc(hsdp_gbuf.dtype, hsdp_gbuf.data_size))
-                    outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
-                    gbuf_data = hsdp_gbuf.data[
-                        # Requires FSDP sharding for (DP-Shard, DP-Outer) to cover DP-Shard.
-                        gbuf.data_size
-                        * outer_fsdp_group.rank() : gbuf.data_size
-                        * (outer_fsdp_group.rank() + 1)
-                    ]
-                    gbuf.init_data(gbuf_data)
-                    hsdp_gbuf.data.zero_()
+                    _init_hfsdp_helper_and_dp_buffer_data(
+                        group.hsdp_gbuf,
+                        gbuf,
+                        mem_alloc=_alloc,
+                        outer_dp_group=self.dist_index.get_outer_fsdp_group(is_expert_parallel=group.is_expert_param),
+                    )
+                    group.hsdp_gbuf.data.zero_()
                 else:
                     # When not using HSDP, the main buffer shards across the FSDP group.
                     gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
                     gbuf.data.zero_()
-            gbuf.data.zero_()
             for item_id, p in enumerate(group.params):
                 # Attach the main grad buffer data and metadata to the parameter.
                 p._gbuf = group.hsdp_gbuf if group.hsdp_gbuf else gbuf
@@ -2649,6 +2730,7 @@ class ParamAndGradBuffer:
                     group.main_weight_buffer,
                     group.main_grad_buffer,
                     group.hsdp_wbuf,
+                    group.hsdp_wtbuf,
                     group.hsdp_gbuf,
                 ]:
                     if buf is None:
@@ -3171,6 +3253,118 @@ class ParamAndGradBuffer:
 
         for op in all_reduce_ops:
             op.wait()
+
+
+def _create_hfsdp_helper_buffer(
+    dp_buffer: DataParallelBuffer,
+    inner_dp_group: torch.distributed.ProcessGroup,
+    is_data_distributed: bool,
+) -> DataParallelBuffer:
+    """
+    Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
+
+    This helper buffer mirrors the metadata of the original fully
+    `dp_buffer` (bucket config, params, allocator, etc.), but binds it to
+    the `inner_dp_group` and computes a per-rank `shard_bucket_index`
+    appropriate for that group. The resulting buffer is used as the
+    HFSDP helper buffer that owns the persistent inner-DP shard of the
+    global bucket, while still sharing the same logical bucket indexing
+    (`bucket_index`) with the fully DP buffer.
+
+    Parameters
+    ----------
+    dp_buffer : DataParallelBuffer
+        The existing fully data-parallel buffer whose configuration
+        and bucket layout should be mirrored.
+    inner_dp_group : torch.distributed.ProcessGroup
+        The process group representing the inner-DP (HFSDP) data-parallel
+        group for this helper buffer.
+    is_data_distributed : bool
+        Whether the underlying data in this helper buffer is sharded
+        across ranks in `inner_dp_group`.
+
+    Returns
+    -------
+    DataParallelBuffer
+        A new DataParallelBuffer configured as the HFSDP helper buffer
+        for the given `inner_dp_group`, sharing the same bucket index
+        as `dp_buffer` but with an inner-DP `shard_bucket_index`.
+    """
+    helper_buffer = DataParallelBuffer(
+        dp_buffer.ddp_config,
+        dp_buffer.params,
+        is_data_distributed=is_data_distributed,
+        dtype=dp_buffer.dtype,
+        device=dp_buffer.device,
+        data_parallel_group=inner_dp_group,
+        is_transpose_buffer=dp_buffer.is_transpose_buffer,
+        temporary_bucket_allocator=dp_buffer.temporary_bucket_allocator,
+        bucket_id=dp_buffer.bucket_id,
+        chunk_size_factor=dp_buffer.chunk_size_factor,
+        mem_alloc_context=dp_buffer.mem_alloc_context,
+        item_index_map=dp_buffer.item_index_map,
+        bucket_index=dp_buffer.bucket_index,
+        # HFSDP helper buffer shares the same global bucket layout as the
+        # fully DP buffer, but computes its own shard_bucket_index because
+        # data is distributed across ranks in the inner-DP group.
+        shard_bucket_index=_get_dp_buffer_shard_bucket_index(
+            bucket_index=dp_buffer.bucket_index,
+            is_data_distributed=is_data_distributed,
+            data_parallel_world_size=inner_dp_group.size(),
+            data_parallel_rank=inner_dp_group.rank(),
+        ),
+    )
+
+    return helper_buffer
+
+
+def _init_hfsdp_helper_and_dp_buffer_data(
+    hfsdp_helper_buffer: DataParallelBuffer,
+    dp_buffer: DataParallelBuffer,
+    mem_alloc: Callable[[torch.dtype, int], torch.Tensor],
+    outer_dp_group: torch.distributed.ProcessGroup,
+) -> None:
+    """
+    Initialize storage for the HFSDP helper buffer and its corresponding
+    fully-DP DataParallelBuffer view.
+
+    The helper buffer is allocated as a single contiguous tensor that
+    stores all DP shards for the given bucket. Each rank in the outer-DP
+    group then takes its local slice of this storage and exposes it
+    through `dp_buffer`, so the fully-DP buffer becomes a view into the helper
+    buffer rather than owning separate storage.
+
+    Parameters
+    ----------
+    hfsdp_helper_buffer : DataParallelBuffer
+        The HFSDP helper buffer that owns the full inner-/outer-DP bucket
+        storage.
+    dp_buffer : DataParallelBuffer
+        The fully-DP DataParallelBuffer that should view its local shard
+        from `hfsdp_helper_buffer`.
+    mem_alloc : Callable[[torch.dtype, int], torch.Tensor]
+        Allocation function used to create the backing tensor for the
+        helper buffer (dtype, numel).
+    outer_dp_group : torch.distributed.ProcessGroup
+        Process group for the outer data-parallel dimension. Its rank and
+        world size determine which slice of the helper buffer this rank
+        sees through `dp_buffer`.
+    """
+    # Allocate contiguous storage for all outer-DP shards in the helper buffer.
+    hfsdp_helper_buffer.init_data(
+        mem_alloc(dtype=hfsdp_helper_buffer.dtype, size=hfsdp_helper_buffer.data_size)
+    )
+
+    rank = outer_dp_group.rank()
+    shard_size = dp_buffer.data_size
+    start = shard_size * rank
+    end = shard_size * (rank + 1)
+
+    # Each outer-DP rank takes a disjoint slice of the helper buffer as its
+    # local DP buffer view. This keeps `dp_buffer` as a view into the
+    # helper-owned storage.
+    dp_buffer_data = hfsdp_helper_buffer.data[start:end]
+    dp_buffer.init_data(dp_buffer_data)
 
 
 class BucketStatus(Enum):
@@ -3875,19 +4069,25 @@ class AllGatherPipeline:
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
             if outer_fsdp_group_param_gather:
-                # TODO(@kunlunl): Support MXFP8 with HFSDP. Requires an HFSDP transpose buffer.
                 self.outer_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
-                    outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+                    is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
+                    outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                        is_expert_parallel=is_expert_parallel
+                    )
                     with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:
-                            # All-gather the (DP-Outer, DP-Shard) weight shards from the DP-backed
-                            # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
-                            wbuf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
-                            hsdp_wbuf = self.buffer.parameter_groups[bucket_id].hsdp_wbuf
+                            inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
+                            outer_dp_group = self.buffer.dist_index.get_outer_dp_group(
+                                is_expert_parallel=is_expert_parallel
+                            )
+                            shard_size = inner_dp_wbuf.data_size // outer_dp_group.size()
+                            rank = outer_dp_group.rank()
                             torch.distributed.all_gather_into_tensor(
-                                output_tensor=hsdp_wbuf.data,
-                                input_tensor=wbuf.data,
+                                output_tensor=inner_dp_wbuf.data,
+                                input_tensor=inner_dp_wbuf.data[
+                                    rank * shard_size : (rank + 1) * shard_size
+                                ],
                                 group=outer_fsdp_group,
                             )
                 # Wait for the DP-Outer group all-gather to finish.
@@ -4008,7 +4208,7 @@ class AllGatherPipeline:
         param_group = self.buffer.parameter_groups[bucket_id]
         if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
             if bwd and param_group.transpose_weight_buffer is not None:
-                raise RuntimeError("Transpose buffer is not supported for HSDP")
+                return param_group.hsdp_wtbuf
             else:
                 return param_group.hsdp_wbuf
         if bwd and param_group.transpose_weight_buffer is not None:
