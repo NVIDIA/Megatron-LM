@@ -557,7 +557,8 @@ class TestDynamicInferenceEngine:
 
         return env
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -1475,7 +1476,7 @@ class TestDynamicInferenceEngine:
                                             So we reduce chunk to 255.
             3. Chunk 2   (Remaining 0)
         """
-        chunk_size = 256
+        prefill_chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
         # 256 + 255 + 2 = 513
         prompt_len = 513
@@ -1485,7 +1486,7 @@ class TestDynamicInferenceEngine:
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=prompt_len + 1,
-            context_max_tokens=chunk_size,
+            context_max_tokens=prefill_chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
             enable_chunked_prefill=True,
@@ -1968,7 +1969,7 @@ class TestDynamicInferenceEngine:
             )
             assert context.max_requests == 4
             assert step_count == 35
-        assert context.block_allocator.active_count == 655
+        assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2832,7 +2833,7 @@ class TestDynamicInferenceEngine:
         # 4 requests. 2 unique prefixes (1 block each).
         # Without sharing, we'd need 8 blocks + 1 dummy = 9 active_used.
         # With sharing, we need 2 shared blocks + 4 generation blocks + 1 dummy = 7 active_used.
-        active_used = env.engine.context.block_allocator.get_active_used()
+        active_used = env.engine.context.kv_block_allocator.get_active_used()
         assert (
             active_used <= 7
         ), f"Prefix caching failed, expected <= 7 active blocks but got {active_used}"
