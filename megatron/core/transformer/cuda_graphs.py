@@ -1719,10 +1719,10 @@ class TECudaGraphHelper:
         self._discover_layers()
 
         # Flags to track CUDA Graph state:
-        # - _capture_ran: Whether create_cudagraphs() has been called (used by training loop)
+        # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
         # - _graphs_created: Whether any graphs were actually created (may be False if no
         #   layers found)
-        self._capture_ran = False
+        self._capture_finished = False
         self._graphs_created = False
 
     def _discover_layers(self):
@@ -1800,7 +1800,7 @@ class TECudaGraphHelper:
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
-    def capture_ran(self):
+    def capture_finished(self):
         """
         Returns whether create_cudagraphs() has been called.
 
@@ -1808,7 +1808,7 @@ class TECudaGraphHelper:
         Returns True after create_cudagraphs() completes, regardless of whether any
         graphs were actually created.
         """
-        return self._capture_ran
+        return self._capture_finished
 
     def graphs_created(self):
         """
@@ -2217,7 +2217,7 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
-        assert not self._capture_ran, "CUDA Graph capture has already been run."
+        assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
         torch.cuda.synchronize()
         gc.collect()
@@ -2262,7 +2262,7 @@ class TECudaGraphHelper:
         gc.collect()
         torch.cuda.empty_cache()
 
-        self._capture_ran = True
+        self._capture_finished = True
 
     def create_cudagraphs(self):
         """

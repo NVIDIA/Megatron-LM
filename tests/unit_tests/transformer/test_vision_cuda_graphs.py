@@ -286,7 +286,7 @@ class TestVisionTECudaGraphHelper:
         assert helper.vision_model is not None, "Should find vision_model"
         assert helper.num_layers == self.vision_num_layers
         assert len(helper.callables) == self.vision_num_layers
-        assert helper.capture_ran() is False
+        assert helper.capture_finished() is False
         assert helper.graphs_created() is False
 
     def test_init_no_vision_model_warns(self):
@@ -300,7 +300,7 @@ class TestVisionTECudaGraphHelper:
         )
         assert helper.vision_model is None
         assert len(helper.callables) == 0
-        assert helper.capture_ran() is False
+        assert helper.capture_finished() is False
         assert helper.graphs_created() is False
 
     # -- _get_sample_arguments tests --
@@ -413,7 +413,7 @@ class TestVisionTECudaGraphHelper:
             micro_batch_size=self.micro_batch_size,
         )
         helper.create_cudagraphs()
-        assert helper.capture_ran()  # Capture process ran
+        assert helper.capture_finished()  # Capture process finished
         assert not helper.graphs_created()  # But no graphs were created
 
     def test_delete_cudagraphs_before_create_asserts(self):
@@ -556,7 +556,7 @@ class TestVisionTECudaGraphHelperPP2:
         helper = self._make_helper(num_microbatches=4)
         assert helper.vision_model is None
         assert len(helper.callables) == 0
-        assert not helper.capture_ran()
+        assert not helper.capture_finished()
         assert not helper.graphs_created()
 
     def test_pp2_num_microbatches_preserved(self):
@@ -621,7 +621,7 @@ class TestVisionTECudaGraphHelperPP2:
 
         helper = self._make_helper(num_microbatches=4)
         helper.create_cudagraphs()
-        assert helper.capture_ran()  # Capture process ran
+        assert helper.capture_finished()  # Capture process finished
         assert not helper.graphs_created()  # But no graphs were created
 
 
