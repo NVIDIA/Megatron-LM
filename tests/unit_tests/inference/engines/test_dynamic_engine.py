@@ -2596,6 +2596,29 @@ class TestDynamicInferenceEngine:
             f"Full output: {finished_req.generated_tokens}"
         )
 
+    @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
+    def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
+        """Test that _check_stop_words_for_request_post_append strips or keeps
+        the stop word tokens based on detokenize_stop_sequence."""
+        engine = types.SimpleNamespace(num_speculative_tokens=0)
+        check = DynamicInferenceEngine._check_stop_words_for_request_post_append
+
+        request = types.SimpleNamespace(
+            generated_tokens=[1, 2, 3, 4, 5],
+            stop_word_ids=[[4, 5]],
+            sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
+        )
+        hit, trimmed = check(engine, request)
+        assert hit
+        if detokenize_stop_sequence:
+            # Stop word kept
+            assert request.generated_tokens == [1, 2, 3, 4, 5]
+            assert trimmed == 0
+        else:
+            # Stop word stripped
+            assert request.generated_tokens == [1, 2, 3]
+            assert trimmed == 2
+
     @pytest.mark.internal
     @torch.inference_mode()
     def test_speculative_sequence_length_double_counting(self):
