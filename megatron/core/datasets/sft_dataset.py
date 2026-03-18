@@ -10,7 +10,7 @@ from typing import Dict, Optional, Tuple, List
 import numpy
 import torch
 
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, _build_document_index, _build_shuffle_index
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split
@@ -20,6 +20,8 @@ from megatron.core.utils import log_single_rank
 from bisect import bisect
 
 logger = logging.getLogger(__name__)
+
+IGNORE_INDEX = -100
 
 @dataclass
 class ChatTemplateConfig:

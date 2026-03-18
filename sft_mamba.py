@@ -42,8 +42,7 @@ from megatron.training import (
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
-from megatron.core.datasets.sft_dataset import SFTDataset, SFTDatasetConfig
+from megatron.core.datasets.sft_dataset import SFTDataset, SFTDatasetConfig, IGNORE_INDEX
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -69,6 +68,7 @@ stimer = StragglerDetector()
 # TODO(asolergi-nv): Add back SFTDataset
 # TODO(asolergi-nv): Fix SFTTokenizer, specially in preprocess script!
 # TODO(asolergi-nv): Fix NullSFTTokenizer
+# TODO(asolergi-nv): The clamp in preprocess_sft_batch for maxseqlen
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
@@ -198,8 +198,8 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is not None:
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_padded,
-            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
             cu_seqlens_q_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
             cu_seqlens_kv_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
             max_seqlen_q=max_seqlen,
@@ -213,7 +213,13 @@ def forward_step(data_iterator, model: MambaModel):
     # print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.squeeze(0).shape}, cu_seqlens_padded: {cu_seqlens_padded.squeeze(0).shape}, max_seqlen: {max_seqlen.shape}")
     # Shapes! tokens: torch.Size([1, 16384]), labels: torch.Size([1, 16384]), loss_mask: torch.Size([1, 16384]), cu_seqlens: torch.Size([2]), cu_seqlens_padded: torch.Size([2]), max_seqlen: torch.Size([1])
     # Shapes! tokens: [batch, seq_len // CP], labels: [batch, seq_len // CP], loss_mask: [batch, seq_len // CP], cu_seqlens: [Number of sequences], cu_seqlens_padded: [Number of sequences], max_seqlen: [1]  
-    
+    if int(os.environ.get('RANK', 0)) == 0:
+        print(f"Number of training tokens: {int(loss_mask.sum().item())}")
+        # print(f"Number of training sequences: {cu_seqlens.shape[0]}")
+        # print(f"tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, position_ids: {position_ids.shape}")
+        # print(f"tokens: {tokens}")
+
+
     with stimer:
         output_tensor = model(
             tokens,
