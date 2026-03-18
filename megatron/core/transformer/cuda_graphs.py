@@ -504,7 +504,8 @@ def delete_cuda_graphs():
         runner.bwd_graph_recorded = False
         runner.fwd_graph = None
         runner.bwd_graph = None
-        runner.mempool = None
+        runner.fwd_mempool = None
+        runner.bwd_mempool = None
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -516,6 +517,8 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempool = None
 
 
 class _GraphStatus(Enum):
@@ -674,7 +677,8 @@ class _CudaGraphRunner(torch.nn.Module):
     def __init__(
         self,
         base_module: MegatronModule,
-        mempool: int,
+        fwd_mempool: int,
+        bwd_mempool: int,
         fwd_graph_input_args: List[Any],
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
@@ -687,7 +691,8 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
-        self.mempool = mempool
+        self.fwd_mempool = fwd_mempool
+        self.bwd_mempool = bwd_mempool
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -948,7 +953,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
                 ):
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
@@ -1063,7 +1068,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+        with torch.cuda.graph(self.bwd_graph, pool=self.bwd_mempool):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1383,8 +1388,15 @@ class _CudaGraphRunner(torch.nn.Module):
 class CudaGraphManager(torch.nn.Module):
     """Creates and runs cudagraphs for a megatron module"""
 
-    """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
+    """A global mempool shared by all graphs (used for PP=1 where microbatches don't overlap)."""
     global_mempool = None
+
+    """Per-microbatch forward mempools, keyed by [vpp_rank][microbatch_idx].
+    Prevents cross-microbatch memory aliasing in PP>1 1F1B schedules."""
+    fwd_mempools = None
+
+    """Shared backward mempool for PP>1 (bwd passes don't overlap in 1F1B)."""
+    bwd_mempool = None
 
     def __init__(
         self, config: TransformerConfig, base_module=None, function_name=None, need_backward=True
@@ -1442,11 +1454,22 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = parallel_state.get_pipeline_model_parallel_world_size() == 1
-        if CudaGraphManager.global_mempool is None:
-            CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            torch.cuda.set_stream(torch.cuda.Stream())
+        if self.reuse_cudagraphs:
+            if CudaGraphManager.global_mempool is None:
+                CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
+        else:
+            # For PP>1, each microbatch gets its own fwd mempool to prevent aliasing
+            # of internal activation buffers across microbatches in the 1F1B schedule.
+            # All bwd passes share a single pool since they don't overlap.
+            if CudaGraphManager.fwd_mempools is None:
+                CudaGraphManager.fwd_mempools = defaultdict(
+                    lambda: defaultdict(torch.cuda.graph_pool_handle)
+                )
+                CudaGraphManager.bwd_mempool = torch.cuda.graph_pool_handle()
+
+        # Cudagraph stream capture requires no operations on the default stream prior to the
+        # capture, so change to a side stream.
+        torch.cuda.set_stream(torch.cuda.Stream())
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -1537,9 +1560,20 @@ class CudaGraphManager(torch.nn.Module):
                         f"runners were found. This module has {len(self.cudagraph_runners)} "
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
+            if self.reuse_cudagraphs:
+                fwd_mempool = CudaGraphManager.global_mempool
+                bwd_mempool = CudaGraphManager.global_mempool
+            else:
+                # Cycle fwd pools over PP stages. In 1F1B, at most PP microbatches
+                # have outstanding fwd activations, so PP pools suffice.
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                pool_idx = len(self.cudagraph_runners) % pp_size
+                fwd_mempool = CudaGraphManager.fwd_mempools[0][pool_idx]
+                bwd_mempool = CudaGraphManager.bwd_mempool
             runner = _CudaGraphRunner(
                 megatron_module,
-                CudaGraphManager.global_mempool,
+                fwd_mempool,
+                bwd_mempool,
                 args,
                 kwargs,
                 self.func,
