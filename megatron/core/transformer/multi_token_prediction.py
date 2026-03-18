@@ -612,6 +612,44 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def compute_mtp_inference_logits(
+    hidden_states: Tensor,
+    mtp_num_layers: int,
+    output_layer: Callable,
+    output_weight: Optional[Tensor],
+    runtime_gather_output: Optional[bool],
+) -> tuple:
+    """Compute MTP logits for inference mode.
+
+    Splits the concatenated hidden states and generates logits for each MTP layer.
+
+    Args:
+        hidden_states (Tensor): Concatenated hidden states from main + MTP layers.
+        mtp_num_layers (int): Number of MTP layers.
+        output_layer (Callable): Output layer method to compute logits.
+        output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
+        runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
+
+    Returns:
+        tuple: (hidden_states, mtp_logits_cache) where hidden_states is the main hidden
+            states and mtp_logits_cache is a tensor of shape
+            [mtp_num_layers, batch_size, vocab_size].
+    """
+    hidden_states_list = torch.chunk(hidden_states, 1 + mtp_num_layers, dim=0)
+    hidden_states = hidden_states_list[0]
+    mtp_inference_logits = []
+    for mtp_layer_number in range(mtp_num_layers):
+        mtp_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        # mtp logits shape [b, 1, vocab size]
+        mtp_inference_logits.append(mtp_logits.squeeze(1).unsqueeze(0))
+    mtp_logits_cache = torch.cat(mtp_inference_logits, dim=0)
+    return hidden_states, mtp_logits_cache
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -996,6 +1034,53 @@ class MultiTokenPredictionLayer(MegatronModule):
         # created to prevent this.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        return hidden_states
+
+    def forward_single_position(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        embedding: Callable,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        inference_params=None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward for single positions without roll_tensor (speculative decoding).
+
+        Unlike the regular forward which rolls input_ids to get the next token's
+        embedding, this method directly takes the correct next_token_ids. This is
+        used in speculative decoding where the correct next token is known after
+        verification.
+
+        Args:
+            hidden_states (Tensor): Hidden states at positions of interest [N, B, H].
+            next_token_ids (Tensor): The correct next token IDs [B, N].
+            position_ids (Tensor): Position IDs for the next tokens [B, N].
+            embedding (Callable): The embedding module.
+
+        Returns:
+            Tensor: MTP hidden states [N, B, H].
+        """
+        decoder_input = embedding(input_ids=next_token_ids, position_ids=position_ids)
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=False, keep_graph=False
+        )
+        hidden_states = self._proj_and_transformer_layer(
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
@@ -1416,7 +1501,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config, self.vp_stage)

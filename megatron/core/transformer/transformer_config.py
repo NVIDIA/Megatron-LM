@@ -916,9 +916,23 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_disable_torch_grouped_mm: bool = False
-    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
-    falling back to TE GroupedGEMM. """
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    """Specifies the backend to use for grouped GEMM operations during inference.
+    Options:
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    """
+
+    inference_moe_disable_fused_quant_kernels: bool = False
+    """When False (default), use fused kernels that combine permute/activation with
+    MXFP8 quantization + swizzle into a single kernel launch. Only applies when
+    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
+    launches (useful for debugging)."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1160,16 +1174,31 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_router_dtype != "fp32":
                 raise ValueError(
-                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
+                    "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-            if self.gated_linear_unit and self.cuda_graph_impl != "none":
+
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
-                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
-                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
-                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
                 )
+
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -2187,12 +2216,6 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
-        if self.inference_disable_torch_grouped_mm:
-            assert self.transformer_impl == "inference_optimized", (
-                "inference_disable_torch_grouped_mm is only supported "
-                "for inference_optimized transformer implementation."
-            )
-
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
@@ -2259,6 +2282,11 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
+    """
 
     def __post_init__(self):
         super().__post_init__()
