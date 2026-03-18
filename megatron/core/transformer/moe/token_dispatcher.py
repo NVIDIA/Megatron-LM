@@ -1086,8 +1086,6 @@ class _HybridEPManager(_DispatchManager):
         if self.moe_expert_rank_capacity_factor is not None:
             over_budget = self.handle[8] != 0  # this is overflow_flag
             self.over_budget |= over_budget
-            if self.config.cuda_graph_impl == 'none':
-                assert not self.over_budget.item(), 'Over budget'
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
