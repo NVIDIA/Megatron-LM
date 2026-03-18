@@ -212,7 +212,11 @@ try:
                 }
 
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
-            if result["routing_indices"] is not None:
+            if result.get("block_cache_key") is not None:
+                cache_key = {"block_cache_key": result["block_cache_key"]}
+                choices[-1]["moe_topk_indices"] = cache_key
+                choices[-1]["prompt_moe_topk_indices"] = cache_key
+            elif result["routing_indices"] is not None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
                     len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0

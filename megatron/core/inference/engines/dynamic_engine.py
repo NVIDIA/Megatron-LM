@@ -46,6 +46,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -286,7 +287,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.block_store_instance = None
                 self.block_store_instance_rank = None
                 self.block_store_instance_id = None
-                assert False
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -304,6 +304,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -330,7 +331,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._spec_tokens_accepted = 0
         self._spec_steps = 0
 
-        # Prefix caching coordination state.
+        # Prefix caching tracking.
+        self._prefix_cache_hits = 0
+        self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -389,6 +392,32 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
+            # Pre-compile FlashInfer CUTLASS kernels before the warmup loop.
+            # JIT compilation can take several minutes on first run; doing it here
+            # prevents the warmup progress bar from appearing stuck at 0%.
+            # Only rank 0 compiles to avoid filelock contention across ranks;
+            # other ranks wait for the result via broadcast.
+            error_msg = None
+            if torch.distributed.get_rank() == 0:
+                try:
+                    prewarm_flashinfer_jit()
+                except Exception as e:
+                    error_msg = str(e)
+
+            # Broadcast success/failure to all ranks so they can fail together
+            # instead of hanging at a barrier.
+            result = torch.tensor(
+                [0 if error_msg is None else 1],
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.broadcast(result, src=0)
+            if result.item() == 1:
+                raise RuntimeError(
+                    f"FlashInfer CUTLASS kernel pre-compilation failed on rank 0"
+                    + (f": {error_msg}" if error_msg else "")
+                )
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -736,6 +765,16 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
+
+            # Reset any partially prefilled requests so they recompute from the start
+            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+                req = self.get_request(req_id)
+                if req.finished_chunk_token_count > 0:
+                    req.remaining_prompt_tokens = req.prompt_tokens
+                    req.finished_chunk_token_count = 0
+
+            # Reset the chunked prefill request id
+            self.chunked_prefill_request_id = -1
         else:
             recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
@@ -781,6 +820,13 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
+
+            # Ensure chunked prefill request remains at the head of the waiting queue
+            if self.context.chunked_prefill_request_id != -1:
+                if self.context.chunked_prefill_request_id in self.waiting_request_ids:
+                    self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
+                    self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
+
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -839,6 +885,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 future=self._loop.create_future(),
             )
             request.add_event_add_engine()  # Record when request enters engine
+
+            # Stamp new request with the current generation epoch.
+            if self._generation_epoch is not None:
+                epoch = self._generation_epoch
+                request.policy_epoch = [(0, epoch)]
+                request.kv_cache_epoch = [(0, epoch)]
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -987,6 +1039,8 @@ class DynamicInferenceEngine(AbstractEngine):
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1016,7 +1070,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
-        block_allocator = self.context.block_allocator
+        block_allocator = self.context.kv_block_allocator
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
@@ -1047,15 +1101,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
-
-                # Track acceptance statistics for logging (decode requests only).
-                # Prefill requests don't propose speculative tokens, so including
-                # them would inflate the proposed count and deflate the rate.
-                # A request in its first generation step (empty generated_tokens)
-                # was in prefill this step.
-                if len(request.generated_tokens) > 0:
-                    self._spec_tokens_proposed += self.num_speculative_tokens
-                    self._spec_tokens_accepted += len(accepted_tokens)
 
                 # The order `accepted_tokens + tokens` is correct here.
                 # `accepted_tokens` contains the sequence of
@@ -1090,6 +1135,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     blocks_ref_count=blocks_ref_count,
+                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                    pre_fwd_step_count=pre_fwd_step_count,
                                 )
                             else:
                                 event = request.add_event_generated_token(
@@ -1097,6 +1144,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     blocks_total=block_allocator.total_count,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
+                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                    pre_fwd_step_count=pre_fwd_step_count,
                                 )
                             if first_token_event is None:
                                 first_token_event = event
@@ -1122,6 +1171,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
                     request
                 )
+
+                # Track acceptance statistics for logging.
+                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
+                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
+
+                    self._spec_tokens_proposed += actual_proposed
+                    self._spec_tokens_accepted += actual_accepted
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1338,18 +1395,49 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
+        """Find farthest block with cached Mamba state by iterating from the end.
+
+        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
+        only divergence and last-aligned blocks do. Iterating from the end
+        finds the farthest block with cached state, which is the only one
+        needed for restore since Mamba state is cumulative.
+        """
+        if not req.precomputed_block_hashes:
+            return 0
+        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
+        for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
+            if req.precomputed_block_hashes[i] in mamba_map:
+                return i + 1
+        return 0
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
+        # Keep track of which requests get scheduled.
+        waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
         else:
             self.schedule_non_chunked_prefill()
+        waiting_after = set(self.waiting_request_ids)
+
+        # Re-stamp kv_cache_epoch on requests that were just scheduled.
+        if self._generation_epoch is not None:
+            for request_id in waiting_before - waiting_after:
+                req = self.get_request(request_id)
+                if req.kv_cache_epoch is None:
+                    req.kv_cache_epoch = [(0, self._generation_epoch)]
 
     def schedule_non_chunked_prefill(self):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        mamba_caching_enabled = (
+            prefix_caching_enabled
+            and self.context.is_hybrid_model
+            and self.context.mamba_slot_allocator is not None
+        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1368,6 +1456,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(self.waiting_request_ids.popleft())
                     continue
 
+            # Find Mamba prefix match before check_availability (sets skip count)
+            if mamba_caching_enabled:
+                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
@@ -1375,7 +1467,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1407,6 +1499,11 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        mamba_caching_enabled = (
+            prefix_caching_enabled
+            and self.context.is_hybrid_model
+            and self.context.mamba_slot_allocator is not None
+        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1434,6 +1531,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     continue
 
+            # Find Mamba prefix match for non-continuing requests
+            if mamba_caching_enabled and not is_continuing_chunked_prefill:
+                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
             token_fully_can_be_added = (
@@ -1448,7 +1549,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if (
+                                block_hash
+                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                            ):
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
@@ -1465,24 +1569,34 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if (
+                                block_hash
+                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                            ):
                                 pending_block_hashes.add(block_hash)
-                    chunk_length = self.context.max_tokens - self.context.active_token_count
+                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
-                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
-                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce
+                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
+                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
+                    # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - chunk_length == 1 and chunk_length > 1:
-                        chunk_length -= 1
+                    if remaining_len - prefill_chunk_length == 1:
+                        if prefill_chunk_length > 1:
+                            prefill_chunk_length -= 1
+                        else:
+                            # We only have space for 1 token, but remaining is 2.
+                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
+                            can_schedule = False
+                            break
 
-                    self.context.add_request(req, chunk_length=chunk_length)
+                    self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
-                    req.finished_chunk_token_count += chunk_length
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
+                    req.finished_chunk_token_count += prefill_chunk_length
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
@@ -1524,6 +1638,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
+            "step_count": self.context.step_count,
         }
 
         # Generate tokens.
@@ -1537,6 +1652,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
+        self.context.prefix_cache_lru_clock += 1
 
         range_pop()
 
@@ -1557,10 +1673,10 @@ class DynamicInferenceEngine(AbstractEngine):
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
-            "total_active_block_count": self.context.block_allocator.active_count,
-            "total_paused_block_count": self.context.block_allocator.paused_count,
-            "total_active_used_blocks": self.context.block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.block_allocator.get_paused_used(),
+            "total_active_block_count": self.context.kv_block_allocator.active_count,
+            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
@@ -1616,6 +1732,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 log_probs,
                 top_n_logprobs,
                 routing_indices_per_request,
+                pre_fwd_active_token_count=context_state.get("active_token_count"),
+                pre_fwd_step_count=context_state.get("step_count"),
             )
 
         else:
@@ -1631,6 +1749,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
         range_pop()
 
         # Detokenize all finished requests if not using
@@ -1649,18 +1768,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
             range_pop()
 
+        # Dump routing indices to block store before coordinator communication.
+        if self.block_store_instance is not None and finished_request_records:
+            for r in finished_request_records:
+                r.dump_routing_indices_to_block_store(
+                    self.block_store_instance,
+                    self.block_store_instance_rank,
+                    self.block_store_instance_id,
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             range_push("coordinator_communication")
-            # Dump routing indices to block store before coordinator communication.
-            if self.block_store_instance is not None and finished_request_records:
-                for r in finished_request_records:
-                    r.dump_routing_indices_to_block_store(
-                        self.block_store_instance,
-                        self.block_store_instance_rank,
-                        self.block_store_instance_id,
-                    )
             payload = msgpack.packb(
                 [
                     Headers.ENGINE_REPLY.value,
@@ -1670,6 +1789,13 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self.socket_for_receiving_requests.send(payload)
             range_pop()
+
+        # Drain prefix cache hit counters from context into engine accumulators.
+        if self.context.enable_prefix_caching:
+            self._prefix_cache_hits += self.context.prefix_cache_hits
+            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
+            self.context.prefix_cache_hits = 0
+            self.context.prefix_cache_blocks_matched = 0
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1699,6 +1825,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
                 metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
                 metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+
+            # Add prefix caching metrics.
+            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+                metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
+                metrics['inference/prefix_cache_blocks_matched'] = int(
+                    self._prefix_cache_blocks_matched
+                )
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
@@ -1757,6 +1890,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
+            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
+                    self._prefix_cache_hits,
+                    self._prefix_cache_blocks_matched,
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
@@ -1766,6 +1904,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._spec_tokens_proposed = 0
                 self._spec_tokens_accepted = 0
                 self._spec_steps = 0
+
+            # Reset prefix caching accumulators after both wandb and console logging.
+            if self.context.enable_prefix_caching:
+                self._prefix_cache_hits = 0
+                self._prefix_cache_blocks_matched = 0
 
         return {
             "active_request_ids": active_request_ids,
@@ -1920,9 +2063,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
 
-        # First pass: add all requests and detect staleness increments.
+        # First pass: add requests.
         # Control signals are queued for the second pass.
-        has_staleness_increment = False
+        new_generation_epoch = None
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1932,16 +2075,29 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
-            elif header == Headers.INCREMENT_STALENESS:
-                has_staleness_increment = True
+            elif header == Headers.SET_GENERATION_EPOCH:
+                new_generation_epoch = data[1]
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
 
-        if has_staleness_increment:
-            waiting = set(self.waiting_request_ids)
-            for request_id, entry in self.requests.items():
-                entry.record.increment_staleness(policy_only=request_id in waiting)
+        if new_generation_epoch is not None:
+            self._generation_epoch = new_generation_epoch
+            # Stamp all active requests with the new epoch.
+            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, new_generation_epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, new_generation_epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).
@@ -2101,7 +2257,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
-            await self.world_zmq_communicator.all_reduce_max(1, async_op=(not self.use_synchronous_zmq_collectives))
+            await self.world_zmq_communicator.all_reduce_max(
+                1, async_op=(not self.use_synchronous_zmq_collectives)
+            )
         range_pop()
 
     @trace_async_exceptions
@@ -2148,6 +2306,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)
