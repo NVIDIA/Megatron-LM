@@ -676,17 +676,11 @@ def test_validate_coefficient_type_rejects_invalid():
 
 # Newton-Schulz step counts known to be compatible with each coefficient type.
 # "custom" is excluded because it requires user-supplied coefficient sets.
-_NS_STEPS_FOR_COEFF_TYPE = {
-    "simple": 3,
-    "quintic": 5,
-    "polar_express": 8,
-    "aol": 4,
-}
+_NS_STEPS_FOR_COEFF_TYPE = {"simple": 3, "quintic": 5, "polar_express": 8, "aol": 4}
 
 # Parametrize over all supported types that we know how to configure.
 _TESTABLE_COEFFICIENT_TYPES = [
-    t for t in get_supported_coefficient_types()
-    if t in _NS_STEPS_FOR_COEFF_TYPE
+    t for t in get_supported_coefficient_types() if t in _NS_STEPS_FOR_COEFF_TYPE
 ]
 
 
