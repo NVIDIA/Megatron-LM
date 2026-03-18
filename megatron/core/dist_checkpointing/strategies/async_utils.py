@@ -111,6 +111,7 @@ class AsyncRequest(NamedTuple):
                         in preloading and writing tensors on the async caller
 
     """
+
     async_fn: Optional[Callable]
     async_fn_args: Tuple
     finalize_fns: List[Callable]
