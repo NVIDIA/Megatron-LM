@@ -1012,7 +1012,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         pass  # TODO
 
 
-def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> str:
+def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tuple:
     """Returns async strategy and related async imported modules"""
     if async_strategy == "nvrx":
         try:
