@@ -2179,6 +2179,19 @@ class TestDynamicInferenceEngine:
             for entry in engine.requests.values():
                 assert entry.record[-1].kv_cache_epoch is None
 
+        # Simulate eviction: checkpoint clears kv_cache_epoch, request goes to
+        # waiting queue, schedule_waiting_requests re-stamps it.
+        for entry in engine.requests.values():
+            req = entry.record[-1]
+            event_add_engine = req.event_add_engine
+            entry.record.checkpoint()
+            entry.record[-1].event_add_engine = event_add_engine
+            assert entry.record[-1].kv_cache_epoch is None
+            engine.waiting_request_ids.append(req.request_id)
+        engine.schedule_waiting_requests()
+        for entry in engine.requests.values():
+            assert entry.record[-1].kv_cache_epoch == [(0, 1)]
+
         # Generation epoch 2: stamp then generate remaining tokens.
         set_epoch(2)
 
@@ -2203,10 +2216,6 @@ class TestDynamicInferenceEngine:
         record.checkpoint()
         assert record[-1].policy_epoch == merged.policy_epoch
         assert record[-1].kv_cache_epoch is None
-
-        # Simulate eviction re-add: _add_request re-stamps kv_cache_epoch.
-        engine._add_request(record[-1])
-        assert record[-1].kv_cache_epoch == [(0, 2)]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
