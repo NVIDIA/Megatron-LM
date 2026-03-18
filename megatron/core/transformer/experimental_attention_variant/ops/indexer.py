@@ -30,11 +30,13 @@ class IndexerFunction(torch.autograd.Function):
         cu_seqlen_ke: torch.Tensor,
         topk: int,
         topk_indices: torch.Tensor | None = None,
+        use_relu: bool = True,
     ):
         """Run fused indexer forward and optionally select top-k indices."""
         _, head_num, _ = index_q.shape
         logits = indexer_fwd_interface(
-            index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True
+            index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True,
+            use_relu=use_relu,
         )
         if topk_indices is None:
             effective_topk = min(topk, logits.size(-1))
@@ -52,6 +54,7 @@ class IndexerFunction(torch.autograd.Function):
         ctx.save_for_backward(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices)
         ctx.topk = topk
         ctx.head_num = head_num
+        ctx.use_relu = use_relu
         return index_score, topk_indices
 
     @staticmethod
@@ -59,9 +62,9 @@ class IndexerFunction(torch.autograd.Function):
         """Propagate gradients through fused indexer outputs."""
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = ctx.saved_tensors
         grad_q, grad_w, grad_k = indexer_bwd_interface(
-            index_q, weights, index_k, topk_indices, grad_scores
+            index_q, weights, index_k, topk_indices, grad_scores, use_relu=ctx.use_relu
         )
-        return grad_q, grad_k, grad_w, None, None, None, None
+        return grad_q, grad_k, grad_w, None, None, None, None, None
 
 
 def lighting_indexer(
@@ -72,10 +75,12 @@ def lighting_indexer(
     cu_seqlen_ke: torch.Tensor,
     topk: int,
     topk_indices: torch.Tensor | None = None,
+    use_relu: bool = True,
 ):
     """Compute indexer top-k scores/indices via the custom autograd function."""
     return IndexerFunction.apply(
-        index_q, index_k, weights.squeeze(-1), cu_seqlen_ks, cu_seqlen_ke, topk, topk_indices
+        index_q, index_k, weights.squeeze(-1), cu_seqlen_ks, cu_seqlen_ke, topk, topk_indices,
+        use_relu,
     )
 
 

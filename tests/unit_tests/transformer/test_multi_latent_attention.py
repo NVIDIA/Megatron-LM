@@ -2,6 +2,7 @@
 
 import os
 from inspect import signature
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -175,6 +176,49 @@ class TestParallelMLAAttention:
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
+
+    def test_absorbed_dsa_uses_lora_merged_kv_up_weight(self):
+        attention = self.parallel_attention
+        n_heads = attention.num_attention_heads_per_partition
+        qk_head_dim = attention.config.qk_head_dim
+        qk_pos_dim = attention.config.qk_pos_emb_head_dim
+        v_head_dim = attention.config.v_head_dim
+        kv_lora_rank = attention.config.kv_lora_rank
+
+        total_out = n_heads * (qk_head_dim + v_head_dim)
+        base_weight = torch.zeros(total_out, kv_lora_rank, dtype=torch.float32)
+        linear_in_weight = torch.zeros(1, kv_lora_rank, dtype=torch.float32)
+        linear_out_weight = torch.zeros(total_out, 1, dtype=torch.float32)
+
+        linear_in_weight[0, 0] = 3.0
+        linear_out_weight[0, 0] = 5.0
+        linear_out_weight[qk_head_dim, 0] = 2.0
+
+        fake_wrapper = torch.nn.Module()
+        fake_wrapper.to_wrap = SimpleNamespace(weight=base_weight)
+        fake_wrapper.adapter = SimpleNamespace(
+            linear_in=SimpleNamespace(weight=linear_in_weight),
+            linear_out=SimpleNamespace(weight=linear_out_weight),
+            alpha=1.0,
+            dim=1,
+            input_is_parallel=False,
+        )
+        fake_wrapper._adapter_enabled = True
+
+        attention.linear_kv_up_proj = fake_wrapper
+
+        query = torch.zeros(1, 1, n_heads, qk_head_dim + qk_pos_dim, dtype=torch.float32)
+        key = torch.zeros(1, 1, n_heads, qk_head_dim + qk_pos_dim, dtype=torch.float32)
+        kv_compressed = torch.zeros(1, 1, kv_lora_rank, dtype=torch.float32)
+        query[..., 0] = 1.0
+
+        query_absorbed, _, value_absorbed, up_v_weight = attention.get_absorb_query_key_value_tensors(
+            query, key, kv_compressed
+        )
+
+        assert value_absorbed is None
+        assert query_absorbed[0, 0, 0, 0].item() == pytest.approx(15.0)
+        assert up_v_weight[0, 0, 0].item() == pytest.approx(6.0)
 
     def test_gpu_forward(self):
         if is_te_min_version("1.10.0"):
