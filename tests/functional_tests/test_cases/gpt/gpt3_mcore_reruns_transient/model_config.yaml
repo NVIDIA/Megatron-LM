@@ -80,6 +80,7 @@ MODEL_ARGS:
   --error-injection-rate: 100
   --error-injection-type: transient_error
   --async-save: true
+  --use-persistent-ckpt-worker: true
 AFTER_SCRIPT: |
   check_log() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then exit 1; else echo OK; fi }
   check_log -F "WARNING:megatron.core.rerun_state_machine:Result validation enabled"
