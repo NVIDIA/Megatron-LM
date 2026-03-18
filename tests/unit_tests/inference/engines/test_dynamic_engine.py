@@ -2204,6 +2204,10 @@ class TestDynamicInferenceEngine:
         assert record[-1].policy_epoch == merged.policy_epoch
         assert record[-1].kv_cache_epoch is None
 
+        # Simulate eviction re-add: _add_request re-stamps kv_cache_epoch.
+        engine._add_request(record[-1])
+        assert record[-1].kv_cache_epoch == [(0, 2)]
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

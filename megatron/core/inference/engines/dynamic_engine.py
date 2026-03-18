@@ -1372,6 +1372,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.block_allocator.hash_to_block_id:
                             pending_block_hashes.add(block_hash)
+                # Re-stamp kv_cache_epoch if cleared by checkpoint (e.g. after eviction).
+                if self._generation_epoch is not None and req.kv_cache_epoch is None:
+                    req.kv_cache_epoch = [(0, self._generation_epoch)]
+                    assert req.policy_epoch is not None
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
