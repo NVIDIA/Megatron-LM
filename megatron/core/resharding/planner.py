@@ -523,8 +523,6 @@ def build_centralized_reshard_plan(
         plans_list = None
 
     # Scatter: each rank receives only its own plan (not all plans).
-    # This replaces broadcast_object_list which sent the full list to every rank,
-    # wasting ~(world_size - 1) × plan_size bytes of CPU memory.
     my_plan_list = [None]
     torch.distributed.scatter_object_list(my_plan_list, plans_list, group_src=0, group=group)
     my_plan = my_plan_list[0]

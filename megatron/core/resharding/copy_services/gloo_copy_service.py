@@ -146,8 +146,6 @@ class GlooCopyService(CopyService):
         if cpu_send_bufs:
             torch.cuda.synchronize()
 
-        # Release GPU send tensors now that data lives in pinned CPU buffers.
-        # This frees ~1x model size of GPU memory before P2P communication.
         for op in remote_sends:
             op.tensor = None
 
