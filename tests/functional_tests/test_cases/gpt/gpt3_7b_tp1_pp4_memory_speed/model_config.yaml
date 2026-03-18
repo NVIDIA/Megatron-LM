@@ -59,6 +59,7 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --exit-interval: 25
   --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"

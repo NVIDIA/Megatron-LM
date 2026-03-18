@@ -54,4 +54,5 @@ MODEL_ARGS:
   --expert-tensor-parallel-size: 4
   --calculate-per-token-loss: true
   --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
