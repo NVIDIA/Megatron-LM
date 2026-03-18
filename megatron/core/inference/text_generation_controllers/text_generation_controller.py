@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 import inspect
+import warnings
 from collections import defaultdict
 from typing import Any, Dict, Iterator, List, Optional, OrderedDict, Tuple, Union
 
@@ -39,6 +40,14 @@ try:
 
 except ImportError:
     HAVE_TE = False
+
+try:
+    import flashinfer  # pylint: disable=unused-import
+
+    HAVE_FLASHINFER = True
+
+except ImportError:
+    HAVE_FLASHINFER = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
@@ -81,6 +90,9 @@ class TextGenerationController:
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
+            if self.model_config.sampling_backend == 'flashinfer' and not HAVE_FLASHINFER:
+                warnings.warn("FlashInfer is not installed. Falling back to PyTorch sampling.")
+                self.model_config.sampling_backend = 'torch'
             self._init_dynamic_sampling_tensors()
 
     def set_stop_word_finished_ids_callback(self, callback):
@@ -109,21 +121,39 @@ class TextGenerationController:
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
 
-        self._sampling_backend = "torch"
-        self._enable_cuda_graph = False
+        self._sampling_backend = self.model_config.sampling_backend
+        self._enable_cuda_graph = (
+            self._sampling_backend == "flashinfer"
+            and self.model_config.cuda_graph_impl == "local"
+        )
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
-            self._all_logits_cuda = torch.empty(
-                (1, max_logits, vocab_size), dtype=logits_dtype, device=device
+            self._all_logits_cuda = torch.zeros(
+                (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
             )
         else:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
-        # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: Iterator[Tuple] = []
+        elif self._sampling_backend == "flashinfer":
+            # Pre-allocate GPU tensors for FlashInfer sampling parameters.
+            # The base metadata keeps these on CPU; we copy to GPU during bookkeeping.
+            self._fi_temperature = torch.empty(max_requests, dtype=torch.float32, device=device)
+            self._fi_top_k = torch.empty(max_requests, dtype=torch.int32, device=device)
+            self._fi_top_p = torch.empty(max_requests, dtype=torch.float32, device=device)
+
+            if self._enable_cuda_graph:
+                # For CUDA-graphed sampling, use seed/offset tensors instead of generator
+                # (generator state isn't captured by CUDA graphs).
+                self._fi_seed = torch.tensor(
+                    self.model_config.inference_sampling_seed,
+                    dtype=torch.int64, device=device,
+                )
+                self._fi_offset = torch.zeros((), dtype=torch.int64, device=device)
+                self._sampling_cuda_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -635,16 +665,133 @@ class TextGenerationController:
             self._torch_sampling_buckets = (
                 (indices, temp[rep], top_k[rep], top_p[rep]) for indices, rep in bucket_map.values()
             )
+        elif self._sampling_backend == "flashinfer":
+            n = active_request_count
+            # Copy sampling params from (pinned) CPU metadata to pre-allocated GPU tensors.
+            self._fi_temperature[:n].copy_(
+                context.active_request_metadata["temperature"][:n], non_blocking=True
+            )
+            self._fi_top_k[:n].copy_(
+                context.active_request_metadata["top_k"][:n], non_blocking=True
+            )
+            self._fi_top_p[:n].copy_(
+                context.active_request_metadata["top_p"][:n], non_blocking=True
+            )
+
+            if self._enable_cuda_graph and context.is_decode_only():
+                # CUDA graph path: remap disabled filters to passthrough values so we can
+                # use the single top_k_top_p_sampling_from_probs for the whole batch.
+                self._fi_top_k[:n][self._fi_top_k[:n] == 0] = self.vocab_size
+                self._fi_top_p[:n][self._fi_top_p[:n] == 0.0] = 1.0
+                # Pad slots beyond active with safe defaults.
+                padded_n = context.padded_active_request_count
+                if padded_n > n:
+                    self._fi_temperature[n:padded_n].fill_(1.0)
+                    self._fi_top_k[n:padded_n].fill_(self.vocab_size)
+                    self._fi_top_p[n:padded_n].fill_(1.0)
+            else:
+                # Eager path: compute CPU-side dispatch indices (avoids GPU sync).
+                top_k_list = context.active_request_metadata["top_k"][:n].tolist()
+                top_p_list = context.active_request_metadata["top_p"][:n].tolist()
+                self._fi_top_k_indices = [i for i, k in enumerate(top_k_list) if k > 0]
+                self._fi_top_p_indices = [
+                    i for i, (k, p) in enumerate(zip(top_k_list, top_p_list))
+                    if k == 0 and p > 0.0
+                ]
+                self._fi_plain_indices = [
+                    i for i, (k, p) in enumerate(zip(top_k_list, top_p_list))
+                    if k == 0 and p == 0.0
+                ]
+
+    def _flashinfer_sampling_func(
+        self, last_token_logits: torch.Tensor, batch_size: int
+    ) -> None:
+        """Sample tokens using FlashInfer kernels, dispatching by top_k/top_p usage.
+
+        Args:
+            last_token_logits (torch.Tensor): Logits of shape [batch_size, vocab_size].
+            batch_size (int): Number of active requests to sample for.
+        """
+        n = batch_size
+
+        # Temperature-scaled softmax.  Clone so we don't corrupt the logits buffer
+        # (log probs are computed from the original logits after sampling).
+        logits = last_token_logits.float().clone()
+        logits.div_(self._fi_temperature[:n].unsqueeze(1))
+        probs = torch.softmax(logits, dim=-1)
+
+        # Dispatch to the appropriate FlashInfer kernel per group.
+        if self._fi_top_k_indices:
+            idx = self._fi_top_k_indices
+            self._sampled_tokens_cuda[idx] = flashinfer.sampling.top_k_sampling_from_probs(
+                probs[idx], self._fi_top_k[idx], generator=self.sampling_rng,
+            )
+        if self._fi_top_p_indices:
+            idx = self._fi_top_p_indices
+            self._sampled_tokens_cuda[idx] = flashinfer.sampling.top_p_sampling_from_probs(
+                probs[idx], self._fi_top_p[idx], generator=self.sampling_rng,
+            )
+        if self._fi_plain_indices:
+            idx = self._fi_plain_indices
+            self._sampled_tokens_cuda[idx] = flashinfer.sampling.sampling_from_probs(
+                probs[idx], generator=self.sampling_rng,
+            )
+
+    def _capture_sampling_cuda_graph(self, batch_size: int) -> None:
+        """Capture a CUDA graph for FlashInfer sampling at a given batch size.
+
+        Uses top_k_top_p_sampling_from_probs uniformly (with remapped defaults) so the
+        code path is fixed and graphable.  seed/offset tensors are used instead of a
+        generator so the RNG state survives graph replay.
+
+        Args:
+            batch_size (int): The (padded) number of requests.
+        """
+        n = batch_size
+
+        # Fill params with safe defaults for the capture pass.
+        self._fi_temperature[:n].fill_(1.0)
+        self._fi_top_k[:n].fill_(self.vocab_size)
+        self._fi_top_p[:n].fill_(1.0)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            # Clone to avoid mutating self._all_logits_cuda (needed for log probs).
+            logits = self._all_logits_cuda.squeeze(0)[:n, :].float().clone()
+            logits.div_(self._fi_temperature[:n].unsqueeze(1))
+            probs = torch.softmax(logits, dim=-1)
+            # Use .copy_() for safe int32 → int64 cast inside the graph.
+            self._sampled_tokens_cuda[:n].copy_(
+                flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, self._fi_top_k[:n], self._fi_top_p[:n],
+                    seed=self._fi_seed, offset=self._fi_offset,
+                )
+            )
+        self._sampling_cuda_graphs[batch_size] = g
 
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
 
-        # Last token logits.
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # CUDA-graphed FlashInfer path: replay the captured graph (reads logits directly
+        # from self._all_logits_cuda, so skip last_token_logits extraction).
+        if (
+            self._sampling_backend == "flashinfer"
+            and self._enable_cuda_graph
+            and context.is_decode_only()
+        ):
+            padded_n = context.padded_active_request_count
+            graph = self._sampling_cuda_graphs.get(padded_n)
+            if graph is not None:
+                self._fi_offset.add_(padded_n)
+                graph.replay()
+                return
+
+        # Extract last token logits.
         if context.config.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
@@ -667,6 +814,8 @@ class TextGenerationController:
             sampled_tokens = torch.cat(token_list, dim=0)
             sampled_indices = torch.cat(indices_list, dim=0)
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
+        elif self._sampling_backend == "flashinfer":
+            self._flashinfer_sampling_func(last_token_logits, active_request_count)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.

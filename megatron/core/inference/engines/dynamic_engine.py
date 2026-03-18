@@ -300,6 +300,15 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+            # Capture sampling CUDA graph for decode-only dimensions.
+            if (
+                controller._enable_cuda_graph
+                and cuda_graph_batch_dimension.prefill_req_count == 0
+            ):
+                controller._capture_sampling_cuda_graph(
+                    cuda_graph_batch_dimension.req_count
+                )
+
             context.reset()
 
         # Memory usage.
