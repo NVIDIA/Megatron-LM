@@ -1,0 +1,43 @@
+name: Claude Tracking Detector
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+jobs:
+  detect-and-trigger-sync:
+    runs-on: ubuntu-latest
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event.pull_request.base.ref != 'main'
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Check for tracking state and trigger sync
+        run: |
+          MARKER="<!-- claude-pr-state:"
+
+          COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body')
+
+          TRACKING_COMMENT=$(echo "$COMMENTS" | grep -o "${MARKER} .*-->" | tail -1 || true)
+
+          if [ -z "$TRACKING_COMMENT" ]; then
+            echo "No Claude tracking state found on PR #${PR_NUMBER}. Skipping."
+            exit 0
+          fi
+
+          STATE_JSON=$(echo "$TRACKING_COMMENT" | sed "s/${MARKER} //" | sed 's/ -->//')
+
+          TRACKING=$(echo "$STATE_JSON" | jq -r '.tracking')
+
+          if [ "$TRACKING" != "true" ]; then
+            echo "Tracking is disabled for PR #${PR_NUMBER}. Skipping."
+            exit 0
+          fi
+
+          echo "Tracking is enabled for PR #${PR_NUMBER}. Posting /claude sync comment."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "/claude sync"

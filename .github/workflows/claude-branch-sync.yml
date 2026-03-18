@@ -1,0 +1,227 @@
+name: Claude Branch Sync
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  branch-sync:
+    name: Claude Branch Sync
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (
+        contains(github.event.comment.body, '/claude copy and track') ||
+        contains(github.event.comment.body, '/claude copy') ||
+        contains(github.event.comment.body, '/claude track') ||
+        contains(github.event.comment.body, '/claude sync') ||
+        contains(github.event.comment.body, '/claude untrack')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Get PR metadata
+        id: pr-meta
+        run: |
+          PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json baseRefName,headRefOid,headRefName,headRepository,title,body)
+          echo "base_branch=$(echo "$PR_JSON" | jq -r '.baseRefName')" | tee -a "$GITHUB_OUTPUT"
+          echo "head_sha=$(echo "$PR_JSON" | jq -r '.headRefOid')" | tee -a "$GITHUB_OUTPUT"
+          echo "head_ref=$(echo "$PR_JSON" | jq -r '.headRefName')" | tee -a "$GITHUB_OUTPUT"
+          echo "head_repo=$(echo "$PR_JSON" | jq -r '.headRepository.name')" | tee -a "$GITHUB_OUTPUT"
+          echo "pr_title=$(echo "$PR_JSON" | jq -r '.title')" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Reject if PR targets main
+        if: steps.pr-meta.outputs.base_branch == 'main'
+        run: |
+          BODY='**Claude Branch Sync**
+
+          This command can only be used on PRs targeting non-main branches (e.g., `dev`, `release/*`).
+
+          Since this PR already targets `main`, there is no need to port changes. If you intended to use this command on a different PR, please navigate to the PR targeting the non-main branch and try again.'
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.PAT }}
+
+      - name: Fetch PR head
+        run: |
+          git fetch origin "pull/${PR_NUMBER}/head:pr-${PR_NUMBER}"
+
+      - name: Run Claude Branch Sync
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "/claude"
+          show_full_output: true
+          claude_args: |
+            --allowedTools "Bash(*),Read,Write,Edit,Glob,Grep"
+            --model "claude-opus-4-6"
+          prompt: |
+            REPO: ${{ env.REPO }}
+            SOURCE PR NUMBER: ${{ env.PR_NUMBER }}
+            SOURCE PR TITLE: ${{ steps.pr-meta.outputs.pr_title }}
+            SOURCE PR BASE BRANCH: ${{ steps.pr-meta.outputs.base_branch }}
+            SOURCE PR HEAD SHA: ${{ steps.pr-meta.outputs.head_sha }}
+            SOURCE PR HEAD REF: ${{ steps.pr-meta.outputs.head_ref }}
+            COMMENT BODY: ${{ github.event.comment.body }}
+            COMMENT AUTHOR: ${{ github.event.comment.user.login }}
+
+            You are a branch sync assistant. Your job is to port PRs from non-main branches to `main`.
+
+            ## Setup
+
+            The repository is already checked out. The `main` branch is checked out as the working tree.
+            The source PR's head is available as a local branch: `pr-${{ env.PR_NUMBER }}`.
+
+            Configure git for commits:
+            ```
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            ```
+
+            ## Sticky Comment Format
+
+            You use a sticky comment on the SOURCE PR to track state. The comment format is:
+
+            ```
+            <!-- claude-pr-state: {"target_pr": <number>, "tracking": <bool>} -->
+            **Claude Branch Sync**
+            ↳ Linked to #<number> | Tracking: enabled/disabled
+            ```
+
+            To find your existing sticky comment, run:
+            ```
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[] | select(.body | contains("<!-- claude-pr-state:")) | {id: .id, body: .body}'
+            ```
+
+            To create a new sticky comment:
+            ```
+            gh pr comment <pr_number> --repo <repo> --body "<body>"
+            ```
+
+            To update an existing sticky comment:
+            ```
+            gh api "repos/${REPO}/issues/comments/<comment_id>" -X PATCH -f body="<body>"
+            ```
+
+            ## Commands
+
+            Parse the COMMENT BODY to determine which command was issued. The command is the FIRST `/claude` command found in the comment. Handle exactly one of:
+
+            ### /claude copy
+
+            1. **Check for duplicates**: Search open PRs targeting `main` to see if a port of this PR already exists.
+               ```
+               gh pr list --repo ${REPO} --base main --state open --json number,title,body --limit 100
+               ```
+               Look for PRs whose title or body references the source PR number (#${PR_NUMBER}). Also check closed/merged PRs:
+               ```
+               gh pr list --repo ${REPO} --base main --state closed --json number,title,body --limit 100
+               ```
+               If a duplicate exists, post a comment explaining that and link to the existing PR. Do NOT create a new one.
+
+            2. **Create a port branch**:
+               ```
+               git checkout -b claude/port-pr-${PR_NUMBER} main
+               ```
+
+            3. **Get the diff from the source PR and apply it**:
+               ```
+               gh pr diff ${PR_NUMBER} --repo ${REPO} > /tmp/pr.diff
+               ```
+               Try applying cleanly first:
+               ```
+               git apply /tmp/pr.diff
+               ```
+               If that fails, try with 3-way merge:
+               ```
+               git apply --3way /tmp/pr.diff
+               ```
+               If that also fails, apply what you can and manually resolve conflicts by reading the source PR's files and the main branch's files to understand the intent. Use your best judgment, but document EVERY conflict and how you resolved it.
+
+            4. **Commit and push**:
+               ```
+               git add -A
+               git commit -m "Port PR #${PR_NUMBER}: ${SOURCE_PR_TITLE}"
+               git push origin claude/port-pr-${PR_NUMBER}
+               ```
+
+            5. **Create a draft PR targeting main**:
+               ```
+               gh pr create --repo ${REPO} --base main --head claude/port-pr-${PR_NUMBER} --draft --title "[Port] ${SOURCE_PR_TITLE}" --body "<body>"
+               ```
+               The PR body should include:
+               - A note that this is an automated port of #${PR_NUMBER}
+               - A summary of what the PR does (based on the source PR)
+               - A conflict resolution summary (if any conflicts were resolved), detailing each conflict and how it was resolved
+               - A note asking reviewers to verify the conflict resolutions if any were made
+
+            6. **Post a sticky comment** on the source PR with `tracking: false` and the target PR number.
+
+            ### /claude copy and track
+
+            Same as `/claude copy`, but set `tracking: true` in the sticky comment.
+
+            ### /claude track <pr_number>
+
+            1. Parse the target PR number from the command (e.g., `/claude track 456` → target is 456).
+            2. Validate the target PR exists and is open:
+               ```
+               gh pr view <target_pr> --repo ${REPO} --json state --jq '.state'
+               ```
+               If it doesn't exist or is not OPEN, post a comment explaining why tracking cannot be enabled.
+            3. Verify the target PR targets `main`:
+               ```
+               gh pr view <target_pr> --repo ${REPO} --json baseRefName --jq '.baseRefName'
+               ```
+               If it doesn't target `main`, post a comment explaining that tracking only works for PRs targeting `main`.
+            4. Create or update the sticky comment with `target_pr` and `tracking: true`.
+
+            ### /claude sync
+
+            1. Find the sticky comment on this PR. If none exists, post a comment:
+               "No tracking state found. Use `/claude copy` to create a port PR, or `/claude track <number>` to link an existing one."
+            2. Parse the `target_pr` from the sticky comment.
+            3. Verify the target PR is still open. If not, post a comment explaining that the target PR is no longer open and disable tracking.
+            4. Get the target PR's branch:
+               ```
+               gh pr view <target_pr> --repo ${REPO} --json headRefName --jq '.headRefName'
+               ```
+            5. Checkout the target branch and update it:
+               ```
+               git fetch origin <target_branch>
+               git checkout <target_branch>
+               ```
+            6. Get the diff of new changes from the source PR. Compare what's currently on the target branch vs the source PR's latest state. Apply the delta, resolving conflicts as needed.
+            7. Commit and push to the target branch.
+            8. Post a comment on the TARGET PR summarizing what was synced, including any conflict resolutions.
+            9. Post a comment on the SOURCE PR confirming the sync completed.
+
+            ### /claude untrack
+
+            1. Find the sticky comment. If none exists, post a comment: "No tracking state found. Nothing to untrack."
+            2. Update the sticky comment to set `tracking: false`.
+            3. Post a confirmation comment.
+
+            ## Important Rules
+
+            - ALWAYS create draft PRs, never regular PRs.
+            - NEVER force push. If a push fails, investigate and resolve the issue.
+            - When resolving conflicts, ALWAYS document what you did and why in the PR body or sync comment.
+            - If something goes wrong, post a clear error comment on the source PR explaining what happened.
+            - Be concise in comments. Use markdown formatting.
+            - When checking for duplicate PRs, be thorough — check both title patterns and body references.
