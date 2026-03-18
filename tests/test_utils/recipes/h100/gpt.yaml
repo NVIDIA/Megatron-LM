@@ -184,7 +184,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [flaky]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]

@@ -64,4 +64,5 @@ MODEL_ARGS:
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
   --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume
