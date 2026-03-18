@@ -21,8 +21,8 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
-    from emerging_optimizers.soap import SOAP
     from emerging_optimizers.scalar_optimizers import Lion
+    from emerging_optimizers.soap import SOAP
 else:
     SOAP = None
     Lion = None
