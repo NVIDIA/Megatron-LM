@@ -423,26 +423,37 @@ def build_centralized_reshard_plan(
         # No destination model on this rank - provide empty metadata
         my_dst_metadata = []
 
-    all_src_metadata_by_rank = [None] * world_size
-    all_dst_metadata_by_rank = [None] * world_size
-    dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata, group=group)
-    dist.all_gather_object(all_dst_metadata_by_rank, my_dst_metadata, group=group)
+    # Gather metadata to rank 0 only (not all ranks) to save CPU memory.
+    # Other ranks don't need the full metadata — they only need their own plan.
+    all_src_metadata_by_rank = [None] * world_size if my_global_rank == 0 else None
+    all_dst_metadata_by_rank = [None] * world_size if my_global_rank == 0 else None
+    dist.gather_object(my_src_metadata, all_src_metadata_by_rank,
+                       group_dst=0, group=group)
+    dist.gather_object(my_dst_metadata, all_dst_metadata_by_rank,
+                       group_dst=0, group=group)
 
-    # Parameter to metadata maps keyed by resolved_name
+    # Free local metadata — no longer needed after gather.
+    del my_src_metadata, my_dst_metadata
+
+    # Parameter to metadata maps keyed by resolved_name (only populated on rank 0)
     src_param_metadata_by_rank = {}
     dst_param_metadata_by_rank = {}
     src_param_metadata: dict[str, list[ParameterMetadata]] = {}
 
-    for rank_id, rank_metadata_list in enumerate(all_src_metadata_by_rank):
-        src_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
-    for rank_id, rank_metadata_list in enumerate(all_dst_metadata_by_rank):
-        dst_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
-    for rank_metadata_list in all_src_metadata_by_rank:
-        for metadata in rank_metadata_list:
-            key = metadata.resolved_name
-            if key not in src_param_metadata:
-                src_param_metadata[key] = []
-            src_param_metadata[key].append(metadata)
+    if my_global_rank == 0:
+        for rank_id, rank_metadata_list in enumerate(all_src_metadata_by_rank):
+            src_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
+        for rank_id, rank_metadata_list in enumerate(all_dst_metadata_by_rank):
+            dst_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
+        for rank_metadata_list in all_src_metadata_by_rank:
+            for metadata in rank_metadata_list:
+                key = metadata.resolved_name
+                if key not in src_param_metadata:
+                    src_param_metadata[key] = []
+                src_param_metadata[key].append(metadata)
+
+        # Free the raw gathered lists — data is now in the indexed dicts.
+        del all_src_metadata_by_rank, all_dst_metadata_by_rank
 
     # Build the plan on global rank 0 and broadcast to all ranks
     if my_global_rank == 0:
@@ -499,12 +510,22 @@ def build_centralized_reshard_plan(
                         )
                     )
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
+
+        # Free planning intermediates on rank 0 before the scatter.
+        del plans_for_all_ranks, src_param_metadata_by_rank
+        del dst_param_metadata_by_rank, src_param_metadata
     else:
-        plans_list = [None] * world_size
-    # Use group_src= (group rank) instead of src= (default PG global rank) to support
-    # cross-cluster ProcessGroups where members share the same default PG rank.
-    torch.distributed.broadcast_object_list(plans_list, group_src=0, group=group)
-    my_plan = plans_list[my_global_rank]
+        plans_list = None
+
+    # Scatter: each rank receives only its own plan (not all plans).
+    # This replaces broadcast_object_list which sent the full list to every rank,
+    # wasting ~(world_size - 1) × plan_size bytes of CPU memory.
+    my_plan_list = [None]
+    torch.distributed.scatter_object_list(
+        my_plan_list, plans_list, group_src=0, group=group,
+    )
+    my_plan = my_plan_list[0]
+    del plans_list  # Free the full list on rank 0.
 
     logger.info(
         f"Rank {my_global_rank}: Received plan - {len(my_plan.recv_ops)} recvs, "
