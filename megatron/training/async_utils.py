@@ -16,7 +16,10 @@ from megatron.training.utils import print_rank_0
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
 except (ImportError, ModuleNotFoundError):
+    from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
+
     NVRxAsyncRequest = ABC
 
 logger = logging.getLogger(__name__)
