@@ -2134,15 +2134,10 @@ def _add_ft_package_args(parser):
 
 
 def _add_tensor_inspect_args(parser):
-    group = parser.add_argument_group(title='tensor_inspect')
-    group.add_argument('--tensor-inspect', action='store_true',
-                       help='Enable tensor inspection via NVIDIA DLFw Inspect.')
-    group.add_argument('--tensor-inspect-config', type=str, default=None,
-                       help='Path to YAML config for tensor inspection features.')
-    group.add_argument('--tensor-inspect-log-dir', type=str, default=None,
-                       help='Directory for tensor inspection logs.')
-    group.add_argument('--tensor-inspect-feature-dirs', type=str, nargs='+', default=None,
-                       help='Directories containing tensor inspection feature implementations.')
+    from megatron.training.config import TensorInspectConfig
+
+    tensor_inspect_factory = ArgumentGroupFactory(TensorInspectConfig)
+    tensor_inspect_factory.build_group(parser, title="tensor_inspect")
     return parser
 
 

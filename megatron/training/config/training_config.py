@@ -323,6 +323,23 @@ class LoggerConfig:
 
 
 @dataclass(kw_only=True)
+class TensorInspectConfig:
+    """Configuration settings for tensor inspection via NVIDIA DLFw Inspect."""
+
+    tensor_inspect: bool = False
+    """Enable tensor inspection and statistics collection."""
+
+    tensor_inspect_config: str | None = None
+    """Path to YAML config for tensor inspection features."""
+
+    tensor_inspect_log_dir: str | None = None
+    """Directory for tensor inspection logs."""
+
+    tensor_inspect_feature_dirs: list[str] | None = None
+    """Directories containing tensor inspection feature implementations."""
+
+
+@dataclass(kw_only=True)
 class CheckpointConfig:
     """Configuration settings for model checkpointing (saving and loading)."""
 
