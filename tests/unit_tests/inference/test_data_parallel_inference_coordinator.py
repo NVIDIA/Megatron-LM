@@ -674,9 +674,7 @@ class TestCoordinator:
 
 
 def _make_routing_coordinator(
-    num_ranks=4,
-    enable_prefix_caching=False,
-    policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+    num_ranks=4, enable_prefix_caching=False, policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
 ):
     """Create a coordinator with fake rank identities for routing-only tests.
 
