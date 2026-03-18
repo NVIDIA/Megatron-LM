@@ -647,6 +647,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         process_group = mpu.get_expert_data_parallel_group()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
+            # Set proper async strategy
+            if hasattr(save_strategy, "async_strategy"):
+                save_strategy.async_strategy = args.async_strategy
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -1178,6 +1181,9 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(
         checkpoint_name, cache_metadata=args.ckpt_assume_constant_structure
     )
+    # Set proper async strategy
+    if hasattr(load_strategy, "async_strategy"):
+        load_strategy.async_strategy = args.async_strategy
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':

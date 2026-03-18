@@ -625,13 +625,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
-        self.async_strategy, async_modules = get_async_strategy(async_strategy)
-        self.async_writer = async_modules["FileSystemWriterAsync"]
-        self.async_request = async_modules["AsyncRequest"]
-        self.save_state_dict_async_finalize = async_modules["save_state_dict_async_finalize"]
-        self.save_state_dict_async_plan = async_modules["save_state_dict_async_plan"]
-        if self.async_strategy == "nvrx":
-            self.checkpointable_metadata_cache = async_modules["CheckpointMetadataCache"]
+        self.async_strategy = async_strategy
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -677,13 +671,20 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         if self.separation_hint is not None and self.thread_count <= 1:
             self.thread_count = 2
-        
+
+        # Get async modules
+        self.async_strategy, modules = get_async_strategy(self.async_strategy)
+        async_writer = modules["FileSystemWriterAsync"]
+        save_state_dict_async_plan = modules["save_state_dict_async_plan"]
+        if self.async_strategy == "nvrx":
+            checkpointable_metadata_cache = modules["CheckpointMetadataCache"]
+
         async_writer_kwargs = {}
         state_dict_saver_kwargs = {}
 
         if self.async_strategy == "nvrx":
             if self._metadata_cache is None:
-                self._metadata_cache = self.checkpointable_metadata_cache()
+                self._metadata_cache = checkpointable_metadata_cache()
                 if self.cached_global_metadata is not None:
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
             # Define additional arguments
@@ -709,7 +710,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 state_dict_saver_kwargs["loaded_all_plans"] = loaded_all_plans
 
         # Use PyT saving mechanism
-        writer = self.async_writer(
+        writer = async_writer(
             checkpoint_dir,
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
@@ -719,7 +720,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
-        save_state_dict_ret = self.save_state_dict_async_plan(
+        save_state_dict_ret = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
             None,
@@ -779,10 +780,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
 
-        def finalize_fn():
-            self.save_state_dict_async_finalize(*save_state_dict_ret)
+        # get async modules
+        self.async_strategy, modules = get_async_strategy(self.async_strategy)
+        async_request = modules["AsyncRequest"]
+        save_state_dict_async_finalize = modules["save_state_dict_async_finalize"]
 
-        return self.async_request(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
+        def finalize_fn():
+            save_state_dict_async_finalize(*save_state_dict_ret)
+
+        return async_request(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 
     def can_handle_sharded_objects(self):
         return True
@@ -796,8 +802,8 @@ def _get_filesystem_reader(
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
-        _, async_modules = get_async_strategy(async_strategy)
-        return async_modules["CachedMetadataFileSystemReader"](checkpoint_dir, cache_metadata=cache_metadata)
+        _, module = get_async_strategy(async_strategy, module="CachedMetadataFileSystemReader")
+        return module(checkpoint_dir, cache_metadata=cache_metadata)
 
     return FileSystemReader(checkpoint_dir)
 
@@ -805,9 +811,10 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, async_strategy: str = "nvrx"):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.async_strategy = async_strategy
         super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -838,7 +845,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
-        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
+        fsr = _get_filesystem_reader(
+            checkpoint_dir,
+            cache_metadata=self.cache_metadata,
+            async_strategy=self.async_strategy,
+        )
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
