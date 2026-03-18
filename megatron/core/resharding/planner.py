@@ -377,6 +377,11 @@ def build_centralized_reshard_plan(
     my_global_rank = group.rank() if group is not None else dist.get_rank()
     world_size = group.size() if group is not None else dist.get_world_size()
 
+    # Shared cache for deduplicating rank lists across all metadata on this
+    # rank.  Params sharing the same TP/DP/EP/PP groups will reference one
+    # list object, making pickle ~75% smaller for the gather.
+    _rank_list_cache: dict = {}
+
     # Extract metadata from source model if present
     if src_module is not None:
         src_pg = getattr(src_module, "pg_collection", None)
@@ -393,6 +398,7 @@ def build_centralized_reshard_plan(
                 num_experts=num_experts,
                 layer_module_prefix_map=src_layer_prefix_map,
                 rank_offset=src_rank_offset,
+                _rank_list_cache=_rank_list_cache,
             )
             for name, p in my_src_params.items()
         ]
@@ -416,6 +422,7 @@ def build_centralized_reshard_plan(
                 num_experts=num_experts,
                 layer_module_prefix_map=dst_layer_prefix_map,
                 rank_offset=dst_rank_offset,
+                _rank_list_cache=_rank_list_cache,
             )
             for name, p in my_dst_params.items()
         ]
@@ -427,10 +434,8 @@ def build_centralized_reshard_plan(
     # Other ranks don't need the full metadata — they only need their own plan.
     all_src_metadata_by_rank = [None] * world_size if my_global_rank == 0 else None
     all_dst_metadata_by_rank = [None] * world_size if my_global_rank == 0 else None
-    dist.gather_object(my_src_metadata, all_src_metadata_by_rank,
-                       group_dst=0, group=group)
-    dist.gather_object(my_dst_metadata, all_dst_metadata_by_rank,
-                       group_dst=0, group=group)
+    dist.gather_object(my_src_metadata, all_src_metadata_by_rank, group_dst=0, group=group)
+    dist.gather_object(my_dst_metadata, all_dst_metadata_by_rank, group_dst=0, group=group)
 
     # Free local metadata — no longer needed after gather.
     del my_src_metadata, my_dst_metadata
@@ -521,9 +526,7 @@ def build_centralized_reshard_plan(
     # This replaces broadcast_object_list which sent the full list to every rank,
     # wasting ~(world_size - 1) × plan_size bytes of CPU memory.
     my_plan_list = [None]
-    torch.distributed.scatter_object_list(
-        my_plan_list, plans_list, group_src=0, group=group,
-    )
+    torch.distributed.scatter_object_list(my_plan_list, plans_list, group_src=0, group=group)
     my_plan = my_plan_list[0]
     del plans_list  # Free the full list on rank 0.
 

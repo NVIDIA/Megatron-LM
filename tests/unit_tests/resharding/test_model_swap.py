@@ -500,3 +500,195 @@ def test_swap_mamba_parametrized(
 
     clear_all_caches()
     Utils.destroy_model_parallel()
+
+
+# ===========================================================================
+# MXFP8 end-to-end swap tests
+# ===========================================================================
+
+_IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
+
+try:
+    from flashinfer import mxfp8_quantize  # noqa: F401
+
+    _HAVE_FLASHINFER = True
+except ImportError:
+    _HAVE_FLASHINFER = False
+
+
+@pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)")
+@pytest.mark.skipif(not _HAVE_FLASHINFER, reason="MXFP8 tests require FlashInfer")
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(not has_nvshmem, reason="nvshmem.core is not available"),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
+@pytest.mark.parametrize(
+    "src_tp,dst_tp,num_experts",
+    [
+        (2, 1, None),  # TP2 -> TP1, non-MoE
+        (1, 2, None),  # TP1 -> TP2, non-MoE
+        (1, 1, 4),  # EP-only, MoE with MXFP8 dst
+        (2, 1, 4),  # TP2 -> TP1, MoE with MXFP8 dst
+    ],
+)
+def test_swap_mxfp8_dst_parametrized(
+    refit_backend: str, src_tp: int, dst_tp: int, num_experts: Optional[int]
+):
+    """End-to-end refit where the destination model has FlashInfer MXFP8 weights.
+
+    Exercises the MXFP8ReshardTransform prepare_recv / finalize_recv path
+    and verifies that refitted weights produce correct forward pass outputs
+    after dequantization.
+    """
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.quantization.utils import (
+        _should_quantize_param,
+        quantize_params_to_mxfp8,
+    )
+    from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+    src_ep = 1
+    dst_ep = 1
+    if num_experts is not None:
+        src_ep = 2
+        dst_ep = 1
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=1
+    )
+    world = dist.get_world_size()
+    if (world % (src_tp * src_ep) != 0) or (world % (dst_tp * dst_ep) != 0):
+        Utils.destroy_model_parallel()
+        pytest.skip("WORLD_SIZE not divisible by parallelism configs")
+
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    seq_len = 8
+    vocab_size = 128
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        moe_router_dtype="fp64",
+        moe_token_dispatcher_type="alltoall",
+        num_query_groups=4,
+    )
+
+    src_pgs = _build_pg_collection(tp_size=src_tp, ep_size=src_ep)
+    dst_pgs = _build_pg_collection(tp_size=dst_tp, ep_size=dst_ep)
+
+    src_cfg = copy.deepcopy(cfg)
+    dst_cfg = copy.deepcopy(cfg)
+
+    if num_experts is not None:
+        for c, ep in [(src_cfg, src_ep), (dst_cfg, dst_ep)]:
+            c.num_moe_experts = num_experts
+            c.moe_ffn_hidden_size = c.ffn_hidden_size
+            c.expert_model_parallel_size = ep
+            c.moe_grouped_gemm = True
+            c.add_bias_linear = False
+
+    src_model = (
+        _build_gpt(
+            src_cfg,
+            vocab_size,
+            seq_len,
+            src_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
+    dst_model = (
+        _build_gpt(
+            dst_cfg,
+            vocab_size,
+            seq_len,
+            dst_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
+
+    # Collect source reference logits (BF16 forward)
+    batch = 2
+    tokens = torch.randint(0, vocab_size, (batch, seq_len), device=device, dtype=torch.long)
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    )
+    attention_mask = torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool)
+
+    ref_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        src_out = src_model(tokens, position_ids, attention_mask)
+        ref_logits.copy_(src_out)
+
+    # Quantize destination decoder to FlashInfer MXFP8
+    from megatron.core.utils import unwrap_model
+
+    dst_core = unwrap_model(dst_model)
+    decoder = dst_core.decoder if hasattr(dst_core, 'decoder') else dst_core
+
+    convertible: set = set()
+    for name, param in decoder.named_parameters():
+        if _should_quantize_param(param):
+            convertible.add(f"decoder.{name}")
+
+    persistent_buffers = quantize_params_to_mxfp8(decoder)
+
+    transform = MXFP8ReshardTransform(
+        convertible_params=convertible,
+        persistent_buffers=persistent_buffers,
+        buffer_key_prefix="decoder.",
+    )
+
+    # Swap weights with MXFP8 transform
+    swap_model_weights([src_model], [dst_model], refit_method=refit_backend, transform=transform)
+
+    # Dequantize MXFP8 params back to BF16 for forward pass comparison
+    for name, buf in persistent_buffers.items():
+        parts = name.split(".")
+        mod = decoder
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        attr_name = parts[-1]
+        bf16_param = torch.nn.Parameter(buf.dequantize(), requires_grad=False)
+        if attr_name in mod._parameters:
+            mod._parameters[attr_name] = bf16_param
+        else:
+            delattr(mod, attr_name)
+            mod.register_parameter(attr_name, bf16_param)
+
+    # Forward on destination
+    dst_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        dst_out = dst_model(tokens, position_ids, attention_mask)
+        dst_logits.copy_(dst_out)
+
+    # Compare — MXFP8 quantization introduces some error, so use wider tolerance
+    assert ref_logits.shape == dst_logits.shape
+    max_diff = (dst_logits - ref_logits).abs().max().item()
+    assert torch.allclose(dst_logits, ref_logits, atol=0.5, rtol=0.1), (
+        f"MXFP8 refit src(TP={src_tp},EP={src_ep})->dst(TP={dst_tp},EP={dst_ep}) "
+        f"outputs differ too much (max_diff={max_diff:.6f})"
+    )
+    dist.barrier()
+
+    clear_all_caches()
+    Utils.destroy_model_parallel()

@@ -170,8 +170,7 @@ def execute_reshard_plan(
                         # Allocate empty BF16 buffer — no need to dequantize
                         # existing weights since all slices will be overwritten.
                         full_bf16 = torch.empty(
-                            dst_param.shape, dtype=torch.bfloat16,
-                            device=dst_param.device,
+                            dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
                         )
                         pending_quantized[param_id] = (dst_param, full_bf16, [])
                     pending_quantized[param_id][2].append((dst_slice, recv_buffer))

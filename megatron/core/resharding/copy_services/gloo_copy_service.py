@@ -65,7 +65,7 @@ class GlooCopyService(CopyService):
         """Submit a receive operation."""
         # Allocate a pinned CPU buffer for faster CPU↔GPU transfer.
         cpu_buffer = torch.empty(
-            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True,
+            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
         )
         self.recv_ops.append(
             (RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
@@ -74,7 +74,7 @@ class GlooCopyService(CopyService):
     def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
         """Submit a receive operation with a unique task identifier."""
         cpu_buffer = torch.empty(
-            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True,
+            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
         )
         self.recv_ops.append(
             (RecvOp(task_id=task_id, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
@@ -138,7 +138,7 @@ class GlooCopyService(CopyService):
         cpu_send_bufs: List[torch.Tensor] = []
         for op in remote_sends:
             cpu_tensor = torch.empty(
-                op.tensor.shape, dtype=op.tensor.dtype, device="cpu", pin_memory=True,
+                op.tensor.shape, dtype=op.tensor.dtype, device="cpu", pin_memory=True
             )
             cpu_tensor.copy_(op.tensor.detach(), non_blocking=True)
             cpu_send_bufs.append(cpu_tensor)

@@ -257,8 +257,17 @@ def extract_param_metadata(
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
     rank_offset: int = 0,
+    _rank_list_cache: dict | None = None,
 ) -> ParameterMetadata:
-    """Extract metadata from a parameter for cross-rank communication."""
+    """Extract metadata from a parameter for cross-rank communication.
+
+    Args:
+        _rank_list_cache: Optional dict used to deduplicate rank lists so
+            that params sharing the same process group reuse one object.
+            This dramatically shrinks pickle size when metadata is gathered
+            across many ranks (pickle uses backreferences for same-``id()``
+            objects, avoiding re-serialization of identical group lists).
+    """
     # TP flags from attributes (set by Megatron linear layers)
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
@@ -266,15 +275,6 @@ def extract_param_metadata(
     partition_sizes = getattr(param, 'partition_sizes', None)
     if partition_sizes is not None:
         partition_sizes = list(partition_sizes)
-
-    # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
-    # and requires partition_stride=2 for correct resharding. New models set this at construction
-    # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
-    # where stride=1 was left as default, we apply stride=2 as a fallback for fc1 parameters.
-    # This is safe because: (1) gated models need it, and (2) non-gated models have smaller fc1
-    # and stride doesn't affect single-block transfers.
-    # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
-    #     partition_stride = 2
 
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
@@ -284,8 +284,22 @@ def extract_param_metadata(
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
+    # Deduplicate rank lists: params sharing the same TP/DP/EP/PP group get
+    # one shared list object instead of separate copies.  This shrinks pickle
+    # size ~75% when metadata is gathered across many ranks (pickle uses
+    # backreferences for same-id() objects).
+    if _rank_list_cache is None:
+        _rank_list_cache = {}
+
+    def _dedup_ranks(ranks: list[int]) -> list[int]:
+        key = tuple(ranks)
+        if key not in _rank_list_cache:
+            _rank_list_cache[key] = list(key)
+        return _rank_list_cache[key]
+
     def _offset_ranks(ranks: list[int]) -> list[int]:
-        return [r + rank_offset for r in ranks] if rank_offset else ranks
+        result = [r + rank_offset for r in ranks] if rank_offset else ranks
+        return _dedup_ranks(result)
 
     if is_ep:
         expert_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.ep))
@@ -314,8 +328,8 @@ def extract_param_metadata(
             dist.get_process_group_ranks(pg_collection.pp)
         )
     else:
-        pipeline_parallel_group_ranks = list(
-            range(rank_offset, rank_offset + dist.get_world_size())
+        pipeline_parallel_group_ranks = _dedup_ranks(
+            list(range(rank_offset, rank_offset + dist.get_world_size()))
         )
 
     meta = ParameterMetadata(
