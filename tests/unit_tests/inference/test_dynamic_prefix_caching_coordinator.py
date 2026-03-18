@@ -346,6 +346,11 @@ class TestCoordinatorPrefixRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
+        # Give both ranks non-zero pending counts so the idle-rank shortcut
+        # doesn't fire and the prefix-affinity logic (with timestamps) is used.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
+
         # Both ranks have both blocks, but rank_1 has higher timestamps.
         for h in hashes:
             coordinator.hash_to_rank_info.setdefault(h, {})[rank_0] = 1
@@ -515,6 +520,10 @@ class TestFirstPrefixBlockRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
+        # Ensure no rank is idle so prefix-matching logic is exercised.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
+
         # Only rank_1 has the first block.
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
@@ -530,6 +539,10 @@ class TestFirstPrefixBlockRouting:
 
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Ensure no rank is idle so prefix-matching logic is exercised.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
 
         # rank_0 has first block only, with higher timestamp.
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
@@ -551,6 +564,10 @@ class TestFirstPrefixBlockRouting:
 
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Ensure no rank is idle so prefix-matching logic is exercised.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
 
         # Both ranks have the first block.
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 3
@@ -587,6 +604,10 @@ class TestFirstPrefixBlockRouting:
         assert len(hashes) == 1
 
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Ensure no rank is idle so prefix-matching logic is exercised.
+        for identity in coordinator.identities_of_data_parallel_ranks:
+            coordinator._rank_pending_count[identity] = 1
 
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
@@ -642,7 +663,8 @@ class TestLoadAwarePrefixRouting:
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 1
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 10
 
-        # But rank_1 already has 5 pending requests while rank_0 has 0.
+        # But rank_1 already has 5 pending requests while rank_0 has only 1.
+        coordinator._rank_pending_count[rank_0] = 1
         coordinator._rank_pending_count[rank_1] = 5
 
         selected = coordinator.get_best_data_parallel_rank(hashes)
@@ -682,7 +704,9 @@ class TestLoadAwarePrefixRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
-        # Equal pending counts (both 0), but rank_0 has higher timestamp.
+        # Equal pending counts (both 1), but rank_0 has higher timestamp.
+        coordinator._rank_pending_count[rank_0] = 1
+        coordinator._rank_pending_count[rank_1] = 1
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_0] = 10
         coordinator.hash_to_rank_info.setdefault(hashes[0], {})[rank_1] = 1
 
