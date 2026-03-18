@@ -49,7 +49,6 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
-
 from .async_utils import AsyncRequest
 from .base import (
     AsyncSaveShardedStrategy,
@@ -61,7 +60,9 @@ from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import CheckpointMetadataCache
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        CheckpointMetadataCache,
+    )
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC
     NVRxAsyncRequest = ABC
@@ -651,7 +652,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.validated_loaded_metadata_reuse = False
 
     def async_save(
-        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, async_strategy: str = "nvrx",
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        async_strategy: str = "nvrx",
     ) -> AsyncRequest | NVRxAsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -777,10 +781,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret, async_strategy)
 
     def _get_save_and_finalize_callbacks(
-        self,
-        writer,
-        save_state_dict_ret,
-        async_strategy,
+        self, writer, save_state_dict_ret, async_strategy
     ) -> AsyncRequest | NVRxAsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
@@ -855,9 +856,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(
-            checkpoint_dir,
-            cache_metadata=self.cache_metadata,
-            async_strategy=async_strategy,
+            checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
         )
         checkpoint.load_state_dict(
             pyt_state_dict,
@@ -1012,15 +1011,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
 
+
 def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> str:
     """Returns async strategy and related async imported modules"""
     if async_strategy == "nvrx":
         try:
             # nvrx async imports
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
                 CachedMetadataFileSystemReader,
             )
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue, AsyncRequest
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import (
+                AsyncCallsQueue,
+                AsyncRequest,
+            )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
                 FileSystemWriterAsync,
                 _results_queue,
@@ -1058,7 +1061,9 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> str:
         imports = _import_mcore_async()
         async_strategy = "mcore"
     else:
-        raise TypeError(f"async_strategy {async_strategy} is not supported. Available strategies: nvrx, mcore.")
+        raise TypeError(
+            f"async_strategy {async_strategy} is not supported. Available strategies: nvrx, mcore."
+        )
 
     modules = imports if not module else imports[module]
 
@@ -1067,12 +1072,22 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> str:
 
 def _import_mcore_async() -> dict:
     """Imports mcore's async modules"""
-    from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
+    from megatron.core.dist_checkpointing.strategies.async_utils import (
+        AsyncCallsQueue,
+        AsyncRequest,
+    )
     from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
         CachedMetadataFileSystemReader,
     )
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync, _results_queue, get_write_results_queue
-    from megatron.core.dist_checkpointing.strategies.state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
+    from megatron.core.dist_checkpointing.strategies.filesystem_async import (
+        FileSystemWriterAsync,
+        _results_queue,
+        get_write_results_queue,
+    )
+    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+        save_state_dict_async_finalize,
+        save_state_dict_async_plan,
+    )
 
     return {
         "AsyncCallsQueue": AsyncCallsQueue,

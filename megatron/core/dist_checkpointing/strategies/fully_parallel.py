@@ -91,6 +91,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
     ):
+        """ """
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(
                 f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
@@ -99,6 +100,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
@@ -140,6 +142,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
     @property
     def can_handle_sharded_objects(self):
+        """ """
         return self.base_strategy.can_handle_sharded_objects
 
 
@@ -255,7 +258,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         ), "sharded_state_dict is not empty after deferring tensors and objects"
         with debug_time("base_load_ShardedObjects", logger):
             # Load sharded objects first
-            loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir, async_strategy)
+            loaded_objects = self.base_strategy.load(
+                to_load_objects, checkpoint_dir, async_strategy
+            )
 
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
@@ -400,18 +405,23 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     @property
     def can_handle_sharded_objects(self):
+        """ """
         return self.base_strategy.can_handle_sharded_objects
 
     def load_tensors_metadata(self, checkpoint_dir: Path):
+        """ """
         return self.base_strategy.load_tensors_metadata(checkpoint_dir)
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
+        """ """
         return self.base_strategy.load_sharded_metadata(checkpoint_dir)
 
     def check_backend_compatibility(self, loaded_version):
+        """ """
         return self.base_strategy.check_backend_compatibility(loaded_version)
 
     def check_version_compatibility(self, loaded_version):
+        """ """
         return self.base_strategy.check_version_compatibility(loaded_version)
 
 
