@@ -406,6 +406,49 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
+        # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_parallel_generation_tasks is None, \
+            "Cannot specify both --rl-num-parallel-generations and " \
+            "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
+            "(--rl-parallel-generation-tasks is deprecated)."
+        if args.rl_parallel_generation_tasks is not None:
+            print_rank_0(
+                "WARNING: --rl-parallel-generation-tasks is deprecated, "
+                "use --rl-num-parallel-generations instead.")
+            args.rl_num_parallel_generations = (
+                args.rl_parallel_generation_tasks * args.grpo_group_size)
+
+        # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_num_parallel_generation_batches is None, \
+            "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
+            "are mutually exclusive."
+        if args.rl_num_parallel_generations is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generations requires --rl-partial-rollouts."
+            assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
+                f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
+                f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generations // args.grpo_group_size)
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
+        elif args.rl_num_parallel_generation_batches is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = args.grpo_prompts_per_step
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
+        else:
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
+            args.rl_parallel_generation_tasks = 512
+
+        # Derive enforce_order after all resolution is complete.
+        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
         if args.rl_use_sequence_packing:
@@ -960,8 +1003,12 @@ def validate_args(args, defaults={}):
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
     
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
-        assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+        if args.fp8 is not None:
+            assert args.transformer_impl == "inference_optimized", \
+                "fp8 with full_iteration_inference CUDA graphs is only supported with " \
+                "--transformer-impl=inference_optimized"
+            assert args.fp8_recipe == "mxfp8", \
+                "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
 
     if args.cuda_graph_impl == 'local':
         assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
@@ -1834,6 +1881,17 @@ def _add_inference_args(parser):
                        'block hash only. "longest_prefix" routes to the rank with '
                        'the longest matching prefix. "round_robin" ignores prefix '
                        'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=None,
+                       dest='inference_dynamic_batching_prefix_caching_mamba_gb',
+                       help='GPU memory budget (in GB) for the Mamba state cache '
+                       'used by prefix caching on hybrid models. When set, Mamba '
+                       'states at block boundaries are cached for reuse.')
+    group.add_argument('--inference-dynamic-batching-mamba-triton-conv1d',
+                       action='store_true', default=False,
+                       dest='inference_dynamic_batching_mamba_triton_conv1d',
+                       help='Use Triton varlen conv1d kernel for Mamba prefill '
+                       'instead of per-request causal_conv1d_fn calls.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -1856,6 +1914,8 @@ def _add_inference_args(parser):
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference SSM states tensor')
+    group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     return parser
 
 
@@ -2183,6 +2243,16 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'lion'],
+                       help='Optimizer for scalar parameters (embeddings, biases, norms) '
+                       'when using muon. Defaults to adam.')
+    group.add_argument('--lion-beta1', type=float, default=0.95,
+                       help='First beta coefficient for Lion optimizer '
+                       '(used in sign update). Default: 0.95.')
+    group.add_argument('--lion-beta2', type=float, default=0.98,
+                       help='Second beta coefficient for Lion optimizer '
+                       '(used in momentum EMA update). Default: 0.98.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2206,6 +2276,21 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
+    group.add_argument('--rl-num-parallel-generations', type=int, default=None,
+                       help='Number of rollouts being generated by the inference engine simultaneously. '
+                            'Internally divided by grpo_group_size. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generation-batches.')
+    group.add_argument('--rl-num-parallel-generation-batches', type=int, default=None,
+                       help='Number of generation batches in flight. '
+                            'Set to L+1 to allow for L steps of staleness between the inference and training policies. '
+                            'Each batch contains grpo_prompts_per_step groups by default. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generations.')
+    group.add_argument('--rl-generation-batch-size', type=int, default=None,
+                       help='Override the number of groups per generation batch. '
+                            'Defaults to grpo_prompts_per_step when '
+                            '--rl-num-parallel-generation-batches is set.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2240,7 +2325,11 @@ def _add_rl_args(parser):
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, use partial rollouts.')
+                       help='Allow inference to continue generating rollouts while training updates '
+                            'the policy weights. This enables off-policy training where rollouts may '
+                            'be generated with a stale version of the policy. Use '
+                            '--rl-num-parallel-generations or --rl-num-parallel-generation-batches '
+                            'to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
@@ -2313,8 +2402,8 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
-                        help='Number of parallel generation tasks for RL inference.')
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
+                       help='Deprecated: use --rl-num-parallel-generations instead.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
@@ -2380,7 +2469,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
