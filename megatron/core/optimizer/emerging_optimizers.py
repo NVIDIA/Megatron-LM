@@ -38,6 +38,7 @@ try:
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
+    AdaptiveMuon = object
 
 
 logger = logging.getLogger(__name__)
