@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -19,9 +20,7 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
@@ -34,10 +33,19 @@ try:
         fused_unpermute,
         te_general_gemm,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_unpermute,
+        te_general_gemm,
+    ) = (None, None, None, None, None, None, None, None, None, None)
 
 
 # MOE logging

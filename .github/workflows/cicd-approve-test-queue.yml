@@ -55,7 +55,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
-          MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 3 }}
+          MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 1 }}
           CONTRIBUTOR_TYPE: ${{ matrix.contributor_type }}
           SSO_USERS_FILE: users_sso.json
           PYTHONUNBUFFERED: 1
@@ -71,7 +71,8 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           if CONTRIBUTOR_TYPE == "external":
-              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"]) // 2
+              # Global limit across all branches — no division needed since we count globally.
+              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
           else:
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
           API_BASE = f"https://api.github.com/repos/NVIDIA/Megatron-LM"
@@ -132,6 +133,14 @@ jobs:
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
 
+          def matches_contributor(workflow_run, contributor_type):
+              """Return True if the workflow run matches the contributor type (ignores branch)."""
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  return False
+              internal = is_internal_contributor(pr_info)
+              return (contributor_type == "internal") == internal
+
           def matches_queue(workflow_run, target_branch, contributor_type):
               """
               Return True if the workflow run belongs to this queue cell:
@@ -160,11 +169,19 @@ jobs:
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
-          # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
-          queued_workflow_runs = [run for run in queued_workflow_runs
-                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
-          in_progress_workflow_runs = [run for run in in_progress_workflow_runs
+          # For external contributors, enforce a single global concurrency limit across ALL branches.
+          # For internal contributors, enforce per-branch limits as before.
+          if CONTRIBUTOR_TYPE == "external":
+              queued_workflow_runs = [run for run in queued_workflow_runs
+                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+              in_progress_workflow_runs = [run for run in in_progress_workflow_runs
+                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+          else:
+              # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
+              queued_workflow_runs = [run for run in queued_workflow_runs
                                       if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+              in_progress_workflow_runs = [run for run in in_progress_workflow_runs
+                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
