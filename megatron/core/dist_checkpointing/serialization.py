@@ -159,7 +159,7 @@ def load(
         )
         merge(common_state_dict, sharded_objects)
 
-    async_strategy = getattr(common_state_dict["args"], "async_strategy", "nvrx")
+    async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
