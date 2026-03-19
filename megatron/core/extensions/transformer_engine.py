@@ -1582,7 +1582,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 def maybe_remap_param(param_name: str) -> None:
                     grouped_key = f"{prefix}{param_name}"
-                    indexed_keys = [f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)]
+                    indexed_keys = [
+                        f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
+                    ]
                     has_grouped_key = grouped_key in state_dict
                     has_any_indexed_key = any(key in state_dict for key in indexed_keys)
                     has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
@@ -1704,17 +1706,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self, tensor: torch.Tensor, checkpoint_key: str
         ) -> list[torch.Tensor]:
             """Split grouped checkpoint tensor into one tensor per GEMM."""
-            if (
-                hasattr(tensor, "split_into_quantized_tensors")
-                and callable(tensor.split_into_quantized_tensors)
+            if hasattr(tensor, "split_into_quantized_tensors") and callable(
+                tensor.split_into_quantized_tensors
             ):
                 grouped_tensors = getattr(tensor, "quantized_tensors", None)
                 if grouped_tensors is None:
                     grouped_tensors = tensor.split_into_quantized_tensors()
                 if len(grouped_tensors) != self.num_gemms:
                     raise RuntimeError(
-                        f"Grouped checkpoint tensor {checkpoint_key} has {len(grouped_tensors)} groups, "
-                        f"expected {self.num_gemms}."
+                        f"Grouped checkpoint tensor {checkpoint_key} has {len(grouped_tensors)} "
+                        f"groups, expected {self.num_gemms}."
                     )
                 return list(grouped_tensors)
             if tensor.ndim > 0 and tensor.shape[0] == self.num_gemms:

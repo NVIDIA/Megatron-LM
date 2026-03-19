@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
-from collections.abc import Callable
 import copy
 import logging
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -115,10 +115,7 @@ class GroupedMLP(MegatronModule):
                 if glu_interleave_size is not None:
                     shape = x.size()
                     x = x.reshape(
-                        -1,
-                        shape[-1] // (2 * glu_interleave_size),
-                        2,
-                        glu_interleave_size,
+                        -1, shape[-1] // (2 * glu_interleave_size), 2, glu_interleave_size
                     )
                     x = x.transpose(1, 2)
                     x = x.reshape(shape)
@@ -749,10 +746,16 @@ class TEGroupedMLP(MegatronModule):
 
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
-            assert self._is_fused_impl_supported(), "Fused GroupedMLP is not supported for this configuration."
+            assert (
+                self._is_fused_impl_supported()
+            ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        if self.config.gated_linear_unit and self.config.moe_mlp_glu_interleave_size is not None and not self._with_fused_impl:
+        if (
+            self.config.gated_linear_unit
+            and self.config.moe_mlp_glu_interleave_size is not None
+            and not self._with_fused_impl
+        ):
             logger.warning(
                 "`moe_mlp_glu_interleave_size=%s` is enabled, but fused MoE MLP implementation "
                 "is not supported for this configuration. The non-fused path may incur extra "
@@ -764,7 +767,9 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 and FP4 requires TE."
             align_size = 256 if self._with_fused_impl else None
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
-            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts, align_size=align_size)
+            self.quantization_unpadding = Fp8Unpadding(
+                self.num_local_experts, align_size=align_size
+            )
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -827,9 +832,17 @@ class TEGroupedMLP(MegatronModule):
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
         fc1_single_grouped_parameter = self.linear_fc1.single_grouped_parameter
-        fc1_weight_dtype = self.linear_fc1.weight.dtype if fc1_single_grouped_parameter else self.linear_fc1.weight0.dtype
+        fc1_weight_dtype = (
+            self.linear_fc1.weight.dtype
+            if fc1_single_grouped_parameter
+            else self.linear_fc1.weight0.dtype
+        )
         fc2_single_grouped_parameter = self.linear_fc2.single_grouped_parameter
-        fc2_weight_dtype = self.linear_fc2.weight.dtype if fc2_single_grouped_parameter else self.linear_fc2.weight0.dtype
+        fc2_weight_dtype = (
+            self.linear_fc2.weight.dtype
+            if fc2_single_grouped_parameter
+            else self.linear_fc2.weight0.dtype
+        )
 
         # TODO:ksivamani: Why meta device?
         op = te.pytorch.ops.GroupedLinear(
@@ -856,7 +869,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Activation and post-multiply probs
         op = te.pytorch.ops.ScaledSwiGLU(
-            glu_interleave_size=self.config.moe_mlp_glu_interleave_size,
+            glu_interleave_size=self.config.moe_mlp_glu_interleave_size
         )
         ops.append(op)
 
@@ -872,7 +885,6 @@ class TEGroupedMLP(MegatronModule):
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_parameter=fc2_single_grouped_parameter,
         )
-
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc2_single_grouped_parameter:
@@ -930,7 +942,7 @@ class TEGroupedMLP(MegatronModule):
         # registering submodules.
         if self._fused_ops is None:
             self._fused_ops = (self._make_fused_ops(),)
-        ops, = self._fused_ops
+        (ops,) = self._fused_ops
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
@@ -948,9 +960,7 @@ class TEGroupedMLP(MegatronModule):
             )
             permuted_probs = permuted_probs.squeeze(-1)
             tokens_per_expert = torch.tensor(
-                tokens_per_expert,
-                dtype=torch.int,
-                device=permuted_probs.device,
+                tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
 
         # Call fused impl
@@ -988,9 +998,7 @@ class TEGroupedMLP(MegatronModule):
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
-                permuted_local_hidden_states,
-                tokens_per_expert,
-                permuted_probs,
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
             output_bias = None
             return output, output_bias

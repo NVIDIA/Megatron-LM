@@ -2751,4 +2751,3 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Release GPU memory after D2H completes. For delayed release case."""
         if self._state_offloader is not None:
             self._state_offloader.release_gpu_memory()
-
