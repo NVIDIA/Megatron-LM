@@ -778,6 +778,10 @@ class TELinear(te.pytorch.Linear):
         else:
             tp_size = get_pg_size(tp_group)
 
+        # Save the original TP size before it may be reset to 1 by explicit_expert_comm.
+        # Used below to determine whether the expert weight is actually TP-sharded.
+        original_tp_size = tp_size
+
         self.expert_parallel = self.config.expert_model_parallel_size > 1
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
@@ -845,14 +849,15 @@ class TELinear(te.pytorch.Linear):
 
         # TE's Linear does not set tensor_model_parallel or partition_dim on its weight for
         # expert layers (verified: absent after __init__ when parallel_mode=None due to
-        # explicit_expert_comm, and TE doesn't set them even at tp_size=1 with a real mode).
+        # explicit_expert_comm, and TE doesn't set them even with a real parallel_mode).
         # The resharding planner reads tensor_model_parallel to build a TP sharding descriptor.
         # Without it the planner falls back to _finalize_dp_transfers (full-tensor copy), which
         # fails with a size mismatch whenever src and dst have different TP sizes.
-        # Fix: always set tensor_model_parallel=True and the correct partition_dim for expert
-        # column/row-parallel weights.  At TP=1 the single-rank group acts as a trivial
-        # descriptor, so this is safe for non-TP configs too.
-        if is_expert and parallel_mode in ("column", "row"):
+        # Fix: set tensor_model_parallel=True only when the weight IS actually TP-sharded
+        # (original_tp_size > 1).  At TP=1 the weight holds the full tensor and should NOT be
+        # marked TP; the planner handles the TP=2<->TP=1 asymmetry by inferring a single-rank
+        # group for the non-TP side.
+        if is_expert and original_tp_size > 1 and parallel_mode in ("column", "row"):
             partition_dim = 1 if parallel_mode == "row" else 0
             if hasattr(self, 'weight') and self.weight is not None:
                 if hasattr(self.weight, "partition_dim"):
@@ -1742,6 +1747,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
+            # Save the original TP size before it may be reset to 1 by explicit_expert_comm.
+            # Used below to determine whether the expert weight is actually TP-sharded.
+            original_tp_size = tp_size
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1788,16 +1796,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # TP sharding descriptor. Without it the planner falls back to _finalize_dp_transfers
             # which does a full-tensor copy — failing with a size mismatch whenever src and dst
             # have different TP sizes (e.g. TP=2→TP=1 or TP=1→TP=2).
-            # Fix: always set tensor_model_parallel=True and the correct partition_dim on every
-            # expert weight. At TP=1 the single-rank TP group acts as a trivial descriptor
-            # (src_world=1 or dst_world=1) and the LCM planner degenerates to a full-tensor copy,
-            # so this is safe for non-TP configs too.
+            # Fix: set tensor_model_parallel=True only when the weight IS actually TP-sharded
+            # (original_tp_size > 1).  At TP=1 the weight holds the full tensor and must NOT be
+            # marked TP; the planner handles TP=2<->TP=1 asymmetry by inferring a single-rank
+            # group for the non-TP side (see _build_descriptors_for_param in planner.py).
             # partition_dim: column-parallel → dim 0 (output dimension sharded),
             #                row-parallel    → dim 1 (input  dimension sharded).
-            # When explicit_expert_comm=True, Megatron divided the tensor size by tp_size before
-            # calling TE (so the weight is already the per-rank shard).  When False, TE received
-            # the full size (tp_size=1, no division) — both cases are handled uniformly here.
-            if original_parallel_mode in ("column", "row"):
+            if original_tp_size > 1 and original_parallel_mode in ("column", "row"):
                 partition_dim = 1 if original_parallel_mode == "row" else 0
                 for i in range(num_gemms):
                     weight = getattr(self, f"weight{i}", None)

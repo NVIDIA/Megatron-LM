@@ -35,9 +35,18 @@ def _build_descriptors_for_param(
         tp_dim = dst_metadata.partition_dim if dst_metadata.is_tp else src_metadata.partition_dim
         src_tp_ranks = src_metadata.tensor_parallel_group_ranks
         dst_tp_ranks = dst_metadata.tensor_parallel_group_ranks
-        if src_tp_ranks is None or dst_tp_ranks is None:
-            # Not enough context to build TP descriptor
+        # Handle asymmetric TP: when one side is TP-sharded (is_tp=True) but the other isn't
+        # (is_tp=False, tensor_parallel_group_ranks=None).  This arises for expert weights when
+        # TP size changes (e.g. TP=2 src → TP=1 dst): the TP=1 side holds the full tensor and
+        # its "TP group" is effectively a single rank.  Infer it from owner_rank so the LCM
+        # planner can correctly scatter or gather the TP dimension across the transition.
+        if src_tp_ranks is None and dst_tp_ranks is None:
+            # Neither side is TP-sharded — cannot build TP descriptor
             return descriptors
+        if src_tp_ranks is None:
+            src_tp_ranks = [src_metadata.owner_rank]
+        if dst_tp_ranks is None:
+            dst_tp_ranks = [dst_metadata.owner_rank]
         src_stride = src_metadata.partition_stride if src_metadata.is_tp else 1
         dst_stride = dst_metadata.partition_stride if dst_metadata.is_tp else 1
 
