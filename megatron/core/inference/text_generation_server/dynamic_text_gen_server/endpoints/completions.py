@@ -4,10 +4,7 @@ import asyncio
 import logging
 import time
 
-from megatron.core.inference.inference_request import (
-    DynamicInferenceEventType,
-    unwrap_serialized_tensors,
-)
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -141,22 +138,18 @@ try:
         failed_errors = []
         has_nontransient_error = False
         for i, record in enumerate(batch_results):
-            last_request = record.requests[-1]
-            if last_request.failed():
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
                 error_events = [
-                    e
-                    for e in last_request.events
-                    if e.type
-                    in (
-                        DynamicInferenceEventType.ERROR_NONTRANSIENT,
-                        DynamicInferenceEventType.ERROR_TRANSIENT,
-                    )
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
                 ]
-                if any(
-                    e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events
-                ):
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
                     has_nontransient_error = True
-                error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
                 failed_errors.append(f"Request {i}: {error_msg}")
 
         if failed_errors:
@@ -170,12 +163,7 @@ try:
 
         request_idx = 0
         for completed_request in batch_results:
-            request_dict = (
-                completed_request
-                if isinstance(completed_request, dict)
-                else completed_request.serialize()
-            )
-            result = unwrap_serialized_tensors(request_dict)
+            result = unwrap_serialized_tensors(completed_request)
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
