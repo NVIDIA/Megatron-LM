@@ -81,10 +81,7 @@ class KVBlockAllocator:
                 )
 
             # Per-block FLOP efficiency for FLOP_EFFICIENCY eviction policy
-            if (
-                self.prefix_caching_eviction_policy
-                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
-            ):
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY:
                 self.block_flop_efficiency = torch.zeros(
                     (self.total_count,), dtype=torch.float32, device=torch.cuda.current_device()
                 )
@@ -185,10 +182,7 @@ class KVBlockAllocator:
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
-            if (
-                self.prefix_caching_eviction_policy
-                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
-            ):
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY:
                 evicted = self.evict_flop_efficiency_blocks(blocks_needed_from_eviction)
             else:
                 evicted = self.evict_lru_blocks(blocks_needed_from_eviction)
@@ -277,10 +271,7 @@ class KVBlockAllocator:
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
                 self.block_timestamps.fill_(0)
-            if (
-                self.prefix_caching_eviction_policy
-                == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
-            ):
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY:
                 self.block_flop_efficiency.fill_(0)
 
     # =========================================================================
@@ -311,8 +302,7 @@ class KVBlockAllocator:
         # Compute and store per-block FLOP efficiency for FLOP_EFFICIENCY policy
         if (
             block_indices is not None
-            and self.prefix_caching_eviction_policy
-            == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
         ):
             ctx = self.context
             block_size = ctx.block_size_tokens
@@ -367,10 +357,7 @@ class KVBlockAllocator:
         self.block_ref_counts[block_ids] = 0
         if self.prefix_caching_eviction_policy in self._CACHING_POLICIES:
             self.block_timestamps[block_ids] = 0
-        if (
-            self.prefix_caching_eviction_policy
-            == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY
-        ):
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.FLOP_EFFICIENCY:
             self.block_flop_efficiency[block_ids] = 0
 
         # Return blocks to free pool

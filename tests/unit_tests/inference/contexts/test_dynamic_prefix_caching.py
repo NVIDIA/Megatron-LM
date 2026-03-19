@@ -930,16 +930,11 @@ class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "policy",
-        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.FLOP_EFFICIENCY],
+        "policy", [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.FLOP_EFFICIENCY]
     )
     def test_cached_block_reuse(self, policy):
         """Blocks stay cached at ref_count=0 and are reused by subsequent matching requests."""
-        ctx = self._ctx(
-            buffer_size_gb=0.01,
-            rounder=1,
-            prefix_caching_eviction_policy=policy,
-        )
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1, prefix_caching_eviction_policy=policy)
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator
 
@@ -971,9 +966,7 @@ class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
     def test_flop_efficiency_eviction_ordering(self, alpha, trigger_blocks, expected_evicted):
         """Sweep alpha to verify 3 eviction regimes: oldest, medium, shallowest."""
         ctx = self._ctx_flop(
-            flop_alpha=alpha,
-            mamba_config=self._mamba_config(),
-            prefix_caching_mamba_gb=0.01,
+            flop_alpha=alpha, mamba_config=self._mamba_config(), prefix_caching_mamba_gb=0.01
         )
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator

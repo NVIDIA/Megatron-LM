@@ -330,9 +330,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
             attention_layer_map, mamba_layer_map, mlp_layer_map, moe_layer_map = (
-                get_layer_maps_from_layer_type_list(
-                    mamba_inference_state_config.layer_type_list
-                )
+                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
@@ -1999,10 +1997,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
-            if (
-                self.prefix_caching_eviction_policy
-                in KVBlockAllocator._CACHING_POLICIES
-            ):
+            if self.prefix_caching_eviction_policy in KVBlockAllocator._CACHING_POLICIES:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
 
         # Note that we decremented the total_request_count for the chunked prefill request
@@ -2107,9 +2102,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
                 self.kv_block_allocator.register_kv_block_hashes(
-                    block_ids_to_hash,
-                    block_hashes_slice,
-                    block_indices=list(range(start, end)),
+                    block_ids_to_hash, block_hashes_slice, block_indices=list(range(start, end))
                 )
 
             # Range 1: prior-chunk partial block that this chunk just completed
