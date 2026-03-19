@@ -10,6 +10,11 @@ from megatron.core.inference.config import PrefixCachingEvictionPolicy
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
 
+# Maximum intermediate state extraction offsets per request. The 3 candidates
+# are: KV divergence boundary, last block-aligned boundary, and penultimate
+# block boundary (see compute_and_store_offsets for details).
+MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
+
 
 class MambaSlotAllocator:
     """Manages Mamba state caching for prefix caching in hybrid models.
@@ -67,12 +72,13 @@ class MambaSlotAllocator:
         self.hash_to_block_id: Dict[int, int] = {}
 
         # Per-request intermediate state storage (GPU tensors, fixed-size per request)
-        # Up to 3 intermediate offsets per request; 0 = no offset, -1 = no block
+        # 0 = no offset, -1 = no block
+        k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         self._intermediate_offsets_gpu = torch.zeros(
-            (context.max_requests, 3), dtype=torch.int32, device=device
+            (context.max_requests, k), dtype=torch.int32, device=device
         )
         self._intermediate_block_ids_gpu = torch.full(
-            (context.max_requests, 3), -1, dtype=torch.int32, device=device
+            (context.max_requests, k), -1, dtype=torch.int32, device=device
         )
         self._intermediate_counts_gpu = torch.zeros(
             context.max_requests, dtype=torch.int32, device=device
@@ -84,13 +90,13 @@ class MambaSlotAllocator:
         self._has_intermediates = False
 
         # Pre-allocated output buffers for CUDA graph compatible extraction
-        self.max_intermediate_count = 3 * context.max_requests
-        self._intermediate_ssm_out = torch.zeros(
+        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
             device=device,
         )
-        self._intermediate_conv_out = torch.zeros(
+        self.intermediate_conv_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
             dtype=conv_states_dtype,
             device=device,
@@ -411,8 +417,8 @@ class MambaSlotAllocator:
         """Commit intermediate states from pre-allocated output buffers to cache.
 
         Called after the forward pass (including CUDA graph replay) completes.
-        Reads SSM states from _intermediate_ssm_out and conv states from
-        _intermediate_conv_out, which were written by GPU ops inside the graph.
+        Reads SSM states from intermediate_ssm_out and conv states from
+        intermediate_conv_out, which were written by GPU ops inside the graph.
 
         For each prefill request:
         - Intermediate states at extraction offsets: allocate cache slot,
@@ -471,10 +477,10 @@ class MambaSlotAllocator:
                         slot = self.allocate_slot(bid)
 
                         self.ssm_states[:, slot].copy_(
-                            self._intermediate_ssm_out[:, ssm_offset + j]
+                            self.intermediate_ssm_out[:, ssm_offset + j]
                         )
                         self.conv_states[:, slot].copy_(
-                            self._intermediate_conv_out[:, ssm_offset + j]
+                            self.intermediate_conv_out[:, ssm_offset + j]
                         )
 
                         block_hash = all_hashes[hash_offset + j]
@@ -526,8 +532,8 @@ class MambaSlotAllocator:
         )
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self._intermediate_ssm_out.zero_()
-        self._intermediate_conv_out.zero_()
+        self.intermediate_ssm_out.zero_()
+        self.intermediate_conv_out.zero_()
         self._intermediate_offsets_gpu.fill_(0)
         self._intermediate_block_ids_gpu.fill_(-1)
         self._intermediate_counts_gpu.fill_(0)

@@ -577,8 +577,8 @@ class MambaMixer(MegatronModule):
         intermediate_ssm_out = None
         intermediate_conv_out = None
         if slot_allocator is not None and mamba_layer_idx is not None:
-            intermediate_ssm_out = slot_allocator._intermediate_ssm_out[mamba_layer_idx]
-            intermediate_conv_out = slot_allocator._intermediate_conv_out[mamba_layer_idx]
+            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
 
         y_prefill = self._ssm_prefill(
             zxBCdt,
@@ -591,7 +591,7 @@ class MambaMixer(MegatronModule):
             intermediate_abs_positions=intermediate_abs_positions,
             intermediate_ssm_out=intermediate_ssm_out,
             intermediate_conv_out=intermediate_conv_out,
-            conv_gather_offsets=metadata._conv_gather_offsets,
+            conv_gather_offsets=metadata.conv_gather_offsets,
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
             seq_idx_for_varlen=metadata.seq_idx_for_varlen,

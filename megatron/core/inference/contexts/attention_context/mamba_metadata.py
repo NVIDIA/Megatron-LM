@@ -5,6 +5,9 @@ from typing import Optional
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.contexts.mamba_slot_allocator import (
+    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+)
 
 
 class MambaMetadata:
@@ -89,7 +92,7 @@ class MambaMetadata:
 
         # Intermediate state extraction buffers (CUDA graph compatible)
         # Each prefill request can produce up to 3 intermediate offsets
-        self.max_intermediate_count = 3 * max_requests
+        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests
         self._intermediate_chunk_indices_buffer = torch.zeros(
             self.max_intermediate_count, dtype=torch.int64, device=self.device
         )
@@ -98,11 +101,11 @@ class MambaMetadata:
         )
         # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
         if d_conv > 0:
-            self._conv_gather_offsets = torch.arange(
+            self.conv_gather_offsets = torch.arange(
                 -d_conv, 0, dtype=torch.int32, device=self.device
             )
         else:
-            self._conv_gather_offsets = None
+            self.conv_gather_offsets = None
 
         self.reset_varlen_metadata()
 
@@ -384,7 +387,9 @@ class MambaMetadata:
                 abs_positions_2d = seq_starts_exp + offsets
 
                 # Validity mask: j < count[i] for each request
-                j_indices = torch.arange(3, device=self.device).unsqueeze(0)
+                j_indices = torch.arange(
+                    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, device=self.device
+                ).unsqueeze(0)
                 valid_mask = j_indices < intermediate_counts_gpu.unsqueeze(1)
 
                 # Flatten valid entries into output buffers
@@ -397,6 +402,10 @@ class MambaMetadata:
                     torch.int32
                 )
 
+                # Pad unused slots with safe defaults for CUDA graph replay:
+                # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
+                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
+                #   which are within bounds and produce a valid but unused state
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:].fill_(0)
                     self._intermediate_abs_positions_buffer[real_count:].fill_(self.d_conv)
@@ -414,6 +423,7 @@ class MambaMetadata:
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
+            # (same rationale as padding comment above)
             self._intermediate_chunk_indices_buffer.fill_(0)
             self._intermediate_abs_positions_buffer.fill_(self.d_conv)
             self.intermediate_count = 0
