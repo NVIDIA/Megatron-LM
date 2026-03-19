@@ -1298,8 +1298,9 @@ class TextGenerationController:
         if not routing_parts:
             return
         flat_routing = torch.cat(routing_parts, dim=0)  # [token_count, num_layers, topk]
-        if flat_routing.shape[0] != token_count:
-            return  # Size mismatch, skip storage
+        assert flat_routing.shape[0] == token_count, (
+            f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
+        )
 
         # Move to CPU for dict-based storage
         flat_routing_cpu = flat_routing.cpu()
