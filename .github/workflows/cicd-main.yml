@@ -76,7 +76,7 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Check NVIDIA SSO membership
@@ -179,11 +179,11 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Run linting
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         run: |
           export PATH=".venv/bin:$PATH"
           export GITLAB_ENDPOINT=github.com
@@ -232,7 +232,7 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Select MBridge test suite
@@ -267,7 +267,7 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout MBridge and create testing branch
@@ -378,7 +378,7 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Get merge commit sha
@@ -613,7 +613,7 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Has Run tests label
@@ -766,7 +766,7 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Has Run tests label
