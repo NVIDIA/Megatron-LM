@@ -121,6 +121,11 @@ class ModelParallelConfig:
        None, no function is called on the loss.
     """
 
+    moe_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MoE auxiliary losses, this function should return the
+       scale tensor for MoE aux loss. If None, falls back to grad_scale_func.
+    """
+
     no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use
