@@ -93,7 +93,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 coefficient_type=coefficient_type,
                 tp_group=tp_group,
                 partition_dim=partition_dim,
-                mode="duplicated" if mode == "blockwise" else mode,
+                tp_mode="duplicated" if mode == "blockwise" else mode,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
