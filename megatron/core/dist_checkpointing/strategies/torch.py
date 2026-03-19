@@ -665,6 +665,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         Returns: None
         """
+        if async_strategy == "mcore":
+            logger.warning(
+                "Megatron Core's async save is deprecated and will be removed in the future releases. "
+                "Please, use NVRx async solution by setting `async_strategy` to `nvrx`."
+            )
+
         # Translate the state dict
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(
@@ -1057,11 +1063,6 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             imports = _import_mcore_async()
             async_strategy = "mcore"
     elif async_strategy == "mcore":
-        logger.warning(
-            "Megatron Core's async save is deprecated and will be removed in the future releases. "
-            "Please, use NVRx async solution by setting `async_strategy` to `nvrx`."
-        )
-
         # do mcore async imports
         imports = _import_mcore_async()
         async_strategy = "mcore"
