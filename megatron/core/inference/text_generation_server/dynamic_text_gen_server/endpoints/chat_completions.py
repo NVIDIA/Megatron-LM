@@ -16,6 +16,75 @@ logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
 
+_TOKEN_ID_FIELDS_TO_REDACT = {
+    "prompt_tokens",
+    "remaining_prompt_tokens",
+    "generated_tokens",
+    "prompt_token_ids",
+    "generation_token_ids",
+}
+
+_INDEX_FIELDS_TO_REDACT = {
+    "routing_indices",
+    "moe_topk_indices",
+    "prompt_moe_topk_indices",
+}
+
+_HASH_FIELDS_TO_REDACT = {
+    "precomputed_block_hashes",
+}
+
+_NUMERIC_SERIES_FIELDS_TO_REDACT = {
+    "tpot",
+}
+
+
+def _is_int_list_like(value):
+    """Return True for integer lists, including nested integer lists."""
+    if not isinstance(value, list):
+        return False
+    return all(isinstance(item, int) or _is_int_list_like(item) for item in value)
+
+
+def _is_numeric_list_like(value):
+    """Return True for numeric lists, including nested numeric lists."""
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, (int, float)) or _is_numeric_list_like(item)
+        for item in value
+    )
+
+
+def _redact_token_id_lists_for_logging(value):
+    """Redact verbose token-id arrays from logs."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if (
+                (
+                    key in _TOKEN_ID_FIELDS_TO_REDACT
+                    or key in _INDEX_FIELDS_TO_REDACT
+                    or key in _HASH_FIELDS_TO_REDACT
+                    or key.endswith("_token_ids")
+                    or key.endswith("_topk_indices")
+                    or key.endswith("_hashes")
+                )
+                and _is_int_list_like(item)
+            ):
+                redacted[key] = "...truncated..."
+            elif (
+                key in _NUMERIC_SERIES_FIELDS_TO_REDACT
+                and _is_numeric_list_like(item)
+            ):
+                redacted[key] = "...truncated..."
+            else:
+                redacted[key] = _redact_token_id_lists_for_logging(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_token_id_lists_for_logging(item) for item in value]
+    return value
+
 
 def _get_field(obj, key, default=None):
     """Read a field from dict-like or object-like values."""
@@ -541,7 +610,7 @@ try:
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
             if current_app.config['verbose']:
-                logging.info(result)
+                logging.info(_redact_token_id_lists_for_logging(result))
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -553,7 +622,8 @@ try:
             choices.append(choice_data)
             if choice_data["generation_log_probs"] is None:
                 logger.warning(
-                    "Generation log probs is None for request:\n%s", json.dumps(result, indent=4)
+                    "Generation log probs is None for request:\n%s",
+                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
                 )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
