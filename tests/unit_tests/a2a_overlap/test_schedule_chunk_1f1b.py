@@ -36,7 +36,7 @@ def build_model(config, use_padding_mask=False):
         "position_ids": torch.tensor([i for i in range(seq_len)], dtype=torch.int64)
         .repeat((1, 1))
         .cuda(),
-        "attention_mask": torch.ones((1, 1, seq_len, seq_len), dtype=bool).cuda(),
+        "attention_mask": None,
     }
 
     # Optionally add padding_mask with same shape as input_ids
