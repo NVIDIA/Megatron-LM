@@ -56,7 +56,7 @@ class MockSaveStrategy(SaveShardedStrategy):
         super().__init__('mock', 1)
         self.save_keys = set()
 
-    def save(self, sharded_state_dict, ckpt_dir, async_strategy):
+    def save(self, sharded_state_dict, ckpt_dir):
         for sh_ten in nested_values(sharded_state_dict):
             if is_main_replica(sh_ten.replica_id):
                 self.save_keys.add(sh_ten.key)
@@ -68,7 +68,7 @@ class MockLoadStrategy(LoadShardedStrategy):
         self.device = device
         self.load_keys = set()
 
-    def load(self, sharded_state_dict, ckpt_dir, async_strategy):
+    def load(self, sharded_state_dict, ckpt_dir, async_strategy="nvrx"):
         for sh_ten in nested_values(sharded_state_dict):
             if is_main_replica(sh_ten.replica_id):
                 self.load_keys.add(sh_ten.key)
