@@ -728,7 +728,7 @@ class LLaVAModel(MegatronModule):
             if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
                 from megatron.training.utils import get_batch_on_this_cp_rank
 
-                batch = get_batch_on_this_cp_rank(batch)
+                batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False)
             else:
                 assert HAVE_TEX and is_te_min_version(
                     "1.10.0"

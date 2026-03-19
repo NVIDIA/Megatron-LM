@@ -57,6 +57,7 @@ def initialize_test_environment(
     args.num_attention_heads = 8
     args.max_position_embeddings = seq_length
 
+    os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
     validate_args(args)
     set_global_variables(args, True)
 
