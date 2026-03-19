@@ -204,8 +204,8 @@ def make_coordinator_direct(
 ):
     """Create a coordinator with mock ZMQ, for unit testing routing logic.
 
-    Thin wrapper around the shared helper in conftest.py that supplies a
-    DummyTokenizer and this module's BLOCK_SIZE default.
+    Thin wrapper around the shared helper in coordinator_test_utils.py that
+    supplies a DummyTokenizer and this module's BLOCK_SIZE default.
     """
     from tests.unit_tests.inference.coordinator_test_utils import (
         make_coordinator_direct as _make_coordinator,

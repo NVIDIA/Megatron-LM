@@ -686,7 +686,7 @@ def _make_routing_coordinator(
 ):
     """Create a coordinator with fake rank identities for routing-only tests.
 
-    Thin wrapper around the shared helper in conftest.py.
+    Thin wrapper around the shared helper in coordinator_test_utils.py.
     """
     from tests.unit_tests.inference.coordinator_test_utils import (
         make_coordinator_direct as _make_coordinator,
