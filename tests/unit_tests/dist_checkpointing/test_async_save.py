@@ -72,9 +72,7 @@ class TestAsyncSave:
             async_calls.maybe_finalize_async_calls(blocking=True)
 
             # load and compare
-            loaded_async_state_dict = load(
-                sharded_state_dict, async_ckpt_dir, async_strategy="mcore"
-            )
+            loaded_async_state_dict = load(sharded_state_dict, async_ckpt_dir)
             loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir)
             diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
             assert not any(map(bool, diffs)), diffs
