@@ -696,7 +696,8 @@ class MegatronFSDP(torch.nn.Module):
             # is set but the delayed hook was never installed, process the parameter
             # immediately as a safety fallback to avoid silently dropping gradients.
             param_list = [
-                p for p in param_list
+                p
+                for p in param_list
                 if not getattr(p, 'skip_backward_post_hook', False)
                 or not hasattr(p, 'post_wgrad_grad_acc_hook')
             ]
