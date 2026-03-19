@@ -63,8 +63,11 @@ from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
+    GroupedRollouts,
     RewardEvaluationResult,
     Rollout,
+    RolloutGroup,
+    Rollouts,
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
@@ -264,8 +267,6 @@ def verify_model_weights_swap(
         if inf_was_training:
             inf_core.train()
 
-Rollouts = list[TokenRollout | Rollout]
-GroupedRollouts = list[Rollouts]
 
 
 @dataclass(slots=True)
@@ -456,11 +457,11 @@ _ROLLOUT_GENERATOR = None
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
-    if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
+    if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
-        # Collect Rollouts
         request = GroupedRolloutRequest(
-            num_groups=-1 if args.rl_partial_rollouts else n_prompts,
+            num_groups=args.rl_generation_batch_size,
+            streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -470,6 +471,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
+            enforce_order=args.rl_enforce_generation_order,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR

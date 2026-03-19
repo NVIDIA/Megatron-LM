@@ -8,10 +8,7 @@ import traceback
 import uuid
 import warnings
 
-from megatron.core.inference.inference_request import (
-    DynamicInferenceEventType,
-    unwrap_serialized_tensors,
-)
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -393,22 +390,18 @@ try:
         failed_errors = []
         has_nontransient_error = False
         for i, record in enumerate(batch_results):
-            last_request = record.requests[-1]
-            if last_request.failed():
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
                 error_events = [
-                    e
-                    for e in last_request.events
-                    if e.type
-                    in (
-                        DynamicInferenceEventType.ERROR_NONTRANSIENT,
-                        DynamicInferenceEventType.ERROR_TRANSIENT,
-                    )
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
                 ]
-                if any(
-                    e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events
-                ):
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
                     has_nontransient_error = True
-                error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
                 failed_errors.append(f"Request {i}: {error_msg}")
 
         if failed_errors:
@@ -424,8 +417,7 @@ try:
 
         request_idx = 0
         for result_item in batch_results:
-            result = result_item if isinstance(result_item, dict) else result_item.serialize()
-            result = unwrap_serialized_tensors(result)
+            result = unwrap_serialized_tensors(result_item)
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
