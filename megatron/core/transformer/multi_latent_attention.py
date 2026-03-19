@@ -17,7 +17,7 @@ except ImportError:
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.extensions.transformer_engine import split_te_layernorm_column_parallel_linear
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -57,25 +57,24 @@ except:
     fused_apply_mla_rope_for_q = None
 
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
         set_save_original_input,
+        split_te_layernorm_column_parallel_linear,
     )
     from megatron.core.post_training.modelopt.layers import Linear
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
         Linear,
         set_save_original_input,
-    ) = (None, None, None, None, None)
-    HAVE_TE = False
+        split_te_layernorm_column_parallel_linear,
+    ) = (None, None, None, None, None, None)
 
 
 @dataclass
@@ -987,8 +986,6 @@ class MLASelfAttention(MultiLatentAttention):
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
-        from megatron.core.extensions.transformer_engine import set_save_original_input
-
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
