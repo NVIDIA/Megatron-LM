@@ -45,7 +45,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
-    check_flashinfer_jit_cache_installed,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -365,13 +364,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
-
-            # Verify that pre-compiled FlashInfer CUTLASS kernels are available
-            # when using the FlashInfer backend. The flashinfer-jit-cache package
-            # must be installed ahead of time to avoid a multi-minute JIT
-            # compilation step during warmup.
-            if model_config.inference_grouped_gemm_backend == 'auto':
-                check_flashinfer_jit_cache_installed()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:

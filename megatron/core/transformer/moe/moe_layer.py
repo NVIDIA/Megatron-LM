@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -32,7 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import internal_api
+from megatron.core.utils import check_flashinfer_jit_cache_installed, internal_api
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -272,12 +271,12 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'te'."
                 )
-                if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
-                    warnings.warn(
-                        "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                        "The FlashInfer cutlass kernel will be JIT compiled,"
-                        "which may take a long time."
-                    )
+                
+                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                # when using the FlashInfer backend. The flashinfer-jit-cache package
+                # must be installed ahead of time to avoid a multi-minute JIT
+                # compilation step at runtime.
+                check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
                 assert hasattr(torch.nn.functional, 'grouped_mm'), (
                     "inference_grouped_gemm_backend='torch' requires "
