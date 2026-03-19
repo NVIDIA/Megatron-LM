@@ -2,6 +2,7 @@
 
 """Convert a GPTModel."""
 import functools
+import inspect
 import json
 import os
 import sys
@@ -20,18 +21,16 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import (
-    modelopt_version_at_least,
     report_current_memory_info,
     to_empty_if_meta,
 )
-from megatron.training import get_args, get_tokenizer
+from megatron.training import get_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
-    "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
 }
@@ -49,7 +48,7 @@ def add_convert_args(parser):
     group.add_argument(
         '--algorithm',
         type=str,
-        choices=["medusa", "eagle1", "eagle3", "None"],
+        choices=["eagle3", "None"],
         default="None",
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
@@ -59,6 +58,12 @@ def add_convert_args(parser):
         default=None,
         help="EAGLE architecture config. If not given, "
         "a default config will be use. If provided, it will overwrite the default config.",
+    )
+    group.add_argument(
+        "--mix-hidden-states",
+        type=bool,
+        default=False,
+        help="Whether to mix hidden states from previous TTT step.",
     )
 
     add_modelopt_args(parser)
@@ -91,8 +96,9 @@ def check_arguments():
         exit()
 
     if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-        args.moe_grouped_gemm = False
+        if not getattr(args, 'export_default_te_spec', False):
+            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+            args.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -140,7 +146,7 @@ if __name__ == "__main__":
             "dtype": import_dtype,
             "moe_router_dtype": args.moe_router_dtype,
         }
-        if modelopt_version_at_least("0.41.0"):
+        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
@@ -148,7 +154,7 @@ if __name__ == "__main__":
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    if args.algorithm in ("eagle1", "eagle3"):
+    if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]
         if args.eagle_config:
             with open(args.eagle_config) as f:
@@ -157,6 +163,8 @@ if __name__ == "__main__":
 
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
+        if args.mix_hidden_states:
+            mtsp_config["config"]["eagle_mix_hidden_states"] = True
 
         unwrapped_model = mtsp.convert(unwrapped_model, mtsp_config)
 
@@ -165,10 +173,6 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
-
-    elif args.algorithm == "medusa":
-        config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
-        unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])
 
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()

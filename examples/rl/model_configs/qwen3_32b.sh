@@ -64,6 +64,7 @@ MODEL_OPTIONS="\
   --attention-softmax-in-fp32 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model Qwen/Qwen3-4B \
+  --tokenizer-hf-include-special-tokens \
   --vocab-size 151936 \
   --make-vocab-size-divisible-by 128 \
   --optimizer adam \

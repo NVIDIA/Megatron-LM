@@ -50,8 +50,12 @@ def _prepare_tensor_for_comm(
 ) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Prepare tensor for P2P/bridge communication by expanding to 3D if needed.
 
-    P2P and bridge communicators expect 3D tensors.
-    Handles both single tensors and lists of tensors (for VPP).
+    P2P and bridge communicators expect 3D tensors. 2D tensors are unsqueezed by adding
+    a singleton last dimension, and _restore_tensor_from_comm will squeeze it back. 3D
+    tensors are passed through unchanged.
+
+    Note: 3D tensors with a singleton last dimension (shape [a, b, 1]) are not supported
+    because _restore_tensor_from_comm cannot distinguish them from unsqueezed 2D tensors.
 
     Args:
         tensor: Input tensor (2D or 3D), list of tensors, or None.
@@ -63,8 +67,14 @@ def _prepare_tensor_for_comm(
         return None
     if isinstance(tensor, list):
         return [_prepare_tensor_for_comm(t) for t in tensor]
-    if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
-        return tensor.unsqueeze(-1)
+    if isinstance(tensor, torch.Tensor):
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(-1)
+        assert tensor.ndim != 3 or tensor.shape[-1] != 1, (
+            f"3D tensor with singleton last dim {tuple(tensor.shape)} is ambiguous for "
+            "multimodule comm. Cannot distinguish from an unsqueezed 2D tensor on the "
+            "receiving rank. Use a 2D tensor or a 3D tensor with last_dim > 1."
+        )
     return tensor
 
 
@@ -206,25 +216,31 @@ class MultiModulePipelineCommunicator:
         return grid.rank_offset <= self.current_rank < grid.rank_offset + grid.size
 
     @property
-    def num_warmup_microbatches(self):
-        """Calculate the number of warmup microbatches for the current rank.
+    def total_stages(self) -> int:
+        """Return total number of pipeline stages across all modules.
 
-        Uses the same simple logic as P2PCommunicator:
-        total_pipeline_stages - current_rank_stage - 1
+        Computes the longest path through the module DAG weighted by each
+        module's pipeline-parallel size.
 
         Returns:
-            int: Number of warmup microbatches for this rank
+            int: Total pipeline stages.
         """
-        # Get total pipeline depth across all modules
-        total_stages = self.compute_total_pipeline_stages(self.topology, self.module_to_grid_map)
+        return self.compute_total_pipeline_stages(self.topology, self.module_to_grid_map)
 
-        # Get current rank's position in the overall pipeline (0-indexed)
-        # Use compute_total_pipeline_stages with current rank to get cumulative position
+    @property
+    def current_stage(self) -> int:
+        """Return current pipeline stage index (0-indexed) within the multi-module pipeline.
+
+        Returns:
+            int: Current stage index.
+        """
+        total = self.total_stages
+
         if self.rank_module_map:
             # Take the first module this rank belongs to
             # TODO: ykarnati - improve this logic.
             module_name = next(iter(self.rank_module_map.keys()))
-            current_stage = (
+            stage = (
                 self.compute_total_pipeline_stages(
                     self.topology,
                     self.module_to_grid_map,
@@ -234,17 +250,15 @@ class MultiModulePipelineCommunicator:
                 - 1
             )  # Convert from 1-indexed to 0-indexed
         else:
-            current_stage = 0
+            stage = 0
 
-        assert (
-            current_stage <= total_stages
-        ), f"current_stage: {current_stage} is greater than total_stages: {total_stages}"
+        assert stage < total, f"current_stage: {stage} must be less than total_stages: {total}"
         logging.debug(
             f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"current_stage: {current_stage} total_stages: {total_stages} "
-            f"num_warmup_microbatches: {total_stages - current_stage - 1}"
+            f"current_stage: {stage} total_stages: {total} "
+            f"num_warmup_microbatches: {total - stage - 1}"
         )
-        return total_stages - current_stage - 1
+        return stage
 
     def _build_rank_module_info_map(self):
         """For each module in the current rank, initialize the P2P communicator

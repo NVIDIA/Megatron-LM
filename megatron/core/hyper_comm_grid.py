@@ -165,6 +165,13 @@ class HyperCommGrid:
         self._pgs[unique_group_key] = pg
         return pg
 
+    def destroy(self) -> None:
+        """Destroy all process groups created by this grid."""
+        for pg in self._pgs.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        self._pgs.clear()
+
     def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
         r"""Get a process group based on a list of dimension names
 

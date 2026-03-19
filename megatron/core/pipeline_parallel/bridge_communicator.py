@@ -46,6 +46,17 @@ class BridgeCommunicator:
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
+    # Cache broadcast PGs to avoid creating duplicate NCCL communicators for identical rank sets.
+    _broadcast_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
+
+    @classmethod
+    def destroy_broadcast_pgs(cls):
+        """Destroy all cached broadcast process groups."""
+        for pg in cls._broadcast_pg_cache.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        cls._broadcast_pg_cache.clear()
+
     def __init__(
         self,
         src_grid: HyperCommGrid,
@@ -110,8 +121,8 @@ class BridgeCommunicator:
 
         self.src_grid_broadcast_ranks = []
         if src_grid_broadcast_ranks_list:
-            self.src_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
-                src_grid_broadcast_ranks_list, backend='nccl'
+            self.src_grid_broadcast_pg = self._get_or_create_broadcast_pg(
+                src_grid_broadcast_ranks_list
             )
             self.src_grid_broadcast_ranks = next(
                 (ranks for ranks in src_grid_broadcast_ranks_list if self.current_rank in ranks), []
@@ -119,8 +130,8 @@ class BridgeCommunicator:
 
         self.dest_grid_broadcast_ranks = []
         if dest_grid_broadcast_ranks_list:
-            self.dest_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
-                dest_grid_broadcast_ranks_list, backend='nccl'
+            self.dest_grid_broadcast_pg = self._get_or_create_broadcast_pg(
+                dest_grid_broadcast_ranks_list
             )
             self.dest_grid_broadcast_ranks = next(
                 (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks),
@@ -145,6 +156,15 @@ class BridgeCommunicator:
 
         self.build_comm_map(self.src_tp_leaders, self.dest_tp_leaders)
         dist.barrier()
+
+    @classmethod
+    def _get_or_create_broadcast_pg(cls, ranks_list: List[List[int]]):
+        """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
+        cache_key = str(sorted([tuple(r) for r in ranks_list]))
+        if cache_key not in cls._broadcast_pg_cache:
+            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
+            cls._broadcast_pg_cache[cache_key] = pg
+        return cls._broadcast_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction.
