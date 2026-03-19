@@ -15,6 +15,7 @@ from transformers import WhisperConfig, WhisperModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+from megatron.core.models.mimo.config.role import LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -506,7 +507,7 @@ class TestMimoModelNonColocated:
                     pp_rank=pp_rank,
                     pp_size=pp_size,
                 ),
-                "language": MockGrid(
+                LANGUAGE_MODULE_KEY: MockGrid(
                     rank_offset=language_offset,
                     size=1,
                     dim_names=["pp"] if pp_size > 1 else [],
@@ -514,7 +515,6 @@ class TestMimoModelNonColocated:
                     pp_size=pp_size,
                 ),
             },
-            language_module_key="language",
         )
 
     def test_grid_validation_rejects_mismatched_keys(self):
@@ -530,8 +530,7 @@ class TestMimoModelNonColocated:
             language_model_spec=language_model_spec,
             modality_submodules_spec={"images": vision_submodule_spec},
             special_token_ids={"images": 50257},
-            module_to_grid_map={"language": MockGrid()},
-            language_module_key="language",
+            module_to_grid_map={LANGUAGE_MODULE_KEY: MockGrid()},
         )
 
         with pytest.raises(ValueError, match="module_to_grid_map keys must match"):

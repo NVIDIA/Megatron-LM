@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.models.mimo.config import MimoModelConfig
-from megatron.core.models.mimo.config.role import ModuleStageInfo, RankRole
+from megatron.core.models.mimo.config.role import LANGUAGE_MODULE_KEY, ModuleStageInfo, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
@@ -205,9 +205,8 @@ class MimoModel(MegatronModule):
     def _validate_grid_map(self) -> None:
         """Validate module_to_grid_map consistency with submodule config.
 
-        Validates that:
-        - language_module_key is set when module_to_grid_map is provided
-        - module_to_grid_map keys exactly match modality_submodules_spec keys + language_module_key
+        Validates that module_to_grid_map keys exactly match
+        modality_submodules_spec keys + LANGUAGE_MODULE_KEY.
 
         Raises:
             ValueError: If validation fails.
@@ -215,23 +214,16 @@ class MimoModel(MegatronModule):
         if not self.mimo_config.module_to_grid_map:
             return
 
-        # Require language_module_key when using multi-module PP
-        if self.mimo_config.language_module_key is None:
-            raise ValueError(
-                "language_module_key must be set when module_to_grid_map is provided. "
-                "Specify which module key identifies the language model."
-            )
-
         grid_map_keys = set(self.mimo_config.module_to_grid_map.keys())
-        submodule_keys = set(self.mimo_config.modality_submodules_spec.keys())
-        submodule_keys.add(self.mimo_config.language_module_key)
+        expected_keys = set(self.mimo_config.modality_submodules_spec.keys())
+        expected_keys.add(LANGUAGE_MODULE_KEY)
 
-        if grid_map_keys != submodule_keys:
-            missing_in_grid = submodule_keys - grid_map_keys
-            extra_in_grid = grid_map_keys - submodule_keys
+        if grid_map_keys != expected_keys:
+            missing_in_grid = expected_keys - grid_map_keys
+            extra_in_grid = grid_map_keys - expected_keys
             raise ValueError(
                 f"module_to_grid_map keys must match modality_submodules_spec keys + "
-                f"language_module_key. Missing in grid_map: {missing_in_grid}, "
+                f"'{LANGUAGE_MODULE_KEY}'. Missing in grid_map: {missing_in_grid}, "
                 f"Extra in grid_map: {extra_in_grid}"
             )
 
@@ -246,9 +238,8 @@ class MimoModel(MegatronModule):
         if not self.mimo_config.module_to_grid_map:
             # Colocated: all modules on all ranks, single stage
             all_module_names = list(self.mimo_config.modality_submodules_spec.keys())
-            language_key = self.mimo_config.language_module_key or "_language"
-            all_module_names.append(language_key)
-            return RankRole.all_modules(all_module_names, language_key)
+            all_module_names.append(LANGUAGE_MODULE_KEY)
+            return RankRole.all_modules(all_module_names)
 
         current_rank = dist.get_rank()
         modules = {}
@@ -282,7 +273,7 @@ class MimoModel(MegatronModule):
                 f"Check module_to_grid_map configuration."
             )
 
-        return RankRole(modules=modules, language_module_name=self.mimo_config.language_module_key)
+        return RankRole(modules=modules)
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor for pipeline parallelism.
@@ -484,7 +475,7 @@ class MimoModel(MegatronModule):
         Returns:
             Language model output (hidden states, logits, or loss depending on stage)
         """
-        lang_name = self.role.language_module_name
+        lang_name = LANGUAGE_MODULE_KEY
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM

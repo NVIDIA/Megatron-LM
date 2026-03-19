@@ -23,10 +23,8 @@ class MimoModelConfig:
         module_to_grid_map (Optional[Dict[str, Any]]):
             Dictionary mapping module keys (e.g., "vision", "language") to their
             corresponding grid configurations for non-colocated pipeline parallelism.
+            The language model must use the key "language" (LANGUAGE_MODULE_KEY).
             When None, all modules are assumed to be colocated on the same ranks.
-        language_module_key (Optional[str]):
-            The key used to identify the language module in the module_to_grid_map.
-            Required when module_to_grid_map is provided.
         kv_format (str):
             Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
             Default is "sbhd".
@@ -43,5 +41,4 @@ class MimoModelConfig:
     modality_submodules_spec: Dict[str, ModuleSpec] = field(default_factory=dict)
     special_token_ids: Dict[str, int] = field(default_factory=dict)
     module_to_grid_map: Optional[Dict[str, Any]] = None
-    language_module_key: Optional[str] = None
     kv_format: str = "sbhd"
