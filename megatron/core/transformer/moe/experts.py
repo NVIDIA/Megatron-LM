@@ -137,7 +137,7 @@ class GroupedLinearFc2Builder(Protocol):
 
 
 @dataclass
-class TEGroupedMLPSubmodules:
+class GroupedMLPSubmodules:
     """
     The dataclass for ModuleSpecs of TEGroupedMLP submodules
     including  linear fc1, activation function, linear fc2.
@@ -164,7 +164,7 @@ class TEGroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: TEGroupedMLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
@@ -471,7 +471,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: TEGroupedMLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
