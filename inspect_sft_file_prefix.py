@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 #!/usr/bin/env python3
 """Inspect pretokenized SFT samples from Megatron-LM .bin/.idx file pairs.
 
