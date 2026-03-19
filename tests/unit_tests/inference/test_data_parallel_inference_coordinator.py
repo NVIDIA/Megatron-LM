@@ -789,4 +789,3 @@ class TestRoutingPolicies:
         for i in range(len(identities)):
             chosen = coord.get_best_data_parallel_rank([99])
             assert chosen == identities[i]
-
