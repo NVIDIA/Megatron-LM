@@ -62,9 +62,7 @@ class HashRankTable:
     # ------------------------------------------------------------------
 
     def match_vector(
-        self,
-        hashes: Sequence[int],
-        policy: PrefixCachingCoordinatorPolicy | None = None,
+        self, hashes: Sequence[int], policy: PrefixCachingCoordinatorPolicy | None = None
     ) -> np.ndarray:
         """Return a float64 score vector of shape ``(n_ranks,)`` quantifying
         how well each rank matches the given *hashes*.

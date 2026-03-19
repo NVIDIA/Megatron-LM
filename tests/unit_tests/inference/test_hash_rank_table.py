@@ -76,9 +76,7 @@ class TestMatchVectorFirstPrefixBlock:
         t = HashRankTable(n_ranks=2)
         t.record(1, [20])  # rank 1 has hash 20 but not hash 10
         # hashes[0]=10 is not cached, even though hashes[1]=20 is.
-        result = t.match_vector(
-            [10, 20], policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-        )
+        result = t.match_vector([10, 20], policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK)
         np.testing.assert_array_equal(result, [0.0, 0.0])
 
     def test_binary_match(self):
@@ -92,9 +90,7 @@ class TestMatchVectorFirstPrefixBlock:
         t = HashRankTable(n_ranks=2)
         t.record(0, [10])
         default = t.match_vector([10])
-        explicit = t.match_vector(
-            [10], policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-        )
+        explicit = t.match_vector([10], policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK)
         np.testing.assert_array_equal(default, explicit)
 
 
