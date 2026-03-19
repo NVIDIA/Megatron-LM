@@ -238,16 +238,22 @@ def test_sft_batch(tp_size, cp_size, seq_length):
             seg_pos = position_ids[0, offset : offset + seg_len]
             seg_loss = loss_mask[0, offset : offset + seg_len]
 
-            # position_ids within each segment's CP partition must be contiguous
-            # (stride 1) starting at cp_rank * seg_len (THD partitioning
-            # assigns the r-th contiguous chunk of each padded segment to rank r)
-            expected_start = cp_rank * seg_len
-            expected_pos = torch.arange(
-                expected_start, expected_start + seg_len, dtype=torch.int64, device=seg_pos.device
-            )
+            # thd_get_partitioned_indices uses zigzag load-balanced partitioning:
+            # each padded segment is split into 2*cp_size chunks, and rank k
+            # gets chunk k and chunk (2*cp_size - 1 - k).
+            padded_seg_len = padded_seg_lengths[i].item()
+            num_chunks = 2 * cp_size
+            chunk_size = padded_seg_len // num_chunks
+            chunk0_start = cp_rank * chunk_size
+            chunk1_start = (num_chunks - 1 - cp_rank) * chunk_size
+            expected_pos = torch.cat([
+                torch.arange(chunk0_start, chunk0_start + chunk_size, dtype=torch.int64, device=seg_pos.device),
+                torch.arange(chunk1_start, chunk1_start + chunk_size, dtype=torch.int64, device=seg_pos.device),
+            ])
             assert torch.equal(seg_pos, expected_pos), (
-                f"Segment {i}: expected position_ids [{expected_start}, "
-                f"{expected_start + seg_len}) but got "
+                f"Segment {i}: expected zigzag position_ids "
+                f"[{chunk0_start}..{chunk0_start + chunk_size - 1}, "
+                f"{chunk1_start}..{chunk1_start + chunk_size - 1}] but got "
                 f"[{seg_pos[0].item()}, ..., {seg_pos[-1].item()}] on CP rank {cp_rank}"
             )
 

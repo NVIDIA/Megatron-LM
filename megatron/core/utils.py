@@ -2603,7 +2603,7 @@ def get_batch_on_this_cp_rank(
         to this CP rank.
     """
 
-    if batch["cu_seqlens"] is not None:  # NOTE(asolergi-nv): SFT & HybridCP case
+    if batch.get("cu_seqlens") is not None:  # NOTE(asolergi-nv): SFT & HybridCP case
         if is_hybrid_cp:
             assert (
                 batch['local_cp_size'] is not None
