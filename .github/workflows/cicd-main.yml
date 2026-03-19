@@ -845,6 +845,7 @@ jobs:
   Nemo_CICD_Test:
     needs:
       - pre-flight
+      - is-not-external-contributor
       - cicd-unit-tests-latest
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
@@ -872,6 +873,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
+          IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
@@ -896,9 +898,12 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 integration tests may be skipped for non-maintainer PRs,
-          # but must not fail or be cancelled
-          if [ "$GB200_RESULT" != "success" ] && [ "$GB200_RESULT" != "skipped" ]; then
+          # GB200 integration tests may be skipped only for non-maintainer PRs
+          # (no GB200 runners available); maintainer runs must always succeed
+          if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+            echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+            FAILED=true
+          elif [ "$GB200_RESULT" != "success" ] && [ "$GB200_RESULT" != "skipped" ]; then
             echo "❌ cicd-integration-tests-latest-gb200: $GB200_RESULT"
             FAILED=true
           fi
