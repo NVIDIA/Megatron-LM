@@ -27,8 +27,8 @@ ROLE_START_TOKENS = {
     "assistant": [10, 1503, 19464, 1010], # <|im_start|>assistant\n
 }
 END_TOKENS = [11, 1010]                   # <|im_end|>\n
-THINK_START_ID = 12                       # <think>
-THINK_END_ID = 13                         # </think>
+THINK_START_ID = [12]                       # <think>
+THINK_END_ID = [13]                         # </think>
 TOOL_CALL_START = [14, 1010]              # <tool_call>\n
 TOOL_CALL_END = [15, 1010]               # </tool_call>\n
 TOOL_RESPONSE_START = [16, 1010]         # <tool_response>\n
@@ -115,8 +115,14 @@ def find_subsequence(sequence, subsequence, start=0):
     return -1
 
 
+NL_TOKEN = 1010  # \n token id
+
 def split_tool_calls(tokens, offset):
-    """Split a token sequence into assistant text and tool_call sub-segments."""
+    """Split a token sequence into assistant text and tool_call sub-segments.
+
+    Whitespace-only assistant fragments (e.g. a lone \\n between </think> and
+    <tool_call>) are dropped so we don't produce meaningless segments.
+    """
     tc_start_len = len(TOOL_CALL_START)
     tc_end_len = len(TOOL_CALL_END)
     result = []
@@ -131,9 +137,11 @@ def split_tool_calls(tokens, offset):
                 result.append({"role": "assistant", "tokens": tokens[pos:], "start": offset + pos, "end": offset + len(tokens)})
             break
 
-        # Assistant content before tool_call
+        # Assistant content before tool_call (skip if whitespace-only)
         if tc_start > pos:
-            result.append({"role": "assistant", "tokens": tokens[pos:tc_start], "start": offset + pos, "end": offset + tc_start})
+            frag = tokens[pos:tc_start]
+            if not all(t == NL_TOKEN for t in frag):
+                result.append({"role": "assistant", "tokens": frag, "start": offset + pos, "end": offset + tc_start})
 
         # Find matching </tool_call>\n
         content_start = tc_start + tc_start_len
@@ -147,6 +155,10 @@ def split_tool_calls(tokens, offset):
         # Tool call content (excluding markers)
         result.append({"role": "tool_call", "tokens": tokens[content_start:tc_end], "start": offset + content_start, "end": offset + tc_end})
         pos = tc_end + tc_end_len
+
+    # Also drop trailing whitespace-only assistant fragments
+    if result and result[-1]["role"] == "assistant" and all(t == NL_TOKEN for t in result[-1]["tokens"]):
+        result.pop()
 
     return result
 
@@ -179,25 +191,22 @@ def extract_segments(tokenized_conversation, role_start_tokens, end_tokens, thin
             continue
 
         if role == "assistant":
-            think_start_idx = None
-            think_end_idx = None
-            for i, tok in enumerate(content_tokens):
-                if tok == think_start_id and think_start_idx is None:
-                    think_start_idx = i
-                elif tok == think_end_id:
-                    think_end_idx = i
-                    break
+            think_start_idx = find_subsequence(content_tokens, think_start_id)
+            if think_start_idx != -1:
+                think_end_idx = find_subsequence(content_tokens, think_end_id, think_start_idx + len(think_start_id))
+            else:
+                think_end_idx = -1
 
-            if think_start_idx is not None and think_end_idx is not None:
-                reasoning_tokens = content_tokens[think_start_idx + 1 : think_end_idx]
-                response_tokens = content_tokens[think_end_idx + 1 :]
+            if think_start_idx != -1 and think_end_idx != -1:
+                reasoning_tokens = content_tokens[think_start_idx + len(think_start_id) : think_end_idx]
+                response_tokens = content_tokens[think_end_idx + len(think_end_id) :]
                 if reasoning_tokens:
-                    abs_start = content_start + think_start_idx + 1
+                    abs_start = content_start + think_start_idx + len(think_start_id)
                     abs_end = content_start + think_end_idx
                     segments.append({"role": "reasoning", "tokens": reasoning_tokens, "start": abs_start, "end": abs_end})
                 # Split the response part by tool calls
                 if response_tokens:
-                    abs_start = content_start + think_end_idx + 1
+                    abs_start = content_start + think_end_idx + len(think_end_id)
                     segments.extend(split_tool_calls(response_tokens, abs_start))
                 continue
 
@@ -228,8 +237,8 @@ def main():
     assert tokenizer.encode("<|im_start|>user\n", add_special_tokens=False) == ROLE_START_TOKENS["user"]
     assert tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False) == ROLE_START_TOKENS["assistant"]
     assert tokenizer.encode("<|im_end|>\n", add_special_tokens=False) == END_TOKENS
-    assert tokenizer.convert_tokens_to_ids("<think>") == THINK_START_ID
-    assert tokenizer.convert_tokens_to_ids("</think>") == THINK_END_ID
+    assert tokenizer.encode("<think>", add_special_tokens=False) == THINK_START_ID
+    assert tokenizer.encode("</think>", add_special_tokens=False) == THINK_END_ID
     assert tokenizer.encode("<tool_call>\n", add_special_tokens=False) == TOOL_CALL_START
     assert tokenizer.encode("</tool_call>\n", add_special_tokens=False) == TOOL_CALL_END
     assert tokenizer.encode("<tool_response>\n", add_special_tokens=False) == TOOL_RESPONSE_START

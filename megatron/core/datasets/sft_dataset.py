@@ -65,8 +65,8 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
     role_start_tokens: Dict[str, List[int]] = field(init=False, default=None)
     end_tokens: List[int] = field(init=False, default=None)
-    think_start_id: int = field(init=False, default=None)
-    think_end_id: int = field(init=False, default=None)
+    think_start_tokens: List[int] = field(init=False, default=None)
+    think_end_tokens: List[int] = field(init=False, default=None)
     tool_call_start_tokens: List[int] = field(init=False, default=None)
     tool_call_end_tokens: List[int] = field(init=False, default=None)
     tool_response_start_tokens: List[int] = field(init=False, default=None)
@@ -90,17 +90,17 @@ class SFTDatasetConfig(GPTDatasetConfig):
 
         if self.train_on_assistant_responses_only:
             self.role_start_tokens = {
-                "system": self.tokenizer.tokenize(self.chat_template_config.system_start_str),
-                "user": self.tokenizer.tokenize(self.chat_template_config.user_start_str),
-                "assistant": self.tokenizer.tokenize(self.chat_template_config.assistant_start_str),
+                "system": self.tokenizer.tokenize(self.chat_template_config.system_start_str, add_special_tokens=False),
+                "user": self.tokenizer.tokenize(self.chat_template_config.user_start_str, add_special_tokens=False),
+                "assistant": self.tokenizer.tokenize(self.chat_template_config.assistant_start_str, add_special_tokens=False),
             }
-            self.end_tokens = self.tokenizer.tokenize(self.chat_template_config.end_str)
-            self.think_start_id = self.tokenizer.tokenize(self.chat_template_config.think_start_str)[0]
-            self.think_end_id = self.tokenizer.tokenize(self.chat_template_config.think_end_str)[0]
-            self.tool_call_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_start_str)
-            self.tool_call_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_end_str)
-            self.tool_response_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_start_str)
-            self.tool_response_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_end_str)
+            self.end_tokens = self.tokenizer.tokenize(self.chat_template_config.end_str, add_special_tokens=False)
+            self.think_start_tokens = self.tokenizer.tokenize(self.chat_template_config.think_start_str, add_special_tokens=False)
+            self.think_end_tokens = self.tokenizer.tokenize(self.chat_template_config.think_end_str, add_special_tokens=False)
+            self.tool_call_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_start_str, add_special_tokens=False)
+            self.tool_call_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_end_str, add_special_tokens=False)
+            self.tool_response_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_start_str, add_special_tokens=False)
+            self.tool_response_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_end_str, add_special_tokens=False)
 
 
 class SFTDataset(MegatronDataset):
@@ -229,8 +229,8 @@ class SFTDataset(MegatronDataset):
                     sample.tolist(),
                     self.config.role_start_tokens,
                     self.config.end_tokens,
-                    self.config.think_start_id,
-                    self.config.think_end_id,
+                    self.config.think_start_tokens,
+                    self.config.think_end_tokens,
                     self.config.tool_call_start_tokens,
                     self.config.tool_call_end_tokens,
                     self.config.tool_response_start_tokens,
@@ -613,8 +613,8 @@ def extract_segments(
     tokenized_conversation,
     role_start_tokens,
     end_tokens,
-    think_start_id,
-    think_end_id,
+    think_start_tokens,
+    think_end_tokens,
     tool_call_start_tokens,
     tool_call_end_tokens,
     tool_response_start_tokens,
@@ -647,25 +647,22 @@ def extract_segments(
             continue
 
         if role == "assistant":
-            think_start_idx = None
-            think_end_idx = None
-            for i, tok in enumerate(content_tokens):
-                if tok == think_start_id and think_start_idx is None:
-                    think_start_idx = i
-                elif tok == think_end_id:
-                    think_end_idx = i
-                    break
+            think_start_idx = find_subsequence(content_tokens, think_start_tokens)
+            if think_start_idx != -1:
+                think_end_idx = find_subsequence(content_tokens, think_end_tokens, think_start_idx + len(think_start_tokens))
+            else:
+                think_end_idx = -1
 
-            if think_start_idx is not None and think_end_idx is not None:
-                reasoning_tokens = content_tokens[think_start_idx + 1:think_end_idx]
-                response_tokens = content_tokens[think_end_idx + 1:]
+            if think_start_idx != -1 and think_end_idx != -1:
+                reasoning_tokens = content_tokens[think_start_idx + len(think_start_tokens):think_end_idx]
+                response_tokens = content_tokens[think_end_idx + len(think_end_tokens):]
                 if reasoning_tokens:
-                    abs_start = content_start + think_start_idx + 1
+                    abs_start = content_start + think_start_idx + len(think_start_tokens)
                     abs_end = content_start + think_end_idx
                     segments.append({"role": "reasoning", "tokens": reasoning_tokens, "start": abs_start, "end": abs_end})
                 # Split the response part by tool calls
                 if response_tokens:
-                    abs_start = content_start + think_end_idx + 1
+                    abs_start = content_start + think_end_idx + len(think_end_tokens)
                     segments.extend(_split_tool_calls(response_tokens, abs_start, tool_call_start_tokens, tool_call_end_tokens))
                 continue
 

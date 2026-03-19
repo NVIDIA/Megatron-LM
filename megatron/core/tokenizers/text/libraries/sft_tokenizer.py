@@ -186,7 +186,7 @@ class SFTTokenizer:
 
         return tokens, target
 
-    def text_to_ids(self, text: Union[str, List[Dict]]):
+    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = False):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
@@ -194,7 +194,7 @@ class SFTTokenizer:
                 text, return_target=False, add_generation_prompt=True
             ).tolist()
 
-        return self._tokenizer.encode(text, add_special_tokens=False)
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
