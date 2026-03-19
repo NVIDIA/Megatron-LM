@@ -97,30 +97,12 @@ class GroupedMLP(MegatronModule):
         ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
-        glu_interleave_size = self.config.moe_mlp_glu_interleave_size
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
-            if glu_interleave_size is not None and (
-                not isinstance(glu_interleave_size, int) or glu_interleave_size <= 0
-            ):
-                raise ValueError(
-                    "`moe_mlp_glu_interleave_size` must be a positive integer or None, "
-                    f"got {glu_interleave_size!r}."
-                )
 
             @jit_fuser
             def glu(x):
-                # Undo interleaving if needed
-                if glu_interleave_size is not None:
-                    shape = x.size()
-                    x = x.reshape(
-                        -1, shape[-1] // (2 * glu_interleave_size), 2, glu_interleave_size
-                    )
-                    x = x.transpose(1, 2)
-                    x = x.reshape(shape)
-
-                # Compute gated activation
                 x = torch.chunk(x, 2, dim=-1)
                 return self.config.activation_func(x[0]) * x[1]
 
@@ -152,19 +134,6 @@ class GroupedMLP(MegatronModule):
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
-        if (
-            self.config.gated_linear_unit
-            and glu_interleave_size is not None
-            and self.config.moe_ffn_hidden_size % (tp_size * glu_interleave_size) != 0
-        ):
-            raise ValueError(
-                "Unsupported `moe_mlp_glu_interleave_size`: expected "
-                "`moe_ffn_hidden_size` to be divisible by "
-                "`expert_tensor_parallel_size * moe_mlp_glu_interleave_size`. "
-                f"Got moe_ffn_hidden_size={self.config.moe_ffn_hidden_size}, "
-                f"expert_tensor_parallel_size={tp_size}, "
-                f"moe_mlp_glu_interleave_size={glu_interleave_size}."
-            )
 
         fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
