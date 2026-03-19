@@ -66,6 +66,19 @@ def get_ep_layer_offset(num_experts: int | None = None) -> int:
     return local_expert_offset
 
 
+def get_total_num_experts(num_experts: int | None = None) -> int:
+    """
+    Get the total number of experts for the current model.
+
+    Args:
+        num_experts: Total number of experts in the model. If None, returns 0.
+
+    Returns:
+        The total number of experts.
+    """
+    return num_experts if num_experts else 0
+
+
 def get_expert_index_from_key(key):
     """Extract expert index from various expert key formats.
 
@@ -102,7 +115,7 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
         The processed state dictionary with rewritten expert keys.
     """
     local_expert_start = get_ep_layer_offset(num_experts)
-    local_expert_end = num_experts if num_experts else 0
+    local_expert_end = get_total_num_experts(num_experts)
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
@@ -180,6 +193,12 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
+
+    Only splits linear_fc1 parameters whose parent TransformerLayer has
+    ``config.gated_linear_unit == True``.  This is critical for heterogeneous
+    models (e.g. VLMs) where the vision encoder uses GELU while the language
+    decoder uses SWiGLU — splitting non-SWiGLU fc1 weights would create _w/_v
+    keys that don't exist in the checkpoint, causing a load-time mismatch.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
@@ -188,6 +207,37 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     num_experts = (
         getattr(model_config, 'num_moe_experts', None) if model_config is not None else None
     )
+
+    # ------------------------------------------------------------------
+    # Build per-TransformerLayer gated_linear_unit map.
+    # For homogeneous LLMs every layer agrees; for VLMs the vision encoder
+    # layers have gated_linear_unit=False while language decoder layers
+    # have gated_linear_unit=True.
+    # ------------------------------------------------------------------
+    def _strip_wrappers(path):
+        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
+        parts = path.split('.')
+        while parts and parts[0] in ('module', 'model'):
+            parts = parts[1:]
+        return '.'.join(parts)
+
+    _layer_glu = {}
+    for name, module in model.named_modules():
+        if isinstance(module, TransformerLayer):
+            _layer_glu[_strip_wrappers(name)] = getattr(
+                module.config, 'gated_linear_unit', False
+            )
+
+    def _key_in_glu_layer(key):
+        """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
+        norm_key = _strip_wrappers(key)
+        best_glu, best_len = None, -1
+        for layer_path, uses_glu in _layer_glu.items():
+            if norm_key.startswith(layer_path + '.') and len(layer_path) > best_len:
+                best_glu, best_len = uses_glu, len(layer_path)
+        if best_glu is None:
+            return True   # no TransformerLayer found — assume GLU for backward compat
+        return best_glu
 
     def intersection(s1, s2):
         # Only works for step=1
@@ -284,8 +334,13 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return weight_w, weight_v
 
     model_state_dict = model_state_dict.copy()
+    _swiglu_split_count = 0
+    _swiglu_skip_count = 0
     for key in list(model_state_dict.keys()):
         if is_swiglu_key(key):
+            if not _key_in_glu_layer(key):
+                _swiglu_skip_count += 1
+                continue
             dist_param = model.get_parameter(f"module.{key}")
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
@@ -298,6 +353,13 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             model_state_dict[f"{key}_w"] = weight_w
             model_state_dict[f"{key}_v"] = weight_v
             del model_state_dict[key]
+            _swiglu_split_count += 1
+
+    if _swiglu_skip_count > 0:
+        logger.info(
+            f"[SWiGLU] Split {_swiglu_split_count} fc1 keys; "
+            f"skipped {_swiglu_skip_count} keys in non-GLU layers (e.g. vision encoder)."
+        )
 
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
@@ -305,8 +367,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             opt_state_dict = optimizer_state_dict["state"]
             new_opt_state_dict = {}
             for key in list(opt_state_dict.keys()):
-                # Only process SWIGLU keys
-                if not is_swiglu_key(key):
+                if not is_swiglu_key(key) or not _key_in_glu_layer(key):
                     new_opt_state_dict[key] = opt_state_dict[key]
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
@@ -321,7 +382,6 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                         swiglu_shard_axis=0,
                         is_expert_param="mlp.experts" in key,
                     )
-                    # Update the optimizer state dict with the new keys
                     new_opt_state_dict[f"{key}_w"][subkey] = weight_w
                     new_opt_state_dict[f"{key}_v"][subkey] = weight_v
             optimizer_state_dict["state"] = new_opt_state_dict

@@ -1,7 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# python checkpoint_inspector.py inspect /path/to/checkpoint
-# torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor /path/to/input_checkpoint /path/to/output_checkpoint --swiglu
+# Usage examples:
+#   python checkpoint_inspector.py inspect /path/to/checkpoint
+#
+#   torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py \
+#       convert-torch-dist-to-fsdp-dtensor \
+#       /path/to/input_checkpoint /path/to/output_checkpoint \
+#       --swiglu-modules language_model --merge-gdn --rename-mtp-keys
 import gc
 import io
 import json
@@ -342,8 +347,55 @@ def convert_checkpoint(
     optimizer_state_prefix="optimizer.state.module.module.module",
     model_weight_prefix="model.module",
     param_to_param_group_map={},
+    merge_gdn=False,
+    rename_mtp_keys=False,
+    swiglu_modules=None,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to standard fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the table below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                              Auto-detected?
+      ─────────────────  ───────────────────────────────────────  ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.     No (manual).
+                         Check HuggingFace config for              Specify which
+                         "hidden_act": "silu" + gate_proj.         modules use it.
+      --swiglu           Same as above, but applies globally       No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --merge-gdn        Model uses Gated DeltaNet (GDN)           YES.
+                         attention with decomposed sub-keys
+                         (query/key/value/z/beta/alpha).
+      --rename-mtp-keys  Model uses Multi-Token Prediction          YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection: --merge-gdn and --rename-mtp-keys are auto-detected from
+    checkpoint keys if not explicitly set. --swiglu / --swiglu-modules must
+    always be specified manually because SWiGLU and GeLU MLP weights are
+    indistinguishable in the MCore torch_dist format.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    Model with SWiGLU in all modules, no GDN/MTP:
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     device_mesh = DeviceMesh.from_group(process_group, device_type="cuda")
 
     # 1. Initialize state_dict with proper metadata
@@ -374,11 +426,49 @@ def convert_checkpoint(
     elapsed_time = time.time() - start_time
     rank0_echo(f"[Load] Finished loading state_dict in {elapsed_time:.2f}s.")
 
+    # --- Resolve SWiGLU scope ---
+    # --swiglu-modules (per-module) takes priority over --swiglu (global).
+    if swiglu_modules is not None:
+        _swiglu_prefixes = list(swiglu_modules)
+        rank0_echo(f"[SWiGLU] Per-module splitting enabled for: {_swiglu_prefixes}")
+    elif swiglu:
+        _swiglu_prefixes = None  # None = match everything (backward compatible)
+        rank0_echo("[SWiGLU] Global splitting enabled (all modules).")
+    else:
+        _swiglu_prefixes = []    # no SWiGLU splitting
+        rank0_echo("[SWiGLU] Disabled (no --swiglu or --swiglu-modules specified).")
+
+    # --- Auto-detect GDN and MTP from checkpoint keys ---
+    all_keys = list(state_dict.keys())
+    _detected = []
+
+    if not merge_gdn and any(
+        ".in_proj.weight.query" in k or ".conv1d.weight.query" in k
+        for k in all_keys
+    ):
+        merge_gdn = True
+        _detected.append("GDN (decomposed in_proj/conv1d sub-keys detected)")
+
+    if not rename_mtp_keys and any(
+        ".mtp.layers." in k and ".transformer_layer." in k
+        for k in all_keys
+    ):
+        rename_mtp_keys = True
+        _detected.append("MTP (transformer_layer -> mtp_model_layer rename needed)")
+
+    if _detected:
+        rank0_echo(
+            "[Auto-detect] Enabled transformations based on checkpoint keys:\n"
+            + "\n".join(f"  - {d}" for d in _detected)
+        )
+    del all_keys
+
     # Handle optimizer state and module parameters
     fsdp_dtensor_state_dict = {}
     rerun_state_machine_state = None
     process_count = 0
     total_items = len(state_dict)
+    _swiglu_split_count = 0
 
     def _free_up_some_gpu_memory():
         if check_gpu_memory(0.5):
@@ -456,29 +546,38 @@ def convert_checkpoint(
             experts[expert_key] = expert_weight
         return experts
 
+    _SWIGLU_PATTERNS = [
+        r"(.*)\.mlp\.linear_fc1\.weight",
+        r"(.*)\.mlp\.linear_fc1\.bias",
+        r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
+        r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
+    ]
+
     def is_swiglu_key(key):
-        return any(re.search(pat, key) for pat in [
-            r"(.*)\.mlp\.linear_fc1\.weight",
-            r"(.*)\.mlp\.linear_fc1\.bias",
-            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
-            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
-        ])
+        if not any(re.search(pat, key) for pat in _SWIGLU_PATTERNS):
+            return False
+        # _swiglu_prefixes=None means global (--swiglu), match all.
+        # _swiglu_prefixes=[] means nothing detected, match none.
+        # _swiglu_prefixes=["language_model", ...] means per-module match.
+        if _swiglu_prefixes is None:
+            return True
+        return any(f".{mod}." in key or key.startswith(f"{mod}.") for mod in _swiglu_prefixes)
 
     def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Split SwiGLU weights into separate tensors.
+        Split SwiGLU weights/biases into separate _w and _v tensors.
         """
         value = gather_uneven_dtensor_to_full_tensor(value)
         swiglu_w_and_v = {}
         w, v = torch.chunk(value, 2, dim=0)
         w = w.redistribute(placements=[Shard(0)])
         v = v.redistribute(placements=[Shard(0)])
-        w_key = re.sub(r'(weight\d*)(.*)', r'\1_w\2', key)
-        v_key = re.sub(r'(weight\d*)(.*)', r'\1_v\2', key)
+        w_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_w\2', key)
+        v_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_v\2', key)
         swiglu_w_and_v[w_key] = w
         swiglu_w_and_v[v_key] = v
         return swiglu_w_and_v
@@ -509,8 +608,10 @@ def convert_checkpoint(
                 is_param = True
 
             # Handle dist-opt flatten tensors
+            _has_mcore = hasattr(metadata, "mcore_data")
             if (
-                key in metadata.mcore_data
+                _has_mcore
+                and key in metadata.mcore_data
                 and "nd_reformulated_orig_global_shape" in metadata.mcore_data[key]
             ):
                 mcore_data = metadata.mcore_data[key]
@@ -553,12 +654,13 @@ def convert_checkpoint(
                         value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            # Handle SWiGLU weights
+            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
             for key, value in list(split_tensors.items()):
-                if swiglu and is_swiglu_key(key):
+                if is_swiglu_key(key):
                     swiglu_w_and_v = split_swiglu_weight(key, value)
                     split_tensors.update(swiglu_w_and_v)
                     del split_tensors[key]
+                    _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
             if is_param and key in param_to_param_group_map:
@@ -597,22 +699,95 @@ def convert_checkpoint(
             torch.save(value, serialized_data)
             fsdp_dtensor_state_dict[key] = serialized_data
 
+    if _swiglu_split_count > 0:
+        rank0_echo(f"[SWiGLU] Split {_swiglu_split_count} fc1 keys into _w/_v pairs.")
+    elif _swiglu_prefixes is not None and len(_swiglu_prefixes) > 0:
+        rank0_echo("[SWiGLU] WARNING: modules specified but 0 keys were split — check module names.")
+
+    # Merge GDN (Gated DeltaNet) composite keys.
+    # The torch_dist format stores in_proj.weight and conv1d.weight as separate
+    # sub-tensors (.query, .key, .value, .z, .beta, .alpha), but the FSDP model
+    # expects them as single concatenated tensors.
+    if merge_gdn:
+        GDN_IN_PROJ_PARTS = ["query", "key", "value", "z", "beta", "alpha"]
+        GDN_CONV1D_PARTS = ["query", "key", "value"]
+
+        gdn_groups: dict[str, dict[str, torch.Tensor]] = {}
+        for k in list(fsdp_dtensor_state_dict.keys()):
+            for part_list in (GDN_IN_PROJ_PARTS, GDN_CONV1D_PARTS):
+                for part_name in part_list:
+                    suffix = f".{part_name}"
+                    if k.endswith(suffix):
+                        base = k[: -len(suffix)]
+                        if ".self_attention.in_proj.weight" in base or ".self_attention.conv1d.weight" in base:
+                            gdn_groups.setdefault(base, {})[part_name] = k
+                            break
+
+        merged_count = 0
+        for base_key, parts_map in sorted(gdn_groups.items()):
+            if ".in_proj.weight" in base_key:
+                expected = GDN_IN_PROJ_PARTS
+            else:
+                expected = GDN_CONV1D_PARTS
+
+            if set(parts_map.keys()) != set(expected):
+                if torch.distributed.get_rank() == 0:
+                    click.echo(click.style(
+                        f"Warning: Incomplete GDN group for {base_key}, "
+                        f"found {sorted(parts_map.keys())}, expected {expected}. Skipping merge.",
+                        fg="yellow",
+                    ))
+                continue
+
+            _free_up_some_gpu_memory()
+            full_parts = []
+            for part_name in expected:
+                part_tensor = fsdp_dtensor_state_dict.pop(parts_map[part_name])
+                full_parts.append(gather_uneven_dtensor_to_full_tensor(part_tensor))
+
+            merged = torch.cat(full_parts, dim=0).redistribute(placements=[Shard(0)])
+            fsdp_dtensor_state_dict[base_key] = merged
+            merged_count += 1
+
+        if merged_count > 0:
+            rank0_echo(f"[GDN merge] Merged {merged_count} composite keys "
+                       f"(in_proj.weight / conv1d.weight).")
+
+    # Rename MTP keys: torch_dist uses "transformer_layer" for MTP sub-modules,
+    # but the FSDP model's state_dict() uses "mtp_model_layer".
+    if rename_mtp_keys:
+        _MTP_OLD = ".mtp.layers."
+        _MTP_SRC = ".transformer_layer."
+        _MTP_DST = ".mtp_model_layer."
+        renamed_count = 0
+        for k in list(fsdp_dtensor_state_dict.keys()):
+            if _MTP_OLD in k and _MTP_SRC in k:
+                new_k = k.replace(_MTP_SRC, _MTP_DST, 1)
+                fsdp_dtensor_state_dict[new_k] = fsdp_dtensor_state_dict.pop(k)
+                if k in param_to_param_group_map:
+                    param_to_param_group_map[new_k] = param_to_param_group_map.pop(k)
+                renamed_count += 1
+        if renamed_count > 0:
+            rank0_echo(f"[MTP rename] Renamed {renamed_count} keys: "
+                       f"'transformer_layer' -> 'mtp_model_layer'.")
+
     # Move back to GPU if necessary
     for key in fsdp_dtensor_state_dict:
         if isinstance(fsdp_dtensor_state_dict[key], torch.Tensor):
             fsdp_dtensor_state_dict[key] = fsdp_dtensor_state_dict[key].cuda()
 
-    # Check MCore data
-    for key, value in list(metadata.mcore_data.items()):
-        if len(value) == 0:
-            del metadata.mcore_data[key]
-    if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
-        click.echo(
-            click.style(
-                f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
-                fg="yellow",
+    # Check MCore data (may not exist for pretrained-only checkpoints)
+    if hasattr(metadata, "mcore_data"):
+        for key, value in list(metadata.mcore_data.items()):
+            if len(value) == 0:
+                del metadata.mcore_data[key]
+        if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
+            click.echo(
+                click.style(
+                    f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
+                    fg="yellow",
+                )
             )
-        )
 
     # Handle args, optimizer.param_groups and other shared objects.
     sharded_strategy = get_default_load_sharded_strategy(input_dir)
@@ -676,7 +851,17 @@ def convert_checkpoint(
 @click.option(
     "--swiglu",
     is_flag=True,
-    help="SwiGLU is used in checkpoint, and MLP linear_fc1 is specially treated.",
+    help="Split SWiGLU fc1 weights/biases into _w and _v for ALL modules. "
+         "Use --swiglu-modules instead if only some modules use SWiGLU (e.g. VLMs). "
+         "NOT auto-detected; must be specified manually.",
+)
+@click.option(
+    "--swiglu-modules",
+    type=str,
+    default=None,
+    help="Comma-separated module names that use SWiGLU (e.g. 'language_model'). "
+         "Only these modules will have fc1 split into _w/_v. Overrides --swiglu. "
+         "NOT auto-detected; must be specified manually.",
 )
 @click.option(
     "--oom-traceback", is_flag=True, help="Enable OOM traceback for debugging."
@@ -698,17 +883,86 @@ def convert_checkpoint(
     default="{}",
     help="JSON string representing the param to parameter group map."
 )
+@click.option(
+    "--merge-gdn",
+    is_flag=True,
+    help="Merge Gated DeltaNet (GDN) decomposed sub-keys "
+         "(query/key/value/z/beta/alpha) into fused in_proj.weight and conv1d.weight. "
+         "Auto-detected if not set: enabled when sub-keys like "
+         "'.in_proj.weight.query' are found in the checkpoint.",
+)
+@click.option(
+    "--rename-mtp-keys",
+    is_flag=True,
+    help="Rename MTP layer keys from 'transformer_layer' to 'mtp_model_layer' "
+         "to match the FSDP model's state_dict naming. "
+         "Auto-detected if not set: enabled when '.mtp.layers.*.transformer_layer' "
+         "keys are found in the checkpoint.",
+)
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
     swiglu,
+    swiglu_modules,
     oom_traceback,
     enable_msc,
     output_optimizer_state_prefix,
     output_model_weight_prefix,
     param_to_param_group_map_json,
+    merge_gdn,
+    rename_mtp_keys,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the guide below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                            Auto-detected?
+      ─────────────────  ────────────────────────────────────── ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.   No (manual).
+                         Check HuggingFace config for            Specify which
+                         "hidden_act": "silu" + gate_proj.       modules use it.
+      --swiglu           Same as above, but applies globally     No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --merge-gdn        Model uses Gated DeltaNet (GDN)         YES.
+                         attention with decomposed sub-keys
+                         (query/key/value/z/beta/alpha).
+      --rename-mtp-keys  Model uses Multi-Token Prediction        YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection note:
+      --merge-gdn and --rename-mtp-keys are auto-detected from checkpoint keys
+      if not explicitly set. --swiglu / --swiglu-modules must always be specified
+      manually because SWiGLU and GeLU MLP weights are indistinguishable in the
+      MCore torch_dist format.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    \b
+    Model with SWiGLU in all modules, no GDN/MTP:
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     if not enable_msc:
         MultiStorageClientFeature.disable()
 
@@ -748,11 +1002,18 @@ def convert_torch_dist_to_fsdp_dtensor(
     output_dir = Path(output_dir)
     with open(param_to_param_group_map_json, "r") as f:
         param_to_param_group_map = json.load(f)
+    _swiglu_modules = (
+        [m.strip() for m in swiglu_modules.split(",") if m.strip()]
+        if swiglu_modules is not None else None
+    )
     convert_checkpoint(
         ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
         param_to_param_group_map=param_to_param_group_map,
+        merge_gdn=merge_gdn,
+        rename_mtp_keys=rename_mtp_keys,
+        swiglu_modules=_swiglu_modules,
     )
 
     click.echo(
