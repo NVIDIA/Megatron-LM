@@ -263,7 +263,7 @@ class InferenceConfig:
     prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance.
-    Only applies when enable_prefix_caching is True and using a coordinator.
+    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
@@ -308,7 +308,14 @@ class InferenceConfig:
     """
 
     use_synchronous_zmq_collectives: bool = False
-    """Whether to use synchronous ZMQ collectives for inference. If True, the 
-    all_reduce_max operation will be performed synchronously, which can help reduce 
+    """Whether to use synchronous ZMQ collectives for inference. If True, the
+    all_reduce_max operation will be performed synchronously, which can help reduce
     performance variability for MoEs.
     """
+
+    def __post_init__(self):
+        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+            raise ValueError(
+                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"got {self.prefix_caching_routing_alpha}"
+            )

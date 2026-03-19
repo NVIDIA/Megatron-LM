@@ -204,43 +204,22 @@ def make_coordinator_direct(
 ):
     """Create a coordinator with mock ZMQ, for unit testing routing logic.
 
-    Returns the coordinator instance with fake rank identities.
+    Thin wrapper around the shared helper in conftest.py that supplies a
+    DummyTokenizer and this module's BLOCK_SIZE default.
     """
-    coordinator = object.__new__(DataParallelInferenceCoordinator)
-    coordinator.tokenizer = DummyTokenizer()
-    coordinator.data_parallel_size = data_parallel_size
-    coordinator.block_size_tokens = block_size_tokens
-    coordinator.enable_prefix_caching = enable_prefix_caching
-    coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
-    coordinator.prefix_caching_routing_alpha = prefix_caching_routing_alpha
-    coordinator.max_requests = max_requests
-
-    # Create fake rank identities.
-    coordinator.identities_of_data_parallel_ranks = deque(
-        [f"rank_{i}".encode() for i in range(data_parallel_size)]
-    )
-    if deterministic_mode:
-        coordinator.identities_of_data_parallel_ranks = deque(
-            sorted(coordinator.identities_of_data_parallel_ranks)
-        )
-    coordinator.data_parallel_rank_iterator = itertools.cycle(
-        coordinator.identities_of_data_parallel_ranks
+    from tests.unit_tests.inference.coordinator_test_utils import (
+        make_coordinator_direct as _make_coordinator,
     )
 
-    n_ranks = data_parallel_size
-    coordinator.hash_table = HashRankTable(n_ranks)
-    coordinator._round_robin_idx = 0
-
-    sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
-    coordinator.identity_to_rank_index = {
-        identity: idx for idx, identity in enumerate(sorted_identities)
-    }
-
-    coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
-    coordinator._identities_list = list(sorted_identities)
-    coordinator._active_mask = np.ones(n_ranks, dtype=bool)
-
-    return coordinator
+    return _make_coordinator(
+        data_parallel_size=data_parallel_size,
+        block_size_tokens=block_size_tokens,
+        enable_prefix_caching=enable_prefix_caching,
+        deterministic_mode=deterministic_mode,
+        prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+        max_requests=max_requests,
+        tokenizer=DummyTokenizer(),
+    )
 
 
 # ============================================================================

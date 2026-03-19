@@ -1,8 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, Sequence
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Sequence
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 
 
 class HashRankTable:
@@ -56,17 +61,60 @@ class HashRankTable:
     # Queries
     # ------------------------------------------------------------------
 
-    def match_vector(self, hashes: Sequence[int]) -> np.ndarray:
-        """Return a float64 vector of shape ``(n_ranks,)`` with 1.0 where *any*
-        of the given *hashes* are present for that rank, 0.0 otherwise.
+    def match_vector(
+        self,
+        hashes: Sequence[int],
+        policy: PrefixCachingCoordinatorPolicy | None = None,
+    ) -> np.ndarray:
+        """Return a float64 score vector of shape ``(n_ranks,)`` quantifying
+        how well each rank matches the given *hashes*.
 
-        This is fully vectorized: the only Python-level iteration is over the
-        hash→row dict lookups; the per-rank reduction is done with numpy.
+        The score semantics depend on *policy*:
+
+        * ``FIRST_PREFIX_BLOCK`` (default): binary – 1.0 if the rank has the
+          first block hash cached, 0.0 otherwise.  Only ``hashes[:1]`` is
+          checked.
+        * ``LONGEST_PREFIX``: reverse-scans hashes to find the deepest block
+          present in the table (parent-chained hashes guarantee that a match at
+          index *i* implies all earlier blocks are also cached).  Ranks that
+          hold that hash score ``(i + 1) / len(hashes)``; all others score 0.
         """
-        row_indices = [self._hash_to_row[h] for h in set(hashes) if h in self._hash_to_row]
-        if row_indices:
-            rows = self._timestamps[row_indices]  # (num_hashes, n_ranks)
-            return (rows > 0).any(axis=0).astype(np.float64)
+        from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+
+        if policy is None:
+            policy = PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+
+        if policy == PrefixCachingCoordinatorPolicy.LONGEST_PREFIX:
+            return self._match_vector_longest_prefix(hashes)
+
+        # FIRST_PREFIX_BLOCK: binary check on the first block hash only.
+        if not hashes:
+            return np.zeros(self._n_ranks, dtype=np.float64)
+        row = self._hash_to_row.get(hashes[0])
+        if row is not None:
+            return (self._timestamps[row] > 0).astype(np.float64)
+        return np.zeros(self._n_ranks, dtype=np.float64)
+
+    def _match_vector_longest_prefix(self, hashes: Sequence[int]) -> np.ndarray:
+        """Longest-prefix scoring via reverse scan.
+
+        Scans *hashes* from the end and stops at the first (deepest) hash
+        found in the table.  Ranks that hold that hash score
+        ``(depth + 1) / len(hashes)``; all others score 0.  Because hashes are
+        parent-chained, a single deepest-match lookup is sufficient.
+        """
+        n = len(hashes)
+        if n == 0:
+            return np.zeros(self._n_ranks, dtype=np.float64)
+
+        for i in range(n - 1, -1, -1):
+            row = self._hash_to_row.get(hashes[i])
+            if row is None:
+                continue
+            present = self._timestamps[row] > 0
+            if present.any():
+                return present.astype(np.float64) * ((i + 1.0) / n)
+
         return np.zeros(self._n_ranks, dtype=np.float64)
 
     def get_row(self, h: int) -> np.ndarray | None:
@@ -100,6 +148,60 @@ class HashRankTable:
     def n_ranks(self) -> int:
         """Number of ranks."""
         return self._n_ranks
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def compact(self) -> None:
+        """Remove dead rows and shrink the backing array when under-utilized.
+
+        A row is *dead* when all of its timestamps are zero (no rank holds the
+        hash).  After removing dead rows, the array is halved repeatedly until
+        it is no larger than ``max(2 * live_rows, initial_capacity=256)``.
+        """
+        # Identify live rows (at least one non-zero timestamp).
+        live_mask = (self._timestamps[: self._next_row] != 0).any(axis=1)
+        live_indices = np.nonzero(live_mask)[0]
+        n_live = len(live_indices)
+
+        if n_live == self._next_row:
+            # Nothing to compact — but still try to shrink the backing array.
+            self._maybe_shrink()
+            return
+
+        # Rebuild the table with only live rows, preserving order.
+        new_timestamps = self._timestamps[live_indices]  # (n_live, n_ranks)
+
+        # Rebuild hash→row mapping.
+        old_to_new = {int(old): new for new, old in enumerate(live_indices)}
+        self._hash_to_row = {
+            h: old_to_new[row] for h, row in self._hash_to_row.items() if row in old_to_new
+        }
+        self._next_row = n_live
+
+        # Allocate a right-sized backing array and copy live data into it.
+        new_capacity = max(256, n_live)
+        # Round up to next power of two to stay consistent with _ensure_capacity.
+        capacity = 256
+        while capacity < new_capacity:
+            capacity *= 2
+        self._timestamps = np.zeros((capacity, self._n_ranks), dtype=np.int64)
+        self._timestamps[:n_live] = new_timestamps
+
+    def _maybe_shrink(self) -> None:
+        """Halve the backing array while it is at most half-occupied."""
+        capacity = self._timestamps.shape[0]
+        min_capacity = max(256, self._next_row * 2)
+        if capacity <= min_capacity:
+            return
+        new_capacity = capacity
+        while new_capacity // 2 >= min_capacity:
+            new_capacity //= 2
+        if new_capacity < capacity:
+            new_table = np.zeros((new_capacity, self._n_ranks), dtype=np.int64)
+            new_table[: self._next_row] = self._timestamps[: self._next_row]
+            self._timestamps = new_table
 
     # ------------------------------------------------------------------
     # Internal helpers

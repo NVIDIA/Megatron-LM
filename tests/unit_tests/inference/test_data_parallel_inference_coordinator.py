@@ -686,25 +686,19 @@ def _make_routing_coordinator(
 ):
     """Create a coordinator with fake rank identities for routing-only tests.
 
-    Bypasses ZMQ entirely — only the routing / scheduling attributes are set up.
+    Thin wrapper around the shared helper in conftest.py.
     """
-    coord = object.__new__(DataParallelInferenceCoordinator)
-    identities = [f"rank-{i}".encode() for i in range(num_ranks)]
-    coord.identities_of_data_parallel_ranks = deque(identities)
-    coord.identity_to_rank_index = {ident: idx for idx, ident in enumerate(identities)}
-    sorted_identities = sorted(identities)
-    n_ranks = len(sorted_identities)
-    coord._pending_counts = np.zeros(n_ranks, dtype=np.int32)
-    coord._identities_list = list(sorted_identities)
-    coord._active_mask = np.ones(n_ranks, dtype=bool)
-    coord._round_robin_idx = 0
-    coord.enable_prefix_caching = enable_prefix_caching
-    coord.prefix_caching_coordinator_policy = policy
-    coord.hash_table = HashRankTable(n_ranks)
-    coord.block_size_tokens = 64
-    coord.prefix_caching_routing_alpha = 0.5
-    coord.max_requests = None
-    return coord
+    from tests.unit_tests.inference.coordinator_test_utils import (
+        make_coordinator_direct as _make_coordinator,
+    )
+
+    return _make_coordinator(
+        data_parallel_size=num_ranks,
+        block_size_tokens=64,
+        enable_prefix_caching=enable_prefix_caching,
+        policy=policy,
+        rank_name_template="rank-{}",
+    )
 
 
 class TestIdleRankPrioritization:

@@ -293,8 +293,10 @@ class DataParallelInferenceCoordinator:
         """Select the best DP rank based on prefix cache affinity and load.
 
         Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
-        where match is 1 if the rank has a prefix hit, 0 otherwise, and
-        normalized_load = free_slots / max_requests (higher means more free capacity).
+        where *match* is a policy-dependent affinity score in [0, 1] (binary for
+        ``first_prefix_block``, normalized prefix depth for ``longest_prefix``)
+        and normalized_load = free_slots / max_requests (higher means more free
+        capacity).
 
         When max_requests is not set, falls back to the original behaviour:
         idle ranks first, then prefix affinity with load-aware tiebreaking.
@@ -315,12 +317,15 @@ class DataParallelInferenceCoordinator:
                 return idle_rank
             return self.get_next_data_parallel_rank()
 
+        # Build policy-aware match vector (binary for first_prefix_block,
+        # normalized prefix depth for longest_prefix).
+        match = self.hash_table.match_vector(
+            request_hashes, policy=self.prefix_caching_coordinator_policy
+        )
+
         # When max_requests is available, use vectorized scoring across all ranks.
         if self.max_requests is not None and self.max_requests > 0:
             alpha = self.prefix_caching_routing_alpha
-
-            # Build match vector: 1.0 for ranks that have any matching hash.
-            match = self.hash_table.match_vector(request_hashes)
 
             # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
             free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
@@ -341,19 +346,14 @@ class DataParallelInferenceCoordinator:
         if idle_rank is not None:
             return idle_rank
 
-        # Reverse scan: first match is the longest prefix (parent-chained hashes).
-        for h in reversed(request_hashes):
-            timestamps = self.hash_table.get_row(h)
-            if timestamps is None:
-                continue
-            active_indices = np.nonzero(timestamps)[0]
-            if len(active_indices) == 0:
-                continue
-            # Among ranks sharing this prefix, pick the least-loaded one.
-            # Ties on load are broken by most-recent timestamp (higher is better).
-            best_idx = int(
-                min(active_indices, key=lambda i: (self._pending_counts[i], -timestamps[i]))
-            )
+        # Use the match vector to find the best rank by prefix affinity,
+        # breaking ties by load (fewest pending) then rank index (lowest).
+        active_match = match.copy()
+        active_match[~self._active_mask] = -1.0
+        best_score = np.max(active_match)
+        if best_score > 0:
+            candidates = np.where(active_match == best_score)[0]
+            best_idx = int(min(candidates, key=lambda i: self._pending_counts[i]))
             return self._identities_list[best_idx]
 
         return self.get_next_data_parallel_rank()
