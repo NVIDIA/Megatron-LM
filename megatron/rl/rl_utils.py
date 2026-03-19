@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
@@ -32,9 +33,14 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.utils import (
+    toggle_cuda_graphs,
+    transition_moe_cudagraphs,
+)
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
@@ -279,9 +285,9 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_staleness: list[list[int]]
-    kv_cache_staleness: list[list[int]]
-    completed_at_steps: list[list[int]]
+    policy_epoch: list[list[int]]
+    kv_cache_epoch: list[list[int]]
+    completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
 
 
@@ -440,7 +446,7 @@ def get_inference_interface(args, loop, model):
                 model[0],
                 host='0.0.0.0',
                 port=8294,
-                verbose=args.inference_flask_server_logging)
+                verbose=args.inference_text_gen_server_logging)
         )
     return _INFERENCE_INTERFACE
 
@@ -527,7 +533,6 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
-            increment_staleness_on_suspend=True,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -648,13 +653,28 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency
-    if packed_seq_params is None and sequence_packing:
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=tokens.shape[1],
-            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-            device=tokens.device,
-        )
+    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
+    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
+    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
+    # graph signature matches the training forward_step in train_rl.py.
+    # This is necessary because reference logprobs steps will reuse the training forward graph.
+    if packed_seq_params is None:
+        if sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     nvtx_range = get_nvtx_range()
 
@@ -741,18 +761,18 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    all_policy_staleness = []
-    all_kv_cache_staleness = []
-    all_completed_at_steps = []
+    all_policy_epoch = []
+    all_kv_cache_epoch = []
+    all_completed_epochs = []
     all_num_evictions = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_policy_staleness = []
-        group_kv_staleness = []
-        group_completed_at_steps = []
+        group_policy_epoch = []
+        group_kv_epoch = []
+        group_completed_epochs = []
         group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
@@ -774,13 +794,15 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_staleness.extend(s for turn in rollout.policy_staleness for s in turn)
-            group_kv_staleness.extend(s for turn in rollout.kv_cache_staleness for s in turn)
-            group_completed_at_steps.extend(rollout.completed_at_step)
+            assert rollout.policy_epoch, "Rollout has no policy_epoch data"
+            assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
+            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
+            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
-        all_policy_staleness.append(group_policy_staleness)
-        all_kv_cache_staleness.append(group_kv_staleness)
-        all_completed_at_steps.append(group_completed_at_steps)
+        all_policy_epoch.append(group_policy_epoch)
+        all_kv_cache_epoch.append(group_kv_epoch)
+        all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
@@ -809,42 +831,13 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        policy_staleness=all_policy_staleness,
-        kv_cache_staleness=all_kv_cache_staleness,
-        completed_at_steps=all_completed_at_steps,
+        policy_epoch=all_policy_epoch,
+        kv_cache_epoch=all_kv_cache_epoch,
+        completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
     )
     return stats
 
-
-def compute_true_staleness(
-    per_token_staleness: list[list[int]],
-    completed_at_steps: list[list[int]],
-    turn_lens: list[list[int]],
-    current_iteration: int,
-) -> list[int]:
-    """Compute true per-token staleness by adding the completion gap.
-
-    Args:
-        per_token_staleness: Grouped flat list of per-token raw staleness values.
-        completed_at_steps: Grouped list of per-turn completion steps.
-        turn_lens: Grouped list of per-turn token counts.
-        current_iteration: Current training iteration.
-
-    Returns:
-        Flat list of true staleness values (one per token across all groups).
-    """
-    result = []
-    for group_staleness, group_completed, group_turn_lens in zip(
-        per_token_staleness, completed_at_steps, turn_lens
-    ):
-        token_idx = 0
-        for completed_at, num_tokens in zip(group_completed, group_turn_lens):
-            gap = current_iteration - completed_at
-            for _ in range(num_tokens):
-                result.append(group_staleness[token_idx] + gap)
-                token_idx += 1
-    return result
 
 
 def prep_wandb_metrics(
@@ -854,10 +847,10 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_staleness: List[List[int]],
-        kv_cache_staleness: List[List[int]],
+        policy_epoch: List[List[int]],
+        kv_cache_epoch: List[List[int]],
+        completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
-        completed_at_steps: List[List[int]],
         current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
@@ -872,10 +865,10 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_staleness: Grouped list of per-token policy staleness.
-        kv_cache_staleness: Grouped list of per-token KV cache staleness.
+        policy_epoch: Grouped list of per-rollout min policy epoch stamps.
+        kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
-        completed_at_steps: Grouped list of per-turn completed at steps.
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
@@ -886,10 +879,8 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = compute_true_staleness(
-        policy_staleness, completed_at_steps, turn_lens, current_iteration)
-    true_kv_staleness = compute_true_staleness(
-        kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
+    true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
+    true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -941,7 +932,7 @@ def prep_wandb_metrics(
             'min_kv_cache_staleness': min(true_kv_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
-            'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
+            'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
     }
     if example_group:
         if tokenizer is None:
@@ -1000,15 +991,15 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    policy_staleness = group_stats.policy_staleness
-    kv_cache_staleness = group_stats.kv_cache_staleness
+    policy_epoch = group_stats.policy_epoch
+    kv_cache_epoch = group_stats.kv_cache_epoch
+    completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
-    completed_at_steps = group_stats.completed_at_steps
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
-        completed_at_steps=completed_at_steps, current_iteration=current_iteration)
+        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
+        num_evictions=num_evictions, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1027,10 +1018,10 @@ def maybe_log_training_metrics(
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
-            policy_staleness=env_stats(policy_staleness, env_idx),
-            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
+            policy_epoch=env_stats(policy_epoch, env_idx),
+            kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
+            completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
-            completed_at_steps=env_stats(completed_at_steps, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
@@ -1059,16 +1050,17 @@ def prepare_trajectories(
     # Track counts for each environment ID
     env_id_counts = Counter()
 
-    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
+    DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>', '<SPECIAL_999>']
 
     if tokenizer.library == "huggingface":
+        tokenizer : HuggingFaceTokenizer
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
-                if pad_token in tokenizer.vocab:
+                if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
                     log_single_rank(
                         logger, logging.INFO, f"Updating tokenizer pad token to {pad_token}"
                     )
-                    tokenizer._tokenizer.pad_token_id = tokenizer.vocab[pad_token]
+                    tokenizer._tokenizer.pad_token = pad_token
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
@@ -1373,13 +1365,11 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
-            # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
-
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1809,7 +1799,6 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
-    increment_staleness_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1831,8 +1820,16 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
+    # Change cudagraph scope for inference (empty list = full-layer capture)
+    model[0].config.cuda_graph_scope = []
+    model[0].config.cuda_graph_impl = "local"
+
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+
+    # Switch MoE layers to full CUDA graph capture for inference
+    if args.rl_training_cuda_graphs and args.num_experts is not None:
+        transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1867,6 +1864,7 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
+        inference_interface.set_generation_epoch(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -1874,11 +1872,25 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
-            if increment_staleness_on_suspend:
-                inference_interface.increment_staleness()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
+
+        # Reset drop_and_pad leaked from inference decode
+        set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
+
+        # Restore partial capture cudagraph scope for training if this is MoE
+        if args.num_experts is not None:
+            model[0].config.cuda_graph_scope = [
+                CudaGraphScope.mamba,
+                CudaGraphScope.attn,
+                CudaGraphScope.moe_router,
+                CudaGraphScope.moe_preprocess,
+            ]
+
+        # Switch MoE layers to partial CUDA graph capture for training
+        if args.rl_training_cuda_graphs and args.num_experts is not None:
+            transition_moe_cudagraphs(lang_module, 'partial')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they
         # don't consume GPU memory during training.
@@ -1905,6 +1917,13 @@ def megatron_rl_inference_mode(
 
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
+    global _ROLLOUT_GENERATOR
+
+    if _ROLLOUT_GENERATOR is not None:
+        loop = get_asyncio_loop()
+        loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
+        _ROLLOUT_GENERATOR = None
+
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())

@@ -156,7 +156,7 @@ def get_num_layers_to_build(
 
         assert (
             num_layers % config.pipeline_model_parallel_size == 0
-        ), "num_layers should be divisible by pipeline_model_parallel_size"
+        ), f"{num_layers=} should be divisible by {config.pipeline_model_parallel_size=}"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
     vp_size = config.virtual_pipeline_model_parallel_size
@@ -311,6 +311,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
                     self.config.cpu_offloading_double_buffering,
+                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
                 )
             )
             self.config._cpu_offloading_context = (

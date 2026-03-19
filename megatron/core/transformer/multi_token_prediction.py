@@ -998,6 +998,53 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         return hidden_states
 
+    def forward_single_position(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        embedding: Callable,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        inference_params=None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward for single positions without roll_tensor (speculative decoding).
+
+        Unlike the regular forward which rolls input_ids to get the next token's
+        embedding, this method directly takes the correct next_token_ids. This is
+        used in speculative decoding where the correct next token is known after
+        verification.
+
+        Args:
+            hidden_states (Tensor): Hidden states at positions of interest [N, B, H].
+            next_token_ids (Tensor): The correct next token IDs [B, N].
+            position_ids (Tensor): Position IDs for the next tokens [B, N].
+            embedding (Callable): The embedding module.
+
+        Returns:
+            Tensor: MTP hidden states [N, B, H].
+        """
+        decoder_input = embedding(input_ids=next_token_ids, position_ids=position_ids)
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=False, keep_graph=False
+        )
+        hidden_states = self._proj_and_transformer_layer(
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        return hidden_states
+
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
@@ -1416,7 +1463,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config, self.vp_stage)
