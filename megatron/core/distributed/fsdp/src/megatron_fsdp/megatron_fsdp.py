@@ -690,6 +690,20 @@ class MegatronFSDP(torch.nn.Module):
             """
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
+
+            # Filter out parameters whose gradient processing is deferred to a delayed
+            # wgrad accumulation hook (post_wgrad_grad_acc_hook).  If skip_backward_post_hook
+            # is set but the delayed hook was never installed, process the parameter
+            # immediately as a safety fallback to avoid silently dropping gradients.
+            param_list = [
+                p for p in param_list
+                if not getattr(p, 'skip_backward_post_hook', False)
+                or not hasattr(p, 'post_wgrad_grad_acc_hook')
+            ]
+
+            if not param_list:
+                return
+
             for param in param_list:
                 _grad_acc(param)
 
@@ -1069,11 +1083,7 @@ class MegatronFSDP(torch.nn.Module):
             for param in grad_acc_param_list:
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
-                        lambda p: (
-                            None
-                            if getattr(p, 'skip_backward_post_hook', False)
-                            else _process_post_backward_gradients([p])
-                        )
+                        lambda p: _process_post_backward_gradients([p])
                     )
                 )
 

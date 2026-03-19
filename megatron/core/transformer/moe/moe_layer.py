@@ -374,7 +374,6 @@ class MoELayer(BaseMoELayer):
         """
         self._delayed_wgrad_event: Optional[torch.cuda.Event] = None
         self._delayed_wgrad_stream: Optional[torch.cuda.Stream] = None
-        self._process_expert_grads_fn = None
         if self.config.delay_wgrad_compute_for_te_grouped_gemm:
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
