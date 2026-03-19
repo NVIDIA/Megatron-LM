@@ -252,10 +252,7 @@ class TestMambaPrefixCachingE2E:
     ):
         """Run all prompts with given pc setting, return (finished_dict, lifetime_prefill)."""
         engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=enable_pc,
-            **engine_kwargs,
+            model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
         )
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(base_req_id + i, prompt, enable_pc, num_tokens))
@@ -447,10 +444,7 @@ class TestMambaPrefixCachingE2E:
             prefix_caching_mamba_gb=0.2,
         )
         on_outputs, on_prefill = self._run_multi_pc_on(
-            model,
-            mamba_config,
-            all_prompts,
-            num_cuda_graphs=num_cuda_graphs,
+            model, mamba_config, all_prompts, num_cuda_graphs=num_cuda_graphs
         )
 
         # verify per-group outputs match independent runs

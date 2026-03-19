@@ -505,11 +505,7 @@ class MambaMixer(MegatronModule):
 
             mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
             y_prefill = self._dynamic_inference_prefill(
-                zxBCdt_prefill,
-                context,
-                conv_state,
-                ssm_state,
-                mamba_layer_idx=mamba_layer_idx,
+                zxBCdt_prefill, context, conv_state, ssm_state, mamba_layer_idx=mamba_layer_idx
             )
 
         # Merge decode and prefill results if necessary

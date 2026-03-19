@@ -3036,12 +3036,9 @@ class TestChunkedPrefillCudaGraphs:
             max_requests=128,
         )
         if mamba_config is not None:
-            inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config,
-            )
+            inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
         context = DynamicInferenceContext(
-            model_config=model.config,
-            inference_config=InferenceConfig(**inference_config_kwargs),
+            model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )
         wrapper = GPTInferenceWrapper(model, context)
         wrapper.model_is_pipeline_parallel = not (
@@ -3063,7 +3060,7 @@ class TestChunkedPrefillCudaGraphs:
                 request_id=i,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(
-                    num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1,
+                    num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
                 ),
                 block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
             )
@@ -3096,7 +3093,7 @@ class TestChunkedPrefillCudaGraphs:
         random.seed(123)
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True,
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
         )
 
         # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
@@ -3105,8 +3102,7 @@ class TestChunkedPrefillCudaGraphs:
         # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
         device = torch.cuda.current_device()
         prompts = [
-            torch.arange(i * 600, i * 600 + 512, dtype=torch.int64, device=device)
-            for i in range(3)
+            torch.arange(i * 600, i * 600 + 512, dtype=torch.int64, device=device) for i in range(3)
         ]
         num_tokens_to_generate = 8
 
@@ -3116,10 +3112,10 @@ class TestChunkedPrefillCudaGraphs:
 
         # Baseline: no chunked prefill, no CUDA graphs.
         baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None,
+            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
         baseline_outputs, baseline_steps = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate,
+            baseline_engine, prompts, num_tokens_to_generate
         )
 
         # Test config.
@@ -3130,7 +3126,7 @@ class TestChunkedPrefillCudaGraphs:
             context_max_tokens=context_max_tokens,
         )
         test_outputs, test_steps = self._run_to_completion(
-            test_engine, prompts, num_tokens_to_generate,
+            test_engine, prompts, num_tokens_to_generate
         )
 
         # Correctness: generated tokens must match baseline.

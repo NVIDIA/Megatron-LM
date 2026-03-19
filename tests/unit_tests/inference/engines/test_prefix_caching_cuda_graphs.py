@@ -165,12 +165,10 @@ class TestPrefixCachingCudaGraphs:
         )
         if mamba_config is not None:
             inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config,
-                prefix_caching_mamba_gb=0.05,
+                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=0.05
             )
         context = DynamicInferenceContext(
-            model_config=model.config,
-            inference_config=InferenceConfig(**inference_config_kwargs),
+            model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )
         wrapper = GPTInferenceWrapper(model, context)
         wrapper.model_is_pipeline_parallel = not (
@@ -199,8 +197,8 @@ class TestPrefixCachingCudaGraphs:
         unique_2 = torch.arange(1000, 1244, dtype=torch.int64, device=device)
         unique_3 = torch.arange(2000, 2344, dtype=torch.int64, device=device)
         return [
-            torch.cat([base, extra]),     # req 0: 300
-            torch.cat([base, extra]),     # req 1: 300
+            torch.cat([base, extra]),  # req 0: 300
+            torch.cat([base, extra]),  # req 1: 300
             torch.cat([base, unique_2]),  # req 2: 500
             torch.cat([base, unique_3]),  # req 3: 600
         ]
@@ -228,11 +226,13 @@ class TestPrefixCachingCudaGraphs:
 
         def _step_and_log():
             result = engine.step_modern()
-            step_log.append((
-                ctx.batch_dimensions.prefill_req_count,
-                ctx.batch_dimensions.decode_req_count,
-                ctx.using_cuda_graph_this_step(),
-            ))
+            step_log.append(
+                (
+                    ctx.batch_dimensions.prefill_req_count,
+                    ctx.batch_dimensions.decode_req_count,
+                    ctx.using_cuda_graph_this_step(),
+                )
+            )
             for record in result["finished_request_records"]:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
@@ -285,8 +285,7 @@ class TestPrefixCachingCudaGraphs:
         # 1. Correctness: generated tokens must match.
         for req_id in range(4):
             assert baseline_outputs[req_id] == cg_outputs[req_id], (
-                f"req {req_id}: baseline {baseline_outputs[req_id]} != "
-                f"cg {cg_outputs[req_id]}"
+                f"req {req_id}: baseline {baseline_outputs[req_id]} != " f"cg {cg_outputs[req_id]}"
             )
 
         # 2. CUDA graph usage at expected batch types.
@@ -371,8 +370,13 @@ class TestHybridChunkedPrefillIntermediateState:
                 module.inference_cudagraphs_lookup_table.clear()
 
     def _build_engine(
-        self, model, mamba_config, enable_prefix_caching, enable_chunked_prefill,
-        max_tokens=None, num_cuda_graphs=None,
+        self,
+        model,
+        mamba_config,
+        enable_prefix_caching,
+        enable_chunked_prefill,
+        max_tokens=None,
+        num_cuda_graphs=None,
     ):
         """Build an engine with the given prefix caching / chunked prefill config."""
         set_rounder(4)
@@ -397,8 +401,7 @@ class TestHybridChunkedPrefillIntermediateState:
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens
         context = DynamicInferenceContext(
-            model_config=model.config,
-            inference_config=InferenceConfig(**inference_config_kwargs),
+            model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )
         wrapper = GPTInferenceWrapper(model, context)
         wrapper.model_is_pipeline_parallel = not (
@@ -418,7 +421,7 @@ class TestHybridChunkedPrefillIntermediateState:
             request_id=req_id,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(
-                num_tokens_to_generate=NUM_TOKENS_TO_GENERATE, termination_id=-1, top_k=1,
+                num_tokens_to_generate=NUM_TOKENS_TO_GENERATE, termination_id=-1, top_k=1
             ),
             block_size_tokens=BLOCK_SIZE if enable_pc else None,
             enable_prefix_caching=enable_pc,
@@ -448,7 +451,7 @@ class TestHybridChunkedPrefillIntermediateState:
         random.seed(123)
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True,
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
         )
 
         model = self._create_hybrid_model()
@@ -456,15 +459,17 @@ class TestHybridChunkedPrefillIntermediateState:
 
         device = torch.cuda.current_device()
         prompt0 = torch.arange(0, 300, dtype=torch.int64, device=device)
-        prompt1 = torch.cat([
-            torch.arange(0, 256, dtype=torch.int64, device=device),
-            torch.arange(5000, 5544, dtype=torch.int64, device=device),
-        ])  # 800 tokens: 256 shared + 544 unique
+        prompt1 = torch.cat(
+            [
+                torch.arange(0, 256, dtype=torch.int64, device=device),
+                torch.arange(5000, 5544, dtype=torch.int64, device=device),
+            ]
+        )  # 800 tokens: 256 shared + 544 unique
         prompt2 = torch.arange(0, 300, dtype=torch.int64, device=device)  # identical to prompt0
 
         # Baseline: no prefix caching, no chunked prefill.
         baseline_engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=False, enable_chunked_prefill=False,
+            model, mamba_config, enable_prefix_caching=False, enable_chunked_prefill=False
         )
         for i, prompt in enumerate([prompt0, prompt1, prompt2]):
             baseline_engine._add_request(self._make_request(i, prompt, enable_pc=False))
@@ -477,7 +482,10 @@ class TestHybridChunkedPrefillIntermediateState:
 
         # Test: prefix caching + chunked prefill, max_tokens=400.
         test_engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=True, enable_chunked_prefill=True,
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
             max_tokens=400,
         )
         ctx = test_engine.context
@@ -496,9 +504,9 @@ class TestHybridChunkedPrefillIntermediateState:
             collect_finished(test_engine.step_modern())
 
         # Verify req0 cached its Mamba state.
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) > 0, (
-            "req0 should have cached Mamba state"
-        )
+        assert (
+            len(ctx.mamba_slot_allocator.hash_to_block_id) > 0
+        ), "req0 should have cached Mamba state"
 
         # Phase 2: add req1 + req2 simultaneously.
         req1 = self._make_request(1, prompt1, enable_pc=True)
@@ -510,9 +518,9 @@ class TestHybridChunkedPrefillIntermediateState:
             collect_finished(test_engine.step_modern())
 
         # Verify Mamba state was restored for req2 (prefix-cached).
-        assert req2._mamba_num_matched_blocks == 1, (
-            f"req2 should have 1 Mamba match, got {req2._mamba_num_matched_blocks}"
-        )
+        assert (
+            req2._mamba_num_matched_blocks == 1
+        ), f"req2 should have 1 Mamba match, got {req2._mamba_num_matched_blocks}"
 
         # Verify prefix caching saved prefill tokens.
         assert ctx.lifetime_prefill_token_count < (300 + 800 + 300), (
