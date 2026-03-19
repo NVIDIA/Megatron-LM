@@ -776,7 +776,7 @@ class TestDynamicInferenceEngine:
         prompts = ["prompt1", "prompt2", "prompt3", "prompt4"]
 
         # Mock the tokenize_prompt method to return predictable token sequences
-        def mock_tokenize_prompt(prompt, add_BOS=False):
+        def mock_tokenize_prompt(tokenizer, prompt, add_BOS=False):
             # Return a token sequence based on the prompt number
             prompt_num = int(prompt[-1])
             return [10 + i for i in range(prompt_num + 2)]
@@ -2394,7 +2394,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Inject the parsed stop word IDs
@@ -2477,7 +2479,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word length 3 > num_speculative_tokens (2)
@@ -2562,7 +2566,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word [6] will land in the middle of a speculative batch [5, 6, 7].
@@ -2590,6 +2596,29 @@ class TestDynamicInferenceEngine:
             f"Token 7 should have been truncated after stop word 6. "
             f"Full output: {finished_req.generated_tokens}"
         )
+
+    @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
+    def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
+        """Test that _check_stop_words_for_request_post_append strips or keeps
+        the stop word tokens based on detokenize_stop_sequence."""
+        engine = types.SimpleNamespace(num_speculative_tokens=0)
+        check = DynamicInferenceEngine._check_stop_words_for_request_post_append
+
+        request = types.SimpleNamespace(
+            generated_tokens=[1, 2, 3, 4, 5],
+            stop_word_ids=[[4, 5]],
+            sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
+        )
+        hit, trimmed = check(engine, request)
+        assert hit
+        if detokenize_stop_sequence:
+            # Stop word kept
+            assert request.generated_tokens == [1, 2, 3, 4, 5]
+            assert trimmed == 0
+        else:
+            # Stop word stripped
+            assert request.generated_tokens == [1, 2, 3]
+            assert trimmed == 2
 
     @pytest.mark.internal
     @torch.inference_mode()
