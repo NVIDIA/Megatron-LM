@@ -20,7 +20,7 @@ def make_coordinator_direct(
     enable_prefix_caching=True,
     deterministic_mode=True,
     prefix_caching_routing_alpha=0.5,
-    max_requests=None,
+    max_requests=10,
     policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
     tokenizer=None,
     rank_name_template="rank_{}",

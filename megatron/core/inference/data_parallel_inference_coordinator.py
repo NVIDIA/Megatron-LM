@@ -98,7 +98,7 @@ class DataParallelInferenceCoordinator:
         ),
         schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
-        max_requests: int | None = None,
+        max_requests: int = 0,
     ):
         """
         Initializes the inference coordinator.
@@ -115,7 +115,7 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
             prefix_caching_routing_alpha (float): Weight for prefix-aware routing score:
                 score = alpha * match + (1 - alpha) * normalized_load.
-            max_requests (Optional[int]): Max concurrent requests per rank, used to
+            max_requests (int): Max concurrent requests per rank, used to
                 compute normalized_load for prefix-aware scoring.
         """
         assert HAVE_ZMQ, (
@@ -277,18 +277,6 @@ class DataParallelInferenceCoordinator:
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
-    def _get_idle_rank(self):
-        """Return the idle rank with the lowest rank index, or None if all ranks are busy.
-
-        An idle rank is one with zero pending requests. Ties are broken by
-        deterministic rank index (lowest wins) so behavior is predictable.
-        """
-        idle_mask = self._active_mask & (self._pending_counts == 0)
-        if not np.any(idle_mask):
-            return None
-        # np.argmax on a bool array returns the first True index (lowest rank index).
-        return self._identities_list[int(np.argmax(idle_mask))]
-
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity and load.
 
@@ -297,9 +285,6 @@ class DataParallelInferenceCoordinator:
         ``first_prefix_block``, normalized prefix depth for ``longest_prefix``)
         and normalized_load = free_slots / max_requests (higher means more free
         capacity).
-
-        When max_requests is not set, falls back to the original behaviour:
-        idle ranks first, then prefix affinity with load-aware tiebreaking.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -311,10 +296,6 @@ class DataParallelInferenceCoordinator:
             return self.get_next_data_parallel_rank()
 
         if not self.enable_prefix_caching or not request_hashes:
-            # Prefix caching off or no hashes: prefer idle ranks, fall back to round-robin.
-            idle_rank = self._get_idle_rank()
-            if idle_rank is not None:
-                return idle_rank
             return self.get_next_data_parallel_rank()
 
         # Build policy-aware match vector (binary for first_prefix_block,
@@ -323,42 +304,20 @@ class DataParallelInferenceCoordinator:
             request_hashes, policy=self.prefix_caching_coordinator_policy
         )
 
-        # When max_requests is available, use vectorized scoring across all ranks.
-        if self.max_requests is not None and self.max_requests > 0:
-            alpha = self.prefix_caching_routing_alpha
+        alpha = self.prefix_caching_routing_alpha
 
-            # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
-            free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
-            scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
+        # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
+        free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
+        scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
 
-            # Mask out inactive ranks.
-            scores[~self._active_mask] = -1.0
+        # Mask out inactive ranks.
+        scores[~self._active_mask] = -1.0
 
-            # np.argmax returns the first max index, which is the lowest rank index
-            # among ties — matching the desired deterministic tiebreaking.
-            best_idx = int(np.argmax(scores))
-            if scores[best_idx] >= 0.0:
-                return self._identities_list[best_idx]
-            return self.get_next_data_parallel_rank()
-
-        # Fallback: max_requests not set, use original idle-first + prefix affinity.
-        idle_rank = self._get_idle_rank()
-        if idle_rank is not None:
-            return idle_rank
-
-        # Use the match vector to find the best rank by prefix affinity,
-        # breaking ties by load (fewest pending), then recency (highest
-        # timestamp), then rank index (lowest).
-        active_match = match.copy()
-        active_match[~self._active_mask] = -1.0
-        best_score = np.max(active_match)
-        if best_score > 0:
-            candidates = np.where(active_match == best_score)[0]
-            # Build per-rank max timestamp across the matched hashes.
-            recency = self.hash_table.max_timestamps(request_hashes)
-            best_idx = int(min(candidates, key=lambda i: (self._pending_counts[i], -recency[i])))
+        # np.argmax returns the first max index, which is the lowest rank index
+        # among ties — matching the desired deterministic tiebreaking.
+        best_idx = int(np.argmax(scores))
+        if scores[best_idx] >= 0.0:
             return self._identities_list[best_idx]
-
         return self.get_next_data_parallel_rank()
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
@@ -623,7 +582,7 @@ class DataParallelInferenceCoordinator:
         ),
         schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
-        max_requests: int | None = None,
+        max_requests: int = 0,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -643,7 +602,7 @@ class DataParallelInferenceCoordinator:
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
             schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
             prefix_caching_routing_alpha (float): Weight for prefix-aware routing score.
-            max_requests (Optional[int]): Max concurrent requests per rank.
+            max_requests (int): Max concurrent requests per rank.
         """
         coordinator = cls(
             pipe_connection,
