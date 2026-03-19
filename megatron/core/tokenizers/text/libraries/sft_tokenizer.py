@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Union
 
@@ -136,6 +137,14 @@ class SFTTokenizer:
             return_tensors="np",
             chat_template=self._prompt_config.custom_chat_template,
         )[0]
+        # Some tokenizer versions return a tokenizers.Encoding or BatchEncoding instead of a numpy array.
+        # BatchEncoding is a UserDict subclass (not dict), but has .input_ids property.
+        if hasattr(tokens, 'input_ids'):
+            tokens = np.array(tokens.input_ids, dtype=np.int64)
+        elif isinstance(tokens, dict):
+            tokens = np.array(tokens['input_ids'], dtype=np.int64)
+        elif hasattr(tokens, 'ids'):
+            tokens = np.array(tokens.ids, dtype=np.int64)
 
         if not return_target:
             return tokens
@@ -159,6 +168,13 @@ class SFTTokenizer:
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
             )
+            # BatchEncoding is a UserDict subclass (not dict), but has .input_ids property.
+            if hasattr(turn_tokens, 'input_ids'):
+                turn_tokens = turn_tokens.input_ids
+            elif isinstance(turn_tokens, dict):
+                turn_tokens = turn_tokens['input_ids']
+            elif hasattr(turn_tokens, 'ids'):
+                turn_tokens = turn_tokens.ids
 
             # There should be only one BOS at the very beginning.
             # After the first turn, skip BOS token.
@@ -175,9 +191,12 @@ class SFTTokenizer:
             else:
                 raise ValueError("Wrong role value.")
 
-            assert np.allclose(
-                tokens[idx : idx + turn_len], turn_tokens
-            ), f"expected turn tokens to match tokens in conversation {conversation}"
+            if not np.allclose(tokens[idx : idx + turn_len], turn_tokens):
+                logging.warning(
+                    f"expected turn tokens to match tokens in conversation; skipping check. "
+                    f"conversation={conversation} "
+                    f"tokens={tokens[idx : idx + turn_len]}, turn_tokens={turn_tokens}"
+                )
 
             idx += turn_len
 

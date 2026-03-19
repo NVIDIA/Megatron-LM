@@ -20,6 +20,12 @@ if [ -z ${QUANT_CFG} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
+# Optional: set LORA_CFG to "dense" or "moe" to add LoRA adapters after quantization.
+LORA_ARGS=""
+if [ -n "${LORA_CFG}" ]; then
+    LORA_ARGS="--lora-config ${LORA_CFG}"
+fi
+
 if [ -z ${MLM_MODEL_SAVE} ]; then
     MLM_MODEL_SAVE=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_quant
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_SAVE})!\n"
@@ -38,6 +44,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
+        ${LORA_ARGS} \
         ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
 else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
@@ -52,5 +59,6 @@ else
         --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
+        ${LORA_ARGS} \
         ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
 fi

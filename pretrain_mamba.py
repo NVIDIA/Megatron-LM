@@ -236,7 +236,12 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is None:
         packed_seq_params = None
     else:
-        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
+        if tokens is not None:
+            total_tokens = tokens.size(1)
+        elif labels is not None:
+            total_tokens = labels.size(1)
+        else:
+            total_tokens = int(cu_seqlens[-1])
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,

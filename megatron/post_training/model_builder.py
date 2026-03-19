@@ -207,8 +207,8 @@ def modelopt_gpt_mamba_builder(
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
-    if args.spec is not None:
-        raise ValueError("ModelOpt integration does not support custom args.spec.")
+    if args.spec is not None and not args.export_default_te_spec:
+        raise ValueError("ModelOpt integration does not support custom args.spec when --export-default-te-spec is not enabled.")
 
     # Llama-4 Scout/Maverick support
     config.qk_l2_norm = args.export_qk_l2_norm
