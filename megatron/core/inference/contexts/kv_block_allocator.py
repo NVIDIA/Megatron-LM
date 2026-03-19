@@ -3,6 +3,7 @@
 from collections import deque
 from typing import Callable, Dict, Optional
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -74,10 +75,10 @@ class KVBlockAllocator:
                 )
 
         # Per-block routing storage for MoE routing replay.
-        # Maps block_id -> CPU tensor [block_size_tokens, num_layers, topk].
+        # Maps block_id -> ndarray [block_size_tokens, num_layers, topk].
         # Routing data persists through block release/deregister and is only
         # cleared when a block is re-allocated or the allocator is reset.
-        self.block_routing: Dict[int, Tensor] = {}
+        self.block_routing: Dict[int, np.ndarray] = {}
 
     def __str__(self):
         return (
@@ -377,32 +378,28 @@ class KVBlockAllocator:
     # Per-block routing storage methods (for MoE routing replay)
     # =========================================================================
 
-    def store_block_routing(
-        self, block_id: int, positions: Tensor, routing: Tensor
-    ) -> None:
+    def store_block_routing(self, block_id: int, positions: np.ndarray, routing: np.ndarray) -> None:
         """Store routing indices for specific token positions in a block.
 
         Args:
             block_id: The block ID.
-            positions: Tensor of token positions within the block (1D, int).
-            routing: Tensor of routing data [num_positions, num_layers, topk].
+            positions: ndarray of token positions within the block (1D, int).
+            routing: ndarray of routing data [num_positions, num_layers, topk].
         """
         if block_id not in self.block_routing:
-            self.block_routing[block_id] = torch.zeros(
-                self.context.block_size_tokens,
-                routing.shape[-2],
-                routing.shape[-1],
+            self.block_routing[block_id] = np.zeros(
+                (self.context.block_size_tokens, routing.shape[-2], routing.shape[-1]),
                 dtype=routing.dtype,
             )
-        self.block_routing[block_id][positions.long()] = routing
+        self.block_routing[block_id][positions] = routing
 
-    def get_block_routing(self, block_id: int) -> Optional[Tensor]:
+    def get_block_routing(self, block_id: int) -> Optional[np.ndarray]:
         """Get stored routing indices for a block.
 
         Args:
             block_id: The block ID.
 
         Returns:
-            Tensor of shape [block_size_tokens, num_layers, topk] or None.
+            ndarray of shape [block_size_tokens, num_layers, topk] or None.
         """
         return self.block_routing.get(block_id)

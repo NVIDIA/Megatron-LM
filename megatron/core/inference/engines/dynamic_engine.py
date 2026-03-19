@@ -1407,10 +1407,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _reconstruct_routing_from_blocks(
         self, block_ids: list[int], total_routing_tokens: int
-    ) -> Optional[Tensor]:
+    ) -> Optional[np.ndarray]:
         """Reconstruct routing indices from per-block storage.
 
-        Concatenates per-block routing tensors in block order, trimming the
+        Concatenates per-block routing ndarrays in block order, trimming the
         last block to exactly ``total_routing_tokens`` entries.
 
         Args:
@@ -1420,7 +1420,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 forward-pass routing).
 
         Returns:
-            Tensor [total_routing_tokens, num_layers, topk] or None if any
+            ndarray [total_routing_tokens, num_layers, topk] or None if any
             block is missing routing data.
         """
         allocator = self.context.kv_block_allocator
@@ -1442,7 +1442,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if not routing_parts or tokens_collected != total_routing_tokens:
             return None
 
-        return torch.cat(routing_parts, dim=0)
+        return np.concatenate(routing_parts, axis=0)
 
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
         """Find farthest block with cached Mamba state by iterating from the end.

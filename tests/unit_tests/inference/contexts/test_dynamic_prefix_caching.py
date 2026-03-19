@@ -3,6 +3,7 @@
 import asyncio
 from collections import deque
 
+import numpy as np
 import pytest
 import torch
 
@@ -931,15 +932,16 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bid = block_ids[0].item()
 
         # Store routing for some positions
-        positions = torch.tensor([0, 1, 2])
-        routing = torch.randn(3, num_layers, topk)
+        positions = np.array([0, 1, 2])
+        routing = np.random.randint(-100, 100, size=(3, num_layers, topk), dtype=np.int16)
         alloc.store_block_routing(bid, positions, routing)
 
         # Retrieve and verify
         stored = alloc.get_block_routing(bid)
         assert stored is not None
+        assert isinstance(stored, np.ndarray)
         assert stored.shape == (bs, num_layers, topk)
-        assert torch.allclose(stored[:3], routing)
+        assert np.allclose(stored[:3], routing)
         # Remaining positions should be zero
         assert (stored[3:] == 0).all()
 
@@ -952,8 +954,8 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Allocate, store routing, release, re-allocate
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
-        positions = torch.tensor([0])
-        routing = torch.randn(1, 4, 2)
+        positions = np.array([0])
+        routing = np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
         alloc.store_block_routing(bid, positions, routing)
         assert alloc.get_block_routing(bid) is not None
 
@@ -975,7 +977,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
-        alloc.store_block_routing(bid, torch.tensor([0]), torch.randn(1, 4, 2))
+        alloc.store_block_routing(bid, np.array([0]), np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16))
         assert alloc.get_block_routing(bid) is not None
 
         alloc.reset()
@@ -997,9 +999,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Store routing for both blocks
         for bid in [b0, b1]:
-            alloc.store_block_routing(
-                bid, torch.arange(bs), torch.randn(bs, 4, 2)
-            )
+            alloc.store_block_routing(bid, np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16))
 
         # Release blocks (REF_ZERO deregisters immediately)
         blocks = ctx.request_to_kv_block_ids[0]
@@ -1026,8 +1026,8 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         for bid in bids[:2]:
             alloc.store_block_routing(
                 bid,
-                torch.arange(bs),
-                torch.arange(bs * num_layers * topk, dtype=torch.float32).reshape(
+                np.arange(bs),
+                np.arange(bs * num_layers * topk, dtype=np.int16).reshape(
                     bs, num_layers, topk
                 )
                 + bid,
@@ -1037,8 +1037,8 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         partial = 5
         alloc.store_block_routing(
             bids[2],
-            torch.arange(partial),
-            torch.arange(partial * num_layers * topk, dtype=torch.float32).reshape(
+            np.arange(partial),
+            np.arange(partial * num_layers * topk, dtype=np.int16).reshape(
                 partial, num_layers, topk
             )
             + bids[2],
@@ -1052,25 +1052,24 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         result = engine._reconstruct_routing_from_blocks(bids, total_routing_tokens)
 
         assert result is not None
+        assert isinstance(result, np.ndarray)
         assert result.shape == (total_routing_tokens, num_layers, topk)
 
         # Verify content: first block
         expected_b0 = (
-            torch.arange(bs * num_layers * topk, dtype=torch.float32).reshape(
-                bs, num_layers, topk
-            )
+            np.arange(bs * num_layers * topk, dtype=np.int16).reshape(bs, num_layers, topk)
             + bids[0]
         )
-        assert torch.allclose(result[:bs], expected_b0)
+        assert np.allclose(result[:bs], expected_b0)
 
         # Verify content: partial last block
         expected_partial = (
-            torch.arange(partial * num_layers * topk, dtype=torch.float32).reshape(
+            np.arange(partial * num_layers * topk, dtype=np.int16).reshape(
                 partial, num_layers, topk
             )
             + bids[2]
         )
-        assert torch.allclose(result[2 * bs :], expected_partial)
+        assert np.allclose(result[2 * bs :], expected_partial)
 
     @pytest.mark.internal
     def test_reconstruct_returns_none_for_missing_block(self):
@@ -1083,9 +1082,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bids = block_ids.tolist()
 
         # Only store routing for the first block
-        alloc.store_block_routing(
-            bids[0], torch.arange(bs), torch.randn(bs, 4, 2)
-        )
+        alloc.store_block_routing(bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16))
 
         engine = _StubEngine(ctx)
         result = engine._reconstruct_routing_from_blocks(bids, 2 * bs)
@@ -1105,10 +1102,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         b0, b1 = self._block_ids(ctx, 0, 2)
 
         # Store routing for both blocks
-        routing_b0 = torch.randn(bs, 4, 2)
-        routing_b1 = torch.randn(bs, 4, 2)
-        alloc.store_block_routing(b0, torch.arange(bs), routing_b0)
-        alloc.store_block_routing(b1, torch.arange(bs), routing_b1)
+        routing_b0 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+        routing_b1 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+        alloc.store_block_routing(b0, np.arange(bs), routing_b0)
+        alloc.store_block_routing(b1, np.arange(bs), routing_b1)
 
         # Release first request's blocks (LRU: blocks stay cached)
         blocks = ctx.request_to_kv_block_ids[0]
@@ -1123,6 +1120,6 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # The matched blocks should still have routing data
         assert alloc.get_block_routing(b0) is not None
-        assert torch.allclose(alloc.get_block_routing(b0), routing_b0)
+        assert np.allclose(alloc.get_block_routing(b0), routing_b0)
         assert alloc.get_block_routing(b1) is not None
-        assert torch.allclose(alloc.get_block_routing(b1), routing_b1)
+        assert np.allclose(alloc.get_block_routing(b1), routing_b1)

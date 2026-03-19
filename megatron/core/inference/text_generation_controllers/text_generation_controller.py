@@ -8,6 +8,7 @@ import inspect
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -1260,7 +1261,7 @@ class TextGenerationController:
         return routing_indices_per_request
 
     def _store_routing_per_block(
-        self, routing_indices_per_request: Optional[Dict[int, Tensor]]
+        self, routing_indices_per_request: Optional[Dict[int, np.ndarray]]
     ) -> None:
         """Distribute per-request routing indices into per-block storage.
 
@@ -1272,7 +1273,7 @@ class TextGenerationController:
 
         Args:
             routing_indices_per_request: Dict mapping request_id to routing
-                tensor [num_tokens, num_layers, topk], or None.
+                ndarray [num_tokens, num_layers, topk], or None.
         """
         if routing_indices_per_request is None:
             return
@@ -1297,29 +1298,29 @@ class TextGenerationController:
         ]
         if not routing_parts:
             return
-        flat_routing = torch.cat(routing_parts, dim=0)  # [token_count, num_layers, topk]
+        flat_routing = np.concatenate(routing_parts, axis=0)  # [token_count, num_layers, topk]
         assert flat_routing.shape[0] == token_count, (
             f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
         )
 
-        # Move to CPU for dict-based storage
-        flat_routing_cpu = flat_routing.cpu()
-        block_ids_cpu = block_ids.cpu()
-        positions_cpu = positions.cpu()
+        # Convert GPU tensors to numpy for dict-based storage
+        block_ids_np = block_ids.cpu().numpy()
+        positions_np = positions.cpu().numpy()
 
-        block_size = context.block_size_tokens
         dummy = allocator.dummy_block_idx
 
         # Group tokens by block_id using sort for efficient scatter
-        unique_blocks, inverse, counts = block_ids_cpu.unique(
-            return_inverse=True, return_counts=True
+        unique_blocks, inverse, counts = np.unique(
+            block_ids_np, return_inverse=True, return_counts=True
         )
-        sorted_indices = inverse.argsort()
-        sorted_positions = positions_cpu[sorted_indices]
-        sorted_routing = flat_routing_cpu[sorted_indices]
+        sorted_indices = np.argsort(inverse, kind='stable')
+        sorted_positions = positions_np[sorted_indices]
+        sorted_routing = flat_routing[sorted_indices]
 
         offset = 0
-        for bid, count in zip(unique_blocks.tolist(), counts.tolist()):
+        for bid, count in zip(unique_blocks, counts):
+            bid = int(bid)
+            count = int(count)
             if bid == dummy:
                 offset += count
                 continue
