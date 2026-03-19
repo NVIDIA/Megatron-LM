@@ -15,7 +15,7 @@ from transformers import WhisperConfig, WhisperModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, PipelineMode
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -548,7 +548,7 @@ class TestMimoModelNonColocated:
             self.patch_dim,
             {"images": 50257},
         )
-        assert model_no_grid.role.mode == PipelineMode.UNIFIED
+        assert model_no_grid.role.mode == ModuleLayout.UNIFIED
         assert model_no_grid.role.has_language_module is True
         assert model_no_grid.role.has_modality_modules is True
 

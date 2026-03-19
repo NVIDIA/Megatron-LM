@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 MIMO_LANGUAGE_MODULE_KEY = "language"
 
 
-class PipelineMode(Enum):
+class ModuleLayout(Enum):
     """Pipeline mode for MIMO multi-module parallelism.
 
     Determines how modules are distributed across ranks and which
@@ -70,7 +70,7 @@ class RankRole:
     """
 
     modules: Dict[str, ModuleStageInfo] = field(default_factory=dict)
-    mode: PipelineMode = PipelineMode.UNIFIED
+    mode: ModuleLayout = ModuleLayout.UNIFIED
 
     @classmethod
     def unified(cls, module_names: List[str]) -> 'RankRole':
@@ -80,7 +80,7 @@ class RankRole:
                 name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
                 for name in module_names
             },
-            mode=PipelineMode.UNIFIED,
+            mode=ModuleLayout.UNIFIED,
         )
 
     @classmethod
@@ -142,7 +142,7 @@ class RankRole:
                 f"Check module_to_grid_map configuration."
             )
 
-        return cls(modules=modules, mode=PipelineMode.NON_COLOCATED)
+        return cls(modules=modules, mode=ModuleLayout.NON_COLOCATED)
 
     @property
     def has_modality_modules(self) -> bool:

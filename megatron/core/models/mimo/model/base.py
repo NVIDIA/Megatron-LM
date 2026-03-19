@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from megatron.core.models.mimo.config import MimoModelConfig
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, PipelineMode, RankRole
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
@@ -312,7 +312,7 @@ class MimoModel(MegatronModule):
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role.mode == PipelineMode.UNIFIED:
+        if self.role.mode == ModuleLayout.UNIFIED:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -323,7 +323,7 @@ class MimoModel(MegatronModule):
                 packing_kwargs,
             )
 
-        if self.role.mode == PipelineMode.NON_COLOCATED:
+        if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
                 return self._forward_encoders(modality_inputs, input_tensors), loss_mask
 
