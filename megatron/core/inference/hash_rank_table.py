@@ -126,6 +126,16 @@ class HashRankTable:
             return None
         return self._timestamps[row]
 
+    def max_timestamps(self, hashes: Sequence[int]) -> np.ndarray:
+        """Return the element-wise max timestamp across *hashes* per rank.
+
+        Returns a int64 array of shape ``(n_ranks,)``.
+        """
+        rows = [self._hash_to_row[h] for h in hashes if h in self._hash_to_row]
+        if not rows:
+            return np.zeros(self._n_ranks, dtype=np.int64)
+        return self._timestamps[rows].max(axis=0)
+
     def get_timestamp(self, h: int, rank_idx: int) -> int:
         """Return the timestamp for a single (hash, rank) pair, or 0."""
         row = self._hash_to_row.get(h)

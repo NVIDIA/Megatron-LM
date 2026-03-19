@@ -347,13 +347,19 @@ class DataParallelInferenceCoordinator:
             return idle_rank
 
         # Use the match vector to find the best rank by prefix affinity,
-        # breaking ties by load (fewest pending) then rank index (lowest).
+        # breaking ties by load (fewest pending), then recency (highest
+        # timestamp), then rank index (lowest).
         active_match = match.copy()
         active_match[~self._active_mask] = -1.0
         best_score = np.max(active_match)
         if best_score > 0:
             candidates = np.where(active_match == best_score)[0]
-            best_idx = int(min(candidates, key=lambda i: self._pending_counts[i]))
+            # Build per-rank max timestamp across the matched hashes.
+            recency = self.hash_table.max_timestamps(request_hashes)
+            best_idx = int(min(
+                candidates,
+                key=lambda i: (self._pending_counts[i], -recency[i]),
+            ))
             return self._identities_list[best_idx]
 
         return self.get_next_data_parallel_rank()
