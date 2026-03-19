@@ -1766,14 +1766,22 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
-            # Fix partition_dim when explicit_expert_comm cleared parallel_mode.
-            # TE defaults to partition_dim=0 when parallel_mode=None, but row-parallel
+            # Fix TP metadata when explicit_expert_comm cleared parallel_mode.
+            # When explicit_expert_comm=True, Megatron manually divides the tensor size by
+            # tp_size and passes parallel_mode=None to TE. TE then creates a non-parallel
+            # weight and does NOT set tensor_model_parallel=True. Without this flag the
+            # resharding planner cannot build a TP descriptor and falls back to a full-tensor
+            # copy, which fails with a size mismatch when src and dst have different TP configs.
+            # Also fix partition_dim: TE defaults to 0 for parallel_mode=None, but row-parallel
             # weights are partitioned along dim=1 (input dimension).
-            if self.explicit_expert_comm and original_parallel_mode == "row":
+            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+                partition_dim = 1 if original_parallel_mode == "row" else 0
                 for i in range(num_gemms):
                     weight = getattr(self, f"weight{i}", None)
-                    if weight is not None and hasattr(weight, "partition_dim"):
-                        weight.partition_dim = 1
+                    if weight is not None:
+                        if hasattr(weight, "partition_dim"):
+                            weight.partition_dim = partition_dim
+                        setattr(weight, "tensor_model_parallel", True)
 
             def merge_extra_states(
                 self,
