@@ -346,10 +346,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
                 }
             # state is a single dict and will be empty if optimizer is fully empty
-            if not sd['optimizer']['state']:
-                sd['optimizer']['state'] = LocalNonpersistentObject(sd['optimizer']['state'])
+            if not sd['state']:
+                sd['state'] = LocalNonpersistentObject(sd['state'])
             # group keys(e.g. 'step') might be missing or not updated
-            for i, group in enumerate(sd['optimizer']['param_groups']):
+            for i, group in enumerate(sd['param_groups']):
                 # keep local param tensor so we only gather metadata
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
@@ -359,7 +359,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params
-                sd['optimizer']['param_groups'][i] = nonempty_rank_group
+                sd['param_groups'][i] = nonempty_rank_group
         return sharded_state_dict
 
     def save_state_dict_to_file(self, filename: str) -> None:
