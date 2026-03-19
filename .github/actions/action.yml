@@ -51,6 +51,10 @@ inputs:
   is_merge_group:
     description: "Is merge group"
     required: true
+  platform:
+    description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
+    required: false
+    default: "dgx_h100"
 runs:
   using: "composite"
   steps:
@@ -96,7 +100,7 @@ runs:
           --model unit-tests \
           --test-case "${{ inputs.test_case }}" \
           --environment dev \
-          --platform dgx_h100 \
+          --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
@@ -184,7 +188,7 @@ runs:
           --model ${{ inputs.model }} \
           --test-case ${{ inputs.test_case }} \
           --environment dev \
-          --platform dgx_h100 \
+          --platform ${{ inputs.platform }} \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
