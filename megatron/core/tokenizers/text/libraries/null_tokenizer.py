@@ -4,6 +4,7 @@ from collections import OrderedDict
 
 from megatron.core.tokenizers.text.libraries.chat_template import MegatronTokenizerChatTemplate
 
+
 class NullTokenizer:
     """
     Synthetic tokenizer for performance benchmarking and debugging
@@ -87,6 +88,7 @@ class NullTokenizer:
     def additional_special_tokens_ids(self):
         """ """
         return None
+
 
 class NullSFTTokenizer(NullTokenizer, MegatronTokenizerChatTemplate):
     """

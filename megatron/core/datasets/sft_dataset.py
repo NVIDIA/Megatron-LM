@@ -3,28 +3,35 @@
 import logging
 import os
 import time
+from bisect import bisect
 from dataclasses import dataclass, field
-from math import ceil
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
+from megatron.core.datasets.utils import Split
 from megatron.core.utils import log_single_rank
-
-from bisect import bisect
 
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
+
 @dataclass
 class ChatTemplateConfig:
+    """Configuration for chat template delimiter strings used to parse tokenized conversations.
+
+    Each field holds the string form of a delimiter token sequence. During SFT dataset
+    construction these strings are tokenized once and then used to locate role boundaries,
+    thinking traces, tool calls, and tool responses inside a tokenized conversation so that
+    a per-token loss mask can be built.
+    """
+
     system_start_str: str
     user_start_str: str
     assistant_start_str: str
@@ -36,8 +43,11 @@ class ChatTemplateConfig:
     tool_response_start_str: str
     tool_response_end_str: str
 
+
 @dataclass
 class Nemotron3ChatTemplateConfig(ChatTemplateConfig):
+    """Default ChatTemplateConfig pre-filled with Nemotron-3 delimiters."""
+
     system_start_str: str = "<|im_start|>system\n"
     user_start_str: str = "<|im_start|>user\n"
     assistant_start_str: str = "<|im_start|>assistant\n"
@@ -52,6 +62,15 @@ class Nemotron3ChatTemplateConfig(ChatTemplateConfig):
 
 @dataclass
 class SFTDatasetConfig(GPTDatasetConfig):
+    """Configuration for SFT (Supervised Fine-Tuning) datasets.
+
+    Extends GPTDatasetConfig with options that control which parts of a
+    multi-turn conversation contribute to the training loss.  When
+    ``train_on_assistant_responses_only`` is True, the chat template delimiter
+    strings are tokenized in ``__post_init__`` and stored as token-id lists
+    so that ``extract_segments`` can build per-token loss masks at training time.
+    """
+
     train_on_assistant_responses_only: bool = True
     """If True, only train on completitions, otherwise train on full conversations"""
 
@@ -76,34 +95,66 @@ class SFTDatasetConfig(GPTDatasetConfig):
         """Do asserts and set fields post init"""
         super().__post_init__()
 
-        assert not self.train_on_thinking_traces or self.train_on_assistant_responses_only, (
-            "train_on_assistant_responses_only must be True when train_on_thinking_traces is True"
-        )
+        assert (
+            not self.train_on_thinking_traces or self.train_on_assistant_responses_only
+        ), "train_on_assistant_responses_only must be True when train_on_thinking_traces is True"
 
-        assert not self.train_on_tool_calls or self.train_on_assistant_responses_only, (
-            "train_on_assistant_responses_only must be True when train_on_tool_calls is True"
-        )
+        assert (
+            not self.train_on_tool_calls or self.train_on_assistant_responses_only
+        ), "train_on_assistant_responses_only must be True when train_on_tool_calls is True"
 
-        assert not self.train_on_assistant_responses_only or self.chat_template_config is not None, (
-            "chat_template_config must be provided when train_on_assistant_responses_only is True"
-        )
+        assert (
+            not self.train_on_assistant_responses_only or self.chat_template_config is not None
+        ), "chat_template_config must be provided when train_on_assistant_responses_only is True"
 
         if self.train_on_assistant_responses_only:
             self.role_start_tokens = {
-                "system": self.tokenizer.tokenize(self.chat_template_config.system_start_str, add_special_tokens=False),
-                "user": self.tokenizer.tokenize(self.chat_template_config.user_start_str, add_special_tokens=False),
-                "assistant": self.tokenizer.tokenize(self.chat_template_config.assistant_start_str, add_special_tokens=False),
+                "system": self.tokenizer.tokenize(
+                    self.chat_template_config.system_start_str, add_special_tokens=False
+                ),
+                "user": self.tokenizer.tokenize(
+                    self.chat_template_config.user_start_str, add_special_tokens=False
+                ),
+                "assistant": self.tokenizer.tokenize(
+                    self.chat_template_config.assistant_start_str, add_special_tokens=False
+                ),
             }
-            self.end_tokens = self.tokenizer.tokenize(self.chat_template_config.end_str, add_special_tokens=False)
-            self.think_start_tokens = self.tokenizer.tokenize(self.chat_template_config.think_start_str, add_special_tokens=False)
-            self.think_end_tokens = self.tokenizer.tokenize(self.chat_template_config.think_end_str, add_special_tokens=False)
-            self.tool_call_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_start_str, add_special_tokens=False)
-            self.tool_call_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_call_end_str, add_special_tokens=False)
-            self.tool_response_start_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_start_str, add_special_tokens=False)
-            self.tool_response_end_tokens = self.tokenizer.tokenize(self.chat_template_config.tool_response_end_str, add_special_tokens=False)
+            self.end_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.end_str, add_special_tokens=False
+            )
+            self.think_start_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.think_start_str, add_special_tokens=False
+            )
+            self.think_end_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.think_end_str, add_special_tokens=False
+            )
+            self.tool_call_start_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.tool_call_start_str, add_special_tokens=False
+            )
+            self.tool_call_end_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.tool_call_end_str, add_special_tokens=False
+            )
+            self.tool_response_start_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.tool_response_start_str, add_special_tokens=False
+            )
+            self.tool_response_end_tokens = self.tokenizer.tokenize(
+                self.chat_template_config.tool_response_end_str, add_special_tokens=False
+            )
 
 
 class SFTDataset(MegatronDataset):
+    """A dataset for Supervised Fine-Tuning on multi-turn conversations.
+
+    Reads pre-tokenized conversations from an IndexedDataset, packs multiple
+    conversations into fixed-length samples using Modified First-Fit Decreasing
+    bin-packing, and builds per-token loss masks that optionally restrict the
+    training signal to assistant responses, thinking traces, and/or tool calls.
+
+    Each ``__getitem__`` returns a dict with keys ``tokens``, ``labels``,
+    ``loss_mask``, and ``cu_seqlens`` (cumulative sequence lengths for
+    variable-length packing).
+    """
+
     def __init__(
         self,
         indexed_dataset: IndexedDataset,
@@ -120,7 +171,7 @@ class SFTDataset(MegatronDataset):
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
         )
-        
+
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
         """Abstract method implementation
@@ -158,12 +209,8 @@ class SFTDataset(MegatronDataset):
                     path_to_idx_cache=config.object_storage_cache_path
                 ),
             )
-        return IndexedDataset(
-            dataset_path,
-            multimodal=False,
-            mmap=config.mmap_bin_files,
-        )
-    
+        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
+
     def __len__(self) -> int:
         """Abstract method implementation
 
@@ -172,7 +219,7 @@ class SFTDataset(MegatronDataset):
         """
 
         return self.shuffle_index.shape[0]
-    
+
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
 
@@ -186,7 +233,11 @@ class SFTDataset(MegatronDataset):
 
         tokens = torch.from_numpy(tokens).long()
         loss_mask = torch.from_numpy(loss_mask).float()
-        cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(torch.from_numpy(lengths), dim = 0))).to(torch.int32) # NOTE(asolergi-nv): torch.cumsum promotes int32 to int64
+        cu_seqlens = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.cumsum(torch.from_numpy(lengths), dim=0))
+        ).to(
+            torch.int32
+        )  # NOTE(asolergi-nv): torch.cumsum promotes int32 to int64
 
         return {
             'tokens': tokens[:-1].contiguous(),
@@ -194,16 +245,18 @@ class SFTDataset(MegatronDataset):
             'loss_mask': loss_mask[:-1].contiguous(),
             'cu_seqlens': cu_seqlens,
         }
+
     def _query_document_sample_shuffle_indices(
         self, idx: int
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
-        """Get the text (token ids) and document ids for a given index
+        """Get the text (token ids), loss mask, and cu_seqlens for a given index
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The text ids, loss mask, and document ids
+            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The text ids,
+            loss mask, and cu_seqlens
         """
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
@@ -215,14 +268,13 @@ class SFTDataset(MegatronDataset):
         document_ids = []
         sample_parts = []
         loss_masks = []
-        
+
         # TODO(asolergi-nv): For PP add flag to JUST read cu_seqlens
-        # TODO(asolergi-nv): sequence_pointer, sequence_length, sequence_mode = self.dataset.index[document_index[i or doc_index_beg]]
-        
+
         for i in range(doc_index_beg, doc_index_end):
             # Add the document id # TODO(asolergi-nv): Remove
             document_ids.append(self.document_index[i])
-            
+
             sample = self.dataset.get(self.document_index[i])
             if self.config.train_on_assistant_responses_only:
                 segments = extract_segments(
@@ -238,14 +290,14 @@ class SFTDataset(MegatronDataset):
                 loss_mask = numpy.zeros(sample.shape[0], dtype=numpy.int64)
                 for seg in segments:
                     if seg["role"] == "assistant":
-                        loss_mask[seg["start"]:seg["end"]] = 1
+                        loss_mask[seg["start"] : seg["end"]] = 1
                     elif seg["role"] == "reasoning" and self.config.train_on_thinking_traces:
-                        loss_mask[seg["start"]:seg["end"]] = 1
+                        loss_mask[seg["start"] : seg["end"]] = 1
                     elif seg["role"] == "tool_call" and self.config.train_on_tool_calls:
-                        loss_mask[seg["start"]:seg["end"]] = 1
+                        loss_mask[seg["start"] : seg["end"]] = 1
             else:
                 loss_mask = numpy.ones(sample.shape[0], dtype=numpy.int64)
-            
+
             # Add the sample part & loss mask
             sample_parts.append(sample)
             loss_masks.append(loss_mask)
@@ -255,8 +307,8 @@ class SFTDataset(MegatronDataset):
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
-            numpy.concatenate(loss_masks,  dtype=numpy.int64),
-            numpy.array([len(sample_part) for sample_part in sample_parts], dtype=numpy.int32), # NOTE(asolergi-nv): cu_seqlens
+            numpy.concatenate(loss_masks, dtype=numpy.int64),
+            numpy.array([len(sample_part) for sample_part in sample_parts], dtype=numpy.int32),
         )
 
     def _build_document_sample_shuffle_indices(
@@ -328,10 +380,16 @@ class SFTDataset(MegatronDataset):
 
             packed_samples = pack_samples(sample_lengths, sequence_length)
             document_index = [j for pack in packed_samples for j in pack]
-            sample_index = torch.cumsum(torch.tensor([0] + [len(sample) for sample in packed_samples]), dim=0)
+            sample_index = torch.cumsum(
+                torch.tensor([0] + [len(sample) for sample in packed_samples]), dim=0
+            )
 
             num_packed = len(packed_samples)
-            num_epochs = (num_samples // num_packed) + 1 if num_samples % num_packed else num_samples // num_packed
+            num_epochs = (
+                (num_samples // num_packed) + 1
+                if num_samples % num_packed
+                else num_samples // num_packed
+            )
             shuffle_index = []
             for epoch in range(num_epochs):
                 shuffle_index.extend(torch.randperm(num_packed).tolist())
@@ -407,13 +465,11 @@ class SFTDataset(MegatronDataset):
 
         return document_index, sample_index, shuffle_index
 
+
 def _classify_items(
     items: List[Tuple[int, int]], bin_capacity: int
 ) -> Tuple[
-    List[Tuple[int, int]],
-    List[Tuple[int, int]],
-    List[Tuple[int, int]],
-    List[Tuple[int, int]],
+    List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]
 ]:
     """Split items into large / medium / small / tiny classes.
 
@@ -440,6 +496,7 @@ def _classify_items(
         else:
             tiny.append((idx, size))
     return large, medium, small, tiny
+
 
 def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[int]]:
     """Pack sequences using the Modified First-Fit Decreasing algorithm.
@@ -493,9 +550,7 @@ def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[in
 
     # Phase-3: backward pass – fill with two small items where possible
     for b in reversed(bins):
-        has_medium = any(
-            bin_capacity / 3 < size <= bin_capacity / 2 for _, size in b
-        )
+        has_medium = any(bin_capacity / 3 < size <= bin_capacity / 2 for _, size in b)
         if has_medium or len(small) < 2:
             continue
         remaining = bin_capacity - sum(size for _, size in b)
@@ -513,9 +568,7 @@ def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[in
             b.extend([first_small, second_small])
 
     # Phase-4: forward greedy fit of remaining items
-    remaining_items = sorted(
-        medium + small + tiny, key=lambda x: x[1], reverse=True
-    )
+    remaining_items = sorted(medium + small + tiny, key=lambda x: x[1], reverse=True)
     for b in bins:
         while remaining_items:
             rem = bin_capacity - sum(size for _, size in b)
@@ -540,7 +593,8 @@ def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[in
     ffd_bins: List[List[Tuple[int, int]]] = [[]]
     ffd_bin_sizes: List[int] = [0]
     for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
-        # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
+        # We only need to check the first bin since we guarantee the order
+        # of ffd_bin_sizes to be sorted from smallest to largest.
         if size <= (bin_capacity - ffd_bin_sizes[0]):
             new_bin = ffd_bins.pop(0)
             new_bin_size = ffd_bin_sizes.pop(0)
@@ -560,12 +614,24 @@ def pack_samples(sequence_lengths: List[int], bin_capacity: int) -> List[List[in
     # Convert to list of index lists (discard sizes)
     return [[idx for idx, _ in b] for b in bins if b]
 
+
 def find_subsequence(sequence, subsequence, start=0):
+    """Return the index of the first occurrence of *subsequence* in *sequence*, or -1.
+
+    Args:
+        sequence (list): The sequence to search in.
+        subsequence (list): The contiguous subsequence to find.
+        start (int): Position in *sequence* at which to begin the search.
+
+    Returns:
+        int: Index of the first match, or -1 if not found.
+    """
     sub_len = len(subsequence)
     for i in range(start, len(sequence) - sub_len + 1):
-        if sequence[i:i + sub_len] == subsequence:
+        if sequence[i : i + sub_len] == subsequence:
             return i
     return -1
+
 
 def _split_tool_calls(tokens, offset, tool_call_start_tokens, tool_call_end_tokens):
     """Split a token sequence into assistant text and tool_call sub-segments.
@@ -583,27 +649,59 @@ def _split_tool_calls(tokens, offset, tool_call_start_tokens, tool_call_end_toke
 
         if tc_start == -1:
             if pos < len(tokens):
-                result.append({"role": "assistant", "tokens": tokens[pos:], "start": offset + pos, "end": offset + len(tokens)})
+                result.append(
+                    {
+                        "role": "assistant",
+                        "tokens": tokens[pos:],
+                        "start": offset + pos,
+                        "end": offset + len(tokens),
+                    }
+                )
             break
 
         # Assistant content before tool_call (skip if whitespace-only)
         if tc_start > pos:
             frag = tokens[pos:tc_start]
             if not all(t == NL_TOKEN for t in frag):
-                result.append({"role": "assistant", "tokens": frag, "start": offset + pos, "end": offset + tc_start})
+                result.append(
+                    {
+                        "role": "assistant",
+                        "tokens": frag,
+                        "start": offset + pos,
+                        "end": offset + tc_start,
+                    }
+                )
 
         content_start = tc_start + tc_start_len
         tc_end = find_subsequence(tokens, tool_call_end_tokens, content_start)
 
         if tc_end == -1:
-            result.append({"role": "tool_call", "tokens": tokens[content_start:], "start": offset + content_start, "end": offset + len(tokens)})
+            result.append(
+                {
+                    "role": "tool_call",
+                    "tokens": tokens[content_start:],
+                    "start": offset + content_start,
+                    "end": offset + len(tokens),
+                }
+            )
             break
 
-        result.append({"role": "tool_call", "tokens": tokens[content_start:tc_end], "start": offset + content_start, "end": offset + tc_end})
+        result.append(
+            {
+                "role": "tool_call",
+                "tokens": tokens[content_start:tc_end],
+                "start": offset + content_start,
+                "end": offset + tc_end,
+            }
+        )
         pos = tc_end + tc_end_len
 
     # Drop trailing whitespace-only assistant fragments
-    if result and result[-1]["role"] == "assistant" and all(t == NL_TOKEN for t in result[-1]["tokens"]):
+    if (
+        result
+        and result[-1]["role"] == "assistant"
+        and all(t == NL_TOKEN for t in result[-1]["tokens"])
+    ):
         result.pop()
 
     return result
@@ -619,6 +717,30 @@ def extract_segments(
     tool_call_end_tokens,
     tool_response_start_tokens,
 ):
+    """Parse a tokenized conversation into labeled segments for loss masking.
+
+    Scans *tokenized_conversation* for role-start and end delimiter token
+    sequences, then classifies each segment as one of: ``system``, ``user``,
+    ``assistant``, ``reasoning``, ``tool_call``, or ``tool_response``.
+    Assistant segments are further split on ``<think>``/``</think>`` and
+    ``<tool_call>``/``</tool_call>`` boundaries.
+
+    Args:
+        tokenized_conversation (List[int]): Full token-id sequence of one conversation.
+        role_start_tokens (Dict[str, List[int]]): Mapping from role name to its
+            start-delimiter token ids.
+        end_tokens (List[int]): Token ids for the end-of-turn delimiter.
+        think_start_tokens (List[int]): Token ids for ``<think>``.
+        think_end_tokens (List[int]): Token ids for ``</think>``.
+        tool_call_start_tokens (List[int]): Token ids for ``<tool_call>``.
+        tool_call_end_tokens (List[int]): Token ids for ``</tool_call>``.
+        tool_response_start_tokens (List[int]): Token ids for ``<tool_response>``.
+
+    Returns:
+        List[dict]: Each dict has keys ``role`` (str), ``tokens`` (List[int]),
+        ``start`` (int), and ``end`` (int) giving absolute indices into
+        *tokenized_conversation*.
+    """
     markers = []
     for role, start_tokens in role_start_tokens.items():
         pos = 0
@@ -642,35 +764,67 @@ def extract_segments(
 
         # Check if this user turn is actually a tool response
         tr_start_len = len(tool_response_start_tokens)
-        if role == "user" and len(content_tokens) >= tr_start_len and content_tokens[:tr_start_len] == tool_response_start_tokens:
-            segments.append({"role": "tool_response", "tokens": content_tokens, "start": content_start, "end": content_end})
+        if (
+            role == "user"
+            and len(content_tokens) >= tr_start_len
+            and content_tokens[:tr_start_len] == tool_response_start_tokens
+        ):
+            segments.append(
+                {
+                    "role": "tool_response",
+                    "tokens": content_tokens,
+                    "start": content_start,
+                    "end": content_end,
+                }
+            )
             continue
 
         if role == "assistant":
             think_start_idx = find_subsequence(content_tokens, think_start_tokens)
             if think_start_idx != -1:
-                think_end_idx = find_subsequence(content_tokens, think_end_tokens, think_start_idx + len(think_start_tokens))
+                think_end_idx = find_subsequence(
+                    content_tokens, think_end_tokens, think_start_idx + len(think_start_tokens)
+                )
             else:
                 think_end_idx = -1
 
             if think_start_idx != -1 and think_end_idx != -1:
-                reasoning_tokens = content_tokens[think_start_idx + len(think_start_tokens):think_end_idx]
-                response_tokens = content_tokens[think_end_idx + len(think_end_tokens):]
+                reasoning_tokens = content_tokens[
+                    think_start_idx + len(think_start_tokens) : think_end_idx
+                ]
+                response_tokens = content_tokens[think_end_idx + len(think_end_tokens) :]
                 if reasoning_tokens:
                     abs_start = content_start + think_start_idx + len(think_start_tokens)
                     abs_end = content_start + think_end_idx
-                    segments.append({"role": "reasoning", "tokens": reasoning_tokens, "start": abs_start, "end": abs_end})
+                    segments.append(
+                        {
+                            "role": "reasoning",
+                            "tokens": reasoning_tokens,
+                            "start": abs_start,
+                            "end": abs_end,
+                        }
+                    )
                 # Split the response part by tool calls
                 if response_tokens:
                     abs_start = content_start + think_end_idx + len(think_end_tokens)
-                    segments.extend(_split_tool_calls(response_tokens, abs_start, tool_call_start_tokens, tool_call_end_tokens))
+                    segments.extend(
+                        _split_tool_calls(
+                            response_tokens, abs_start, tool_call_start_tokens, tool_call_end_tokens
+                        )
+                    )
                 continue
 
             # No think tags — split entire content by tool calls
             if find_subsequence(content_tokens, tool_call_start_tokens) != -1:
-                segments.extend(_split_tool_calls(content_tokens, content_start, tool_call_start_tokens, tool_call_end_tokens))
+                segments.extend(
+                    _split_tool_calls(
+                        content_tokens, content_start, tool_call_start_tokens, tool_call_end_tokens
+                    )
+                )
                 continue
 
-        segments.append({"role": role, "tokens": content_tokens, "start": content_start, "end": content_end})
+        segments.append(
+            {"role": role, "tokens": content_tokens, "start": content_start, "end": content_end}
+        )
 
     return segments

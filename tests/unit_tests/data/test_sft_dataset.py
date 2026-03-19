@@ -15,8 +15,13 @@ import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.sft_dataset import SFTDataset, SFTDatasetConfig, ChatTemplateConfig, extract_segments
 from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
+from megatron.core.datasets.sft_dataset import (
+    ChatTemplateConfig,
+    SFTDataset,
+    SFTDatasetConfig,
+    extract_segments,
+)
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
@@ -32,6 +37,7 @@ class TestChatTemplateConfig(ChatTemplateConfig):
     Think markers must be single characters (tokenize(str)[0] returns a single ID).
     Tool call markers end with '\\n' as required by _split_tool_calls.
     """
+
     system_start_str: str = "[S]"
     user_start_str: str = "[U]"
     assistant_start_str: str = "[A]"
@@ -55,7 +61,9 @@ def _random_content_tokens(min_len=5, max_len=20):
     return [random.randint(CONTENT_TOKEN_MIN, CONTENT_TOKEN_MAX - 1) for _ in range(length)]
 
 
-def build_tokenized_conversation(tokenizer, chat_template_config, conversation_type, with_system=True):
+def build_tokenized_conversation(
+    tokenizer, chat_template_config, conversation_type, with_system=True
+):
     """Build a pre-tokenized conversation as a flat list of token IDs.
 
     Args:
@@ -94,7 +102,14 @@ def build_tokenized_conversation(tokenizer, chat_template_config, conversation_t
     elif conversation_type == "with_thinking":
         # user + assistant(think + response)
         tokens += usr_start + _random_content_tokens() + end
-        tokens += ast_start + think_start + _random_content_tokens() + think_end + _random_content_tokens() + end
+        tokens += (
+            ast_start
+            + think_start
+            + _random_content_tokens()
+            + think_end
+            + _random_content_tokens()
+            + end
+        )
 
     elif conversation_type == "with_tool_calls":
         # user + assistant(tool_call) + user(tool_response) + assistant(response)
@@ -106,7 +121,16 @@ def build_tokenized_conversation(tokenizer, chat_template_config, conversation_t
     elif conversation_type == "with_thinking_and_tool_calls":
         # user + assistant(think + tool_call) + user(tool_response) + assistant(response)
         tokens += usr_start + _random_content_tokens() + end
-        tokens += ast_start + think_start + _random_content_tokens() + think_end + tc_start + _random_content_tokens() + tc_end + end
+        tokens += (
+            ast_start
+            + think_start
+            + _random_content_tokens()
+            + think_end
+            + tc_start
+            + _random_content_tokens()
+            + tc_end
+            + end
+        )
         tokens += usr_start + tr_start + _random_content_tokens() + end
         tokens += ast_start + _random_content_tokens() + end
 
@@ -116,7 +140,9 @@ def build_tokenized_conversation(tokenizer, chat_template_config, conversation_t
 CONVERSATION_TYPES = ["simple", "with_thinking", "with_tool_calls", "with_thinking_and_tool_calls"]
 
 
-def create_file_prefixes(tokenizer, chat_template_config, number_of_files, max_conversations_per_file, dataset_dir):
+def create_file_prefixes(
+    tokenizer, chat_template_config, number_of_files, max_conversations_per_file, dataset_dir
+):
     """Create indexed dataset files with pre-tokenized conversations of all types."""
     os.makedirs(dataset_dir, exist_ok=True)
 
@@ -129,7 +155,9 @@ def create_file_prefixes(tokenizer, chat_template_config, number_of_files, max_c
         for _ in range(random.randint(10, max_conversations_per_file)):
             conv_type = random.choice(CONVERSATION_TYPES)
             with_system = random.choice([True, False])
-            tokens = build_tokenized_conversation(tokenizer, chat_template_config, conv_type, with_system)
+            tokens = build_tokenized_conversation(
+                tokenizer, chat_template_config, conv_type, with_system
+            )
             builder.add_document(tokens, [len(tokens)])
         builder.finalize(file_prefix_path + ".idx")
         file_prefixes.append(file_prefix_path)
@@ -163,7 +191,7 @@ def verify_loss_mask(sample, config):
     offset = 0
     for doc_idx in range(num_docs):
         doc_len = (cu_seqlens[doc_idx + 1] - cu_seqlens[doc_idx]).item()
-        doc_tokens = full_tokens[offset:offset + doc_len].tolist()
+        doc_tokens = full_tokens[offset : offset + doc_len].tolist()
 
         # loss_mask covers positions [0, cu_seqlens[-1] - 1) of the full sequence
         # For this document, loss_mask positions are [offset, offset + doc_len)
@@ -173,9 +201,9 @@ def verify_loss_mask(sample, config):
 
         if not config.train_on_assistant_responses_only:
             # All tokens should be trained on
-            assert (doc_loss_mask == 1.0).all(), (
-                f"Doc {doc_idx}: expected all loss_mask=1 when train_on_assistant_responses_only=False"
-            )
+            assert (
+                doc_loss_mask == 1.0
+            ).all(), f"Doc {doc_idx}: expected all loss_mask=1 when train_on_assistant_responses_only=False"
         else:
             segments = extract_segments(
                 doc_tokens,
@@ -261,7 +289,10 @@ def test_sft_dataset(
     with TempNamedDir(tmp_path_dist_ckpt / "test_fast_builder", sync=True) as temp_dir:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             file_prefixes = create_file_prefixes(
-                tokenizer, chat_template_config, number_of_files, max_conversations_per_file,
+                tokenizer,
+                chat_template_config,
+                number_of_files,
+                max_conversations_per_file,
                 os.path.join(temp_dir, "dataset"),
             )
         else:
@@ -352,7 +383,9 @@ def test_sft_dataset(
             assert cu_seqlens[0] == 0
             doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             assert (doc_lengths > 0).all(), "Each document must have positive length"
-            assert (doc_lengths <= sequence_length).all(), "No document should exceed sequence_length"
+            assert (
+                doc_lengths <= sequence_length
+            ).all(), "No document should exceed sequence_length"
 
             # Loss mask is binary (only 0.0 or 1.0)
             assert ((loss_mask == 0.0) | (loss_mask == 1.0)).all(), "Loss mask must be binary"

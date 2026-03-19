@@ -470,7 +470,10 @@ def get_mtp_layer_spec_for_backend(
 
 
 def mtp_on_this_rank(
-    layout: PipelineParallelLayerLayout = None, mtp_num_layers: Optional[int] = None, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+    layout: PipelineParallelLayerLayout = None,
+    mtp_num_layers: Optional[int] = None,
+    ignore_virtual: Optional[bool] = True,
+    vp_stage: Optional[int] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.

@@ -197,7 +197,12 @@ class MambaModel(LanguageModule):
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
             # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(layout=self.config.pipeline_model_parallel_layout, mtp_num_layers=self.config.mtp_num_layers, ignore_virtual=False, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(
+                layout=self.config.pipeline_model_parallel_layout,
+                mtp_num_layers=self.config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=self.vp_stage,
+            )
         )
 
         # megatron core pipelining currently depends on model type
