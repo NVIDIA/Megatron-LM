@@ -16,6 +16,9 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 
 try:
     import zmq
@@ -404,7 +407,7 @@ class DataParallelInferenceCoordinator:
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
-                Headers.INCREMENT_STALENESS,
+                Headers.SET_GENERATION_EPOCH,
                 Headers.STOP,
             ):
                 # Start by checking the current state against the control signal.
@@ -445,7 +448,9 @@ class DataParallelInferenceCoordinator:
                     self.state = self.CoordinatorState.STOPPING
 
                 # Broadcast the control signal if we're in a good state.
-                broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
+                # Forward the full deserialized payload so that data-bearing
+                # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
+                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
@@ -501,11 +506,16 @@ class DataParallelInferenceCoordinator:
                 generated tokens to be detokenized. It is modified in place.
         """
         if finished_request["prompt"] is None:
-            finished_request["prompt"] = self.tokenizer.detokenize(
-                finished_request["prompt_tokens"][1]
+            finished_request["prompt"] = TextGenerationController.detokenize(
+                self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
             )
-        finished_request["generated_text"] = self.tokenizer.detokenize(
-            finished_request["generated_tokens"]
+        detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
+            "detokenize_stop_sequence", False
+        )
+        finished_request["generated_text"] = TextGenerationController.detokenize(
+            self.tokenizer,
+            finished_request["generated_tokens"],
+            remove_EOD=not detokenize_stop_sequence,
         )
 
     @classmethod
