@@ -1589,7 +1589,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     has_any_indexed_key = any(key in state_dict for key in indexed_keys)
                     has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
 
-                    if self.single_grouped_parameter:
+                    if getattr(self, "single_grouped_parameter", False):
                         if has_grouped_key or not has_all_indexed_keys:
                             return
                         state_dict[grouped_key] = torch.stack(
