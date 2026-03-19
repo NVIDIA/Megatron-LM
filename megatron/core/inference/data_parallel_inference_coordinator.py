@@ -16,6 +16,9 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 
 try:
     import zmq
@@ -503,11 +506,16 @@ class DataParallelInferenceCoordinator:
                 generated tokens to be detokenized. It is modified in place.
         """
         if finished_request["prompt"] is None:
-            finished_request["prompt"] = self.tokenizer.detokenize(
-                finished_request["prompt_tokens"][1]
+            finished_request["prompt"] = TextGenerationController.detokenize(
+                self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
             )
-        finished_request["generated_text"] = self.tokenizer.detokenize(
-            finished_request["generated_tokens"]
+        detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
+            "detokenize_stop_sequence", False
+        )
+        finished_request["generated_text"] = TextGenerationController.detokenize(
+            self.tokenizer,
+            finished_request["generated_tokens"],
+            remove_EOD=not detokenize_stop_sequence,
         )
 
     @classmethod
