@@ -69,6 +69,7 @@ jobs:
         with:
           username: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
           github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+          sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
 
       - name: Set maintainer status
         id: check-membership

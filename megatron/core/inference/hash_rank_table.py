@@ -162,10 +162,10 @@ class HashRankTable:
     # ------------------------------------------------------------------
 
     def compact(self) -> None:
-        """Remove dead rows and shrink the backing array when under-utilized.
+        """Remove stale rows and shrink the backing array when under-utilized.
 
-        A row is *dead* when all of its timestamps are zero (no rank holds the
-        hash).  After removing dead rows, the array is halved repeatedly until
+        A row is *stale* when all of its timestamps are zero (no rank holds the
+        hash).  After removing stale rows, the array is halved repeatedly until
         it is no larger than ``max(2 * live_rows, initial_capacity=256)``.
         """
         # Identify live rows (at least one non-zero timestamp).

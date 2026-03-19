@@ -249,7 +249,7 @@ class TestCompact:
         t = HashRankTable(n_ranks=2, initial_capacity=4)
         t.set(10, 0, 1)
         t.set(20, 1, 2)
-        # Kill everything.
+        # Remove everything.
         t._timestamps[:] = 0
 
         t.compact()
@@ -262,7 +262,7 @@ class TestCompact:
         t = HashRankTable(n_ranks=2, initial_capacity=4)
         t.set(10, 0, 1)
         t.set(20, 0, 2)
-        # Kill hash 10.
+        # Remove hash 10.
         t._timestamps[t._hash_to_row[10], :] = 0
         t.compact()
 
