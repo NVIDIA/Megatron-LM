@@ -271,7 +271,7 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'te'."
                 )
-                
+
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
                 # when using the FlashInfer backend. The flashinfer-jit-cache package
                 # must be installed ahead of time to avoid a multi-minute JIT
