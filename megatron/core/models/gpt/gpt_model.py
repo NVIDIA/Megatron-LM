@@ -242,7 +242,11 @@ class GPTModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
@@ -482,6 +486,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -495,6 +500,9 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
+            is_spec_decode (bool, optional): Explicitly override whether speculative
+                decoding is active.  When ``None`` (default) the flag is inferred from
+                ``inference_context.num_speculative_tokens``.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -554,6 +562,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            is_spec_decode=is_spec_decode,
         )
 
     def _postprocess(
@@ -575,6 +584,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        is_spec_decode=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -585,17 +595,27 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        # Check if speculative decoding is active. When it is, MTP must be
+        # computed *after* verification so that it is conditioned on verified
+        # tokens rather than stale speculative tokens from the previous step.
+        if is_spec_decode is None:
+            is_spec_decode = (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+            )
+
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess:
+        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_params=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
@@ -609,19 +629,27 @@ class GPTModel(LanguageModule):
             return hidden_states
 
         if self.config.mtp_num_layers:
-            hidden_states = process_mtp_loss(
-                hidden_states=hidden_states,
-                labels=labels,
-                loss_mask=loss_mask,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                is_training=self.training,
-                compute_language_model_loss=self.compute_language_model_loss,
-                config=self.config,
-                cp_group=self.pg_collection.cp,
-                packed_seq_params=packed_seq_params,
-            )
+            assert self.config.mtp_num_layers > 0
+            if in_inference_mode or is_spec_decode:
+                # Cache decoder hidden states for serial MTP computation
+                # after speculative token verification.
+                self._decoder_hidden_states_cache = hidden_states
+            else:
+                # In training/eval, use the utility function for processing MTP loss/scaling.
+                hidden_states = process_mtp_loss(
+                    hidden_states=hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    is_training=self.training,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    packed_seq_params=packed_seq_params,
+                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                )
         sequence_parallel_override = False
 
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
@@ -638,16 +666,17 @@ class GPTModel(LanguageModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [B, 1, H]
-                # (so that the output layer, which expects S×B×H, receives only the final token)
-                hidden_states = inference_context.last_token_logits(
-                    hidden_states.squeeze(1).unsqueeze(0)
-                ).unsqueeze(1)
+                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                # then back to [S’, B, H] for the output layer.
+                reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Apply MuP output scaling to logits
+        logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -677,6 +706,49 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: int,
+        runtime_gather_output: bool = True,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int): MTP depth index (0-indexed).
+            runtime_gather_output (bool): Whether to gather output across TP.
+
+        Returns:
+            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
+        """
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(
+            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+
+        return mtp_hidden, logits
 
     def build_schedule_plan(
         self,

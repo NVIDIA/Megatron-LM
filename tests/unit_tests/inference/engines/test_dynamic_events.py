@@ -7,6 +7,7 @@ request methods, and lifecycle sequences with exactly 9 substantial tests.
 """
 
 import time
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -381,6 +382,38 @@ def test_request_record_merge_across_eviction_recovery():
     single_merged = single_record.merge()
     assert len(single_merged.events) == len(req1.events)
     assert single_merged.generated_tokens == req1.generated_tokens
+
+
+# ============================================================================
+# Test 5b: Merge does not recompute precomputed_block_hashes
+# ============================================================================
+
+
+def test_merge_preserves_precomputed_block_hashes():
+    """Test that merge() carries over precomputed_block_hashes and does not recompute them."""
+    fake_hashes = [111, 222, 333]
+
+    with patch.object(DynamicInferenceRequest, '_compute_block_hashes') as mock_compute:
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=4),
+            enable_prefix_caching=True,
+            block_size_tokens=4,
+            precomputed_block_hashes=fake_hashes,
+        )
+
+        # __post_init__ should have skipped recomputation since hashes were provided.
+        mock_compute.assert_not_called()
+
+        req.generated_tokens.extend([100, 101])
+        req.add_event_finish()
+
+        record = DynamicInferenceRequestRecord.from_request(req)
+        merged = record.merge()
+
+        # Merge should carry hashes through and also skip recomputation.
+        mock_compute.assert_not_called()
 
 
 # ============================================================================
