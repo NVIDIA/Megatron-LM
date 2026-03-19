@@ -35,13 +35,19 @@ except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
 
-# TODO: Remove this separate try/except once the next version of emerging_optimizers
-# (which includes Lion) is released. Then Lion can be imported in the block above.
 try:
+    from importlib.metadata import version as _pkg_version
+
+    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
+    if _eo_ver < (0, 2):
+        raise ImportError(
+            f"Lion optimizer requires emerging_optimizers >= 0.2, "
+            f"found {_pkg_version('emerging-optimizers')}"
+        )
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
     HAVE_LION = True
-except ImportError:
+except (ImportError, Exception):
     HAVE_LION = False
 
 
