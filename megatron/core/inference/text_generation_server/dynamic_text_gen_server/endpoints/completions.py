@@ -141,7 +141,7 @@ try:
         failed_errors = []
         has_nontransient_error = False
         for i, record in enumerate(batch_results):
-            last_request = record.requests[-1]
+            last_request = record
             if last_request.failed():
                 error_events = [
                     e
