@@ -367,9 +367,7 @@ class MambaMetadata:
                 seq_lens = (cu[1 : real_prefill_count + 1] - cu[:real_prefill_count]).to(
                     torch.int64
                 )
-                num_chunks = torch.clamp(
-                    (seq_lens + chunk_size - 1) // chunk_size, min=1
-                )
+                num_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
                 cum_chunks = torch.zeros(
                     real_prefill_count + 1, dtype=torch.int64, device=self.device
                 )

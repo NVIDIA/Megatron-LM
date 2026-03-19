@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict
 
 import torch
 from torch import Tensor
@@ -379,9 +379,9 @@ class MambaSlotAllocator:
         if last_aligned_abs == prompt_len and prompt_len > 0:
             last_block_idx = prompt_len // ctx.block_size_tokens - 1
             if last_block_idx >= 0:
-                self._eos_cache_block_id_gpu[current_id] = ctx.request_to_kv_block_ids[
-                    current_id
-                ][last_block_idx]
+                self._eos_cache_block_id_gpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                    last_block_idx
+                ]
                 self._has_intermediates = True
             else:
                 self._eos_cache_block_id_gpu[current_id] = -1
@@ -476,9 +476,7 @@ class MambaSlotAllocator:
                         bid = all_block_ids_cpu[req_idx][j]
                         slot = self.allocate_slot(bid)
 
-                        self.ssm_states[:, slot].copy_(
-                            self.intermediate_ssm_out[:, ssm_offset + j]
-                        )
+                        self.ssm_states[:, slot].copy_(self.intermediate_ssm_out[:, ssm_offset + j])
                         self.conv_states[:, slot].copy_(
                             self.intermediate_conv_out[:, ssm_offset + j]
                         )
