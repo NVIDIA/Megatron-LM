@@ -366,10 +366,12 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-            # Verify that pre-compiled FlashInfer CUTLASS kernels are available.
-            # The flashinfer-jit-cache package must be installed ahead of time to
-            # avoid a multi-minute JIT compilation step during warmup.
-            check_flashinfer_jit_cache_installed()
+            # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+            # when using the FlashInfer backend. The flashinfer-jit-cache package
+            # must be installed ahead of time to avoid a multi-minute JIT
+            # compilation step during warmup.
+            if model_config.inference_grouped_gemm_backend == 'auto':
+                check_flashinfer_jit_cache_installed()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
