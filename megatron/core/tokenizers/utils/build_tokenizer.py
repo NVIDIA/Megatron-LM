@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 NULL_TOKENIZERS = {
     'NullTokenizer': 'null-text',
     'NullMultimodalTokenizer': 'null-multimodal',
-    'NullSFTTokenizer': 'null-sft',
 }
 
 

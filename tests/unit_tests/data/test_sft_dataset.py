@@ -78,15 +78,16 @@ def build_tokenized_conversation(
     """
     cfg = chat_template_config
 
-    sys_start = tokenizer.tokenize(cfg.system_start_str)
-    usr_start = tokenizer.tokenize(cfg.user_start_str)
-    ast_start = tokenizer.tokenize(cfg.assistant_start_str)
-    end = tokenizer.tokenize(cfg.end_str)
-    think_start = tokenizer.tokenize(cfg.think_start_str)
-    think_end = tokenizer.tokenize(cfg.think_end_str)
-    tc_start = tokenizer.tokenize(cfg.tool_call_start_str)
-    tc_end = tokenizer.tokenize(cfg.tool_call_end_str)
-    tr_start = tokenizer.tokenize(cfg.tool_response_start_str)
+    sys_start = tokenizer.tokenize(cfg.system_start_str, add_special_tokens=False)
+    usr_start = tokenizer.tokenize(cfg.user_start_str, add_special_tokens=False)
+    ast_start = tokenizer.tokenize(cfg.assistant_start_str, add_special_tokens=False)
+    end = tokenizer.tokenize(cfg.end_str, add_special_tokens=False)
+    think_start = tokenizer.tokenize(cfg.think_start_str, add_special_tokens=False)
+    think_end = tokenizer.tokenize(cfg.think_end_str, add_special_tokens=False)
+    tc_start = tokenizer.tokenize(cfg.tool_call_start_str, add_special_tokens=False)
+    tc_end = tokenizer.tokenize(cfg.tool_call_end_str, add_special_tokens=False)
+    tr_start = tokenizer.tokenize(cfg.tool_response_start_str, add_special_tokens=False)
+    tr_end = tokenizer.tokenize(cfg.tool_response_end_str, add_special_tokens=False)
 
     tokens = []
 
@@ -115,7 +116,7 @@ def build_tokenized_conversation(
         # user + assistant(tool_call) + user(tool_response) + assistant(response)
         tokens += usr_start + _random_content_tokens() + end
         tokens += ast_start + tc_start + _random_content_tokens() + tc_end + end
-        tokens += usr_start + tr_start + _random_content_tokens() + end
+        tokens += usr_start + tr_start + _random_content_tokens() + tr_end + end
         tokens += ast_start + _random_content_tokens() + end
 
     elif conversation_type == "with_thinking_and_tool_calls":
@@ -131,7 +132,7 @@ def build_tokenized_conversation(
             + tc_end
             + end
         )
-        tokens += usr_start + tr_start + _random_content_tokens() + end
+        tokens += usr_start + tr_start + _random_content_tokens() + tr_end + end
         tokens += ast_start + _random_content_tokens() + end
 
     return tokens
@@ -209,8 +210,8 @@ def verify_loss_mask(sample, config):
                 doc_tokens,
                 config.role_start_tokens,
                 config.end_tokens,
-                config.think_start_id,
-                config.think_end_id,
+                config.think_start_tokens,
+                config.think_end_tokens,
                 config.tool_call_start_tokens,
                 config.tool_call_end_tokens,
                 config.tool_response_start_tokens,
@@ -277,7 +278,7 @@ def test_sft_dataset(
     tokenizer = build_tokenizer(
         Namespace(
             vocab_size=vocab_size,
-            tokenizer_type="NullSFTTokenizer",
+            tokenizer_type="NullTokenizer",
             rank=0,
             make_vocab_size_divisible_by=128,
             tensor_model_parallel_size=1,
