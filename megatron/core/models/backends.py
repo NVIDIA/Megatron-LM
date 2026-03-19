@@ -36,12 +36,12 @@ except ImportError:
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
-    TEColumnParallelLinear,
     TEDotProductAttention,
     TELinear,
     TENorm,
 )
 from megatron.core.tensor_parallel.inference_layers import (
+    InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
@@ -152,7 +152,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module TE backend uses"""
-        return TEColumnParallelLinear
+        return InferenceColumnParallelLinear
 
     def row_parallel_linear(self) -> type:
         """Which row parallel linear module TE backend uses"""

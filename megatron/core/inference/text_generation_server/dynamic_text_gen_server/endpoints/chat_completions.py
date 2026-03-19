@@ -8,7 +8,10 @@ import traceback
 import uuid
 import warnings
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -140,6 +143,22 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
+def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+
+    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
+    Before applying the chat template, we must inline those tags back into content.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.pop("reasoning_content", None)
+        if reasoning_content is not None:
+            content = message.get("content") or ""
+            message["content"] = f"<think>{reasoning_content}</think>{content}"
+    return messages
+
+
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -228,6 +247,7 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -369,7 +389,35 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format OpenAI Response ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            last_request = record.requests[-1]
+            if last_request.failed():
+                error_events = [
+                    e
+                    for e in last_request.events
+                    if e.type
+                    in (
+                        DynamicInferenceEventType.ERROR_NONTRANSIENT,
+                        DynamicInferenceEventType.ERROR_TRANSIENT,
+                    )
+                ]
+                if any(
+                    e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events
+                ):
+                    has_nontransient_error = True
+                error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+
+        # --- 5. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
@@ -378,17 +426,6 @@ try:
         for result_item in batch_results:
             result = result_item if isinstance(result_item, dict) else result_item.serialize()
             result = unwrap_serialized_tensors(result)
-
-            if result["status"] == "FAILED":
-                if result["sampling_params"]["num_tokens_to_generate"] <= 0:
-                    return Response(
-                        f"Request {request_idx} failed due to context length overflow", status=400
-                    )
-                else:
-                    return Response(
-                        f"Request {request_idx} failed due to internal error {result['events']}",
-                        status=500,
-                    )
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
@@ -441,7 +478,7 @@ try:
             if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
-                message["reasoning"] = metadata["reasoning"]
+                message["reasoning_content"] = metadata["reasoning"]
 
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
@@ -468,8 +505,8 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_staleness"] = result["policy_staleness"]
-            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
