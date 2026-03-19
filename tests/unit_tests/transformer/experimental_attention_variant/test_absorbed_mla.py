@@ -235,6 +235,7 @@ def get_mla_submodules(
 #       megatron.core.models.gpt.gpt_layer_specs to simplify submodule setup and cover real specs.
 # TODO: Add test case to cover TP > 1 but SP = False.
 
+
 @pytest.mark.parametrize("tp_cp_sp", [[1, 1, False], [2, 1, True], [1, 2, False], [2, 2, True]])
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 @pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
