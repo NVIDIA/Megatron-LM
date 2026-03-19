@@ -334,7 +334,16 @@ class DynamicInferenceEngine(AbstractEngine):
             reset_context (bool): Whether to reset the context after building cuda graphs.
         """
 
+        import sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        def _dbg(msg):
+            _dbg_f.write(f"[CG] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [CG] {msg}", flush=True, file=sys.stderr)
+
+        _dbg(f"create_cuda_graphs start (impl={self.cuda_graph_impl})")
         if self.cuda_graph_impl != "local":
+            _dbg("skipping (not local)")
             return
 
         if (
@@ -393,12 +402,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+        _dbg(f"warmup loop start ({len(context.cuda_graph_batch_dimensions_list)} graphs)")
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
+            _dbg(f"warmup iter {tbar_idx}: context_init start ({cuda_graph_batch_dimension})")
             input_ids, position_ids = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
+            _dbg(f"warmup iter {tbar_idx}: context_init done")
             # Progress.
             tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:
@@ -1630,12 +1642,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
 
+        import sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        def _dbg(msg):
+            _dbg_f.write(f"[ENGINE] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [ENGINE] {msg}", flush=True, file=sys.stderr)
+
+        _dbg("async_forward enter")
+
         # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
         # schedule requests
+        _dbg("schedule_waiting_requests start")
         self.schedule_waiting_requests()
+        _dbg(f"schedule_waiting_requests done (total={self.context.total_request_count}, paused={self.context.paused_request_count}, tokens={self.context.active_token_count})")
 
         # Saving pre-step state, for printing output below.
         is_decode_only = self.context.is_decode_only()
@@ -1654,7 +1677,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
+        _dbg("async_generate_output_tokens_dynamic_batch start")
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        _dbg("async_generate_output_tokens_dynamic_batch done")
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -2283,17 +2308,30 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
 
+        import sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        _iter = 0
+        def _dbg(msg):
+            _dbg_f.write(f"[COORD iter={_iter}] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [COORD iter={_iter}] {msg}", flush=True, file=sys.stderr)
+
         try:
             while True:
+                _iter += 1
+                _dbg(f"loop top (state={self.state})")
                 self.schedule_requests()
+                _dbg(f"schedule done (active={self.context.get_active_request_count()}, waiting={len(self.waiting_request_ids)})")
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
+                    _dbg(f"ep_consensus start (local_pending={local_pending})")
                     global_work, all_pausing = await self._ep_establish_consensus(
                         local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                     )
+                    _dbg(f"ep_consensus done (global_work={global_work}, all_pausing={all_pausing})")
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2303,15 +2341,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
+                            _dbg("async_step start")
                             await self.async_step()
+                            _dbg("async_step done")
                         else:
                             # Dummy forward to participate in the EP collective.
+                            _dbg("dummy_forward start")
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
+                            _dbg("dummy_forward done")
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

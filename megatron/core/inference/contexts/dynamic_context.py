@@ -1659,11 +1659,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
+        import os, sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        def _dbg(msg):
+            _dbg_f.write(f"[ATTN] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [ATTN] {msg}", flush=True, file=sys.stderr)
+
+        _dbg(f"build_active_slices start (padded_req={self.padded_active_request_count}, padded_tok={self.padded_active_token_count}, paused={self.paused_request_count}, total={self.total_request_count})")
         self.build_active_slices(self.padded_active_request_count)
+        _dbg("build_active_slices done")
         self.pad_active_slices()
+        _dbg("pad_active_slices done")
 
         batch_size = self.total_request_count - self.paused_request_count
         assert self.active_attn_metadata is not None
+        _dbg(f"mha_metadata.update start (batch_size={batch_size})")
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=self.active_request_query_lengths[:batch_size],
             request_kv_length_offsets=self.active_request_kv_length_offsets[:batch_size],
@@ -1672,6 +1683,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             padded_batch_dimensions=self.padded_batch_dimensions,
             num_speculative_tokens=self.num_speculative_tokens,
         )
+        _dbg("mha_metadata.update done")
 
         if self.is_hybrid_model:
             active_slice = slice(self.paused_request_count, self.total_request_count)

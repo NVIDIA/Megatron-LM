@@ -107,6 +107,11 @@ class TextGenerationController:
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
+        import sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        _dbg_f.write("[INIT] _init_dynamic_sampling_tensors start\n"); _dbg_f.flush()
+        print(f"[rank{_rank}] [INIT] _init_dynamic_sampling_tensors start", flush=True, file=sys.stderr)
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         if context.config.materialize_only_last_token_logits:
@@ -143,6 +148,8 @@ class TextGenerationController:
             self._torch_sampling_buckets: List[Tuple] = []
 
         self._init_mtp_sampling_tensor()
+        _dbg_f.write("[INIT] _init_dynamic_sampling_tensors done\n"); _dbg_f.flush()
+        print(f"[rank{_rank}] [INIT] _init_dynamic_sampling_tensors done", flush=True, file=sys.stderr)
 
     def _init_mtp_sampling_tensor(self):
         """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
@@ -626,11 +633,20 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
 
+        import os, sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        def _dbg(msg):
+            _dbg_f.write(f"[FWD] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [FWD] {msg}", flush=True, file=sys.stderr)
+
+        _dbg(f"run_one_forward_step start (logits_seq_len={logits_seq_len})")
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
             # logits shape: [1, seq_len, vocab_size]
+        _dbg(f"run_one_forward_step done (logits={'None' if logits is None else tuple(logits.shape)})")
 
         # Note: When speculative decoding is active (num_speculative_tokens > 0),
         # the model skips MTP computation during the forward pass. MTP logits
@@ -653,12 +669,14 @@ class TextGenerationController:
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
+            _dbg("broadcast_from_last_pipeline_stage start")
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
                 dtype=self.model_config.params_dtype,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
+            _dbg("broadcast_from_last_pipeline_stage done")
 
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
@@ -1754,11 +1772,20 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        import os, sys
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _dbg_f = open(f"/tmp/tde_debug_rank{_rank}.log", "a")
+        def _dbg(msg):
+            _dbg_f.write(f"[STEP] {msg}\n"); _dbg_f.flush()
+            print(f"[rank{_rank}] [STEP] {msg}", flush=True, file=sys.stderr)
+
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        _dbg(f"context_init start (tokens={context.active_token_count}, reqs={active_request_count})")
         input_ids, position_ids = self._dynamic_step_context_init()
+        _dbg(f"context_init done (input_ids.shape={tuple(input_ids.shape)})")
 
         cuda_graph_request_count = (
             context.padded_active_request_count if context.is_decode_only() else None
@@ -1771,7 +1798,9 @@ class TextGenerationController:
 
         # Forward pass produces only base logits. When speculative decoding is
         # active, MTP logits are computed serially after verification.
+        _dbg("forward_logits start")
         self._dynamic_step_forward_logits(input_ids, position_ids)
+        _dbg("forward_logits done")
 
         # Commit Mamba intermediate states before update_requests, which
         # may swap request indices. The Python lists tracking EOS block IDs
@@ -1790,10 +1819,13 @@ class TextGenerationController:
         # asynchronous.
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
+        _dbg("yield start")
         await asyncio.sleep(0)
+        _dbg("yield done")
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
         self._dynamic_step_sample_bookkeeping()
+        _dbg("sample_logits start")
 
         if self.num_speculative_tokens > 0:
             # Phase 1: Verify speculative tokens using base logits only.
@@ -1810,6 +1842,7 @@ class TextGenerationController:
             self._compute_serial_mtp_and_sample()
         else:
             self._dynamic_step_sample_logits()
+        _dbg("sample_logits done")
 
         log_probs = None
         top_n_logprobs = None
@@ -1825,10 +1858,12 @@ class TextGenerationController:
                 if return_top_n_logprobs:
                     top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
 
+        _dbg("bookkeeping start")
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
+        _dbg("bookkeeping done")
 
         ret = {
             # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
