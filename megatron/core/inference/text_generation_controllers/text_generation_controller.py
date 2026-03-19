@@ -8,6 +8,7 @@ import inspect
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -1268,6 +1269,75 @@ class TextGenerationController:
 
         return routing_indices_per_request
 
+    def _store_routing_per_block(
+        self, routing_indices_per_request: Optional[Dict[int, np.ndarray]]
+    ) -> None:
+        """Distribute per-request routing indices into per-block storage.
+
+        Uses the context's token-to-block mapping to scatter each token's
+        routing data into the appropriate block in the allocator. Matched
+        (prefix-cached) blocks already have routing from the original request
+        and are not overwritten here since their tokens are not in the active
+        token layout.
+
+        Args:
+            routing_indices_per_request: Dict mapping request_id to routing
+                ndarray [num_tokens, num_layers, topk], or None.
+        """
+        if routing_indices_per_request is None:
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        allocator = context.kv_block_allocator
+        token_count = context.active_token_count
+        if token_count == 0:
+            return
+
+        # Get token-to-block mapping for all active tokens
+        block_ids = context.token_to_block_idx[:token_count]
+        positions = context.token_to_local_position_within_kv_block[:token_count]
+
+        # Reconstruct flat routing in active-request order
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].tolist()
+        routing_parts = [
+            routing_indices_per_request[rid]
+            for rid in active_request_ids
+            if rid in routing_indices_per_request
+        ]
+        if not routing_parts:
+            return
+        flat_routing = np.concatenate(routing_parts, axis=0)  # [token_count, num_layers, topk]
+        assert flat_routing.shape[0] == token_count, (
+            f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
+        )
+
+        # Convert GPU tensors to numpy for dict-based storage
+        block_ids_np = block_ids.cpu().numpy()
+        positions_np = positions.cpu().numpy()
+
+        dummy = allocator.dummy_block_idx
+
+        # Group tokens by block_id using sort for efficient scatter
+        unique_blocks, inverse, counts = np.unique(
+            block_ids_np, return_inverse=True, return_counts=True
+        )
+        sorted_indices = np.argsort(inverse, kind='stable')
+        sorted_positions = positions_np[sorted_indices]
+        sorted_routing = flat_routing[sorted_indices]
+
+        offset = 0
+        for bid, count in zip(unique_blocks, counts):
+            bid = int(bid)
+            count = int(count)
+            if bid == dummy:
+                offset += count
+                continue
+            block_pos = sorted_positions[offset : offset + count]
+            block_rout = sorted_routing[offset : offset + count]
+            allocator.store_block_routing(bid, block_pos, block_rout)
+            offset += count
+
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
@@ -1715,6 +1785,17 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        # Save block IDs for finished requests before update_requests releases them.
+        # Needed for per-block routing reconstruction in the engine.
+        finished_routing_block_ids = {}
+        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = blocks[blocks >= 0].tolist()
+                if valid:
+                    finished_routing_block_ids[req_id] = valid
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused _sampled_tokens_cuda buffer.
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -1732,6 +1813,7 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
+            "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
         }
 
@@ -1784,6 +1866,12 @@ class TextGenerationController:
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()
+
+        # Store routing per-block for MoE routing replay reconstruction.
+        # Must be done while token-to-block mappings are still valid (before update_requests).
+        self._store_routing_per_block(routing_indices_per_request)
+        # Per-step routing is no longer needed; reconstruction happens from blocks at completion.
+        routing_indices_per_request = None
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.

@@ -3,6 +3,7 @@
 from collections import deque
 from typing import Callable, Dict, Optional
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -72,6 +73,12 @@ class KVBlockAllocator:
                 self.block_timestamps = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
                 )
+
+        # Per-block routing storage for MoE routing replay.
+        # Maps block_id -> ndarray [block_size_tokens, num_layers, topk].
+        # Routing data persists through block release/deregister and is only
+        # cleared when a block is re-allocated or the allocator is reset.
+        self.block_routing: Dict[int, np.ndarray] = {}
 
     def __str__(self):
         return (
@@ -183,6 +190,11 @@ class KVBlockAllocator:
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
+        # Clear stale routing data for newly allocated blocks
+        if self.block_routing:
+            for bid in block_ids.tolist():
+                self.block_routing.pop(bid, None)
+
         return block_ids
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
@@ -244,6 +256,9 @@ class KVBlockAllocator:
         )
 
         self.total_avail = self.total_count - 1
+
+        # Clear per-block routing data
+        self.block_routing.clear()
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -358,3 +373,33 @@ class KVBlockAllocator:
         self._deregister_blocks(blocks_to_evict)
 
         return True
+
+    # =========================================================================
+    # Per-block routing storage methods (for MoE routing replay)
+    # =========================================================================
+
+    def store_block_routing(self, block_id: int, positions: np.ndarray, routing: np.ndarray) -> None:
+        """Store routing indices for specific token positions in a block.
+
+        Args:
+            block_id: The block ID.
+            positions: ndarray of token positions within the block (1D, int).
+            routing: ndarray of routing data [num_positions, num_layers, topk].
+        """
+        if block_id not in self.block_routing:
+            self.block_routing[block_id] = np.zeros(
+                (self.context.block_size_tokens, routing.shape[-2], routing.shape[-1]),
+                dtype=routing.dtype,
+            )
+        self.block_routing[block_id][positions] = routing
+
+    def get_block_routing(self, block_id: int) -> Optional[np.ndarray]:
+        """Get stored routing indices for a block.
+
+        Args:
+            block_id: The block ID.
+
+        Returns:
+            ndarray of shape [block_size_tokens, num_layers, topk] or None.
+        """
+        return self.block_routing.get(block_id)

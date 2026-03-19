@@ -16,6 +16,7 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -45,6 +46,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    connect_to_ray_block_store,
     prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -260,6 +262,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Routing indices dtype for numpy storage.
+        _num_experts = model_config.num_moe_experts or 0
+        self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -521,6 +527,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
+
+        # Connect to block store only on the mp coordinator rank.
+        if self.context.config.store_routing_indices_in_ray_block_store:
+            model_config = self.controller.inference_wrapped_model.model.config
+            assert model_config.moe_enable_routing_replay, (
+                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay to be enabled."
+            )
+        if self.context.config.store_routing_indices_in_ray_block_store and self.is_mp_coordinator:
+            conn = connect_to_ray_block_store()
+            self.block_store_instance = conn.instance
+            self.block_store_instance_rank = conn.instance_rank
+            self.block_store_instance_id = conn.instance_id
 
         local_ip = socket.gethostname()
 
@@ -1046,6 +1064,7 @@ class DynamicInferenceEngine(AbstractEngine):
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
+        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1062,7 +1081,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 list of (top_n_logprobs, top_n_indices) tuples.
             routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
                 pre-mapped by request_id. Each value is a tensor of shape
-                [num_tokens_this_step, num_layers, topk].
+                [num_tokens_this_step, num_layers, topk]. Unused when per-block
+                routing is active (routing_indices_per_request will be None).
+            finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
+                finished requests, saved before update_requests released them.
+                Used for per-block routing reconstruction.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1186,6 +1209,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_accepted += actual_accepted
 
                 if request_id in finished_request_ids:
+                    # Reconstruct routing from per-block storage before popping.
+                    if (
+                        finished_routing_block_ids
+                        and request_id in finished_routing_block_ids
+                        and len(self.requests[request_id].record.requests) == 1
+                    ):
+                        block_ids = finished_routing_block_ids[request_id]
+                        total_tokens = len(request.prompt_tokens) + len(
+                            request.generated_tokens
+                        )
+                        request.routing_indices = self._reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
+                        )
+
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
@@ -1287,18 +1324,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Process routing indices if available (keyed by request_id)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
             # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
             if (
                 routing_indices_per_request is not None
                 and request_id in routing_indices_per_request
             ):
                 step_routing = routing_indices_per_request[
                     request_id
-                ]  # [num_tokens, num_layers, topk]
+                ].cpu().numpy().astype(self._routing_indices_dtype)  # [num_tokens, num_layers, topk]
                 if request.routing_indices is None:
-                    request.routing_indices = step_routing.clone()
+                    request.routing_indices = step_routing
                 else:
-                    request.routing_indices = torch.cat(
-                        [request.routing_indices, step_routing], dim=0
+                    request.routing_indices = np.concatenate(
+                        [request.routing_indices, step_routing], axis=0
                     )
 
         # Handle evicted requests.
@@ -1401,6 +1439,45 @@ class DynamicInferenceEngine(AbstractEngine):
             Dict with coordination stats including the number of scheduling waits.
         """
         return {"waits": self._prefix_coordination_waits}
+
+    def _reconstruct_routing_from_blocks(
+        self, block_ids: list[int], total_routing_tokens: int
+    ) -> Optional[np.ndarray]:
+        """Reconstruct routing indices from per-block storage.
+
+        Concatenates per-block routing ndarrays in block order, trimming the
+        last block to exactly ``total_routing_tokens`` entries.
+
+        Args:
+            block_ids: Ordered list of block IDs for the request.
+            total_routing_tokens: Expected number of routing tokens
+                (total_tokens - 1, since the last generated token has no
+                forward-pass routing).
+
+        Returns:
+            ndarray [total_routing_tokens, num_layers, topk] or None if any
+            block is missing routing data.
+        """
+        allocator = self.context.kv_block_allocator
+        block_size = self.context.block_size_tokens
+        routing_parts = []
+        tokens_collected = 0
+
+        for bid in block_ids:
+            routing = allocator.get_block_routing(bid)
+            if routing is None:
+                return None  # Missing routing data for this block
+            remaining = total_routing_tokens - tokens_collected
+            if remaining <= 0:
+                break
+            take = min(block_size, remaining)
+            routing_parts.append(routing[:take])
+            tokens_collected += take
+
+        if not routing_parts or tokens_collected != total_routing_tokens:
+            return None
+
+        return np.concatenate(routing_parts, axis=0)
 
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
         """Find farthest block with cached Mamba state by iterating from the end.
@@ -1721,6 +1798,7 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
+            finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1741,6 +1819,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 routing_indices_per_request,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
+                finished_routing_block_ids=finished_routing_block_ids,
             )
 
         else:
@@ -1778,6 +1857,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
+
+        # Dump routing indices to block store before coordinator communication.
+        if getattr(self, 'block_store_instance', None) is not None and finished_request_records:
+            for r in finished_request_records:
+                r.dump_routing_indices_to_block_store(
+                    self.block_store_instance,
+                    self.block_store_instance_rank,
+                    self.block_store_instance_id,
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
