@@ -15,7 +15,7 @@ from transformers import WhisperConfig, WhisperModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
-from megatron.core.models.mimo.config.role import LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, PipelineMode
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -306,8 +306,8 @@ class TestMimoModel:
         checkpoint_dict = mimo_model.state_dict_for_save_checkpoint()
         assert len(checkpoint_dict) > 0
 
-    def test_pipeline_model_parallel_assertion(self):
-        """Test that MimoModel raises AssertionError when pipeline_model_parallel_size > 1."""
+    def test_pipeline_model_parallel_accepted(self):
+        """Test that MimoModel accepts pipeline_model_parallel_size > 1."""
         lm_config_pp2 = TransformerConfig(
             num_layers=2,
             hidden_size=self.hidden_size,
@@ -333,8 +333,8 @@ class TestMimoModel:
             special_token_ids=self.special_token_ids,
         )
 
-        with pytest.raises(AssertionError, match="Pipeline parallelism is not supported"):
-            MimoModel(mimo_config)
+        model = MimoModel(mimo_config)
+        assert model is not None
 
     def test_partition_adapter_none_by_default(self):
         """Test that partition_adapter is None with default config (no CP/SP)."""
@@ -507,7 +507,7 @@ class TestMimoModelNonColocated:
                     pp_rank=pp_rank,
                     pp_size=pp_size,
                 ),
-                LANGUAGE_MODULE_KEY: MockGrid(
+                MIMO_LANGUAGE_MODULE_KEY: MockGrid(
                     rank_offset=language_offset,
                     size=1,
                     dim_names=["pp"] if pp_size > 1 else [],
@@ -530,7 +530,7 @@ class TestMimoModelNonColocated:
             language_model_spec=language_model_spec,
             modality_submodules_spec={"images": vision_submodule_spec},
             special_token_ids={"images": 50257},
-            module_to_grid_map={LANGUAGE_MODULE_KEY: MockGrid()},
+            module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: MockGrid()},
         )
 
         with pytest.raises(ValueError, match="module_to_grid_map keys must match"):
@@ -548,7 +548,7 @@ class TestMimoModelNonColocated:
             self.patch_dim,
             {"images": 50257},
         )
-        assert model_no_grid.role.colocated is True
+        assert model_no_grid.role.mode == PipelineMode.UNIFIED
         assert model_no_grid.role.has_language_module is True
         assert model_no_grid.role.has_modality_modules is True
 

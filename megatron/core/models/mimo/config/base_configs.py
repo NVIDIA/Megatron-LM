@@ -2,8 +2,9 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -20,10 +21,10 @@ class MimoModelConfig:
             Dictionary mapping modality names to their special token IDs.
             For example, {"vision": -200, "audio":32000}, these represent placeholders
             in the input_ids to insert the modality embeddings at the correct positions.
-        module_to_grid_map (Optional[Dict[str, Any]]):
+        module_to_grid_map (Optional[Dict[str, HyperCommGrid]]):
             Dictionary mapping module keys (e.g., "vision", "language") to their
-            corresponding grid configurations for non-colocated pipeline parallelism.
-            The language model must use the key "language" (LANGUAGE_MODULE_KEY).
+            corresponding HyperCommGrid configurations for non-colocated pipeline
+            parallelism. The language model must use the key MIMO_LANGUAGE_MODULE_KEY.
             When None, all modules are assumed to be colocated on the same ranks.
         kv_format (str):
             Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
@@ -40,5 +41,5 @@ class MimoModelConfig:
     language_model_spec: ModuleSpec = field(default_factory=ModuleSpec)
     modality_submodules_spec: Dict[str, ModuleSpec] = field(default_factory=dict)
     special_token_ids: Dict[str, int] = field(default_factory=dict)
-    module_to_grid_map: Optional[Dict[str, Any]] = None
+    module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
