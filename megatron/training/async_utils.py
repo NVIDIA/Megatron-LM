@@ -17,18 +17,15 @@ from megatron.training.utils import print_rank_0
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
-
-    # Singleton manager of async calls
-    _async_calls_queue = None
 except (ImportError, ModuleNotFoundError):
-    from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
     from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
 
     NVRxAsyncRequest = ABC
-    # Singleton manager of async calls
-    _async_calls_queue = AsyncCallsQueue()
 
 logger = logging.getLogger(__name__)
+
+# Singleton manager of async calls
+_async_calls_queue = None
 
 
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
