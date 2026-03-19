@@ -2149,10 +2149,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.delay_wgrad_compute_for_te_grouped_gemm:
-            assert self.moe_latent_size is None, (
-                'moe_latent_size must be disabled when enabling '
-                'delay_wgrad_compute_for_te_grouped_gemm.'
-            )
             assert not self.overlap_moe_expert_parallel_comm, (
                 'overlap_moe_expert_parallel_comm must be disabled when enabling '
                 'delay_wgrad_compute_for_te_grouped_gemm.'
