@@ -960,76 +960,62 @@ class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b0].item() == 1
 
     @pytest.mark.internal
-    def test_flop_efficiency_prefers_longer_prefix(self):
-        """Under memory pressure, shorter-prefix blocks are evicted before longer-prefix blocks."""
-        ctx = self._ctx_flop()
+    @pytest.mark.parametrize(
+        "alpha,trigger_blocks,expected_evicted",
+        [
+            (0.0, 8, "long"),  # Pure LRU: evicts oldest
+            (1.0, 8, "medium"),  # Balanced: evicts low-efficiency + not-newest
+            (100.0, 4, "short"),  # FLOP-dominant: evicts lowest efficiency
+        ],
+    )
+    def test_flop_efficiency_eviction_ordering(self, alpha, trigger_blocks, expected_evicted):
+        """Sweep alpha to verify 3 eviction regimes: oldest, medium, shallowest."""
+        ctx = self._ctx_flop(
+            flop_alpha=alpha,
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+        )
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator
 
-        # Request A: 1-block prefix
-        prompt_a = self._prompt(bs)
-        ctx.add_request(self._req(ctx, prompt_a.clone()))
+        # Long request: 8 blocks (indices 0-7), tracked block at deepest index 7
+        prompt_long = self._prompt(bs * 8)
+        ctx.add_request(self._req(ctx, prompt_long.clone()))
         ctx.prefix_cache_lru_clock += 1
 
-        # Request B: 3-block prefix (blocks at indices 0, 1, 2)
-        prompt_b = self._prompt(bs * 3, offset=5000)
-        ctx.add_request(self._req(ctx, prompt_b.clone(), request_id=2))
+        # Medium request: 2 blocks (indices 0-1), tracked block at index 1
+        prompt_med = self._prompt(bs * 2, offset=5000)
+        ctx.add_request(self._req(ctx, prompt_med.clone(), request_id=2))
         ctx.prefix_cache_lru_clock += 1
 
-        # Gather hashes before release
-        hash_a = alloc.block_hashes[ctx.request_to_kv_block_ids[0][0].item()].item()
-        hash_b2 = alloc.block_hashes[ctx.request_to_kv_block_ids[1][2].item()].item()
+        # Short request: 1 block (index 0), tracked block at index 0
+        prompt_short = self._prompt(bs, offset=9000)
+        ctx.add_request(self._req(ctx, prompt_short.clone(), request_id=3))
+        ctx.prefix_cache_lru_clock += 1
 
-        # Release both requests (blocks stay cached under FLOP_EFFICIENCY)
+        # Capture tracked block hashes (deepest block per request)
+        hashes = {
+            "long": alloc.block_hashes[ctx.request_to_kv_block_ids[0][7].item()].item(),
+            "medium": alloc.block_hashes[ctx.request_to_kv_block_ids[1][1].item()].item(),
+            "short": alloc.block_hashes[ctx.request_to_kv_block_ids[2][0].item()].item(),
+        }
+
+        # Release all requests; blocks stay cached under FLOP_EFFICIENCY
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([2]))
         ctx.total_request_count = 0
 
-        # Exhaust free pool to force eviction when adding the next request
+        # Exhaust free pool to force eviction
         alloc.total_avail = 0
 
-        # Add a disjoint request to trigger eviction
-        prompt_c = self._prompt(bs * 2, offset=9000)
-        ctx.add_request(self._req(ctx, prompt_c.clone(), request_id=3))
+        # Add trigger request with disjoint tokens to force eviction
+        prompt_trigger = self._prompt(bs * trigger_blocks, offset=20000)
+        ctx.add_request(self._req(ctx, prompt_trigger.clone(), request_id=4))
 
-        # The short-prefix block (request A) should be evicted first
-        assert hash_a not in alloc.kv_hash_to_block_id
-        # The long-prefix block (index 2 of request B) should survive
-        assert hash_b2 in alloc.kv_hash_to_block_id
-
-    @pytest.mark.internal
-    def test_flop_efficiency_alpha_zero_fallback(self):
-        """With alpha=0.0, eviction ordering matches pure LRU (oldest evicted first)."""
-        ctx = self._ctx_flop(flop_alpha=0.0)
-        bs = ctx.block_size_tokens
-        alloc = ctx.kv_block_allocator
-
-        # Request A: 1-block prefix, added first (oldest timestamp)
-        prompt_a = self._prompt(bs)
-        ctx.add_request(self._req(ctx, prompt_a.clone()))
-        ctx.prefix_cache_lru_clock += 1
-
-        # Request B: 1-block prefix, added second (newer timestamp)
-        prompt_b = self._prompt(bs, offset=5000)
-        ctx.add_request(self._req(ctx, prompt_b.clone(), request_id=2))
-        ctx.prefix_cache_lru_clock += 1
-
-        hash_a = alloc.block_hashes[ctx.request_to_kv_block_ids[0][0].item()].item()
-        hash_b = alloc.block_hashes[ctx.request_to_kv_block_ids[1][0].item()].item()
-
-        # Release both (blocks stay cached)
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        ctx.total_request_count = 0
-
-        # Exhaust free pool to force eviction of exactly 1 block
-        alloc.total_avail = 0
-
-        # Add disjoint 1-block request to trigger eviction of 1 block
-        prompt_c = self._prompt(bs, offset=9000)
-        ctx.add_request(self._req(ctx, prompt_c.clone(), request_id=3))
-
-        # With alpha=0.0, only recency matters: oldest block (A) evicted first
-        assert hash_a not in alloc.kv_hash_to_block_id
-        # Newer block (B) should survive
-        assert hash_b in alloc.kv_hash_to_block_id
+        # The expected block should be evicted
+        assert hashes[expected_evicted] not in alloc.kv_hash_to_block_id
+        # The other two tracked blocks should survive
+        for name in hashes:
+            if name != expected_evicted:
+                assert hashes[name] in alloc.kv_hash_to_block_id
