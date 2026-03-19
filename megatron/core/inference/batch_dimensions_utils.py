@@ -142,6 +142,7 @@ class InferenceBatchDimensions:
         decode_only_cuda_graphs: bool,
         explicit_chunked_prefill: bool,
         smallest_non_decode_cuda_graph_size: int,
+        requires_mamba_state_extraction: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
@@ -152,6 +153,8 @@ class InferenceBatchDimensions:
             strict: Whether to use strict matching for batch dimensions.
             decode_only_cuda_graphs: Whether CUDA graphs are only used for decode steps.
             explicit_chunked_prefill: Whether chunked prefill is enabled with explicit requests
+            requires_mamba_state_extraction: Whether this rank needs to extract intermediate
+                Mamba states
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
@@ -173,6 +176,7 @@ class InferenceBatchDimensions:
                 int(is_non_decode),
                 local_batch_dims.prefill_req_count,
                 local_batch_dims.decode_req_count,
+                int(requires_mamba_state_extraction),
             ],
             dtype=torch.int32,
             device=torch.cuda.current_device(),
@@ -182,6 +186,7 @@ class InferenceBatchDimensions:
 
         sync_tensor = sync_tensor.cpu()
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
+        is_any_ep_rank_requiring_mamba_extraction = sync_tensor[4].item() == 1
 
         # We force eager mode for scenarios where some ranks will run with CUDA graphs
         # while others will not. Without this check, communication in the
@@ -191,8 +196,11 @@ class InferenceBatchDimensions:
         #   1. If we only allow decode CUDA graphs but some ranks are running non-decode batches
         #   2. Some ranks are running explicit chunked prefill requests
         #       (graphs are not recorded for batches with explicit chunked prefill requests)
+        #   3. Some ranks need to extract intermediate Mamba model states
         if is_any_ep_rank_in_non_decode and (decode_only_cuda_graphs or explicit_chunked_prefill):
             return None  # indicate no match, run in eager mode
+        elif is_any_ep_rank_requiring_mamba_extraction:
+            return None
 
         # If strict matching is enabled, we sync the request counts across EP ranks
         # to ensure the graph captures the maximum needed capacity.
@@ -504,6 +512,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         explicit_chunked_prefill: bool = False,
+        requires_mamba_state_extraction: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional[InferenceBatchDimensions]:
         """
@@ -518,6 +527,7 @@ class CUDAGraphBatchDimensionBuilder:
             and one of the EP ranks is running a non-decode step, we elect to run in
             eager mode instead of matching a decode-only cuda graph.
             explicit_chunked_prefill: Whether chunked prefill is enabled with explicit requests
+            requires_mamba_state_extraction: Whether intermediate Mamba states need to be extracted
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
@@ -534,6 +544,7 @@ class CUDAGraphBatchDimensionBuilder:
             strict=strict,
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             explicit_chunked_prefill=explicit_chunked_prefill,
+            requires_mamba_state_extraction=requires_mamba_state_extraction,
             ep_group=ep_group,
             smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
         )
@@ -545,6 +556,9 @@ class CUDAGraphBatchDimensionBuilder:
             return None
 
         if explicit_chunked_prefill and real_batch_dim.prefill_req_count > 0:
+            return None
+
+        if requires_mamba_state_extraction:
             return None
 
         # first filter out batch dimensions with smaller token count, prefill req count,
