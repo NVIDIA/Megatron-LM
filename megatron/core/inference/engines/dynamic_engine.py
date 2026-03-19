@@ -1198,9 +1198,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         and len(self.requests[request_id].record.requests) == 1
                     ):
                         block_ids = finished_routing_block_ids[request_id]
-                        total_tokens = len(request.prompt_tokens) + len(
-                            request.generated_tokens
-                        )
+                        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
                         request.routing_indices = self._reconstruct_routing_from_blocks(
                             block_ids, total_tokens - 1
                         )

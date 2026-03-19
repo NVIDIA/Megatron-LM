@@ -377,9 +377,7 @@ class KVBlockAllocator:
     # Per-block routing storage methods (for MoE routing replay)
     # =========================================================================
 
-    def store_block_routing(
-        self, block_id: int, positions: Tensor, routing: Tensor
-    ) -> None:
+    def store_block_routing(self, block_id: int, positions: Tensor, routing: Tensor) -> None:
         """Store routing indices for specific token positions in a block.
 
         Args:

@@ -997,9 +997,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Store routing for both blocks
         for bid in [b0, b1]:
-            alloc.store_block_routing(
-                bid, torch.arange(bs), torch.randn(bs, 4, 2)
-            )
+            alloc.store_block_routing(bid, torch.arange(bs), torch.randn(bs, 4, 2))
 
         # Release blocks (REF_ZERO deregisters immediately)
         blocks = ctx.request_to_kv_block_ids[0]
@@ -1056,9 +1054,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Verify content: first block
         expected_b0 = (
-            torch.arange(bs * num_layers * topk, dtype=torch.float32).reshape(
-                bs, num_layers, topk
-            )
+            torch.arange(bs * num_layers * topk, dtype=torch.float32).reshape(bs, num_layers, topk)
             + bids[0]
         )
         assert torch.allclose(result[:bs], expected_b0)
@@ -1083,9 +1079,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bids = block_ids.tolist()
 
         # Only store routing for the first block
-        alloc.store_block_routing(
-            bids[0], torch.arange(bs), torch.randn(bs, 4, 2)
-        )
+        alloc.store_block_routing(bids[0], torch.arange(bs), torch.randn(bs, 4, 2))
 
         engine = _StubEngine(ctx)
         result = engine._reconstruct_routing_from_blocks(bids, 2 * bs)
