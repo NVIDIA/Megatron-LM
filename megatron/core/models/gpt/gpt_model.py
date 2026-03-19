@@ -549,16 +549,14 @@ class GPTModel(LanguageModule):
                 cp_size = self.pg_collection.cp.size()
             else:
                 cp_size = self.config.context_parallel_size
-            device = decoder_input.device if decoder_input is not None else attention_mask.device
-            dtype = decoder_input.dtype if decoder_input is not None else self.config.params_dtype
             attention_bias = to_zz_mask_attn_bias(
                 attention_mask,
                 cp_size=cp_size,
                 nheads=self.config.num_attention_heads,
                 nheads_k=self.config.num_query_groups,
                 heads_k_stride=1,
-                device=device,
-                dtype=dtype,
+                device=torch.cuda.current_device(),
+                dtype=self.config.params_dtype,
             )
 
         # Run decoder.
