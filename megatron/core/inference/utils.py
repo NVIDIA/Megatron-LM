@@ -166,8 +166,9 @@ def check_flashinfer_jit_cache_installed():
     Raises:
         RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
     """
-    import torch
     from importlib.metadata import PackageNotFoundError, version
+
+    import torch
 
     try:
         ver = version("flashinfer-jit-cache")
