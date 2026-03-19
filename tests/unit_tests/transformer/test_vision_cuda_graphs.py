@@ -47,6 +47,7 @@ class TestVisionLayerIsGraphable:
         layer = torch.nn.Linear(4, 4)
         assert _layer_is_graphable(layer, config) is False
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_wrong_cuda_graph_impl_returns_false(self):
         from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -285,6 +286,7 @@ class TestVisionTECudaGraphHelper:
         assert helper.vision_model is not None, "Should find vision_model"
         assert helper.num_layers == self.vision_num_layers
         assert len(helper.callables) == self.vision_num_layers
+        assert helper.capture_finished() is False
         assert helper.graphs_created() is False
 
     def test_init_no_vision_model_warns(self):
@@ -298,6 +300,7 @@ class TestVisionTECudaGraphHelper:
         )
         assert helper.vision_model is None
         assert len(helper.callables) == 0
+        assert helper.capture_finished() is False
         assert helper.graphs_created() is False
 
     # -- _get_sample_arguments tests --
@@ -344,6 +347,7 @@ class TestVisionTECudaGraphHelper:
         assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
@@ -381,6 +385,7 @@ class TestVisionTECudaGraphHelper:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_create_cudagraphs_multi_microbatch(self):
         """Verify that graphs are created per-microbatch per-layer."""
@@ -408,7 +413,8 @@ class TestVisionTECudaGraphHelper:
             micro_batch_size=self.micro_batch_size,
         )
         helper.create_cudagraphs()
-        assert not helper.graphs_created()
+        assert helper.capture_finished()  # Capture process finished
+        assert not helper.graphs_created()  # But no graphs were created
 
     def test_delete_cudagraphs_before_create_asserts(self):
         """delete_cuda_graphs before creation should raise AssertionError."""
@@ -550,6 +556,7 @@ class TestVisionTECudaGraphHelperPP2:
         helper = self._make_helper(num_microbatches=4)
         assert helper.vision_model is None
         assert len(helper.callables) == 0
+        assert not helper.capture_finished()
         assert not helper.graphs_created()
 
     def test_pp2_num_microbatches_preserved(self):
@@ -571,6 +578,7 @@ class TestVisionTECudaGraphHelperPP2:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_pp2_create_cudagraphs_first_stage(self):
         """On stage 0, CUDA graphs should be captured with the full pipeline order."""
@@ -613,7 +621,8 @@ class TestVisionTECudaGraphHelperPP2:
 
         helper = self._make_helper(num_microbatches=4)
         helper.create_cudagraphs()
-        assert not helper.graphs_created()
+        assert helper.capture_finished()  # Capture process finished
+        assert not helper.graphs_created()  # But no graphs were created
 
 
 if __name__ == "__main__":

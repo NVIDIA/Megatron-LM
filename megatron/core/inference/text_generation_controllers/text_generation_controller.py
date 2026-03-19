@@ -157,58 +157,64 @@ class TextGenerationController:
                 * -1
             )
 
-    def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
+    @staticmethod
+    def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
 
         Args:
+            tokenizer: The tokenizer to use.
             prompt (str): The input prompt.
+            add_BOS (bool): Whether to add a BOS token.
 
         Returns:
             List[int]: Returns the tokenized prompt.
         """
 
-        prompt_tokens = self.tokenizer.tokenize(prompt)
+        prompt_tokens = tokenizer.tokenize(prompt)
 
         if add_BOS:
-            assert self.tokenizer.bos is not None
+            assert tokenizer.bos is not None
 
-        while prompt_tokens and prompt_tokens[0] == self.tokenizer.bos:
+        while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
             prompt_tokens.pop(0)
 
         if add_BOS:
-            prompt_tokens = [self.tokenizer.bos] + prompt_tokens
+            prompt_tokens = [tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
 
-    def _detokenize(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+    @staticmethod
+    def detokenize(
+        tokenizer, tokens: List[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+    ) -> str:
         """
-        Detokenize a sequence of token IDs, handling skip_special_tokens for
-        different tokenizer APIs.
-
-        On the first call, inspects `self.tokenizer.detokenize` to see if it accepts
-        a `skip_special_tokens` keyword argument, and caches that result on `self`.
-        Subsequent calls will use the cached flag to invoke `detokenize` with the
-        correct signature (with or without `skip_special_tokens`).
+        Detokenize a sequence of token IDs, optionally removing trailing EOD
+        tokens and handling skip_special_tokens for different tokenizer APIs.
 
         Args:
+            tokenizer: The tokenizer to use for detokenization.
             tokens (List[int]): The token IDs to convert back to text.
+            remove_EOD (bool): Whether to remove trailing EOD tokens before
+                detokenization. Defaults to True.
             skip_special_tokens (bool): Whether to remove special tokens (e.g. BOS/EOS)
                 during detokenization. Only passed through if the tokenizer supports it.
 
         Returns:
             str: The detokenized string.
         """
-        # cache the check on first call
-        if not hasattr(self, "_detok_accepts_skip"):
-            sig_params = inspect.signature(self.tokenizer.detokenize).parameters.values()
-            self._detok_accepts_skip = any(
-                p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig_params
-            )
-        if self._detok_accepts_skip:
-            return self.tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+            while tokens and tokens[-1] == tokenizer.eod:
+                tokens = tokens[:-1]
+
+        sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
+        detok_accepts_skip = any(
+            p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig_params
+        )
+        if detok_accepts_skip:
+            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
         else:
-            return self.tokenizer.detokenize(tokens)
+            return tokenizer.detokenize(tokens)
 
     def detokenize_generations(
         self,
@@ -237,7 +243,10 @@ class TextGenerationController:
 
         if not detokenize_segments:
             tokens = tokens_gpu_tensor.tolist()
-            return self._detokenize(tokens, skip_special_tokens=skip_special_tokens), None
+            return (
+                self.detokenize(self.tokenizer, tokens, skip_special_tokens=skip_special_tokens),
+                None,
+            )
 
         prompts_plus_generations: List[str] = []
         prompts_plus_generations_segments: List[List[str]] = []
@@ -247,7 +256,7 @@ class TextGenerationController:
 
         for sequence_tokens, length in zip(tokens, lengths):
             sequence_tokens = sequence_tokens[:length]
-            detok_str = self._detokenize(sequence_tokens)
+            detok_str = self.detokenize(self.tokenizer, sequence_tokens)
             prompts_plus_generations.append(detok_str)
             offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
             words = [
@@ -256,7 +265,7 @@ class TextGenerationController:
 
             prompts_plus_generations_segments.append(words)
 
-        text = self._detokenize(tokens[0], skip_special_tokens=skip_special_tokens)
+        text = self.detokenize(self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens)
 
         return text, prompts_plus_generations_segments
 
@@ -580,10 +589,6 @@ class TextGenerationController:
             else:
                 set_decode_expert_padding(unwrapped_model, False)
 
-        # initialize symmetric memory if needed
-        if model_config.transformer_impl == "inference_optimized":
-            context.maybe_initialize_symmetric_memory()
-
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
@@ -762,7 +767,7 @@ class TextGenerationController:
             context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
 
             # Release the blocks back to the allocator
-            context.block_allocator.release_memory_blocks(blocks_to_release)
+            context.kv_block_allocator.release_memory_blocks(blocks_to_release)
 
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
@@ -839,10 +844,11 @@ class TextGenerationController:
 
         # Compute position IDs for the next tokens.
         # After rewind, request_kv_length_offsets has been adjusted. The actual
-        # KV cache length is: adjusted_offset + (1 + num_speculative_tokens).
+        # KV cache length is: adjusted_offset + processed_tokens.
         # The next position to predict starts at that cache length.
         adjusted_offsets = context.request_kv_length_offsets[active_slice]
-        base_position = adjusted_offsets + (1 + self.num_speculative_tokens)
+        processed_tokens = context.request_query_lengths[active_slice]
+        base_position = adjusted_offsets + processed_tokens
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -926,12 +932,9 @@ class TextGenerationController:
         return required_logit_indices
 
     def _sample_speculative_logits(
-        self,
-        required_logits: Tensor,
-        required_mtp_logits: Tensor,
-        request_in_prefill_status_tensor: Tensor,
+        self, required_logits: Tensor, request_in_prefill_status_tensor: Tensor
     ) -> tuple:
-        """Sample tokens from logits and MTP logits using sampling buckets.
+        """Sample tokens from logits using sampling buckets.
 
         For torch sampling buckets: [request_indices, temp, top_k, top_p]
 
@@ -945,9 +948,7 @@ class TextGenerationController:
             (Rearranged from sampling bucket order back to input order using token_order)
 
         Returns:
-            tuple: (output_tokens, mtp_output_tokens, repeats) where output_tokens has shape
-                [total_required_tokens] and mtp_output_tokens has shape
-                [num_speculative_tokens, total_required_tokens].
+            tuple: (output_tokens, repeats) where output_tokens has shape [total_required_tokens]
         """
         repeats = torch.where(
             request_in_prefill_status_tensor == 0, 1 + self.num_speculative_tokens, 1
@@ -961,10 +962,7 @@ class TextGenerationController:
         )
 
         output_tokens_jumbled_list = []
-        mtp_output_tokens_jumbled_list = []
         token_order_list = []
-
-        has_mtp_logits = required_mtp_logits is not None
 
         for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
             request_indices_tensor = torch.tensor(
@@ -976,13 +974,6 @@ class TextGenerationController:
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
-            if has_mtp_logits:
-                mtp_logits_slice = required_mtp_logits[:, required_indices, :]
-                num_spec, num_reqs, vocab = mtp_logits_slice.shape
-                sampled_mtp = self._torch_sampling_func(
-                    mtp_logits_slice.reshape(num_spec * num_reqs, vocab), temp, top_k, top_p
-                )
-                mtp_output_tokens_jumbled_list.append(sampled_mtp.reshape(num_spec, num_reqs))
             token_order_list.append(required_indices)
 
         output_tokens_jumbled = torch.cat(output_tokens_jumbled_list, dim=0)
@@ -995,15 +986,7 @@ class TextGenerationController:
         # Rearrange output tokens from sampling_bucket request order back to input ids order
         output_tokens[token_order] = output_tokens_jumbled
 
-        mtp_output_tokens = None
-        if has_mtp_logits:
-            mtp_output_tokens_jumbled = torch.cat(
-                mtp_output_tokens_jumbled_list, dim=1
-            )  # Shape [num_speculative_tokens, total_tokens]
-            mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
-            mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
-
-        return output_tokens, mtp_output_tokens, repeats
+        return output_tokens, repeats
 
     def _verify_speculative_tokens(
         self,
@@ -1089,9 +1072,7 @@ class TextGenerationController:
 
         return last_one_indices, accepted_tokens_mask, input_tokens_required
 
-    def _dynamic_step_sample_logits_and_verify_tokens(
-        self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
-    ):
+    def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, input_ids: Tensor):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """
@@ -1120,15 +1101,10 @@ class TextGenerationController:
         required_logits = logits.squeeze(0)[
             required_logit_indices, :
         ]  # Shape [num_required, vocab_size]
-        required_mtp_logits = None
-        if mtp_logits is not None:
-            required_mtp_logits = mtp_logits[
-                :, required_logit_indices, :
-            ]  # Shape [num_speculative_tokens, num_required, vocab_size]
 
-        # Sample tokens from logits (and MTP logits if provided).
-        output_tokens, mtp_output_tokens, repeats = self._sample_speculative_logits(
-            required_logits, required_mtp_logits, request_in_prefill_status_tensor
+        # Sample tokens from logits
+        output_tokens, repeats = self._sample_speculative_logits(
+            required_logits, request_in_prefill_status_tensor
         )
 
         # Verify speculative tokens against input tokens.
@@ -1148,12 +1124,6 @@ class TextGenerationController:
         # Store the final sampled tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
-
-        # Store MTP tokens if they were computed inline (non-serial path).
-        if mtp_output_tokens is not None:
-            self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
-                :, last_one_indices
-            ]
 
         # Store the last accepted positions in the packed sequence for serial
         # MTP computation after verification.
@@ -1590,16 +1560,11 @@ class TextGenerationController:
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
-        on ranks that do not have any real requests."""
+        on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
-            # initialize symmetric memory if needed
-            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            model_config = get_model_config(unwrapped_model)
-            if model_config.transformer_impl == "inference_optimized":
-                context.maybe_initialize_symmetric_memory()
             self.inference_wrapped_model.dummy_forward()
 
             # Disable MoE padding for MTP computation
@@ -1640,6 +1605,7 @@ class TextGenerationController:
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
+    @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
         """Run dummy MTP forward passes to participate in EP collectives.
 
@@ -1790,8 +1756,8 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # No tokens?
-        if context.active_token_count == 0:
+        # No tokens and no active requests?
+        if context.active_token_count == 0 and active_request_count == 0:
             return None
 
         input_ids, position_ids = self._dynamic_step_context_init()
@@ -1808,6 +1774,13 @@ class TextGenerationController:
         # Forward pass produces only base logits. When speculative decoding is
         # active, MTP logits are computed serially after verification.
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # Commit Mamba intermediate states before update_requests, which
+        # may swap request indices. The Python lists tracking EOS block IDs
+        # and intermediate offsets are not swapped along with tensors, so
+        # commit must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()
@@ -1826,8 +1799,7 @@ class TextGenerationController:
 
         if self.num_speculative_tokens > 0:
             # Phase 1: Verify speculative tokens using base logits only.
-            # MTP logits are NOT passed here; they will be computed serially.
-            self._dynamic_step_sample_logits_and_verify_tokens(logits, None, input_ids)
+            self._dynamic_step_sample_logits_and_verify_tokens(logits, input_ids)
             # Phase 2: Rewind KV cache for rejected tokens.
             self._rewind_kv_cache()
 
