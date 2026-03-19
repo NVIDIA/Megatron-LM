@@ -246,10 +246,22 @@ def test_sft_batch(tp_size, cp_size, seq_length):
             chunk_size = padded_seg_len // num_chunks
             chunk0_start = cp_rank * chunk_size
             chunk1_start = (num_chunks - 1 - cp_rank) * chunk_size
-            expected_pos = torch.cat([
-                torch.arange(chunk0_start, chunk0_start + chunk_size, dtype=torch.int64, device=seg_pos.device),
-                torch.arange(chunk1_start, chunk1_start + chunk_size, dtype=torch.int64, device=seg_pos.device),
-            ])
+            expected_pos = torch.cat(
+                [
+                    torch.arange(
+                        chunk0_start,
+                        chunk0_start + chunk_size,
+                        dtype=torch.int64,
+                        device=seg_pos.device,
+                    ),
+                    torch.arange(
+                        chunk1_start,
+                        chunk1_start + chunk_size,
+                        dtype=torch.int64,
+                        device=seg_pos.device,
+                    ),
+                ]
+            )
             assert torch.equal(seg_pos, expected_pos), (
                 f"Segment {i}: expected zigzag position_ids "
                 f"[{chunk0_start}..{chunk0_start + chunk_size - 1}, "
