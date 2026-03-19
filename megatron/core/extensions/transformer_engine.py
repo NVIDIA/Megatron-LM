@@ -843,6 +843,21 @@ class TELinear(te.pytorch.Linear):
                     # Mark as NOT tensor parallel since weight is duplicated
                     setattr(param, "tensor_model_parallel", False)
 
+        # Fix TP metadata when explicit_expert_comm cleared parallel_mode.
+        # When explicit_expert_comm=True, Megatron manually divides the tensor size by tp_size
+        # and passes parallel_mode=None to TE. TE then creates a non-parallel weight and does
+        # NOT set tensor_model_parallel=True. Without this flag the resharding planner cannot
+        # build a TP descriptor and falls back to a full-tensor copy, which fails with a size
+        # mismatch when src and dst have different TP configs.
+        # Also fix partition_dim: TE defaults to 0 for parallel_mode=None, but row-parallel
+        # weights are partitioned along dim=1 (input dimension).
+        if explicit_expert_comm and parallel_mode in ("column", "row"):
+            partition_dim = 1 if parallel_mode == "row" else 0
+            if hasattr(self, 'weight') and self.weight is not None:
+                if hasattr(self.weight, "partition_dim"):
+                    self.weight.partition_dim = partition_dim
+                setattr(self.weight, "tensor_model_parallel", True)
+
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
 
