@@ -843,15 +843,16 @@ class TELinear(te.pytorch.Linear):
                     # Mark as NOT tensor parallel since weight is duplicated
                     setattr(param, "tensor_model_parallel", False)
 
-        # Fix TP metadata when explicit_expert_comm cleared parallel_mode.
-        # When explicit_expert_comm=True, Megatron manually divides the tensor size by tp_size
-        # and passes parallel_mode=None to TE. TE then creates a non-parallel weight and does
-        # NOT set tensor_model_parallel=True. Without this flag the resharding planner cannot
-        # build a TP descriptor and falls back to a full-tensor copy, which fails with a size
-        # mismatch when src and dst have different TP configs.
-        # Also fix partition_dim: TE defaults to 0 for parallel_mode=None, but row-parallel
-        # weights are partitioned along dim=1 (input dimension).
-        if explicit_expert_comm and parallel_mode in ("column", "row"):
+        # TE's Linear does not set tensor_model_parallel or partition_dim on its weight for
+        # expert layers (verified: absent after __init__ when parallel_mode=None due to
+        # explicit_expert_comm, and TE doesn't set them even at tp_size=1 with a real mode).
+        # The resharding planner reads tensor_model_parallel to build a TP sharding descriptor.
+        # Without it the planner falls back to _finalize_dp_transfers (full-tensor copy), which
+        # fails with a size mismatch whenever src and dst have different TP sizes.
+        # Fix: always set tensor_model_parallel=True and the correct partition_dim for expert
+        # column/row-parallel weights.  At TP=1 the single-rank group acts as a trivial
+        # descriptor, so this is safe for non-TP configs too.
+        if is_expert and parallel_mode in ("column", "row"):
             partition_dim = 1 if parallel_mode == "row" else 0
             if hasattr(self, 'weight') and self.weight is not None:
                 if hasattr(self.weight, "partition_dim"):
@@ -1781,15 +1782,22 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
-            # Fix TP metadata when explicit_expert_comm cleared parallel_mode.
-            # When explicit_expert_comm=True, Megatron manually divides the tensor size by
-            # tp_size and passes parallel_mode=None to TE. TE then creates a non-parallel
-            # weight and does NOT set tensor_model_parallel=True. Without this flag the
-            # resharding planner cannot build a TP descriptor and falls back to a full-tensor
-            # copy, which fails with a size mismatch when src and dst have different TP configs.
-            # Also fix partition_dim: TE defaults to 0 for parallel_mode=None, but row-parallel
-            # weights are partitioned along dim=1 (input dimension).
-            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+            # TE's GroupedLinear never sets tensor_model_parallel or partition_dim on its
+            # weightN parameters (verified: they are always absent after __init__).
+            # The resharding planner reads tensor_model_parallel to decide whether to build a
+            # TP sharding descriptor. Without it the planner falls back to _finalize_dp_transfers
+            # which does a full-tensor copy — failing with a size mismatch whenever src and dst
+            # have different TP sizes (e.g. TP=2→TP=1 or TP=1→TP=2).
+            # Fix: always set tensor_model_parallel=True and the correct partition_dim on every
+            # expert weight. At TP=1 the single-rank TP group acts as a trivial descriptor
+            # (src_world=1 or dst_world=1) and the LCM planner degenerates to a full-tensor copy,
+            # so this is safe for non-TP configs too.
+            # partition_dim: column-parallel → dim 0 (output dimension sharded),
+            #                row-parallel    → dim 1 (input  dimension sharded).
+            # When explicit_expert_comm=True, Megatron divided the tensor size by tp_size before
+            # calling TE (so the weight is already the per-rank shard).  When False, TE received
+            # the full size (tp_size=1, no division) — both cases are handled uniformly here.
+            if original_parallel_mode in ("column", "row"):
                 partition_dim = 1 if original_parallel_mode == "row" else 0
                 for i in range(num_gemms):
                     weight = getattr(self, f"weight{i}", None)
