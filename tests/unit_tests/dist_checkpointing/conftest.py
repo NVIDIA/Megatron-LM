@@ -23,8 +23,15 @@ def set_default_dist_ckpt_strategy():
     # Disable MSC for tests
     MultiStorageClientFeature.disable()
 
+    # Import the real class before patching so the inner function doesn't
+    # call back through the mock (which would cause infinite recursion since
+    # get_default_strategy now directly instantiates TorchDistSaveShardedStrategy).
+    from megatron.core.dist_checkpointing.strategies.torch import (
+        TorchDistSaveShardedStrategy as _RealTorchDistSaveShardedStrategy,
+    )
+
     def get_pyt_dist_save_sharded_strategy():
-        return get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+        return _RealTorchDistSaveShardedStrategy()
 
     with mock.patch(
         'megatron.core.dist_checkpointing.strategies.torch.TorchDistSaveShardedStrategy',
