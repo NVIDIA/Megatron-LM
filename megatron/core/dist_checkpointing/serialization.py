@@ -65,7 +65,6 @@ def load(
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
-    async_strategy: Optional[str] = "nvrx",
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -160,6 +159,7 @@ def load(
         )
         merge(common_state_dict, sharded_objects)
 
+    async_strategy = getattr(common_state_dict["args"], "async_strategy", "nvrx")
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
