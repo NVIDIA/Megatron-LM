@@ -92,6 +92,11 @@ def test_build_num_microbatches_calculator():
     assert temp_calculator.get_current_global_batch_size() == 16
     assert type(temp_calculator) is mb_calculator.RampupBatchsizeNumMicroBatchesCalculator
 
+    with pytest.raises(ValueError):
+        mb_calculator._build_num_microbatches_calculator(
+            0, None, None, 8, 2, True, step_batch_size_schedule="0:16 100:32"
+        )
+
 
 class TestConstantNumMicroBatchesCalculator:
     def setup_method(self, method):
@@ -208,29 +213,15 @@ def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small()
         calc.update(0, consistency_check=True)
 
 
-def test_step_batch_size_schedule_decrease_batch_yields_zero_microbatches():
-    """Test that decrease_batch_size_if_needed=True with a batch size smaller
-    than micro_batch_size * data_parallel_size results in num_micro_batches=0.
-
-    This is a silent failure mode: the batch rounds down to 0 and training would
-    fail. The runtime check in setup_model_and_optimizer catches this by asserting
-    num_micro_batches >= 1.
-    """
-    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
-        micro_batch_size=1,
-        data_parallel_size=512,
-        decrease_batch_size_if_needed=True,
-        rank=0,
-        schedule="0:256 200000:512 600000:1024",
-    )
-
-    # At consumed_samples=0, batch=256, rounds down to 0.
-    calc.update(0, consistency_check=True)
-    assert calc.num_micro_batches == 0
-
-    # After progressing past the threshold, batch=512 works.
-    calc.update(200000, consistency_check=True)
-    assert calc.num_micro_batches == 1
+def test_step_batch_size_schedule_rejects_decrease_batch_size_if_needed():
+    with pytest.raises(ValueError):
+        mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+            micro_batch_size=1,
+            data_parallel_size=512,
+            decrease_batch_size_if_needed=True,
+            rank=0,
+            schedule="0:256 200000:512 600000:1024",
+        )
 
 
 def test_rampup_consistency_check_fails_when_batch_too_small():

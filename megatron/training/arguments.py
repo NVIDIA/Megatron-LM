@@ -2447,7 +2447,8 @@ def _add_training_args(parser):
                     'If --seq-length is provided, thresholds are interpreted as tokens; '
                     'otherwise as samples. '
                     'Example: --step-batch-size-schedule "0:768 250B:1536 500B:3072 750B:6144" '
-                    'Cannot be used together with --rampup-batch-size.')
+                    'Cannot be used together with --rampup-batch-size or '
+                    '--decrease-batch-size-if-needed.')
     group.add_argument('--decrease-batch-size-if-needed', action='store_true', default=False,
                        help='If set, decrease batch size if microbatch_size * dp_size'
                        'does not divide batch_size. Useful for KSO (Keep Soldiering On)'

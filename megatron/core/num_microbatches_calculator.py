@@ -265,6 +265,11 @@ def _build_num_microbatches_calculator(
 
     # Step batch size schedule
     if step_batch_size_schedule is not None:
+        if decrease_batch_size_if_needed:
+            raise ValueError(
+                'Cannot specify both --step-batch-size-schedule and '
+                '--decrease-batch-size-if-needed'
+            )
         if global_batch_size is not None and rank == 0:
             logger.warning(
                 '--global-batch-size is ignored when using --step-batch-size-schedule'
@@ -583,7 +588,8 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
     Args:
         micro_batch_size (int): Micro batch size.
         data_parallel_size (int): Data parallel size.
-        decrease_batch_size_if_needed (bool): Decrease batch size for divisibility.
+        decrease_batch_size_if_needed (bool): Must be False. Step schedules do not support
+            decreasing batch size for divisibility.
         rank (int): Rank for logging.
         schedule (str): Schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
             Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
@@ -605,6 +611,11 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         seq_length: Optional[int] = None,
     ) -> None:
         super().__init__()
+
+        if decrease_batch_size_if_needed:
+            raise ValueError(
+                'Step batch size schedules do not support decrease_batch_size_if_needed'
+            )
 
         self.micro_batch_size = micro_batch_size
         self.data_parallel_size = data_parallel_size

@@ -30,7 +30,8 @@ class TrainingConfig:
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
-    with dp_size that divides batch_size // microbatch_size."""
+    with dp_size that divides batch_size // microbatch_size. Not supported with
+    step-batch-size-schedule."""
 
     empty_unused_memory_level: Literal[0, 1, 2] = 0
     """Call torch.cuda.empty_cache() each iteration (training and eval), to reduce fragmentation.
