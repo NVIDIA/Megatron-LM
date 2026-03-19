@@ -929,6 +929,37 @@ class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
         return ctx
 
     @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "policy",
+        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.FLOP_EFFICIENCY],
+    )
+    def test_cached_block_reuse(self, policy):
+        """Blocks stay cached at ref_count=0 and are reused by subsequent matching requests."""
+        ctx = self._ctx(
+            buffer_size_gb=0.01,
+            rounder=1,
+            prefix_caching_eviction_policy=policy,
+        )
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.block_hashes[b0].item()
+
+        # Release request: blocks stay cached (not returned to free pool)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert b0_hash in alloc.kv_hash_to_block_id
+
+        # New request with same prompt reuses cached blocks
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 0, 2) == [b0, b1]
+        assert alloc.block_ref_counts[b0].item() == 1
+
+    @pytest.mark.internal
     def test_flop_efficiency_prefers_longer_prefix(self):
         """Under memory pressure, shorter-prefix blocks are evicted before longer-prefix blocks."""
         ctx = self._ctx_flop()
@@ -1002,26 +1033,3 @@ class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
         assert hash_a not in alloc.kv_hash_to_block_id
         # Newer block (B) should survive
         assert hash_b in alloc.kv_hash_to_block_id
-
-    @pytest.mark.internal
-    def test_flop_efficiency_cached_block_reuse(self):
-        """Blocks stay cached at ref_count=0 and are reused by subsequent matching requests."""
-        ctx = self._ctx_flop()
-        bs = ctx.block_size_tokens
-        alloc = ctx.kv_block_allocator
-
-        prompt = self._prompt(bs * 2)
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
-
-        # Release request: blocks stay cached (not returned to free pool)
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.total_request_count = 0
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash in alloc.kv_hash_to_block_id
-
-        # New request with same prompt reuses cached blocks
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 0, 2) == [b0, b1]
-        assert alloc.block_ref_counts[b0].item() == 1
