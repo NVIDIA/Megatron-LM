@@ -356,10 +356,7 @@ class DataParallelInferenceCoordinator:
             candidates = np.where(active_match == best_score)[0]
             # Build per-rank max timestamp across the matched hashes.
             recency = self.hash_table.max_timestamps(request_hashes)
-            best_idx = int(min(
-                candidates,
-                key=lambda i: (self._pending_counts[i], -recency[i]),
-            ))
+            best_idx = int(min(candidates, key=lambda i: (self._pending_counts[i], -recency[i])))
             return self._identities_list[best_idx]
 
         return self.get_next_data_parallel_rank()
@@ -402,9 +399,7 @@ class DataParallelInferenceCoordinator:
                         new_idx = self.hash_table.add_rank()
                         self.identity_to_rank_index[sender_identity] = new_idx
                         self._identities_list.append(sender_identity)
-                        self._pending_counts = np.append(
-                            self._pending_counts, np.int32(0)
-                        )
+                        self._pending_counts = np.append(self._pending_counts, np.int32(0))
                         self._active_mask = np.append(self._active_mask, True)
                 continue
 
