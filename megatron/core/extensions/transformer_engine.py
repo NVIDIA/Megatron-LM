@@ -2516,6 +2516,7 @@ try:
         activation_offloading,
         weight_offloading,
         double_buffering,
+        retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
@@ -2527,6 +2528,7 @@ try:
                 activation_offloading,
                 weight_offloading,
                 double_buffering,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
@@ -2575,11 +2577,26 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.12.0", check_equality=True):
+        if interleaved:
+            assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
+
+        if is_te_min_version("2.3.0", check_equality=True):
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                interleaved=interleaved,
+            )
+        elif is_te_min_version("1.12.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
                 freqs,
