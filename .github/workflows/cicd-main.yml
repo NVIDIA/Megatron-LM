@@ -23,22 +23,6 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
-    inputs:
-      test_nemo_cicd_gate:
-        description: >
-          Smoke-test the Nemo_CICD_Test gate without running expensive jobs.
-          Mocks container build, uses ubuntu-latest runners, and a single-item
-          matrix for each test group. Choose a scenario to validate gate behaviour:
-          all_pass (gate must pass), h100_skipped (gate must fail),
-          gb200_skipped (gate must fail for maintainer runs).
-          Leave empty / disabled for a normal workflow run.
-        type: choice
-        options:
-          - disabled
-          - all_pass
-          - h100_skipped
-          - gb200_skipped
-        default: disabled
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -59,8 +43,8 @@ jobs:
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
-      selected_runner: ${{ inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '' && 'ubuntu-latest' || steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '' && 'ubuntu-latest' || steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
@@ -94,9 +78,8 @@ jobs:
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
-          # Skip SSO check for scheduled jobs, main branch, merge groups, or manual dispatches
-          # (workflow_dispatch requires write access, so the triggerer is always a maintainer)
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Skip SSO check for scheduled jobs, main branch, or merge groups
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -148,7 +131,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    if: github.repository == 'NVIDIA/Megatron-LM' && (inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == '')
+    if: github.repository == 'NVIDIA/Megatron-LM'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
 
   linting:
@@ -202,8 +185,7 @@ jobs:
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
-      || needs.pre-flight.outputs.docs_only == 'true'
-      || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != ''))
+      || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
         run: |
@@ -220,7 +202,6 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -261,7 +242,6 @@ jobs:
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -367,8 +347,7 @@ jobs:
       matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     if: |
-      (inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == '')
-      && needs.is-not-external-contributor.result != 'cancelled'
+      needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-compute-build-matrix.result != 'cancelled'
@@ -481,12 +460,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Mock container build (test mode)
-        if: inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != ''
-        run: echo "Test mode — skipping container build"
-
       - name: Build and push
-        if: inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == ''
         uses: docker/build-push-action@v6
         with:
           file: ./docker/Dockerfile.ci.dev
@@ -523,7 +497,6 @@ jobs:
       && needs.cicd-container-build.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -535,10 +508,6 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          if [ "${{ inputs.test_nemo_cicd_gate }}" != "disabled" ] && [ -n "${{ inputs.test_nemo_cicd_gate }}" ]; then
-            echo 'unit-tests=[{"bucket":"mock-unit-tests"}]' | tee -a $GITHUB_OUTPUT
-            exit 0
-          fi
           cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
@@ -564,7 +533,6 @@ jobs:
       && needs.cicd-parse-unit-tests.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -578,7 +546,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: main
-        if: inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == ''
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.bucket }}
@@ -588,9 +555,6 @@ jobs:
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
-      - name: Mock unit test (test mode)
-        if: inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != ''
-        run: echo "Test mode — mock unit test passed for ${{ matrix.bucket }}"
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
@@ -606,7 +570,6 @@ jobs:
       && needs.cicd-unit-tests-latest.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -649,11 +612,6 @@ jobs:
           HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
           HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
-          if [ "${{ inputs.test_nemo_cicd_gate }}" != "disabled" ] && [ -n "${{ inputs.test_nemo_cicd_gate }}" ]; then
-            echo 'integration-tests-h100=[{"model":"mock","test_case":"mock-h100-test"}]' | tee -a "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           export PYTHONPATH=$(pwd)
 
           if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
@@ -716,10 +674,8 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-h100.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && inputs.test_nemo_cicd_gate != 'h100_skipped'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -729,7 +685,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: main
-        if: inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == ''
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.test_case }}
@@ -741,9 +696,6 @@ jobs:
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
           is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
-      - name: Mock H100 integration test (test mode)
-        if: inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != ''
-        run: echo "Test mode — mock H100 integration test passed for ${{ matrix.model }}/${{ matrix.test_case }}"
 
   cicd-parse-integration-tests-gb200:
     runs-on: ubuntu-latest
@@ -761,7 +713,6 @@ jobs:
       && needs.cicd-unit-tests-latest.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -804,11 +755,6 @@ jobs:
           HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
           HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
-          if [ "${{ inputs.test_nemo_cicd_gate }}" != "disabled" ] && [ -n "${{ inputs.test_nemo_cicd_gate }}" ]; then
-            echo 'integration-tests-gb200=[{"model":"mock","test_case":"mock-gb200-test"}]' | tee -a "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           export PYTHONPATH=$(pwd)
 
           if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
@@ -872,10 +818,8 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-gb200.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && inputs.test_nemo_cicd_gate != 'gb200_skipped'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -885,7 +829,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: main
-        if: inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == ''
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.test_case }}
@@ -898,9 +841,6 @@ jobs:
           is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
           is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
           platform: dgx_gb200
-      - name: Mock GB200 integration test (test mode)
-        if: inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != ''
-        run: echo "Test mode — mock GB200 integration test passed for ${{ matrix.model }}/${{ matrix.test_case }}"
 
   Nemo_CICD_Test:
     needs:
