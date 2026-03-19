@@ -214,6 +214,18 @@ class HashRankTable:
             self._hash_to_row[h] = row
         return row
 
+    def add_rank(self) -> int:
+        """Append a new rank column and return its index.
+
+        All existing hash timestamps for the new rank are initialised to zero.
+        """
+        new_idx = self._n_ranks
+        self._n_ranks += 1
+        # Expand timestamps array by one column.
+        new_col = np.zeros((self._timestamps.shape[0], 1), dtype=np.int64)
+        self._timestamps = np.concatenate([self._timestamps, new_col], axis=1)
+        return new_idx
+
     def _ensure_capacity(self, needed_rows: int) -> None:
         current = self._timestamps.shape[0]
         if needed_rows <= current:

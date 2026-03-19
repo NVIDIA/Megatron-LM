@@ -389,7 +389,17 @@ class DataParallelInferenceCoordinator:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
                     idx = self.identity_to_rank_index.get(sender_identity)
                     if idx is not None:
+                        # Known engine reconnecting — reactivate it.
                         self._active_mask[idx] = True
+                    else:
+                        # Brand-new engine — expand all tracking structures.
+                        new_idx = self.hash_table.add_rank()
+                        self.identity_to_rank_index[sender_identity] = new_idx
+                        self._identities_list.append(sender_identity)
+                        self._pending_counts = np.append(
+                            self._pending_counts, np.int32(0)
+                        )
+                        self._active_mask = np.append(self._active_mask, True)
                 continue
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
