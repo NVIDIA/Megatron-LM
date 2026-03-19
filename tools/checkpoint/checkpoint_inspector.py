@@ -368,18 +368,20 @@ def convert_checkpoint(
       --swiglu           Same as above, but applies globally       No (manual).
                          to ALL modules. Use --swiglu-modules
                          if only some modules use SWiGLU.
-      --merge-gdn        Model uses Gated DeltaNet (GDN)           YES.
-                         attention with decomposed sub-keys
-                         (query/key/value/z/beta/alpha).
+      --merge-gdn        [DEPRECATED for TP>1] Merge GDN             No.
+                         sub-keys. Only for legacy TP=1.
+                         For TP>1: OMIT this flag — FSDP
+                         runtime handles splitting via
+                         handle_gdn_in_state_dict().
       --rename-mtp-keys  Model uses Multi-Token Prediction          YES.
                          (MTP) with 'transformer_layer' naming
                          in the torch_dist checkpoint.
 
     \b
-    Auto-detection: --merge-gdn and --rename-mtp-keys are auto-detected from
-    checkpoint keys if not explicitly set. --swiglu / --swiglu-modules must
-    always be specified manually because SWiGLU and GeLU MLP weights are
-    indistinguishable in the MCore torch_dist format.
+    Auto-detection: --rename-mtp-keys is auto-detected from checkpoint keys
+    if not explicitly set. --swiglu / --swiglu-modules must always be specified
+    manually because SWiGLU and GeLU MLP weights are indistinguishable in the
+    MCore torch_dist format. --merge-gdn is NOT auto-detected (deprecated).
 
     \b
     Examples
@@ -438,16 +440,14 @@ def convert_checkpoint(
         _swiglu_prefixes = []    # no SWiGLU splitting
         rank0_echo("[SWiGLU] Disabled (no --swiglu or --swiglu-modules specified).")
 
-    # --- Auto-detect GDN and MTP from checkpoint keys ---
+    # --- Auto-detect MTP from checkpoint keys ---
+    # NOTE: GDN auto-detection has been removed.  For FSDP training with
+    # TP > 1, GDN sub-keys must be kept un-merged so that
+    # handle_gdn_in_state_dict() in fsdp_dtensor_checkpoint.py can wrap
+    # each sub-tensor with correct TP metadata.  Use --merge-gdn only if
+    # you explicitly need the legacy merged format (TP=1 only).
     all_keys = list(state_dict.keys())
     _detected = []
-
-    if not merge_gdn and any(
-        ".in_proj.weight.query" in k or ".conv1d.weight.query" in k
-        for k in all_keys
-    ):
-        merge_gdn = True
-        _detected.append("GDN (decomposed in_proj/conv1d sub-keys detected)")
 
     if not rename_mtp_keys and any(
         ".mtp.layers." in k and ".transformer_layer." in k
@@ -886,10 +886,11 @@ def convert_checkpoint(
 @click.option(
     "--merge-gdn",
     is_flag=True,
-    help="Merge Gated DeltaNet (GDN) decomposed sub-keys "
-         "(query/key/value/z/beta/alpha) into fused in_proj.weight and conv1d.weight. "
-         "Auto-detected if not set: enabled when sub-keys like "
-         "'.in_proj.weight.query' are found in the checkpoint.",
+    help="[DEPRECATED for FSDP TP>1] Merge GDN decomposed sub-keys "
+         "(query/key/value/z/beta/alpha) into fused in_proj.weight / conv1d.weight. "
+         "For FSDP training with TP > 1, do NOT use this flag — keep sub-keys "
+         "un-merged so that handle_gdn_in_state_dict() can produce correct TP DTensors. "
+         "Only use this flag for legacy TP=1-only workflows.",
 )
 @click.option(
     "--rename-mtp-keys",
@@ -929,19 +930,20 @@ def convert_torch_dist_to_fsdp_dtensor(
       --swiglu           Same as above, but applies globally     No (manual).
                          to ALL modules. Use --swiglu-modules
                          if only some modules use SWiGLU.
-      --merge-gdn        Model uses Gated DeltaNet (GDN)         YES.
-                         attention with decomposed sub-keys
-                         (query/key/value/z/beta/alpha).
+      --merge-gdn        [DEPRECATED for TP>1] Merge GDN           No.
+                         sub-keys. Only for legacy TP=1.
+                         For TP>1: OMIT this flag — FSDP
+                         runtime handles splitting via
+                         handle_gdn_in_state_dict().
       --rename-mtp-keys  Model uses Multi-Token Prediction        YES.
                          (MTP) with 'transformer_layer' naming
                          in the torch_dist checkpoint.
 
     \b
     Auto-detection note:
-      --merge-gdn and --rename-mtp-keys are auto-detected from checkpoint keys
-      if not explicitly set. --swiglu / --swiglu-modules must always be specified
-      manually because SWiGLU and GeLU MLP weights are indistinguishable in the
-      MCore torch_dist format.
+      --rename-mtp-keys is auto-detected from checkpoint keys if not explicitly
+      set. --swiglu / --swiglu-modules must always be specified manually.
+      --merge-gdn is NOT auto-detected (deprecated for TP>1).
 
     \b
     Examples
