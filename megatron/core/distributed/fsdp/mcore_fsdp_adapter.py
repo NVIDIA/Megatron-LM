@@ -83,6 +83,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
@@ -279,7 +281,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             expt_tp_group = single_rank_group
 
         if enable_hsdp:
-            if expt_dp_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
                     outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
                 )
@@ -308,7 +310,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
             )
         else:
-            if ep_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],

@@ -24,18 +24,21 @@ from .optimizer_config import ParamKey, ParamPredicate
 try:
     from emerging_optimizers import registry
     from emerging_optimizers.orthogonalized_optimizers import (
+        AdaptiveMuon,
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
-    # It is necessary to import SOAP for the registry to work.
+    # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
+    AdaptiveMuon = object
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,22 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # Registry dataclass and public API
 # ===========================================================================
+
+
+def _eopt_init_state_fn(opt, config=None):
+    """Initialize emerging optimizer state for torch_dist checkpoint format."""
+    for group in opt.param_groups:
+        # Checkpoint init needs state for all parameters, including those without grads yet.
+        opt._init_group(group, skip_non_grad_params=False)
+
+
+def _default_param_overrides_factory() -> Dict[ParamKey, Dict[str, Any]]:
+    """Default param overrides: route non-linear/embedding params to Adam."""
+    return {
+        ParamKey(
+            predicate=ParamPredicate(name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding)
+        ): {'optimizer': 'adam'}
+    }
 
 
 @dataclass
@@ -59,9 +78,11 @@ class EmergingOptimizerEntry:
     """
 
     optimizer_cls: type
-    init_state_fn: Callable
-    config_to_kwargs: Callable | None
-    default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(default_factory=dict)
+    init_state_fn: Callable = _eopt_init_state_fn
+    config_to_kwargs: Callable | None = None
+    default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
+        default_factory=_default_param_overrides_factory
+    )
 
 
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
@@ -166,7 +187,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
-        super().__init__(
+        # Use explicit class call instead of super() so that subclasses with
+        # multiple inheritance (e.g. TensorParallelAdaptiveMuon) don't route
+        # through an intermediate class that doesn't accept scaled_orthogonalize_fn.
+        OrthogonalizedOptimizer.__init__(
+            self,
             params,
             lr,
             momentum,
@@ -229,10 +254,60 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return grad
 
 
-def _eopt_init_state_fn(opt, config=None):
-    """Initialize emerging optimizer state for torch_dist checkpoint format."""
-    for group in opt.param_groups:
-        opt._init_group(group)
+class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
+    """Tensor Parallel Adaptive Muon optimizer."""
+
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float = 3e-4,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        weight_decay: float = 0.01,
+        use_decoupled_weight_decay: bool = True,
+        split_qkv: bool = False,
+        is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_split_shapes: tuple[int, int, int] | None = None,
+        fp32_matmul_prec: str = "medium",
+        coefficient_type: str = "quintic",
+        num_ns_steps: int = 5,
+        scale_mode: str = "spectral",
+        extra_scale_factor: float = 1.0,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        moment2_method: Literal["adamuon", "normuon"] = "adamuon",
+        beta2: float = 0.95,
+        eps: float = 1e-8,
+    ) -> None:
+        TensorParallelMuon.__init__(
+            self,
+            params,
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            use_decoupled_weight_decay=use_decoupled_weight_decay,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
+            fp32_matmul_prec=fp32_matmul_prec,
+            coefficient_type=coefficient_type,
+            num_ns_steps=num_ns_steps,
+            scale_mode=scale_mode,
+            extra_scale_factor=extra_scale_factor,
+            pg_collection=pg_collection,
+            tp_mode=tp_mode,
+        )
+        self.moment2_method = moment2_method
+
+        for group in self.param_groups:
+            group.setdefault("beta2", beta2)
+            group.setdefault("eps", eps)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Step function"""
+        return AdaptiveMuon.step(self, closure)
 
 
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
@@ -265,6 +340,13 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     return kwargs
 
 
+def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
+    return kwargs
+
+
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
@@ -279,34 +361,20 @@ def _default_adam_based_eopt_config_to_kwargs(
 # -----------------------------------------------------------------------
 _EMERGING_OPTIMIZERS = {
     'muon': EmergingOptimizerEntry(
-        optimizer_cls=TensorParallelMuon,
-        init_state_fn=_eopt_init_state_fn,
-        config_to_kwargs=_muon_config_to_kwargs,
-        default_param_overrides={
-            ParamKey(
-                predicate=ParamPredicate(
-                    name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                )
-            ): {'optimizer': 'adam'}
-        },
-    )
+        optimizer_cls=TensorParallelMuon, config_to_kwargs=_muon_config_to_kwargs
+    ),
+    "adaptive_muon": EmergingOptimizerEntry(
+        optimizer_cls=TensorParallelAdaptiveMuon, config_to_kwargs=_adaptive_muon_config_to_kwargs
+    ),
 }
 
 # Register soap with default config
 # TODO(skyw): register all emerging optimizers.
 if HAVE_EMERGING_OPTIMIZERS:
-    for eopt_name in ["soap"]:
+    for eopt_name in registry.get_optimizer_name_list():
         if eopt_name in _EMERGING_OPTIMIZERS:
+            # skip already registered local versions, e.g. TensorParallel versions.
             continue
         _EMERGING_OPTIMIZERS[eopt_name] = EmergingOptimizerEntry(
-            optimizer_cls=registry.get_optimizer_cls(eopt_name),
-            init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=None,
-            default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
-            },
+            optimizer_cls=registry.get_optimizer_cls(eopt_name)
         )
