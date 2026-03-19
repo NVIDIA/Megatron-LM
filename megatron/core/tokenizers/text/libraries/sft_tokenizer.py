@@ -20,8 +20,6 @@ identity_template = """{% for message in messages %}{{ message['content'] }}{% e
 # fmt: on
 
 
-identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
-
 IGNORE_INDEX = -100
 
 @dataclass
@@ -186,7 +184,7 @@ class SFTTokenizer:
 
         return tokens, target
 
-    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = False):
+    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.

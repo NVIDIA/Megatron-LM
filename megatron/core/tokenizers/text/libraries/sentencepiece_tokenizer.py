@@ -138,7 +138,7 @@ class SentencePieceTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerCha
             tokens = list(filter(lambda x: x != self.extra_space_token, tokens))
         return tokens
 
-    def text_to_ids(self, text, sample_alpha=None) -> List[int]:
+    def text_to_ids(self, text, sample_alpha=None, add_special_tokens=True) -> List[int]:
         """Converts text to tokens ids."""
         if isinstance(text, str):
             return self._text_to_ids(text, sample_alpha)

@@ -63,7 +63,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         else:
             return library_class(self.path, **kwargs)
 
-    def tokenize(self, text: str, add_special_tokens: bool = False) -> List[int]:
+    def tokenize(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """
         Text tokenization.
 

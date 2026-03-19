@@ -18,7 +18,7 @@ class NullTokenizer:
         self._eod_id = self._vocab_size_without_eod
         self.pad_id = self._vocab_size_without_eod - 1
 
-    def text_to_ids(self, text):
+    def text_to_ids(self, text, add_special_tokens=True):
         """Converts text to ids."""
         return [int(x) for x in text.split(' ')]
 
@@ -96,6 +96,6 @@ class NullSFTTokenizer(NullTokenizer, MegatronTokenizerChatTemplate):
         vocab_size: vocabulary size for embedding
     """
 
-    def text_to_ids(self, text):
+    def text_to_ids(self, text, add_special_tokens=True):
         """Converts text to ids by mapping each character to its ASCII code point."""
         return [ord(c) % self._vocab_size_without_eod for c in text]
