@@ -177,26 +177,20 @@ def check_flashinfer_jit_cache_installed():
 
         if cuda_major == "12":
             install_cmd = (
-                "  pip install flashinfer-jit-cache "
+                "Install it with:\n\npip install flashinfer-jit-cache "
                 "--index-url https://flashinfer.ai/whl/cu129\n"
             )
         elif cuda_major == "13":
             install_cmd = (
-                "  pip install flashinfer-jit-cache "
+                "Install it with:\n\npip install flashinfer-jit-cache "
                 "--index-url https://flashinfer.ai/whl/cu130\n"
             )
         else:
-            logging.warning(
-                "The 'flashinfer-jit-cache' package is not installed and CUDA version "
-                "'%s' is not recognized. FlashInfer CUTLASS kernels will be JIT compiled, "
-                "which may take a long time.",
-                torch.version.cuda,
-            )
-            return
+            install_cmd = ""
 
         raise RuntimeError(
             "The 'flashinfer-jit-cache' package is required for expert parallel inference "
-            "but is not installed. Install it with:\n\n" + install_cmd
+            f"but is not installed. {install_cmd}"
         )
     logging.info("Found flashinfer-jit-cache %s with pre-compiled CUTLASS kernels.", ver)
 
