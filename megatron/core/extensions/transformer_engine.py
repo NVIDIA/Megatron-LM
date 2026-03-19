@@ -1775,6 +1775,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     if weight is not None and hasattr(weight, "partition_dim"):
                         weight.partition_dim = 1
 
+            # Explicitly stamp tensor_model_parallel, partition_dim, and partition_stride
+            # on every expert weight tensor.  TE ≤2.12 set these attributes internally;
+            # TE ≥2.13 no longer does (especially when parallel_mode=None is passed due
+            # to explicit_expert_comm).  The resharding/refit planner relies on these
+            # attributes to correctly plan TP gather/scatter operations across model
+            # configurations
+            if original_parallel_mode in ("column", "row"):
+                part_dim = 0 if original_parallel_mode == "column" else 1
+                for i in range(num_gemms):
+                    weight = getattr(self, f"weight{i}", None)
+                    if weight is not None:
+                        setattr(weight, "tensor_model_parallel", True)
+                        setattr(weight, "partition_dim", part_dim)
+                        setattr(weight, "partition_stride", 1)
+
             def merge_extra_states(
                 self,
                 state_dict,
