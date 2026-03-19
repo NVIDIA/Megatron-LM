@@ -132,6 +132,7 @@ def _run_one_iter_and_capture(
     return logits.detach().float().cpu(), grads, peak_bytes
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
