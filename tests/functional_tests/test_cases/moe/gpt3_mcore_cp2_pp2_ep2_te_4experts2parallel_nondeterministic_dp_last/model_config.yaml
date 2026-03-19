@@ -58,4 +58,6 @@ MODEL_ARGS:
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
