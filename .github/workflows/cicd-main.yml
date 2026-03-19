@@ -219,6 +219,7 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -259,6 +260,7 @@ jobs:
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -370,6 +372,7 @@ jobs:
       && needs.cicd-compute-build-matrix.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
@@ -519,6 +522,7 @@ jobs:
       && needs.cicd-container-build.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -559,6 +563,7 @@ jobs:
       && needs.cicd-parse-unit-tests.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -600,6 +605,7 @@ jobs:
       && needs.cicd-unit-tests-latest.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -712,6 +718,7 @@ jobs:
       && inputs.test_nemo_cicd_gate != 'h100_skipped'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -753,6 +760,7 @@ jobs:
       && needs.cicd-unit-tests-latest.result != 'cancelled'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -866,6 +874,7 @@ jobs:
       && inputs.test_nemo_cicd_gate != 'gb200_skipped'
       && (
         success()
+        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
