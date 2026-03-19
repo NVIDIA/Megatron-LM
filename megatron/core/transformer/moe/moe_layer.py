@@ -31,7 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import check_flashinfer_jit_cache_installed, internal_api
+from megatron.core.utils import internal_api
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -276,6 +276,8 @@ class MoELayer(BaseMoELayer):
                 # when using the FlashInfer backend. The flashinfer-jit-cache package
                 # must be installed ahead of time to avoid a multi-minute JIT
                 # compilation step at runtime.
+                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+
                 check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
                 assert hasattr(torch.nn.functional, 'grouped_mm'), (

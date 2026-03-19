@@ -4,11 +4,17 @@ import asyncio
 import logging
 import multiprocessing
 import sys
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
 
 
 def device_memory_summary() -> str:
@@ -156,7 +162,7 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
-def check_flashinfer_jit_cache_installed():
+def check_flashinfer_jit_cache_installed(log_version: bool = False):
     """Verify that the flashinfer-jit-cache package is installed.
 
     The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
@@ -166,33 +172,33 @@ def check_flashinfer_jit_cache_installed():
     Raises:
         RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    import torch
-
-    try:
-        ver = version("flashinfer-jit-cache")
-    except PackageNotFoundError:
-        cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
-
-        if cuda_major == "12":
-            install_cmd = (
-                "Install it with:\n\npip install flashinfer-jit-cache "
-                "--index-url https://flashinfer.ai/whl/cu129\n"
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
+        if log_version:
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
             )
-        elif cuda_major == "13":
-            install_cmd = (
-                "Install it with:\n\npip install flashinfer-jit-cache "
-                "--index-url https://flashinfer.ai/whl/cu130\n"
-            )
-        else:
-            install_cmd = ""
+        return
 
-        raise RuntimeError(
-            "The 'flashinfer-jit-cache' package is required for expert parallel inference "
-            f"but is not installed. {install_cmd}"
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
         )
-    logging.info("Found flashinfer-jit-cache %s with pre-compiled CUTLASS kernels.", ver)
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
+    raise RuntimeError(
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
+    )
 
 
 def set_inference_cuda_graphed_iteration_for_ep_inference(model):
