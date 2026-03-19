@@ -94,8 +94,9 @@ jobs:
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
-          # Skip SSO check for scheduled jobs, main branch, or merge groups
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+          # Skip SSO check for scheduled jobs, main branch, merge groups, or manual dispatches
+          # (workflow_dispatch requires write access, so the triggerer is always a maintainer)
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -366,13 +367,13 @@ jobs:
       matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      (inputs.test_nemo_cicd_gate == 'disabled' || inputs.test_nemo_cicd_gate == '')
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-compute-build-matrix.result != 'cancelled'
       && (
         success()
-        || (inputs.test_nemo_cicd_gate != 'disabled' && inputs.test_nemo_cicd_gate != '')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
