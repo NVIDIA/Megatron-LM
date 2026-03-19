@@ -166,18 +166,13 @@ class MimoModel(MegatronModule):
         initialization on non-last stages (saves memory in pipeline parallelism).
         """
         for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
-            # Skip if we have a role and this module isn't in it
-            if self.role is not None and modality_name not in self.role.modules:
+            if modality_name not in self.role.modules:
                 logger.debug(f"Skipping {modality_name} submodule (not in role)")
                 continue
 
-            # Determine stage info for this module
-            is_first_stage = True
-            is_last_stage = True
-            if self.role is not None:
-                stage_info = self.role.modules[modality_name]
-                is_first_stage = stage_info.is_first_stage
-                is_last_stage = stage_info.is_last_stage
+            stage_info = self.role.modules[modality_name]
+            is_first_stage = stage_info.is_first_stage
+            is_last_stage = stage_info.is_last_stage
 
             submodule_class = submodule_spec.module
             logger.debug(
@@ -197,8 +192,7 @@ class MimoModel(MegatronModule):
 
         When role is set, only initializes if this rank participates in language module.
         """
-        # Skip if we have a role and don't participate in language module
-        if self.role is not None and not self.role.has_language_module:
+        if not self.role.has_language_module:
             logger.debug("Skipping language model initialization (not in role)")
             self.language_model = None
             return
@@ -241,15 +235,20 @@ class MimoModel(MegatronModule):
                 f"Extra in grid_map: {extra_in_grid}"
             )
 
-    def _determine_role(self) -> Optional[RankRole]:
+    def _determine_role(self) -> RankRole:
         """Determine this rank's role based on grid map.
 
         Returns:
-            RankRole describing which modules this rank participates in,
-            or None if module_to_grid_map is not set (all modules on all ranks).
+            RankRole describing which modules this rank participates in.
+            For the colocated case (no module_to_grid_map), returns a role with
+            all modules at first+last stage and colocated=True.
         """
         if not self.mimo_config.module_to_grid_map:
-            return None
+            # Colocated: all modules on all ranks, single stage
+            all_module_names = list(self.mimo_config.modality_submodules_spec.keys())
+            language_key = self.mimo_config.language_module_key or "_language"
+            all_module_names.append(language_key)
+            return RankRole.all_modules(all_module_names, language_key)
 
         current_rank = dist.get_rank()
         modules = {}
@@ -278,7 +277,10 @@ class MimoModel(MegatronModule):
             modules[module_name] = ModuleStageInfo(is_first_stage=is_first, is_last_stage=is_last)
 
         if not modules:
-            return None
+            raise RuntimeError(
+                f"Rank {current_rank} is not in any module grid. "
+                f"Check module_to_grid_map configuration."
+            )
 
         return RankRole(modules=modules, language_module_name=self.mimo_config.language_module_key)
 
@@ -398,8 +400,7 @@ class MimoModel(MegatronModule):
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role is None:
-            # Original behavior: all modules on all ranks
+        if self.role.colocated:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -453,22 +454,10 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
-
-            # Determine input based on stage position
-            if self.role.is_first_stage(encoder_name):
-                encoder_input = modality_inputs.get(encoder_name) if modality_inputs else None
-                output = (
-                    submodule.forward(encoder_inputs=encoder_input)
-                    if encoder_input is not None
-                    else None
-                )
-            else:
-                hidden_states = input_tensors.get(encoder_name) if input_tensors else None
-                output = (
-                    submodule.forward(hidden_states=hidden_states)
-                    if hidden_states is not None
-                    else None
-                )
+            output = submodule.forward(
+                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
+                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
+            )
 
             if output is not None:
                 outputs[encoder_name] = output

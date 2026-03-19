@@ -539,7 +539,7 @@ class TestMimoModelNonColocated:
 
     def test_role_determination(self):
         """Test role correctly identifies modules and stage positions."""
-        # No grid map = no role
+        # No grid map = colocated role with all modules
         model_no_grid = get_vlm_mimo_model(
             self.hidden_size,
             self.vocab_size,
@@ -549,7 +549,9 @@ class TestMimoModelNonColocated:
             self.patch_dim,
             {"images": 50257},
         )
-        assert model_no_grid.role is None
+        assert model_no_grid.role.colocated is True
+        assert model_no_grid.role.has_language_module is True
+        assert model_no_grid.role.has_modality_modules is True
 
         # Encoder-only rank
         model_encoder = MimoModel(self._make_config(encoder_in_grid=True, language_in_grid=False))

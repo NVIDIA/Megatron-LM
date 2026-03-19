@@ -32,10 +32,14 @@ class RankRole:
             this rank participates in.
         language_module_name: Name of the language module, used to distinguish
             encoders from the language model.
+        colocated: If True, all modules run on all ranks (no multi-module PP).
+            The forward path uses the colocated codepath which supports
+            PartitionAdapter and PackedSeqParams.
     """
 
     modules: Dict[str, ModuleStageInfo] = field(default_factory=dict)
     language_module_name: Optional[str] = None
+    colocated: bool = False
 
     def __post_init__(self):
         """Validate that language_module_name is set when modules is non-empty."""
@@ -44,6 +48,18 @@ class RankRole:
                 "language_module_name must be set when modules is non-empty. "
                 f"Got modules={list(self.modules.keys())} with language_module_name=None."
             )
+
+    @classmethod
+    def all_modules(cls, module_names: List[str], language_module_name: str) -> 'RankRole':
+        """Create a role for the colocated case: every module, first+last stage."""
+        return cls(
+            modules={
+                name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
+                for name in module_names
+            },
+            language_module_name=language_module_name,
+            colocated=True,
+        )
 
     @property
     def has_modality_modules(self) -> bool:
