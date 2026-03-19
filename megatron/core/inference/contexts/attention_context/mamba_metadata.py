@@ -256,22 +256,22 @@ class MambaMetadata:
             for i in range(padded_prefill_count):
                 start = cu_seqlens_all[i]
                 end = cu_seqlens_all[i + 1]
-                pos = start + chunk_size
-                while pos < end:
-                    chunk_boundaries.append(pos)
-                    chunk_to_seq_list.append(i)
-                    pos += chunk_size
-                chunk_boundaries.append(end)
-                chunk_to_seq_list.append(i)
+                seq_len = end - start
+                n_chunks = max(1, (seq_len + chunk_size - 1) // chunk_size)
+                boundaries = [min(start + (k + 1) * chunk_size, end) for k in range(n_chunks)]
+                chunk_boundaries.extend(boundaries)
+                chunk_to_seq_list.extend([i] * n_chunks)
                 last_chunk_idx_list.append(len(chunk_boundaries) - 2)
 
             # Pad to fixed size for CUDA graph compatibility
             padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count
             last_boundary = chunk_boundaries[-1]
-            while len(chunk_boundaries) < padded_max_chunks + 1:
-                chunk_boundaries.append(last_boundary)
-            while len(chunk_to_seq_list) < padded_max_chunks:
-                chunk_to_seq_list.append(0)
+            pad_b = padded_max_chunks + 1 - len(chunk_boundaries)
+            if pad_b > 0:
+                chunk_boundaries.extend([last_boundary] * pad_b)
+            pad_s = padded_max_chunks - len(chunk_to_seq_list)
+            if pad_s > 0:
+                chunk_to_seq_list.extend([0] * pad_s)
 
             # Fill GPU buffers
             n_cu = padded_max_chunks + 1
@@ -293,18 +293,17 @@ class MambaMetadata:
             # Build conv1d per-token metadata (request ID and request start position)
             real_tokens = self.real_prefill_token_count
             if real_tokens > 0:
-                conv_seq_idx_list = []
-                conv_seq_start_list = []
-                for i in range(real_prefill_count):
-                    start = cu_seqlens_real[i]
-                    length = cu_seqlens_real[i + 1] - start
-                    conv_seq_idx_list.extend([i] * length)
-                    conv_seq_start_list.extend([start] * length)
-                self._conv_seq_idx_buffer[:real_tokens].copy_(
-                    torch.tensor(conv_seq_idx_list, dtype=torch.int32)
+                cu = self._cu_seqlens_buffer[: real_prefill_count + 1]
+                lengths = (cu[1:] - cu[:-1]).to(torch.int64)
+                seq_indices = torch.arange(
+                    real_prefill_count, dtype=torch.int32, device=self.device
                 )
-                self._conv_seq_start_buffer[:real_tokens].copy_(
-                    torch.tensor(conv_seq_start_list, dtype=torch.int32)
+                seq_starts = cu[:real_prefill_count].to(torch.int32)
+                self._conv_seq_idx_buffer[:real_tokens] = torch.repeat_interleave(
+                    seq_indices, lengths
+                )
+                self._conv_seq_start_buffer[:real_tokens] = torch.repeat_interleave(
+                    seq_starts, lengths
                 )
             if padded_token_count > real_tokens:
                 self._conv_seq_idx_buffer[real_tokens:padded_token_count] = 0

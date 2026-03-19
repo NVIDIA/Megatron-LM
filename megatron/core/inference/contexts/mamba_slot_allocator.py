@@ -179,6 +179,30 @@ class MambaSlotAllocator:
         self.free_slots[self.free_count] = slot
         self.free_count += 1
 
+    def _invalidate_blocks_batch(self, block_ids_list: list) -> None:
+        """Free cache slots and clear mappings for multiple blocks at once.
+
+        Vectorized version of invalidate_block that avoids per-block .item()
+        GPU syncs. Used by on_kv_blocks_deregistered for bulk eviction.
+
+        Args:
+            block_ids_list: List of block IDs to invalidate.
+        """
+        if not block_ids_list:
+            return
+        bid_t = torch.tensor(block_ids_list, dtype=torch.int64, device=self.block_to_slot.device)
+        slots = self.block_to_slot[bid_t].to(torch.int64)
+        valid_mask = slots >= 0
+        if not valid_mask.any():
+            return
+        valid_slots = slots[valid_mask]
+        valid_bids = bid_t[valid_mask]
+        self.block_to_slot[valid_bids] = -1
+        self.slot_to_block[valid_slots] = -1
+        n = valid_slots.numel()
+        self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
+        self.free_count += n
+
     # =========================================================================
     # State store/restore
     # =========================================================================
@@ -265,8 +289,7 @@ class MambaSlotAllocator:
                 from collections import deque
 
                 deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                for bid in block_ids_list:
-                    self.invalidate_block(bid)
+                self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
     # Intermediate offset tracking
@@ -408,14 +431,13 @@ class MambaSlotAllocator:
                         bid = block_ids[j]
                         slot = self.allocate_slot(bid)
 
-                        # Copy states from output buffers for all layers
-                        for layer_idx in range(self.num_mamba_layers):
-                            self.ssm_states[layer_idx, slot].copy_(
-                                self._intermediate_ssm_out[layer_idx, ssm_offset + j]
-                            )
-                            self.conv_states[layer_idx, slot].copy_(
-                                self._intermediate_conv_out[layer_idx, ssm_offset + j]
-                            )
+                        # Copy states from output buffers for all layers at once
+                        self.ssm_states[:, slot].copy_(
+                            self._intermediate_ssm_out[:, ssm_offset + j]
+                        )
+                        self.conv_states[:, slot].copy_(
+                            self._intermediate_conv_out[:, ssm_offset + j]
+                        )
 
                         # Register in mamba hash map
                         block_hash = ctx.kv_block_allocator.block_hashes[bid].item()
