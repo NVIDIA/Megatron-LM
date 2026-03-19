@@ -34,6 +34,7 @@ except ImportError:
         USING_PYTORCH_OPTIMIZER = True
 
 try:
+    from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
     _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
@@ -45,7 +46,7 @@ try:
     from emerging_optimizers.scalar_optimizers import Lion
 
     HAVE_LION = True
-except (ImportError, Exception):
+except (ImportError, PackageNotFoundError):
     HAVE_LION = False
 
 from megatron.core import parallel_state
