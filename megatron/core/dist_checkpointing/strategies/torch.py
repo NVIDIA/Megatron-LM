@@ -667,7 +667,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         """
         if async_strategy == "mcore":
             logger.warning(
-                "Megatron Core's async save is deprecated and will be removed in the future releases. "
+                "MCore's async save is deprecated and will be removed in the future releases. "
                 "Please, use NVRx async solution by setting `async_strategy` to `nvrx`."
             )
 
