@@ -37,6 +37,14 @@ class RankRole:
     modules: Dict[str, ModuleStageInfo] = field(default_factory=dict)
     language_module_name: Optional[str] = None
 
+    def __post_init__(self):
+        """Validate that language_module_name is set when modules is non-empty."""
+        if self.modules and self.language_module_name is None:
+            raise ValueError(
+                "language_module_name must be set when modules is non-empty. "
+                f"Got modules={list(self.modules.keys())} with language_module_name=None."
+            )
+
     @property
     def has_modality_modules(self) -> bool:
         """Return True if this rank participates in any modality (non-language) module."""

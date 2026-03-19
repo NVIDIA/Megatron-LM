@@ -174,7 +174,7 @@ class MimoModel(MegatronModule):
             # Determine stage info for this module
             is_first_stage = True
             is_last_stage = True
-            if self.role is not None and modality_name in self.role.modules:
+            if self.role is not None:
                 stage_info = self.role.modules[modality_name]
                 is_first_stage = stage_info.is_first_stage
                 is_last_stage = stage_info.is_last_stage
@@ -276,6 +276,9 @@ class MimoModel(MegatronModule):
                 f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
             )
             modules[module_name] = ModuleStageInfo(is_first_stage=is_first, is_last_stage=is_last)
+
+        if not modules:
+            return None
 
         return RankRole(modules=modules, language_module_name=self.mimo_config.language_module_key)
 
@@ -407,26 +410,24 @@ class MimoModel(MegatronModule):
                 packing_kwargs,
             )
 
-        if self.role.has_modality_modules and not self.role.has_language_module:
-            # Encoder-only rank
-            return self._forward_encoders(modality_inputs, input_tensors), loss_mask
-
-        if self.role.has_language_module and not self.role.has_modality_modules:
-            # Language-module-only rank
-            return (
-                self._forward_language_module(
-                    input_ids, position_ids, attention_mask, labels, input_tensors
-                ),
-                loss_mask,
-            )
-
+        # Guard: colocated encoders + language module is not supported
         if self.role.has_modality_modules and self.role.has_language_module:
-            # Colocated encoders and language module is a configuration error
             raise ValueError(
                 "Invalid configuration: Colocated encoders and language module on the same "
                 "rank is not supported in multi-module pipeline parallelism. Use separate "
                 "grids for encoders and language module, or disable multi-module PP by not "
                 "setting module_to_grid_map."
+            )
+
+        if self.role.has_modality_modules:
+            return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+
+        if self.role.has_language_module:
+            return (
+                self._forward_language_module(
+                    input_ids, position_ids, attention_mask, labels, input_tensors
+                ),
+                loss_mask,
             )
 
         raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -455,19 +456,19 @@ class MimoModel(MegatronModule):
 
             # Determine input based on stage position
             if self.role.is_first_stage(encoder_name):
-                # First stage: use raw modality inputs
                 encoder_input = modality_inputs.get(encoder_name) if modality_inputs else None
-                if encoder_input is not None:
-                    output = submodule.forward(encoder_inputs=encoder_input)
-                else:
-                    output = None
+                output = (
+                    submodule.forward(encoder_inputs=encoder_input)
+                    if encoder_input is not None
+                    else None
+                )
             else:
-                # Non-first stage: use hidden states from previous stage
                 hidden_states = input_tensors.get(encoder_name) if input_tensors else None
-                if hidden_states is not None:
-                    output = submodule.forward(hidden_states=hidden_states)
-                else:
-                    output = None
+                output = (
+                    submodule.forward(hidden_states=hidden_states)
+                    if hidden_states is not None
+                    else None
+                )
 
             if output is not None:
                 outputs[encoder_name] = output

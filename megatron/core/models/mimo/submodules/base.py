@@ -85,19 +85,17 @@ class ModalitySubmodules(ABC, nn.Module):
 
     @classmethod
     def from_spec(
-        cls,
-        module_spec: ModuleSpec,
-        is_first_stage: bool = True,
-        is_last_stage: bool = True,
+        cls, module_spec: ModuleSpec, is_first_stage: bool = True, is_last_stage: bool = True
     ) -> 'ModalitySubmodules':
         """Create a modality submodule from ModuleSpec configuration.
 
         Args:
             module_spec (ModuleSpec): The module specification for this modality submodule
             is_first_stage (bool): Whether this is the first pipeline stage for this module.
-                Controls encoder initialization. Defaults to True.
+                Controls encoder initialization and output projection initialization
+                (output projections only built on first stage). Defaults to True.
             is_last_stage (bool): Whether this is the last pipeline stage for this module.
-                Controls input projection initialization (only needed on last stage).
+                Controls input projection initialization (only built on last stage).
                 Defaults to True.
 
         Returns:
@@ -137,9 +135,7 @@ class ModalitySubmodules(ABC, nn.Module):
                 projection = build_module(proj_spec)
                 input_projections.append(projection)
         elif 'input_projections' in submodules:
-            logger.debug(
-                f"Skipping {cls.__name__} input projections (not last stage)"
-            )
+            logger.debug(f"Skipping {cls.__name__} input projections (not last stage)")
 
         # Build output projections only on first stage
         # (projection happens before decoding, after receiving from language model)
@@ -152,9 +148,7 @@ class ModalitySubmodules(ABC, nn.Module):
                 projection = build_module(proj_spec)
                 output_projections.append(projection)
         elif 'output_projections' in submodules:
-            logger.debug(
-                f"Skipping {cls.__name__} output projections (not first stage)"
-            )
+            logger.debug(f"Skipping {cls.__name__} output projections (not first stage)")
 
         # Pass any additional parameters from the params dictionary
         additional_params = params.copy()
@@ -173,31 +167,61 @@ class ModalitySubmodules(ABC, nn.Module):
             **additional_params,
         )
 
-    @abstractmethod
     def combine_embeddings(self, embeddings: List[torch.Tensor]) -> torch.Tensor:
-        """Combine multiple embeddings from different encoders.
+        """Combine multiple embeddings from different encoders by concatenation.
 
         Args:
             embeddings (List[torch.Tensor]):
-                List of embeddings to combine
+                List of embeddings to combine. Each is [total_tokens, hidden_dim].
 
         Returns:
             torch.Tensor: Combined embedding tensor
         """
-        pass
+        if not embeddings:
+            raise ValueError("Cannot combine empty list of embeddings")
 
-    @abstractmethod
-    def encode(self, data_batch: Dict) -> List[torch.Tensor]:
+        if len(embeddings) == 1:
+            return embeddings[0]
+
+        combined = torch.cat(embeddings, dim=0)
+        logger.debug(f"Combined embeddings shape after concatenation: {combined.shape}")
+        return combined
+
+    def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode data batch into a list of tensors.
 
         Args:
-            data_batch (Dict):
-                Dictionary containing input data
+            encoders_data_batch (Dict):
+                Dictionary containing encoder-specific inputs.
+                Keys should match encoder names in self.encoders.
 
         Returns:
-            List[torch.Tensor]: List of encoded embeddings
+            List[torch.Tensor]: List of encoded embeddings, each [total_tokens, hidden_dim]
         """
-        pass
+        if not encoders_data_batch:
+            return []
+
+        embeddings = []
+
+        for name, encoder in self.encoders.items():
+            if name not in encoders_data_batch:
+                raise ValueError(f"No inputs found for encoder '{name}'")
+
+            encoder_inputs = encoders_data_batch[name]
+            encoder_outputs = encoder(**encoder_inputs)
+            logger.debug(f"Encoder '{name}' output shape: {encoder_outputs.shape}")
+
+            if encoder_outputs.ndim == 3:
+                encoder_outputs = encoder_outputs.reshape(-1, encoder_outputs.size(-1))
+            elif encoder_outputs.ndim != 2:
+                raise ValueError(
+                    f"Encoder '{name}' output shape {encoder_outputs.shape} is not supported. "
+                    f"Expected 3D (b,s,h) or 2D (b*s,h) tensor, got {encoder_outputs.ndim}D"
+                )
+
+            embeddings.append(encoder_outputs)
+
+        return embeddings
 
     @abstractmethod
     def decode(self, embeddings: torch.Tensor, data_batch: Dict) -> torch.Tensor:
@@ -214,11 +238,10 @@ class ModalitySubmodules(ABC, nn.Module):
         """
         pass
 
-    @abstractmethod
     def project_embeddings(
         self, embeddings: List[torch.Tensor], is_input: bool = True
     ) -> Optional[torch.Tensor]:
-        """Project embeddings into a tensor.
+        """Project embeddings using input or output projections.
 
         Args:
             embeddings (List[torch.Tensor]):
@@ -229,18 +252,49 @@ class ModalitySubmodules(ABC, nn.Module):
         Returns:
             Optional[torch.Tensor]: Projected embeddings or None
         """
-        pass
+        combined = self.combine_embeddings(embeddings)
 
-    @abstractmethod
-    def forward(self, encoder_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        projections = self.input_projections if is_input else self.output_projections
+
+        if projections:
+            projection = projections[0]
+            projected = projection(combined)
+            logger.debug(f"Post-projection embeddings shape: {projected.shape}")
+            return projected
+
+        return combined
+
+    def forward(
+        self,
+        encoder_inputs: Optional[Dict[str, Any]] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Process data for this modality through encoding and projection.
 
         Args:
             encoder_inputs (Dict[str, Any]):
                 Dictionary containing encoder-specific inputs. Keys should match encoder names.
+                Used when is_first_stage=True.
+            hidden_states (Optional[torch.Tensor]):
+                Hidden states from previous pipeline stage. Used when is_first_stage=False.
 
         Returns:
             Optional[torch.Tensor]:
                 Processed and projected embeddings tensor, or None if no embeddings were produced.
         """
-        pass
+        if self.is_first_stage:
+            if encoder_inputs is None:
+                return None
+            embeddings = self.encode(encoder_inputs)
+            if not embeddings:
+                return None
+            combined = self.combine_embeddings(embeddings)
+        else:
+            if hidden_states is None:
+                return None
+            combined = hidden_states
+
+        if self.is_last_stage:
+            return self.project_embeddings([combined], is_input=True)
+
+        return combined
