@@ -49,8 +49,6 @@ from megatron.training.utils import (
 )
 from model_provider import model_provider
 
-from transformers import AutoTokenizer
-
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
@@ -60,13 +58,10 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# TODO(asolergi-nv): Remove chat templates & refactor SFTTokenizer
 # TODO(asolergi-nv): Craft docs with expected inputs & formats
 # TODO(asolergi-nv): Drop positions_ids & attention_mask from batch
 # TODO(asolergi-nv): Add shape assertions!
 # TODO(asolergi-nv): How are we going to have attention mask in hybrid cp if we already have cu_seqlens and everything is SFTDataset? REMOVED
-# TODO(asolergi-nv): Add back SFTDataset
-# TODO(asolergi-nv): Fix SFTTokenizer, specially in preprocess script!
 # TODO(asolergi-nv): Fix NullSFTTokenizer
 # TODO(asolergi-nv): The clamp in preprocess_sft_batch for maxseqlen
 def get_batch(data_iterator, vp_stage=None):
@@ -196,12 +191,13 @@ def forward_step(data_iterator, model: MambaModel):
 
     packed_seq_params = None
     if cu_seqlens is not None:
+        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
-            cu_seqlens_kv_padded=None, # cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            cu_seqlens_q=cu_seqlens_for_params,
+            cu_seqlens_kv=cu_seqlens_for_params,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             local_cp_size=local_cp_size,
@@ -209,16 +205,6 @@ def forward_step(data_iterator, model: MambaModel):
         )
 
     timers('batch-generator').stop()
-
-    # print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.squeeze(0).shape}, cu_seqlens_padded: {cu_seqlens_padded.squeeze(0).shape}, max_seqlen: {max_seqlen.shape}")
-    # Shapes! tokens: torch.Size([1, 16384]), labels: torch.Size([1, 16384]), loss_mask: torch.Size([1, 16384]), cu_seqlens: torch.Size([2]), cu_seqlens_padded: torch.Size([2]), max_seqlen: torch.Size([1])
-    # Shapes! tokens: [batch, seq_len // CP], labels: [batch, seq_len // CP], loss_mask: [batch, seq_len // CP], cu_seqlens: [Number of sequences], cu_seqlens_padded: [Number of sequences], max_seqlen: [1]  
-    if int(os.environ.get('RANK', 0)) == 0:
-        print(f"Number of training tokens: {int(loss_mask.sum().item())}")
-        # print(f"Number of training sequences: {cu_seqlens.shape[0]}")
-        # print(f"tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, position_ids: {position_ids.shape}")
-        # print(f"tokens: {tokens}")
-
 
     with stimer:
         output_tensor = model(
@@ -235,12 +221,16 @@ def forward_step(data_iterator, model: MambaModel):
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    args = get_args()
+    config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
         return True
-    else:
-        return is_first_or_last_pipeline_stage(vp_stage)
+    return (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
+    )
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -251,26 +241,43 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-    return SFTDatasetConfig(
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-        fast_cache_load=False,
-        context_parallel_size=args.context_parallel_size,
-    )
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
+
+    data_args = {
+        "random_seed": args.seed,
+        "sequence_length": args.seq_length,
+        "blend": blend,
+        "blend_per_split": blend_per_split,
+        "split": args.split,
+        "multiple_validation_sets": args.multiple_validation_sets,
+        "full_validation": args.full_validation,
+        "num_dataset_builder_threads": args.num_dataset_builder_threads,
+        "path_to_cache": args.data_cache_path,
+        "mmap_bin_files": args.mmap_bin_files,
+        "tokenizer": tokenizer,
+        "reset_position_ids": args.reset_position_ids,
+        "reset_attention_mask": args.reset_attention_mask,
+        "eod_mask_loss": args.eod_mask_loss,
+        "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "object_storage_cache_path": args.object_storage_cache_path,
+        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
+        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
+        "fast_cache_load": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
+        "context_parallel_size": args.context_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,
+    }
+
+    if args.sft:
+        return SFTDatasetConfig(**data_args)
+
+    return GPTDatasetConfig(**data_args)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
