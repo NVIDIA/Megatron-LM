@@ -619,7 +619,6 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
 
         self.micro_batch_size = micro_batch_size
         self.data_parallel_size = data_parallel_size
-        self.decrease_batch_size_if_needed = decrease_batch_size_if_needed
         self.rank = rank
         self.seq_length = seq_length
 
@@ -641,7 +640,6 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             logger.info(f'  seq_length: {seq_length} (thresholds interpreted as {"tokens" if seq_length else "samples"})')
             logger.info(f'  micro_batch_size: {micro_batch_size}')
             logger.info(f'  data_parallel_size: {data_parallel_size}')
-            logger.info(f'  decrease_batch_size_if_needed: {decrease_batch_size_if_needed}')
             logger.info(f'step batch size schedule ({len(self.schedule)} steps):')
             for threshold, batch_size in self.schedule:
                 num_microbatches = batch_size // self.micro_batch_times_data_parallel_size
@@ -743,11 +741,6 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 break
         return batch_size
 
-    @staticmethod
-    def _round(batch_size: int, divisor: int) -> int:
-        """Round batch_size down to nearest value divisible by divisor."""
-        return (batch_size // divisor) * divisor
-
     def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
         """Update number of microbatches based on consumed samples.
 
@@ -756,44 +749,17 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             consistency_check (bool): Check divisibility constraints.
             verbose (bool): Enable logging.
         """
-        old_current_global_batch_size = self.current_global_batch_size
         self.current_global_batch_size = self._get_batch_size_for_samples(consumed_samples)
 
-        global_batch_size_changed = old_current_global_batch_size != self.current_global_batch_size
-
-        if self.rank == 0 and global_batch_size_changed and verbose:
-            if old_current_global_batch_size is None:
-                logger.info(f'setting initial batch size to {self.current_global_batch_size}')
-            else:
-                logger.info(
-                    f'stepping batch size from {old_current_global_batch_size} to '
-                    f'{self.current_global_batch_size} at {consumed_samples:,} samples'
-                )
-
         # Consistency check
-        if consistency_check and not self.decrease_batch_size_if_needed:
+        if consistency_check:
             assert self.current_global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
                 f'current global batch size ({self.current_global_batch_size}) is not divisible by '
                 f'micro_batch_size ({self.micro_batch_size}) * '
                 f'data_parallel_size ({self.data_parallel_size})'
             )
 
-        # Handle decrease_batch_size_if_needed
-        if (
-            self.decrease_batch_size_if_needed
-            and self.current_global_batch_size % self.micro_batch_times_data_parallel_size != 0
-        ):
-            self.current_running_global_batch_size = self._round(
-                self.current_global_batch_size, self.micro_batch_times_data_parallel_size
-            )
-            if self.rank == 0 and global_batch_size_changed and verbose:
-                logger.info(
-                    f'adjusted running batch size to {self.current_running_global_batch_size} '
-                    f'for divisibility'
-                )
-        else:
-            self.current_running_global_batch_size = self.current_global_batch_size
-
+        self.current_running_global_batch_size = self.current_global_batch_size
         self.num_micro_batches = (
             self.current_running_global_batch_size // self.micro_batch_times_data_parallel_size
         )
