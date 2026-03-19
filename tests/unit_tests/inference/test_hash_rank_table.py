@@ -271,3 +271,83 @@ class TestCompact:
         assert t.has(30, 1)
         assert t.has(40, 1)
         assert t.has(20, 0)
+
+
+class TestMaxTimestamps:
+    """max_timestamps returns per-rank element-wise max across hashes."""
+
+    def test_single_hash(self):
+        t = HashRankTable(n_ranks=2)
+        t.set(10, 0, 5)
+        t.set(10, 1, 3)
+        result = t.max_timestamps([10])
+        np.testing.assert_array_equal(result, [5, 3])
+
+    def test_max_across_multiple_hashes(self):
+        t = HashRankTable(n_ranks=2)
+        t.set(10, 0, 5)
+        t.set(10, 1, 3)
+        t.set(20, 0, 2)
+        t.set(20, 1, 9)
+        result = t.max_timestamps([10, 20])
+        np.testing.assert_array_equal(result, [5, 9])
+
+    def test_unseen_hashes_ignored(self):
+        t = HashRankTable(n_ranks=2)
+        t.set(10, 0, 5)
+        result = t.max_timestamps([10, 999])
+        np.testing.assert_array_equal(result, [5, 0])
+
+    def test_all_unseen_returns_zeros(self):
+        t = HashRankTable(n_ranks=3)
+        result = t.max_timestamps([99, 88])
+        np.testing.assert_array_equal(result, [0, 0, 0])
+
+    def test_empty_hashes(self):
+        t = HashRankTable(n_ranks=2)
+        result = t.max_timestamps([])
+        np.testing.assert_array_equal(result, [0, 0])
+
+
+class TestAddRank:
+    """add_rank() appends a new rank column."""
+
+    def test_add_rank_returns_new_index(self):
+        t = HashRankTable(n_ranks=2)
+        new_idx = t.add_rank()
+        assert new_idx == 2
+        assert t.n_ranks == 3
+
+    def test_add_rank_preserves_existing_data(self):
+        t = HashRankTable(n_ranks=2)
+        t.set(10, 0, 5)
+        t.set(10, 1, 3)
+        t.add_rank()
+        assert t.get_timestamp(10, 0) == 5
+        assert t.get_timestamp(10, 1) == 3
+        assert t.get_timestamp(10, 2) == 0
+
+    def test_add_rank_new_rank_is_usable(self):
+        t = HashRankTable(n_ranks=2)
+        new_idx = t.add_rank()
+        t.record(new_idx, [42])
+        assert t.has(42, new_idx)
+        assert not t.has(42, 0)
+
+    def test_add_multiple_ranks(self):
+        t = HashRankTable(n_ranks=1)
+        idx1 = t.add_rank()
+        idx2 = t.add_rank()
+        assert idx1 == 1
+        assert idx2 == 2
+        assert t.n_ranks == 3
+        t.set(10, idx2, 7)
+        assert t.get_timestamp(10, idx2) == 7
+
+    def test_match_vector_after_add_rank(self):
+        t = HashRankTable(n_ranks=2)
+        t.record(0, [10])
+        new_idx = t.add_rank()
+        t.record(new_idx, [10])
+        result = t.match_vector([10])
+        np.testing.assert_array_equal(result, [1.0, 0.0, 1.0])
