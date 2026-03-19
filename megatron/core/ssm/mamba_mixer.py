@@ -930,6 +930,7 @@ class MambaMixer(MegatronModule):
                 ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
             else:
                 ssm_varlen_states = ssm_varlen_result
+                intermediate_ssm_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
