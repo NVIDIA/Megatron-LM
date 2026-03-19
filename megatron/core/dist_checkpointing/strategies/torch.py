@@ -1054,11 +1054,6 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             }
             async_strategy = "nvrx"
         except (ImportError, ModuleNotFoundError):
-            logger.warning(
-                "`nvrx` async strategy is set, but nvrx package is not installed. "
-                "Setting async strategy to `mcore`."
-            )
-
             # do mcore async imports
             imports = _import_mcore_async()
             async_strategy = "mcore"
