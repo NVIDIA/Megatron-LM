@@ -750,6 +750,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
         (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
+        ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
             req2,
             1,
@@ -760,11 +762,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate
-        offsets = msa._intermediate_offsets[1]
-        if offsets is not None:
+        count = msa._intermediate_counts_gpu[1].item()
+        if count > 0:
+            offsets = msa._intermediate_offsets_gpu[1, :count].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa._eos_cache_block_id[1] is not None
+        assert msa._eos_cache_block_id_gpu[1].item() >= 0
 
         # non-aligned prompt produces last_aligned intermediate offset
         ctx2 = self._mctx(block_size_tokens=bs)
@@ -779,11 +782,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 2
         ctx2.add_request(req2b)
-        offsets = msa2._intermediate_offsets[1]
-        if offsets is not None:
+        count2 = msa2._intermediate_counts_gpu[1].item()
+        if count2 > 0:
+            offsets = msa2._intermediate_offsets_gpu[1, :count2].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa2._eos_cache_block_id[1] is None
+        assert msa2._eos_cache_block_id_gpu[1].item() < 0
 
         # block-aligned prompts set EOS cache block ID
         ctx3 = self._mctx(block_size_tokens=bs)
@@ -792,7 +796,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 0
         ctx3.add_request(req3)
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id[1] is not None
+        assert ctx3.mamba_slot_allocator._eos_cache_block_id_gpu[1].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()

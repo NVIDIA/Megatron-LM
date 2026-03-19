@@ -1614,9 +1614,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
-            intermediate_offsets = None
+            intermediate_offsets_gpu = None
+            intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
-                intermediate_offsets = self.mamba_slot_allocator.get_intermediate_offsets()
+                intermediate_offsets_gpu, intermediate_counts_gpu = (
+                    self.mamba_slot_allocator.get_intermediate_gpu_data()
+                )
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
@@ -1624,7 +1627,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
-                intermediate_token_offsets=intermediate_offsets,
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
             )
 
         if self.moe_enable_routing_replay:
@@ -2230,13 +2234,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Clear intermediate offset entries for released requests
         if self.mamba_slot_allocator is not None:
-            idx_list = (
-                request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
-            )
-            for idx in idx_list:
-                self.mamba_slot_allocator._intermediate_offsets[idx] = None
-                self.mamba_slot_allocator._intermediate_block_ids[idx] = None
-                self.mamba_slot_allocator._eos_cache_block_id[idx] = None
+            sa = self.mamba_slot_allocator
+            sa._intermediate_counts_gpu[request_indexes] = 0
+            sa._intermediate_offsets_gpu[request_indexes] = 0
+            sa._intermediate_block_ids_gpu[request_indexes] = -1
+            sa._eos_cache_block_id_gpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor
