@@ -66,13 +66,13 @@ try:
 
     # Alias the PyTorch wrapper so we can call tex.* APIs
     import transformer_engine_torch as tex
+    from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+        pad_thd_sequences_for_cp,
+    )
 except ImportError:
     # TE isn’t installed or the torch wrapper is missing
     tex = None
-
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
-    pad_thd_sequences_for_cp,
-)
+    pad_thd_sequences_for_cp = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
