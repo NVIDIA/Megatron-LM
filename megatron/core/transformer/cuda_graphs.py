@@ -585,7 +585,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 need_copy_inputs.append(user_input)
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
             else:
-                cudagraph_input.copy_(user_input)
+                if user_input.data_ptr() != cudagraph_input.data_ptr():
+                    cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
