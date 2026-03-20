@@ -36,7 +36,7 @@ def initialize_test_environment(
     destroy_global_vars()
     destroy_num_microbatches_calculator()
 
-    sys.argv = ['test_tp_cp_.py']
+    sys.argv = ['test_get_batch.py']
     args = parse_args()
     args.seq_length = seq_length
     args.tensor_model_parallel_size = tp_size
@@ -58,6 +58,8 @@ def initialize_test_environment(
     args.max_position_embeddings = seq_length
 
     os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+    os.environ['NCCL_NVLS_ENABLE'] = '0'
+
     validate_args(args)
     set_global_variables(args, True)
 
@@ -301,8 +303,7 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     else:
         assert cu_seqlens_padded is None
 
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    Utils.destroy_model_parallel()
 
 
 def create_pretrain_data_iterator(
@@ -429,8 +430,7 @@ def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask, mic
     else:
         assert attention_mask is None
 
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    Utils.destroy_model_parallel()
 
 
 def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
@@ -592,9 +592,4 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert cu_seqlens_padded is None
         assert hybrid_cp_group is None
 
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-
-if __name__ == "__main__":
-    test_pretrain_batch(1, 2, 1024, True, 2)
+    Utils.destroy_model_parallel()
