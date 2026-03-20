@@ -213,13 +213,19 @@ class MimoModel(MegatronModule):
         Returns:
             None
         """
-        # Store dict input for multi-module PP
-        if isinstance(input_tensor, dict):
-            self.input_tensors = input_tensor
-            return
-
+        # The schedule wraps input_tensor in a list (schedules.py:415-416),
+        # so unwrap first before checking type.
         if isinstance(input_tensor, list):
             input_tensor = input_tensor[0]
+
+        # Store dict input for multi-module PP
+        if isinstance(input_tensor, dict):
+            # P2P recv may return [tensor] (list) for VPP compat — unwrap to tensor
+            self.input_tensors = {
+                k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                for k, v in input_tensor.items()
+            }
+            return
 
         self.input_tensors = input_tensor
 
@@ -425,9 +431,11 @@ class MimoModel(MegatronModule):
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
-            # Set input tensor on language model for PP
-            if hidden_states is not None and hasattr(self.language_model, 'set_input_tensor'):
-                self.language_model.set_input_tensor(hidden_states)
+            # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
+            if hidden_states is not None:
+                underlying_lm = unwrap_model(self.language_model)
+                if hasattr(underlying_lm, 'set_input_tensor'):
+                    underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
                 input_ids=None,
