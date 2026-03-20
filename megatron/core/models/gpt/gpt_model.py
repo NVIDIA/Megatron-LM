@@ -27,7 +27,6 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
-    compute_mtp_inference_logits,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -218,7 +217,10 @@ class GPTModel(LanguageModule):
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(
-                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
+                config=self.config,
+                spec=self.mtp_block_spec,
+                vp_stage=vp_stage,
+                pg_collection=self.pg_collection,
             )
 
         # Output
@@ -610,7 +612,7 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not is_spec_decode:
+        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -631,21 +633,10 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            # The new process_mtp_loss function doesn't handle mtp_logits_cache,
-            # so we manually generate and cache MTP logits when in inference mode.
-            if in_inference_mode:
-                if is_spec_decode:
-                    # Cache decoder hidden states for serial MTP computation
-                    # after speculative token verification.
-                    self._decoder_hidden_states_cache = hidden_states
-                else:
-                    hidden_states, self._mtp_logits_cache = compute_mtp_inference_logits(
-                        hidden_states=hidden_states,
-                        mtp_num_layers=self.config.mtp_num_layers,
-                        output_layer=self.output_layer,
-                        output_weight=output_weight,
-                        runtime_gather_output=runtime_gather_output,
-                    )
+            if in_inference_mode or is_spec_decode:
+                # Cache decoder hidden states for serial MTP computation
+                # after speculative token verification.
+                self._decoder_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
