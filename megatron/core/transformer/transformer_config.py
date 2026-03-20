@@ -450,6 +450,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -820,6 +824,15 @@ class TransformerConfig(ModelParallelConfig):
     """Number of CUDA thread blocks for the unpermute part in HybridEP.
     When permute_fusion_into_hybridep is True, this sets the number
     of SMs for the unpermute part (only 1 block per SM)."""
+
+    moe_mlp_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the MoE grouped MLP layer will use a
+    block interleaved format. Instead of interpreting the input tensor
+    as a concatenation of gates and linear units, it will be
+    interpreted as alternating blocks of gates and linear units.
+
+    This data format is experimental and primarily intended to enable
+    advanced fused kernels."""
 
     ##################
     # Context Parallel
