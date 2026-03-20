@@ -11,10 +11,7 @@ SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2T
 
 logger = logging.getLogger(__name__)
 
-NULL_TOKENIZERS = {
-    'NullTokenizer': 'null-text',
-    'NullMultimodalTokenizer': 'null-multimodal',
-}
+NULL_TOKENIZERS = {'NullTokenizer': 'null-text', 'NullMultimodalTokenizer': 'null-multimodal'}
 
 
 def build_tokenizer(args, **kwargs):
