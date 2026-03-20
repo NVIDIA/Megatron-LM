@@ -134,17 +134,36 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format Response (matching old_completions.py) ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return f"Inference request(s) failed: {error_detail}", status
+
+        # --- 5. Format Response (matching old_completions.py) ---
         choices = []
 
         request_idx = 0
         for completed_request in batch_results:
-            request_dict = (
-                completed_request
-                if isinstance(completed_request, dict)
-                else completed_request.serialize()
-            )
-            result = unwrap_serialized_tensors(request_dict)
+            result = unwrap_serialized_tensors(completed_request)
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 

@@ -62,8 +62,7 @@ class PRReviewTracker:
                     for part in parts[1:]:
                         if part.startswith("@NVIDIA/"):
                             teams.add(part.split("/", 1)[1])
-                    if teams:
-                        rules.append((pattern, teams))
+                    rules.append((pattern, teams))
         except FileNotFoundError:
             logger.warning("CODEOWNERS file not found")
         logger.info(f"Parsed {len(rules)} CODEOWNERS rules")
