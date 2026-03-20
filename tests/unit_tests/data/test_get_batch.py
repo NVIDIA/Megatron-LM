@@ -58,7 +58,7 @@ def initialize_test_environment(
     args.max_position_embeddings = seq_length
 
     os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
-    os.environ['NCCL_NVLS_ENABLE'] = '0'
+    os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
     set_global_variables(args, True)
