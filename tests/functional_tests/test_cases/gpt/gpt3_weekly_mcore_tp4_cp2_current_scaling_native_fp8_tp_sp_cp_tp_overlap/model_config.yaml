@@ -54,4 +54,6 @@ MODEL_ARGS:
   --bf16: true
   --log-memory-to-tensorboard: true
   --normalization: RMSNorm
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular

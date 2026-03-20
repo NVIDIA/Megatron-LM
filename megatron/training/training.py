@@ -65,6 +65,56 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
+# Canonical list of RL timer names to include in timers_to_log.
+# When the profiling branch is merged, this will be imported from rl_profiling
+# as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
+RL_LOGGABLE_TIMER_NAMES = [
+    # Top-level RL phases
+    'rl/rollout-collection',
+    'rl/prepare-data-for-update',
+    # Rollout collection breakdown
+    'rl/inference-setup',
+    'rl/collect-rollouts',
+    'rl/sync-rollouts',
+    'rl/suspend-engine',
+    # Optimizer offload/restore
+    'rl/offload-optimizer-before-inference',
+    'rl/restore-optimizer-after-inference',
+    'rl/offload-kv-cache-after-inference',
+    'rl/restore-kv-cache-before-inference',
+    # Fine-grained offload/restore breakdown
+    'rl/restore/grad-buffers',
+    'rl/restore/optimizer-state',
+    'rl/restore/wait-for-transfers',
+    'rl/offload/grad-buffers',
+    'rl/offload/optimizer-state',
+    # Weight prefetching
+    'rl/prefetch-weights-to-gpu',
+    'rl/prefetch-weights-to-cpu',
+    # Data preparation
+    'rl/compute-group-stats',
+    'rl/prepare-advantages',
+    'rl/prepare-trajectories',
+    'rl/get-ltor-masks',
+    'rl/create-dataloader',
+    'rl/sequence-packing',
+    'rl/align-inference-logprobs',
+    'rl/log-wandb-tb',
+    'rl/pack-sequences',
+    'rl/regather-trajectories',
+    # Logprobs computation
+    'rl/compute-logprobs',
+    'rl/compute-old-logprobs',
+    'rl/compute-ref-logprobs',
+    'rl/get-logprobs',
+    'rl/forward-pass',
+    'rl/log-softmax',
+    # Inference / cuda graphs
+    'rl/build-cuda-graphs',
+    'rl/wait-for-decode-only',
+]
+
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -147,10 +197,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAInde
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
-    destroy_global_symmetric_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
 
@@ -210,7 +260,7 @@ def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
-    destroy_global_symmetric_memory_buffer()
+    SymmetricMemoryManager.destroy()
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
@@ -1378,14 +1428,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # To pass kwargs unique to specific DDP classes.
-            dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                # Also pass the mixed-precision arguments for Megatron-FSDP only.
-                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-
             model = [
                 DP(
                     config=config,
@@ -1394,7 +1436,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -1933,15 +1974,8 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
-    if args.perform_rl_step:
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+    if getattr(args, 'perform_rl_step', False):
+        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2855,7 +2889,7 @@ def train(
         # Capture CUDA Graphs.
         if (
             args.cuda_graph_impl == "transformer_engine"
-            and not cuda_graph_helper.graphs_created()
+            and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
@@ -2963,8 +2997,8 @@ def train(
                         and args.cuda_graph_warmup_steps == 0
                     ):
                         assert (
-                            cuda_graph_helper.graphs_created()
-                        ), "CUDA Graphs should have been created."
+                            cuda_graph_helper.capture_finished()
+                        ), "CUDA Graph capture should have been finished."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
@@ -3256,16 +3290,14 @@ def evaluate(
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
-                        total_loss_dict[key] = torch.tensor(
-                            [0.0, 0.0], dtype=torch.float
-                        ).cuda()
+                        total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float, device='cuda')
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
                         if args.sft:
                             # normalize over micro batch instead of global
                             val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1]
+                            val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,

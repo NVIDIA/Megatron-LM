@@ -51,4 +51,6 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --log-memory-to-tensorboard: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume

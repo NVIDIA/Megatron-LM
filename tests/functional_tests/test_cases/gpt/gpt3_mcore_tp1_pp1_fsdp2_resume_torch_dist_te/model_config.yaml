@@ -52,4 +52,6 @@ MODEL_ARGS:
   --fp16: true
   --apply-query-key-layer-scaling: true
   --log-memory-to-tensorboard: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume

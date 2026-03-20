@@ -52,4 +52,6 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
   --expert-tensor-parallel-size: 4
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
