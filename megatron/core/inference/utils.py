@@ -4,9 +4,7 @@ import asyncio
 import logging
 import multiprocessing
 import sys
-import time
-from dataclasses import dataclass
-from typing import Optional
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
@@ -19,6 +17,11 @@ except ImportError:
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
 
 
 def device_memory_summary() -> str:
@@ -166,29 +169,42 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
-def prewarm_flashinfer_jit():
-    """Pre-compile FlashInfer CUTLASS fused MoE kernels if not already cached.
+def check_flashinfer_jit_cache_installed(log_version: bool = False):
+    """Verify that the flashinfer-jit-cache package is installed.
 
-    FlashInfer uses JIT compilation via ninja to build CUTLASS kernels on first use.
-    This can take several minutes and blocks CUDA graph warmup. This function triggers
-    the compilation early so the cached .so is ready before the warmup loop.
+    The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
+    so they don't need to be JIT-compiled at runtime. This avoids a multi-minute
+    compilation step during CUDA graph warmup.
+
+    Raises:
+        RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
     """
-    try:
-        from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
-    except ImportError:
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
+        if log_version:
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
+            )
         return
 
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
-    logging.info(
-        "Pre-compiling FlashInfer CUTLASS kernels for sm_%s "
-        "(one-time cost, may take several minutes)...",
-        device_arch,
-    )
-    t0 = time.time()
-    get_cutlass_fused_moe_module(device_arch)
-    logging.info(
-        "FlashInfer CUTLASS kernel compilation finished in %.1f seconds.", time.time() - t0
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
+        )
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
+    raise RuntimeError(
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
     )
 
 
