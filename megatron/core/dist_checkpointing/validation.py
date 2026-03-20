@@ -239,7 +239,7 @@ def verify_checkpoint_and_load_strategy(
                 TorchDistLoadShardedStrategy,
             )
 
-            sharded_strategy = TorchDistLoadShardedStrategy(cache_metadata=True)
+            sharded_strategy = TorchDistLoadShardedStrategy(cache_metadata=cache_metadata)
         else:
             sharded_strategy = get_default_strategy(
                 StrategyAction.LOAD_SHARDED,
