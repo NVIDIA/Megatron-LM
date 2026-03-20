@@ -193,7 +193,7 @@ jobs:
           echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
 
           cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
-          Running **scope=$SCOPE** with **n_repeat=$N_REPEAT** repetitions$( [ "$LIGHTWEIGHT" == "true" ] && echo " in lightweight mode" || echo "" ).
+          Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )with **$N_REPEAT** repetition(s). You are welcome.
 
           | Setting | Value |
           |---|---|
