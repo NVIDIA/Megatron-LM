@@ -189,6 +189,16 @@ jobs:
           echo "lts=$HAS_LTS"                 | tee -a $GITHUB_OUTPUT
           echo "mbridge_suite=$MBRIDGE_SUITE" | tee -a $GITHUB_OUTPUT
 
+          cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
+          | Setting | Value |
+          |---|---|
+          | \`scope\` | \`$SCOPE\` |
+          | \`n_repeat\` | \`$N_REPEAT\` |
+          | \`lightweight\` | \`$LIGHTWEIGHT\` |
+          | \`lts\` | \`$HAS_LTS\` |
+          | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
+          SUMMARY
+
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
