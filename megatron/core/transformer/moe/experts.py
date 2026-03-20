@@ -558,14 +558,26 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
+            stacked_data = torch.stack(q_list, dim=0).contiguous()
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+
             setattr(
                 self,
                 buf_name,
-                MXFP8Tensor(
-                    data=torch.stack(q_list, dim=0).contiguous(),
-                    scale=torch.stack(s_list, dim=0).contiguous(),
-                ),
+                MXFP8Tensor(data=stacked_data, scale=stacked_scale),
             )
+
+            # Redirect per-expert weight .data to views into the stacked buffer,
+            # mirroring _build_concatenated_weights. This frees the original
+            # allocations while keeping the Parameter objects intact.
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                if isinstance(w, MXFP8Tensor):
+                    w.data = stacked_data[i]
+                    w.scale = stacked_scale[i]
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    w.data.data = stacked_data[i]
+                    w.data.scale = stacked_scale[i]
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
