@@ -208,7 +208,7 @@ flash_mla = [
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "287770466f0f4433052260a765db5ff7b8be1320" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "63154570cea17f8805a7fd15cc3b8cc2919ba575" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "v0.5.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
