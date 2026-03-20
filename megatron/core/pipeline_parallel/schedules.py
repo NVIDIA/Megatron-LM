@@ -282,6 +282,7 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
+    cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
@@ -293,7 +294,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
@@ -308,7 +308,7 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            MTPLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
     return output_tensor, num_tokens
 
