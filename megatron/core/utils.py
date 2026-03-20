@@ -2546,6 +2546,10 @@ def get_pretrain_batch_on_this_cp_rank(
         for key, val in batch.items():
             if val is not None:
                 seq_dim = 2 if key == 'attention_mask' else 1
+                if not isinstance(val, torch.Tensor) or val.dim() <= seq_dim:
+                    # NOTE(asolergi-nv): HybridCP includes 1D metadata tensors
+                    # like cu_seqlens, cu_seqlens_padded, max_seqlen, local_cp_size
+                    continue
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
