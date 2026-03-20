@@ -1456,6 +1456,11 @@ class MultiTokenPredictionBlock(MegatronModule):
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
 
+        if self.config.mtp_detach_heads:
+            # Set is_mtp_param on the mtp params so the optimizer can handle them separately from the main model params
+            for param in self.parameters():
+                param.is_mtp_param = True
+
     def _build_layers(self, pg_collection):
         # Determine number of depths to build
         if self.mtp_num_depths > 0:
