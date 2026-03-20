@@ -1280,21 +1280,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
-            range_push("push routing indices to request")
             # Process routing indices if available (list aligned with request_ids)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
             # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
+            # add_routing_indices will simply append this step's routing chunk to a list 
+            # Later when we finish the request, we will assemble the full routing map 
+            # from these chunks.
             if routing_indices_per_request is not None and req_idx < len(routing_indices_per_request):
                 step_routing = routing_indices_per_request[req_idx]  # [num_tokens, num_layers, topk]
-                # if request.routing_indices is None:
-                #     request.routing_indices = step_routing
-                # else:
-                #     request.routing_indices = np.concatenate(
-                #         [request.routing_indices, step_routing], axis=0
-                #     )
                 request.add_routing_indices(step_routing)
-            range_pop()
+            
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:

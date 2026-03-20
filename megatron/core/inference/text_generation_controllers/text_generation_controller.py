@@ -1253,9 +1253,7 @@ class TextGenerationController:
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
             # gather_from_sequence_parallel_region gathers along dim 0
             # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
-            range_push("router_record_allgather")
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
-            range_pop()
 
         # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
@@ -1792,9 +1790,7 @@ class TextGenerationController:
             context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
-        range_push("router_record_bookkeeping")
         routing_indices_per_request = self._router_record_bookkeeping()
-        range_pop()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
