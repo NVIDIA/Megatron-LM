@@ -11,6 +11,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -35,13 +36,6 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
-
-try:
-    import transformer_engine.pytorch as te  # pylint: disable=unused-import
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
 
 try:
     import apex  # pylint: disable=unused-import
@@ -311,6 +305,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
                     self.config.cpu_offloading_double_buffering,
+                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
                 )
             )
             self.config._cpu_offloading_context = (
