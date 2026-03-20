@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -40,12 +41,10 @@ from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TEColumnParallelGroupedLinear = None
 
 _SEED = 42
 

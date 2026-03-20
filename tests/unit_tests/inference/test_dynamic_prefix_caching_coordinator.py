@@ -216,6 +216,7 @@ def make_coordinator_direct(
     )
 
     coordinator.hash_to_rank_info = {}
+    coordinator._round_robin_idx = 0
     coordinator._assignment_counter = 0
 
     return coordinator
@@ -442,7 +443,7 @@ class TestCoordinatorEndToEnd:
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)
