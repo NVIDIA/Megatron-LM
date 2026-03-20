@@ -2019,22 +2019,26 @@ def pad_or_truncate_thd_tensors(
         input_ids = input_ids[:sequence_length]
         labels = labels[:sequence_length]
         loss_mask = loss_mask[:sequence_length]
-        # NOTE(asolergi-nv): Truncate cu_seqlens
-        # Find the largest index such that cu_seqlens[index] <= sequence_length
-        idx = (cu_seqlens < sequence_length).nonzero(as_tuple=True)[0]
-        # We want to keep all elements up to and including that index,
-        # and add a last element containing sequence_length
-        cu_seqlens = torch.cat(
-            [cu_seqlens[: idx[-1] + 1], cu_seqlens.new_tensor([sequence_length])]
-        )
-        # NOTE(asolergi-nv): Truncate cu_seqlens_padded if CP
         if cu_seqlens_padded is not None:
-            # Find the largest index such that cu_seqlens_padded[index] <= sequence_length
+            # NOTE(asolergi-nv): When CP padding is active, cu_seqlens_padded
+            # determines the actual token layout. Because padded entries are
+            # always >= original entries, cu_seqlens_padded hits
+            # sequence_length first. Truncate BOTH at the same segment
+            # boundary so they always have the same number of entries.
             idx = (cu_seqlens_padded < sequence_length).nonzero(as_tuple=True)[0]
-            # We want to keep all elements up to and including that index,
-            # and add a last element containing sequence_length
+            num_keep = idx[-1] + 1
+            cu_seqlens = torch.cat(
+                [cu_seqlens[:num_keep], cu_seqlens.new_tensor([sequence_length])]
+            )
             cu_seqlens_padded = torch.cat(
-                [cu_seqlens_padded[: idx[-1] + 1], cu_seqlens_padded.new_tensor([sequence_length])]
+                [cu_seqlens_padded[:num_keep], cu_seqlens_padded.new_tensor([sequence_length])]
+            )
+        else:
+            # NOTE(asolergi-nv): Truncate cu_seqlens
+            # Find the largest index such that cu_seqlens[index] < sequence_length
+            idx = (cu_seqlens < sequence_length).nonzero(as_tuple=True)[0]
+            cu_seqlens = torch.cat(
+                [cu_seqlens[: idx[-1] + 1], cu_seqlens.new_tensor([sequence_length])]
             )
     else:  # Pad
         input_ids = torch.cat(
