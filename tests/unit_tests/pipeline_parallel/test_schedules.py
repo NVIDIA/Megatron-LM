@@ -768,3 +768,117 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         assert l['loss_reduced'] == expected['loss_reduced']
 
     Utils.destroy_model_parallel()
+
+
+class TestMTPLossScaleWithCP:
+    """Verify MTPLossAutoScaler loss scale accounts for CP-induced num_microbatches inflation.
+
+    When CP is enabled, num_microbatches in the schedule is multiplied by cp_size.
+    Without the fix (issue #3943), the MTP loss scale would be incorrectly divided by
+    this inflated num_microbatches, effectively scaling down the MTP loss gradient by
+    cp_size.  The fix multiplies by cp_size to compensate, mirroring the MoE aux loss
+    fix in PR #2217.
+    """
+
+    @staticmethod
+    def _make_config(mtp_num_layers=2, calculate_per_token_loss=False):
+        import types
+
+        config = types.SimpleNamespace(
+            mtp_num_layers=mtp_num_layers,
+            num_moe_experts=None,
+            calculate_per_token_loss=calculate_per_token_loss,
+            grad_scale_func=None,
+            timers=None,
+        )
+        return config
+
+    @pytest.fixture(autouse=True)
+    def _reset_mtp_loss_scale(self):
+        from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+        yield
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+    @staticmethod
+    def _set_scale_via_schedule(config, num_microbatches, cp_group_size):
+        output_tensor = torch.ones(1)
+
+        schedule.forward_step_calc_loss(
+            model=None,
+            output_tensor=output_tensor,
+            loss_func=None,
+            config=config,
+            vp_stage=None,
+            collect_non_loss_data=False,
+            num_microbatches=num_microbatches,
+            forward_data_store=[],
+            cp_group_size=cp_group_size,
+            is_last_stage=False,
+        )
+
+    @pytest.mark.parametrize(
+        "cp_group_size,num_microbatches,expected_scale",
+        [
+            (1, 1, 1.0),
+            (2, 4, 0.5),
+            (2, 6, 1.0 / 3.0),
+        ],
+    )
+    def test_mtp_loss_scale_matches_actual_ga(
+        self, cp_group_size, num_microbatches, expected_scale
+    ):
+        """MTP loss scale should equal 1/actual_GA across CP and GA combinations."""
+        from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+        config = self._make_config()
+        self._set_scale_via_schedule(config, num_microbatches, cp_group_size)
+
+        actual_ga = num_microbatches // cp_group_size
+        actual_scale = MTPLossAutoScaler.main_loss_backward_scale.item()
+        assert actual_scale == pytest.approx(expected_scale), (
+            f"cp_group_size={cp_group_size}, num_microbatches={num_microbatches}, "
+            f"actual_ga={actual_ga}: "
+            f"expected {expected_scale}, got {actual_scale}"
+        )
+
+    def test_mtp_loss_scale_with_per_token_loss(self):
+        """When calculate_per_token_loss is True, scale should be 1.0 (no GA/CP adjustment)."""
+        from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+        config = self._make_config(calculate_per_token_loss=True)
+        self._set_scale_via_schedule(config, num_microbatches=8, cp_group_size=4)
+
+        actual_scale = MTPLossAutoScaler.main_loss_backward_scale.item()
+        assert actual_scale == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        "cp_group_size,num_microbatches,mtp_loss_elements",
+        [
+            (1, 1, 2),
+            (2, 6, 6),
+        ],
+    )
+    def test_mtp_loss_scale_applied_in_backward(
+        self, cp_group_size, num_microbatches, mtp_loss_elements
+    ):
+        """Dummy backward should receive the scale computed from schedule inputs."""
+        from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+        config = self._make_config()
+        self._set_scale_via_schedule(config, num_microbatches, cp_group_size)
+
+        main_output = torch.tensor([1.0], requires_grad=True)
+        mtp_input = torch.arange(1, mtp_loss_elements + 1, dtype=torch.float32, requires_grad=True)
+        mtp_loss = mtp_input.mean()
+
+        scaled_output = MTPLossAutoScaler.apply(main_output, mtp_loss)
+        scaled_output.sum().backward()
+
+        expected_scale = cp_group_size / num_microbatches
+        expected_grad = torch.full_like(mtp_input, expected_scale / mtp_loss_elements)
+        assert torch.allclose(mtp_input.grad, expected_grad, rtol=0, atol=0), (
+            f"cp_group_size={cp_group_size}, num_microbatches={num_microbatches}: "
+            f"expected {expected_grad}, got {mtp_input.grad}"
+        )
