@@ -2524,10 +2524,9 @@ def get_pretrain_batch_on_this_cp_rank(
     for CP=2 the 4 chunks are assigned as (chunk_0, chunk_3) -> GPU 0 and
     (chunk_1, chunk_2) -> GPU 1, balancing the workload across the CP group.
 
-    Only the sequence-dimension tensors ('tokens', 'labels', 'loss_mask',
-    'position_ids') are partitioned along ``seq_dim=1``. The 'attention_mask',
-    if present, is partitioned along ``seq_dim=2``. All other keys (metadata,
-    None-valued entries) are left unchanged.
+    All tensor-valued entries in the batch are partitioned along their sequence
+    dimension (``seq_dim=1`` by default, ``seq_dim=2`` for 'attention_mask').
+    None-valued entries are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
@@ -2543,31 +2542,22 @@ def get_pretrain_batch_on_this_cp_rank(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    SEQUENCE_KEYS = {
-        'tokens': 1,
-        'labels': 1,
-        'loss_mask': 1,
-        'position_ids': 1,
-        'attention_mask': 2,
-    }
-
     if cp_size > 1:
-        for key, seq_dim in SEQUENCE_KEYS.items():
-            val = batch.get(key)
-            if val is None:
-                continue
-            val = val.view(
-                *val.shape[0:seq_dim],
-                2 * cp_size,
-                val.shape[seq_dim] // (2 * cp_size),
-                *val.shape[(seq_dim + 1) :],
-            )
-            index = torch.zeros(2, dtype=torch.int64, device=val.device)
-            index[0].fill_(cp_rank)
-            index[1].fill_(2 * cp_size - cp_rank - 1)
-            val = val.index_select(seq_dim, index)
-            val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-            batch[key] = val
+        for key, val in batch.items():
+            if val is not None:
+                seq_dim = 2 if key == 'attention_mask' else 1
+                val = val.view(
+                    *val.shape[0:seq_dim],
+                    2 * cp_size,
+                    val.shape[seq_dim] // (2 * cp_size),
+                    *val.shape[(seq_dim + 1) :],
+                )
+                index = torch.zeros(2, dtype=torch.int64, device=val.device)
+                index[0].fill_(cp_rank)
+                index[1].fill_(2 * cp_size - cp_rank - 1)
+                val = val.index_select(seq_dim, index)
+                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                batch[key] = val
 
     return batch
 

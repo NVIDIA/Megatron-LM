@@ -62,7 +62,9 @@ def initialize_test_environment(
     set_global_variables(args, True)
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        hybrid_context_parallel=hybrid_context_parallel,
     )
     return args
 
