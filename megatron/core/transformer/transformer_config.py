@@ -395,6 +395,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -760,6 +764,15 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
+
+    moe_mlp_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the MoE grouped MLP layer will use a
+    block interleaved format. Instead of interpreting the input tensor
+    as a concatenation of gates and linear units, it will be
+    interpreted as alternating blocks of gates and linear units.
+
+    This data format is experimental and primarily intended to enable
+    advanced fused kernels."""
 
     ##################
     # Context Parallel

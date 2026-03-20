@@ -286,6 +286,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fallback_to_eager_attn": False,
     "linear_attention_type": None,
     "moe_router_force_biased": None,
+    "moe_mlp_glu_interleave_size": None,
+    "use_transformer_engine_op_fuser": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
