@@ -44,7 +44,8 @@ from megatron.post_training.utils import (
     print_distributed_quant_summary,
     report_current_memory_info,
 )
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -352,13 +353,7 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
-    tokenizer = get_tokenizer()._tokenizer
-    tok_attrs = ["tokenizer", "_tokenizer"]
-    for attr in tok_attrs:
-        if hasattr(tokenizer, attr):
-            tokenizer = getattr(tokenizer, attr)
-            continue
+    tokenizer = get_hf_tokenizer()
 
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False

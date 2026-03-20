@@ -19,7 +19,8 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 import modelopt.torch.quantization as mtq
 from model_provider import model_provider
@@ -168,13 +169,7 @@ if __name__ == "__main__":
 
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
-    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
-    tokenizer = get_tokenizer()._tokenizer
-    tok_attrs = ["tokenizer", "_tokenizer"]
-    for attr in tok_attrs:
-        if hasattr(tokenizer, attr):
-            tokenizer = getattr(tokenizer, attr)
-            break
+    tokenizer = get_hf_tokenizer()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
