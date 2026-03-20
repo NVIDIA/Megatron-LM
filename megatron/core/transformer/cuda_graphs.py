@@ -585,7 +585,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 need_copy_inputs.append(user_input)
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
             else:
-                cudagraph_input.copy_(user_input)
+                if user_input.data_ptr() != cudagraph_input.data_ptr():
+                    cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
@@ -1718,8 +1719,11 @@ class TECudaGraphHelper:
 
         self._discover_layers()
 
-        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
-        # have been created.
+        # Flags to track CUDA Graph state:
+        # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
+        # - _graphs_created: Whether any graphs were actually created (may be False if no
+        #   layers found)
+        self._capture_finished = False
         self._graphs_created = False
 
     def _discover_layers(self):
@@ -1797,9 +1801,22 @@ class TECudaGraphHelper:
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
+    def capture_finished(self):
+        """
+        Returns whether create_cudagraphs() has been called.
+
+        This is used by the training loop to determine if the capture process has run.
+        Returns True after create_cudagraphs() completes, regardless of whether any
+        graphs were actually created.
+        """
+        return self._capture_finished
+
     def graphs_created(self):
         """
-        Returns whether the CUDA Graphs have been created.
+        Returns whether any CUDA Graphs were actually created.
+
+        This returns False if create_cudagraphs() was called but no graphable layers
+        were found, and True if at least one graph was successfully created.
         """
         return self._graphs_created
 
@@ -2201,9 +2218,9 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
-        assert not self._graphs_created, "CUDA Graphs have already been created."
+        assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
-        torch.distributed.barrier()
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
         if FREEZE_GC:
@@ -2212,6 +2229,20 @@ class TECudaGraphHelper:
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
+
+    def _reset_after_capture(self):
+        """
+        Reset the model and optimizer state after capturing CUDA Graphs.
+        """
+        from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+
+        for model_chunk in self.model:
+            model_chunk.zero_grad_buffer()
+        for optimizer in self.optimizers:
+            optimizer.zero_grad()
+        clear_aux_losses_tracker()
+        reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
         """
@@ -2225,23 +2256,14 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
-
-        torch.distributed.barrier()
-        for model_chunk in self.model:
-            model_chunk.zero_grad_buffer()
-        for optimizer in self.optimizers:
-            optimizer.zero_grad()
-        clear_aux_losses_tracker()
-        reset_model_temporary_tensors(self.config, self.model)
-
+        torch.cuda.synchronize()
+        self._reset_after_capture()
         if FREEZE_GC:
             gc.unfreeze()
         gc.collect()
         torch.cuda.empty_cache()
 
-        self._graphs_created = True
+        self._capture_finished = True
 
     def create_cudagraphs(self):
         """
@@ -2249,33 +2271,44 @@ class TECudaGraphHelper:
         """
         start_time = self._start_capturing()
 
-        # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-        sample_args, kwargs = self._get_cuda_graph_input_data()
-        if self.config.sequence_parallel:
-            rng_context = get_cuda_rng_tracker().fork()
+        if not self.flattened_callables:
+            # Check if there are any graphable layers. If not, log a warning and skip capture,
+            # but still call _finish_capturing to ensure all ranks complete the capture phase.
+            logger.warning(
+                'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
+            )
         else:
-            rng_context = nullcontext()
-        with rng_context:
-            graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
+            sample_args, kwargs = self._get_cuda_graph_input_data()
+            if self.config.sequence_parallel:
+                rng_context = get_cuda_rng_tracker().fork()
+            else:
+                rng_context = nullcontext()
+            with rng_context:
+                graphs = make_graphed_callables(
+                    tuple(self.flattened_callables), sample_args, **kwargs
+                )
 
-        # Push the captured graphs to the corresponding TransformerBlock.
-        num_layers_accumulated = 0
-        for layers in self.callables_per_chunk:
-            for layer_number, layer in enumerate(layers):
-                layer.cuda_graphs = []
-                for batch_number in range(self.num_microbatches):
-                    if self.config.overlap_moe_expert_parallel_comm:
-                        graph_idx = (
-                            num_layers_accumulated + layer_number
-                        ) * self.num_microbatches + batch_number
-                    else:
-                        graph_idx = (
-                            num_layers_accumulated * self.num_microbatches
-                            + batch_number * len(layers)
-                            + layer_number
-                        )
-                    layer.cuda_graphs.append(graphs[graph_idx])
-            num_layers_accumulated += len(layers)
+            # Push the captured graphs to the corresponding TransformerBlock.
+            num_layers_accumulated = 0
+            for layers in self.callables_per_chunk:
+                for layer_number, layer in enumerate(layers):
+                    layer.cuda_graphs = []
+                    for batch_number in range(self.num_microbatches):
+                        if self.config.overlap_moe_expert_parallel_comm:
+                            graph_idx = (
+                                num_layers_accumulated + layer_number
+                            ) * self.num_microbatches + batch_number
+                        else:
+                            graph_idx = (
+                                num_layers_accumulated * self.num_microbatches
+                                + batch_number * len(layers)
+                                + layer_number
+                            )
+                        layer.cuda_graphs.append(graphs[graph_idx])
+                num_layers_accumulated += len(layers)
+
+            self._graphs_created = True
 
         self._finish_capturing(start_time)
 
@@ -2293,7 +2326,7 @@ class TECudaGraphHelper:
         """
         Delete all CUDA graphs.
         """
-        assert self._graphs_created, "CUDA Graphs have not been created."
+        assert self._graphs_created, "No CUDA Graphs were created to delete."
 
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
@@ -2570,8 +2603,14 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
       dimension).
     * Sample argument generation uses a simple loop (no rotary embeddings or
       buffer-reuse optimization).
-    * Captured graph outputs are wrapped to filter None values that arise
-      from vision encoder layers returning (output, None).
+    * _finish_capturing wraps captured graphs to filter None values that arise
+      from vision encoder layers returning (output, None), and skips cleanup
+      that is handled by the LM decoder helper.
+
+    Note:
+        With pipeline parallelism > 1, only the first pipeline stage typically
+        has vision layers. Ranks without vision layers can safely skip calling
+        create_cudagraphs() or will gracefully return with no graphs created.
 
     Args:
         model: The full model (list of model chunks) containing vision_model.
@@ -2651,45 +2690,27 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 f'layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)'
             )
 
-    def _start_capturing(self):
-        """Start capturing for vision encoder.
-
-        Unlike the parent, this skips torch.distributed.barrier() because
-        with PP > 1 only the first pipeline stage has vision layers — other
-        ranks return early from create_cudagraphs and never reach this
-        point, so a barrier would deadlock.
+    def _reset_after_capture(self):
         """
-        assert not self._graphs_created, 'CUDA Graphs have already been created.'
-        gc.collect()
-        torch.cuda.empty_cache()
-        if FREEZE_GC:
-            gc.freeze()
-        _set_capture_start()
-        log_single_rank(logger, logging.INFO, 'Start vision encoder CUDA Graphs capture...')
-        return time.time()
-
-    def _finish_capturing(self, start_time):
-        """Finish capturing for vision encoder.
-
-        Unlike the parent, this skips:
-        - torch.distributed.barrier() (asymmetric: only first PP stage captures).
+        No-op: vision encoder layers do not require any reset:
         - model_chunk.zero_grad_buffer() / optimizer.zero_grad() (handled
           by the LM decoder helper's _finish_capturing which runs on all ranks).
         - clear_aux_losses_tracker / reset_model_temporary_tensors
           (LM-specific cleanup already handled by the LM helper).
         """
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f'Time spent in vision encoder CUDA Graphs capture on rank '
-            f'{torch.distributed.get_rank()}: {time.time() - start_time}s',
-        )
-        _set_capture_end()
-        if FREEZE_GC:
-            gc.unfreeze()
-        gc.collect()
-        torch.cuda.empty_cache()
-        self._graphs_created = True
+
+    def _finish_capturing(self, start_time):
+        """
+        Before calling super()._finish_capturing, wrap the captured graphs with
+        _wrap_graph_for_vision to filter None from (output, None) tuples so that
+        _te_cuda_graph_replay's len == 1 assertion passes.
+        """
+        # Wrap the captured graphs before finishing
+        for layer in self.flattened_callables:
+            if hasattr(layer, 'cuda_graphs'):
+                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
+
+        super()._finish_capturing(start_time)
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """Generate sample arguments for vision encoder CUDA Graph capturing.
@@ -2732,27 +2753,6 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                     sample_kwargs_list.append({})
 
         return sample_args, sample_kwargs_list
-
-    def create_cudagraphs(self):
-        """Capture CUDA Graphs for vision encoder layers per microbatch.
-
-        Delegates to the parent's capture workflow, then wraps the captured
-        graphs with _wrap_graph_for_vision to filter None from
-        (output, None) tuples so that _te_cuda_graph_replay's
-        len == 1 assertion passes.
-        """
-        if not self.flattened_callables:
-            logger.warning(
-                'VisionTECudaGraphHelper: No graphable layers found. '
-                'Skipping CUDA graph capture.'
-            )
-            return
-
-        super().create_cudagraphs()
-
-        for layer in self.flattened_callables:
-            if hasattr(layer, 'cuda_graphs'):
-                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
 
     def cuda_graph_set_manual_hooks(self):
         """No-op: vision encoder layers do not use DDP parameter-gather hooks.
