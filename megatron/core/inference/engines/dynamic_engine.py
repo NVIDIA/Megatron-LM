@@ -197,6 +197,13 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
 
+        # Fail fast if block store is requested but prerequisites are missing.
+        if inference_config.store_routing_indices_in_ray_block_store:
+            assert model_config.moe_enable_routing_replay, (
+                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay."
+            )
+            connect_to_ray_block_store()  # validates ray + actor availability, then discards
+
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection
         else:
@@ -529,11 +536,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         # Connect to block store only on the mp coordinator rank.
-        if self.context.config.store_routing_indices_in_ray_block_store:
-            model_config = self.controller.inference_wrapped_model.model.config
-            assert model_config.moe_enable_routing_replay, (
-                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay to be enabled."
-            )
         if self.context.config.store_routing_indices_in_ray_block_store and self.is_mp_coordinator:
             conn = connect_to_ray_block_store()
             self.block_store_instance = conn.instance
@@ -1270,17 +1272,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
-            # Process routing indices if available (keyed by request_id)
+            # Process routing indices if available (list aligned with request_ids)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
             # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
             # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
-            if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
-            ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ].cpu().numpy().astype(self._routing_indices_dtype)  # [num_tokens, num_layers, topk]
+            if routing_indices_per_request is not None and req_idx < len(routing_indices_per_request):
+                step_routing = routing_indices_per_request[req_idx]  # [num_tokens, num_layers, topk]
                 if request.routing_indices is None:
                     request.routing_indices = step_routing
                 else:

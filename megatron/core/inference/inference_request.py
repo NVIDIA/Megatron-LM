@@ -249,7 +249,13 @@ class InferenceRequest:
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
             elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
-                setattr(self, k, deserialize_ndarray(v[1]))
+                arr = deserialize_ndarray(v[1])
+                if k == "routing_indices":
+                    # Restore as a single-element chunks list.
+                    self.routing_indices_chunks = [arr]
+                    self.routing_indices = None
+                else:
+                    setattr(self, k, arr)
 
 
 class DynamicInferenceEventType(Enum):
@@ -386,9 +392,7 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps.
-    # Stored as numpy array (int16/int32) on CPU.
+    # routing_indices is the concatenated result, set on finished requests only.
     routing_indices: Optional[np.ndarray] = None
     # routing_block_store_key is set when routing_indices are written to block store.
     # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.

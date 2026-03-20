@@ -8,8 +8,10 @@ import inspect
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.cuda.nvtx import range_pop, range_push
 from torch import Tensor
 
 from megatron.core import parallel_state
@@ -1242,22 +1244,29 @@ class TextGenerationController:
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
             # gather_from_sequence_parallel_region gathers along dim 0
             # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
+            range_push("router_record_allgather")
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
+            range_pop()
 
-        # Slice to real tokens (remove CUDA padding)
-        stacked_routing = stacked_routing[:active_token_count]
+        # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
+        _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
+        stacked_routing = stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
         # Split by request along token dimension
         # stacked_routing has shape [active_token_count, num_layers, topk]
-        routing_splits = stacked_routing.split(active_query_lengths, dim=0)
+        routing_splits = np.split(
+            stacked_routing,
+            np.cumsum(active_query_lengths[:-1]),
+            axis=0,
+        )
 
-        # Map to request IDs
-        routing_indices_per_request = {}
-        for req_id, routing_split in zip(active_request_ids, routing_splits):
-            # routing_split has shape [num_tokens_for_request, num_layers, topk]
-            routing_indices_per_request[req_id] = routing_split
+        # # Map to request IDs
+        # routing_indices_per_request = {}
+        # for req_id, routing_split in zip(active_request_ids, routing_splits):
+        #     # routing_split has shape [num_tokens_for_request, num_layers, topk]
+        #     routing_indices_per_request[req_id] = routing_split
 
-        return routing_indices_per_request
+        return routing_splits
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -1774,7 +1783,9 @@ class TextGenerationController:
             context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
+        range_push("router_record_bookkeeping")
         routing_indices_per_request = self._router_record_bookkeeping()
+        range_pop()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
