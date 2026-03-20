@@ -11,12 +11,41 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.paged_stash import (
+    check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
+    """Per-expert token counts from a local routing map, summed across the default process group.
+
+    ``routing_map`` is shaped [num_local_token_rows, num_experts] (as in
+    ``_HybridEPManager``). Tests here assume world size equals expert-parallel size (all GPUs
+    are EP ranks); ``all_reduce`` on the world group aggregates disjoint local maps.
+    """
+    counts = routing_map.sum(dim=0).to(torch.int64)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+    return counts
+
+
+def _tokens_per_expert_from_routing_map(routing_map: torch.Tensor, layer: MoELayer) -> torch.Tensor:
+    """Per-local-expert assignment counts from the routing map (columns for this EP rank)."""
+    counts = _global_tokens_per_expert_from_local_routing_map(routing_map)
+    idx = torch.as_tensor(layer.local_expert_indices, device=counts.device, dtype=torch.long)
+    return counts[idx].to(torch.int64).clone()
+
+
+def _pad_token_counts_to_align_size(
+    tokens_per_expert: torch.Tensor, pad_multiple: int
+) -> torch.Tensor:
+    """Round each count up to a multiple of ``pad_multiple`` (``n + (-n % m)`` like budget)."""
+    t = tokens_per_expert.to(torch.int64)
+    return t + (-t % pad_multiple)
 
 
 class MoEModelTestContainer:
@@ -92,12 +121,19 @@ class MoEModelTestContainer:
             moe_router_padding_for_fp8=kwargs.get("moe_router_padding_for_fp8", True),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
             moe_mlp_glu_interleave_size=kwargs.get("moe_mlp_glu_interleave_size", None),
-            moe_router_padding_for_quantization=kwargs.get("moe_router_padding_for_quantization", False),
+            moe_router_padding_for_quantization=kwargs.get(
+                "moe_router_padding_for_quantization", False
+            ),
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
             activation_func=kwargs.get("activation_func", F.gelu),
             moe_router_force_biased=kwargs.get("moe_router_force_biased", None),
+            stash_buffer_size_factor_cuda=0.5,
+            stash_buffer_size_factor_cpu=1.5,
         )
-        self.moe_layer = self._create_moe_layer(layer_number=0)
+        self.moe_layers = [
+            self._create_moe_layer(layer_number=i) for i in range(num_layers)
+        ]
+        self.moe_layer = self.moe_layers[0]
 
     def _create_moe_layer(self, layer_number=0):
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -114,41 +150,42 @@ class MoEModelTestContainer:
             return moe_layer
 
     def zero_grad(self):
-        self.moe_layer.zero_grad()
+        for layer in self.moe_layers:
+            layer.zero_grad()
 
     def __del__(self):
         torch.distributed.barrier()
         torch.cuda.synchronize()
         Utils.destroy_model_parallel()
 
-    def forward_backward(self, hidden_states):
-        """Run one forward and backward pass through the MoE layer.
-
-        Returns:
-            output: MoE layer output (detached).
-            hidden_states_grad: Gradient w.r.t. hidden_states.
-            routing_map: Token-to-expert routing map from the dispatcher (after forward).
-            tokens_per_expert: Number of tokens per local expert on this EP rank (after forward).
-        """
-        hidden_states = hidden_states.cuda().requires_grad_(True)
-        quantization_context = get_fp8_context(self.config)
-        with quantization_context:
-            output, _ = self.moe_layer(hidden_states)
-        # Capture routing_map and tokens_per_expert after forward (before backward)
-        comm = getattr(self.moe_layer.token_dispatcher, "_comm_manager", None)
-        routing_map = getattr(comm, "routing_map", None)
-        tokens_per_expert = (
-            comm.get_number_of_tokens_per_expert()
-            if comm is not None and hasattr(comm, "get_number_of_tokens_per_expert")
-            else None
-        )
-        # Use contiguous gradient to avoid non-contiguous grad in HybridEP combine backward
-        # (output.sum().backward() produces a broadcast gradient that is non-contiguous)
-        output.backward(torch.ones_like(output))
-        return output.detach(), hidden_states.grad, routing_map, tokens_per_expert
-
     def destroy(self):
         Utils.destroy_model_parallel()
+
+
+def _forward_backward_all_layers(container: MoEModelTestContainer, hidden_states: torch.Tensor):
+    """Forward/backward all MoE layers; returns output, input grad, last layer routing state."""
+    initial_hidden_states = hidden_states.cuda().requires_grad_(True)
+    hidden_states = initial_hidden_states
+    quantization_context = get_fp8_context(container.config)
+    with quantization_context:
+        for layer in container.moe_layers:
+            hidden_states, _ = layer(hidden_states)
+        output = hidden_states
+    last_layer = container.moe_layers[-1]
+    comm = getattr(last_layer.token_dispatcher, "_comm_manager", None)
+    routing_map = getattr(comm, "routing_map", None)
+    tokens_per_expert = (
+        comm.get_number_of_tokens_per_expert()
+        if comm is not None and hasattr(comm, "get_number_of_tokens_per_expert")
+        else None
+    )
+    output.backward(torch.ones_like(output))
+    return (
+        output.detach(),
+        initial_hidden_states.grad,
+        routing_map,
+        tokens_per_expert,
+    )
 
 
 def is_hybrid_ep_available():
@@ -166,7 +203,8 @@ class TestPagedStashing:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    def test_forward_backward(self):
+    def test_forward_backward_4_layers(self):
+        """Test paged stashing with 4 MoE layers: ref run vs paged run match."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
 
@@ -177,7 +215,7 @@ class TestPagedStashing:
             ep_size=4,
             pp_size=1,
             num_moe_experts=8,
-            num_layers=2,
+            num_layers=4,
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
@@ -197,11 +235,12 @@ class TestPagedStashing:
             gated_linear_unit=True,
             activation_func=F.silu,
         )
-        if not isinstance(container.moe_layer.experts, TEGroupedMLP) or not container.moe_layer.experts._is_fused_impl_supported():
+        experts = container.moe_layer.experts
+        fused_ok = isinstance(experts, TEGroupedMLP) and experts._is_fused_impl_supported()
+        if not fused_ok:
             container.destroy()
             pytest.skip("TEGroupedMLP fused impl not supported")
 
-        # [sequence_length, batch_size, hidden_size] for MoELayer.forward
         seq_length = 1024
         batch_size = 1
         hidden_size = container.config.hidden_size
@@ -210,32 +249,42 @@ class TestPagedStashing:
         )
 
         # First iteration: capture schedule, capacity, etc.
-        paged_stash_reset(True)
+        paged_stash_reset(True, config=container.config)
         paged_stash_init_chunk_handler(1, 0)
         output_ref, hidden_states_grad_ref, routing_map_ref, tokens_per_expert_ref = (
-            container.forward_backward(hidden_states)
+            _forward_backward_all_layers(container, hidden_states)
         )
 
         container.zero_grad()
 
         # Second iteration: run with paged stash.
-        paged_stash_reset(True)
+        paged_stash_reset(True, config=container.config)
         paged_stash_init_chunk_handler(1, 0)
-        output, hidden_states_grad, routing_map, tokens_per_expert = container.forward_backward(
-            hidden_states
+        output, hidden_states_grad, routing_map, tokens_per_expert = _forward_backward_all_layers(
+            container, hidden_states
         )
 
-        # Verify output and input gradient match the first iteration.
-        torch.testing.assert_close(output, output_ref, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(
-            hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4
+        overflow = check_paged_stash_overflow()
+        assert overflow.any().item() == 0
+
+        assert torch.allclose(output, output_ref, atol=1e-4, rtol=1e-4), (
+            f"output != output_ref: max diff = {(output - output_ref).abs().max().item()}"
         )
-        # Routing and token counts available after forward (e.g. for debugging or further checks)
+        assert torch.allclose(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4), (
+            f"hidden_states_grad != ref: max diff = "
+            f"{(hidden_states_grad - hidden_states_grad_ref).abs().max().item()}"
+        )
         if routing_map is not None and tokens_per_expert is not None:
             num_tokens_per_ep_rank = tokens_per_expert.sum().item()
-            assert num_tokens_per_ep_rank > 0
+            assert num_tokens_per_ep_rank > 0, (
+                f"num_tokens_per_ep_rank={num_tokens_per_ep_rank} (expected > 0)"
+            )
             assert routing_map_ref is not None and tokens_per_expert_ref is not None
-            torch.testing.assert_close(tokens_per_expert, tokens_per_expert_ref)
+            tpe_f = tokens_per_expert.float()
+            ref_f = tokens_per_expert_ref.float()
+            assert torch.allclose(tpe_f, ref_f, atol=1e-4, rtol=1e-4), (
+                f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
+            )
 
 
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
@@ -249,8 +298,7 @@ class TestPagedStashingOverBudget:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_overload_factor_and_over_budget(self):
-        """Test budget computation (same as token_dispatcher lines 1017-1025) and assert
-        over_budget flag is set when tokens_per_ep_rank exceeds budget."""
+        """Budget matches HybridEP setup_metadata; over_budget matches map-derived load."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
 
@@ -261,8 +309,8 @@ class TestPagedStashingOverBudget:
             ep_size=4,
             pp_size=1,
             num_moe_experts=8,
-            num_layers=1,
-            moe_router_topk=4,
+            num_layers=4,
+            moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
             moe_permute_fusion=True,
@@ -274,7 +322,7 @@ class TestPagedStashingOverBudget:
             moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             stash_modules=["expert_fc1", "moe_act", "expert_fc2"],
-            moe_expert_rank_capacity_factor=1.0,
+            moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,
             moe_mlp_glu_interleave_size=32,
             moe_router_padding_for_quantization=True,
@@ -282,42 +330,76 @@ class TestPagedStashingOverBudget:
             activation_func=F.silu,
             moe_router_force_biased=1,
         )
-        if not isinstance(container.moe_layer.experts, TEGroupedMLP) or not container.moe_layer.experts._is_fused_impl_supported():
+        experts = container.moe_layer.experts
+        fused_ok = isinstance(experts, TEGroupedMLP) and experts._is_fused_impl_supported()
+        if not fused_ok:
             container.destroy()
             pytest.skip("TEGroupedMLP fused impl not supported")
 
-        seq_length = 4096
+        seq_length = 1024
         batch_size = 1
         topk = container.config.moe_router_topk
         capacity_factor = container.config.moe_expert_rank_capacity_factor
-        hidden_size = container.config.hidden_size
         hidden_states = torch.randn(
-            (seq_length, batch_size, hidden_size), dtype=torch.bfloat16
+            (seq_length, batch_size, container.config.hidden_size), dtype=torch.bfloat16
         )
 
-        # Budget computed like token_dispatcher._HybridEPManager.setup_metadata (lines 1017-1025)
-        num_tokens = seq_length * batch_size
+        num_tokens = seq_length * batch_size * topk
         pad_multiple = get_align_size_for_quantization(container.config)
-        budget = int(num_tokens * topk * capacity_factor)
+        budget = int(num_tokens * capacity_factor)
         budget += -budget % pad_multiple
 
-        paged_stash_reset(True)
+        paged_stash_reset(True, config=container.config)
         paged_stash_init_chunk_handler(1, 0)
-        _, _, _, tokens_per_expert = container.forward_backward(hidden_states)
+        _forward_backward_all_layers(container, hidden_states)
 
-        assert tokens_per_expert is not None
-        tokens_per_ep_rank = tokens_per_expert.sum().item()
-        over_budget_tensor = container.moe_layer.token_dispatcher.check_over_budget()
-        over_budget = over_budget_tensor.item() if over_budget_tensor is not None else False
+        overflow = check_paged_stash_overflow()
+        num_layers = len(container.moe_layers)
+        stash_cuda = container.config.stash_buffer_size_factor_cuda
+        stash_cpu = container.config.stash_buffer_size_factor_cpu
+        stash_buffer_size = num_tokens * num_layers * (stash_cuda + stash_cpu)
 
-        # When tokens_per_ep_rank > budget, over_budget flag must be raised
-        if tokens_per_ep_rank >= budget:
-            assert over_budget, (
-                f"tokens_per_ep_rank ({tokens_per_ep_rank}) > budget ({budget}), "
-                "but over_budget flag was not set"
+        total_tokens = 0
+        for layer_idx, layer in enumerate(container.moe_layers):
+            comm = getattr(layer.token_dispatcher, "_comm_manager", None)
+            routing_map = getattr(comm, "routing_map", None) if comm is not None else None
+            over_budget_tensor = (
+                layer.token_dispatcher.check_over_budget()
+                if hasattr(layer.token_dispatcher, "check_over_budget")
+                else None
             )
-        else:
-            assert not over_budget, (
-                f"tokens_per_ep_rank ({tokens_per_ep_rank}) <= budget ({budget}), "
-                "but over_budget flag was set"
+            over_budget = over_budget_tensor.item() if over_budget_tensor is not None else False
+
+            assert routing_map is not None, f"layer {layer_idx}: routing_map is None"
+            assert routing_map.dim() == 2, f"layer {layer_idx}: expected 2D routing_map"
+            assert routing_map.shape[1] == container.config.num_moe_experts, (
+                f"layer {layer_idx}: routing_map has {routing_map.shape[1]} experts, "
+                f"expected {container.config.num_moe_experts}"
             )
+            tokens_per_expert_from_map = _tokens_per_expert_from_routing_map(routing_map, layer)
+            tokens_per_expert_from_map_padded = _pad_token_counts_to_align_size(
+                tokens_per_expert_from_map, pad_multiple
+            )
+            tokens_per_ep_rank_from_map = tokens_per_expert_from_map_padded.sum().item()
+            total_tokens += tokens_per_ep_rank_from_map
+
+            # Padded map-derived tokens strictly over budget iff dispatcher reports over_budget
+            if tokens_per_ep_rank_from_map > budget:
+                assert over_budget, (
+                    f"layer {layer_idx}: tokens_per_ep_rank_from_map "
+                    f"({tokens_per_ep_rank_from_map}) > budget ({budget}), "
+                    f"but over_budget flag was not set"
+                )
+            else:
+                assert not over_budget, (
+                    f"layer {layer_idx}: tokens_per_ep_rank_from_map "
+                    f"({tokens_per_ep_rank_from_map}) <= budget ({budget}), "
+                    f"but over_budget flag was set"
+                )
+
+        overflow_set = overflow.any().item()
+        stash_exceeded = total_tokens > stash_buffer_size
+        assert overflow_set == stash_exceeded, (
+            f"overflow {overflow_set} should match total_tokens > stash_buffer_size "
+            f"({total_tokens} > {stash_buffer_size})"
+        )
