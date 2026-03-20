@@ -758,6 +758,7 @@ class InferenceTopKRouter(TopKRouter):
         """Disable CUDA graph-compatible operations for the router."""
         self.is_inference_cuda_graphed_iteration = False
 
+        
     @staticmethod
     @torch.compile
     def _compiled_topk_routing(

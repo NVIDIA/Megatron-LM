@@ -268,6 +268,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
+        # Routing replay config.
+        self._routing_replay_enabled = model_config.moe_enable_routing_replay
+
         # Routing indices dtype for numpy storage.
         _num_experts = model_config.num_moe_experts or 0
         self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
@@ -1276,18 +1279,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+            range_push("push routing indices to request")
             # Process routing indices if available (list aligned with request_ids)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
             # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
             # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
             if routing_indices_per_request is not None and req_idx < len(routing_indices_per_request):
                 step_routing = routing_indices_per_request[req_idx]  # [num_tokens, num_layers, topk]
-                if request.routing_indices is None:
-                    request.routing_indices = step_routing
-                else:
-                    request.routing_indices = np.concatenate(
-                        [request.routing_indices, step_routing], axis=0
-                    )
+                # if request.routing_indices is None:
+                #     request.routing_indices = step_routing
+                # else:
+                #     request.routing_indices = np.concatenate(
+                #         [request.routing_indices, step_routing], axis=0
+                #     )
+                request.add_routing_indices(step_routing)
+            range_pop()
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1766,6 +1772,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
+
+        # Finalize routing chunks on all sub-requests before block store dump or merge/serialize.
+        if self._routing_replay_enabled and finished_request_records:
+            for record in finished_request_records:
+                for req in record.requests:
+                    req.finalize_routing_chunks()
 
         # Dump routing indices to block store before coordinator communication.
         if getattr(self, 'block_store_instance', None) is not None and finished_request_records:

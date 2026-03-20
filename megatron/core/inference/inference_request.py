@@ -249,13 +249,7 @@ class InferenceRequest:
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
             elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
-                arr = deserialize_ndarray(v[1])
-                if k == "routing_indices":
-                    # Restore as a single-element chunks list.
-                    self.routing_indices_chunks = [arr]
-                    self.routing_indices = None
-                else:
-                    setattr(self, k, arr)
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -399,6 +393,7 @@ class DynamicInferenceRequest(InferenceRequest):
     routing_block_store_key: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    _routing_indices_chunks: Optional[List[np.ndarray]] = field(default=None, repr=False)  # Internal storage for routin
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
@@ -420,6 +415,22 @@ class DynamicInferenceRequest(InferenceRequest):
             and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
+
+    def add_routing_indices(self, chunk: np.ndarray):
+        """Append a routing indices chunk to the staging list (O(1) in the critical path).
+
+        Args:
+            chunk (np.ndarray): Routing indices for this step, shape [num_tokens, num_layers, topk].
+        """
+        if self._routing_indices_chunks is None:
+            self._routing_indices_chunks = []
+        self._routing_indices_chunks.append(chunk)
+
+    def finalize_routing_chunks(self):
+        """Concatenate all staged routing chunks into routing_indices and delete the staging list."""
+        if self._routing_indices_chunks:
+            self.routing_indices = np.concatenate(self._routing_indices_chunks, axis=0)
+        self._routing_indices_chunks = None
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
@@ -463,9 +474,14 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        assert self._routing_indices_chunks is None, (
+            "Pending routing chunks during serialization. "
+            "Call finalize_routing_chunks() before serialize()."
+        )
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_routing_indices_chunks", None)
 
         # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:

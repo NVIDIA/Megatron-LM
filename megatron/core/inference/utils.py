@@ -4,6 +4,7 @@ import asyncio
 import logging
 import multiprocessing
 import sys
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 
 import torch
