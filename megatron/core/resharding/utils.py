@@ -44,6 +44,11 @@ class ParameterMetadata:
     is_tp: bool = False
     partition_dim: int = 0
     partition_stride: int = 1
+    # For parameters that pack multiple independently-sharded components of
+    # different sizes (e.g. Mamba in_proj packs z, x, B, C, dt).  When present,
+    # lists the per-TP-rank block sizes along partition_dim.  The refit planner
+    # interleaves these blocks rather than doing a simple contiguous concat.
+    partition_sizes: list[int] | None = None
 
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
@@ -251,12 +256,16 @@ def extract_param_metadata(
     pg_collection,
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
+    rank_offset: int = 0,
 ) -> ParameterMetadata:
     """Extract metadata from a parameter for cross-rank communication."""
     # TP flags from attributes (set by Megatron linear layers)
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
+    partition_sizes = getattr(param, 'partition_sizes', None)
+    if partition_sizes is not None:
+        partition_sizes = list(partition_sizes)
 
     # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
     # and requires partition_stride=2 for correct resharding. New models set this at construction
@@ -270,31 +279,69 @@ def extract_param_metadata(
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 
+    # Expert-param detection for TP inference.  When explicit_expert_comm is
+    # active (is_expert and (tp_size>1 or ep)), TE clears parallel_mode so
+    # tensor_model_parallel is never stamped — yet the weight IS TP-sharded
+    # when tp_size > 1.  We detect expert params via num_experts + the
+    # per-expert naming convention (weightK / biasK in TEGroupedLinear).
+    is_expert_param = (
+        num_experts is not None and _detect_expert_index_from_param_name(param_name) is not None
+    )
+
     tensor_parallel_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    if is_ep:
-        expert_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.ep)
-        # For MoE params, prefer expert TP group when available, else regular TP
-        if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.expt_tp)
-        elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+    def _offset_ranks(ranks: list[int]) -> list[int]:
+        return [r + rank_offset for r in ranks] if rank_offset else ranks
+
+    if is_ep or is_expert_param:
+        if is_ep:
+            expert_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.ep)
+            )
+        # For expert params, always provide TP group ranks so the planner can
+        # handle TP size transitions (e.g., TP2→TP1).  When explicit_expert_comm
+        # clears TE's parallel_mode, tensor_model_parallel may not be set even
+        # though the weight IS TP-sharded.  Detect TP via group size instead.
+        expt_tp = getattr(pg_collection, 'expt_tp', None)
+        tp_grp = expt_tp if expt_tp is not None else getattr(pg_collection, 'tp', None)
+        if tp_grp is not None:
+            tp_ranks = _offset_ranks(dist.get_process_group_ranks(tp_grp))
+            tensor_parallel_group_ranks = tp_ranks
+            if not is_tp and len(tp_ranks) > 1:
+                is_tp = True
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
         if hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+            tensor_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.tp)
+            )
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     else:
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
+
+    # Always provide TP group ranks so the planner can handle TP size transitions
+    # (e.g., TP2→TP1).  When is_tp=False the param is replicated across the TP group,
+    # but the planner still needs to know the TP topology to plan gather/scatter ops
+    # when the *other* side of the reshard IS TP-sharded.
+    if (
+        tensor_parallel_group_ranks is None
+        and hasattr(pg_collection, 'tp')
+        and pg_collection.tp is not None
+    ):
+        tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
 
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
-        pipeline_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.pp)
+        pipeline_parallel_group_ranks = _offset_ranks(
+            dist.get_process_group_ranks(pg_collection.pp)
+        )
     else:
-        pipeline_parallel_group_ranks = list(range(dist.get_world_size()))
+        pipeline_parallel_group_ranks = list(
+            range(rank_offset, rank_offset + dist.get_world_size())
+        )
 
     meta = ParameterMetadata(
         name=param_name,
@@ -304,6 +351,7 @@ def extract_param_metadata(
         is_tp=is_tp,
         partition_dim=partition_dim,
         partition_stride=partition_stride,
+        partition_sizes=partition_sizes,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,

@@ -27,12 +27,13 @@ jobs:
     strategy:
       matrix:
         branch: [main, dev, others]
+        contributor_type: [internal, external]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -41,22 +42,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Download SSO users list
+        run: |
+          gh release download v0.1.0 \
+            --repo NVIDIA-GitHub-Management/github-audits \
+            --pattern users_sso.json \
+            --output users_sso.json || echo '{}' > users_sso.json
+        env:
+          GH_TOKEN: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+
       - name: Approve waiting deployments
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
+          MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 1 }}
+          CONTRIBUTOR_TYPE: ${{ matrix.contributor_type }}
+          SSO_USERS_FILE: users_sso.json
           PYTHONUNBUFFERED: 1
         shell: python
         run: |
           import os
+          import json
           import requests
           import re
 
           # GitHub API configuration
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
-          MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
+          CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
+          if CONTRIBUTOR_TYPE == "external":
+              # Global limit across all branches — no division needed since we count globally.
+              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
+          else:
+              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
           API_BASE = f"https://api.github.com/repos/NVIDIA/Megatron-LM"
+
+          # Load SSO users for internal/external classification
+          with open(os.environ["SSO_USERS_FILE"]) as f:
+              sso_users = json.load(f)
 
           # Headers for GitHub API
           headers = {
@@ -81,53 +104,92 @@ jobs:
                       print(f"Response: {e.response.text}")
                   return None
 
-          def is_pr_targeting_branch(workflow_run, target_branch):
+          def is_internal_contributor(pr_info):
+              """Return True if the PR author is a member of NVIDIA or NVIDIA-NeMo org (is_org_member)."""
+              login = pr_info.get("user", {}).get("login", "")
+              org_roles = sso_users.get(login, {}).get("org_roles", [])
+              return any(role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles)
+
+          def get_pr_base_branch(workflow_run):
               """
-              Check if a workflow run belongs to a PR targeting the given branch.
-              Extract PR number from head branch like 'pull-request/1913' and verify base branch.
+              Return the base branch of the PR associated with a workflow run, or None.
+              Extracts PR number from head branch like 'pull-request/1913' and fetches PR info.
+              Returns (base_branch, pr_info) tuple, or (None, None) if not a PR run.
               """
               print(workflow_run.get("head_branch", ""))
               head_branch = workflow_run.get("head_branch", "")
               match = re.match(r"pull-request/(\d+)", head_branch)
               if not match:
-                  return False  # Not a PR branch pattern
+                  return None, None  # Not a PR branch pattern
 
               pr_number = int(match.group(1))
-              
+
               # Fetch PR info from GitHub API
               pr_info = make_request(f"pulls/{pr_number}")
               if not pr_info:
                   print(f"Failed to fetch PR #{pr_number}")
-                  return False
+                  return None, None
 
               base_branch = pr_info.get("base", {}).get("ref")
-              if (
-                (base_branch == target_branch) or 
-                (base_branch != "main" and base_branch != "dev" and target_branch == "others")
-              ):
-                  print(f"PR #{pr_number} targets {target_branch}")
-                  return True
+              return base_branch, pr_info
 
-              return False
+          def matches_contributor(workflow_run, contributor_type):
+              """Return True if the workflow run matches the contributor type (ignores branch)."""
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  return False
+              internal = is_internal_contributor(pr_info)
+              return (contributor_type == "internal") == internal
+
+          def matches_queue(workflow_run, target_branch, contributor_type):
+              """
+              Return True if the workflow run belongs to this queue cell:
+              matching target branch AND matching contributor type (internal/external).
+              """
+              base_branch, pr_info = get_pr_base_branch(workflow_run)
+              if base_branch is None:
+                  return False
+
+              branch_match = (
+                  (base_branch == target_branch) or
+                  (base_branch != "main" and base_branch != "dev" and target_branch == "others")
+              )
+              if not branch_match:
+                  return False
+
+              pr_number = re.match(r"pull-request/(\d+)", workflow_run.get("head_branch", "")).group(1)
+              internal = is_internal_contributor(pr_info)
+              contributor_match = (contributor_type == "internal") == internal
+              if branch_match and contributor_match:
+                  print(f"PR #{pr_number} targets {target_branch}, contributor_type={contributor_type} (internal={internal})")
+              return branch_match and contributor_match
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
-          # Filter for workflows belonging to PRs targeting ${{ matrix.branch }}
-          queued_workflow_runs = [run for run in queued_workflow_runs 
-                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
-          in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
-                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
+          # For external contributors, enforce a single global concurrency limit across ALL branches.
+          # For internal contributors, enforce per-branch limits as before.
+          if CONTRIBUTOR_TYPE == "external":
+              queued_workflow_runs = [run for run in queued_workflow_runs
+                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+              in_progress_workflow_runs = [run for run in in_progress_workflow_runs
+                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+          else:
+              # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
+              queued_workflow_runs = [run for run in queued_workflow_runs
+                                      if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+              in_progress_workflow_runs = [run for run in in_progress_workflow_runs
+                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
           in_progress_workflows = len(in_progress_workflow_runs)
 
           total_workflows = queued_workflows + in_progress_workflows
-          print(f"Current queued workflows (PRs targeting ${{ matrix.branch }}): {queued_workflows}")
-          print(f"Current running workflows (PRs targeting ${{ matrix.branch }}): {in_progress_workflows}")
+          print(f"Current queued workflows (PRs targeting ${{ matrix.branch }}, {CONTRIBUTOR_TYPE}): {queued_workflows}")
+          print(f"Current running workflows (PRs targeting ${{ matrix.branch }}, {CONTRIBUTOR_TYPE}): {in_progress_workflows}")
           print(f"Total workflows: {total_workflows}")
           print(f"Max concurrency: {MAX_CONCURRENCY}")
 
@@ -139,8 +201,8 @@ jobs:
           print("Fetching deployments...")
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
-          pending_workflows = [run for run in pending_workflows 
-                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
+          pending_workflows = [run for run in pending_workflows
+                              if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")

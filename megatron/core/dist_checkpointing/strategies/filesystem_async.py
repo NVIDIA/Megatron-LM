@@ -49,10 +49,19 @@ except ImportError:
 _results_queue = None
 
 
-def _get_write_results_queue():
+@_disable_gc()
+def get_write_results_queue(mp_mode: str = 'spawn') -> mp.Queue:
+    """Get or create a multiprocessing queue for write results.
+
+    Args:
+        mp_mode (str): Multiprocessing context mode. Defaults to 'spawn'.
+
+    Returns:
+        mp.Queue: Queue for collecting write results.
+    """
     global _results_queue
     if _results_queue is None:
-        ctx = mp.get_context("spawn")
+        ctx = mp.get_context(mp_mode)
         _results_queue = ctx.Manager().Queue()
     return _results_queue
 
@@ -183,7 +192,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 len(self.write_buckets),
                 self.thread_count,
             )
-            self.results_queue = _get_write_results_queue()
+            self.results_queue = get_write_results_queue()
         else:
             self.results_queue = None
         end = time()
