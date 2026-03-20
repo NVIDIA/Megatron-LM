@@ -157,6 +157,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/moe/**/*.py]
     products:
       - environment: [lts, dev]
