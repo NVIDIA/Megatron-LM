@@ -35,6 +35,15 @@ except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
 
+# TODO: Remove this separate try/except once the next version of emerging_optimizers
+# (which includes Lion) is released. Then Lion can be imported in the block above.
+try:
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
+
+    HAVE_LION = True
+except ImportError:
+    HAVE_LION = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -181,11 +190,17 @@ def get_megatron_muon_optimizer(
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
     """
-    # Muon currently use adam config. setting str here to call regular get for adam creation
-    # side effect is muon optimizer will have wrong name, i.e. config.optimizer == 'adam'
-    config.optimizer = 'adam'
+    # TODO: Mutating config.optimizer is a side effect; clean up after
+    # https://github.com/NVIDIA/Megatron-LM/pull/3638 lands.
+    # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
+    config.optimizer = config.muon_scalar_optimizer
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
+    if config.muon_scalar_optimizer == 'lion':
+        assert HAVE_LION, (
+            "Lion optimizer requires a version of 'emerging_optimizers' that includes Lion. "
+            "Please upgrade to use --muon-scalar-optimizer lion."
+        )
 
     # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
     # In theory we can change DDP to enable use muon and dist-opt-adam together
@@ -220,6 +235,16 @@ def get_megatron_muon_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                     else:
                         opt.initialize_state(p)
+
+    def lion_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+
+    nonlinear_init_state_fn = (
+        lion_init_state_fn if config.muon_scalar_optimizer == 'lion' else adam_init_state_fn
+    )
 
     optimizers = []
     # record list of non/linear params
@@ -337,7 +362,9 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
-    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [adam_init_state_fn]
+    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [
+        nonlinear_init_state_fn
+    ]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:

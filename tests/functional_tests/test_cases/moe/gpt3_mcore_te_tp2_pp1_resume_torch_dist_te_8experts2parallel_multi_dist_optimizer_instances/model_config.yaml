@@ -61,4 +61,5 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --num-distributed-optimizer-instances: 2
   --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume

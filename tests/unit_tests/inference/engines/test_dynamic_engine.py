@@ -557,7 +557,8 @@ class TestDynamicInferenceEngine:
 
         return env
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -775,7 +776,7 @@ class TestDynamicInferenceEngine:
         prompts = ["prompt1", "prompt2", "prompt3", "prompt4"]
 
         # Mock the tokenize_prompt method to return predictable token sequences
-        def mock_tokenize_prompt(prompt, add_BOS=False):
+        def mock_tokenize_prompt(tokenizer, prompt, add_BOS=False):
             # Return a token sequence based on the prompt number
             prompt_num = int(prompt[-1])
             return [10 + i for i in range(prompt_num + 2)]
@@ -1475,7 +1476,7 @@ class TestDynamicInferenceEngine:
                                             So we reduce chunk to 255.
             3. Chunk 2   (Remaining 0)
         """
-        chunk_size = 256
+        prefill_chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
         # 256 + 255 + 2 = 513
         prompt_len = 513
@@ -1485,7 +1486,7 @@ class TestDynamicInferenceEngine:
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=prompt_len + 1,
-            context_max_tokens=chunk_size,
+            context_max_tokens=prefill_chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
             enable_chunked_prefill=True,
@@ -1968,7 +1969,7 @@ class TestDynamicInferenceEngine:
             )
             assert context.max_requests == 4
             assert step_count == 35
-        assert context.block_allocator.active_count == 655
+        assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2090,7 +2091,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
     @torch.inference_mode()
     def test_staleness_tracking(self, use_checkpoint):
-        """Test that staleness is correct tracked.
+        """Test that training-iteration stamps are correctly tracked.
         The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
         """
         PROMPT_LEN = 8
@@ -2123,26 +2124,51 @@ class TestDynamicInferenceEngine:
                 )
             )
 
+        def set_epoch(epoch):
+            """Simulate receiving a SET_GENERATION_EPOCH signal."""
+            engine._generation_epoch = epoch
+            for entry in engine.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
+
+        # Steps without a generation epoch set — no stamps.
+        engine.step_modern()
+        for entry in engine.requests.values():
+            assert entry.record[-1].policy_epoch is None
+            assert entry.record[-1].kv_cache_epoch is None
+
+        # Generation epoch 0: stamps all active requests at their current length.
+        set_epoch(0)
+        for _ in range(2):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps == ks == [(0, 0)]
+
+        # Generation epoch 1: boundary at current length, before next step.
+        set_epoch(1)
         for _ in range(3):
             engine.step_modern()
 
         for entry in engine.requests.values():
-            assert len(entry.record[-1].generated_tokens) == 3
-            assert entry.record[-1].policy_staleness is None
-            assert entry.record[-1].kv_cache_staleness is None
+            ps = entry.record[-1].policy_epoch
+            ks = entry.record[-1].kv_cache_epoch
+            assert ps == ks == [(0, 0), (PROMPT_LEN + 2, 1)]
 
-        # Increment staleness.
-        for entry in engine.requests.values():
-            entry.record.increment_staleness()
-
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_staleness
-            ks = entry.record[-1].kv_cache_staleness
-            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-            assert (ps == 1).all()
-            assert (ks == 1).all()
-
-        # Simulate RECOMPUTE
+        # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
+        # stamping logic will recreate it fresh on the next epoch signal.
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
@@ -2152,41 +2178,10 @@ class TestDynamicInferenceEngine:
                 entry.record[-1].event_add_engine = event_add_engine
 
             for entry in engine.requests.values():
-                ps = entry.record[-1].policy_staleness
-                ks = entry.record[-1].kv_cache_staleness
-                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-                assert (ps == 1).all()
-                assert (ks == 0).all()
+                assert entry.record[-1].kv_cache_epoch is None
 
-        for _ in range(3):
-            engine.step_modern()
-
-        # Increment staleness.
-        for entry in engine.requests.values():
-            entry.record.increment_staleness()
-
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_staleness
-            ks = entry.record[-1].kv_cache_staleness
-            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
-            assert (ps[: PROMPT_LEN + 3] == 2).all()
-            assert (ps[PROMPT_LEN + 3 :] == 1).all()
-            if use_checkpoint:
-                assert (ks == 1).all()
-            else:
-                assert (ks[: PROMPT_LEN + 3] == 2).all()
-                assert (ks[PROMPT_LEN + 3 :] == 1).all()
-
-        if use_checkpoint:
-            for entry in engine.requests.values():
-                old_req = entry.record[-1]
-                event_add_engine = old_req.event_add_engine
-                entry.record.checkpoint()
-                entry.record[-1].event_add_engine = event_add_engine
-
-            for entry in engine.requests.values():
-                ks = entry.record[-1].kv_cache_staleness
-                assert (ks == 0).all()
+        # Generation epoch 2: stamp then generate remaining tokens.
+        set_epoch(2)
 
         finished_records = []
         while engine.has_unfinished_requests():
@@ -2196,30 +2191,19 @@ class TestDynamicInferenceEngine:
         for record in finished_records:
             merged = record.merge()
 
-            assert merged.policy_staleness is not None
-            assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
-            assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
-            assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-            assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
+            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
 
-            assert merged.kv_cache_staleness is not None
-            assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
             if use_checkpoint:
-                assert (merged.kv_cache_staleness == 0).all()
+                # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
+                assert merged.kv_cache_epoch == [(0, 2)]
             else:
-                assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
-                assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
-                assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
+                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
 
-        # Verify evicted requests don't have their policy staleness incremented.
+        # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]
         record.checkpoint()
-        pre_ps = record[-1].policy_staleness.clone()
-
-        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
-
-        assert (record[-1].policy_staleness == pre_ps + 1).all()
-        assert (record[-1].kv_cache_staleness == 0).all()
+        assert record[-1].policy_epoch == merged.policy_epoch
+        assert record[-1].kv_cache_epoch is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2410,7 +2394,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Inject the parsed stop word IDs
@@ -2493,7 +2479,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word length 3 > num_speculative_tokens (2)
@@ -2578,7 +2566,9 @@ class TestDynamicInferenceEngine:
         env.engine.add_request(
             request_id=0,
             prompt=torch.tensor([1, 2, 3, 4], device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=99),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10, termination_id=99, detokenize_stop_sequence=True
+            ),
         )
 
         # Stop word [6] will land in the middle of a speculative batch [5, 6, 7].
@@ -2606,6 +2596,29 @@ class TestDynamicInferenceEngine:
             f"Token 7 should have been truncated after stop word 6. "
             f"Full output: {finished_req.generated_tokens}"
         )
+
+    @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
+    def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
+        """Test that _check_stop_words_for_request_post_append strips or keeps
+        the stop word tokens based on detokenize_stop_sequence."""
+        engine = types.SimpleNamespace(num_speculative_tokens=0)
+        check = DynamicInferenceEngine._check_stop_words_for_request_post_append
+
+        request = types.SimpleNamespace(
+            generated_tokens=[1, 2, 3, 4, 5],
+            stop_word_ids=[[4, 5]],
+            sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
+        )
+        hit, trimmed = check(engine, request)
+        assert hit
+        if detokenize_stop_sequence:
+            # Stop word kept
+            assert request.generated_tokens == [1, 2, 3, 4, 5]
+            assert trimmed == 0
+        else:
+            # Stop word stripped
+            assert request.generated_tokens == [1, 2, 3]
+            assert trimmed == 2
 
     @pytest.mark.internal
     @torch.inference_mode()
@@ -2849,7 +2862,7 @@ class TestDynamicInferenceEngine:
         # 4 requests. 2 unique prefixes (1 block each).
         # Without sharing, we'd need 8 blocks + 1 dummy = 9 active_used.
         # With sharing, we need 2 shared blocks + 4 generation blocks + 1 dummy = 7 active_used.
-        active_used = env.engine.context.block_allocator.get_active_used()
+        active_used = env.engine.context.kv_block_allocator.get_active_used()
         assert (
             active_used <= 7
         ), f"Prefix caching failed, expected <= 7 active blocks but got {active_used}"

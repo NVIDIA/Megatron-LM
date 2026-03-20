@@ -136,7 +136,8 @@ class TestTextGenerationController:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     def test_sample_from_logits(self):
@@ -598,7 +599,7 @@ class TestTextGenerationController:
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(
             [
                 ''.join(random.choices(string.ascii_letters, k=random.randint(1, len(prompt))))
                 for _ in range(len(x))
@@ -611,35 +612,73 @@ class TestTextGenerationController:
             random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
         ]
 
+        tokenizer = self.mock_tokenizer
+
         # Test on a tokenizer that does not add BOS by default
-        no_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert no_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        no_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert no_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert no_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        no_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert no_bos_to_no_bos[0] != tokenizer.bos
+        no_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert no_bos_to_yes_bos[0] == tokenizer.bos
+        assert no_bos_to_yes_bos[1] != tokenizer.bos
 
         # Force the first token to be BOS to emulate a tokenizer that does add BOS by default
-        self.mock_tokenizer.tokenize.return_value[0] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[0] = tokenizer.bos
 
-        yes_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert yes_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        yes_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert yes_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert yes_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        yes_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert yes_bos_to_no_bos[0] != tokenizer.bos
+        yes_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert yes_bos_to_yes_bos[0] == tokenizer.bos
+        assert yes_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test on an input that has had multiple BOS added
-        self.mock_tokenizer.tokenize.return_value[1] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[1] = tokenizer.bos
 
-        many_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert many_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        many_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert many_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert many_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        many_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert many_bos_to_no_bos[0] != tokenizer.bos
+        many_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert many_bos_to_yes_bos[0] == tokenizer.bos
+        assert many_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test the assert triggered when the tokenizer has no bos
-        self.mock_tokenizer.bos = None
+        tokenizer.bos = None
         with pytest.raises(AssertionError):
-            self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+            TextGenerationController.tokenize_prompt(tokenizer, prompt, add_BOS=True)
+
+    @pytest.mark.parametrize("remove_EOD", [True, False])
+    def test_remove_eod_token(self, remove_EOD):
+        self.setup_model(torch.float32)
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(f"T{t}" for t in x)
+
+        tokenizer = self.mock_tokenizer
+        eod = tokenizer.eod
+        detok = TextGenerationController.detokenize
+
+        # No trailing EOD.
+        assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+
+        # Single trailing EOD.
+        result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)
+        assert result == ("T1 T2" if remove_EOD else f"T1 T2 T{eod}")
+
+        # Multiple trailing EOD.
+        result = detok(tokenizer, [1, eod, eod, eod], remove_EOD=remove_EOD)
+        assert result == ("T1" if remove_EOD else f"T1 T{eod} T{eod} T{eod}")
 
     def test_zero_tokens_generated_batch_vs_single(self):
         """
@@ -1070,10 +1109,9 @@ class TestTextGenerationController:
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
-        mtp_logits = torch.randn(2, 6, self.vocab_size, device='cuda')
 
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-            logits, mtp_logits, input_ids
+            logits, input_ids
         )
 
         # Verify acceptance counts
@@ -1105,7 +1143,7 @@ class TestTextGenerationController:
         ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
 
         # Initialize allocator and states
-        ctx.block_allocator.total_avail = 100
+        ctx.kv_block_allocator.total_avail = 100
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device='cuda')
         ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device='cuda')
 
@@ -1153,7 +1191,7 @@ class TestTextGenerationController:
 
         # Assert released block is cleared
         assert ctx.request_to_kv_block_ids[1, 3].item() == -1
-        assert ctx.block_allocator.total_avail == 101  # 1 block released
+        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
@@ -1188,8 +1226,6 @@ class TestTextGenerationController:
         # Create random logits
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
-        # MTP logits shape: [num_spec, 8, vocab_size]
-        mtp_logits = torch.randn(num_spec, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
         # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
@@ -1200,7 +1236,7 @@ class TestTextGenerationController:
 
         try:
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-                logits, mtp_logits, input_ids
+                logits, input_ids
             )
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
@@ -1247,10 +1283,10 @@ class TestTextGenerationController:
         )
 
         # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
-        ctx.block_allocator.block_ref_counts[20] = 2
-        ctx.block_allocator.block_ref_counts[10] = 1
+        ctx.kv_block_allocator.block_ref_counts[20] = 2
+        ctx.kv_block_allocator.block_ref_counts[10] = 1
 
-        initial_avail = ctx.block_allocator.total_avail
+        initial_avail = ctx.kv_block_allocator.total_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
         self.text_generation_controller._init_mtp_sampling_tensor()
@@ -1261,9 +1297,9 @@ class TestTextGenerationController:
         self.text_generation_controller._rewind_kv_cache()
 
         # Req 1 should have released block 20 (ref count decremented).
-        assert ctx.block_allocator.block_ref_counts[20].item() == 1
+        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
         # Block 10 should be untouched.
-        assert ctx.block_allocator.block_ref_counts[10].item() == 1
+        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
 
     @pytest.mark.internal
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
@@ -1291,7 +1327,7 @@ class TestTextGenerationController:
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.block_allocator.total_avail = 50
+        ctx.kv_block_allocator.total_avail = 50
 
         self.text_generation_controller._init_mtp_sampling_tensor()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
@@ -1304,9 +1340,71 @@ class TestTextGenerationController:
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_id[0].item() == 30
         assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.block_allocator.total_avail == 51  # exactly 1 block released
+        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
 
         # Prefix blocks remain in request_to_kv_block_ids.
         assert ctx.request_to_kv_block_ids[0, 0].item() == 10
         assert ctx.request_to_kv_block_ids[0, 1].item() == 20
         assert ctx.request_to_kv_block_ids[0, 2].item() == 30
+
+    @pytest.mark.internal
+    def test_speculative_mtp_position_ids_with_prefill(self):
+        """Test that _compute_serial_mtp_and_sample uses the correct position IDs
+        for a mixed batch of prefill and decode requests."""
+        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+
+        self.text_generation_controller.num_speculative_tokens = 2
+        self.text_generation_controller.num_mtp_heads = 2
+        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        ctx.total_request_count = 2
+        ctx.paused_request_count = 0
+
+        # Req 0: Decode, Req 1: Prefill
+        ctx.request_in_prefill_status_tensor = torch.tensor([0, 1], device='cuda')
+
+        # Req 0 has 10 previous tokens, just processed 3 (1 base + 2 spec)
+        # Req 1 has 0 previous tokens, just processed 15 (prefill)
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 0], dtype=torch.int32, device='cuda')
+        ctx.request_query_lengths[:2] = torch.tensor([3, 15], dtype=torch.int32, device='cuda')
+
+        self.text_generation_controller._init_mtp_sampling_tensor()
+        # Mock base token sampling (the first tokens fed into MTP)
+        self.text_generation_controller._sampled_tokens_cuda[:2] = torch.tensor(
+            [100, 200], device='cuda'
+        )
+
+        # Mock the MTP computation to record the position_ids it receives
+        unwrapped_model = self.text_generation_controller.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = torch.randn(2, 1, 32, device='cuda')
+        self.text_generation_controller._last_accepted_seq_indices = torch.tensor(
+            [0, 1], device='cuda'
+        )
+
+        captured_position_ids = []
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            captured_position_ids.append(position_ids.clone())
+            return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(
+            side_effect=mock_compute_mtp_single_step
+        )
+
+        # Mock _sample_from_logits_2d to return arbitrary dummy tokens
+        self.text_generation_controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([101, 201], device='cuda')
+        )
+
+        self.text_generation_controller._compute_serial_mtp_and_sample()
+
+        # The base_position for Req 0 should be 10 + 3 = 13
+        # The base_position for Req 1 should be 0 + 15 = 15
+        assert len(captured_position_ids) == 2
+        # Depth 0:
+        assert torch.equal(
+            captured_position_ids[0].squeeze(0), torch.tensor([13, 15], device='cuda')
+        )
+        # Depth 1:
+        assert torch.equal(
+            captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
+        )
