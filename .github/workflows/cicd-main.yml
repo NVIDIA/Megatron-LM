@@ -192,6 +192,12 @@ jobs:
           echo "mbridge_suite=$MBRIDGE_SUITE" | tee -a $GITHUB_OUTPUT
           echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
 
+          # Pre-compute active row markers for the decision tree
+          _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                          && echo "**→**" || echo "" )
+          _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                       && echo "**→**" || echo "" )
+          _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ] && echo "**→**" || echo "" )
+          _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                         && echo "**→**" || echo "" )
+
           cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
           Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )with **$N_REPEAT** repetition(s). You are welcome.
 
@@ -203,6 +209,15 @@ jobs:
           | \`lts\` | \`$HAS_LTS\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`dev\` | \`$DEV\` |
+
+          ### Decision tree
+
+          | | Trigger | \`scope\` | \`n_repeat\` | \`lightweight\` |
+          |---|---|---|---|---|
+          | $_MG | Merge group | \`mr-github\` | \`1\` | \`false\` |
+          | $_RT | Label: _Run tests_ | \`mr-github\` | \`1\` | \`true\` |
+          | $_RF | Label: _Run functional tests_ / CI workload | \`mr-github\` | \`5\` | \`false\` |
+          | $_DF | _(default)_ | \`mr-github-slim\` | \`5\` | \`false\` |
           SUMMARY
 
   linting:
