@@ -134,18 +134,24 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
-    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """
-        Get main_grads that should be taken into account to compute the grad norm.
+    def _filter_grads_for_norm(
+        self,
+        params: List[torch.nn.Parameter],
+        param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
+    ) -> List[torch.Tensor]:
+        """Filter parameter gradients for norm computation.
+
         Filter parameters based on:
+          - param_filter predicate, when provided.
           - grad should not be None.
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
         """
-        params = self.get_parameters()
         grads_for_norm = []
         for param in params:
+            if param_filter is not None and not param_filter(param):
+                continue
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
                 if (
@@ -165,8 +171,24 @@ class MegatronOptimizer(ABC):
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
-
         return grads_for_norm
+
+    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Get main parameter gradients for grad norm, excluding MTP params when present."""
+        params = self.get_parameters()
+        has_mtp_params = any(getattr(p, 'is_mtp_param', False) for p in params)
+        if has_mtp_params:
+            return self._filter_grads_for_norm(
+                params, param_filter=lambda p: not getattr(p, 'is_mtp_param', False)
+            )
+        return self._filter_grads_for_norm(params)
+
+    def get_mtp_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Get gradients from MTP parameters only, for independent MTP gradient clipping."""
+        params = self.get_parameters()
+        return self._filter_grads_for_norm(
+            params, param_filter=lambda p: getattr(p, 'is_mtp_param', False)
+        )
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -208,7 +230,12 @@ class MegatronOptimizer(ABC):
         return total_norm
 
     def clip_grad_norm(self, clip_grad: float) -> float:
-        """Compute and return grad norm, also clip grads."""
+        """Compute and return grad norm, also clip grads.
+
+        When MTP parameters are tagged with is_mtp_param (via mtp_detach_heads), they are
+        excluded from the main gradient norm and clipped independently using their own norm.
+        The MTP gradient norm is stored in self.mtp_grad_norm for external reporting.
+        """
         params = self.get_parameters()
         if params:
             grads_for_norm = self.get_main_grads_for_grad_norm()
@@ -218,13 +245,33 @@ class MegatronOptimizer(ABC):
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
 
+        mtp_grads = self.get_mtp_grads_for_grad_norm()
+        mtp_grad_norm = get_grad_norm_fp32(
+            mtp_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        )
+        self.mtp_grad_norm = mtp_grad_norm if mtp_grad_norm > 0.0 else None
+
         if params:
-            clip_grad_by_total_norm_fp32(
-                params,
-                clip_grad,
-                grad_norm,
-                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
-            )
+            main_params, mtp_params = [], []
+            for p in params:
+                if getattr(p, 'is_mtp_param', False):
+                    mtp_params.append(p)
+                else:
+                    main_params.append(p)
+            if main_params:
+                clip_grad_by_total_norm_fp32(
+                    main_params,
+                    clip_grad,
+                    grad_norm,
+                    self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                )
+            if mtp_params and self.mtp_grad_norm is not None:
+                clip_grad_by_total_norm_fp32(
+                    mtp_params,
+                    clip_grad,
+                    self.mtp_grad_norm,
+                    self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                )
         return grad_norm
 
     def count_zeros(self) -> float:
@@ -599,6 +646,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
+        self.mtp_grad_norm = None
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -683,6 +731,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
+                            if hasattr(param, 'is_mtp_param'):
+                                main_param.is_mtp_param = param.is_mtp_param
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
@@ -969,6 +1019,7 @@ class FP32Optimizer(MegatronOptimizer):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
         timers = self.config.timers
+        self.mtp_grad_norm = None
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -1320,13 +1371,45 @@ class ChainedOptimizer(MegatronOptimizer):
             return num_zeros_in_grad
 
     @torch.no_grad()
+    def _get_mtp_grad_norm(self):
+        """Compute gradient norm for MTP parameters only."""
+        if self.grads_states_parallel_group_is_shared():
+            mtp_grads = []
+            for optimizer in self.chained_optimizers:
+                mtp_grads += optimizer.get_mtp_grads_for_grad_norm()
+            return get_grad_norm_fp32(
+                mtp_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+        else:
+            mtp_norms = []
+            for optimizer in self.chained_optimizers:
+                mtp_grads = optimizer.get_mtp_grads_for_grad_norm()
+                norm = get_grad_norm_fp32(
+                    mtp_grads,
+                    grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
+                )
+                mtp_norms.append(norm if norm else 0.0)
+            return math.sqrt(sum([x**2 for x in mtp_norms]))
+
+    @torch.no_grad()
     def step(self):
-        """ChainedOptimizer will step all optimizers one by one."""
+        """ChainedOptimizer will step all optimizers one by one.
+
+        When MTP parameters are tagged with is_mtp_param (via mtp_detach_heads), they are
+        excluded from the main gradient norm and clipped independently using their own norm.
+        """
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+
+        mtp_grad_norm = self._get_mtp_grad_norm()
+        has_mtp_params = mtp_grad_norm > 0.0
+
+        # HACK: store the MTP grad norm for external reporting.
+        # The caller can get the MTP grad norm via optimizer.mtp_grad_norm.
+        self.mtp_grad_norm = mtp_grad_norm if has_mtp_params else None
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
@@ -1335,19 +1418,40 @@ class ChainedOptimizer(MegatronOptimizer):
             parameters = optimizer.get_parameters()
             if len(parameters) == 0:
                 continue
-            if optimizer.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    parameters,
-                    max_norm=optimizer.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=(
-                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                    ),
-                )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold:
+            main_params, mtp_params = [], []
+            for p in parameters:
+                if getattr(p, 'is_mtp_param', False):
+                    mtp_params.append(p)
+                else:
+                    main_params.append(p)
+
+            if optimizer.config.clip_grad > 0.0:
+                if main_params:
+                    clip_grad_by_total_norm_fp32(
+                        main_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=grad_norm,
+                        use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                    )
+                if mtp_params and self.mtp_grad_norm is not None:
+                    clip_grad_by_total_norm_fp32(
+                        mtp_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=self.mtp_grad_norm,
+                        use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                    )
+
+            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
                 print("skipping grad norm because it's too large", grad_norm)
-                zero_grads_manual_impl(parameters, use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8)
+                zero_grads_manual_impl(main_params, use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8)
+            if (
+                self.mtp_grad_norm is not None
+                and self.mtp_grad_norm > optimizer.config.grad_norm_skip_threshold
+                and mtp_params
+            ):
+                print("skipping mtp grad norm because it's too large", self.mtp_grad_norm)
+                zero_grads_manual_impl(mtp_params, use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8)
 
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
