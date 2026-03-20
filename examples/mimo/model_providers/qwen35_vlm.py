@@ -3,7 +3,8 @@
 """Model provider for a Qwen3.5-397B-A17B style Vision-Language Model.
 
 This provider assembles a MIMO model that consists of:
-  - Qwen3.5 vision encoder (ViT + PatchMerger) from HuggingFace, outputting at 4096-dim.
+  - Qwen3.5 vision encoder (ViT + PatchMerger) built with Megatron specs,
+    outputting at out_hidden_size=4096.
   - Qwen3-Next language decoder with MoE (512 experts, top-10) and hybrid GDN/full attention.
   - No separate projection MLP — the vision encoder's PatchMerger already projects
     to out_hidden_size=4096 which matches the decoder hidden_size.
@@ -15,7 +16,11 @@ Architecture reference:
 import torch
 from configs.qwen35_vlm import get_qwen35_language_layer_spec, get_qwen35_language_model_config
 
-from examples.mimo.model_providers.hf_qwen35_vision_encoder import HFQwen35VisionEncoderWrapper
+from examples.mimo.model_providers.megatron_qwen35_vision_encoder import (
+    Qwen35VisionModel,
+    get_qwen35_vision_layer_spec,
+    get_qwen35_vision_transformer_config,
+)
 from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo.utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -106,7 +111,7 @@ def model_provider_qwen35_vlm(
     """Build a Qwen3.5-397B-A17B style Vision-Language MIMO model.
 
     Components:
-      - HuggingFace Qwen3.5 vision encoder (frozen, outputs at decoder hidden_size)
+      - Megatron-native Qwen3.5 vision encoder (frozen, outputs at decoder hidden_size)
       - Qwen3-Next MoE decoder (hybrid GDN/full attention)
 
     The decoder architecture is controlled by megatron command-line args
@@ -115,14 +120,34 @@ def model_provider_qwen35_vlm(
     """
 
     language_config = get_qwen35_language_model_config()
-    _apply_args_to_language_config(language_config)
+    args = _apply_args_to_language_config(language_config)
 
-    # HF Qwen3.5 vision encoder — includes PatchMerger, outputs at out_hidden_size=4096
+    # Build the Megatron-native Qwen3.5 vision encoder config and layer spec.
+    # The vision encoder uses the 397B defaults (depth=27, hidden_size=1152,
+    # num_heads=16) regardless of the language-model args.
+    vision_config = get_qwen35_vision_transformer_config(
+        params_dtype=language_config.params_dtype,
+    )
+    # Propagate TP/SP settings from language config to vision config so that
+    # ColumnParallelLinear / RowParallelLinear in the merger are consistent.
+    vision_config.tensor_model_parallel_size = language_config.tensor_model_parallel_size
+    vision_config.sequence_parallel = language_config.sequence_parallel
+
+    vision_layer_spec = get_qwen35_vision_layer_spec()
+
+    # Megatron Qwen3.5 vision encoder — includes PatchMerger, outputs at
+    # out_hidden_size = language_config.hidden_size (4096 for 397B).
     vision_encoder = ModuleSpec(
-        module=HFQwen35VisionEncoderWrapper,
+        module=Qwen35VisionModel,
         params={
-            "pretrained_model_name": "Qwen/Qwen3.5-397B-A17B",
-            "load_pretrained_weights": False,
+            "config": vision_config,
+            "layer_spec": vision_layer_spec,
+            "spatial_merge_size": 2,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "in_channels": 3,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": language_config.hidden_size,
         },
     )
 

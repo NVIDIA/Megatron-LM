@@ -45,7 +45,7 @@ EP=${EP:-2}
 
 NUM_LAYERS=${NUM_LAYERS:-4}
 NUM_EXPERTS=${NUM_EXPERTS:-4}
-SEQ_LEN=${SEQ_LEN:-1024}
+SEQ_LEN=${SEQ_LEN:-4096}
 MOE_ROUTER_TOPK=${MOE_ROUTER_TOPK:-2}
 MOE_TOKEN_DISPATCHER_TYPE=${MOE_TOKEN_DISPATCHER_TYPE:-alltoall}
 
@@ -127,6 +127,7 @@ EVAL_AND_LOGGING_ARGS=(
     --wandb-exp-name "$EXP_NAME"
     --wandb-save-dir "$CHECKPOINT_STORE_PATH"
     --log-throughput
+    --log-timers-to-tensorboard
     "${LANGUAGE_MODEL_CKPT_ARG[@]}"
 )
 
@@ -141,6 +142,7 @@ if [ "$DATASET_PATH" = "mock" ]; then
     DATASET_ARGS=(
         --dataset-provider qwen35_mock
         --image-token-id 248056
+        --total-seq-length ${SEQ_LEN}
     )
 else
     echo "ERROR: Real dataset is not supported yet. Only mock dataset is available." >&2
