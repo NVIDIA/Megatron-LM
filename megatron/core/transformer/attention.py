@@ -1582,31 +1582,18 @@ class SelfAttention(Attention):
         # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
         weight_reshaped = weight.view(
             self.num_query_groups_per_partition,
-            (self.query_projection_size + 2 * self.kv_projection_size)
-            // self.num_query_groups_per_partition,
             -1,
+            weight.shape[-1]
         )
 
         # Split into query_projection_size and 2 * kv_projection_size parts:
         # (n, a, -1) and (n, b, -1)
-        weight_q = weight_reshaped[
-            :, : self.query_projection_size // self.num_query_groups_per_partition, :
+        qkv_split_shape = [
+            self.config.kv_channels * self.config.num_attention_heads // self.config.num_query_groups,
+            self.config.kv_channels,
+            self.config.kv_channels
         ]
-        weight_k = weight_reshaped[
-            :,
-            self.query_projection_size
-            // self.num_query_groups_per_partition : (
-                self.query_projection_size + self.kv_projection_size
-            )
-            // self.num_query_groups_per_partition,
-            :,
-        ]
-        weight_v = weight_reshaped[
-            :,
-            (self.query_projection_size + self.kv_projection_size)
-            // self.num_query_groups_per_partition :,
-            :,
-        ]
+        (weight_q, weight_k, weight_v) = torch.split(weight_reshaped, qkv_split_shape, dim=1)
 
         # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
         self.qk_clip_balancing_eta_extended = self.qk_clip_balancing_eta.repeat(
@@ -1619,9 +1606,7 @@ class SelfAttention(Attention):
 
         # Concatenate back and reshape to original shape
         weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
-        weight_updated = weight_updated.view(
-            self.query_projection_size + 2 * self.kv_projection_size, -1
-        )
+        weight_updated = weight_updated.view(weight.shape)
 
         return weight_updated
 
