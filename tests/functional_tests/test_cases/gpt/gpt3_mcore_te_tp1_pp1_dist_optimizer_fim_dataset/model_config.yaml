@@ -53,4 +53,6 @@ MODEL_ARGS:
   --fim-data: true
   --fim-rate: 0.5
   --fim-spm-rate: 0.5
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular

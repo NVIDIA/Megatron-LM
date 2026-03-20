@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 import sys
@@ -108,6 +109,9 @@ def _shard_and_copy_(
         )
 
 
+_active_grids: list = []
+
+
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
@@ -128,7 +132,16 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     _ = grid.create_pg(["cp"])
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
+    _active_grids.append(grid)
     return grid
+
+
+def destroy_all_grids():
+    """Destroy all tracked grids and bridge communicator PGs."""
+    for grid in _active_grids:
+        grid.destroy()
+    _active_grids.clear()
+    BridgeCommunicator.destroy_broadcast_pgs()
 
 
 def _get_pg_collection_from_grid(grid):
@@ -199,6 +212,9 @@ class TestBridgeCommunicator:
 
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        destroy_all_grids()
 
     def test_bridge_communicator_init(self):
 

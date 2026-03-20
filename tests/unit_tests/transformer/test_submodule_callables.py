@@ -3,7 +3,9 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -140,13 +142,13 @@ class TestTransformerLayerSubmoduleCallables:
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
                 num_experts=8,
                 moe_grouped_gemm=grouped_gemm,
                 qk_layernorm=True,
                 multi_latent_attention=True,
             )
-            model = TransformerLayer(config, transformer_layer_spec.submodules)
+            model = TransformerLayer(config, transformer_layer_submodules)
 
             params = reset_model(model)
             input_tensors = [build_data() for _ in range(microbatches)]

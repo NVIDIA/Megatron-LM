@@ -444,7 +444,7 @@ def get_batch(data_iterator):
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
-    if not args.export_offline_model:
+    if not args.export_offline_model and args.context_parallel_size == 1:
         try:
             report_draft_acceptance_length(model)
         except Exception as e:

@@ -58,6 +58,7 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --timing-log-level: 0
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:

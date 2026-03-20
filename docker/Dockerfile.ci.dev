@@ -88,7 +88,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     python -m venv /opt/jet 
     /opt/jet/bin/pip install --no-cache-dir $JET_INDEX_URLS \
-        jet-api==$JET_API_VERSION
+        "jet-api==$JET_API_VERSION" "setuptools<82.0.0"
 EOF
 
 RUN --mount=type=secret,id=JET_INDEX_URLS \

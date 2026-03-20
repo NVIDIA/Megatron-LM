@@ -54,6 +54,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     "--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1
 )
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
+@click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
     "--enable-lightweight-mode",
@@ -73,6 +74,7 @@ def main(
     container_image,
     n_repeat: int = 1,
     data_dir: Optional[str] = None,
+    hf_home: Optional[str] = None,
     tag: Optional[str] = None,
     enable_lightweight_mode: Optional[bool] = False,
 ):
@@ -107,6 +109,8 @@ def main(
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
     if data_dir:
         artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
+    if hf_home:
+        artifacts.append(f"{pathlib.Path(hf_home)}:/mnt/hf_home")
 
     executor = run.DockerExecutor(
         container_image=container_image,
@@ -122,6 +126,8 @@ def main(
             "CLUSTER": "dgxh100_dgxc",
             "NCCL_DEBUG": "INFO",
             "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
+            "HF_HOME": "/mnt/hf_home",
+            "TRANSFORMERS_OFFLINE": "1",
         },
         packager=run.Packager(),
         volumes=artifacts,
@@ -140,10 +146,10 @@ def main(
         succeeded = str(job_dict["status"]) == "SUCCEEDED"
 
         if succeeded:
-            logger.info(f"Job succeeded with status: {job_dict["status"]}")
+            logger.info(f"Job succeeded with status: {job_dict['status']}")
             sys.exit(0)
 
-        logger.error(f"Job failed with status: {job_dict["status"]}")
+        logger.error(f"Job failed with status: {job_dict['status']}")
         log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
         all_ranks_all_logs = []
         for log_file_path in log_file_paths:

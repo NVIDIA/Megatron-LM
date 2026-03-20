@@ -169,6 +169,8 @@ if __name__ == "__main__":
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
     tokenizer = get_tokenizer()._tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
@@ -177,7 +179,10 @@ if __name__ == "__main__":
     # Fold the scalars into weight for speedup.
     # [TODO]: fold_weight current assumes all weight_quantizer has weight allocated;
     # however, this is not the case when share_embeddings_and_output_weights is False.
-    if not getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
+    # [TODO]: fold_weight does not support TEGroupedMLP (QuantTEColumnParallelGroupedLinear)
+    # which stores per-expert weights as weight0, weight1, etc. instead of a single weight.
+    has_grouped_mlp = any("TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules())
+    if not getattr(unwrapped_model, "share_embeddings_and_output_weights", False) and not has_grouped_mlp:
         mtq.fold_weight(unwrapped_model)
 
     all_subjects = get_all_subjects()

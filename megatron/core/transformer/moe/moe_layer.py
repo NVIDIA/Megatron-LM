@@ -9,6 +9,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -24,19 +25,34 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceCUDAGraphTokenDispatcher,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import flashinfer  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
-
-    HAVE_TE = True
+    HAVE_FLASHINFER = True
 except ImportError:
-    HAVE_TE = False
+    HAVE_FLASHINFER = False
+
+if HAVE_FLASHINFER:
+    try:
+        import flashinfer_cubin  # pylint: disable=unused-import
+        import flashinfer_jit_cache  # pylint: disable=unused-import
+
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
+    except ImportError:
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+else:
+    TELinear, te_checkpoint = None, None
 
 
 class RouterInterface(Protocol):
@@ -87,10 +103,12 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -140,6 +158,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -147,7 +166,10 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -163,7 +185,9 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection)
+        self.router = submodules.router(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -238,9 +262,86 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Inference-optimized mode setup
+        if config.transformer_impl == "inference_optimized":
+            if config.inference_grouped_gemm_backend == 'auto':
+                assert HAVE_FLASHINFER, (
+                    "inference_grouped_gemm_backend='auto'"
+                    "requires flashinfer-python. "
+                    "Install flashinfer-python or set "
+                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                )
+
+                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                # when using the FlashInfer backend. The flashinfer-jit-cache package
+                # must be installed ahead of time to avoid a multi-minute JIT
+                # compilation step at runtime.
+                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+
+                check_flashinfer_jit_cache_installed()
+            elif config.inference_grouped_gemm_backend == 'torch':
+                assert hasattr(torch.nn.functional, 'grouped_mm'), (
+                    "inference_grouped_gemm_backend='torch' requires "
+                    "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
+                )
+            self._setup_inference_mode(pg_collection)
+
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+
+    def _setup_inference_mode(self, pg_collection):
+        """Set up inference-optimized token dispatcher and state.
+
+        Called from __init__ when config.transformer_impl == "inference_optimized".
+        Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
+        which is swapped in during CUDA-graphed forward passes.
+        """
+
+        assert self.config.moe_token_dispatcher_type == "alltoall", (
+            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
+            f"got '{self.config.moe_token_dispatcher_type}'"
+        )
+        self.is_inference_cuda_graphed_iteration = False
+        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
+            self.num_local_experts,
+            self.local_expert_indices,
+            config=self.config,
+            pg_collection=pg_collection,
+        )
+
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        Swaps in the inference-optimized token dispatcher and disables
+        shared expert overlap.
+        """
+        self.is_inference_cuda_graphed_iteration = True
+        if hasattr(self.router, "set_inference_cuda_graphed_iteration"):
+            self.router.set_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "set_inference_cuda_graphed_iteration"):
+            self.experts.set_inference_cuda_graphed_iteration()
+
+        if self._inference_token_dispatcher is not None:
+            self._saved_token_dispatcher = self.token_dispatcher
+            self.token_dispatcher = self._inference_token_dispatcher
+            self._saved_shared_expert_overlap = self.shared_expert_overlap
+            self.shared_expert_overlap = False
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        Restores the standard token dispatcher and shared expert overlap setting.
+        """
+        self.is_inference_cuda_graphed_iteration = False
+        if hasattr(self.router, "unset_inference_cuda_graphed_iteration"):
+            self.router.unset_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "unset_inference_cuda_graphed_iteration"):
+            self.experts.unset_inference_cuda_graphed_iteration()
+
+        if hasattr(self, "_saved_token_dispatcher"):
+            self.token_dispatcher = self._saved_token_dispatcher
+            self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -320,7 +421,18 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        if (
+            hasattr(self, "_inference_token_dispatcher")
+            and self.is_inference_cuda_graphed_iteration
+        ):
+            routing_map = self.token_dispatcher.routing_map
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+            )
+        else:
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
@@ -386,7 +498,7 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -429,7 +541,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute:
+        if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,
@@ -437,11 +549,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    intermediate_tensors,
                     padding_mask,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, padding_mask
+                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
@@ -450,10 +563,25 @@ class MoELayer(BaseMoELayer):
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
+        # TODO(Wohox): replace the "routed_experts" and "shared_experts" arguments with better
+        # naming to better explain that they are actually from different fine-grained callables,
+        # or use scanning to decide which backward_dw should be called.
         if routed_experts:
             self.experts.backward_dw()
-        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
-            self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
+                # so we execute its backward_dw in the comm stream too. But this may harm the
+                # EP overlap performance. Better to check if there is a better way to handle this.
+                from megatron.core.pipeline_parallel.utils import get_comm_stream
+
+                comm_stream = get_comm_stream()
+                with torch.cuda.stream(comm_stream):
+                    self.fc2_latent_proj.backward_dw()
+        if shared_experts:
+            if self.use_shared_expert and not self.shared_expert_overlap:
+                self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                self.fc1_latent_proj.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
