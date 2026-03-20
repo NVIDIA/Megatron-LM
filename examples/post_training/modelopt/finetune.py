@@ -48,8 +48,13 @@ def get_eos_id():
 
     We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
     we need to replace it with some other special tokens that do not appear in message."""
-    tokenizer = get_tokenizer()
-    hf_tokenizer = tokenizer._tokenizer
+    hf_tokenizer = get_tokenizer()._tokenizer
+    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
+    tok_attrs = ["tokenizer", "_tokenizer"]
+    for attr in tok_attrs:
+        if hasattr(hf_tokenizer, attr):
+            hf_tokenizer = getattr(hf_tokenizer, attr)
+            break
 
     if hf_tokenizer.eos_token == "<|eot_id|>":
         return 128001

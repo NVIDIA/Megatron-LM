@@ -168,9 +168,13 @@ if __name__ == "__main__":
 
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
+    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
     tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tok_attrs = ["tokenizer", "_tokenizer"]
+    for attr in tok_attrs:
+        if hasattr(tokenizer, attr):
+            tokenizer = getattr(tokenizer, attr)
+            break
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)

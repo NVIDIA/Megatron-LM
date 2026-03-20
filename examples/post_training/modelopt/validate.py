@@ -114,9 +114,13 @@ if __name__ == "__main__":
     else:
         ground_truth = [None for _ in range(len(prompts))]
 
+    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
     tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tok_attrs = ["tokenizer", "_tokenizer"]
+    for attr in tok_attrs:
+        if hasattr(tokenizer, attr):
+            tokenizer = getattr(tokenizer, attr)
+            break
     model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
     report_current_memory_info()

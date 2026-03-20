@@ -352,9 +352,14 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Megatron-Core tokenizers are now nested, need to unwrap to get the underlying HF tokenizer
     tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tok_attrs = ["tokenizer", "_tokenizer"]
+    for attr in tok_attrs:
+        if hasattr(tokenizer, attr):
+            tokenizer = getattr(tokenizer, attr)
+            continue
+
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -418,7 +423,7 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
-        if tokenizer.pad_token is None:
+        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"  # better for calibration
 
