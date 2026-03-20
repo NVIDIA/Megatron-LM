@@ -286,6 +286,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_disable_triton_nvls_kernels": False,
     "inference_grouped_gemm_backend": "auto",
     "inference_moe_disable_fused_quant_kernels": False,
+    "moe_mlp_glu_interleave_size": None,
+    "use_transformer_engine_op_fuser": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
