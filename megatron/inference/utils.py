@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import logging
 from argparse import ArgumentParser
 from functools import partial
@@ -80,6 +81,9 @@ def get_model_for_inference() -> MegatronModule:
                 "inference_grouped_gemm_backend='te'."
             )
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
+        # Force GC of TE weight copies and intermediate BF16 tensors
+        gc.collect()
+        torch.cuda.empty_cache()
     return model
 
 

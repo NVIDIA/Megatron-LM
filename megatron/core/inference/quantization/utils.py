@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -27,6 +28,20 @@ try:
     HAVE_TORCH_SCALED_MM = True
 except ImportError:
     HAVE_TORCH_SCALED_MM = False
+
+
+def _free_te_state(model: torch.nn.Module) -> None:
+    """Remove TE-specific state that is no longer needed after MXFP8 conversion.
+
+    Frees fp8_meta (CUDA tensors for scales/amax history), _extra_state
+    (serialized FP8 checkpoint data), and any TE-registered buffers.
+    """
+    if hasattr(model, 'fp8_meta'):
+        del model.fp8_meta
+    if hasattr(model, '_extra_state'):
+        del model._extra_state
+    if hasattr(model, '_buffers') and model._buffers:
+        model._buffers.clear()
 
 
 def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tensor) -> None:
@@ -87,9 +102,13 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: str = "flashinfer")
                 _verify_te_to_mcore_mxfp8_conversion(te_dequantized, mcore_quantized)
                 del model._parameters[key]
                 setattr(model, key, mcore_quantized)
+                # Free TE weight and intermediate BF16 tensor immediately
+                del val, te_dequantized
 
     if hasattr(model, '_parameters') and model._parameters:
         replace_in_dict(model._parameters)
+
+    _free_te_state(model)
 
     return model
 
@@ -208,6 +227,10 @@ def quantize_params_to_mxfp8(
             # Replace nn.Parameter with MXFP8Tensor attribute
             del model._parameters[key]
             setattr(model, key, mcore_tensor)
+            # Free TE weight and intermediate BF16 tensor immediately
+            del val, bf16_data
+
+    _free_te_state(model)
 
     return persistent_buffers
 
