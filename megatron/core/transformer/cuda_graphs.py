@@ -1149,13 +1149,18 @@ class _CudaGraphRunner(torch.nn.Module):
                 return ref
 
             # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
-            # reference. This is safe for surfaces whose memory is managed by
-            # the CUDA graph pool (driver-pinned, stable addresses) but not safe for
-            # tensors allocated by the caching allocator, whose data_ptr() may be invalidated by
-            # block coalescing or empty_cache().
-            # We do not weakref tensors in fwd_graph_input_surface. These may be allocated from
-            # tensor_reuse_pool which is outside the scope of the graph pool. Weakref'ing them
-            # creates a dangling pointer if the caching allocator reclaims the block.
+            # reference. This is safe for surfaces whose memory is managed by the CUDA graph pool
+            # (driver-pinned, stable addresses) but not safe for tensors allocated by the caching
+            # allocator, whose data_ptr() may be invalidated by block coalescing or empty_cache().
+            def replace_with_weak_ref_for_input_surface(arg):
+                if torch.is_tensor(arg) and _CudagraphGlobalRecord.tensor_reuse_pool.owns(arg):
+                    return arg
+                return replace_with_weak_ref(arg)
+
+            self.fwd_graph_input_surface = tree_map(
+                replace_with_weak_ref_for_input_surface, self.fwd_graph_input_surface
+            )
+
             self.fwd_graph_input_args = tree_map(replace_with_weak_ref, self.fwd_graph_input_args)
             self.fwd_graph_input_kwargs = tree_map(
                 replace_with_weak_ref, self.fwd_graph_input_kwargs
