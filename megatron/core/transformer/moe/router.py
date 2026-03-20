@@ -789,7 +789,7 @@ class InferenceTopKRouter(TopKRouter):
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
-
+        torch._dynamo.mark_dynamic(logits, 0)  # Mark logits as dynamic for batch size changes
         probs, top_indices = self._compiled_topk_routing(
             logits,
             self.topk,
