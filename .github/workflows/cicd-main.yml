@@ -193,13 +193,15 @@ jobs:
           echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
-          _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                          && echo "**→**" || echo "" )
-          _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                       && echo "**→**" || echo "" )
-          _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ] && echo "**→**" || echo "" )
-          _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                         && echo "**→**" || echo "" )
+          _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
+          _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                        && echo "**→**" || echo "" )
+          _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ]  && echo "**→**" || echo "" )
+          _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                          && echo "**→**" || echo "" )
+          _LTS=$( [ "$HAS_LTS" == "true" ]                                                                                 && echo "**→**" || echo "" )
+          _DEV=$( [ "$HAS_LTS" != "true" ]                                                                                 && echo "**→**" || echo "" )
 
           cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
-          Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )with **$N_REPEAT** repetition(s). You are welcome.
+          Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )against the **$( [ "$HAS_LTS" == "true" ] && echo "lts" || echo "dev" )** container with **$N_REPEAT** repetition(s). You are welcome.
 
           | Setting | Value |
           |---|---|
@@ -207,10 +209,12 @@ jobs:
           | \`n_repeat\` | \`$N_REPEAT\` |
           | \`lightweight\` | \`$LIGHTWEIGHT\` |
           | \`lts\` | \`$HAS_LTS\` |
-          | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`dev\` | \`$DEV\` |
+          | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
 
           ### Decision tree
+
+          **Test scope**
 
           | | Trigger | \`scope\` | \`n_repeat\` | \`lightweight\` |
           |---|---|---|---|---|
@@ -218,6 +222,18 @@ jobs:
           | $_RT | Label: _Run tests_ | \`mr-github\` | \`1\` | \`true\` |
           | $_RF | Label: _Run functional tests_ / CI workload | \`mr-github\` | \`5\` | \`false\` |
           | $_DF | _(default)_ | \`mr-github-slim\` | \`5\` | \`false\` |
+
+          **Container image**
+
+          | | Trigger | \`image\` |
+          |---|---|---|
+          | $_LTS | Label: _container::lts_ | \`lts\` |
+          | $_DEV | _(default)_ | \`dev\` |
+
+          ### Glossary
+          - **\`lightweight\`**: runs a curated subset of tests for faster PR feedback — skips long-running or low-signal test cases
+          - **\`lts\`**: uses the Long Term Support container base image instead of the latest dev image
+          - **\`dev\`**: uses the latest development container base image (default)
           SUMMARY
 
   linting:
