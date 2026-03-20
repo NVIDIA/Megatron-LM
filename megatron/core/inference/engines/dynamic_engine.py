@@ -48,6 +48,7 @@ from megatron.core.inference.utils import (
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
+    connect_to_ray_block_store
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
