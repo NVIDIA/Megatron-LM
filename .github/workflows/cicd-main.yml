@@ -197,6 +197,7 @@ jobs:
           | \`lightweight\` | \`$LIGHTWEIGHT\` |
           | \`lts\` | \`$HAS_LTS\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
+          | \`dev\` | \`true\` |
           SUMMARY
 
   linting:
