@@ -103,6 +103,10 @@ def execute_reshard_plan(
     #   ('transform', param_name, dst_slice, [recv_bufs]) — transform.finalize_recv
     recv_writebacks: list = []
 
+    # Pre-allocate BF16 accumulation buffers for TE MXFP8 destination params so
+    # we can recv directly into views instead of allocating per-slice buffers.
+    pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor, list]] = {}
+
     for op in plan.recv_ops:
         if transform is not None and transform.should_transform(op.param_name):
             recv_bufs = transform.prepare_recv(op.param_name, op.my_slice)
@@ -128,6 +132,29 @@ def execute_reshard_plan(
                     else:
                         service.submit_recv(dst_slice_view, op.peer_rank)
                     recv_writebacks.append(('direct',))
+                elif _is_mxfp8_tensor(dst_param):
+                    # TE MXFP8: recv directly into pre-allocated accumulation
+                    # buffer to avoid per-slice BF16 allocations.
+                    param_id = id(dst_param)
+                    if param_id not in pending_quantized:
+                        full_bf16 = torch.empty(
+                            dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
+                        )
+                        pending_quantized[param_id] = (dst_param, full_bf16, [])
+                    accum_view = pending_quantized[param_id][1][op.my_slice]
+                    if accum_view.is_contiguous():
+                        if submit_recv_with_id is not None and op.task_id is not None:
+                            submit_recv_with_id(op.task_id, accum_view, op.peer_rank)
+                        else:
+                            service.submit_recv(accum_view, op.peer_rank)
+                        recv_writebacks.append(('direct',))
+                    else:
+                        recv_buffer = torch.empty_like(dst_slice_view.contiguous())
+                        if submit_recv_with_id is not None and op.task_id is not None:
+                            submit_recv_with_id(op.task_id, recv_buffer, op.peer_rank)
+                        else:
+                            service.submit_recv(recv_buffer, op.peer_rank)
+                        recv_writebacks.append(('default', recv_buffer, dst_param, op.my_slice))
                 else:
                     recv_buffer = torch.empty_like(dst_slice_view.contiguous())
                     if submit_recv_with_id is not None and op.task_id is not None:
@@ -151,12 +178,15 @@ def execute_reshard_plan(
     # Since refit overwrites every slice of each param, we allocate a fresh
     # BF16 buffer (torch.empty) instead of dequantizing the existing MXFP8
     # weights — this avoids a full-model-sized dequantize+clone.
-    pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor, list]] = {}
-
-    for wb in recv_writebacks:
+    #
+    # pending_quantized was pre-populated during recv submission so that
+    # contiguous MXFP8 slices recv'd directly into the accumulation buffer.
+    # Non-contiguous fallback slices are copied into it here.
+    for i in range(len(recv_writebacks)):
+        wb = recv_writebacks[i]
+        recv_writebacks[i] = None  # Eagerly drop reference to free recv buffers
         with torch.no_grad():
             if wb[0] == 'direct':
-                # Already written in-place during recv — nothing to do.
                 pass
             elif wb[0] == 'transform':
                 _, param_name, dst_slice, recv_bufs = wb
@@ -164,11 +194,9 @@ def execute_reshard_plan(
             else:
                 _, recv_buffer, dst_param, dst_slice = wb
                 if _is_mxfp8_tensor(dst_param):
-                    # Accumulate BF16 slices for deferred quantization
+                    # Non-contiguous fallback: copy into pre-allocated accum buffer.
                     param_id = id(dst_param)
                     if param_id not in pending_quantized:
-                        # Allocate empty BF16 buffer — no need to dequantize
-                        # existing weights since all slices will be overwritten.
                         full_bf16 = torch.empty(
                             dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
                         )
@@ -177,15 +205,12 @@ def execute_reshard_plan(
                     pending_quantized[param_id][1][dst_slice].copy_(recv_buffer)
                 else:
                     dst_param.data[dst_slice].copy_(recv_buffer)
-
-    # Free writeback list — recv_buffers are no longer needed after copy.
     recv_writebacks.clear()
 
     # Finalize deferred quantized param updates
     for param_id, (dst_param, full_bf16, slices) in pending_quantized.items():
         with torch.no_grad():
             dst_param.quantize_(full_bf16)
-    # Free the BF16 accumulation buffers eagerly.
     pending_quantized.clear()
 
     # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
@@ -194,5 +219,10 @@ def execute_reshard_plan(
     # execute_reshard_plan returns — creating a race with callers that immediately
     # inspect or capture (via CUDA graphs) the destination parameters.
     torch.cuda.synchronize()
+
+    # Release transient BF16 recv/accumulation buffers back to the CUDA driver.
+    # Without this the caching allocator retains the peak allocation, which can
+    # be significant for MXFP8 destinations (full model weight size in BF16).
+    torch.cuda.empty_cache()
 
     logger.info("Reshard complete")
