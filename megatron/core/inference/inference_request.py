@@ -8,6 +8,7 @@ from enum import Enum, auto
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
+import uuid
 import numpy as np
 import torch
 
@@ -779,11 +780,11 @@ class DynamicInferenceRequestRecord:
             return
 
         routing_indices = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        req_id = str(self.requests[0].request_id)
+        blockstore_uuid = str(uuid.uuid4())
 
         ray.get(
             block_store_instance.put_numpy.remote(
-                req_id,
+                blockstore_uuid,
                 "moe_topk_indices",
                 routing_indices,
             )
@@ -792,12 +793,12 @@ class DynamicInferenceRequestRecord:
         routing_block_store_key = {
             "instance_rank": block_store_instance_rank,
             "instance_id": block_store_instance_id,
-            "req_id": req_id,
+            "req_id": blockstore_uuid,
             "key": "moe_topk_indices",
         }
 
         logging.info(
-            f"NeMo-RL block store put: req_id={req_id} "
+            f"NeMo-RL block store put: req_id={blockstore_uuid} "
             f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
             f"instance_id={block_store_instance_id}"
         )
