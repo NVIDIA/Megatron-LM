@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.nvtx import range_pop, range_push
 from torch import Tensor
 
 from megatron.core import parallel_state
@@ -1266,12 +1265,6 @@ class TextGenerationController:
             np.cumsum(active_query_lengths[:-1]),
             axis=0,
         )
-
-        # # Map to request IDs
-        # routing_indices_per_request = {}
-        # for req_id, routing_split in zip(active_request_ids, routing_splits):
-        #     # routing_split has shape [num_tokens_for_request, num_layers, topk]
-        #     routing_indices_per_request[req_id] = routing_split
 
         return routing_splits
 
