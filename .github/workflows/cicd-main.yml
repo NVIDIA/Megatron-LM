@@ -144,6 +144,7 @@ jobs:
       lightweight:   ${{ steps.configure.outputs.lightweight }}
       lts:           ${{ steps.configure.outputs.lts }}
       mbridge_suite: ${{ steps.configure.outputs.mbridge_suite }}
+      dev:           ${{ steps.configure.outputs.dev }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -182,12 +183,14 @@ jobs:
           fi
 
           MBRIDGE_SUITE=$( [ "$HAS_MBRIDGE" == "true" ] && echo "all" || echo "unit-only" )
+          DEV=true
 
           echo "scope=$SCOPE"                 | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"           | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"     | tee -a $GITHUB_OUTPUT
           echo "lts=$HAS_LTS"                 | tee -a $GITHUB_OUTPUT
           echo "mbridge_suite=$MBRIDGE_SUITE" | tee -a $GITHUB_OUTPUT
+          echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
 
           cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
           | Setting | Value |
@@ -197,7 +200,7 @@ jobs:
           | \`lightweight\` | \`$LIGHTWEIGHT\` |
           | \`lts\` | \`$HAS_LTS\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
-          | \`dev\` | \`true\` |
+          | \`dev\` | \`$DEV\` |
           SUMMARY
 
   linting:
