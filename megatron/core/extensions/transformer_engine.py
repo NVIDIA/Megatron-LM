@@ -1766,14 +1766,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
-            # Fix partition_dim when explicit_expert_comm cleared parallel_mode.
-            # TE defaults to partition_dim=0 when parallel_mode=None, but row-parallel
-            # weights are partitioned along dim=1 (input dimension).
-            if self.explicit_expert_comm and original_parallel_mode == "row":
+            # Explicitly stamp partition_dim and partition_stride on expert weight
+            # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12
+            # set these internally; TE ≥2.13 no longer does (parallel_mode=None
+            # is passed due to explicit_expert_comm).  The resharding/refit planner
+            # relies on partition_dim to correctly plan TP gather/scatter operations.
+            # NOTE: we intentionally do NOT stamp tensor_model_parallel here —
+            # doing so would change num-zeros gradient counting.
+            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+                part_dim = 0 if original_parallel_mode == "column" else 1
                 for i in range(num_gemms):
                     weight = getattr(self, f"weight{i}", None)
-                    if weight is not None and hasattr(weight, "partition_dim"):
-                        weight.partition_dim = 1
+                    if weight is not None:
+                        setattr(weight, "partition_dim", part_dim)
+                        setattr(weight, "partition_stride", 1)
 
             def merge_extra_states(
                 self,

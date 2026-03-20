@@ -279,6 +279,15 @@ def extract_param_metadata(
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 
+    # Expert-param detection for TP inference.  When explicit_expert_comm is
+    # active (is_expert and (tp_size>1 or ep)), TE clears parallel_mode so
+    # tensor_model_parallel is never stamped — yet the weight IS TP-sharded
+    # when tp_size > 1.  We detect expert params via num_experts + the
+    # per-expert naming convention (weightK / biasK in TEGroupedLinear).
+    is_expert_param = (
+        num_experts is not None and _detect_expert_index_from_param_name(param_name) is not None
+    )
+
     tensor_parallel_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
@@ -301,17 +310,22 @@ def extract_param_metadata(
         result = [r + rank_offset for r in ranks] if rank_offset else ranks
         return _dedup_ranks(result)
 
-    if is_ep:
-        expert_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.ep))
-        # For MoE params, prefer expert TP group when available, else regular TP
-        if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(
-                dist.get_process_group_ranks(pg_collection.expt_tp)
+    if is_ep or is_expert_param:
+        if is_ep:
+            expert_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.ep)
             )
-        elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(
-                dist.get_process_group_ranks(pg_collection.tp)
-            )
+        # For expert params, always provide TP group ranks so the planner can
+        # handle TP size transitions (e.g., TP2→TP1).  When explicit_expert_comm
+        # clears TE's parallel_mode, tensor_model_parallel may not be set even
+        # though the weight IS TP-sharded.  Detect TP via group size instead.
+        expt_tp = getattr(pg_collection, 'expt_tp', None)
+        tp_grp = expt_tp if expt_tp is not None else getattr(pg_collection, 'tp', None)
+        if tp_grp is not None:
+            tp_ranks = _offset_ranks(dist.get_process_group_ranks(tp_grp))
+            tensor_parallel_group_ranks = tp_ranks
+            if not is_tp and len(tp_ranks) > 1:
+                is_tp = True
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
@@ -322,6 +336,17 @@ def extract_param_metadata(
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     else:
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
+
+    # Always provide TP group ranks so the planner can handle TP size transitions
+    # (e.g., TP2→TP1).  When is_tp=False the param is replicated across the TP group,
+    # but the planner still needs to know the TP topology to plan gather/scatter ops
+    # when the *other* side of the reshard IS TP-sharded.
+    if (
+        tensor_parallel_group_ranks is None
+        and hasattr(pg_collection, 'tp')
+        and pg_collection.tp is not None
+    ):
+        tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
 
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
         pipeline_parallel_group_ranks = _offset_ranks(
