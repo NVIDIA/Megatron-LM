@@ -6,7 +6,7 @@
 #   torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py \
 #       convert-torch-dist-to-fsdp-dtensor \
 #       /path/to/input_checkpoint /path/to/output_checkpoint \
-#       --swiglu-modules language_model --merge-gdn --rename-mtp-keys
+#       --swiglu-modules language_model --rename-mtp-keys
 import gc
 import io
 import json
@@ -347,7 +347,6 @@ def convert_checkpoint(
     optimizer_state_prefix="optimizer.state.module.module.module",
     model_weight_prefix="model.module",
     param_to_param_group_map={},
-    merge_gdn=False,
     rename_mtp_keys=False,
     swiglu_modules=None,
 ):
@@ -368,11 +367,6 @@ def convert_checkpoint(
       --swiglu           Same as above, but applies globally       No (manual).
                          to ALL modules. Use --swiglu-modules
                          if only some modules use SWiGLU.
-      --merge-gdn        [DEPRECATED for TP>1] Merge GDN             No.
-                         sub-keys. Only for legacy TP=1.
-                         For TP>1: OMIT this flag — FSDP
-                         runtime handles splitting via
-                         handle_gdn_in_state_dict().
       --rename-mtp-keys  Model uses Multi-Token Prediction          YES.
                          (MTP) with 'transformer_layer' naming
                          in the torch_dist checkpoint.
@@ -381,7 +375,7 @@ def convert_checkpoint(
     Auto-detection: --rename-mtp-keys is auto-detected from checkpoint keys
     if not explicitly set. --swiglu / --swiglu-modules must always be specified
     manually because SWiGLU and GeLU MLP weights are indistinguishable in the
-    MCore torch_dist format. --merge-gdn is NOT auto-detected (deprecated).
+    MCore torch_dist format.
 
     \b
     Examples
@@ -441,11 +435,9 @@ def convert_checkpoint(
         rank0_echo("[SWiGLU] Disabled (no --swiglu or --swiglu-modules specified).")
 
     # --- Auto-detect MTP from checkpoint keys ---
-    # NOTE: GDN auto-detection has been removed.  For FSDP training with
-    # TP > 1, GDN sub-keys must be kept un-merged so that
-    # handle_gdn_in_state_dict() in fsdp_dtensor_checkpoint.py can wrap
-    # each sub-tensor with correct TP metadata.  Use --merge-gdn only if
-    # you explicitly need the legacy merged format (TP=1 only).
+    # GDN sub-keys are kept un-merged; handle_gdn_in_state_dict() in
+    # fsdp_dtensor_checkpoint.py wraps each sub-tensor with correct TP metadata
+    # at runtime.
     all_keys = list(state_dict.keys())
     _detected = []
 
@@ -704,55 +696,6 @@ def convert_checkpoint(
     elif _swiglu_prefixes is not None and len(_swiglu_prefixes) > 0:
         rank0_echo("[SWiGLU] WARNING: modules specified but 0 keys were split — check module names.")
 
-    # Merge GDN (Gated DeltaNet) composite keys.
-    # The torch_dist format stores in_proj.weight and conv1d.weight as separate
-    # sub-tensors (.query, .key, .value, .z, .beta, .alpha), but the FSDP model
-    # expects them as single concatenated tensors.
-    if merge_gdn:
-        GDN_IN_PROJ_PARTS = ["query", "key", "value", "z", "beta", "alpha"]
-        GDN_CONV1D_PARTS = ["query", "key", "value"]
-
-        gdn_groups: dict[str, dict[str, torch.Tensor]] = {}
-        for k in list(fsdp_dtensor_state_dict.keys()):
-            for part_list in (GDN_IN_PROJ_PARTS, GDN_CONV1D_PARTS):
-                for part_name in part_list:
-                    suffix = f".{part_name}"
-                    if k.endswith(suffix):
-                        base = k[: -len(suffix)]
-                        if ".self_attention.in_proj.weight" in base or ".self_attention.conv1d.weight" in base:
-                            gdn_groups.setdefault(base, {})[part_name] = k
-                            break
-
-        merged_count = 0
-        for base_key, parts_map in sorted(gdn_groups.items()):
-            if ".in_proj.weight" in base_key:
-                expected = GDN_IN_PROJ_PARTS
-            else:
-                expected = GDN_CONV1D_PARTS
-
-            if set(parts_map.keys()) != set(expected):
-                if torch.distributed.get_rank() == 0:
-                    click.echo(click.style(
-                        f"Warning: Incomplete GDN group for {base_key}, "
-                        f"found {sorted(parts_map.keys())}, expected {expected}. Skipping merge.",
-                        fg="yellow",
-                    ))
-                continue
-
-            _free_up_some_gpu_memory()
-            full_parts = []
-            for part_name in expected:
-                part_tensor = fsdp_dtensor_state_dict.pop(parts_map[part_name])
-                full_parts.append(gather_uneven_dtensor_to_full_tensor(part_tensor))
-
-            merged = torch.cat(full_parts, dim=0).redistribute(placements=[Shard(0)])
-            fsdp_dtensor_state_dict[base_key] = merged
-            merged_count += 1
-
-        if merged_count > 0:
-            rank0_echo(f"[GDN merge] Merged {merged_count} composite keys "
-                       f"(in_proj.weight / conv1d.weight).")
-
     # Rename MTP keys: torch_dist uses "transformer_layer" for MTP sub-modules,
     # but the FSDP model's state_dict() uses "mtp_model_layer".
     if rename_mtp_keys:
@@ -884,15 +827,6 @@ def convert_checkpoint(
     help="JSON string representing the param to parameter group map."
 )
 @click.option(
-    "--merge-gdn",
-    is_flag=True,
-    help="[DEPRECATED for FSDP TP>1] Merge GDN decomposed sub-keys "
-         "(query/key/value/z/beta/alpha) into fused in_proj.weight / conv1d.weight. "
-         "For FSDP training with TP > 1, do NOT use this flag — keep sub-keys "
-         "un-merged so that handle_gdn_in_state_dict() can produce correct TP DTensors. "
-         "Only use this flag for legacy TP=1-only workflows.",
-)
-@click.option(
     "--rename-mtp-keys",
     is_flag=True,
     help="Rename MTP layer keys from 'transformer_layer' to 'mtp_model_layer' "
@@ -910,7 +844,6 @@ def convert_torch_dist_to_fsdp_dtensor(
     output_optimizer_state_prefix,
     output_model_weight_prefix,
     param_to_param_group_map_json,
-    merge_gdn,
     rename_mtp_keys,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
@@ -930,11 +863,6 @@ def convert_torch_dist_to_fsdp_dtensor(
       --swiglu           Same as above, but applies globally     No (manual).
                          to ALL modules. Use --swiglu-modules
                          if only some modules use SWiGLU.
-      --merge-gdn        [DEPRECATED for TP>1] Merge GDN           No.
-                         sub-keys. Only for legacy TP=1.
-                         For TP>1: OMIT this flag — FSDP
-                         runtime handles splitting via
-                         handle_gdn_in_state_dict().
       --rename-mtp-keys  Model uses Multi-Token Prediction        YES.
                          (MTP) with 'transformer_layer' naming
                          in the torch_dist checkpoint.
@@ -943,7 +871,6 @@ def convert_torch_dist_to_fsdp_dtensor(
     Auto-detection note:
       --rename-mtp-keys is auto-detected from checkpoint keys if not explicitly
       set. --swiglu / --swiglu-modules must always be specified manually.
-      --merge-gdn is NOT auto-detected (deprecated for TP>1).
 
     \b
     Examples
@@ -1013,7 +940,6 @@ def convert_torch_dist_to_fsdp_dtensor(
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
         param_to_param_group_map=param_to_param_group_map,
-        merge_gdn=merge_gdn,
         rename_mtp_keys=rename_mtp_keys,
         swiglu_modules=_swiglu_modules,
     )
