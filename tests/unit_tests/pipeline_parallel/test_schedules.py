@@ -820,11 +820,7 @@ class TestMTPLossScaleWithCP:
 
     @pytest.mark.parametrize(
         "cp_group_size,num_microbatches,expected_scale",
-        [
-            (1, 1, 1.0),
-            (2, 4, 0.5),
-            (2, 6, 1.0 / 3.0),
-        ],
+        [(1, 1, 1.0), (2, 4, 0.5), (2, 6, 1.0 / 3.0)],
     )
     def test_mtp_loss_scale_matches_actual_ga(
         self, cp_group_size, num_microbatches, expected_scale
@@ -854,11 +850,7 @@ class TestMTPLossScaleWithCP:
         assert actual_scale == pytest.approx(1.0)
 
     @pytest.mark.parametrize(
-        "cp_group_size,num_microbatches,mtp_loss_elements",
-        [
-            (1, 1, 2),
-            (2, 6, 6),
-        ],
+        "cp_group_size,num_microbatches,mtp_loss_elements", [(1, 1, 2), (2, 6, 6)]
     )
     def test_mtp_loss_scale_applied_in_backward(
         self, cp_group_size, num_microbatches, mtp_loss_elements
