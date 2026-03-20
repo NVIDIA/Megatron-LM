@@ -231,7 +231,7 @@ jobs:
           | $_DEV | _(default)_ | \`dev\` |
 
           ### Glossary
-          - **\`lightweight\`**: runs a curated subset of tests for faster PR feedback — skips long-running or low-signal test cases
+          - **\`lightweight\`**: trains for 4 steps instead of 100 and skips comparison against golden values — faster feedback, no correctness guarantees
           - **\`lts\`**: uses the Long Term Support container base image instead of the latest dev image
           - **\`dev\`**: uses the latest development container base image (default)
           SUMMARY
