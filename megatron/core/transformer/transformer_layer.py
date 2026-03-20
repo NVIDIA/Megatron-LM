@@ -277,6 +277,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
     ):
         self.submodules_config = submodules
+        
         super().__init__(config=config, vp_stage=vp_stage)
 
         if pg_collection is None:
@@ -498,8 +499,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             CudaGraphScope.mlp in self.config.cuda_graph_scope
             and self.submodules_config.mlp != IdentityOp
         ):
-            # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
-            assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
 
     @staticmethod

@@ -52,6 +52,13 @@ try:
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
     from transformer_engine.pytorch.utils import make_weak_ref
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+        ETP_CONFIG,
+        get_ag_stream,
+        get_rs_stream,
+        reallocate_etp_cache_to_mempool,
+        wait_async_comms,
+    )
 
     HAVE_TE_GRAPHS = True
 except:
@@ -67,6 +74,8 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+_EXTERNAL_STREAMS = []
 
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
@@ -112,6 +121,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
@@ -390,6 +400,10 @@ class _CudagraphGlobalRecord:
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
 
+        if any(r[0].parameter_sharding for r in cls.cudagraph_record):
+            reallocate_etp_cache_to_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
+            ETP_CONFIG.check_param_states = False
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -609,7 +623,17 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        runner.fwd_graph.replay()
+        if runner.parameter_sharding:
+            wait_async_comms()
+
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.fwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
+        else:
+            runner.fwd_graph.replay()
+
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -642,7 +666,17 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        runner.bwd_graph.replay()
+        if runner.parameter_sharding:
+            wait_async_comms()
+
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.bwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+        else:
+            runner.bwd_graph.replay()
+
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -660,7 +694,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated
         dgrads = runner.static_grad_inputs[: runner.num_dgrads]
-        wgrads = (g.clone() for g in runner.static_grad_inputs[runner.num_dgrads :])
+        wgrads = (g.clone() if torch.is_tensor(g) else g for g in runner.static_grad_inputs[runner.num_dgrads :])
 
         return None, None, *dgrads, *wgrads
 
@@ -706,6 +740,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp8_enabled = False
         self.fp4_enabled = False
         self.deallocate_pipeline_outputs = False
+        self.use_stream = False
+        self.parameter_sharding = False
+        self.fwd_side_streams = []
+        self.bwd_side_streams = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -730,6 +768,16 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
+            self.parameter_sharding = self.base_module.config.parameter_sharding_size > 1
+
+            if self.parameter_sharding:
+                self.use_stream = True
+                self.stream = torch.cuda.Stream()
+                self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                self._register_side_stream(self.fwd_side_streams, get_ag_stream())
+                self._register_side_stream(self.bwd_side_streams, get_ag_stream())
+                self._register_side_stream(self.bwd_side_streams, get_rs_stream())
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -740,6 +788,25 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+    def _register_side_stream(self, side_streams, stream):
+        """Register a side stream for graph capture/replay synchronization."""
+        side_streams.append(stream)
+
+    def _sync_against_side_streams(self, side_streams):
+        """Make registered side streams wait for the current stream.
+        Also injects a dummy kernel into each stream to ensure it is non-empty,
+        which is required for CUDA graph capture (joining an empty captured
+        stream is a CUDA error)."""
+        for s in side_streams:
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                torch.cuda._sleep(1)
+
+    def _wait_side_streams(self, side_streams):
+        """Make the current stream wait for all registered side streams."""
+        for s in side_streams:
+            torch.cuda.current_stream().wait_stream(s)
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -905,30 +972,34 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
-            for _ in range(self.num_warmup_steps):
-                with self.get_quantization_context():
 
-                    def clone_ten(ten):
-                        if not torch.is_tensor(ten):
-                            return ten
-                        return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
+            # if self.parameter_sharding:
+            #     ETP_CONFIG.weight_prefetch = False
 
-                    warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
-                    warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
-                    warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
+            # for _ in range(self.num_warmup_steps):
+            #     with self.get_quantization_context():
 
-                if self.grad_enabled:
-                    warmup_outputs = self.get_tensors(warmup_outputs)
-                    warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-                    input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
-                    torch.autograd.grad(
-                        outputs=warmup_outputs,
-                        inputs=tuple(i for i in input_tensors if i.requires_grad),
-                        grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
-            _set_warmup_end()
+            #         def clone_ten(ten):
+            #             if not torch.is_tensor(ten):
+            #                 return ten
+            #             return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
+
+            #         warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
+            #         warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
+            #         warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
+
+            #     if self.grad_enabled:
+            #         warmup_outputs = self.get_tensors(warmup_outputs)
+            #         warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
+            #         input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
+            #         torch.autograd.grad(
+            #             outputs=warmup_outputs,
+            #             inputs=tuple(i for i in input_tensors if i.requires_grad),
+            #             grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
+            #             only_inputs=True,
+            #             allow_unused=True,
+            #         )
+            # _set_warmup_end()
 
             with self.get_quantization_context():
                 torch.cuda.synchronize()
@@ -948,10 +1019,23 @@ class _CudaGraphRunner(torch.nn.Module):
                 with torch.cuda.graph(
                     self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                 ):
+
+                    self._sync_against_side_streams(self.fwd_side_streams)
+
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
 
+                    # Record completion event inside the graph so the current stream can
+                    # proceed as soon as module compute finishes, before async comms are joined.
+                    if self.use_stream:
+                        self.fwd_completion_event.record()
+
+                    if self.parameter_sharding:
+                        wait_async_comms()
+                    if self.fwd_side_streams:
+                        self._wait_side_streams(self.fwd_side_streams)
+                
                 # Unfreeze GC.
                 if FREEZE_GC:
                     gc.unfreeze()
@@ -1062,6 +1146,9 @@ class _CudaGraphRunner(torch.nn.Module):
             gc.freeze()
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+
+            self._sync_against_side_streams(self.bwd_side_streams)
+
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1070,6 +1157,13 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
+
+            if self.use_stream:
+                self.bwd_completion_event.record()
+            if self.parameter_sharding:
+                wait_async_comms()
+            if self.bwd_side_streams:
+                self._wait_side_streams(self.bwd_side_streams)
 
         # Unfreeze GC.
         if FREEZE_GC:

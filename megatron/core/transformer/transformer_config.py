@@ -1790,13 +1790,13 @@ class TransformerConfig(ModelParallelConfig):
                     and CudaGraphScope.moe_router not in self.cuda_graph_scope
                 ), 'moe cuda graph is only supported for MoE.'
             else:
-                if self.moe_layer_freq == 1 or (
-                    isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
-                ):
-                    assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
-                        'mlp cuda graph is only supported for dense layers, '
-                        'but not found in the model.'
-                    )
+                # if self.moe_layer_freq == 1 or (
+                #     isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                # ):
+                #     assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
+                #         'mlp cuda graph is only supported for dense layers, '
+                #         'but not found in the model.'
+                #     )
                 if (
                     self.moe_expert_capacity_factor is None
                     or not self.moe_pad_expert_input_to_capacity

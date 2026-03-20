@@ -274,6 +274,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if ps_group is not None:
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
+            self.weight._need_weight_prefetch = False
 
     def forward(self, input_):
         """Forward.
@@ -909,7 +910,6 @@ class ColumnParallelLinear(torch.nn.Module):
         if ps_group is not None:
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
-            
 
         if bias:
             if config.use_cpu_initialization:
