@@ -15,11 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import (
-    InferenceConfig,
-    KVCacheManagementMode,
-    PrefixCachingEvictionPolicy,
-)
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -329,16 +325,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            attention_layer_map, mamba_layer_map, _, _ = get_layer_maps_from_layer_type_list(
-                mamba_inference_state_config.layer_type_list
+            attention_layer_map, mamba_layer_map, mlp_layer_map, moe_layer_map = (
+                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
+            self.num_mlp_layers = len(mlp_layer_map) + len(moe_layer_map)
             self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
             self.num_mamba_layers = 0
+            self.num_mlp_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
@@ -346,6 +344,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise NotImplementedError(
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
+
+        # FLOP efficiency formula parameters (used by FLOP_EFFICIENCY eviction policy)
+        self.flop_hidden_size = model_config.hidden_size
+        self.flop_num_attn_layers = self.num_attention_layers
+        self.flop_num_mamba_layers = self.num_mamba_layers
+        self.flop_num_mlp_layers = self.num_mlp_layers
+        if self.is_hybrid_model and self.mamba_ssm_states_shape is not None:
+            self.flop_ssm_state_dim = self.mamba_ssm_states_shape[0]
+        else:
+            self.flop_ssm_state_dim = 0
+        self.flop_alpha = inference_config.prefix_caching_flop_alpha
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
@@ -482,6 +491,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            flop_alpha=self.flop_alpha,
         )
 
         # Track request metadata.
@@ -1983,7 +1993,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            if self.prefix_caching_eviction_policy in KVBlockAllocator._CACHING_POLICIES:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
 
         # Note that we decremented the total_request_count for the chunked prefill request
@@ -2088,7 +2098,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
                 self.kv_block_allocator.register_kv_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
+                    block_ids_to_hash, block_hashes_slice, block_indices=list(range(start, end))
                 )
 
             # Range 1: prior-chunk partial block that this chunk just completed

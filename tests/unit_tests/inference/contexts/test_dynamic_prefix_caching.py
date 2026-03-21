@@ -913,3 +913,102 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[2]) == bs
         assert len(log_probs_list[3]) == cached_ql
         assert len(log_probs_list[4]) == bs
+
+
+class TestFLOPEfficiencyEviction(PrefixCachingTestBase):
+
+    def _ctx_flop(self, *, flop_alpha=1.0, **kwargs):
+        defaults = dict(
+            buffer_size_gb=0.01,
+            rounder=1,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.FLOP_EFFICIENCY,
+        )
+        defaults.update(kwargs)
+        ctx = self._ctx(**defaults)
+        ctx.kv_block_allocator.flop_alpha = flop_alpha
+        return ctx
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "policy", [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.FLOP_EFFICIENCY]
+    )
+    def test_cached_block_reuse(self, policy):
+        """Blocks stay cached at ref_count=0 and are reused by subsequent matching requests."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1, prefix_caching_eviction_policy=policy)
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.block_hashes[b0].item()
+
+        # Release request: blocks stay cached (not returned to free pool)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert b0_hash in alloc.kv_hash_to_block_id
+
+        # New request with same prompt reuses cached blocks
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 0, 2) == [b0, b1]
+        assert alloc.block_ref_counts[b0].item() == 1
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "alpha,trigger_blocks,expected_evicted",
+        [
+            (0.0, 8, "long"),  # Pure LRU: evicts oldest
+            (1.0, 8, "medium"),  # Balanced: evicts low-efficiency + not-newest
+            (100.0, 4, "short"),  # FLOP-dominant: evicts lowest efficiency
+        ],
+    )
+    def test_flop_efficiency_eviction_ordering(self, alpha, trigger_blocks, expected_evicted):
+        """Sweep alpha to verify 3 eviction regimes: oldest, medium, shallowest."""
+        ctx = self._ctx_flop(
+            flop_alpha=alpha, mamba_config=self._mamba_config(), prefix_caching_mamba_gb=0.01
+        )
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        # Long request: 8 blocks (indices 0-7), tracked block at deepest index 7
+        prompt_long = self._prompt(bs * 8)
+        ctx.add_request(self._req(ctx, prompt_long.clone()))
+        ctx.prefix_cache_lru_clock += 1
+
+        # Medium request: 2 blocks (indices 0-1), tracked block at index 1
+        prompt_med = self._prompt(bs * 2, offset=5000)
+        ctx.add_request(self._req(ctx, prompt_med.clone(), request_id=2))
+        ctx.prefix_cache_lru_clock += 1
+
+        # Short request: 1 block (index 0), tracked block at index 0
+        prompt_short = self._prompt(bs, offset=9000)
+        ctx.add_request(self._req(ctx, prompt_short.clone(), request_id=3))
+        ctx.prefix_cache_lru_clock += 1
+
+        # Capture tracked block hashes (deepest block per request)
+        hashes = {
+            "long": alloc.block_hashes[ctx.request_to_kv_block_ids[0][7].item()].item(),
+            "medium": alloc.block_hashes[ctx.request_to_kv_block_ids[1][1].item()].item(),
+            "short": alloc.block_hashes[ctx.request_to_kv_block_ids[2][0].item()].item(),
+        }
+
+        # Release all requests; blocks stay cached under FLOP_EFFICIENCY
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([2]))
+        ctx.total_request_count = 0
+
+        # Exhaust free pool to force eviction
+        alloc.total_avail = 0
+
+        # Add trigger request with disjoint tokens to force eviction
+        prompt_trigger = self._prompt(bs * trigger_blocks, offset=20000)
+        ctx.add_request(self._req(ctx, prompt_trigger.clone(), request_id=4))
+
+        # The expected block should be evicted
+        assert hashes[expected_evicted] not in alloc.kv_hash_to_block_id
+        # The other two tracked blocks should survive
+        for name in hashes:
+            if name != expected_evicted:
+                assert hashes[name] in alloc.kv_hash_to_block_id
