@@ -341,6 +341,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        megatron_fsdp_fine_grained_param_ag=enable_fine_grained_param_gather,
     )
 
     # Create FSDPDistributedIndex.
@@ -376,7 +377,6 @@ def fully_shard_model(
         calculate_per_token_loss=calculate_per_token_loss,
         init_model_with_meta_device=init_model_with_meta_device,
         sync_model_each_microbatch=sync_model_each_microbatch,
-        enable_fine_grained_param_gather_hook=enable_fine_grained_param_gather,
         report_nan_in_param_grad=report_nan_in_param_grad,
     )
 

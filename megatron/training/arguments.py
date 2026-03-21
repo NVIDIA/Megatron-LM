@@ -3247,6 +3247,11 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument("--megatron-fsdp-fine-grained-param-ag", action='store_true', default=False,
+                        help="Whether to enable "fine-grained" param all-gather, which can improve performance "
+                             "when using MXFP8 parameters with activation recomputation. Not compatible with "
+                             "TransformerEngine fused Module(s), which do not permit Megatron-FSDP hooks to "
+                             "modify inputs and outputs. Auto-activated with selective recomputation.")
     
     return parser
 
