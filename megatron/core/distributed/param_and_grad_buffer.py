@@ -238,6 +238,9 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+        # Track grad mode used to create cached param views. Rebuild if mode changes to avoid
+        # mixing no_grad-created views with in-place updates in grad-enabled mode.
+        self._cached_param_buffer_shards_grad_enabled = None
 
     def reset(self):
         """
@@ -398,23 +401,29 @@ class _ParamAndGradBucketGroup:
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and
             # does not need a copy-back step, so coalescing works correctly.
-            with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+            current_grad_enabled = torch.is_grad_enabled()
+            if self._cached_param_buffer_shards_grad_enabled != current_grad_enabled:
+                self.cached_param_buffer_shard_list = [None] * len(self.buckets)
+                self._cached_param_buffer_shards_grad_enabled = current_grad_enabled
+            with torch.no_grad():
+                # Coalesce communication kernels across buckets in the bucket group.
+                with _coalescing_manager(
+                    self.intra_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm:
+                    for idx, bucket in enumerate(self.buckets):
+                        if self.cached_param_buffer_shard_list[idx] is None:
+                            self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.param_data, self.intra_distributed_optimizer_instance_size
+                            )
+                        local_data_view = self.cached_param_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
                         )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
             if async_op:
                 self.param_gather_handle = cm
             else:
