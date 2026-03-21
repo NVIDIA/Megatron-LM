@@ -531,8 +531,8 @@ class TestMuPMTPLossScaling:
         loss_mask = torch.ones_like(labels, dtype=torch.float32)
         observed_logits_mean = {'value': None}
 
-        def output_layer(hidden, weight=None, runtime_gather_output=None):
-            return hidden.clone(), None
+        def output_layer(input_=None, weight=None, runtime_gather_output=None):
+            return input_.clone(), None
 
         def scale_logits_fn(logits):
             return logits * 3.0
