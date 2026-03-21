@@ -49,8 +49,6 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
-logger = logging.getLogger(__name__)
-
 
 class MoETokenDispatcher:
     """

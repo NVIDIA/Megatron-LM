@@ -48,7 +48,12 @@ if not skip_autodoc:
     extensions.append("autodoc2")  # Generates API docs
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "discussions/deepseek-v3-gb200-optimization/deepseek-v3-gb200-reproduce-guide.md",
+]
 
 # -- Options for MyST Parser (Markdown) --------------------------------------
 # MyST Parser settings
