@@ -111,9 +111,6 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
-            moe_use_device_initiated_grouped_gemm=kwargs.get(
-                "moe_use_device_initiated_grouped_gemm", False
-            ),
             moe_use_legacy_grouped_gemm=kwargs.get("moe_use_legacy_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             stash_modules=kwargs.get("stash_modules", None),
@@ -224,7 +221,6 @@ class TestPagedStashing:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_device_initiated_grouped_gemm=True,
             moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             stash_modules=["expert_fc1", "moe_act", "expert_fc2"],
@@ -318,7 +314,6 @@ class TestPagedStashingOverBudget:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_device_initiated_grouped_gemm=True,
             moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             stash_modules=["expert_fc1", "moe_act", "expert_fc2"],
