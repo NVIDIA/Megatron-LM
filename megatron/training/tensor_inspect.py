@@ -2,10 +2,10 @@
 
 """NVIDIA DLFw Inspect integration for tensor inspection and statistics collection."""
 
+from pathlib import Path
 from typing import Any, List, Optional
 
 from megatron.training.utils import print_rank_0
-
 
 MISSING_NVINSPECT_MSG = (
     "nvdlfw_inspect is not available. Please install it with `pip install nvdlfw-inspect`."
@@ -31,7 +31,6 @@ def _get_default_feature_dirs() -> List[str]:
     feature_dirs = []
     try:
         import importlib
-        from pathlib import Path
 
         te_features_mod = importlib.import_module("transformer_engine.debug.features")
         te_features_dir = Path(te_features_mod.__file__).parent
@@ -83,7 +82,7 @@ def _maybe_attach_metric_loggers(tensorboard_logger: Any, wandb_logger: Any) -> 
 
 def initialize_tensor_inspect_pre_model(
     enabled: bool,
-    config_file: Optional[str] = None,
+    features: Optional[dict[str, Any] | str | Path] = None,
     feature_dirs: Optional[List[str]] = None,
     log_dir: Optional[str] = None,
     init_training_step: int = 0,
@@ -99,7 +98,7 @@ def initialize_tensor_inspect_pre_model(
         feature_dirs = _get_default_feature_dirs()
 
     nvinspect_api.initialize(
-        config_file=config_file or "",
+        config_file=features if features is not None else "",
         feature_dirs=feature_dirs,
         log_dir=log_dir or ".",
         statistics_logger=None,

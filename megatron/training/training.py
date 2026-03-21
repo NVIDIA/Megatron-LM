@@ -929,10 +929,10 @@ def pretrain(
     if getattr(args, 'tensor_inspect', False):
         initialize_tensor_inspect_pre_model(
             enabled=True,
-            config_file=args.tensor_inspect_config,
+            features=getattr(args, 'tensor_inspect_features', None),
             feature_dirs=args.tensor_inspect_feature_dirs,
             log_dir=args.tensor_inspect_log_dir or args.save,
-            init_training_step=getattr(args, 'iteration', 0),
+            init_training_step=0,
         )
 
     # Model, optimizer, and learning rate.
@@ -1035,7 +1035,7 @@ def pretrain(
             model=model,
             tensorboard_logger=get_tensorboard_writer(),
             wandb_logger=get_wandb_writer(),
-            current_training_step=args.iteration,
+            current_training_step=int(getattr(args, 'iteration', 0)),
             include_context_parallel=True,
         )
 

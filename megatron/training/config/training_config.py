@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Literal, Optional
+from pathlib import Path
+from typing import Any, Literal, Optional
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -324,19 +326,22 @@ class LoggerConfig:
 
 @dataclass(kw_only=True)
 class TensorInspectConfig:
-    """Configuration settings for tensor inspection via NVIDIA DLFw Inspect."""
+    """Configuration for Nvidia-DL-Framework-Inspect integration."""
 
-    tensor_inspect: bool = False
+    enabled: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--tensor-inspect"], "dest": "tensor_inspect"}},
+    )
     """Enable tensor inspection and statistics collection."""
 
-    tensor_inspect_config: str | None = None
-    """Path to YAML config for tensor inspection features."""
+    features: dict[str, Any] | str | Path | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tensor-inspect-features"], "dest": "tensor_inspect_features", "type": str}})
+    """Feature configuration as a YAML file path or a Python dict."""
 
-    tensor_inspect_log_dir: str | None = None
-    """Directory for tensor inspection logs."""
+    feature_dirs: list[str] | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tensor-inspect-feature-dirs"], "dest": "tensor_inspect_feature_dirs"}})
+    """Directories containing feature modules. Defaults to Transformer Engine's debug feature modules directory if unset."""
 
-    tensor_inspect_feature_dirs: list[str] | None = None
-    """Directories containing tensor inspection feature implementations."""
+    log_dir: str | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tensor-inspect-log-dir"], "dest": "tensor_inspect_log_dir"}})
+    """Root directory to store inspection logs/statistics. Defaults to checkpoint save dir if unset."""
 
 
 @dataclass(kw_only=True)

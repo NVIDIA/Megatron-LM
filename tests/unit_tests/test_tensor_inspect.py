@@ -43,7 +43,7 @@ def inspect_session(tmp_path):
 
         initialize_tensor_inspect_pre_model(
             enabled=True,
-            config_file=str(cfg_file) if config_str else None,
+            features=str(cfg_file) if config_str else None,
             feature_dirs=feature_dirs if feature_dirs is not None else [],
             log_dir=log_dir,
         )
@@ -174,7 +174,7 @@ class TestTensorInspectLifecycle:
         Path(log_dir).mkdir(exist_ok=True)
 
         initialize_tensor_inspect_pre_model(
-            enabled=True, config_file=cfg_file, feature_dirs=None, log_dir=log_dir
+            enabled=True, features=cfg_file, feature_dirs=None, log_dir=log_dir
         )
 
         # Verify TE features were loaded
