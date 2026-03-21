@@ -8,10 +8,7 @@ import traceback
 import uuid
 import warnings
 
-from megatron.core.inference.inference_request import (
-    DynamicInferenceEventType,
-    unwrap_serialized_tensors,
-)
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -267,15 +264,6 @@ try:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
-                    eos_token_id = tokenizer.eos_id
-                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                    warnings.warn(
-                        "Avoiding prefix retokenization."
-                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
-                    )
-
                     # Find the last assistant message
                     last_assistant_message_idx = None
                     for i in reversed(range(len(template_messages))):
@@ -283,8 +271,28 @@ try:
                             last_assistant_message_idx = i
                             break
 
-                    # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
-                    if last_assistant_message_idx is not None:
+                    last_assistant_message = (
+                        template_messages[last_assistant_message_idx]
+                        if last_assistant_message_idx is not None
+                        else None
+                    )
+
+                    # Only proceed if the last assistant message has the token IDs from a previous generation.
+                    # Dataset-provided conversation history won't have these fields.
+                    if (
+                        last_assistant_message is not None
+                        and "prompt_token_ids" in last_assistant_message
+                        and "generation_token_ids" in last_assistant_message
+                    ):
+                        eos_token_id = tokenizer.eos_id
+                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                        warnings.warn(
+                            "Avoiding prefix retokenization."
+                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                        )
+
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
                         ]
@@ -299,11 +307,6 @@ try:
                         )
 
                         # Replace the prefix tokens with the tokens from the previous generation
-                        last_assistant_message = template_messages[last_assistant_message_idx]
-                        assert (
-                            "prompt_token_ids" in last_assistant_message
-                            and "generation_token_ids" in last_assistant_message
-                        ), "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
                         previous_turn_token_ids = (
                             last_assistant_message["prompt_token_ids"]
                             + last_assistant_message["generation_token_ids"]
@@ -393,22 +396,18 @@ try:
         failed_errors = []
         has_nontransient_error = False
         for i, record in enumerate(batch_results):
-            last_request = record.requests[-1]
-            if last_request.failed():
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
                 error_events = [
-                    e
-                    for e in last_request.events
-                    if e.type
-                    in (
-                        DynamicInferenceEventType.ERROR_NONTRANSIENT,
-                        DynamicInferenceEventType.ERROR_TRANSIENT,
-                    )
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
                 ]
-                if any(
-                    e.type == DynamicInferenceEventType.ERROR_NONTRANSIENT for e in error_events
-                ):
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
                     has_nontransient_error = True
-                error_msg = str(error_events[-1].payload) if error_events else "Unknown error"
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
                 failed_errors.append(f"Request {i}: {error_msg}")
 
         if failed_errors:
@@ -424,8 +423,7 @@ try:
 
         request_idx = 0
         for result_item in batch_results:
-            result = result_item if isinstance(result_item, dict) else result_item.serialize()
-            result = unwrap_serialized_tensors(result)
+            result = unwrap_serialized_tensors(result_item)
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]

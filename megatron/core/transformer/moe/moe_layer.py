@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -10,6 +9,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -49,14 +49,10 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TELinear, te_checkpoint = None, None
 
 
 class RouterInterface(Protocol):
@@ -275,12 +271,14 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'te'."
                 )
-                if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
-                    warnings.warn(
-                        "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                        "The FlashInfer cutlass kernel will be JIT compiled,"
-                        "which may take a long time."
-                    )
+
+                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                # when using the FlashInfer backend. The flashinfer-jit-cache package
+                # must be installed ahead of time to avoid a multi-minute JIT
+                # compilation step at runtime.
+                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+
+                check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
                 assert hasattr(torch.nn.functional, 'grouped_mm'), (
                     "inference_grouped_gemm_backend='torch' requires "
