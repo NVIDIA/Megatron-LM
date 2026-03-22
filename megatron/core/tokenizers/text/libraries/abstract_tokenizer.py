@@ -1,13 +1,82 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Dict, List, Optional, Union
+
+try:
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    HAVE_TRANSFORMERS = True
+except ImportError:
+    HAVE_TRANSFORMERS = False
 
 
 class MegatronTokenizerTextAbstract(ABC):
     """
     Abstract class for Megatron text tokenizers.
     """
+
+    def apply_chat_template(
+        self,
+        conversation: List[Dict[str, str]],
+        chat_template: str = None,
+        tokenize: Optional[bool] = True,
+        truncation: Optional[bool] = False,
+        max_length: Optional[int] = None,
+        add_generation_prompt: Optional[bool] = False,
+        **kwargs,
+    ) -> Union[str, List[int]]:
+        """
+        Applies tokenizer's chat template to the conversation using Jinja2.
+
+        Args:
+            conversation (List[Dict[str, str]]): a list of dicts with "role" and "content" keys,
+                representing the chat history so far.
+            chat_template (str): Jinja2 chat template string. If not provided, falls back to
+                ``self.chat_template``.
+            tokenize (bool): whether to tokenize the output. If ``False``,
+                the output will be a string.
+            truncation (bool): whether to truncate sequences at the maximum length.
+                Has no effect if tokenize is ``False``.
+            max_length (int): maximum length to use for truncation.
+                Has no effect if tokenize is ``False``.
+            add_generation_prompt (bool): If set, a prompt with the token(s) that indicate
+                the start of an assistant message will be appended to the formatted output.
+        """
+        if not chat_template:
+            chat_template = getattr(self, 'chat_template', None)
+        assert chat_template, (
+            "Chat template is not defined. "
+            "Please, specify tokenizer chat template in the metadata file."
+        )
+        if truncation:
+            assert max_length, "max_length must be specified if truncation is used."
+
+        if HAVE_TRANSFORMERS:
+            compiled_template = _compile_jinja_template(chat_template)
+            chat_text = compiled_template.render(
+                messages=conversation, add_generation_prompt=add_generation_prompt
+            )
+
+            if tokenize:
+                chat_ids = self.text_to_ids(chat_text)
+                if truncation:
+                    chat_ids = chat_ids[:max_length]
+                return chat_ids
+
+            return chat_text
+        else:
+            raise ModuleNotFoundError("Please, install transformers library.")
+
+    def token_to_id(self, token: str) -> int:
+        """Converts a single token to its ID.
+
+        Concrete default so that every text library tokenizer exposes a canonical
+        single-token-to-ID method.  SentencePiece, TikToken, and HuggingFace
+        override this with optimized versions; the default delegates to
+        ``tokens_to_ids``.
+        """
+        return self.tokens_to_ids([token])[0]
 
     @abstractmethod
     def text_to_tokens(self, text: str) -> List[str]:
@@ -91,57 +160,3 @@ class MegatronTokenizerTextAbstract(ABC):
     def add_special_tokens(self):
         """Adds special tokens to the tokenizer."""
         pass
-
-    @property
-    def cls_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns cls_id if available."""
-        if hasattr(self, 'cls_id'):
-            return self.cls_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'cls' or 'cls_id'")
-
-    @property
-    def sep_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns sep_id if available."""
-        if hasattr(self, 'sep_id'):
-            return self.sep_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'sep' or 'sep_id'")
-
-    @property
-    def pad_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns pad_id if available."""
-        if hasattr(self, 'pad_id'):
-            return self.pad_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'pad' or 'pad_id'")
-
-    @property
-    def eod(self) -> int:
-        """Property alias to match MegatronTokenizer; returns eod_id if available."""
-        if hasattr(self, 'eod_id'):
-            return self.eod_id
-        if hasattr(self, 'eos_id'):
-            # Default to end-of-sentence id if end-of-document is not defined.
-            return self.eos_id
-        raise AttributeError(
-            f"{type(self).__name__} has no attribute 'eod', 'eod_id', 'eos', or 'eos_id'"
-        )
-
-    @property
-    def bos_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns bos_id if available."""
-        if hasattr(self, 'bos_id'):
-            return self.bos_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'bos' or 'bos_id'")
-
-    @property
-    def eos_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns eos_id if available."""
-        if hasattr(self, 'eos_id'):
-            return self.eos_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'eos' or 'eos_id'")
-
-    @property
-    def mask_id(self) -> int:
-        """Property alias to match MegatronTokenizer; returns mask_id if available."""
-        if hasattr(self, 'mask_id'):
-            return self.mask_id
-        raise AttributeError(f"{type(self).__name__} has no attribute 'mask' or 'mask_id'")

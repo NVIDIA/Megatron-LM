@@ -37,7 +37,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 ARGS=" \
   --tiktoken-pattern v2 \
   --use-mcore-models \
-  --tokenizer-type TikTokenizer \
+  --tokenizer-library tiktoken \
   --tokenizer-model ${TOKENIZER_MODEL} \
   --auto-detect-ckpt-format \
   --max-tokens-to-oom 3600000 \

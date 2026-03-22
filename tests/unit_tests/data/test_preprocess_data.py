@@ -186,7 +186,9 @@ def test_preprocess_data_gpt():
 
         # gpt specific args
         gpt_args = [
-            "--tokenizer-type",
+            "--tokenizer-library",
+            "megatron",
+            "--tokenizer-model",
             "GPT2BPETokenizer",
             "--vocab-file",
             "/opt/data/tokenizers/megatron/gpt2-vocab.json",
@@ -250,7 +252,9 @@ def test_preprocess_data_bert():
 
         # bert specific args
         bert_args = [
-            "--tokenizer-type",
+            "--tokenizer-library",
+            "megatron",
+            "--tokenizer-model",
             "BertWordPieceLowerCase",
             "--vocab-file",
             "/opt/data/tokenizers/megatron/gpt2-vocab.json",

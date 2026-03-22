@@ -364,7 +364,8 @@ def test_fast_builder(
     tokenizer = build_tokenizer(
         Namespace(
             vocab_size=vocab_size,
-            tokenizer_type="NullTokenizer",
+            tokenizer_library="null",
+            tokenizer_model=None,
             rank=0,
             make_vocab_size_divisible_by=128,
             tensor_model_parallel_size=1,

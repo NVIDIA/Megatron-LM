@@ -24,7 +24,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --split: 949,50,1
-  --tokenizer-type: NullTokenizer
+  --tokenizer-library: null
   --vocab-size: 8192
   --distributed-backend: nccl
   --lr: 0.00015

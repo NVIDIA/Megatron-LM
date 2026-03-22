@@ -1599,7 +1599,7 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-special-tokens instead."
         )
         args.tokenizer_special_tokens = args.tiktoken_special_tokens
-    
+
     if args.tokenizer_hf_use_fast:
         warn_rank_0(
             "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
@@ -1613,6 +1613,54 @@ def validate_args(args, defaults={}):
             "`include_special_tokens` is set to True by default for HF tokenizers."
             "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
         )
+
+    # Map deprecated --tokenizer-type to new --tokenizer-library.
+    _TOKENIZER_TYPE_TO_LIBRARY = {
+        'BertWordPieceLowerCase': 'megatron',
+        'BertWordPieceCase': 'megatron',
+        'GPT2BPETokenizer': 'megatron',
+        'SentencePieceTokenizer': 'sentencepiece',
+        'GPTSentencePieceTokenizer': 'sentencepiece',
+        'Llama2Tokenizer': 'sentencepiece',
+        'HuggingFaceTokenizer': 'huggingface',
+        'TikTokenizer': 'tiktoken',
+        'MultimodalTokenizer': 'multimodal',
+        'SFTTokenizer': 'huggingface',
+        'NullTokenizer': 'null',
+        'NullMultimodalTokenizer': 'null-multimodal',
+    }
+    if args.tokenizer_type is not None and args.tokenizer_library is None:
+        warn_rank_0(
+            "--tokenizer-type is deprecated and will be removed in a future release. "
+            "Use --tokenizer-library instead."
+        )
+        args.tokenizer_library = _TOKENIZER_TYPE_TO_LIBRARY[args.tokenizer_type]
+
+    # Map deprecated --sft-tokenizer-prompt-format to --tokenizer-prompt-format.
+    # Only applies when using the deprecated --tokenizer-type SFTTokenizer.
+    if (
+        getattr(args, 'tokenizer_type', None) == 'SFTTokenizer'
+        and getattr(args, 'sft_tokenizer_prompt_format', None)
+        and not args.tokenizer_prompt_format
+    ):
+        args.tokenizer_prompt_format = args.sft_tokenizer_prompt_format
+
+    # Map deprecated --tokenizer-mode to new flags.
+    _mode = getattr(args, 'tokenizer_mode', 'text')
+    if _mode != 'text':
+        warn_rank_0(
+            "--tokenizer-mode is deprecated and will be removed in a future release. "
+            "SFT: use --tokenizer-prompt-format instead. "
+            "Multimodal: use --tokenizer-library multimodal instead."
+        )
+        if _mode == 'multimodal' and args.tokenizer_library not in ('multimodal', 'null-multimodal'):
+            args.tokenizer_library = (
+                'null-multimodal' if args.tokenizer_library == 'null' else 'multimodal'
+            )
+        if _mode == 'sft' and not args.tokenizer_prompt_format:
+            args.tokenizer_prompt_format = getattr(
+                args, 'sft_tokenizer_prompt_format', 'nemotron-h-aligned'
+            )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2746,6 +2794,23 @@ def _add_validation_args(parser):
 
 def _add_tokenizer_args(parser):
     group = parser.add_argument_group(title='tokenizer')
+
+    # --- New preferred flags ---
+    group.add_argument('--tokenizer-library', type=str, default=None,
+                       choices=['huggingface', 'sentencepiece', 'tiktoken',
+                                'megatron', 'byte-level', 'null',
+                                'multimodal', 'null-multimodal'],
+                       help='Tokenizer backend library. Preferred over --tokenizer-type.')
+    group.add_argument('--tokenizer-prompt-format', type=str, default=None,
+                       help='Prompt format for conversation tokenization (SFT / multimodal).')
+
+    # --- Deprecated mode flag (mapped to --tokenizer-library + --tokenizer-prompt-format) ---
+    group.add_argument('--tokenizer-mode', type=str, default='text',
+                       choices=['text', 'sft', 'multimodal'],
+                       help='Deprecated. Use --tokenizer-library and '
+                            '--tokenizer-prompt-format instead.')
+
+    # --- Vocabulary ---
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
     group.add_argument('--padded-vocab-size', type=int, default=None,
@@ -2759,6 +2824,8 @@ def _add_tokenizer_args(parser):
     group.add_argument('--vocab-extra-ids', type=int, default=0,
                        help='Number of additional vocabulary tokens. '
                             'They are used for span masking in the T5 model')
+
+    # --- Legacy --tokenizer-type (deprecated, use --tokenizer-library) ---
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
@@ -2773,31 +2840,40 @@ def _add_tokenizer_args(parser):
                                 'NullTokenizer',
                                 'NullMultimodalTokenizer',
                                 'SFTTokenizer'],
-                       help='What type of tokenizer to use.')
+                       help='Deprecated. Use --tokenizer-library instead.')
+
+    # --- Common ---
     group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='Sentencepiece tokenizer model.')
+                       help='Path to the tokenizer model file.')
     group.add_argument('--tokenizer-metadata', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
     group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+
+    # --- TikToken-specific ---
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have '
-                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+                       help='Deprecated. Use --tokenizer-special-tokens instead.')
+
+    # --- SentencePiece-specific ---
     group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
                        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
+
+    # --- HuggingFace-specific ---
     group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
-                       help='Whether to use fast HuggingFace tokenizer.')
+                       help='Deprecated. use_fast is True by default. '
+                            'Use --tokenizer-hf-no-use-fast to disable.')
     group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
-                       help='Converting text to ids will include special for HuggingFace tokenizer.')
+                       help='Deprecated. include_special_tokens is True by default. '
+                            'Use --tokenizer-hf-no-include-special-tokens to disable.')
     group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
-                       help='Whether to use fast HuggingFace tokenizer.')
+                       help='Disable fast HuggingFace tokenizer.')
     group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
-                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
+                       help='Do not include special tokens in text-to-ids for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser

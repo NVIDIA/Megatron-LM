@@ -50,7 +50,7 @@ MODEL_ARGS:
   # Data args
   --seq-length: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
-  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-library: sentencepiece
   --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
   --data-path: $DATA_BLEND
   --split: 99,1,0

@@ -77,7 +77,20 @@ MEGATRON_CONFIG_MAP = {
 
 
 class MegatronHFTokenizer(HuggingFaceTokenizer):
-    """ """
+    """Auto-download resolver for Megatron's legacy predefined tokenizer names.
+
+    Maps predefined names (``GPT2BPETokenizer``, ``BertWordPieceCase``,
+    ``BertWordPieceLowerCase``, ``megatron-gpt-345m``, ``biomegatron-bert-*``,
+    etc.) to the corresponding HuggingFace tokenizer name and vocab/merges file
+    URLs.  Files are automatically downloaded from NGC/S3 and cached under
+    ``~/.cache/torch/megatron/``.
+
+    Once the name is resolved and files are fetched, all tokenization is
+    delegated to :class:`HuggingFaceTokenizer`.
+
+    This class is selected via ``--tokenizer-library megatron``.  See
+    :data:`MEGATRON_CONFIG_MAP` for the full list of supported model names.
+    """
 
     def __init__(
         self,

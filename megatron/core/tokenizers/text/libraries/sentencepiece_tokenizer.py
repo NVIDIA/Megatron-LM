@@ -16,10 +16,9 @@ except ModuleNotFoundError:
 import torch
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
-from .chat_template import MegatronTokenizerChatTemplate
 
 
-class SentencePieceTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemplate):
+class SentencePieceTokenizer(MegatronTokenizerTextAbstract):
     """Sentencepiecetokenizer https://github.com/google/sentencepiece."""
 
     def __init__(
