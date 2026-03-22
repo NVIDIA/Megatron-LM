@@ -272,6 +272,7 @@ class HybridCPDataLoaderWrapper:
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
         def _get_pad_len(seq_len, local_cp_size):
+            # Step1: Calculate padding for entire sequence after packing
             # Packed Sequence should be divisible by local_cp_size * 2
             # Or local_cp_size * tp_size * 2 when using sequence parallel
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -287,22 +288,24 @@ class HybridCPDataLoaderWrapper:
 
             total_seq_len = seq_len + seq_pad_len
 
+            # Step2: Calculate padding required for sequence after sharding
+            sharded_pad_granularity = 1
             # MXFP8 BLOCK_SIZE is 32 and sequence after sharding should be divisible
             if self.config.fp8 is not None and self.config.fp8_recipe == "mxfp8":
-                pad_granularity = 32
+                sharded_pad_granularity = 32
             if (
                 self.config.moe_token_dispatcher_type == "flex"
                 and self.config.moe_flex_dispatcher_backend == "hybridep"
             ):
                 # HybridEP requires MAX_NUM_OF_TOKENS_PER_RANK to be divisible
                 # by NUM_OF_TOKENS_PER_CHUNK (128)
-                pad_granularity = 128
+                sharded_pad_granularity = 128
 
             sharded_tensor_shape = total_seq_len // (local_cp_size * tp_size)
-            mod_token_count = sharded_tensor_shape % pad_granularity
+            mod_token_count = sharded_tensor_shape % sharded_pad_granularity
             sharded_pad_len = 0
             if mod_token_count != 0:
-                sharded_pad_len = (pad_granularity - mod_token_count) * (local_cp_size * tp_size)
+                sharded_pad_len = (sharded_pad_granularity - mod_token_count) * (local_cp_size * tp_size)
 
             return sharded_pad_len + seq_pad_len
 
@@ -323,6 +326,8 @@ class HybridCPDataLoaderWrapper:
         cu_seqlens_padded[0, 0] = 0
         cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
 
+        # We only pad after packing because SFTDataset already pads
+        # individual samples
         pad_len = _get_pad_len(tokens.shape[0], local_cp_size)
         if pad_len > 0:
             tokens = torch.cat(
