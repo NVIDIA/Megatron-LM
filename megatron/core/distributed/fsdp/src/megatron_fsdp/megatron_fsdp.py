@@ -926,7 +926,7 @@ class MegatronFSDP(torch.nn.Module):
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 
             # Output is not modified, return None.
-            return output
+            return None
 
         @torch.compiler.disable
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
