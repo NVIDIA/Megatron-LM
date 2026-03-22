@@ -966,8 +966,6 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron FSDP only supports fsdp_dtensor checkpoint format"
 
-        args.reuse_grad_buf_for_mxfp8_param_ag = False
-
         if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
             raise ValueError(
                 "Meta device initialization (init_model_with_meta_device=True) is not "
