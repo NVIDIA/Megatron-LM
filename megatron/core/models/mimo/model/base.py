@@ -5,10 +5,9 @@ import warnings
 from typing import Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
 
 from megatron.core.models.mimo.config import MimoModelConfig
-from megatron.core.models.mimo.config.role import LANGUAGE_MODULE_KEY, ModuleStageInfo, RankRole
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
@@ -57,8 +56,11 @@ class MimoModel(MegatronModule):
         )
 
         self.mimo_config = mimo_config
-        self._validate_grid_map()
-        self.role = self._determine_role()
+        modality_names = list(mimo_config.modality_submodules_spec.keys())
+        if mimo_config.module_to_grid_map:
+            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
+        else:
+            self.role = RankRole.unified(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -67,9 +69,6 @@ class MimoModel(MegatronModule):
 
         # Extract language model config for partition adapter
         language_config = mimo_config.language_model_spec.params['config']
-        assert (
-            language_config.pipeline_model_parallel_size == 1
-        ), "Pipeline parallelism is not supported in MimoModel"
         max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
         self.partition_adapter: Optional[PartitionAdapter] = None
@@ -160,10 +159,8 @@ class MimoModel(MegatronModule):
     def _initialize_submodules(self) -> None:
         """Initialize modality submodules from the ModuleSpec configurations.
 
-        Only modalities present in the config will be instantiated.
         When role is set, only initializes submodules this rank participates in.
-        Stage info is passed to from_spec() to conditionally skip projection
-        initialization on non-last stages (saves memory in pipeline parallelism).
+        Stage info is passed to from_spec() to conditionally skip projection.
         """
         for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
             if modality_name not in self.role.modules:
@@ -202,79 +199,6 @@ class MimoModel(MegatronModule):
         )
         self.language_model = build_module(self.mimo_config.language_model_spec)
 
-    def _validate_grid_map(self) -> None:
-        """Validate module_to_grid_map consistency with submodule config.
-
-        Validates that module_to_grid_map keys exactly match
-        modality_submodules_spec keys + LANGUAGE_MODULE_KEY.
-
-        Raises:
-            ValueError: If validation fails.
-        """
-        if not self.mimo_config.module_to_grid_map:
-            return
-
-        grid_map_keys = set(self.mimo_config.module_to_grid_map.keys())
-        expected_keys = set(self.mimo_config.modality_submodules_spec.keys())
-        expected_keys.add(LANGUAGE_MODULE_KEY)
-
-        if grid_map_keys != expected_keys:
-            missing_in_grid = expected_keys - grid_map_keys
-            extra_in_grid = grid_map_keys - expected_keys
-            raise ValueError(
-                f"module_to_grid_map keys must match modality_submodules_spec keys + "
-                f"'{LANGUAGE_MODULE_KEY}'. Missing in grid_map: {missing_in_grid}, "
-                f"Extra in grid_map: {extra_in_grid}"
-            )
-
-    def _determine_role(self) -> RankRole:
-        """Determine this rank's role based on grid map.
-
-        Returns:
-            RankRole describing which modules this rank participates in.
-            For the colocated case (no module_to_grid_map), returns a role with
-            all modules at first+last stage and colocated=True.
-        """
-        if not self.mimo_config.module_to_grid_map:
-            # Colocated: all modules on all ranks, single stage
-            all_module_names = list(self.mimo_config.modality_submodules_spec.keys())
-            all_module_names.append(LANGUAGE_MODULE_KEY)
-            return RankRole.all_modules(all_module_names)
-
-        current_rank = dist.get_rank()
-        modules = {}
-
-        for module_name, grid in self.mimo_config.module_to_grid_map.items():
-            # Check if current rank is in this grid
-            if not (grid.rank_offset <= current_rank < grid.rank_offset + grid.size):
-                continue
-
-            # Check if PP dimension exists
-            if "pp" not in grid.dim_names:
-                # No PP dimension means single stage (both first and last)
-                modules[module_name] = ModuleStageInfo(is_first_stage=True, is_last_stage=True)
-                continue
-
-            # Get PP process group and determine stage
-            pp_group = grid.get_pg("pp")
-            pp_rank = pp_group.rank()
-            pp_size = pp_group.size()
-            is_first = pp_rank == 0
-            is_last = pp_rank == pp_size - 1
-            logger.info(
-                f"[_determine_role] Rank {current_rank}: module={module_name}, "
-                f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
-            )
-            modules[module_name] = ModuleStageInfo(is_first_stage=is_first, is_last_stage=is_last)
-
-        if not modules:
-            raise RuntimeError(
-                f"Rank {current_rank} is not in any module grid. "
-                f"Check module_to_grid_map configuration."
-            )
-
-        return RankRole(modules=modules)
-
     def set_input_tensor(self, input_tensor):
         """Set input tensor for pipeline parallelism.
 
@@ -289,19 +213,22 @@ class MimoModel(MegatronModule):
         Returns:
             None
         """
-        # Store dict input for multi-module PP
-        if isinstance(input_tensor, dict):
-            self.input_tensors = input_tensor
-            return
-
-        # Backward compatibility: single tensor or list
+        # The schedule wraps input_tensor in a list (schedules.py:415-416),
+        # so unwrap first before checking type.
         if isinstance(input_tensor, list):
             input_tensor = input_tensor[0]
 
-        # Store as input_tensors for consistency
+        # Store dict input for multi-module PP
+        if isinstance(input_tensor, dict):
+            # P2P recv may return [tensor] (list) for VPP compat — unwrap to tensor
+            self.input_tensors = {
+                k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                for k, v in input_tensor.items()
+            }
+            return
+
         self.input_tensors = input_tensor
 
-        # Also delegate to language model for backward compatibility
         if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
@@ -391,7 +318,7 @@ class MimoModel(MegatronModule):
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role.colocated:
+        if self.role.mode == ModuleLayout.UNIFIED:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -402,27 +329,21 @@ class MimoModel(MegatronModule):
                 packing_kwargs,
             )
 
-        # Guard: colocated encoders + language module is not supported
-        if self.role.has_modality_modules and self.role.has_language_module:
-            raise ValueError(
-                "Invalid configuration: Colocated encoders and language module on the same "
-                "rank is not supported in multi-module pipeline parallelism. Use separate "
-                "grids for encoders and language module, or disable multi-module PP by not "
-                "setting module_to_grid_map."
-            )
+        if self.role.mode == ModuleLayout.NON_COLOCATED:
+            if self.role.has_modality_modules:
+                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
 
-        if self.role.has_modality_modules:
-            return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+            if self.role.has_language_module:
+                return (
+                    self._forward_language_module(
+                        input_ids, position_ids, attention_mask, labels, input_tensors
+                    ),
+                    loss_mask,
+                )
 
-        if self.role.has_language_module:
-            return (
-                self._forward_language_module(
-                    input_ids, position_ids, attention_mask, labels, input_tensors
-                ),
-                loss_mask,
-            )
+            raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
 
-        raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
+        raise NotImplementedError(f"Pipeline mode {self.role.mode} is not yet supported")
 
     def _forward_encoders(
         self,
@@ -475,7 +396,7 @@ class MimoModel(MegatronModule):
         Returns:
             Language model output (hidden states, logits, or loss depending on stage)
         """
-        lang_name = LANGUAGE_MODULE_KEY
+        lang_name = MIMO_LANGUAGE_MODULE_KEY
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM
@@ -510,9 +431,11 @@ class MimoModel(MegatronModule):
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
-            # Set input tensor on language model for PP
-            if hidden_states is not None and hasattr(self.language_model, 'set_input_tensor'):
-                self.language_model.set_input_tensor(hidden_states)
+            # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
+            if hidden_states is not None:
+                underlying_lm = unwrap_model(self.language_model)
+                if hasattr(underlying_lm, 'set_input_tensor'):
+                    underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
                 input_ids=None,
