@@ -124,11 +124,11 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
+        optimizer_config.use_layer_wise_distributed_optimizer = use_layer_wise
         optimizer = get_megatron_muon_optimizer(
             config=optimizer_config,
             model_chunks=[model],
             use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=use_layer_wise,
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
@@ -197,11 +197,11 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
+        optimizer_config.use_layer_wise_distributed_optimizer = True
         optimizer = get_megatron_muon_optimizer(
             config=optimizer_config,
             model_chunks=[model],
             use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=True,
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
@@ -399,11 +399,11 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             muon_tp_mode="duplicated",
         )
+        optimizer_config.use_layer_wise_distributed_optimizer = False
         muon_optimizer = get_megatron_muon_optimizer(
             config=optimizer_config,
             model_chunks=[model],
             use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
             pg_collection=pg_collection,
         )
 
