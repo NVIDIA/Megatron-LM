@@ -690,18 +690,13 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
-        def _pre_forward_param_unshard(
-            module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
-        ):
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
+        def _pre_forward_param_unshard(module: nn.Module, *unused):
+            """
+            Installs a hook that un-shards module parameters prior to the forward pass.
+            If the module is an FSDP unit module, parameters are un-sharded recursively,
+            otherwise (or when fine-grained AG is enabled) only shallow children
+            parameters are un-sharded.
+            """
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -728,37 +723,37 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-            return args, kwargs
+
+            # Because this hook does not modify the arguments, return None.
+            # The original args and kwargs will be used.
+            return None
 
         @torch.compiler.disable
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
+            args: Optional[Tuple[Any, ...]],
             kwargs: Optional[Dict[str, Any]] = None,
         ):
             """
-            Register a post-backward hook for the given module by inserting an autograd
+            Register a post-backward hook for the given module by inserting an Autograd
             Function in front of it. Note that a post-backward hook implemented in this
             way is not compatible with in-place modifications of the module's inputs,
-            since such operations can trigger an autograd error that
-            "the output is a view and is being modified in-place".
+            since such operations can trigger an autograd error that "the output is a
+            view and is being modified in-place". kwargs is optional to flexibly support
+            with_kwargs={True, False}, this hook can handle both cases.
             """
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
-            if not torch.is_grad_enabled():
+            if not torch.is_grad_enabled() or args is None:
                 # No gradients / backward pass, don't attach the post-backward hook.
-                return args, kwargs
+                # Return None for PyTorch to utilize the original args / kwargs.
+                return None
 
-            # Preprocess the input arguments.
+            # Preprocess the input arguments. Args followed by kwargs.
             args_list, args_spec = tree_flatten(args)
-            kwargs_list, kwargs_spec = tree_flatten(kwargs)
-            args_kwargs_list = list(args_list) + list(kwargs_list)
+            args_kwargs_list = list(args_list)
+            if kwargs is not None:
+                kwargs_list, kwargs_spec = tree_flatten(kwargs)
+                args_kwargs_list.extend(list(kwargs_list))
             inp_tensor_indices: List[int] = []
             inp_tensors: List[torch.Tensor] = []
             for i, obj in enumerate(args_kwargs_list):
@@ -767,13 +762,17 @@ class MegatronFSDP(torch.nn.Module):
                     inp_tensors.append(obj)
 
             if len(inp_tensors) == 0:
-                return args, kwargs
+                # All Tensors have requires_grad = False, so Megatron-FSDP
+                # backward hooks are not necessary. Return None for PyTorch
+                # to utilize the original args / kwargs.
+                return None
 
             """
             Identity autograd Function that attaches a post-backward "hook" to the
             module, triggering parameter deallocation immediately after the module's
             backward pass has completed in order to shard this layer's model memory
-            once the current backward stage is done.
+            once the current backward stage is done. None of the Tensors or Gradients
+            in inp_tensors are modified, only ctx is modified.
             """
             inp_tensors = RegisterFSDPBackwardFunction.apply(
                 functools.partial(post_backward_hook, module), *inp_tensors
@@ -781,14 +780,19 @@ class MegatronFSDP(torch.nn.Module):
 
             # Post-process the input arguments for input into the module.
             for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
+                # Insert the modified Tensors back into args / kwargs.
                 args_kwargs_list[inp_tensor_idx] = inp_tensor
             args_list = args_kwargs_list[: len(args_list)]
-            kwargs_list = args_kwargs_list[len(args_list) :]
             args = tree_unflatten(args_list, args_spec)
-            kwargs = tree_unflatten(kwargs_list, kwargs_spec)
+            if kwargs is not None:
+                kwargs_list = args_kwargs_list[len(args_list) :]
+                kwargs = tree_unflatten(kwargs_list, kwargs_spec)
 
-            # Return original input to the module forward pass.
-            return args, kwargs
+            # Return modified input to the module forward pass.
+            if args is not None and kwargs is not None:
+                return args, kwargs
+            else:
+                return args
 
         def _root_post_backward(*unused):
             # Make sure all the gradients are handled.
@@ -897,7 +901,10 @@ class MegatronFSDP(torch.nn.Module):
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
-        def _post_forward(module: nn.Module, input: Any, output: Any):
+        def _post_forward(module: nn.Module, *unused):
+            """
+            Register post-forward re-sharding / parameter de-allocation.
+            """
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
             # after the forward pass. In this case, the resharding is performed lazily.
@@ -918,6 +925,7 @@ class MegatronFSDP(torch.nn.Module):
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 
+            # Output is not modified, return None.
             return output
 
         @torch.compiler.disable
@@ -952,6 +960,8 @@ class MegatronFSDP(torch.nn.Module):
                 torch.autograd.graph.register_multi_grad_hook(
                     output_list, lambda grads: custom_backward_handler(_module, grads), mode="any"
                 )
+
+                # Return the view-duplicated output.
                 return output
 
             # Register the post-forward hook that attaches the custom backward hook
@@ -966,9 +976,7 @@ class MegatronFSDP(torch.nn.Module):
             """
             if self.data_parallel_sharding_strategy != "no_shard":
                 self.forward_pre_hooks[f"{module._get_name()} parameter unshard"] = (
-                    module.register_forward_pre_hook(
-                        _pre_forward_param_unshard, prepend=True, with_kwargs=True
-                    )
+                    module.register_forward_pre_hook(_pre_forward_param_unshard, prepend=True)
                 )
 
         def _register_pre_backward_param_unshard_hook(module):
