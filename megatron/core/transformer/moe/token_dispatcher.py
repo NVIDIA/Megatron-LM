@@ -1313,7 +1313,7 @@ class _DeepepManager(_DispatchManager):
             num_out_tokens=self.tokens_per_expert.sum().item(),
             fused=self.permute_fusion,
             tokens_per_expert=self.tokens_per_expert,
-            align_size=get_align_size_for_quantization(self.config),
+            align_size=get_align_size_for_quantization(self.config) if self.config.fp8 or self.config.fp4 else 0,
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
