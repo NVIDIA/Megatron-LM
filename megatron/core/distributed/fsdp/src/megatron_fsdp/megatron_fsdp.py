@@ -621,9 +621,11 @@ class MegatronFSDP(torch.nn.Module):
 
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
+            release_module_parameters(module, bwd=False)
 
             # Transition this module back to the IDLE training state.
-            module._training_state = TrainingState.IDLE
+            for sub_module in module.modules():
+                sub_module._training_state = TrainingState.IDLE
 
         @torch.compiler.disable
         def _process_post_backward_gradients(param_list):
@@ -840,14 +842,12 @@ class MegatronFSDP(torch.nn.Module):
             before the backward pass.
             """
             # Set the module's training state to PRE_BACKWARD.
-            module._training_state = TrainingState.PRE_BACKWARD
+            for sub_module in module.modules():
+                sub_module._training_state = TrainingState.PRE_BACKWARD
 
             if isinstance(module, tuple(fsdp_unit_modules)):
                 param_list = list(module.parameters())
             else:
-                param_list = list(module.parameters(recurse=False))
-
-            if self.enable_fine_grained_param_gather_hook:
                 param_list = list(module.parameters(recurse=False))
 
             # All-gather / unshard the module parameters before the backward pass.
@@ -871,11 +871,10 @@ class MegatronFSDP(torch.nn.Module):
             self._root_pre_backward_hook_issued = True
 
             if self.data_parallel_sharding_strategy == "optim_grads_params":
-                for module in root_module.modules():
-                    if isinstance(module, tuple(fsdp_unit_modules)):
-                        # Set PRE_BACKWARD state to skip resharding and forward pre-fetching
-                        # when performing activation recomputation / gradient checkpointing.
-                        module._training_state = TrainingState.PRE_BACKWARD
+                for sub_module in root_module.modules():
+                    # Set PRE_BACKWARD state to skip resharding and forward pre-fetching
+                    # when performing activation recomputation / gradient checkpointing.
+                    sub_module._training_state = TrainingState.PRE_BACKWARD
                 # set all param buckets can be released
                 ag_pipeline = self.all_gather_pipeline
                 for bucket_id in range(ag_pipeline.num_buckets):
@@ -985,7 +984,6 @@ class MegatronFSDP(torch.nn.Module):
         for name, module in root_module.named_modules():
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
-                _register_pre_backward_param_unshard_hook(module)
 
             # Skip if the module is already registered in fsdp_modules.
             if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
@@ -1003,8 +1001,7 @@ class MegatronFSDP(torch.nn.Module):
                     module.register_forward_hook(_post_forward, prepend=False)
                 )
 
-                if not self.enable_fine_grained_param_gather_hook:
-                    _register_pre_backward_param_unshard_hook(module)
+                _register_pre_backward_param_unshard_hook(module)
             elif (
                 not self.ddp_config.keep_fp8_transpose_cache
                 and self.data_parallel_sharding_strategy == "optim_grads_params"
