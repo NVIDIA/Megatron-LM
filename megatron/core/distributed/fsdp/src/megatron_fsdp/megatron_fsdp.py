@@ -725,7 +725,13 @@ class MegatronFSDP(torch.nn.Module):
             )
 
             # Because this hook does not modify the arguments, return None.
-            # The original args and kwargs will be used.
+            # The original args and kwargs will be used. This defends against
+            # situations where Megatron-FSDP hooks are called with "dummy"
+            # inputs (such as `None`), and ensures that this hook does not
+            # perform any modifications on the args or kwargs.
+            # NOTE(@cspades): Such as in TransformerEngine's fused layers,
+            # where they sequentially call all sub-module hooks like this:
+            # ret = hook(submodule, None, None) for hook in hooks
             return None
 
         @torch.compiler.disable
@@ -743,17 +749,14 @@ class MegatronFSDP(torch.nn.Module):
             view and is being modified in-place". kwargs is optional to flexibly support
             with_kwargs={True, False}, this hook can handle both cases.
             """
-            if not torch.is_grad_enabled() or args is None:
+            if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
-                # Return None for PyTorch to utilize the original args / kwargs.
                 return None
 
-            # Preprocess the input arguments. Args followed by kwargs.
+            # Preprocess the input arguments. tree_flatten(None) = ([None], ...)
             args_list, args_spec = tree_flatten(args)
-            args_kwargs_list = list(args_list)
-            if kwargs is not None:
-                kwargs_list, kwargs_spec = tree_flatten(kwargs)
-                args_kwargs_list.extend(list(kwargs_list))
+            kwargs_list, kwargs_spec = tree_flatten(kwargs)
+            args_kwargs_list = list(args_list) + list(kwargs_list)
             inp_tensor_indices: List[int] = []
             inp_tensors: List[torch.Tensor] = []
             for i, obj in enumerate(args_kwargs_list):
@@ -763,8 +766,12 @@ class MegatronFSDP(torch.nn.Module):
 
             if len(inp_tensors) == 0:
                 # All Tensors have requires_grad = False, so Megatron-FSDP
-                # backward hooks are not necessary. Return None for PyTorch
-                # to utilize the original args / kwargs.
+                # backward hooks are not necessary.
+                # TODO(@cspades): There is a loophole where if the user purposefully
+                # passes None to args or kwargs, then this hook will not modify args
+                # or kwargs. This implies that the user cannot check if this hook
+                # modifies args or kwargs by passing in None as a canary. Should
+                # return the original args or kwargs unmodified.
                 return None
 
             """
@@ -783,13 +790,12 @@ class MegatronFSDP(torch.nn.Module):
                 # Insert the modified Tensors back into args / kwargs.
                 args_kwargs_list[inp_tensor_idx] = inp_tensor
             args_list = args_kwargs_list[: len(args_list)]
+            kwargs_list = args_kwargs_list[len(args_list) :]
             args = tree_unflatten(args_list, args_spec)
-            if kwargs is not None:
-                kwargs_list = args_kwargs_list[len(args_list) :]
-                kwargs = tree_unflatten(kwargs_list, kwargs_spec)
+            kwargs = tree_unflatten(kwargs_list, kwargs_spec)
 
             # Return modified input to the module forward pass.
-            if args is not None and kwargs is not None:
+            if kwargs is not None:
                 return args, kwargs
             else:
                 return args
@@ -925,7 +931,14 @@ class MegatronFSDP(torch.nn.Module):
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 
-            # Output is not modified, return None.
+            # Because this hook does not modify the output, return None.
+            # The original args and kwargs will be used. This defends against
+            # situations where Megatron-FSDP hooks are called with "dummy"
+            # inputs (such as `None`), and ensures that this hook does not
+            # perform any modifications on the output.
+            # NOTE(@cspades): Such as in TransformerEngine's fused layers,
+            # where they sequentially call all sub-module hooks like this:
+            # ret = hook(submodule, None, None) for hook in hooks
             return None
 
         @torch.compiler.disable
@@ -976,7 +989,9 @@ class MegatronFSDP(torch.nn.Module):
             """
             if self.data_parallel_sharding_strategy != "no_shard":
                 self.forward_pre_hooks[f"{module._get_name()} parameter unshard"] = (
-                    module.register_forward_pre_hook(_pre_forward_param_unshard, prepend=True)
+                    module.register_forward_pre_hook(
+                        _pre_forward_param_unshard, prepend=True, with_kwargs=True
+                    )
                 )
 
         def _register_pre_backward_param_unshard_hook(module):
