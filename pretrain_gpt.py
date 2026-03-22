@@ -127,7 +127,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
-    if  cu_seqlens is not None and cu_seqlens.dim() == 2:
+    if cu_seqlens is not None and cu_seqlens.dim() == 2:
         cu_seqlens = cu_seqlens[0]
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     if cu_seqlens_padded is None:

@@ -583,8 +583,8 @@ def hybrid_context_parallel_forward_backward(
 
     # TODO(pmannan): This is now equivalent to regular no pipeline schedule.
     # Remove this special forward_backward_func and merge with forward_backward_no_pipelining.
-    # With sequence packing + Dynamic CP enable, num_total_groups is logicallye
-    # quivalent to num_microbatches.
+    # With sequence packing + Dynamic CP enable, num_total_groups is logically
+    # equivalent to num_microbatches.
     # num_samples_this_group is set to 1 as we now run 1 packed sample per group.
     num_total_groups = _broadcast_num_total_groups(num_total_groups)
 
