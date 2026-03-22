@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers import WhisperConfig, WhisperModel
 
@@ -492,8 +493,9 @@ class TestMimoModelNonColocated:
             self.hidden_size, self.img_h, self.img_w, self.patch_dim
         )
 
-        encoder_offset = 0 if encoder_in_grid else 10
-        language_offset = 0 if language_in_grid else 10
+        world_size = dist.get_world_size()
+        encoder_offset = 0 if encoder_in_grid else world_size
+        language_offset = 0 if language_in_grid else world_size
 
         return MimoModelConfig(
             language_model_spec=language_model_spec,
@@ -502,14 +504,14 @@ class TestMimoModelNonColocated:
             module_to_grid_map={
                 "images": MockGrid(
                     rank_offset=encoder_offset,
-                    size=1,
+                    size=world_size,
                     dim_names=["pp"] if pp_size > 1 else [],
                     pp_rank=pp_rank,
                     pp_size=pp_size,
                 ),
                 MIMO_LANGUAGE_MODULE_KEY: MockGrid(
                     rank_offset=language_offset,
-                    size=1,
+                    size=world_size,
                     dim_names=["pp"] if pp_size > 1 else [],
                     pp_rank=pp_rank,
                     pp_size=pp_size,

@@ -25,7 +25,6 @@ class TestMimoRole:
         # Encoder-only role
         encoder_role = RankRole(
             modules={"vision": ModuleStageInfo(True, False)},
-            language_module_name="language",
         )
         assert encoder_role.has_modality_modules is True
         assert encoder_role.has_language_module is False
@@ -34,7 +33,6 @@ class TestMimoRole:
         # Language-only role
         lang_role = RankRole(
             modules={"language": ModuleStageInfo(True, True)},
-            language_module_name="language",
         )
         assert lang_role.has_modality_modules is False
         assert lang_role.has_language_module is True
@@ -45,7 +43,6 @@ class TestMimoRole:
                 "vision": ModuleStageInfo(is_first_stage=True, is_last_stage=False),
                 "language": ModuleStageInfo(is_first_stage=False, is_last_stage=True),
             },
-            language_module_name="language",
         )
         assert mixed.is_first_stage("vision") is True
         assert mixed.is_last_stage("vision") is False
