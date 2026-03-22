@@ -275,9 +275,10 @@ class HybridCPDataLoaderWrapper:
             # Step1: Calculate padding for entire sequence after packing
             # Packed Sequence should be divisible by local_cp_size * 2
             # Or local_cp_size * tp_size * 2 when using sequence parallel
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            tp_size = 1
             if self.config.sequence_parallel:
                 # TODO (pmannan): Remove parallel_state usage and pass pg_collection instead
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
                 pad_granularity = local_cp_size * tp_size * 2
             else:
                 pad_granularity = local_cp_size * 2
@@ -301,6 +302,7 @@ class HybridCPDataLoaderWrapper:
                 # by NUM_OF_TOKENS_PER_CHUNK (128)
                 sharded_pad_granularity = 128
 
+            # tp_size is set to 1 when sequence parallel is not enabled
             sharded_tensor_shape = total_seq_len // (local_cp_size * tp_size)
             mod_token_count = sharded_tensor_shape % sharded_pad_granularity
             sharded_pad_len = 0
