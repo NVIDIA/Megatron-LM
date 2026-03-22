@@ -729,9 +729,6 @@ class MegatronFSDP(torch.nn.Module):
             # situations where Megatron-FSDP hooks are called with "dummy"
             # inputs (such as `None`), and ensures that this hook does not
             # perform any modifications on the args or kwargs.
-            # NOTE(@cspades): Such as in TransformerEngine's fused layers,
-            # where they sequentially call all sub-module hooks like this:
-            # ret = hook(submodule, None, None) for hook in hooks
             return None
 
         @torch.compiler.disable
@@ -767,11 +764,11 @@ class MegatronFSDP(torch.nn.Module):
             if len(inp_tensors) == 0:
                 # All Tensors have requires_grad = False, so Megatron-FSDP
                 # backward hooks are not necessary.
-                # TODO(@cspades): There is a loophole where if the user purposefully
-                # passes None to args or kwargs, then this hook will not modify args
-                # or kwargs. This implies that the user cannot check if this hook
-                # modifies args or kwargs by passing in None as a canary. Should
-                # return the original args or kwargs unmodified.
+                # TODO(@cspades): Loophole where if the user purposefully
+                # passes None to args or kwargs, then this hook returns None.
+                # This implies that the user cannot check if this hook modifies
+                # args or kwargs by passing in None as a canary. Should return
+                # the original args or kwargs unmodified.
                 return None
 
             """
@@ -936,9 +933,6 @@ class MegatronFSDP(torch.nn.Module):
             # situations where Megatron-FSDP hooks are called with "dummy"
             # inputs (such as `None`), and ensures that this hook does not
             # perform any modifications on the output.
-            # NOTE(@cspades): Such as in TransformerEngine's fused layers,
-            # where they sequentially call all sub-module hooks like this:
-            # ret = hook(submodule, None, None) for hook in hooks
             return None
 
         @torch.compiler.disable
