@@ -153,20 +153,19 @@ class OnlineCrossEntropy:
         global_split_end = vocab_offset + vocab_tile_start + vocab_tile_size
 
         for r in cutlass.range(self.num_rows, unroll_full=True):
-            acc_row = acc_mn_tile[r, None].load()
-
             label = labels_per_thread[r]
             coord_m_local = tCcAcc_mn_logprobs[r, 0][0]
             coord_m_global: cutlass.Int32 = row_block_start + coord_m_local
             m_is_valid: cutlass.Boolean = coord_m_global < num_tokens
 
-            acc_row_masked = cute.make_rmem_tensor(acc_row.shape, Float32)
+            acc_row_masked = cute.make_rmem_tensor((self.num_cols,), Float32)
             for v in cutlass.range(self.num_cols, unroll_full=True):
-                coord_n_local = tCcAcc_mn_logprobs[r, v][1]
+                acc_val = acc_mn_tile[r, v]
+                coord_n_local: cutlass.Int32 = tCcAcc_mn_logprobs[r, v][1]
 
                 # Mask OOB elements for softmax computation
                 oob = coord_n_local >= vocab_tile_size
-                acc_row_masked[v] = -Float32.inf if oob else acc_row[v]
+                acc_row_masked[v] = -Float32.inf if oob else acc_val
 
                 # Store label logit if this position matches the label
                 # Use global position (vocab_offset + local) for comparison with global label
@@ -178,7 +177,7 @@ class OnlineCrossEntropy:
                         and (global_position == label)
                         and (label != ignore_index)
                     ):
-                        gLogprobs[coord_m_local] = acc_row[v]
+                        gLogprobs[coord_m_local, 0] = acc_val
 
             # ==================== Softmax Online Update ====================
             acc_row_masked_ssa = acc_row_masked.load()

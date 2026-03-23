@@ -320,7 +320,9 @@ try:
             # Partition Global Memory Tiles
             gMax = cute.local_tile(mMax, (self.mma_tiler[0], 1), (pid_m, pid_n))
             gAccu = cute.local_tile(mAccu, (self.mma_tiler[0], 1), (pid_m, pid_n))
-            gLogprobs = cute.local_tile(mLogprobs, (self.mma_tiler[0],), (pid_m,))
+            gLogprobs = cute.append_ones(
+                cute.local_tile(mLogprobs, (self.mma_tiler[0],), (pid_m,))
+            )
             gLabels = cute.local_tile(mLabels, (self.mma_tiler[0],), (pid_m,))
 
             # Copy Labels to Thread-Local Memory

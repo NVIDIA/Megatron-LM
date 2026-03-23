@@ -477,6 +477,6 @@ try:
 
 except ImportError:
     logging.warning(
-        "Cutlass or CUDA bindings not found. LinearCrossEntropy Blackwell entry "
+        "Cutlass or CUDA bindings not found. LinearCrossEntropy Hopper entry "
         "points will not be available."
     )
