@@ -303,6 +303,104 @@ class LanguageModule(MegatronModule):
             return logits * self.config.mup_output_mult
         return logits
 
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: int,
+        runtime_gather_output: bool = True,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        The serial MTP computation in inference receives hidden states that are
+        replicated across TP ranks (not partitioned along the sequence
+        dimension).  Sequence-parallel scatter/gather operations in the shared
+        embedding layer, MTP layers, and output layer would produce incorrect
+        results on these replicated tensors, so SP is temporarily disabled on
+        all layers involved in the MTP computation.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int): MTP depth index (0-indexed).
+            runtime_gather_output (bool): Whether to gather output across TP.
+
+        Returns:
+            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
+        """
+        saved_sp_state = self._disable_sp_for_mtp(depth)
+        try:
+            layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+            mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+                hidden_states=hidden_states,
+                next_token_ids=next_token_ids,
+                position_ids=position_ids,
+                embedding=self.embedding,
+            )
+
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+
+            logits, _ = self.output_layer(
+                mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+            logits = self._scale_logits(logits)
+        finally:
+            self._restore_sp_for_mtp(saved_sp_state)
+
+        return mtp_hidden, logits
+
+    def _disable_sp_for_mtp(self, depth: int) -> dict:
+        """Disable sequence parallelism on layers used by MTP inference.
+
+        Returns a dict of saved state to pass to ``_restore_sp_for_mtp``.
+        """
+        if not self.config.sequence_parallel:
+            return {}
+
+        saved = {}
+
+        # Embedding layer: prevent scatter/reduce-scatter to SP region.
+        saved['embedding_scatter'] = self.embedding.scatter_to_sequence_parallel
+        saved['embedding_reduce_scatter'] = self.embedding.reduce_scatter_embeddings
+        saved['word_emb_reduce_scatter'] = self.embedding.word_embeddings.reduce_scatter_embeddings
+        self.embedding.scatter_to_sequence_parallel = False
+        self.embedding.reduce_scatter_embeddings = False
+        self.embedding.word_embeddings.reduce_scatter_embeddings = False
+
+        # MTP layer: prevent scatter in _concat_embeddings.
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+        layer = self.mtp.layers[layer_idx]
+        saved['mtp_layer_sp'] = layer.sequence_parallel
+        layer.sequence_parallel = False
+
+        # Output layer: prevent gather from SP region on input.
+        saved['output_layer_sp'] = self.output_layer.sequence_parallel
+        self.output_layer.sequence_parallel = False
+
+        return saved
+
+    def _restore_sp_for_mtp(self, saved: dict) -> None:
+        """Restore sequence parallelism state after MTP inference."""
+        if not saved:
+            return
+
+        self.embedding.scatter_to_sequence_parallel = saved['embedding_scatter']
+        self.embedding.reduce_scatter_embeddings = saved['embedding_reduce_scatter']
+        self.embedding.word_embeddings.reduce_scatter_embeddings = saved['word_emb_reduce_scatter']
+
+        for layer in self.mtp.layers:
+            layer.sequence_parallel = saved['mtp_layer_sp']
+
+        self.output_layer.sequence_parallel = saved['output_layer_sp']
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).
