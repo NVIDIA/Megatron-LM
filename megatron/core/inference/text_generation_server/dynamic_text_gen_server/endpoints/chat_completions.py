@@ -100,6 +100,15 @@ _STRUCTURED_TOOL_ARG_KEYS = {
     "payment_history",
 }
 
+_TRANSFER_TOOL_NAME = "transfer_to_human_agents"
+_TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
+_RESERVATION_UPDATE_TOOLS = {
+    "update_reservation_flights",
+    "update_reservation_passengers",
+    "update_reservation_baggages",
+}
+_RESERVATION_DESTRUCTIVE_TOOLS = {"cancel_reservation", "book_reservation"}
+
 
 def _try_parse_jsonish(value):
     if not isinstance(value, str):
@@ -161,7 +170,46 @@ def _normalize_tool_calls(tool_calls):
                 "function": {"name": str(fn_name), "arguments": fn_args},
             }
         )
-    return normalized
+    return _apply_tool_call_guardrails(normalized)
+
+
+def _apply_tool_call_guardrails(tool_calls):
+    """Apply conservative post-parse guardrails to tool call lists.
+
+    If update-style reservation tools are already present in the same response,
+    suppress cancel+book style calls to avoid destructive replanning patterns.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+
+    call_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in tool_calls
+        if isinstance(call, dict)
+    }
+    if call_names & _RESERVATION_UPDATE_TOOLS:
+        return [
+            call
+            for call in tool_calls
+            if _get_field(_get_field(call, "function", {}), "name")
+            not in _RESERVATION_DESTRUCTIVE_TOOLS
+        ]
+    return tool_calls
+
+
+def _normalize_assistant_content(message_text, tool_calls):
+    """Normalize assistant content for policy-sensitive tool transitions."""
+    if not isinstance(message_text, str):
+        message_text = "" if message_text is None else str(message_text)
+
+    tool_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in (tool_calls or [])
+        if isinstance(call, dict)
+    }
+    if _TRANSFER_TOOL_NAME in tool_names:
+        return _TRANSFER_HOLD_MESSAGE
+    return message_text
 
 
 def _coerce_arguments_mapping(arguments):
@@ -620,9 +668,13 @@ try:
                     message_text, req.get("tools", None), parsers, tools_requested
                 )
 
-            message = {"role": "assistant", "content": message_text}
-            if metadata.get("tool_calls", []):
-                message["tool_calls"] = metadata["tool_calls"]
+            normalized_tool_calls = metadata.get("tool_calls", [])
+            message = {
+                "role": "assistant",
+                "content": _normalize_assistant_content(message_text, normalized_tool_calls),
+            }
+            if normalized_tool_calls:
+                message["tool_calls"] = normalized_tool_calls
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
