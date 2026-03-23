@@ -46,6 +46,8 @@ if HAVE_TE:
 else:
     TEColumnParallelGroupedLinear = None
 
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+
 _SEED = 42
 
 
@@ -927,3 +929,276 @@ class TestMultiTokenPredictionMamba:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestMTPSequenceParallelDisableRestore:
+    """Test that sequence parallelism is correctly disabled during MTP inference
+    and restored afterwards.
+
+    These tests verify the _disable_sp_for_mtp / _restore_sp_for_mtp cycle
+    and end-to-end compute_mtp_single_step with non-TP-aligned input sizes.
+    """
+
+    def setup_method(self, method):
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+    def _build_gpt_model(self, tp, hidden_size=64, vocab_size=128, mtp_num_layers=2):
+        """Build a small GPTModel with MTP and sequence parallelism."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        config = TransformerConfig(
+            mtp_num_layers=mtp_num_layers,
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True if tp > 1 else False,
+        )
+        transformer_layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=False
+        )
+        model_parallel_cuda_manual_seed(_SEED)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            mtp_block_spec=mtp_block_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=256,
+            pre_process=True,
+            post_process=True,
+            share_embeddings_and_output_weights=True,
+            position_embedding_type='rope',
+        )
+        model.cuda()
+        model.eval()
+        return model, config
+
+    def _collect_sp_flags(self, model, depth=0):
+        """Collect all SP-related flags from the model for verification."""
+        flags = {}
+        flags['embedding_scatter'] = model.embedding.scatter_to_sequence_parallel
+        flags['embedding_reduce_scatter'] = model.embedding.reduce_scatter_embeddings
+        flags['word_emb_reduce_scatter'] = (
+            model.embedding.word_embeddings.reduce_scatter_embeddings
+        )
+        layer_idx = 0 if model.mtp.mtp_use_repeated_layer else depth
+        layer = model.mtp.layers[layer_idx]
+        flags['mtp_layer_sp'] = layer.sequence_parallel
+        flags['mtp_submodule_sp'] = {}
+        for name, module in layer.named_modules():
+            if hasattr(module, 'sequence_parallel'):
+                flags['mtp_submodule_sp'][name] = module.sequence_parallel
+        flags['output_layer_sp'] = model.output_layer.sequence_parallel
+        return flags
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_disable_sp_sets_all_flags_false(self, tp):
+        """_disable_sp_for_mtp must set all SP flags to False."""
+        model, config = self._build_gpt_model(tp)
+        assert config.sequence_parallel is True
+
+        # Verify SP is initially enabled on the relevant modules.
+        initial_flags = self._collect_sp_flags(model)
+        assert initial_flags['embedding_scatter'] is True
+        assert initial_flags['mtp_layer_sp'] is True
+        assert initial_flags['output_layer_sp'] is True
+        # At least some submodules (e.g. ColumnParallelLinear) should have SP=True.
+        sp_true_submodules = [
+            name for name, val in initial_flags['mtp_submodule_sp'].items() if val is True
+        ]
+        assert len(sp_true_submodules) > 0, "Expected some submodules with SP=True"
+
+        # Disable and check.
+        saved = model._disable_sp_for_mtp(depth=0)
+        disabled_flags = self._collect_sp_flags(model)
+        assert disabled_flags['embedding_scatter'] is False
+        assert disabled_flags['embedding_reduce_scatter'] is False
+        assert disabled_flags['word_emb_reduce_scatter'] is False
+        assert disabled_flags['mtp_layer_sp'] is False
+        assert disabled_flags['output_layer_sp'] is False
+        for name, val in disabled_flags['mtp_submodule_sp'].items():
+            assert val is False, f"Expected SP=False on submodule {name} after disable"
+
+        # Saved state should be non-empty.
+        assert len(saved) > 0
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_restore_sp_restores_all_flags(self, tp):
+        """_restore_sp_for_mtp must restore all SP flags to their original values."""
+        model, config = self._build_gpt_model(tp)
+        initial_flags = self._collect_sp_flags(model)
+
+        saved = model._disable_sp_for_mtp(depth=0)
+        model._restore_sp_for_mtp(saved)
+
+        restored_flags = self._collect_sp_flags(model)
+        assert restored_flags == initial_flags
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_disable_restore_cycle_multiple_depths(self, tp):
+        """Disable/restore should work correctly for each MTP depth independently."""
+        model, config = self._build_gpt_model(tp, mtp_num_layers=2)
+
+        for depth in range(config.mtp_num_layers):
+            initial_flags = self._collect_sp_flags(model, depth=depth)
+
+            saved = model._disable_sp_for_mtp(depth=depth)
+            # All SP flags should be False while disabled.
+            disabled_flags = self._collect_sp_flags(model, depth=depth)
+            assert disabled_flags['mtp_layer_sp'] is False
+
+            model._restore_sp_for_mtp(saved)
+            restored_flags = self._collect_sp_flags(model, depth=depth)
+            assert restored_flags == initial_flags
+
+    def test_no_op_when_sp_disabled(self):
+        """When SP is not enabled (tp=1), _disable_sp_for_mtp returns empty dict."""
+        model, config = self._build_gpt_model(tp=1)
+        assert config.sequence_parallel is False
+
+        saved = model._disable_sp_for_mtp(depth=0)
+        assert saved == {}
+
+        # Restore with empty dict should be a no-op.
+        model._restore_sp_for_mtp(saved)
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_restore_happens_on_exception(self, tp):
+        """SP flags must be restored even if the MTP forward raises an exception."""
+        model, config = self._build_gpt_model(tp)
+        initial_flags = self._collect_sp_flags(model)
+
+        # Monkey-patch to force an exception inside compute_mtp_single_step.
+        original_forward = model.mtp.layers[0].forward_single_position
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("simulated failure")
+
+        model.mtp.layers[0].forward_single_position = _raise
+
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            dummy_hidden = torch.randn(3, 1, config.hidden_size, device='cuda')
+            dummy_ids = torch.zeros(1, 3, dtype=torch.long, device='cuda')
+            dummy_pos = torch.arange(3, device='cuda').unsqueeze(0)
+            model.compute_mtp_single_step(
+                hidden_states=dummy_hidden,
+                next_token_ids=dummy_ids,
+                position_ids=dummy_pos,
+                depth=0,
+            )
+
+        # Restore original to allow flag collection.
+        model.mtp.layers[0].forward_single_position = original_forward
+        restored_flags = self._collect_sp_flags(model)
+        assert restored_flags == initial_flags
+
+    @pytest.mark.parametrize(
+        ('tp', 'num_positions'),
+        [
+            (2, 3),   # 3 is not divisible by TP=2
+            (2, 5),   # 5 is not divisible by TP=2
+            (4, 3),   # 3 is not divisible by TP=4
+            (4, 5),   # 5 is not divisible by TP=4
+            (4, 7),   # 7 is not divisible by TP=4
+        ],
+    )
+    def test_compute_mtp_single_step_non_aligned_sizes(self, tp, num_positions):
+        """compute_mtp_single_step must succeed with sequence lengths not divisible by TP.
+
+        When SP is active, the input tensors are replicated (not scattered) for MTP
+        inference.  If SP were not disabled, scatter operations would fail or produce
+        wrong shapes for non-TP-aligned sizes.  This test verifies that the disable/
+        restore logic allows the computation to complete and produces correct shapes.
+        """
+        hidden_size = 64
+        vocab_size = 128
+        model, config = self._build_gpt_model(
+            tp, hidden_size=hidden_size, vocab_size=vocab_size
+        )
+        assert config.sequence_parallel is True
+        assert num_positions % tp != 0, "Test requires non-TP-aligned input size"
+
+        # Replicated hidden states (as produced by gather_from_sequence_parallel_region).
+        hidden_states = torch.randn(num_positions, 1, hidden_size, device='cuda')
+        next_token_ids = torch.randint(0, vocab_size, (1, num_positions), device='cuda')
+        position_ids = torch.arange(num_positions, device='cuda').unsqueeze(0)
+
+        with torch.inference_mode():
+            new_hidden, logits = model.compute_mtp_single_step(
+                hidden_states=hidden_states,
+                next_token_ids=next_token_ids,
+                position_ids=position_ids,
+                depth=0,
+                runtime_gather_output=True,
+            )
+
+        # Shape checks: output should match the non-aligned input size.
+        assert new_hidden.shape == (num_positions, 1, hidden_size)
+        assert logits.shape[0] == num_positions
+        assert logits.shape[1] == 1
+        # Vocab dim should be the full (gathered) vocab size.
+        assert logits.shape[2] == vocab_size
+
+        # Verify SP was restored after the call.
+        restored_flags = self._collect_sp_flags(model)
+        assert restored_flags['embedding_scatter'] is True
+        assert restored_flags['mtp_layer_sp'] is True
+        assert restored_flags['output_layer_sp'] is True
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_compute_mtp_single_step_all_depths(self, tp):
+        """Run compute_mtp_single_step for every depth, chaining hidden states."""
+        hidden_size = 64
+        vocab_size = 128
+        num_positions = 3  # Non-aligned for both TP=2 and TP=4
+        mtp_num_layers = 2
+        model, config = self._build_gpt_model(
+            tp, hidden_size=hidden_size, vocab_size=vocab_size, mtp_num_layers=mtp_num_layers
+        )
+
+        hidden_states = torch.randn(num_positions, 1, hidden_size, device='cuda')
+        next_token_ids = torch.randint(0, vocab_size, (1, num_positions), device='cuda')
+        position_ids = torch.arange(num_positions, device='cuda').unsqueeze(0)
+
+        with torch.inference_mode():
+            for depth in range(mtp_num_layers):
+                hidden_states, logits = model.compute_mtp_single_step(
+                    hidden_states=hidden_states,
+                    next_token_ids=next_token_ids,
+                    position_ids=position_ids,
+                    depth=depth,
+                    runtime_gather_output=True,
+                )
+                assert hidden_states.shape == (num_positions, 1, hidden_size)
+                assert logits.shape == (num_positions, 1, vocab_size)
+
+        # After all depths, SP should be fully restored.
+        restored_flags = self._collect_sp_flags(model)
+        assert restored_flags['embedding_scatter'] is True
+        assert restored_flags['mtp_layer_sp'] is True
+        assert restored_flags['output_layer_sp'] is True
+
+    @pytest.mark.parametrize('tp', [2, 4])
+    def test_gather_before_mtp_cache(self, tp):
+        """Verify that gather_from_sequence_parallel_region produces the correct
+        full-sequence tensor from a partitioned input, simulating what GPTModel.forward
+        does before caching hidden states for MTP.
+        """
+        hidden_size = 64
+        # Use a sequence length that IS divisible by TP (as the main decoder produces).
+        seq_len = 12
+        model, config = self._build_gpt_model(tp, hidden_size=hidden_size)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        # Simulate partitioned hidden states: each rank holds seq_len/tp tokens.
+        local_seq = seq_len // tp
+        partitioned = torch.randn(local_seq, 1, hidden_size, device='cuda')
+
+        gathered = gather_from_sequence_parallel_region(partitioned, group=pg_collection.tp)
+        assert gathered.shape == (seq_len, 1, hidden_size)
