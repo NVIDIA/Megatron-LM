@@ -165,51 +165,36 @@ class HashRankTable:
         """Remove stale rows and shrink the backing array when under-utilized.
 
         A row is *stale* when all of its timestamps are zero (no rank holds the
-        hash).  After removing stale rows, the array is halved repeatedly until
-        it is no larger than ``max(2 * live_rows, initial_capacity=256)``.
+        hash).  After removing stale rows, the backing array is halved
+        repeatedly while live rows occupy less than half the capacity.
         """
         # Identify live rows (at least one non-zero timestamp).
         live_mask = (self._timestamps[: self._next_row] != 0).any(axis=1)
         live_indices = np.nonzero(live_mask)[0]
         n_live = len(live_indices)
+        removed_rows = n_live < self._next_row
 
-        if n_live == self._next_row:
-            # Nothing to compact — but still try to shrink the backing array.
-            self._maybe_shrink()
-            return
+        if removed_rows:
+            # Rebuild the table with only live rows, preserving order.
+            new_timestamps = self._timestamps[live_indices]  # (n_live, n_ranks)
 
-        # Rebuild the table with only live rows, preserving order.
-        new_timestamps = self._timestamps[live_indices]  # (n_live, n_ranks)
+            # Rebuild hash→row mapping.
+            old_to_new = {int(old): new for new, old in enumerate(live_indices)}
+            self._hash_to_row = {
+                h: old_to_new[row] for h, row in self._hash_to_row.items() if row in old_to_new
+            }
+            self._next_row = n_live
+        else:
+            new_timestamps = self._timestamps[:n_live]
 
-        # Rebuild hash→row mapping.
-        old_to_new = {int(old): new for new, old in enumerate(live_indices)}
-        self._hash_to_row = {
-            h: old_to_new[row] for h, row in self._hash_to_row.items() if row in old_to_new
-        }
-        self._next_row = n_live
-
-        # Allocate a right-sized backing array and copy live data into it.
-        new_capacity = max(256, n_live)
-        # Round up to next power of two to stay consistent with _ensure_capacity.
-        capacity = 256
-        while capacity < new_capacity:
-            capacity *= 2
-        self._timestamps = np.zeros((capacity, self._n_ranks), dtype=np.int64)
-        self._timestamps[:n_live] = new_timestamps
-
-    def _maybe_shrink(self) -> None:
-        """Halve the backing array while it is at most half-occupied."""
-        capacity = self._timestamps.shape[0]
-        min_capacity = max(256, self._next_row * 2)
-        if capacity <= min_capacity:
-            return
-        new_capacity = capacity
-        while new_capacity // 2 >= min_capacity:
+        # Shrink: halve capacity while live rows fit in less than half.
+        new_capacity = self._timestamps.shape[0]
+        while n_live < 0.5 * new_capacity and new_capacity > 256:
             new_capacity //= 2
-        if new_capacity < capacity:
-            new_table = np.zeros((new_capacity, self._n_ranks), dtype=np.int64)
-            new_table[: self._next_row] = self._timestamps[: self._next_row]
-            self._timestamps = new_table
+
+        if new_capacity != self._timestamps.shape[0] or removed_rows:
+            self._timestamps = np.zeros((new_capacity, self._n_ranks), dtype=np.int64)
+            self._timestamps[:n_live] = new_timestamps
 
     # ------------------------------------------------------------------
     # Internal helpers

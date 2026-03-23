@@ -873,12 +873,7 @@ class TestScoringFunctionRouting:
 
 
 class TestCompactInterval:
-    """Tests for the configurable compact interval on the coordinator."""
-
-    def test_default_compact_interval(self):
-        """Default compact interval is 100."""
-        coordinator = make_coordinator_direct()
-        assert coordinator._compact_interval == 100
+    """Tests for compaction triggered via the coordinator."""
 
     def test_remove_engine_zeros_column_and_compacts(self):
         """_remove_engine zeros the rank's hash column and compacts the table."""
