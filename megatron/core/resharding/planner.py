@@ -293,10 +293,23 @@ def _finalize_dp_transfers(
         full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
         return [(my_global_rank, full_slice, full_slice)]
 
-    # src_metadata was already DP-balanced by select_src_metadata_balanced,
-    # so just use its owner_rank directly.
+    # Different DP groups - use round-robin based on destination global rank for
+    # better load balancing across source ranks. This ensures that destination
+    # ranks are distributed across source ranks even when they have the same
+    # position within their respective DP groups.
+    #
+    # In non-collocated mode, src_dp_ranks might include ranks that don't
+    # have the source model (e.g., idle ranks or destination ranks). Filter to only
+    # include the rank that provided this metadata (src_metadata.owner_rank).
+    # src_metadata was selected by select_src_metadata_balanced, so owner_rank is the
+    # actual source rank for this parameter.
+    actual_src_rank = src_metadata.owner_rank
+    src_global_rank = src_dp_ranks[my_global_rank % len(src_dp_ranks)]
+    # Override with the actual source rank if the selected rank doesn't have the parameter
+    if src_global_rank != actual_src_rank:
+        src_global_rank = actual_src_rank
     full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
-    return [(src_metadata.owner_rank, full_slice, full_slice)]
+    return [(src_global_rank, full_slice, full_slice)]
 
 
 def _determine_source_ranks_for_dst_param(

@@ -34,7 +34,8 @@ def execute_reshard_plan(
     """
     Execute a reshard plan (from centralized controller).
     A communication service must be provided to abstract transport.
-    Expected service API: submit_send(tensor, dest_rank, task_id), submit_recv(tensor, src_rank, task_id), run().
+    Expected service API: submit_send(tensor, dest_rank, task_id),
+    submit_recv(tensor, src_rank, task_id), run().
 
     Supports None for src_module and/or dst_module to allow ranks in non-collocated mode:
     - src_module=None: Rank only receives data (destination-only)
