@@ -454,7 +454,7 @@ class CheckpointConfig:
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
 
-    fully_parallel_load: bool = field(default=False, metatdata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}}
+    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
     ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
