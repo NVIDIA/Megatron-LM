@@ -28,6 +28,7 @@ class HashRankTable:
 
     def __init__(self, n_ranks: int, initial_capacity: int = 256):
         self._n_ranks = n_ranks
+        self._initial_capacity = initial_capacity
         self._hash_to_row: Dict[int, int] = {}
         self._next_row = 0
         self._timestamps = np.zeros((initial_capacity, n_ranks), dtype=np.int64)
@@ -189,7 +190,7 @@ class HashRankTable:
 
         # Shrink: halve capacity while live rows fit in less than half.
         new_capacity = self._timestamps.shape[0]
-        while n_live < 0.5 * new_capacity and new_capacity > 256:
+        while n_live < 0.5 * new_capacity and new_capacity > self._initial_capacity:
             new_capacity //= 2
 
         if new_capacity != self._timestamps.shape[0] or removed_rows:
