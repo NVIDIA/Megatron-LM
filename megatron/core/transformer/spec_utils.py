@@ -139,4 +139,4 @@ def get_submodules(spec: Callable[..., Any]) -> object:
         return spec.keywords['submodules']
     if hasattr(spec, "submodules"):
         return spec.submodules  # type: ignore
-    raise ValueError("Could not find `submodules` in the provided spec: {spec!r}")
+    raise ValueError(f"Could not find `submodules` in the provided spec: {spec!r}")
