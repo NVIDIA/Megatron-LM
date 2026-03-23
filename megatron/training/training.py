@@ -3362,8 +3362,9 @@ def evaluate(
     total_loss_dict = {}
 
     # make validation batch size independent from training batch size
-    eval_batch_size = args.global_batch_size
-    eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
+    eval_batch_size = args.eval_global_batch_size
+    eval_micro_batch_size = args.eval_micro_batch_size
+    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
@@ -3373,7 +3374,7 @@ def evaluate(
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
             seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=eval_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
         )
     else:
@@ -3422,7 +3423,7 @@ def evaluate(
                 model=model,
                 num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3494,7 +3495,7 @@ def evaluate(
                 model=model,
                 num_microbatches=get_num_microbatches(),
                 seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
@@ -3632,8 +3633,8 @@ def get_train_valid_test_num_samples():
         else:
             assert args.train_iters is not None
             eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
-        eval_samples = eval_iters * args.global_batch_size
-    test_samples = args.eval_iters * args.global_batch_size
+        eval_samples = eval_iters * args.eval_global_batch_size
+    test_samples = args.eval_iters * args.eval_global_batch_size
 
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
@@ -3680,7 +3681,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
-                (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
+                (args.iteration // args.eval_interval) * args.eval_iters * args.eval_global_batch_size
             )
 
     # Get consumed train samples in this phase.

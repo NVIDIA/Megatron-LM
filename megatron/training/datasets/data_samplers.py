@@ -30,28 +30,42 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
+    # Use eval-specific batch sizes for validation/test splits
+    is_eval = split in (Split.valid, Split.test)
+    micro_batch_size = args.eval_micro_batch_size if is_eval else args.micro_batch_size
+    global_batch_size = args.eval_global_batch_size if is_eval else args.global_batch_size
+
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronPretrainingSampler(
             total_samples=len(dataset),
             consumed_samples=0,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
         )
     elif args.dataloader_type == 'single':
-        # Megatron sampler
-        batch_sampler = MegatronPretrainingSampler(
-            total_samples=len(dataset),
-            consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+        if args.dynamic_context_parallel:
+            batch_sampler = DynamicCPMegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=micro_batch_size,
+                global_batch_size=global_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size())
+        else:
+            # Megatron sampler
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
