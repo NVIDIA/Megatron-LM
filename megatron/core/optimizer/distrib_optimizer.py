@@ -384,7 +384,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        # NVFP4 tensor will also go to this block.
                         if is_nvfp4tensor(model_param) or is_float8tensor(model_param):
                             if hasattr(model_param, 'get_high_precision_init_val'):
                                 shard_main_param = (
