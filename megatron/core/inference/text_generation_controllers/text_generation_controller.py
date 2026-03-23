@@ -84,6 +84,14 @@ class TextGenerationController:
         self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
+        # Disable sequence parallelism on MTP layers for inference. The serial
+        # MTP computation operates on per-request hidden states that are already
+        # replicated across TP ranks, so the scatter/gather in
+        # _concat_embeddings is unnecessary and would produce incorrect results
+        # when the hidden states are not TP-aligned for sequence parallelism.
+        if self.num_mtp_heads > 0 and self.model_config.sequence_parallel:
+            self._set_mtp_sequence_parallel(False)
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
@@ -93,6 +101,27 @@ class TextGenerationController:
         if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
             return model.config.mtp_num_layers or 0
         return 0
+
+    def _set_mtp_sequence_parallel(self, enabled: bool):
+        """Enable or disable sequence parallelism on MTP layers.
+
+        The MTP serial computation in inference receives hidden states that are
+        replicated across TP ranks (not partitioned along the sequence dimension).
+        The MTP layer's _concat_embeddings method contains a
+        scatter_to_sequence_parallel_region call that would incorrectly split
+        these replicated hidden states. Disabling SP on the MTP layers prevents
+        this and ensures correct TP behavior during inference.
+
+        Args:
+            enabled: Whether to enable (True) or disable (False) sequence
+                parallelism on the MTP layers.
+        """
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        if not hasattr(unwrapped_model, 'mtp'):
+            return
+        mtp_block = unwrapped_model.mtp
+        for layer in mtp_block.layers:
+            layer.sequence_parallel = enabled
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
