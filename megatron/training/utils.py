@@ -10,6 +10,7 @@ from datetime import datetime
 from collections import defaultdict
 
 import torch
+from torch import nn
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
@@ -42,7 +43,19 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+def param_is_not_shared(param: nn.Parameter) -> bool:
+    """Check if a parameter is marked as not shared.
+
+    Args:
+        param (torch.nn.Parameter): The parameter to check.
+
+    Returns:
+        bool: True if the parameter does not have a 'shared' attribute or if
+              param.shared is False.
+    """
+    return not hasattr(param, "shared") or not param.shared
+
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
