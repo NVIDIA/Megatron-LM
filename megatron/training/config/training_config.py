@@ -27,6 +27,15 @@ class TrainingConfig:
     300000 / 126 = 2380 samples.
     """
 
+    step_batch_size_schedule: str | None = None
+    """Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...".
+    Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+    If sequence length is provided, thresholds are interpreted as tokens; otherwise as samples.
+    Example:
+        step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
+    Cannot be used together with rampup_batch_size or decrease_batch_size_if_needed.
+    """
+
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
