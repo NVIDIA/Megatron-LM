@@ -1888,6 +1888,12 @@ def _add_inference_args(parser):
                        'score = alpha * match + (1 - alpha) * normalized_load. '
                        'Higher alpha favors prefix cache hits; lower alpha '
                        'favors load balance. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-compact-interval',
+                       type=int, default=100,
+                       dest='inference_dynamic_batching_prefix_caching_compact_interval',
+                       help='Number of completed requests between hash table '
+                       'compaction cycles. Lower values reclaim memory sooner '
+                       'but add overhead. Default: 100.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',

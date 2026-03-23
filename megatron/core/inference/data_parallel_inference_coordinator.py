@@ -99,6 +99,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
         max_requests: int = 0,
+        prefix_caching_compact_interval: int = 100,
     ):
         """
         Initializes the inference coordinator.
@@ -218,6 +219,8 @@ class DataParallelInferenceCoordinator:
 
         # Hash → rank timestamp table for prefix cache affinity routing.
         self.hash_table = HashRankTable(n_ranks)
+        self._completed_since_compact = 0
+        self._compact_interval = prefix_caching_compact_interval
 
     def get_next_data_parallel_rank(self):
         """
@@ -239,6 +242,10 @@ class DataParallelInferenceCoordinator:
         idx = self.identity_to_rank_index.get(identity)
         if idx is not None:
             self._active_mask[idx] = False
+            # Zero out the removed rank's column so rows with no remaining
+            # live timestamps can be reclaimed by compact().
+            self.hash_table._timestamps[:, idx] = 0
+            self.hash_table.compact()
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -530,6 +537,12 @@ class DataParallelInferenceCoordinator:
                         ]
                     )
 
+                # Periodically compact the hash table to reclaim rows with 0 engine entries.
+                self._completed_since_compact += len(finished_requests)
+                if self._completed_since_compact >= self._compact_interval:
+                    self._completed_since_compact = 0
+                    self.hash_table.compact()
+
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
@@ -584,6 +597,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
         max_requests: int = 0,
+        prefix_caching_compact_interval: int = 100,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -617,6 +631,7 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             max_requests=max_requests,
+            prefix_caching_compact_interval=prefix_caching_compact_interval,
         )
         ready_event.set()
         try:

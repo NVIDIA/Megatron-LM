@@ -870,3 +870,35 @@ class TestScoringFunctionRouting:
         #            score(rank_1) = 0 + 0.5*(8/10) = 0.4
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
+
+
+class TestCompactInterval:
+    """Tests for the configurable compact interval on the coordinator."""
+
+    def test_default_compact_interval(self):
+        """Default compact interval is 100."""
+        coordinator = make_coordinator_direct()
+        assert coordinator._compact_interval == 100
+
+    def test_remove_engine_zeros_column_and_compacts(self):
+        """_remove_engine zeros the rank's hash column and compacts the table."""
+        coordinator = make_coordinator_direct(data_parallel_size=3)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        rank_2 = coordinator.identities_of_data_parallel_ranks[2]
+
+        # Record hashes: hash 10 only on rank_1, hash 20 on rank_0 and rank_2.
+        idx_0 = coordinator.identity_to_rank_index[rank_0]
+        idx_1 = coordinator.identity_to_rank_index[rank_1]
+        idx_2 = coordinator.identity_to_rank_index[rank_2]
+        coordinator.hash_table.set(10, idx_1, 1)
+        coordinator.hash_table.set(20, idx_0, 2)
+        coordinator.hash_table.set(20, idx_2, 3)
+
+        # Remove rank_1 — hash 10's row should become all-zero and be compacted.
+        coordinator._remove_engine(rank_1)
+
+        assert not coordinator.hash_table.has(10, idx_1)
+        # Hash 20 is still live on rank_0 and rank_2.
+        assert coordinator.hash_table.has(20, idx_0)
+        assert coordinator.hash_table.has(20, idx_2)

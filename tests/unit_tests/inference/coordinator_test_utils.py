@@ -74,5 +74,7 @@ def make_coordinator_direct(
     coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
     coordinator._identities_list = list(sorted_identities)
     coordinator._active_mask = np.ones(n_ranks, dtype=bool)
+    coordinator._completed_since_compact = 0
+    coordinator._compact_interval = 100
 
     return coordinator
