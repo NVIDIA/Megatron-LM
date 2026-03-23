@@ -433,7 +433,7 @@ class CheckpointConfig:
     The legacy format was deprecated on Feb 13, 2024.
     """
 
-    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
+    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
