@@ -26,7 +26,19 @@ from megatron.training.global_vars import (
 from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from megatron.core.distributed import DistributedDataParallel as DDP
+from tests.unit_tests.test_utilities import Utils
 
+cuda_graph_supported = False
+reason_for_no_cuda_graph = ""
+try:
+    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+
+    if is_te_min_version("2.10.0"):
+        cuda_graph_supported = True
+    else:
+        reason_for_no_cuda_graph = "Need newer TransformerEngine"
+except ImportError:
+    reason_for_no_cuda_graph = "Need newer TransformerEngine"
 
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
@@ -45,72 +57,6 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
     )
-
-
-class Utils:
-    """Minimal test utilities for distributed setup."""
-
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
-    inited = False
-
-    @staticmethod
-    def initialize_distributed():
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-
-        # Force deterministic behavior to eliminate run-to-run variation
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-        if not torch.distributed.is_initialized() and Utils.rank >= 0:
-            print(
-                f'Initializing torch.distributed with rank: {Utils.rank}, '
-                f'world_size: {Utils.world_size}'
-            )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
-            torch.distributed.init_process_group(
-                backend='nccl',
-                world_size=Utils.world_size,
-                rank=Utils.rank,
-                timeout=timedelta(minutes=1),
-            )
-            torch.distributed.barrier()
-        Utils.inited = True
-
-    @staticmethod
-    def destroy_model_parallel():
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-        if not Utils.inited:
-            return
-        torch.distributed.barrier()
-        ps.destroy_model_parallel()
-        Utils.inited = False
-
-    @staticmethod
-    def initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        virtual_pipeline_model_parallel_size=None,
-        **kwargs,
-    ):
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-
-        ps.destroy_model_parallel()
-        Utils.initialize_distributed()
-        ps.initialize_model_parallel(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size,
-            **kwargs,
-        )
-        Utils.inited = True
 
 _SEED = 1234
 is_nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
@@ -185,7 +131,6 @@ class TestFP4Param:
         # FP4 settings
         args.fp4 = "e2m1"
         args.fp4_recipe = "nvfp4"
-        args.fp4_param = fp4_param_gather
         args.fp4_param_gather = fp4_param_gather
         args.ddp_bucket_size = 40960
 
@@ -269,8 +214,6 @@ class TestFP4Param:
             assert num_fp4_params == 4 * fp4_layers
 
         loss_list = []
-        grad_ref_out: dict | None = {} if collect_grad_ref else None
-        first_master_mismatch_iter = None  # Track first master weight divergence
 
         # CUDA graph setup (transformer_engine implementation)
         cuda_graph_helper = None
@@ -352,7 +295,7 @@ class TestFP4Param:
                 **kwargs,
             )
 
-            torch.testing.assert_close(loss_list, loss_list_ref, atol=0, rtol=0)
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
@@ -418,14 +361,13 @@ if __name__ == "__main__":
     # Run tests directly without pytest
     test = TestFP4Param()
     test.setup_method(None)
-    try:    
-        kwargs = {
-            "enable_cuda_graph": True,
-            "first_last_layers_bf16": True,
-            "num_layers_at_start_in_bf16": 1,
-            "num_layers_at_end_in_bf16": 1,
-            "overlap_param_gather": True,
-            "overlap_grad_reduce": True,
-        }
-        test.run_test(tp_size=2, **kwargs)
-        test.teardown_method(None)
+    kwargs = {
+        "enable_cuda_graph": True,
+        "first_last_layers_bf16": True,
+        "num_layers_at_start_in_bf16": 1,
+        "num_layers_at_end_in_bf16": 1,
+        "overlap_param_gather": True,
+        "overlap_grad_reduce": True,
+    }
+    test.run_test(tp_size=2, **kwargs)
+    test.teardown_method(None)

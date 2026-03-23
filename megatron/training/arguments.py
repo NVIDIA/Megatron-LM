@@ -1735,14 +1735,14 @@ def core_transformer_config_from_args(args, config_class=None):
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
-    # FP8 related arguments
-    group.add_argument('--fp8-param-gather', action='store_true',
-                       help='Keep the compute param in fp8 (do not use any other intermediate '
-                            'dtype) and perform the param all-gather in fp8.')
     # FP4 related arguments
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.')
+    # FP8 related arguments
+    group.add_argument('--fp8-param-gather', action='store_true',
+                       help='Keep the compute param in fp8 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp8.')
     # TE precision config file
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
@@ -2004,6 +2004,7 @@ def _add_network_size_args(parser):
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
+        "fp4_param",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",

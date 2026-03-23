@@ -1022,9 +1022,6 @@ class _ParamAndGradBuffer:
             # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
                 if self.param_data is not None:
-                    new_param_data = self._get(
-                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                    )
                     if is_nvfp4tensor(param):
                         # NVFP4 params: map rowwise packed bytes (uint8) into the param buffer.
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
@@ -1034,8 +1031,14 @@ class _ParamAndGradBuffer:
                         )
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
                     elif is_float8tensor(param):
+                        new_param_data = self._get(
+                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
                         modify_underlying_storage(param, new_param_data)
                     else:
+                        new_param_data = self._get(
+                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
                         old_param_data = param.data
                         param.data = new_param_data
                         assert old_param_data._base is None
@@ -1092,16 +1095,30 @@ class _ParamAndGradBuffer:
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
-            self.buckets.append(
-                self._new_bucket(
-                    bucket_params=bucket_params,
-                    start_index=bucket_start_index,
-                    end_index=bucket_end_index,
-                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                    bucket_id=cur_bucket_id,
+            if self.has_nvfp4_params:
+                # Pad grad_numel for last bucket
+                grad_bucket_end_index = self.grad_numel
+                self.buckets.append(
+                    self._new_bucket(
+                        bucket_params=bucket_params,
+                        start_index=bucket_start_index,
+                        end_index=bucket_end_index,
+                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                        bucket_id=cur_bucket_id,
+                        grad_start_index=grad_bucket_start_index,
+                        grad_end_index=grad_bucket_end_index,
+                    )
                 )
-            )
-
+            else:
+                self.buckets.append(
+                    self._new_bucket(
+                        bucket_params=bucket_params,
+                        start_index=bucket_start_index,
+                        end_index=bucket_end_index,
+                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                        bucket_id=cur_bucket_id,
+                    )
+                )
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
@@ -1129,7 +1146,7 @@ class _ParamAndGradBuffer:
         """Scale the gradient data by `scaling_factor`."""
         self.grad_data *= scaling_factor
 
-    def get_grad_index_map(self) -> Dict[torch.nn.Parameter, Tuple[int, int, int]]:
+    def get_grad_index_map(self) -> Dict[torch.nn.Parameter, tuple[int, int, int]]:
         """
         Return the index map for grad buffer operations.
         
