@@ -38,7 +38,6 @@ from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
-from ...utils import get_torch_version, is_torch_min_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
 from ..mapping import (
@@ -110,7 +109,7 @@ def register_default_torch_strategies():
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
     )
     register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
+        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy()
     )
 
 
@@ -285,6 +284,8 @@ def mcore_to_pyt_state_dict(
         - if `allow_shape_mismatch` is True, the data is initialized with zeros
             prior to loading (not all parts of the tensor will be read from the checkpoint)
         """
+        from ...utils import is_torch_min_version
+
         assert all(isinstance(sh_ten, ShardedTensor) for sh_ten in sh_tens), sh_tens
         for sh_ten in sh_tens:
             if sh_ten.data is None:
@@ -434,6 +435,8 @@ class MCoreSavePlanner(DefaultSavePlanner):
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
         # during saving.
+        from ...utils import get_torch_version
+
         if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
@@ -603,8 +606,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
     def __init__(
         self,
-        backend: str,
-        version: int,
+        backend: str = "torch_dist",
+        version: int = 1,
         keep_only_main_replica: bool = True,
         thread_count: int = 1,
         cached_metadata: bool = False,
@@ -934,6 +937,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         4. resaves the new metadata and removes the old metadata
         5. removes the relevant files
         """
+        from ...utils import is_torch_min_version
 
         assert is_torch_min_version(
             "2.3.0"

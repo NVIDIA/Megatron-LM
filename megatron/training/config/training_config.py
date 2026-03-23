@@ -84,7 +84,7 @@ class TrainingConfig:
     """
 
     iterations_to_skip: list[int] = field(default_factory=list)
-    """List of iterations to skip during training, empty by default."""
+    """List of 1-indexed iterations to skip during training, empty by default."""
 
 
 @dataclass(kw_only=True)
