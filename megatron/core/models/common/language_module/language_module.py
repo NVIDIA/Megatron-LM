@@ -375,11 +375,23 @@ class LanguageModule(MegatronModule):
         self.embedding.reduce_scatter_embeddings = False
         self.embedding.word_embeddings.reduce_scatter_embeddings = False
 
-        # MTP layer: prevent scatter in _concat_embeddings.
+        # MTP layer: disable SP on the layer itself (controls scatter in
+        # _concat_embeddings) AND on every submodule that has a
+        # sequence_parallel attribute (eh_proj, transformer layer internals
+        # like ColumnParallelLinear/RowParallelLinear).  When SP is enabled,
+        # ColumnParallelLinear all-gathers the input along the sequence dim
+        # before the matmul; on replicated (non-scattered) inference tensors
+        # this inflates the sequence dimension by TP, causing a shape mismatch
+        # at the next depth's torch.cat.
         layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
         layer = self.mtp.layers[layer_idx]
         saved['mtp_layer_sp'] = layer.sequence_parallel
         layer.sequence_parallel = False
+        saved['mtp_submodule_sp'] = {}
+        for name, module in layer.named_modules():
+            if hasattr(module, 'sequence_parallel'):
+                saved['mtp_submodule_sp'][name] = module.sequence_parallel
+                module.sequence_parallel = False
 
         # Output layer: prevent gather from SP region on input.
         saved['output_layer_sp'] = self.output_layer.sequence_parallel
@@ -398,6 +410,9 @@ class LanguageModule(MegatronModule):
 
         for layer in self.mtp.layers:
             layer.sequence_parallel = saved['mtp_layer_sp']
+            for name, module in layer.named_modules():
+                if name in saved['mtp_submodule_sp']:
+                    module.sequence_parallel = saved['mtp_submodule_sp'][name]
 
         self.output_layer.sequence_parallel = saved['output_layer_sp']
 
