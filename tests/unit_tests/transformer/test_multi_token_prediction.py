@@ -984,9 +984,7 @@ class TestMTPSequenceParallelDisableRestore:
         flags = {}
         flags['embedding_scatter'] = model.embedding.scatter_to_sequence_parallel
         flags['embedding_reduce_scatter'] = model.embedding.reduce_scatter_embeddings
-        flags['word_emb_reduce_scatter'] = (
-            model.embedding.word_embeddings.reduce_scatter_embeddings
-        )
+        flags['word_emb_reduce_scatter'] = model.embedding.word_embeddings.reduce_scatter_embeddings
         layer_idx = 0 if model.mtp.mtp_use_repeated_layer else depth
         layer = model.mtp.layers[layer_idx]
         flags['mtp_layer_sp'] = layer.sequence_parallel
@@ -1035,7 +1033,7 @@ class TestMTPSequenceParallelDisableRestore:
         initial_flags = self._collect_sp_flags(model)
 
         saved = model._disable_sp_for_mtp(depth=0)
-        model._restore_sp_for_mtp(saved)
+        model._restore_sp_for_mtp(depth=0, saved=saved)
 
         restored_flags = self._collect_sp_flags(model)
         assert restored_flags == initial_flags
@@ -1053,7 +1051,7 @@ class TestMTPSequenceParallelDisableRestore:
             disabled_flags = self._collect_sp_flags(model, depth=depth)
             assert disabled_flags['mtp_layer_sp'] is False
 
-            model._restore_sp_for_mtp(saved)
+            model._restore_sp_for_mtp(depth, saved)
             restored_flags = self._collect_sp_flags(model, depth=depth)
             assert restored_flags == initial_flags
 
@@ -1066,7 +1064,7 @@ class TestMTPSequenceParallelDisableRestore:
         assert saved == {}
 
         # Restore with empty dict should be a no-op.
-        model._restore_sp_for_mtp(saved)
+        model._restore_sp_for_mtp(depth=0, saved=saved)
 
     @pytest.mark.parametrize('tp', [2, 4])
     def test_restore_happens_on_exception(self, tp):
@@ -1101,11 +1099,11 @@ class TestMTPSequenceParallelDisableRestore:
     @pytest.mark.parametrize(
         ('tp', 'num_positions'),
         [
-            (2, 3),   # 3 is not divisible by TP=2
-            (2, 5),   # 5 is not divisible by TP=2
-            (4, 3),   # 3 is not divisible by TP=4
-            (4, 5),   # 5 is not divisible by TP=4
-            (4, 7),   # 7 is not divisible by TP=4
+            (2, 3),  # 3 is not divisible by TP=2
+            (2, 5),  # 5 is not divisible by TP=2
+            (4, 3),  # 3 is not divisible by TP=4
+            (4, 5),  # 5 is not divisible by TP=4
+            (4, 7),  # 7 is not divisible by TP=4
         ],
     )
     def test_compute_mtp_single_step_non_aligned_sizes(self, tp, num_positions):
@@ -1118,9 +1116,7 @@ class TestMTPSequenceParallelDisableRestore:
         """
         hidden_size = 64
         vocab_size = 128
-        model, config = self._build_gpt_model(
-            tp, hidden_size=hidden_size, vocab_size=vocab_size
-        )
+        model, config = self._build_gpt_model(tp, hidden_size=hidden_size, vocab_size=vocab_size)
         assert config.sequence_parallel is True
         assert num_positions % tp != 0, "Test requires non-TP-aligned input size"
 

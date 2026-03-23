@@ -353,7 +353,7 @@ class LanguageModule(MegatronModule):
             )
             logits = self._scale_logits(logits)
         finally:
-            self._restore_sp_for_mtp(saved_sp_state)
+            self._restore_sp_for_mtp(depth, saved_sp_state)
 
         return mtp_hidden, logits
 
@@ -399,7 +399,7 @@ class LanguageModule(MegatronModule):
 
         return saved
 
-    def _restore_sp_for_mtp(self, saved: dict) -> None:
+    def _restore_sp_for_mtp(self, depth: int, saved: dict) -> None:
         """Restore sequence parallelism state after MTP inference."""
         if not saved:
             return
@@ -408,11 +408,12 @@ class LanguageModule(MegatronModule):
         self.embedding.reduce_scatter_embeddings = saved['embedding_reduce_scatter']
         self.embedding.word_embeddings.reduce_scatter_embeddings = saved['word_emb_reduce_scatter']
 
-        for layer in self.mtp.layers:
-            layer.sequence_parallel = saved['mtp_layer_sp']
-            for name, module in layer.named_modules():
-                if name in saved['mtp_submodule_sp']:
-                    module.sequence_parallel = saved['mtp_submodule_sp'][name]
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+        layer = self.mtp.layers[layer_idx]
+        layer.sequence_parallel = saved['mtp_layer_sp']
+        for name, module in layer.named_modules():
+            if name in saved['mtp_submodule_sp']:
+                module.sequence_parallel = saved['mtp_submodule_sp'][name]
 
         self.output_layer.sequence_parallel = saved['output_layer_sp']
 
