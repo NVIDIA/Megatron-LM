@@ -914,3 +914,171 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[2]) == bs
         assert len(log_probs_list[3]) == cached_ql
         assert len(log_probs_list[4]) == bs
+
+
+class TestMambaSlotAllocator(PrefixCachingTestBase):
+
+    def _mctx(self, **kwargs):
+        defaults = dict(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        defaults.update(kwargs)
+        return self._ctx(**defaults)
+
+    @pytest.mark.internal
+    def test_allocate_slots_batch(self):
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+        msa = ctx.mamba_slot_allocator
+
+        # Basic batch: allocate 3 new slots, verify unique slots and mappings
+        prompt = self._prompt(bs * 4)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        bids = self._block_ids(ctx, 0, 3)
+        initial_free = msa.free_count
+        slots = msa.allocate_slots_batch(bids)
+        assert len(slots) == 3
+        assert len(set(slots)) == 3  # all unique
+        assert msa.free_count == initial_free - 3
+        for bid, slot in zip(bids, slots):
+            assert msa.block_to_slot[bid].item() == slot
+            assert msa.slot_to_block[slot].item() == bid
+
+        # Existing slots: same block_ids return same slots without consuming pool
+        free_before = msa.free_count
+        slots2 = msa.allocate_slots_batch(bids)
+        assert slots2 == slots
+        assert msa.free_count == free_before
+
+        # Dedup: same block_id twice, only one free slot consumed
+        ctx2 = self._mctx()
+        ctx2.add_request(self._req(ctx2, self._prompt(bs * 2)))
+        bid_new = self._block_ids(ctx2, 0, 1)[0]
+        msa2 = ctx2.mamba_slot_allocator
+        free_before2 = msa2.free_count
+        dup_slots = msa2.allocate_slots_batch([bid_new, bid_new])
+        assert dup_slots[0] == dup_slots[1]
+        assert msa2.free_count == free_before2 - 1
+
+        # Mixed: pre-allocated + new in one call
+        ctx3 = self._mctx()
+        ctx3.add_request(self._req(ctx3, self._prompt(bs * 3)))
+        bids3 = self._block_ids(ctx3, 0, 3)
+        msa3 = ctx3.mamba_slot_allocator
+        pre_slot = msa3.allocate_slot(bids3[0])
+        free_before3 = msa3.free_count
+        mixed_slots = msa3.allocate_slots_batch(bids3)
+        assert mixed_slots[0] == pre_slot
+        assert msa3.free_count == free_before3 - 2  # only 2 new
+
+        # Eviction: exhaust free pool, verify eviction fires and returns valid slots
+        ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
+        msa4 = ctx4.mamba_slot_allocator
+        total_slots = msa4.max_slots
+        ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))
+        bids4 = self._block_ids(ctx4, 0, 4)
+        # Allocate all available slots by filling the free pool
+        fill_bids = bids4[:min(total_slots, 4)]
+        fill_slots = msa4.allocate_slots_batch(fill_bids)
+        assert len(fill_slots) == len(fill_bids)
+        # If we can exhaust the pool, test eviction
+        if total_slots <= 4:
+            assert msa4.free_count == 0
+            # Set ref counts to 0 so blocks are evictable
+            for bid in fill_bids:
+                ctx4.kv_block_allocator.block_ref_counts[bid] = 0
+            # Invalidate old slots, then reallocate to test eviction path
+            for bid in fill_bids:
+                msa4.invalidate_block(bid)
+            evict_slots = msa4.allocate_slots_batch(fill_bids)
+            assert len(evict_slots) == len(fill_bids)
+
+    @pytest.mark.internal
+    def test_commit_intermediate_states_batched(self):
+        ctx = self._mctx(block_size_tokens=256)
+        bs = ctx.block_size_tokens
+        msa = ctx.mamba_slot_allocator
+        alloc = ctx.kv_block_allocator
+        metadata = ctx.mamba_metadata
+
+        # Set up context with a prefill request that has block-aligned prompt
+        prompt = self._prompt(bs * 3)
+        req = self._req(ctx, prompt.clone())
+        req._mamba_num_matched_blocks = 0
+        ctx.add_request(req)
+
+        # initialize_attention_state sets batch_dimensions and mamba metadata
+        ctx.initialize_attention_state()
+
+        # Determine prefill_start for this batch
+        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+        ctx_idx = prefill_start  # first prefill request
+
+        # Write known patterns to intermediate output buffers
+        for layer in range(ctx.num_mamba_layers):
+            msa.intermediate_ssm_out[layer, 0] = layer + 1.0
+            msa.intermediate_conv_out[layer, 0] = layer + 100.0
+
+        # Set up intermediate offsets: 1 intermediate at src_offset=0
+        bid0 = ctx.request_to_kv_block_ids[ctx_idx][0].item()
+        msa._intermediate_block_ids_gpu[ctx_idx, 0] = bid0
+        msa._intermediate_offsets_gpu[ctx_idx, 0] = 128
+        msa._intermediate_counts_gpu[ctx_idx] = 1
+        msa._has_intermediates = True
+
+        # Set metadata fields that would normally be set by _update_intermediate_offsets
+        metadata.intermediate_count = 1
+        metadata.per_request_intermediate_counts = [1]
+
+        # Set up EOS block (block-aligned prompt)
+        eos_bid = ctx.request_to_kv_block_ids[ctx_idx][2].item()
+        msa._eos_cache_block_id_gpu[ctx_idx] = eos_bid
+
+        # Write known patterns to live mamba state for EOS copy
+        mamba_idx = metadata.request_to_mamba_state_idx[ctx_idx].item()
+        for layer in range(ctx.num_mamba_layers):
+            ctx.mamba_conv_states[layer, mamba_idx] = layer + 200.0
+            ctx.mamba_ssm_states[layer, mamba_idx] = layer + 300.0
+
+        # Call the batched commit
+        msa.commit_intermediate_states()
+
+        # Verify intermediate state was copied to correct slot
+        slot0 = msa.block_to_slot[bid0].item()
+        assert slot0 >= 0
+        for layer in range(ctx.num_mamba_layers):
+            assert torch.allclose(
+                msa.ssm_states[layer, slot0],
+                torch.full_like(msa.ssm_states[layer, slot0], layer + 1.0),
+            )
+            assert torch.allclose(
+                msa.conv_states[layer, slot0],
+                torch.full_like(msa.conv_states[layer, slot0], layer + 100.0),
+            )
+
+        # Verify EOS state was copied from live buffer
+        eos_slot = msa.block_to_slot[eos_bid].item()
+        assert eos_slot >= 0
+        for layer in range(ctx.num_mamba_layers):
+            assert torch.allclose(
+                msa.conv_states[layer, eos_slot],
+                torch.full_like(msa.conv_states[layer, eos_slot], layer + 200.0),
+            )
+            assert torch.allclose(
+                msa.ssm_states[layer, eos_slot],
+                torch.full_like(msa.ssm_states[layer, eos_slot], layer + 300.0),
+            )
+
+        # Verify hash_to_block_id updated for valid hashes
+        bid0_hash = alloc.block_hashes[bid0].item()
+        eos_hash = alloc.block_hashes[eos_bid].item()
+        if bid0_hash > 0:
+            assert msa.hash_to_block_id.get(bid0_hash) == bid0
+        if eos_hash > 0:
+            assert msa.hash_to_block_id.get(eos_hash) == eos_bid
+
+        # Verify _has_intermediates cleared
+        assert not msa._has_intermediates
