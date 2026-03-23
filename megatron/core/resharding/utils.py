@@ -44,6 +44,11 @@ class ParameterMetadata:
     is_tp: bool = False
     partition_dim: int = 0
     partition_stride: int = 1
+    # For parameters that pack multiple independently-sharded components of
+    # different sizes (e.g. Mamba in_proj packs z, x, B, C, dt).  When present,
+    # lists the per-TP-rank block sizes along partition_dim.  The refit planner
+    # interleaves these blocks rather than doing a simple contiguous concat.
+    partition_sizes: list[int] | None = None
 
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
@@ -252,44 +257,75 @@ def extract_param_metadata(
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
     rank_offset: int = 0,
+    _rank_list_cache: dict | None = None,
 ) -> ParameterMetadata:
-    """Extract metadata from a parameter for cross-rank communication."""
+    """Extract metadata from a parameter for cross-rank communication.
+
+    Args:
+        _rank_list_cache: Optional dict used to deduplicate rank lists so
+            that params sharing the same process group reuse one object.
+            This dramatically shrinks pickle size when metadata is gathered
+            across many ranks (pickle uses backreferences for same-``id()``
+            objects, avoiding re-serialization of identical group lists).
+    """
     # TP flags from attributes (set by Megatron linear layers)
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
-
-    # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
-    # and requires partition_stride=2 for correct resharding. New models set this at construction
-    # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
-    # where stride=1 was left as default, we apply stride=2 as a fallback for fc1 parameters.
-    # This is safe because: (1) gated models need it, and (2) non-gated models have smaller fc1
-    # and stride doesn't affect single-block transfers.
-    # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
-    #     partition_stride = 2
+    partition_sizes = getattr(param, 'partition_sizes', None)
+    if partition_sizes is not None:
+        partition_sizes = list(partition_sizes)
 
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
+
+    # Expert-param detection for TP inference.  When explicit_expert_comm is
+    # active (is_expert and (tp_size>1 or ep)), TE clears parallel_mode so
+    # tensor_model_parallel is never stamped — yet the weight IS TP-sharded
+    # when tp_size > 1.  We detect expert params via num_experts + the
+    # per-expert naming convention (weightK / biasK in TEGroupedLinear).
+    is_expert_param = (
+        num_experts is not None and _detect_expert_index_from_param_name(param_name) is not None
+    )
 
     tensor_parallel_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    def _offset_ranks(ranks: list[int]) -> list[int]:
-        return [r + rank_offset for r in ranks] if rank_offset else ranks
+    # Deduplicate rank lists: params sharing the same TP/DP/EP/PP group get
+    # one shared list object instead of separate copies.  This shrinks pickle
+    # size ~75% when metadata is gathered across many ranks (pickle uses
+    # backreferences for same-id() objects).
+    if _rank_list_cache is None:
+        _rank_list_cache = {}
 
-    if is_ep:
-        expert_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.ep))
-        # For MoE params, prefer expert TP group when available, else regular TP
-        if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(
-                dist.get_process_group_ranks(pg_collection.expt_tp)
+    def _dedup_ranks(ranks: list[int]) -> list[int]:
+        key = tuple(ranks)
+        if key not in _rank_list_cache:
+            _rank_list_cache[key] = list(key)
+        return _rank_list_cache[key]
+
+    def _offset_ranks(ranks: list[int]) -> list[int]:
+        result = [r + rank_offset for r in ranks] if rank_offset else ranks
+        return _dedup_ranks(result)
+
+    if is_ep or is_expert_param:
+        if is_ep:
+            expert_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.ep)
             )
-        elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(
-                dist.get_process_group_ranks(pg_collection.tp)
-            )
+        # For expert params, always provide TP group ranks so the planner can
+        # handle TP size transitions (e.g., TP2→TP1).  When explicit_expert_comm
+        # clears TE's parallel_mode, tensor_model_parallel may not be set even
+        # though the weight IS TP-sharded.  Detect TP via group size instead.
+        expt_tp = getattr(pg_collection, 'expt_tp', None)
+        tp_grp = expt_tp if expt_tp is not None else getattr(pg_collection, 'tp', None)
+        if tp_grp is not None:
+            tp_ranks = _offset_ranks(dist.get_process_group_ranks(tp_grp))
+            tensor_parallel_group_ranks = tp_ranks
+            if not is_tp and len(tp_ranks) > 1:
+                is_tp = True
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
@@ -301,13 +337,24 @@ def extract_param_metadata(
     else:
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
 
+    # Always provide TP group ranks so the planner can handle TP size transitions
+    # (e.g., TP2→TP1).  When is_tp=False the param is replicated across the TP group,
+    # but the planner still needs to know the TP topology to plan gather/scatter ops
+    # when the *other* side of the reshard IS TP-sharded.
+    if (
+        tensor_parallel_group_ranks is None
+        and hasattr(pg_collection, 'tp')
+        and pg_collection.tp is not None
+    ):
+        tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
+
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
         pipeline_parallel_group_ranks = _offset_ranks(
             dist.get_process_group_ranks(pg_collection.pp)
         )
     else:
-        pipeline_parallel_group_ranks = list(
-            range(rank_offset, rank_offset + dist.get_world_size())
+        pipeline_parallel_group_ranks = _dedup_ranks(
+            list(range(rank_offset, rank_offset + dist.get_world_size()))
         )
 
     meta = ParameterMetadata(
@@ -318,6 +365,7 @@ def extract_param_metadata(
         is_tp=is_tp,
         partition_dim=partition_dim,
         partition_stride=partition_stride,
+        partition_sizes=partition_sizes,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,
