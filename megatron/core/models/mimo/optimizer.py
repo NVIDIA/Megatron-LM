@@ -192,7 +192,9 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
     from megatron.core.optimizer import get_megatron_optimizer
 
     grid_map = mimo_model.mimo_config.module_to_grid_map
-    lang_key = mimo_model.mimo_config.language_module_key
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+    lang_key = MIMO_LANGUAGE_MODULE_KEY
 
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
 

@@ -213,7 +213,6 @@ def run_distributed_test():
         modality_submodules_spec={"images": vision_spec},
         special_token_ids={"images": 50257},
         module_to_grid_map={"images": encoder_grid, "language": llm_grid},
-        language_module_key="language",
     )
 
     mimo_model = MimoModel(mimo_config)
