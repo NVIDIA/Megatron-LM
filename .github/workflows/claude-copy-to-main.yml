@@ -66,7 +66,7 @@ jobs:
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
 
-            You are a PR copy assistant. Your job is to cherry-pick the commits from a merged PR onto a new branch based on `main` and create a new PR targeting `main`.
+            You are a PR copy assistant. Your job is to apply the final changes from a merged PR onto a new branch based on `main` and create a new PR targeting `main`.
 
             The PR's commits originated from a fork and have been fetched locally as the branch: pr-${PR_NUMBER}-head
 
@@ -74,32 +74,33 @@ jobs:
             1. Get the PR details (title, body, and base branch):
                gh pr view $PR_NUMBER --repo $REPO --json title,body,baseRefName
 
-            2. Identify the commits to cherry-pick. The PR was merged into its base branch, and the
-               fork commits are on the local branch pr-${PR_NUMBER}-head. Use the merge base to find
-               just the PR's commits:
-               git log --reverse --format="%H" $(git merge-base origin/<baseRefName> pr-${PR_NUMBER}-head)..pr-${PR_NUMBER}-head
-               (Replace <baseRefName> with the actual base branch name from step 1.)
-
-            3. Configure git for committing (use the svcnvidia-nemo-ci service account since secrets.PAT belongs to it):
+            2. Configure git for committing (use the svcnvidia-nemo-ci service account since secrets.PAT belongs to it):
                git config user.name "svcnvidia-nemo-ci"
                git config user.email "svcnvidia-nemo-ci@nvidia.com"
 
-            4. Create a new branch from `main`:
+            3. Create a new branch from `main`:
                git checkout main
                git pull origin main
                git checkout -b copy-pr-${PR_NUMBER}-to-main
 
-            5. Cherry-pick each commit from step 2 onto the new branch, in chronological order.
-               For each commit SHA, run: git cherry-pick <sha>
+            4. Generate a patch of the PR's final changes and apply it:
+               MERGE_BASE=$(git merge-base origin/<baseRefName> pr-${PR_NUMBER}-head)
+               git diff $MERGE_BASE pr-${PR_NUMBER}-head | git apply --3way
+               (Replace <baseRefName> with the actual base branch name from step 1.)
 
-               If a cherry-pick fails due to merge conflicts:
+               If the apply fails due to merge conflicts:
                a. Identify conflicted files: git diff --name-only --diff-filter=U
                b. For each conflicted file, read its contents to see the conflict markers
-               c. Resolve the conflicts intelligently by understanding the intent of both sides of the change
+               c. Resolve the conflicts by favoring the `main` branch side when there is a genuine
+                  conflict between the two sides. The goal is to bring the PR's changes into main
+                  without overriding what is already on main.
                d. Stage the resolved files: git add <file>
-               e. Continue the cherry-pick: git cherry-pick --continue --no-edit
 
-            6. After all commits are cherry-picked, push the new branch:
+            5. Commit the changes:
+               git add -A
+               git commit -m "Copy PR #${PR_NUMBER} to main"
+
+            6. Push the new branch:
                git push origin copy-pr-${PR_NUMBER}-to-main
 
             7. Create a new PR targeting `main`:
@@ -112,10 +113,7 @@ jobs:
             8. Comment on the original PR with a link to the newly created PR.
 
             IMPORTANT:
-            - The PR commits come from a fork. Use the local pr-${PR_NUMBER}-head branch (NOT gh pr view --json commits) to get commit SHAs, since fork OIDs may not exist in the base repo after squash/rebase merges.
-            - Resolve merge conflicts thoughtfully by understanding the code context on both sides.
-            - Make sure ALL cherry-picks complete successfully before pushing.
+            - When resolving merge conflicts, favor `main` over the non-main branch. Do not override changes already on main.
             - Do NOT force push.
-            - Do NOT skip or drop any commits.
           claude_args: |
             --allowedTools "Bash(git:*),Bash(gh:*),Read,Edit"
