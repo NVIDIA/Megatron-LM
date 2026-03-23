@@ -44,18 +44,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 
-def param_is_not_shared(param: nn.Parameter) -> bool:
-    """Check if a parameter is marked as not shared.
-
-    Args:
-        param (torch.nn.Parameter): The parameter to check.
-
-    Returns:
-        bool: True if the parameter does not have a 'shared' attribute or if
-              param.shared is False.
-    """
-    return not hasattr(param, "shared") or not param.shared
-
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
