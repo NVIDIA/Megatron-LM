@@ -2621,7 +2621,6 @@ dev = [
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "multi-storage-client" },
-    { name = "nv-grouped-gemm" },
     { name = "nvidia-modelopt", marker = "(sys_platform != 'darwin' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
@@ -2648,7 +2647,6 @@ lts = [
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "multi-storage-client" },
-    { name = "nv-grouped-gemm" },
     { name = "nvtx" },
     { name = "onnxscript" },
     { name = "opentelemetry-api", version = "1.33.1", source = { registry = "https://pypi.org/simple" } },
@@ -2759,8 +2757,6 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
-    { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
-    { name = "nv-grouped-gemm", marker = "extra == 'lts'", specifier = "~=1.1" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=v0.5.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
@@ -3552,18 +3548,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/fd/16d710c085d28ba4feaf29ac60c936c9d662e390344f94a6beaa2ac9899b/numpy-2.4.3-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8e236dbda4e1d319d681afcbb136c0c4a8e0f1a5c58ceec2adebb547357fe857", size = 16729409, upload-time = "2026-03-09T07:58:47.972Z" },
     { url = "https://files.pythonhosted.org/packages/57/a7/b35835e278c18b85206834b3aa3abe68e77a98769c59233d1f6300284781/numpy-2.4.3-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:4b42639cdde6d24e732ff823a3fa5b701d8acad89c4142bc1d0bd6dc85200ba5", size = 12504685, upload-time = "2026-03-09T07:58:50.525Z" },
 ]
-
-[[package]]
-name = "nv-grouped-gemm"
-version = "1.1.4.post8"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "absl-py" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "torch", marker = "sys_platform == 'never'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/02/ad/046a097b63a96c1ba1d85f0031dbe7fcbdb33e6c445dfbaba2ffaefdd497/nv_grouped_gemm-1.1.4.post8.tar.gz", hash = "sha256:ab321693f0292cfd8a26dc7b6f14decd9eb00e209494de7218e4fad36191275d", size = 20821209, upload-time = "2025-12-17T02:22:38.432Z" }
 
 [[package]]
 name = "nv-one-logger-core"
