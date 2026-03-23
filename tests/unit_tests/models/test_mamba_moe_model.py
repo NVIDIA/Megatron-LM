@@ -282,6 +282,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delay_offload_until_cuda_graph": False,
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
+    "dynamic_context_parallel": False,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_torch_grouped_mm": False,
