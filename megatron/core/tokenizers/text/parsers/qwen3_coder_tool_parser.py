@@ -41,6 +41,27 @@ class _Qwen3CoderToolParser:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    def _extract_declared_types(self, schema: Any) -> set[str]:
+        """Recursively extract declared JSON-schema type names."""
+        declared: set[str] = set()
+        if not isinstance(schema, dict):
+            return declared
+
+        schema_type = schema.get("type")
+        if isinstance(schema_type, str):
+            declared.add(schema_type.strip().lower())
+        elif isinstance(schema_type, list):
+            for item in schema_type:
+                if isinstance(item, str):
+                    declared.add(item.strip().lower())
+
+        for combinator in ("anyOf", "oneOf", "allOf"):
+            options = schema.get(combinator)
+            if isinstance(options, list):
+                for option in options:
+                    declared.update(self._extract_declared_types(option))
+        return declared
+
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
     ) -> dict:
@@ -48,21 +69,29 @@ class _Qwen3CoderToolParser:
         if tools is None:
             return {}
         for config in tools:
-            config = SimpleNamespace(**config)  # Convert to SimpleNamespace for ease of access
-            if not hasattr(config, "type") or not (
-                hasattr(config, "function") and hasattr(config.function, "name")
-            ):
+            if isinstance(config, dict):
+                config_type = config.get("type")
+                function = config.get("function")
+            else:
+                config = SimpleNamespace(**config)
+                config_type = getattr(config, "type", None)
+                function = getattr(config, "function", None)
+
+            if isinstance(function, dict):
+                function_name = function.get("name")
+                params = function.get("parameters")
+            else:
+                function_name = getattr(function, "name", None)
+                params = getattr(function, "parameters", None)
+
+            if config_type != "function" or function_name != func_name:
                 continue
-            if config.type == "function" and config.function.name == func_name:
-                if not hasattr(config.function, "parameters"):
-                    return {}
-                params = config.function.parameters
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
-                    return params
-                else:
-                    return {}
+            if isinstance(params, dict) and "properties" in params:
+                return params["properties"]
+            elif isinstance(params, dict):
+                return params
+            else:
+                return {}
         logger.debug("Tool '%s' is not defined in the tools list.", func_name)
         return {}
 
@@ -85,10 +114,29 @@ class _Qwen3CoderToolParser:
                 )
             return param_value
 
-        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
-            param_type = str(param_config[param_name]["type"]).strip().lower()
-        else:
-            param_type = "string"
+        param_schema = (
+            param_config[param_name] if isinstance(param_config[param_name], dict) else {}
+        )
+        declared_types = self._extract_declared_types(param_schema)
+        param_type = next(iter(declared_types), "string")
+
+        # If schema allows structured values (array/object), prefer parsing before fallback.
+        if declared_types & {"array", "arr", "object"}:
+            try:
+                return json.loads(param_value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                try:
+                    return ast.literal_eval(param_value)
+                except (ValueError, SyntaxError, TypeError):
+                    logger.debug(
+                        "Parsed value '%s' of parameter '%s' could not be coerced to "
+                        "structured type in tool '%s'.",
+                        param_value,
+                        param_name,
+                        func_name,
+                    )
+                    return param_value
+
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
         elif (

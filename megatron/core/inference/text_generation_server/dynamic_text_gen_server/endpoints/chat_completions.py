@@ -93,6 +93,40 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+_STRUCTURED_TOOL_ARG_KEYS = {
+    "flights",
+    "passengers",
+    "payment_methods",
+    "payment_history",
+}
+
+
+def _try_parse_jsonish(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except (TypeError, ValueError):
+        return value
+
+
+def _normalize_structured_tool_arguments(arguments):
+    """Coerce known structured tool args from JSON strings to objects/lists."""
+    if not isinstance(arguments, dict):
+        return arguments
+    normalized = dict(arguments)
+    for key in _STRUCTURED_TOOL_ARG_KEYS:
+        if key not in normalized:
+            continue
+        parsed = _try_parse_jsonish(normalized[key])
+        if isinstance(parsed, (dict, list)):
+            normalized[key] = parsed
+    return normalized
+
+
 def _normalize_tool_calls(tool_calls):
     """Normalize tool calls to OpenAI-compatible JSON primitives."""
     normalized = []
@@ -102,7 +136,20 @@ def _normalize_tool_calls(tool_calls):
         fn_args = _get_field(fn, "arguments", "")
         if fn_name is None:
             continue
-        if not isinstance(fn_args, str):
+        if isinstance(fn_args, str):
+            try:
+                parsed_args = json.loads(fn_args)
+            except (TypeError, ValueError):
+                parsed_args = None
+            if isinstance(parsed_args, dict):
+                fn_args = json.dumps(
+                    _normalize_structured_tool_arguments(parsed_args), ensure_ascii=False
+                )
+        elif isinstance(fn_args, dict):
+            fn_args = json.dumps(
+                _normalize_structured_tool_arguments(fn_args), ensure_ascii=False
+            )
+        else:
             try:
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             except TypeError:
