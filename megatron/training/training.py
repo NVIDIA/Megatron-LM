@@ -33,6 +33,7 @@ def set_startup_timestamps(program_start=None, main_entry=None):
 
 from collections import defaultdict
 import copy
+import csv
 import dataclasses
 from datetime import datetime, timedelta
 import functools
@@ -57,6 +58,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
 
 _LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
+
+# Per-GPU power CSV state (set up in train(), used in training_log())
+_POWER_CSV_FILE = None
+_POWER_CSV_WRITER = None
 
 import torch
 
@@ -2226,6 +2231,19 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'iter-energy/gpu': energy}, iteration)
                 wandb_writer.log({'power/gpu': power}, iteration)
+            # Per-GPU power CSV (rank 0 only, when --log-energy-csv-dir is set)
+            if _POWER_CSV_WRITER is not None:
+                per_gpu_energy = energy_monitor.get_last_lap_per_gpu()
+                if per_gpu_energy:
+                    total_elapsed = elapsed_time_per_iteration * total_iterations
+                    per_gpu_power = [e / total_elapsed for e in per_gpu_energy]
+                    avg_power = sum(per_gpu_power) / len(per_gpu_power)
+                    _POWER_CSV_WRITER.writerow(
+                        [iteration, datetime.now().isoformat()]
+                        + [f'{p:.1f}' for p in per_gpu_power]
+                        + [f'{avg_power:.1f}']
+                    )
+                    _POWER_CSV_FILE.flush()
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
@@ -2756,6 +2774,18 @@ def train(
         energy_monitor.setup()
         energy_monitor.resume()
 
+    # Per-GPU power CSV setup (rank 0 only)
+    global _POWER_CSV_FILE, _POWER_CSV_WRITER
+    if args.log_energy_csv_dir is not None and args.rank == 0:
+        os.makedirs(args.log_energy_csv_dir, exist_ok=True)
+        csv_path = os.path.join(args.log_energy_csv_dir, 'power_per_gpu.csv')
+        _POWER_CSV_FILE = open(csv_path, 'w', newline='')
+        _POWER_CSV_WRITER = csv.writer(_POWER_CSV_FILE)
+        header = (['iteration', 'timestamp']
+                  + [f'gpu_{i}_power_w' for i in range(args.world_size)]
+                  + ['avg_power_w'])
+        _POWER_CSV_WRITER.writerow(header)
+
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
@@ -3239,6 +3269,10 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    # Close per-GPU power CSV
+    if _POWER_CSV_FILE is not None:
+        _POWER_CSV_FILE.close()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:

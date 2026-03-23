@@ -318,6 +318,10 @@ class LoggerConfig:
     log_energy: bool = False
     """If set, log energy consumption (in Joules)."""
 
+    log_energy_csv_dir: str | None = None
+    """Directory to save per-GPU power CSV. If not set, no CSV is written.
+    When set, implies --log-energy (aggregate power logging is also enabled)."""
+
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
