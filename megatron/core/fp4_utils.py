@@ -42,11 +42,86 @@ else:
     HAVE_TE_FP4_TENSOR_CLASS = False
     FP4_TENSOR_CLASS = None
 
+try:
+    from transformer_engine.pytorch.tensor.utils import (
+        post_all_gather_processing as te_post_all_gather_processing,
+    )
+except ImportError:
+    te_post_all_gather_processing = None
 
 def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine NVFP4Tensor."""
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
 
+def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
+    """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
+    if len(shape) == 0:
+        return shape
+    assert shape[-1] % 2 == 0, "NVFP4 requires inner dimension divisible by 2"
+    packed = list(shape)
+    packed[-1] = packed[-1] // 2
+    return torch.Size(packed)
+
+
+def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: torch.Tensor) -> None:
+    """Replace NVFP4 tensor's rowwise raw data with a new uint8 storage view.
+
+    Copies existing bytes into the new buffer, then swaps the underlying pointer.
+    """
+    if not is_nvfp4tensor(fp4_tensor):
+        raise ValueError("modify_nvfp4_rowwise_storage expects an NVFP4 tensor")
+    # Access TE's internal storage fields
+    old_rowwise = getattr(fp4_tensor, "_rowwise_data", None)
+    if old_rowwise is None:
+        raise RuntimeError("NVFP4 tensor is missing rowwise data to replace")
+    assert (
+        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
+    ), "Rowwise NVFP4 storage must be uint8"
+    # Preserve existing values and then swap storage
+    new_rowwise_data.detach().copy_(old_rowwise)
+    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
+
+def quantize_nvfp4_param_shard(
+    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+):
+    """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
+
+    This function wraps Transformer Engine's quantize_master_weights, which handles:
+    - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
+    - Partial casting with nibble-accurate updates
+    - Coordinated amax reduction across data parallel group
+
+    Args:
+        model_params: List of NVFP4 model parameters (NVFP4Tensor).
+        main_params: List of FP32 master weights (shards).
+        start_offsets: List of starting offsets in the full model weight for each shard.
+        data_parallel_group: Distributed group for amax reduction.
+        fsdp_shard_model_params: Optional list of FSDP sharded model params.
+    """
+    if not HAVE_TE_FP4_TENSOR_CLASS:
+        raise RuntimeError(
+            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
+        )
+
+    try:
+        from transformer_engine.pytorch.tensor.utils import quantize_master_weights
+    except ImportError:
+        raise RuntimeError(
+            "quantize_master_weights not available in this Transformer Engine version"
+        )
+
+    if len(model_params) == 0:
+        return
+
+    args = [model_params, main_params, start_offsets, data_parallel_group]
+    if fsdp_shard_model_params is not None:
+        args.append(fsdp_shard_model_params)
+
+    kwargs = {}
+    if te_post_all_gather_processing is not None:
+        kwargs["manual_post_all_gather_processing"] = True
+
+    quantize_master_weights(*args, **kwargs)
 
 def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     """
@@ -96,8 +171,9 @@ if HAVE_TE:
         if is_te_min_version("2.7.0.dev0"):
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
+                    # Enable SR after debugging:
                     fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(
-                        fp8_dpa=config.fp8_dot_product_attention
+                        fp8_dpa=config.fp8_dot_product_attention, disable_stochastic_rounding=True
                     )
                 except AttributeError:
                     raise ValueError(
@@ -158,6 +234,10 @@ if HAVE_TE:
                     in inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
                     context_args["recipe"] = fp4_recipe
+                if "preserve_high_precision_init_val" in (
+                    inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
+                ):
+                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp4_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
         return fp4_context
