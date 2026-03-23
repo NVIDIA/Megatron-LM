@@ -51,6 +51,8 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps._MODEL_PARALLEL_GROUP is None
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_parallel_initializations(order):
     Utils.initialize_model_parallel(
@@ -63,6 +65,8 @@ def test_pipeline_parallel_initializations(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_data_parallel_initializations(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
@@ -72,6 +76,8 @@ def test_data_parallel_initializations(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_tensor_model_parellel_world_size(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
@@ -81,6 +87,8 @@ def test_tensor_model_parellel_world_size(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_expert_tensor_parellel_world_size(order):
     Utils.initialize_model_parallel(expert_tensor_parallel_size=world_size, order=order)
@@ -90,6 +98,8 @@ def test_expert_tensor_parellel_world_size(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_model_parallel_world_size(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
@@ -99,6 +109,8 @@ def test_pipeline_model_parallel_world_size(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_tensor_model_parallel_rank(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
@@ -108,6 +120,8 @@ def test_tensor_model_parallel_rank(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_moe_tensor_model_parellel_rank(order):
     Utils.initialize_model_parallel(expert_tensor_parallel_size=world_size, order=order)
@@ -117,6 +131,8 @@ def test_moe_tensor_model_parellel_rank(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_model_parallel_rank(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
@@ -126,12 +142,16 @@ def test_pipeline_model_parallel_rank(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_context_parallel_rank():
     Utils.initialize_model_parallel(context_parallel_size=world_size)
     assert ps.get_context_parallel_rank() == rank
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_expert_model_parallel_rank():
     Utils.initialize_model_parallel(expert_model_parallel_size=world_size)
     assert ps.get_expert_model_parallel_rank() == rank
@@ -140,6 +160,8 @@ def test_expert_model_parallel_rank():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_first_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
@@ -148,6 +170,8 @@ def test_is_pipeline_first_stage(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_last_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
