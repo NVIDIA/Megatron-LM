@@ -103,7 +103,7 @@ class MambaSlotAllocator:
         )
 
     # =========================================================================
-    # Slot management
+    # Slot allocation
     # =========================================================================
 
     def allocate_slots_batch(self, block_ids: list) -> list:
@@ -169,17 +169,6 @@ class MambaSlotAllocator:
                 result.append(alloc_bid_to_slot[bid])
         return result
 
-    def allocate_slot(self, block_id: int) -> int:
-        """Get a free Mamba cache slot for a block, evicting if necessary.
-
-        Args:
-            block_id: The KV block ID to associate with this slot.
-
-        Returns:
-            The allocated slot index.
-        """
-        return self.allocate_slots_batch([block_id])[0]
-
     def _evict_lru_slots_batch(self, num_needed: int) -> list:
         """Evict the least recently used Mamba cache slots.
 
@@ -240,10 +229,12 @@ class MambaSlotAllocator:
         """Check if a block has cached Mamba state."""
         return self.block_to_slot[block_id].item() >= 0
 
+    # =========================================================================
+    # Slot invalidation and deregistration
+    # =========================================================================
+
     def invalidate_block(self, block_id: int) -> None:
         """Free cache slot and clear mappings for a block.
-
-        Called when KV blocks are evicted/deregistered.
 
         Args:
             block_id: The KV block ID.
@@ -281,6 +272,23 @@ class MambaSlotAllocator:
         self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
         self.free_count += n
 
+    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
+        """Handle KV block deregistration by cleaning up Mamba state.
+
+        Called by KVBlockAllocator._deregister_blocks via callback.
+
+        Args:
+            block_ids_list: List of deregistered block IDs.
+            hashes_to_delete: Set of hashes being deregistered (excludes -1).
+        """
+        if self.hash_to_block_id:
+            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
+            if mamba_keys:
+                from collections import deque
+
+                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
+                self._invalidate_blocks_batch(block_ids_list)
+
     # =========================================================================
     # State store/restore
     # =========================================================================
@@ -304,8 +312,6 @@ class MambaSlotAllocator:
     def store_from_live_batch(self, slots: list, request_indices: list) -> None:
         """Copy all layers from live per-request buffers to cache slots.
 
-        Batched version that avoids per-request GPU syncs.
-
         Args:
             slots: List of cache slot indices.
             request_indices: List of context request indices.
@@ -321,20 +327,6 @@ class MambaSlotAllocator:
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
         self.ssm_states[:, slot_tensor] = self.context.mamba_ssm_states[:, mamba_idx_tensor]
-
-    def store_from_live(self, block_id: int, request_idx: int) -> None:
-        """Copy all layers from live per-request buffer to cache slot.
-
-        Used for block-aligned EOS case where the final kernel state
-        is in the live buffer.
-
-        Args:
-            block_id: The KV block ID.
-            request_idx: The context request index.
-        """
-        slot = self.block_to_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no Mamba cache slot"
-        self.store_from_live_batch([slot], [request_idx])
 
     def restore_to_live(self, request_idx: int, block_id: int) -> bool:
         """Copy all layers from cache slot to live request state.
@@ -358,38 +350,21 @@ class MambaSlotAllocator:
     # Hash registration
     # =========================================================================
 
-    def register_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block as having cached Mamba state.
+    def register_block_hashes_batch(self, block_ids: list, hashes: list) -> None:
+        """Register multiple blocks as having cached Mamba state.
+
+        Only registers entries where hash > 0.
 
         Args:
-            block_id: The block ID.
-            block_hash: The block's hash value.
+            block_ids: List of block IDs.
+            hashes: List of hash values (same length as block_ids).
         """
-        self.hash_to_block_id[block_hash] = block_id
+        updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
+        if updates:
+            self.hash_to_block_id.update(updates)
 
     # =========================================================================
-    # Deregistration callback
-    # =========================================================================
-
-    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
-        """Handle KV block deregistration by cleaning up Mamba state.
-
-        Called by KVBlockAllocator._deregister_blocks via callback.
-
-        Args:
-            block_ids_list: List of deregistered block IDs.
-            hashes_to_delete: Set of hashes being deregistered (excludes -1).
-        """
-        if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
-                from collections import deque
-
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                self._invalidate_blocks_batch(block_ids_list)
-
-    # =========================================================================
-    # Intermediate offset tracking
+    # Intermediate state tracking
     # =========================================================================
 
     def compute_and_store_offsets(
@@ -492,6 +467,37 @@ class MambaSlotAllocator:
         counts = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
         return offsets, counts
 
+    # =========================================================================
+    # Intermediate state commit
+    # =========================================================================
+
+    def commit_intermediate_states(self) -> None:
+        """Commit intermediate states from pre-allocated output buffers to cache.
+
+        Called after the forward pass (including CUDA graph replay) completes.
+        Batched pipeline: collect data, allocate slots, copy states, register hashes.
+        """
+        collected = self._collect_commit_data()
+        if collected is None:
+            return
+        intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
+
+        # Allocate all slots in one batch (intermediates + EOS)
+        all_bids = intermediate_bids + eos_bids
+        all_slots = self.allocate_slots_batch(all_bids)
+
+        # Copy intermediate states from output buffers to cache
+        n_intermediate = len(intermediate_bids)
+        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
+
+        # Copy EOS states from live buffers to cache
+        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
+
+        # Register hashes for all committed blocks
+        self.register_block_hashes_batch(all_bids, all_hashes)
+
+        self._clear_intermediate_state()
+
     def _collect_commit_data(self):
         """Extract commit data from GPU intermediate state tracking.
 
@@ -570,46 +576,6 @@ class MambaSlotAllocator:
         dst_idx = torch.tensor(slots, dtype=torch.int64, device=device)
         self.ssm_states[:, dst_idx] = self.intermediate_ssm_out[:, src_idx]
         self.conv_states[:, dst_idx] = self.intermediate_conv_out[:, src_idx]
-
-    def register_block_hashes_batch(self, block_ids: list, hashes: list) -> None:
-        """Register multiple blocks as having cached Mamba state.
-
-        Only registers entries where hash > 0.
-
-        Args:
-            block_ids: List of block IDs.
-            hashes: List of hash values (same length as block_ids).
-        """
-        updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
-        if updates:
-            self.hash_to_block_id.update(updates)
-
-    def commit_intermediate_states(self) -> None:
-        """Commit intermediate states from pre-allocated output buffers to cache.
-
-        Called after the forward pass (including CUDA graph replay) completes.
-        Batched pipeline: collect data, allocate slots, copy states, register hashes.
-        """
-        collected = self._collect_commit_data()
-        if collected is None:
-            return
-        intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
-
-        # Allocate all slots in one batch (intermediates + EOS)
-        all_bids = intermediate_bids + eos_bids
-        all_slots = self.allocate_slots_batch(all_bids)
-
-        # Copy intermediate states from output buffers to cache
-        n_intermediate = len(intermediate_bids)
-        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
-
-        # Copy EOS states from live buffers to cache
-        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
-
-        # Register hashes for all committed blocks
-        self.register_block_hashes_batch(all_bids, all_hashes)
-
-        self._clear_intermediate_state()
 
     def _clear_intermediate_state(self) -> None:
         """Clear all per-request intermediate state tracking."""
