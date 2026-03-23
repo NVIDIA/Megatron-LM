@@ -1231,7 +1231,8 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
 @internal_api
 class RandomSTEShared(torch.autograd.Function):
     """
-    STE that generates random values with shared seed across all ranks.
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
     When std < 0, caches and reuses values per layer.
     """
 
