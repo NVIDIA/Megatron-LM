@@ -103,6 +103,17 @@ class ValidationConfig:
     during training.
     """
 
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
+    """
+
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
 
