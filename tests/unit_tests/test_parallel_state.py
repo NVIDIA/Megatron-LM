@@ -166,8 +166,6 @@ def test_virtual_pipeline_model_parallel_rank(order):
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_get_tensor_model_parallel_src_rank(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
@@ -175,8 +173,6 @@ def test_get_tensor_model_parallel_src_rank(order):
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.internal
 @pytest.mark.parametrize(
     'src_tp_pp, ep_size',
@@ -274,8 +270,6 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.internal
 @pytest.mark.parametrize(
     'nodes, num_gpu, tp, pp, cp, ep',
@@ -511,8 +505,6 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize(
     "world_size, tp_size, cp_size, dp_size",
     [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
