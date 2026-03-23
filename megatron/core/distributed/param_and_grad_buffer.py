@@ -19,7 +19,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
-from ..fp4_utils import is_nvfp4tensor, get_nvfp4_rowwise_packed_shape
+from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
     is_float8tensor,
     is_mxfp8tensor,
@@ -874,9 +874,9 @@ class _ParamAndGradBuffer:
                 getattr(param, "shared_embedding", False)
                 and self.ddp_config.use_distributed_optimizer
             )
-        
+
         # Check if this buffer contains NVFP4 params
-        self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)      
+        self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
         # For NVFP4, we need separate tracking for param buffer (packed) and grad buffer (full)
         self.nvfp4_grad_index_map = {}  # Maps param -> (start, end, bucket_id) for grad buffer
         grad_start_index = 0 if self.has_nvfp4_params else None
@@ -1000,7 +1000,8 @@ class _ParamAndGradBuffer:
                         device=torch.cuda.current_device(),
                         requires_grad=False,
                     )
-                # For NVFP4, grad buffer uses full size (grad_numel), param buffer uses packed size (numel)
+                # For NVFP4, grad buffer uses full size (grad_numel),
+                # param buffer uses packed size (numel)
                 self.grad_data = torch.zeros(
                     self.grad_numel,
                     dtype=self.grad_dtype,
@@ -1025,6 +1026,7 @@ class _ParamAndGradBuffer:
                     if is_nvfp4tensor(param):
                         # NVFP4 params: map rowwise packed bytes (uint8) into the param buffer.
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
+
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
                         rowwise_bytes_view = self._get(
                             packed_shape, param_start_index, buffer_type=BufferType.PARAM
@@ -1149,10 +1151,10 @@ class _ParamAndGradBuffer:
     def get_grad_index_map(self) -> Dict[torch.nn.Parameter, tuple[int, int, int]]:
         """
         Return the index map for grad buffer operations.
-        
+
         For NVFP4 buffers, returns nvfp4_grad_index_map (full numel indices).
         For other buffers, returns param_index_map (same as grad indices).
-        
+
         This is needed because NVFP4 has separate param buffer (packed) and grad buffer (full).
         The distributed optimizer uses this to determine which rank owns which portion of
         each param's gradient - this calculation must use grad buffer indices.
@@ -1213,7 +1215,9 @@ class _ParamAndGradBuffer:
         # For NVFP4, use separate grad buffer offsets
         if grad_start_index is not None and grad_end_index is not None:
             bucketed_grad_data = self._get(
-                torch.Size([grad_end_index - grad_start_index]), grad_start_index, buffer_type=BufferType.GRAD
+                torch.Size([grad_end_index - grad_start_index]),
+                grad_start_index,
+                buffer_type=BufferType.GRAD,
             )
         else:
             bucketed_grad_data = self._get(
@@ -1278,8 +1282,9 @@ class _ParamAndGradBuffer:
 
 
 def partition_buckets(
-    buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False,
-    reduce_scatter_with_fp32_accumulation: bool = False
+    buffers: List[_ParamAndGradBuffer],
+    force_single_bucket_group: bool = False,
+    reduce_scatter_with_fp32_accumulation: bool = False,
 ) -> List[_ParamAndGradBucketGroup]:
     """
     Automatically regroup the buckets of input buffers and return a list of bucket groups.
@@ -1369,8 +1374,9 @@ def partition_buckets(
         bucket_groups = []
         fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
-            if (len(bucket_groups) == len(fp8_buffer.buckets) - 1):
-                # When using reduce-scatter with FP32 accumulation, we can only have one bucket per group.
+            if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
+                # When using reduce-scatter with FP32 accumulation,
+                # we can only have one bucket per group.
                 if reduce_scatter_with_fp32_accumulation:
                     # Create separate groups for FP8 bucket and non-FP8 buckets
                     bucket_groups.append(
@@ -1391,7 +1397,7 @@ def partition_buckets(
                                     buffer.data_parallel_world_size,
                                 )
                             )
-                        
+
                     continue  # Skip the default bucket group creation below
                 else:
                     group_buckets = [bucket] + non_fp8_buckets

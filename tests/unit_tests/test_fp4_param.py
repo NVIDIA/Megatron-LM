@@ -8,6 +8,8 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_nvfp4_support
 
+import megatron.core.parallel_state as ps
+from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
 from megatron.core.fp4_utils import is_nvfp4tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -15,7 +17,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-import megatron.core.parallel_state as ps
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -25,7 +26,6 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
-from megatron.core.distributed import DistributedDataParallel as DDP
 from tests.unit_tests.test_utilities import Utils
 
 cuda_graph_supported = False
@@ -39,6 +39,7 @@ try:
         reason_for_no_cuda_graph = "Need newer TransformerEngine"
 except ImportError:
     reason_for_no_cuda_graph = "Need newer TransformerEngine"
+
 
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
@@ -57,6 +58,7 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
     )
+
 
 _SEED = 1234
 is_nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
@@ -162,20 +164,11 @@ class TestFP4Param:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self,
-        tp_size,
-        inference: bool = False,
-        fp4_param_gather: bool = True,
-        **kwargs,
+        self, tp_size, inference: bool = False, fp4_param_gather: bool = True, **kwargs
     ):
         """Test fp4_param with gpt_model."""
         args = self.create_test_args(
-            tp_size,
-            self.seq_length,
-            self.micro_batch_size,
-            inference,
-            fp4_param_gather,
-            **kwargs,
+            tp_size, self.seq_length, self.micro_batch_size, inference, fp4_param_gather, **kwargs
         )
 
         set_args(args)
@@ -220,6 +213,7 @@ class TestFP4Param:
         use_cuda_graph = kwargs.get("enable_cuda_graph", False)
         if use_cuda_graph and args.cuda_graph_impl == "transformer_engine":
             from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
             cuda_graph_helper = TECudaGraphHelper(
                 model=gpt_model,
                 config=gpt_model[0].config,
@@ -283,17 +277,9 @@ class TestFP4Param:
                 self._run_test_helper(tp_size, inference=True, **kwargs)
         else:
             print("\n=== Running with fp4_param_gather=True (NVFP4) ===")
-            loss_list = self._run_test_helper(
-                tp_size,
-                fp4_param_gather=True,
-                **kwargs,
-            )
+            loss_list = self._run_test_helper(tp_size, fp4_param_gather=True, **kwargs)
             print("\n=== Running with fp4_param_gather=False (BF16) ===")
-            loss_list_ref = self._run_test_helper(
-                tp_size, 
-                fp4_param_gather=False, 
-                **kwargs,
-            )
+            loss_list_ref = self._run_test_helper(tp_size, fp4_param_gather=False, **kwargs)
 
             torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
 
@@ -331,7 +317,6 @@ class TestFP4Param:
         }
         self.run_test(tp_size=tp_size, **kwargs)
 
-
     def run_determinism_test(self, tp_size, fp4_param_gather: bool, **kwargs):
         """
         Run the same model type twice to check for determinism. This is for debugging purposes.
@@ -341,18 +326,10 @@ class TestFP4Param:
         mode = "NVFP4" if fp4_param_gather else "BF16"
 
         print(f"\n=== {mode} Run 1 ===")
-        loss_list_1 = self._run_test_helper(
-            tp_size,
-            fp4_param_gather=fp4_param_gather,
-            **kwargs,
-        )
+        loss_list_1 = self._run_test_helper(tp_size, fp4_param_gather=fp4_param_gather, **kwargs)
 
         print(f"\n=== {mode} Run 2 ===")
-        loss_list_2 = self._run_test_helper(
-            tp_size,
-            fp4_param_gather=fp4_param_gather,
-            **kwargs,
-        )
+        loss_list_2 = self._run_test_helper(tp_size, fp4_param_gather=fp4_param_gather, **kwargs)
 
         torch.testing.assert_close(loss_list_1, loss_list_2, atol=0, rtol=0)
 

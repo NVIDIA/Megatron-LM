@@ -7,8 +7,8 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..fp4_utils import is_nvfp4tensor
+from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -141,8 +141,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
                     # dtype (usually a higher precision dtype such as bfloat16), but its actual
                     # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
-                    # ".data" attribute. Therefore, when creating the param buffer for fp8/fp4 params,
-                    # it is necessary to use torch.uint8, not the "fake" dtype got from
+                    # ".data" attribute. Therefore, when creating the param buffer for fp8/fp4
+                    # params,it is necessary to use torch.uint8, not the "fake" dtype got from
                     # "param.dtype".
                     param_dtype = torch.uint8
                 grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype

@@ -49,8 +49,8 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
+from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -364,7 +364,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    if (is_float8tensor(model_param) and config.fp8_recipe != "delayed") or is_nvfp4tensor(model_param):
+                    if (
+                        is_float8tensor(model_param) and config.fp8_recipe != "delayed"
+                    ) or is_nvfp4tensor(model_param):
                         # MXFP8Tensor, BlockwiseQTensor, and NVFP4Tensor don't support view(-1)
                         shard_model_param = None
                     else:
@@ -2397,11 +2399,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         get_shard_fp32_from_fp8(self.shard_fp32_groups, self.model_fp32_groups)
 
         return fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-    
+
     def _get_nvfp4_params_and_shard_fp32_from_nvfp4(self):
         """
         Get lists of NVFP4 model params, corresponding shard main params, and the starting index of
-        the shard main param in the NVFP4 param. Parameters in all three lists are in the same order.
+        the shard main param in the NVFP4 param.
         """
         nvfp4_params = []
         shard_fp32_from_nvfp4 = []
@@ -2513,6 +2515,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
         else:
             pass
+
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
@@ -2534,7 +2537,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     elif is_nvfp4tensor(model_param):
-                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard" function.
+                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard"
+                        # function.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)

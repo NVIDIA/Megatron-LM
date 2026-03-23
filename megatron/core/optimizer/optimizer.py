@@ -1322,7 +1322,8 @@ class ChainedOptimizer(MegatronOptimizer):
 
         grad_norm = self.get_grad_norm()
 
-        # Only for debugging: Round to reduce accumulated floating-point errors, will remove after merging this PR
+        # Only for debugging: Round to reduce accumulated floating-point errors,
+        # will remove after merging this PR
         grad_norm = round(grad_norm, 4)
 
         # Clip gradients.

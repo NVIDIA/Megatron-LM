@@ -49,9 +49,11 @@ try:
 except ImportError:
     te_post_all_gather_processing = None
 
+
 def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine NVFP4Tensor."""
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
+
 
 def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
     """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
@@ -81,6 +83,7 @@ def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: tor
     new_rowwise_data.detach().copy_(old_rowwise)
     setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
 
+
 def quantize_nvfp4_param_shard(
     model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
 ):
@@ -99,9 +102,7 @@ def quantize_nvfp4_param_shard(
         fsdp_shard_model_params: Optional list of FSDP sharded model params.
     """
     if not HAVE_TE_FP4_TENSOR_CLASS:
-        raise RuntimeError(
-            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
-        )
+        raise RuntimeError("NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0")
 
     try:
         from transformer_engine.pytorch.tensor.utils import quantize_master_weights
@@ -122,6 +123,7 @@ def quantize_nvfp4_param_shard(
         kwargs["manual_post_all_gather_processing"] = True
 
     quantize_master_weights(*args, **kwargs)
+
 
 def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     """
