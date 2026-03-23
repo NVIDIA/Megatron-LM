@@ -162,7 +162,7 @@ jobs:
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
           # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '[.labels[].name]') || LABELS='[]'
+          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
