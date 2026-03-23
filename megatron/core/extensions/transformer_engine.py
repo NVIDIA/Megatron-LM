@@ -529,9 +529,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 def forward_pre_hook(module, *_) -> None:
                     for submodule, hook, with_kwargs in forward_pre_hooks:
                         if with_kwargs:
-                            ret = hook(submodule, None, {})
+                            ret = hook(submodule, (), {})
                         else:
-                            ret = hook(submodule, None)
+                            ret = hook(submodule, ())
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedResidualRMSNorm module does not expose "
@@ -553,9 +553,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 def forward_post_hook(module, *_) -> None:
                     for submodule, hook, with_kwargs in forward_post_hooks:
                         if with_kwargs:
-                            ret = hook(submodule, None, {}, None)
+                            ret = hook(submodule, (), {}, None)
                         else:
-                            ret = hook(submodule, None, None)
+                            ret = hook(submodule, (), None)
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedResidualRMSNorm module does not expose "
@@ -2361,9 +2361,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 def forward_pre_hook(module, *_) -> None:
                     for submodule, hook, with_kwargs in forward_pre_hooks:
                         if with_kwargs:
-                            ret = hook(submodule, None, {})
+                            ret = hook(submodule, (), {})
                         else:
-                            ret = hook(submodule, None)
+                            ret = hook(submodule, ())
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedMLP module does not expose intermediate tensors, but "
@@ -2384,9 +2384,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 def forward_post_hook(module, *_) -> None:
                     for submodule, hook, with_kwargs in forward_post_hooks:
                         if with_kwargs:
-                            ret = hook(submodule, None, {}, None)
+                            ret = hook(submodule, (), {}, None)
                         else:
-                            ret = hook(submodule, None, None)
+                            ret = hook(submodule, (), None)
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedMLP module does not expose intermediate tensors, but "
