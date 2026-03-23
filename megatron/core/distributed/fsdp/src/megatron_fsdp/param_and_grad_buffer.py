@@ -885,6 +885,7 @@ class DataParallelBuffer:
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+        self.chunk_size_factor = chunk_size_factor
 
         # Setup the item index map, bucket index, and shard bucket index from
         # the provided arguments, or build them if not provided.
@@ -4086,11 +4087,8 @@ class AllGatherPipeline:
                     with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:
                             inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
-                            outer_dp_group = self.buffer.dist_index.get_outer_dp_group(
-                                is_expert_parallel=is_expert_parallel
-                            )
-                            shard_size = inner_dp_wbuf.data_size // outer_dp_group.size()
-                            rank = outer_dp_group.rank()
+                            shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
+                            rank = outer_fsdp_group.rank()
                             torch.distributed.all_gather_into_tensor(
                                 output_tensor=inner_dp_wbuf.data,
                                 input_tensor=inner_dp_wbuf.data[

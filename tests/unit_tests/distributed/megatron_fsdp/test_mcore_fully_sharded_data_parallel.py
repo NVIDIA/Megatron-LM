@@ -745,7 +745,7 @@ class TestMegatronFSDPE2E:
                     fp8_param_gather=True,
                     bf16=True,
                     num_distributed_optimizer_instances=2,
-                    enable_fully_sharding_in_hsdp=True,
+                    outer_dp_sharding_strategy="optim",
                 ),
                 id="optim_grads_params_mxfp8_double_buffer",
             ),
