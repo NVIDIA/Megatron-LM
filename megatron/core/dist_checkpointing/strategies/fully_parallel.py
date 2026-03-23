@@ -23,10 +23,9 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
-from megatron.core.dist_checkpointing.strategies.base import (
-    AsyncSaveShardedStrategy,
-    LoadShardedStrategy,
-    SaveShardedStrategy,
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.utils import (
     _sharded_object_id,
@@ -45,7 +44,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T', ShardedObject, ShardedTensor)
 
 
-class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
+class FullyParallelSaveStrategyWrapper:
     """Wraps arbitrary strategy and distributes the save during `save`.
 
     The save distribution happens without any *data* communication.
@@ -60,7 +59,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
     described in `distribute_shards_to_ranks`.
 
     Args:
-        strategy (SaveShardedStrategy): base strategy to wrap
+        strategy (TorchDistSaveShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for save
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -72,7 +71,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
     def __init__(
         self,
-        strategy: SaveShardedStrategy,
+        strategy: TorchDistSaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
     ):
@@ -86,10 +85,6 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self.cached_distribution: Optional[ShardDistribution] = None
 
     def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
-            raise CheckpointingException(
-                f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
-            )
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
@@ -133,18 +128,14 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
 
-    @property
-    def can_handle_sharded_objects(self):
-        return self.base_strategy.can_handle_sharded_objects
 
-
-class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
+class FullyParallelLoadStrategyWrapper(TorchDistLoadShardedStrategy):
     """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
 
     Args:
-        strategy (LoadShardedStrategy): base strategy to wrap
+        strategy (TorchDistLoadShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for load
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -166,7 +157,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     def __init__(
         self,
-        strategy: LoadShardedStrategy,
+        strategy: TorchDistLoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
@@ -387,10 +378,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             self.cached_distribution = precomputed_distribution
 
         return precomputed_distribution
-
-    @property
-    def can_handle_sharded_objects(self):
-        return self.base_strategy.can_handle_sharded_objects
 
     def load_tensors_metadata(self, checkpoint_dir: Path):
         return self.base_strategy.load_tensors_metadata(checkpoint_dir)

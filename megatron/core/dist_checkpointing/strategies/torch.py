@@ -48,12 +48,6 @@ from ..mapping import (
     is_main_replica,
 )
 from .async_utils import AsyncRequest
-from .base import (
-    AsyncSaveShardedStrategy,
-    LoadShardedStrategy,
-    StrategyAction,
-    register_default_strategy,
-)
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .filesystem_async import FileSystemWriterAsync
@@ -589,7 +583,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         return super().commit_tensor(read_item, tensor)
 
 
-class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+class TorchDistSaveShardedStrategy:
     """Async save strategy for the PyT Distributed format.
 
     The idea is to translate MCore ShardedTensors into PyT ShardedTensors
@@ -771,7 +765,7 @@ def _get_filesystem_reader(
     return FileSystemReader(checkpoint_dir)
 
 
-class TorchDistLoadShardedStrategy(LoadShardedStrategy):
+class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
     def __init__(self, cache_metadata: bool = False):
