@@ -385,22 +385,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
                         # NVFP4 tensor will also go to this block.
-                        if is_nvfp4tensor(model_param):
-                            # NVFP4: param_range is in full numel space (from get_grad_index_map)
-                            if hasattr(model_param, 'get_high_precision_init_val'):
-                                shard_main_param = (
-                                    model_param.get_high_precision_init_val()
-                                    .view(-1)[param_range.start : param_range.end]
-                                    .clone()
-                                    .to(model_param.device)
-                                    .float()
-                                )
-                                model_param.clear_high_precision_init_val()
-                            else:
-                                shard_main_param = model_param.float().view(-1)[
-                                    param_range.start : param_range.end
-                                ]
-                        elif is_float8tensor(model_param):
+                        if is_nvfp4tensor(model_param) or is_float8tensor(model_param):
                             if hasattr(model_param, 'get_high_precision_init_val'):
                                 shard_main_param = (
                                     model_param.get_high_precision_init_val()
