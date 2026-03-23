@@ -636,7 +636,19 @@ class GPTModel(LanguageModule):
             if in_inference_mode or is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
+                # When sequence parallel is enabled, hidden_states is partitioned
+                # along the sequence dimension ([S/TP, 1, H]).  The downstream
+                # consumer (_compute_serial_mtp_and_sample) indexes this cache
+                # with full-sequence indices and compute_mtp_single_step expects
+                # replicated tensors, so we must gather first.
+                if self.config.sequence_parallel:
+                    self._decoder_hidden_states_cache = (
+                        gather_from_sequence_parallel_region(
+                            hidden_states, group=self.pg_collection.tp
+                        )
+                    )
+                else:
+                    self._decoder_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
