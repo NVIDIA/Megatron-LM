@@ -10,7 +10,6 @@ from datetime import datetime
 from collections import defaultdict
 
 import torch
-from torch import nn
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
