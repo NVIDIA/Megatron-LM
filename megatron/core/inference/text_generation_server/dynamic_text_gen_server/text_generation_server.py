@@ -58,7 +58,7 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr)
+    inference_client = InferenceClient(coordinator_addr, deserialize=False)
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
