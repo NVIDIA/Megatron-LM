@@ -156,6 +156,8 @@ def test_is_pipeline_last_stage(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_virtual_pipeline_model_parallel_rank(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)

@@ -118,7 +118,6 @@ def main(
         runtime="nvidia",
         ipc_mode="host",
         shm_size="30g",
-        ulimits=["nofile:1048576:1048576"],
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
