@@ -202,30 +202,8 @@ def verify_checkpoint(checkpoint_dir: str):
     if not Path(checkpoint_dir).exists():
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
-            sharded_strategy = TorchDistLoadShardedStrategy(cache_metadata=cache_metadata)
-        else:
-            sharded_strategy = get_default_strategy(
-                StrategyAction.LOAD_SHARDED,
-                saved_config.sharded_backend,
-                saved_config.sharded_backend_version,
-            )
-    elif isinstance(sharded_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, *sharded_strategy)
-
-    if common_strategy is None:
-        common_strategy = get_default_strategy(
-            StrategyAction.LOAD_COMMON,
-            saved_config.common_backend,
-            saved_config.common_backend_version,
-        )
-    elif isinstance(common_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
-
-    sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
-    sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
-    common_strategy.check_backend_compatibility(saved_config.common_backend)
-    common_strategy.check_version_compatibility(saved_config.common_backend_version)
-    return sharded_strategy, common_strategy
+    if not check_is_distributed_checkpoint(checkpoint_dir):
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
 
 def adjust_non_strict_load(
