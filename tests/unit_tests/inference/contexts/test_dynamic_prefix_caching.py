@@ -981,7 +981,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))
         bids4 = self._block_ids(ctx4, 0, 4)
         # Allocate all available slots by filling the free pool
-        fill_bids = bids4[:min(total_slots, 4)]
+        fill_bids = bids4[: min(total_slots, 4)]
         fill_slots = msa4.allocate_slots_batch(fill_bids)
         assert len(fill_slots) == len(fill_bids)
         # If we can exhaust the pool, test eviction
