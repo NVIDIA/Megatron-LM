@@ -85,7 +85,7 @@ class DistributedInitConfig:
     local_rank: int = field(default_factory=lambda: int(os.getenv("LOCAL_RANK", "0")))
     """local rank passed from distributed launcher."""
 
-    lazy_mpu_init: bool = False
+    lazy_init: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--lazy-mpu-init"], "dest": "lazy_mpu_init"}})
     """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
     Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
 
@@ -106,7 +106,7 @@ class DistributedInitConfig:
     """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.
     """
 
-    enable_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
+    use_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"], "dest": "enable_gloo_process_groups"}})
     """If enabled, create Gloo process groups for communications."""
 
     use_sharp: bool = False
