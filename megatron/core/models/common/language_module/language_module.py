@@ -389,6 +389,9 @@ class LanguageModule(MegatronModule):
         layer.sequence_parallel = False
         saved['mtp_submodule_sp'] = {}
         for name, module in layer.named_modules():
+            if name == "":
+                # root layer already handled via 'mtp_layer_sp'
+                continue
             if hasattr(module, 'sequence_parallel'):
                 saved['mtp_submodule_sp'][name] = module.sequence_parallel
                 module.sequence_parallel = False
