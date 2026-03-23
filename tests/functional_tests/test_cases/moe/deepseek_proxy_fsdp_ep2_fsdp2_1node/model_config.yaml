@@ -50,10 +50,14 @@ MODEL_ARGS:
   --manual-gc: true
   --manual-gc-interval: 100
   --transformer-impl: transformer_engine
+
+  # Recompute args
   --recompute-granularity: selective
-  --recompute-modules: "[layernorm mla_up_proj moe_act]"
+  --recompute-modules: "layernorm,mla_up_proj,moe_act"
+
+  # CPU Offloading
   --fine-grained-activation-offloading: true
-  --offload-modules: "[core_attn attn_proj]"
+  --offload-modules: "core_attn,attn_proj"
 
   # Data args
   --seq-length: 1024
