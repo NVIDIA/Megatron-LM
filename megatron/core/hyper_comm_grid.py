@@ -270,4 +270,4 @@ class HyperCommGrid:
             True if the current rank is within [rank_offset, rank_offset + size).
         """
         rank = dist.get_rank()
-        return self.rank_offset <= rank < self.rank_offset + self.size
+        return bool(self.rank_offset <= rank < self.rank_offset + self.size)

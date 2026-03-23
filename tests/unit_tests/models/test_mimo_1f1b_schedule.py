@@ -668,7 +668,7 @@ class TestMimo1F1BSchedule:
             llm_dp=1,
             llm_offset=1,
             hidden_size=256,
-            num_layers=2,
+            num_layers=3,
             vocab_size=1000,
             seq_length=64,
             micro_batch_size=2,
