@@ -2034,8 +2034,8 @@ def get_thd_batch_on_this_cp_rank(
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen[0].item()),
-        max_seqlen_kv=int(max_seqlen[0].item()),
+        max_seqlen_q=int(max_seqlen[0].item()) if max_seqlen.dim() == 1 else max_seqlen.item(),
+        max_seqlen_kv=int(max_seqlen[0].item()) if max_seqlen.dim() == 1 else max_seqlen.item(),
     )
 
     cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
@@ -2063,16 +2063,21 @@ def get_thd_batch_on_this_cp_rank(
 
 def get_batch_on_this_hybrid_cp_rank(
     batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: torch.Tensor,
     local_cp_size: int,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
-    assert local_cp_size is not None
+    assert (
+        local_cp_size is not None
+    ), "local_cp_size must be provided when using Hybrid Context Parallel"
     if cp_group is None:
         # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
-        if local_cp_size > 1:
+        if local_cp_size >= 1:
             cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
                 group_size=local_cp_size
             )
@@ -2083,29 +2088,18 @@ def get_batch_on_this_hybrid_cp_rank(
 
     # Convert [seqlen] to [1, seqlen] similar to default collate_fn
     # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
+    # TODO(pmannan): Is this still needed after packing to THD format?
     for key, data in batch.items():
         if key in ['attention_mask']:
             continue
         batch[key] = torch.stack([data], 0)
-    sample_length = batch['tokens'].shape[1]
-    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
-    # Create packed_seq_params for SBHD format with cp group information.
-    packed_seq_params = PackedSeqParams(
-        qkv_format="sbhd",
-        cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        max_seqlen_q=sample_length,
-        max_seqlen_kv=sample_length,
-        local_cp_size=local_cp_size,
-        cp_group=cp_group,
-    )
 
-    if cp_group is not None and cp_group.size() > 1:
-        # When using hybrid_context_parallel, each sub-sample of a packed sample is
-        # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
+    assert cp_group is not None, "No valid cp_group found when using Hybrid Context Parallel"
+    batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        batch, cu_seqlens, cu_seqlens_padded, max_seqlen, cp_group.size(), cp_group.rank()
+    )
+    packed_seq_params.local_cp_size = local_cp_size
+    packed_seq_params.cp_group = cp_group
 
     return batch, packed_seq_params
 

@@ -287,16 +287,24 @@ class TopKRouter(Router):
         scores_for_aux_loss: torch.Tensor,
         routing_map: torch.Tensor,
         with_padding_mask: bool = False,
+        packed_seq_params=None,
     ):
         """Apply the auxiliary loss for the given scores and routing map."""
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
 
+        # For hybrid context parallel, use a two-step reduction: first over the per-sequence
+        # CP sub-group, then over the TP group.  For standard CP, use the combined tp_cp_group.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            reduce_group = [packed_seq_params.cp_group, self.tp_group]
+        else:
+            reduce_group = self.tp_cp_group
+
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=reduce_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -311,6 +319,14 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+        # In hybrid CP, the tp_cp_group SUM in reduce_aux_losses_tracker_across_ranks
+        # collects contributions from N/K independent sub-groups per step, overcounting
+        # by N/K relative to standard CP.  Scale down the logged value to correct for
+        # this; the backward gradient (via MoEAuxLossAutoScaler) is unaffected.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            logging_scale = packed_seq_params.cp_group.size() / self.cp_group.size()
+        else:
+            logging_scale = 1.0
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             aux_loss_coeff,
@@ -318,6 +334,7 @@ class TopKRouter(Router):
             "load_balancing_loss",
             self.tp_cp_group,
             valid_token_count=local_num_tokens,
+            logging_scale=logging_scale,
         )
         return probs
 
@@ -329,6 +346,7 @@ class TopKRouter(Router):
         seq_length: int,
         bsz: int,
         with_padding_mask: bool = False,
+        packed_seq_params=None,
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
@@ -344,10 +362,17 @@ class TopKRouter(Router):
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
 
+        # For hybrid context parallel, use a two-step reduction: first over the per-sequence
+        # CP sub-group, then over the TP group.  For standard CP, use the combined tp_cp_group.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            reduce_group = [packed_seq_params.cp_group, self.tp_group]
+        else:
+            reduce_group = self.tp_cp_group
+
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=reduce_group,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk * bsz,
             )
@@ -366,6 +391,14 @@ class TopKRouter(Router):
             / bsz
         )
 
+        # In hybrid CP, the tp_cp_group SUM in reduce_aux_losses_tracker_across_ranks
+        # collects contributions from N/K independent sub-groups per step, overcounting
+        # by N/K relative to standard CP.  Scale down the logged value to correct for
+        # this; the backward gradient (via MoEAuxLossAutoScaler) is unaffected.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            logging_scale = packed_seq_params.cp_group.size() / self.cp_group.size()
+        else:
+            logging_scale = 1.0
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             seq_aux_loss_coeff,
@@ -373,6 +406,7 @@ class TopKRouter(Router):
             "seq_load_balancing_loss",
             self.tp_cp_group,
             valid_token_count=local_num_tokens,
+            logging_scale=logging_scale,
         )
         return probs
 
@@ -431,6 +465,7 @@ class TopKRouter(Router):
         reduce_group: torch.distributed.ProcessGroup,
         reduce_group_has_dp: bool = False,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        logging_scale: float = 1.0,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -446,6 +481,9 @@ class TopKRouter(Router):
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
+            logging_scale (float): Scale factor applied to the logged value only (not the
+                backward gradient). Used in hybrid context parallel to normalize out the N/K
+                sub-group overcounting in the tp_cp_group SUM. Defaults to 1.0 (no scaling).
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
@@ -472,7 +510,7 @@ class TopKRouter(Router):
 
         save_to_aux_losses_tracker(
             aux_loss_name,
-            aux_loss / aux_loss_coeff,
+            aux_loss * logging_scale / aux_loss_coeff,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
@@ -583,7 +621,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params=None,
+    ):
         """Top-k routing function
 
         Args:
@@ -591,6 +634,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional): Packed sequence parameters.
+                When set and packed_seq_params.cp_group is not None, aux-loss reductions use
+                the per-sequence hybrid CP sub-group instead of the full tp_cp_group.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -650,6 +696,7 @@ class TopKRouter(Router):
                 scores_for_aux_loss,
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
+                packed_seq_params=packed_seq_params,
             )
             probs = self._apply_seq_aux_loss(
                 probs,
@@ -658,6 +705,7 @@ class TopKRouter(Router):
                 seq_length,
                 bsz,
                 with_padding_mask=padding_mask is not None,
+                packed_seq_params=packed_seq_params,
             )
             probs = self._apply_global_aux_loss(
                 probs,
@@ -677,7 +725,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params=None,
+    ):
         """
         Forward pass of the router.
 
@@ -686,6 +739,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional): Packed sequence parameters.
+                When set and packed_seq_params.cp_group is not None, aux-loss reductions use
+                the per-sequence hybrid CP sub-group instead of the full tp_cp_group.
         """
         self._maintain_float32_expert_bias()
 
@@ -697,7 +753,9 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+        )
 
         return probs, routing_map
 

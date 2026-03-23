@@ -419,6 +419,9 @@ class MambaModel(LanguageModule):
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For hybrid context parallel, use the dynamic CP sub-group
+                if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                    self.pg_collection.cp = packed_seq_params.cp_group
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,

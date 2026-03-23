@@ -193,6 +193,7 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import get_num_total_groups
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -1161,6 +1162,25 @@ def pretrain(
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
 
+    if args.hybrid_context_parallel:
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        if isinstance(valid_data_iterator, list):
+            valid_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in valid_data_iterator
+            ]
+        elif valid_data_iterator is not None:
+            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, config))
+        if isinstance(test_data_iterator, list):
+            test_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in test_data_iterator
+            ]
+        elif test_data_iterator is not None:
+            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, config))
+
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
@@ -2118,7 +2138,13 @@ def training_log(
 
     # Log MoE metrics.
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        # For hybrid CP, num_total_groups replaces num_microbatches as the step count.
+        if args.hybrid_context_parallel:
+            _hybrid_groups = get_num_total_groups()
+            assert _hybrid_groups > 0, "Hybrid CP must report groups to log MoE metrics"
+            moe_loss_scale = 1 / _hybrid_groups
+        else:
+            moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2156,7 +2182,11 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        if args.hybrid_context_parallel:
+            _hybrid_groups = get_num_total_groups()
+            mtp_loss_scale = 1 / _hybrid_groups if _hybrid_groups > 0 else 1 / get_num_microbatches()
+        else:
+            mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -2680,9 +2710,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
@@ -3345,27 +3372,12 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else :
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key] += val
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            val,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True)
+                        )
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
