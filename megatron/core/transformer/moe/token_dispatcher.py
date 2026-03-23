@@ -84,6 +84,23 @@ class MoETokenDispatcher:
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
 
+    def get_cudagraph_attr(self, attr_name: str):
+        """Resolve a cudagraph attribute path, including nested attributes."""
+        attr = self
+        for name in attr_name.split('.'):
+            attr = getattr(attr, name, None)
+            if attr is None:
+                return None
+        return attr
+
+    def set_cudagraph_attr(self, attr_name: str, value) -> None:
+        """Assign to a cudagraph attribute path, including nested attributes."""
+        hier_attr_name = attr_name.split('.')
+        attr = self
+        for name in hier_attr_name[:-1]:
+            attr = getattr(attr, name)
+        setattr(attr, hier_attr_name[-1], value)
+
     @abstractmethod
     def dispatch_preprocess(
         self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
