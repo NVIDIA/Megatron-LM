@@ -861,6 +861,7 @@ class TextGenerationController:
 
             mtp_logits_2d = None
             if has_mtp:
+                print(f"current_hidden.shape={current_hidden.shape}")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,

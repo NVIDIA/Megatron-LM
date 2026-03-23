@@ -198,6 +198,7 @@ class DataParallelInferenceCoordinator:
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
         self.max_requests = max_requests
+        assert self.max_requests is not None and self.max_requests > 0 
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
