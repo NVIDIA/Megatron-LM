@@ -6,7 +6,10 @@ import asyncio
 import torch
 
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import run_flask_server
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+    start_text_gen_server,
+    stop_text_gen_server,
+)
 from megatron.core.utils import trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
@@ -19,20 +22,24 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_modelopt_args(parser)
     parser = add_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
-    parser.add_argument("--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response")
+    parser.add_argument(
+        "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
+    )
     return parser
 
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, flask_port: int
+    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int
 ):
-    """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks.
+    """
+    Runs the text generation server from rank 0 and initializes the
+    DynamicInferenceEngine on all ranks.
 
     Args:
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
-        flask_port (int): The network for port the frontend Flask server.
+        server_port (int): The network for port the frontend text generation server.
     """
 
     rank = torch.distributed.get_rank()
@@ -41,27 +48,24 @@ async def run_text_generation_server(
         inference_coordinator_port=coordinator_port, launch_inference_coordinator=True
     )
 
-    server_task = None
-    if rank == 0:
-        server_task = asyncio.create_task(
-            run_flask_server(
+    try:
+        if rank == 0:
+            start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=args.parsers,
                 rank=rank,
-                flask_port=flask_port,
-                verbose=args.inference_flask_server_logging,
+                server_port=server_port,
+                verbose=args.inference_text_gen_server_logging,
             )
-        )
-    engine_task = engine.engine_loop_task
 
-    tasks_to_run = [engine_task]
-    if server_task:
-        assert rank == 0
+        # Await the engine loop directly since the server is running in a separate process
+        await engine.engine_loop_task
 
-        tasks_to_run.append(server_task)
-
-    await asyncio.gather(*tasks_to_run)
+    finally:
+        # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
+        if rank == 0:
+            stop_text_gen_server()
 
 
 if __name__ == "__main__":
@@ -79,4 +83,14 @@ if __name__ == "__main__":
 
         engine = get_dynamic_inference_engine()
 
-        asyncio.run(run_text_generation_server(engine, args.inference_coordinator_port, args.port))
+        try:
+            asyncio.run(
+                run_text_generation_server(engine, args.inference_coordinator_port, args.port)
+            )
+        except KeyboardInterrupt:
+            # Catching at the top level ensures clean stdout without spamming the traceback
+            print("Server process interrupted by user.")
+        finally:
+            # Clean up PyTorch distributed groups properly
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
