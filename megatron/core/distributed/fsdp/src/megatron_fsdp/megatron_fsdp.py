@@ -691,9 +691,7 @@ class MegatronFSDP(torch.nn.Module):
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(
-            module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
+            module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
         ):
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
@@ -721,23 +719,21 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-
             return args, kwargs
 
         @torch.compiler.disable
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
+            args: Tuple[Any, ...],
+            kwargs: Dict[str, Any],
         ):
             """
             Register a post-backward hook for the given module by inserting an Autograd
             Function in front of it. Note that a post-backward hook implemented in this
             way is not compatible with in-place modifications of the module's inputs,
-            since such operations can trigger an autograd error that "the output is a
-            view and is being modified in-place". kwargs is optional to flexibly support
-            with_kwargs={True, False}, this hook can handle both cases.
+            since such operations can trigger an autograd error that
+            "the output is a view and is being modified in-place".
             """
             if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
