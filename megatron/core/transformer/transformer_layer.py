@@ -480,6 +480,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.recompute_mlp = True
 
         self._set_offload_modules()
+        self.off_interface = _get_offloading_interface()
         self.mlp_norm_manager = None
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -569,8 +570,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-        off_interface = _get_offloading_interface()
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
@@ -579,7 +578,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         # Optional Input Layer norm
-        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
+        attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with attn_norm_manager as hidden_states:
@@ -691,9 +690,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
-        off_interface = _get_offloading_interface()
-
-        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
@@ -1008,19 +1005,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        off_interface = _get_offloading_interface()
-
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
             if len(args) > 0:
                 hidden_states = args[0]
-                hidden_states = off_interface.backward_record(hidden_states)
+                hidden_states = self.off_interface.backward_record(hidden_states)
                 args = (hidden_states,) + args[1:]
             else:
                 hidden_states = kwargs.pop("hidden_states")
-                hidden_states = off_interface.backward_record(hidden_states)
+                hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
         context = None
         if not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope:
@@ -1053,9 +1048,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the D2H transfer on offloading stream.
         if self.offload_module_in_cuda_graph:
-            off_interface = _get_offloading_interface()
-
-            off_interface.forward_record()
+            self.off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -1080,15 +1073,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.config.delay_offload_until_cuda_graph:
-            off_interface = _get_offloading_interface()
-
-            off_interface.enter_replay()
+            self.off_interface.enter_replay()
 
         try:
             return self._te_cuda_graph_replay_impl(args, kwargs, context)
         finally:
             if self.config.delay_offload_until_cuda_graph:
-                off_interface.exit_replay()
+                self.off_interface.exit_replay()
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
@@ -1098,9 +1089,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The CPU is idle during the sync between graph replay and a2a comm,
         # so we use that time to execute the delayed offload operations.
         if self.config.delay_offload_until_cuda_graph:
-            off_interface = _get_offloading_interface()
-
-            off_interface.flush_delayed_groups()
+            self.off_interface.flush_delayed_groups()
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
@@ -1525,8 +1514,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
-        off_interface = _get_offloading_interface()
-
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1542,7 +1529,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
-        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
+        attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
@@ -1620,8 +1607,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
-        off_interface = _get_offloading_interface()
-
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
@@ -1641,7 +1626,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
-        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=mhc_recompute_manager
