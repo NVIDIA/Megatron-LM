@@ -3,7 +3,6 @@
 import logging
 from typing import Literal, Optional
 
-import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -417,7 +416,17 @@ class MambaModel(LanguageModule):
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
+                # Cache decoder hidden states for serial MTP computation
+                # after speculative token verification.
+                # When sequence parallel is enabled, hidden_states is partitioned
+                # along the sequence dimension ([S/TP, 1, H]).  The downstream
+                # consumer (_compute_serial_mtp_and_sample) indexes this cache
+                # with full-sequence indices and compute_mtp_single_step expects
+                # replicated tensors, so we must gather first.
+                if self.config.sequence_parallel:
+                    self._decoder_hidden_states_cache = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.pg_collection.tp
+                    )
             else:
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
