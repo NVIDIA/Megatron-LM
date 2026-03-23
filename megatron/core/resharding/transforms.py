@@ -219,9 +219,7 @@ class MXFP8ReshardTransform(ReshardTransform):
             if buf.scale.ndim == 1:
                 if buf_key not in self._pending_1d:
                     self._pending_1d[buf_key] = [
-                        torch.zeros(
-                            buf.data.shape, dtype=torch.bfloat16, device=buf.data.device
-                        ),
+                        torch.zeros(buf.data.shape, dtype=torch.bfloat16, device=buf.data.device),
                         0,
                     ]
                 accum_view = self._pending_1d[buf_key][0][dst_slice]

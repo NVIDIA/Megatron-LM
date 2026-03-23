@@ -21,6 +21,11 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _sort_ops_by_dst_offset(ops, dim):
+    """Sort transfer ops by destination offset on the sharded dimension."""
+    ops.sort(key=lambda op: op[2][dim].start if isinstance(op[2][dim], slice) else 0)
+
+
 def _build_descriptors_for_param(
     src_metadata: ParameterMetadata, dst_metadata: ParameterMetadata
 ) -> list[ShardingDescriptor]:
@@ -142,13 +147,7 @@ def _plan_multi_dim_lcm(
             dst_slice[dim] = slice(dst_start, dst_start + unit)
             ops.append((src_global_rank, tuple(src_slice), tuple(dst_slice)))
 
-    # Stable order by destination offset
-    def dst_key(op):
-        _, _, dsl = op
-        s = dsl[dim]
-        return s.start if isinstance(s, slice) else 0
-
-    ops.sort(key=dst_key)
+    _sort_ops_by_dst_offset(ops, dim)
     return ops
 
 
@@ -262,13 +261,7 @@ def _plan_block_interleaved(
         src_block_offset += src_blk_sz
         dst_block_offset += dst_blk_sz
 
-    # Stable sort by destination offset
-    def dst_key(op):
-        _, _, dsl = op
-        s = dsl[dim]
-        return s.start if isinstance(s, slice) else 0
-
-    ops.sort(key=dst_key)
+    _sort_ops_by_dst_offset(ops, dim)
     return ops
 
 
@@ -300,23 +293,10 @@ def _finalize_dp_transfers(
         full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
         return [(my_global_rank, full_slice, full_slice)]
 
-    # Different DP groups - use round-robin based on destination global rank for
-    # better load balancing across source ranks. This ensures that destination
-    # ranks are distributed across source ranks even when they have the same
-    # position within their respective DP groups.
-    #
-    # In non-collocated mode, src_dp_ranks might include ranks that don't
-    # have the source model (e.g., idle ranks or destination ranks). Filter to only
-    # include the rank that provided this metadata (src_metadata.owner_rank).
-    # src_metadata was selected by select_src_metadata_balanced, so owner_rank is the
-    # actual source rank for this parameter.
-    actual_src_rank = src_metadata.owner_rank
-    src_global_rank = src_dp_ranks[my_global_rank % len(src_dp_ranks)]
-    # Override with the actual source rank if the selected rank doesn't have the parameter
-    if src_global_rank != actual_src_rank:
-        src_global_rank = actual_src_rank
+    # src_metadata was already DP-balanced by select_src_metadata_balanced,
+    # so just use its owner_rank directly.
     full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
-    return [(src_global_rank, full_slice, full_slice)]
+    return [(src_metadata.owner_rank, full_slice, full_slice)]
 
 
 def _determine_source_ranks_for_dst_param(
@@ -382,53 +362,30 @@ def build_centralized_reshard_plan(
     # list object, making pickle ~75% smaller for the gather.
     _rank_list_cache: dict = {}
 
-    # Extract metadata from source model if present
-    if src_module is not None:
-        src_pg = getattr(src_module, "pg_collection", None)
-        if src_pg is None:
-            raise ValueError("Source module must have pg_collection")
-        my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
-        src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
-        my_src_metadata = [
+    def _extract_metadata(module, rank_offset):
+        """Extract per-parameter metadata from a module, or [] if module is None."""
+        if module is None:
+            return []
+        pg = getattr(module, "pg_collection", None)
+        if pg is None:
+            raise ValueError("Module must have pg_collection")
+        layer_prefix_map = _build_layer_module_prefix_map(module)
+        return [
             extract_param_metadata(
                 p,
                 name,
                 my_global_rank,
-                src_pg,
+                pg,
                 num_experts=num_experts,
-                layer_module_prefix_map=src_layer_prefix_map,
-                rank_offset=src_rank_offset,
+                layer_module_prefix_map=layer_prefix_map,
+                rank_offset=rank_offset,
                 _rank_list_cache=_rank_list_cache,
             )
-            for name, p in my_src_params.items()
+            for name, p in module.named_parameters(recurse=True)
         ]
-    else:
-        # No source model on this rank - provide empty metadata
-        my_src_metadata = []
 
-    # Extract metadata from destination model if present
-    if dst_module is not None:
-        dst_pg = getattr(dst_module, "pg_collection", None)
-        if dst_pg is None:
-            raise ValueError("Destination module must have pg_collection")
-        my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
-        dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
-        my_dst_metadata = [
-            extract_param_metadata(
-                p,
-                name,
-                my_global_rank,
-                dst_pg,
-                num_experts=num_experts,
-                layer_module_prefix_map=dst_layer_prefix_map,
-                rank_offset=dst_rank_offset,
-                _rank_list_cache=_rank_list_cache,
-            )
-            for name, p in my_dst_params.items()
-        ]
-    else:
-        # No destination model on this rank - provide empty metadata
-        my_dst_metadata = []
+    my_src_metadata = _extract_metadata(src_module, src_rank_offset)
+    my_dst_metadata = _extract_metadata(dst_module, dst_rank_offset)
 
     # Gather metadata to rank 0 only (not all ranks) to save CPU memory.
     # Other ranks don't need the full metadata — they only need their own plan.
@@ -441,21 +398,15 @@ def build_centralized_reshard_plan(
     del my_src_metadata, my_dst_metadata
 
     # Parameter to metadata maps keyed by resolved_name (only populated on rank 0)
-    src_param_metadata_by_rank = {}
     dst_param_metadata_by_rank = {}
     src_param_metadata: dict[str, list[ParameterMetadata]] = {}
 
     if my_global_rank == 0:
-        for rank_id, rank_metadata_list in enumerate(all_src_metadata_by_rank):
-            src_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
         for rank_id, rank_metadata_list in enumerate(all_dst_metadata_by_rank):
             dst_param_metadata_by_rank[rank_id] = {m.resolved_name: m for m in rank_metadata_list}
         for rank_metadata_list in all_src_metadata_by_rank:
             for metadata in rank_metadata_list:
-                key = metadata.resolved_name
-                if key not in src_param_metadata:
-                    src_param_metadata[key] = []
-                src_param_metadata[key].append(metadata)
+                src_param_metadata.setdefault(metadata.resolved_name, []).append(metadata)
 
         # Free the raw gathered lists — data is now in the indexed dicts.
         del all_src_metadata_by_rank, all_dst_metadata_by_rank
@@ -517,8 +468,7 @@ def build_centralized_reshard_plan(
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
 
         # Free planning intermediates on rank 0 before the scatter.
-        del plans_for_all_ranks, src_param_metadata_by_rank
-        del dst_param_metadata_by_rank, src_param_metadata
+        del plans_for_all_ranks, dst_param_metadata_by_rank, src_param_metadata
     else:
         plans_list = None
 

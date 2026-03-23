@@ -34,7 +34,7 @@ def execute_reshard_plan(
     """
     Execute a reshard plan (from centralized controller).
     A communication service must be provided to abstract transport.
-    Expected service API: submit_send(tensor, dest_rank), submit_recv(tensor, src_rank), run().
+    Expected service API: submit_send(tensor, dest_rank, task_id), submit_recv(tensor, src_rank, task_id), run().
 
     Supports None for src_module and/or dst_module to allow ranks in non-collocated mode:
     - src_module=None: Rank only receives data (destination-only)
@@ -55,9 +55,6 @@ def execute_reshard_plan(
     if dst_module is not None:
         dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
-    submit_send_with_id = getattr(service, "submit_send_with_id", None)
-    submit_recv_with_id = getattr(service, "submit_recv_with_id", None)
-
     # Cache dequantized BF16 views of MXFP8 source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.
     _sendable_cache: dict[str, torch.Tensor] = {}
@@ -74,11 +71,7 @@ def execute_reshard_plan(
             if src_param is not None:
                 tensors = transform.prepare_send(op.param_name, op.my_slice, src_param)
                 for t in tensors:
-                    buf = t.contiguous()
-                    if submit_send_with_id is not None and op.task_id is not None:
-                        submit_send_with_id(op.task_id, buf, op.peer_rank)
-                    else:
-                        service.submit_send(buf, op.peer_rank)
+                    service.submit_send(t.contiguous(), op.peer_rank, task_id=op.task_id)
         else:
             src_param = src_params.get(op.param_name)
             if src_param is not None:
@@ -87,10 +80,7 @@ def execute_reshard_plan(
                 # Only copy if the slice is non-contiguous.
                 if not src_view.is_contiguous():
                     src_view = src_view.contiguous()
-                if submit_send_with_id is not None and op.task_id is not None:
-                    submit_send_with_id(op.task_id, src_view, op.peer_rank)
-                else:
-                    service.submit_send(src_view, op.peer_rank)
+                service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
 
     # Free the dequant cache — slices have been submitted and the service
     # holds its own references to the contiguous buffers it needs.
@@ -111,10 +101,7 @@ def execute_reshard_plan(
         if transform is not None and transform.should_transform(op.param_name):
             recv_bufs = transform.prepare_recv(op.param_name, op.my_slice)
             for buf in recv_bufs:
-                if submit_recv_with_id is not None and op.task_id is not None:
-                    submit_recv_with_id(op.task_id, buf, op.peer_rank)
-                else:
-                    service.submit_recv(buf, op.peer_rank)
+                service.submit_recv(buf, op.peer_rank, task_id=op.task_id)
             recv_writebacks.append(('transform', op.param_name, op.my_slice, recv_bufs))
         else:
             dst_param = dst_params.get(op.param_name)
@@ -127,10 +114,7 @@ def execute_reshard_plan(
                 dst_slice_view = dst_param.data[op.my_slice]
                 if dst_slice_view.is_contiguous() and not _is_mxfp8_tensor(dst_param):
                     # Recv directly into destination — no writeback needed.
-                    if submit_recv_with_id is not None and op.task_id is not None:
-                        submit_recv_with_id(op.task_id, dst_slice_view, op.peer_rank)
-                    else:
-                        service.submit_recv(dst_slice_view, op.peer_rank)
+                    service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
                     recv_writebacks.append(('direct',))
                 elif _is_mxfp8_tensor(dst_param):
                     # TE MXFP8: recv directly into pre-allocated accumulation
@@ -143,24 +127,15 @@ def execute_reshard_plan(
                         pending_quantized[param_id] = (dst_param, full_bf16, [])
                     accum_view = pending_quantized[param_id][1][op.my_slice]
                     if accum_view.is_contiguous():
-                        if submit_recv_with_id is not None and op.task_id is not None:
-                            submit_recv_with_id(op.task_id, accum_view, op.peer_rank)
-                        else:
-                            service.submit_recv(accum_view, op.peer_rank)
+                        service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
                         recv_writebacks.append(('direct',))
                     else:
                         recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-                        if submit_recv_with_id is not None and op.task_id is not None:
-                            submit_recv_with_id(op.task_id, recv_buffer, op.peer_rank)
-                        else:
-                            service.submit_recv(recv_buffer, op.peer_rank)
+                        service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
                         recv_writebacks.append(('default', recv_buffer, dst_param, op.my_slice))
                 else:
                     recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-                    if submit_recv_with_id is not None and op.task_id is not None:
-                        submit_recv_with_id(op.task_id, recv_buffer, op.peer_rank)
-                    else:
-                        service.submit_recv(recv_buffer, op.peer_rank)
+                    service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
                     recv_writebacks.append(('default', recv_buffer, dst_param, op.my_slice))
 
     # Execute
@@ -187,6 +162,7 @@ def execute_reshard_plan(
         recv_writebacks[i] = None  # Eagerly drop reference to free recv buffers
         with torch.no_grad():
             if wb[0] == 'direct':
+                # Already written in-place during recv — nothing to do.
                 pass
             elif wb[0] == 'transform':
                 _, param_name, dst_slice, recv_bufs = wb
@@ -197,6 +173,8 @@ def execute_reshard_plan(
                     # Non-contiguous fallback: copy into pre-allocated accum buffer.
                     param_id = id(dst_param)
                     if param_id not in pending_quantized:
+                        # Allocate empty BF16 buffer — no need to dequantize
+                        # existing weights since all slices will be overwritten.
                         full_bf16 = torch.empty(
                             dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
                         )
