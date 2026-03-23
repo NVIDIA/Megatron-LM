@@ -184,12 +184,14 @@ def execute_reshard_plan(
                     pending_quantized[param_id][1][dst_slice].copy_(recv_buffer)
                 else:
                     dst_param.data[dst_slice].copy_(recv_buffer)
+    # Free writeback list — recv_buffers are no longer needed after copy.
     recv_writebacks.clear()
 
     # Finalize deferred quantized param updates
     for param_id, (dst_param, full_bf16, slices) in pending_quantized.items():
         with torch.no_grad():
             dst_param.quantize_(full_bf16)
+    # Free the BF16 accumulation buffers eagerly.
     pending_quantized.clear()
 
     # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
