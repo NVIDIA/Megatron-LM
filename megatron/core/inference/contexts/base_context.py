@@ -2,6 +2,8 @@
 
 import abc
 
+from megatron.core.inference.config import InferenceConfig
+
 
 class BaseInferenceContext(abc.ABC):
     """Base class for inference contexts.
@@ -10,13 +12,11 @@ class BaseInferenceContext(abc.ABC):
     Extend this class for any future contexts types.
     """
 
-    def __init__(self, materialize_only_last_token_logits: bool):
+    def __init__(self, inference_config: InferenceConfig):
         """
         Args:
-            materialize_only_last_token_logits (bool):
-                If True, only the last-token logits will be extracted during decode
         """
-        self.materialize_only_last_token_logits = materialize_only_last_token_logits
+        self.config = inference_config
 
     @abc.abstractmethod
     def is_static_batching(self) -> bool:

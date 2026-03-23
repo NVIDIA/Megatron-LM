@@ -22,14 +22,17 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
     initialize_rerun_state_machine,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
+from megatron.training.utils import is_rank0
 from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
@@ -80,9 +83,6 @@ def initialize_megatron(
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
 
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker()
-
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
@@ -94,6 +94,9 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
     def state_save_func():
@@ -114,6 +117,10 @@ def initialize_megatron(
         ),
         result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
+    
+    if args.batch_invariant_mode:
+        print_rank_0("Enabling batch invariant mode globally")
+        enable_batch_invariant_mode()
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -122,8 +129,7 @@ def initialize_megatron(
         _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
         # Random seeds for reproducibility.
-        if args.rank == 0:
-            print("> setting random seeds to {} ...".format(args.seed))
+        print_rank_0("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(
             args.seed,
             args.data_parallel_random_init,
@@ -206,13 +212,10 @@ def _compile_dependencies():
     )
     # Print a warning.
     if not ((args.fp16 or args.bf16) and custom_kernel_constraint and args.masked_softmax_fusion):
-        if args.rank == 0:
-            print(
-                "WARNING: constraints for invoking optimized"
-                " fused softmax kernel are not met. We default"
-                " back to unfused kernel invocations.",
-                flush=True,
-            )
+        warn_rank_0(
+            "Constraints for invoking optimized fused softmax kernel are not met. "
+            "We default back to unfused kernel invocations."
+        )
 
     # Always build on rank zero first.
     if torch.distributed.get_rank() == 0:
@@ -316,18 +319,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
-        if args.rank == 0:
-            print(
-                "torch distributed is already initialized, " "skipping initialization ...",
-                flush=True,
-            )
+        print_rank_0("torch distributed is already initialized, skipping initialization ...")
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
 
     else:
 
-        if args.rank == 0:
-            print("> initializing torch distributed ...", flush=True)
+        print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
             torch.cuda.set_device(args.local_rank)
@@ -338,6 +336,41 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         # Set to non-default stream for cudagraph capturing.
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
+
+        # Set flight recorder env vars if specified.
+        # Priority: pre-existing environment variable > MLM argument.
+        # All vars follow the same setdefault semantics: if already set in the
+        # environment we warn and keep the user's value; otherwise we apply the
+        # value derived from the MLM argument / flag.
+        # The block is also triggered when either path env var is already set
+        # so that the remaining defaults are applied consistently.
+        _fr_path = (
+            args.flight_recorder_dump_path
+            or os.environ.get('TORCH_FR_DUMP_TEMP_FILE')
+            or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
+        )
+        if _fr_path is not None:
+            _fr_env_defaults = {
+                'TORCH_FR_DUMP_TEMP_FILE': _fr_path,
+                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_path,
+                'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
+                'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
+                'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
+                'TORCH_INCLUDE_ONLY_ACTIVE': str(int(args.flight_recorder_include_only_active)),
+                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(int(args.flight_recorder_extra_dump_on_exec)),
+            }
+            for _var, _default in _fr_env_defaults.items():
+                if _var in os.environ:
+                    warn_rank_0(
+                        f"Flight recorder: environment variable {_var} is already set to "
+                        f"'{os.environ[_var]}'; ignoring config value '{_default}'."
+                    )
+                else:
+                    os.environ[_var] = _default
+            print_rank_0(
+                "Flight recorder env vars:\n"
+                + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
+            )
 
         # Call the init process
         init_process_group_kwargs = {
@@ -371,6 +404,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+                hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -382,16 +416,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 create_gloo_process_groups=args.enable_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
+                create_all_gather_group=args.create_all_gather_group,
             )
-            if args.rank == 0:
-                print(
-                    f"> initialized tensor model parallel with size "
-                    f"{mpu.get_tensor_model_parallel_world_size()}"
-                )
-                print(
-                    f"> initialized pipeline model parallel with size "
-                    f"{mpu.get_pipeline_model_parallel_world_size()}"
-                )
+            print_rank_0(
+                f"> initialized tensor model parallel with size "
+                f"{mpu.get_tensor_model_parallel_world_size()}"
+            )
+            print_rank_0(
+                f"> initialized pipeline model parallel with size "
+                f"{mpu.get_pipeline_model_parallel_world_size()}"
+            )
 
 
 def _init_autoresume():
@@ -543,5 +577,6 @@ def setup_logging() -> None:
         logging_level = args.logging_level
 
     if logging_level is not None:
-        logger.info(f'Setting logging level to {logging_level}')
+        if is_rank0():
+            logger.info(f'Setting logging level to {logging_level}')
         logging.getLogger().setLevel(logging_level)

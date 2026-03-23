@@ -24,7 +24,7 @@ class SamplingParams:
     return_log_probs: bool = False
     skip_prompt_log_probs: bool = False
     return_segments: bool = False  # Whether to return individually detokenized tokens
-    num_tokens_to_generate: int = 30
+    num_tokens_to_generate: int = None
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
     top_n_logprobs: int = 0
@@ -33,6 +33,7 @@ class SamplingParams:
     stop_words: Optional[List[str]] = (
         None  # List of strings that will stop generation when produced
     )
+    detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
@@ -51,7 +52,7 @@ class SamplingParams:
                 DeprecationWarning,
             )
             assert (
-                self.skip_prompt_log_probs
+                not self.skip_prompt_log_probs
             ), "return_prompt_top_n_logprobs requires skip_prompt_log_probs to be False"
         if self.top_n_logprobs > 0:
             self.return_prompt_top_n_logprobs = not self.skip_prompt_log_probs

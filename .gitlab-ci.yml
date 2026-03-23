@@ -29,8 +29,14 @@ workflow:
       auto_cancel:
         on_new_commit: none
 
-    # For manual pipelines
+    # For manual pipelines (GitLab UI)
     - if: $CI_PIPELINE_SOURCE == "web"
+
+    # For pipelines created via the REST API (personal access token)
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+    # For trigger pipelines
+    - if: $CI_PIPELINE_SOURCE == "trigger"
 
     # For push to main
     - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
@@ -235,6 +241,11 @@ variables:
     options:
       - "dgxh100_coreweave"
       - "dgxh100_eos"
+    description: "Cluster for H100 workloads"
+  CLUSTER_GB200:
+    value: "dgxgb200_oci-hsg"
+    options:
+      - "dgxgb200_oci-hsg"
     description: "Cluster for H100 workloads"
   PUBLISH:
     value: "no"

@@ -7,6 +7,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
+    get_gpt_decoder_layer_specs,
+)
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -42,8 +46,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts:
-                assert not (config.transformer_impl == "inference_optimized")
+            if args.experimental_attention_variant is not None:
+                transformer_layer_spec = (
+                    get_transformer_block_with_experimental_attention_variant_spec(
+                        config=config, vp_stage=vp_stage
+                    )
+                )
+            elif args.num_experts:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -69,7 +78,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
                 transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
             else:
-                transformer_layer_spec_for_mtp = transformer_layer_spec
+                # Define the decoder block spec
+                decoder_layer_specs = get_gpt_decoder_layer_specs(
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                )
+                transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
+            # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config,
                 transformer_layer_spec_for_mtp,
@@ -104,39 +118,39 @@ def _get_transformer_layer_spec(use_te, config):
 
     Args:
         use_te (bool): Whether to use Transformer Engine
-        args: Training arguments
         config: Model configuration
 
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
-    args = get_args()
     if use_te:
         return get_gpt_layer_with_transformer_engine_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=args.qk_l2_norm,
+            config.num_moe_experts,
+            config.moe_grouped_gemm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            config.experimental_attention_variant,
+            qk_l2_norm=config.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            qk_l2_norm=args.qk_l2_norm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            qk_l2_norm=config.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            normalization=args.normalization,
+            config.num_moe_experts,
+            config.moe_grouped_gemm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            config.experimental_attention_variant,
+            normalization=config.normalization,
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,

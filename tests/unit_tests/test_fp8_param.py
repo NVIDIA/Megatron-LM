@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 import gc
@@ -11,7 +11,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
-from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -36,7 +36,10 @@ reason_for_no_cuda_graph = ""
 try:
     from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
 
-    cuda_graph_supported = True
+    if is_te_min_version("2.10.0"):
+        cuda_graph_supported = True
+    else:
+        reason_for_no_cuda_graph = "Need newer TransformerEngine"
 except ImportError:
     reason_for_no_cuda_graph = "Need newer TransformerEngine"
 
@@ -65,12 +68,16 @@ class TestFP8Param:
     def setup_method(self, method):
         self.seq_length = 512
         self.micro_batch_size = 2
+        self.cuda_graph_helper = None
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            self.cuda_graph_helper.delete_cuda_graphs()
+            self.cuda_graph_helper = None
         gc.collect()
 
     def model_provider(
@@ -209,13 +216,12 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
-        cuda_graph_helper = None
         # Hard coded to use cuda_graph_impl="transformer_engine"
         cuda_graph_impl = "transformer_engine"
         if use_cuda_graph and cuda_graph_impl == "transformer_engine":
             from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
-            cuda_graph_helper = TECudaGraphHelper(
+            self.cuda_graph_helper = TECudaGraphHelper(
                 model=gpt_model,
                 config=gpt_model[0].config,
                 seq_length=self.seq_length,
@@ -240,6 +246,28 @@ class TestFP8Param:
         if fp8_param_gather:
             assert num_fp8_params == 4 * fp8_layers
 
+        # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
+        # to the param buffer (shared with grad buffer) rather than allocated separately.
+        if args.reuse_grad_buf_for_mxfp8_param_ag:
+            for buffer in gpt_model[0].buffers:
+                if buffer.param_data is None:
+                    continue
+                buf_start = buffer.param_data.data_ptr()
+                buf_end = buf_start + buffer.param_data.numel() * buffer.param_data.element_size()
+                for param in buffer.param_to_bucket:
+                    if is_mxfp8tensor(param):
+                        # MXFP8 params keep their own quantized storage.
+                        assert not (
+                            buf_start <= param.data.data_ptr() < buf_end
+                        ), "MXFP8 param should not be mapped to the param buffer"
+                    else:
+                        # BF16 params should be views into the param buffer
+                        # (no double allocation).
+                        assert buf_start <= param.data.data_ptr() < buf_end, (
+                            "BF16 param should be a view into the param buffer "
+                            "(no separate allocation)"
+                        )
+
         loss_list = []
 
         for i in range(100):
@@ -250,13 +278,13 @@ class TestFP8Param:
             # Capture CUDA graphs after warmup if helper is provided.
             # Hard coded cuda_graph_warmup_steps = 0.
             cuda_graph_warmup_steps = 0
-            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+            if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
                 if should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
-                cuda_graph_helper.create_cudagraphs()
+                self.cuda_graph_helper.create_cudagraphs()
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(gpt_model)
-                    cuda_graph_helper.cuda_graph_set_manual_hooks()
+                    self.cuda_graph_helper.cuda_graph_set_manual_hooks()
 
             # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
@@ -296,6 +324,10 @@ class TestFP8Param:
             assert update_successful
 
             loss_list.append(loss.item())
+
+        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            self.cuda_graph_helper.delete_cuda_graphs()
+            self.cuda_graph_helper = None
 
         return torch.tensor(loss_list)
 

@@ -17,7 +17,7 @@ name: Oncall Rotation
 on:
   schedule:
     # Runs at 09:00 UTC every Wednesday
-    - cron: '0 9 * * 3'
+    - cron: "0 9 * * 3"
   workflow_dispatch:
 
 permissions:
@@ -28,22 +28,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ secrets.PAT }}
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Rotate Schedule
         env:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          # Slack token for updating the Slack usergroup
+          SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
-          pip install --no-cache-dir uv
-          uv run python .github/scripts/oncall_manager.py rotate
+          pip install --no-cache-dir "uv<0.9.29"
+          uv venv .venv
+          uv cache clean
+          uv sync --no-cache 
+          uv run --with slack-sdk python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
         run: |
@@ -53,4 +58,3 @@ jobs:
           git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
           git pull --rebase
           git push origin HEAD:main
-

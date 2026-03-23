@@ -1,0 +1,312 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+"""
+Pipelined communication execution engine.
+
+Orchestrates the pack/send/unpack pipeline with double-buffering
+and proper stream synchronization.
+"""
+
+from typing import Dict, List, Optional
+
+from ..compat import ensure_nvshmem_compat
+
+ensure_nvshmem_compat()
+
+try:
+    import nvshmem.core
+
+    HAVE_NVSHMEM = True
+except ImportError:
+    HAVE_NVSHMEM = False
+
+import torch
+
+from ..logger import PELogger
+from ..memory.double_buffer_manager import DoubleBufferManager
+from ..nvshmem_types import ReceiveRequest, ScheduledBatch, SendRequest
+from .kernel_launcher import KernelLauncher
+
+
+class PipelineExecutor:
+    """Executes pipelined NVSHMEM communication with pack/send/unpack overlap."""
+
+    def __init__(
+        self, kernel_launcher: KernelLauncher, buffer_manager: DoubleBufferManager, my_pe: int
+    ):
+        """
+        Initialize pipeline executor.
+
+        Args:
+            kernel_launcher: KernelLauncher instance for pack/unpack kernels
+            buffer_manager: DoubleBufferManager for send/recv buffers
+            my_pe: This PE's rank
+        """
+        self.kernel_launcher = kernel_launcher
+        self.buffer_manager = buffer_manager
+        self.my_pe = my_pe
+
+        # Streams (will be set by service)
+        self.pack_stream = None
+        self.unpack_stream = None
+        self.send_stream = None
+        self.copy_stream = None
+
+        self.torch_pack_stream_wrapper = None
+        self.torch_unpack_stream_wrapper = None
+        self.torch_send_stream_wrapper = None
+        self.torch_copy_stream_wrapper = None
+
+        # Events for double-buffered synchronization
+        self.pack_events = []
+        self.unpack_events = []
+        self.barrier_events = []
+
+    def set_streams(
+        self,
+        pack_stream,
+        unpack_stream,
+        send_stream,
+        copy_stream,
+        torch_pack_stream_wrapper,
+        torch_unpack_stream_wrapper,
+        torch_send_stream_wrapper,
+        torch_copy_stream_wrapper,
+    ):
+        """Set CUDA streams for execution."""
+        self.pack_stream = pack_stream
+        self.unpack_stream = unpack_stream
+        self.send_stream = send_stream
+        self.copy_stream = copy_stream
+
+        self.torch_pack_stream_wrapper = torch_pack_stream_wrapper
+        self.torch_unpack_stream_wrapper = torch_unpack_stream_wrapper
+        self.torch_send_stream_wrapper = torch_send_stream_wrapper
+        self.torch_copy_stream_wrapper = torch_copy_stream_wrapper
+
+    def set_events(self, pack_events: List, unpack_events: List, barrier_events: List):
+        """Set double-buffered CUDA events."""
+        self.pack_events = pack_events
+        self.unpack_events = unpack_events
+        self.barrier_events = barrier_events
+
+    def execute_pipeline(
+        self, iter_schedules: List[Dict[str, Optional[ScheduledBatch]]], num_iterations: int
+    ) -> None:
+        """
+        Execute pipelined communication.
+
+        Pipeline stages:
+        1. Pack NEXT iteration (async)
+        2. Unpack PRIOR iteration (async)
+        3. Send CURRENT iteration
+        4. Barrier + record barrier event
+        5. Wait for async pack/unpack to complete
+
+        Cross-stream synchronization uses lightweight CUDA events instead of
+        cudaDeviceSynchronize (torch.cuda.synchronize). The pack kernel includes
+        __threadfence_system() to ensure writes are visible to the NIC's DMA
+        engine, and barrier_events propagate NVSHMEM RDMA completion from
+        send_stream to unpack_stream.
+
+        Args:
+            iter_schedules: List of iteration schedules
+            num_iterations: Total number of iterations
+        """
+        PELogger.info(f"Executing pipeline: {num_iterations} iterations")
+
+        # Priming: Pack iteration 0 (async, no CPU sync needed —
+        # step 3 uses GPU-level event wait for pack→put ordering)
+        if num_iterations > 0 and iter_schedules[0]["send"]:
+            torch.cuda.nvtx.range_push("Priming")
+            PELogger.debug("Priming: Packing iteration 0")
+            self._launch_pack(0, iter_schedules[0]["send"])
+            torch.cuda.nvtx.range_pop()
+
+        for i in range(num_iterations):
+            torch.cuda.nvtx.range_push(f"Iteration {i}")
+            has_send = iter_schedules[i]["send"] is not None
+            has_recv = iter_schedules[i]["recv"] is not None
+            has_next_send = i + 1 < num_iterations and iter_schedules[i + 1]["send"] is not None
+            has_prior_recv = i > 0 and iter_schedules[i - 1]["recv"] is not None
+
+            slot = i % 2
+
+            # Log iteration start
+            send_info = (
+                f" → PE {iter_schedules[i]['send'].dest_pe} "
+                f"({iter_schedules[i]['send'].total_size} bytes)"
+                if has_send
+                else ""
+            )
+            recv_info = (
+                f" ← PE {iter_schedules[i]['recv'].src_pe} "
+                f"({iter_schedules[i]['recv'].total_size} bytes)"
+                if has_recv
+                else ""
+            )
+            PELogger.debug(f"Iteration {i}/{num_iterations}: slot={slot}{send_info}{recv_info}")
+
+            # Step 1: Pack NEXT iteration (async)
+            if has_next_send:
+                torch.cuda.nvtx.range_push("Step 1: Pack Next")
+                next_batch = iter_schedules[i + 1]["send"]
+                assert next_batch is not None
+                PELogger.debug(
+                    f"  Pack next (iter {i+1}): {len(next_batch.tasks)} tasks "
+                    f"→ PE {next_batch.dest_pe}"
+                )
+                self._launch_pack(i + 1, next_batch)
+                torch.cuda.nvtx.range_pop()
+
+            # Step 2: Unpack PRIOR iteration (async)
+            if has_prior_recv:
+                torch.cuda.nvtx.range_push("Step 2: Unpack Prior")
+                prior_batch = iter_schedules[i - 1]["recv"]
+                assert prior_batch is not None
+                PELogger.debug(
+                    f"  Unpack prior (iter {i-1}): {prior_batch.total_size} bytes "
+                    f"← PE {prior_batch.src_pe}"
+                )
+                # GPU-level event wait: ensures send_stream's barrier_all from
+                # the prior iteration has completed before unpack_stream proceeds.
+                self.torch_unpack_stream_wrapper.wait_event(self.barrier_events[(i - 1) % 2])
+                self._launch_unpack(i - 1, prior_batch)
+                torch.cuda.nvtx.range_pop()
+
+            # Step 3: Send CURRENT iteration
+            if has_send:
+                torch.cuda.nvtx.range_push("Step 3: Send Current")
+                batch = iter_schedules[i]["send"]
+                assert batch is not None
+                transfer_size = batch.total_size
+                PELogger.debug(f"  Send current: {transfer_size} bytes → PE {batch.dest_pe}")
+
+                # GPU-level event wait: ensures pack data in send_slot is visible
+                # to send_stream before NVSHMEM put reads it. The pack kernel's
+                # __threadfence_system() guarantees the writes are also visible to
+                # the NIC's DMA engine.
+                self.torch_send_stream_wrapper.wait_event(self.pack_events[slot])
+
+                nvshmem.core.put(
+                    self.buffer_manager.recv_slots[slot][0:transfer_size],
+                    self.buffer_manager.send_slots[slot][0:transfer_size],
+                    batch.dest_pe,
+                    stream=self.send_stream,
+                )
+                torch.cuda.nvtx.range_pop()
+
+            # Step 4a: Wait for prior unpack to complete BEFORE the barrier.
+            torch.cuda.nvtx.range_push("Step 4a: Wait Unpack")
+            if has_prior_recv:
+                self.unpack_events[(i - 1) % 2].synchronize()
+            torch.cuda.nvtx.range_pop()
+
+            # Ensure all NVSHMEM operations on send_stream complete (stream-ordered)
+            nvshmem.core.quiet(stream=self.send_stream)
+
+            # Step 4b: Global barrier + CPU sync + record event
+            torch.cuda.nvtx.range_push("Step 4b: Barrier")
+            nvshmem.core.barrier_all(stream=self.send_stream)
+            # CPU-sync the send_stream to ensure barrier_all has actually
+            # completed (not just submitted). Without this, the barrier_event
+            # can fire before RDMA data from the remote PE is visible, because
+            # stream-ordered operations are only guaranteed to be submitted,
+            # not completed, when the event is recorded.
+            self.torch_send_stream_wrapper.synchronize()
+            self.barrier_events[slot].record(stream=self.torch_send_stream_wrapper)
+            torch.cuda.nvtx.range_pop()
+
+            # Step 5: Wait for async pack to complete (double-buffer safety)
+            torch.cuda.nvtx.range_push("Step 5: Wait Pack")
+            if has_next_send:
+                self.pack_events[(i + 1) % 2].synchronize()
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_pop()
+
+        # Final unpack for last iteration
+        if num_iterations > 0 and iter_schedules[num_iterations - 1]["recv"]:
+            torch.cuda.nvtx.range_push("Final Unpack")
+            PELogger.debug(f"Final unpack: iteration {num_iterations-1}")
+            last_recv = iter_schedules[num_iterations - 1]["recv"]
+            assert last_recv is not None
+            # GPU-level event wait for NVSHMEM RDMA data visibility
+            self.torch_unpack_stream_wrapper.wait_event(
+                self.barrier_events[(num_iterations - 1) % 2]
+            )
+            self._launch_unpack(num_iterations - 1, last_recv)
+            self.unpack_events[(num_iterations - 1) % 2].synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        PELogger.info(f"Pipeline complete: {num_iterations} iterations")
+
+    def _launch_pack(self, iteration: int, batch: ScheduledBatch) -> None:
+        """Launch pack kernel for given iteration."""
+        if not batch.gpu_plan:
+            return
+
+        self.kernel_launcher.launch_pack(
+            batch.gpu_plan,
+            self.pack_stream,
+            self.torch_pack_stream_wrapper,
+            self.pack_events[iteration % 2],
+        )
+
+    def _launch_unpack(self, iteration: int, batch: ScheduledBatch) -> None:
+        """Launch unpack kernel for given iteration."""
+        if not batch.gpu_plan:
+            return
+
+        self.kernel_launcher.launch_unpack(
+            batch.gpu_plan,
+            self.unpack_stream,
+            self.torch_unpack_stream_wrapper,
+            self.unpack_events[iteration % 2],
+        )
+
+    def process_self_moves(
+        self, send_requests: List[SendRequest], receive_requests: List[ReceiveRequest]
+    ) -> None:
+        """
+        Handle same-PE transfers (where src_pe == dest_pe == my_pe).
+
+        Uses PyTorch copy on the copy stream for efficiency.
+
+        Args:
+            send_requests: List of send requests
+            receive_requests: List of receive requests
+        """
+        # Match send/recv requests where src_pe == dest_pe == my_pe
+        local_sends = {r.task_id: r for r in send_requests if r.dest_pe == self.my_pe}
+        local_recvs = [r for r in receive_requests if r.src_pe == self.my_pe]
+
+        if local_recvs:
+            PELogger.debug(f"Processing {len(local_recvs)} self-moves")
+
+        num_processed = 0
+        with torch.cuda.stream(self.torch_copy_stream_wrapper):
+            for recv_req in local_recvs:
+                if recv_req.task_id in local_sends:
+                    send_req = local_sends[recv_req.task_id]
+                    PELogger.debug(
+                        "  Self-move: task_id=%d, size=%d bytes", recv_req.task_id, send_req.size
+                    )
+
+                    # Create views of the tensors with offsets
+                    src_view = send_req.src_tensor[
+                        send_req.src_pos : send_req.src_pos + send_req.size
+                    ]
+                    dest_view = recv_req.dest_tensor[
+                        recv_req.dest_pos : recv_req.dest_pos + send_req.size
+                    ]
+
+                    # Async copy on the copy stream
+                    dest_view.copy_(src_view, non_blocking=True)
+                    num_processed += 1
+
+        # Synchronize the PyTorch stream
+        self.torch_copy_stream_wrapper.synchronize()
+
+        if num_processed > 0:
+            PELogger.info("Self-moves complete: %d transfers", num_processed)

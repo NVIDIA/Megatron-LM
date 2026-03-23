@@ -6,6 +6,7 @@ Requirements: pip install PyGithub slack-sdk requests
 Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-... SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM python github_pr_reminder.py
 """
 
+import html
 import logging
 import os
 import sys
@@ -39,6 +40,7 @@ class Reminder:
 class PRReviewTracker:
     EXPERT_REVIEW = "Expert Review"
     FINAL_REVIEW = "Final Review"
+    APPROVED = "Approved"
     EXCLUDED_TEAMS = {"core-adlr", "core-nemo"}
 
     def __init__(
@@ -126,6 +128,11 @@ class PRReviewTracker:
         ]
         return max(dates) if dates else None
 
+    def get_ready_for_review_date(self, pr):
+        """Get the date a PR was marked as ready for review."""
+        dates = [e.created_at for e in pr.as_issue().get_events() if e.event == "ready_for_review"]
+        return max(dates) if dates else None
+
     def days_since(self, date):
         """Calculate days since given date."""
         if not date:
@@ -137,11 +144,22 @@ class PRReviewTracker:
     def get_stage(self, pr):
         """Get current review stage."""
         labels = {l.name for l in pr.labels}
-        return self.FINAL_REVIEW if self.FINAL_REVIEW in labels else self.EXPERT_REVIEW
+        if self.APPROVED in labels:
+            return self.APPROVED
+        if self.FINAL_REVIEW in labels:
+            return self.FINAL_REVIEW
+        return self.EXPERT_REVIEW
 
     def get_reviewers(self, pr):
         """Get filtered reviewer emails who haven't approved yet."""
         stage = self.get_stage(pr)
+
+        if stage == self.APPROVED:
+            return (
+                [self.get_user_email(pr.user.login)],
+                "All reviewers have approved. Please merge the PR.",
+            )
+
         org = self.github.get_organization(self.repo.organization.login)
 
         # 1. Get the latest review state for everyone who has submitted a review
@@ -206,9 +224,19 @@ class PRReviewTracker:
         # 8. Handle the original edge cases
         if len(reviewer_emails) == 0:
             if stage == self.EXPERT_REVIEW:
+                # No reviewer activity yet — assignment hasn't completed (e.g. PR just became
+                # ready-for-review). Don't fire a spurious "all approved" message.
+                has_reviewer_activity = bool(
+                    approvers
+                    or non_approving_reviewers
+                    or pending_individuals
+                    or pending_teams_slugs
+                )
+                if not has_reviewer_activity:
+                    return [], "Waiting for reviewers to be assigned."
                 # Assign to PR author
                 reviewer_emails = [self.get_user_email(pr.user.login)]
-                action_message = "All Expert Reviewers approved the PR. Please attach the Final Review label to proceed with the review."
+                action_message = "All Expert Reviewers have approved the PR."
             elif stage == self.FINAL_REVIEW:
                 # Assign to mcore-reviewers who approved
                 try:
@@ -216,7 +244,7 @@ class PRReviewTracker:
                     mcore_members = {m.login for m in mcore_team.get_members()}
                     valid_approvers = approvers & mcore_members
                     reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
-                    action_message = "All Final Reviewers approved the PR. Please ping an Expert or Final Reviewer to merge the PR."
+                    action_message = "All Final Reviewers approved the PR. Please ping the @mcore-oncall to merge the PR."
 
                 except Exception as e:
                     logger.warning(
@@ -228,18 +256,26 @@ class PRReviewTracker:
     def create_reminder(self, pr):
         """Create reminder for PR."""
         stage = self.get_stage(pr)
-        stage_days = self.days_since(self.get_label_date(pr, stage))
+        ready_date = self.get_ready_for_review_date(pr)
+        if stage == self.EXPERT_REVIEW:
+            stage_days = self.days_since(ready_date)
+        elif stage in (self.FINAL_REVIEW, self.APPROVED):
+            stage_days = self.days_since(self.get_label_date(pr, stage))
+        else:
+            stage_days = 0
+        total_review_days = self.days_since(ready_date)
         author_email = self.get_user_email(pr.user.login)
         reviewer_emails, action_message = self.get_reviewers(pr)
+        escaped_title = html.escape(pr.title, quote=False)
 
         return Reminder(
             id=pr.number,
-            pr=f"<{pr.html_url}|#{pr.number} - {pr.title}>",
+            pr=f"<{pr.html_url}|#{pr.number} - {escaped_title}>",
             milestone=pr.milestone.title if pr.milestone else "No Milestone",
             author=self.get_slack_user_id(author_email),
             priority="P0" if stage_days > 3 else "P1" if stage_days >= 1 else "P2",
             review_stage=stage,
-            total_review_time=self.days_since(self.get_label_date(pr, self.EXPERT_REVIEW)),
+            total_review_time=total_review_days,
             current_stage_time=stage_days,
             reviewers=[self.get_slack_user_id(email) for email in reviewer_emails],
             action_message=action_message,
@@ -254,12 +290,11 @@ class PRReviewTracker:
 
         reminders = []
         for milestone in milestones:
-            # Find issues with the 'Expert Review' or 'Final Review' label
+            # Find all open non-draft PRs with this milestone
             query = (
                 f'repo:"{self.repo.full_name}" '
                 f'milestone:"{milestone.title}" '
-                f'is:open is:pr '
-                f'label:"{self.EXPERT_REVIEW}","{self.FINAL_REVIEW}"'
+                f'is:open is:pr -is:draft'
             )
             try:
                 # Use search_issues for a more direct query instead of get_issues + filtering

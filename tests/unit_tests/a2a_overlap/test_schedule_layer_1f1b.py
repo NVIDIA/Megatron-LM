@@ -306,7 +306,59 @@ class TestA2AOverlap:
             "moe_shared_expert_intermediate_size": 512,
         }
         overlap_config = get_test_config(extra_kwargs=extra_kwargs)
-        extra_kwargs["moe_shared_expert_overlap"] = True
+        extra_kwargs["moe_shared_expert_overlap"] = False
+        ref_config = get_test_config(extra_kwargs=extra_kwargs)
+        microbatches = 4
+        with deterministic_mode():
+            transformer_layer_spec = get_gpt_decoder_block_spec(
+                config=ref_config, use_transformer_engine=True
+            )
+            gpt_model = GPTModel(
+                config=ref_config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=300,
+            )
+
+            params = reset_model(gpt_model)
+            input_tensors = [build_data() for _ in range(microbatches)]
+
+            fp8_context = get_fp8_context(ref_config, 0) if ref_config.fp8 else nullcontext()
+            with fp8_context:
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    gpt_model, input_tensors, microbatches
+                )
+            del gpt_model
+
+            gpt_model = GPTModel(
+                config=overlap_config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=300,
+            )
+            reset_model(gpt_model, params)
+            capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                gpt_model, input_tensors, microbatches
+            )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_transformer_layer_overlap_early_attn_memory_release(self):
+        """
+        Verifies all-to-all overlap optimization in transformer layer with early attn memory release
+        produces the same results as the reference implementation.
+        """
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "ep_overlap_early_attn_memory_release": True,
+            "overlap_moe_expert_parallel_comm": True,
+        }
+        overlap_config = get_test_config(extra_kwargs=extra_kwargs)
         ref_config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4
         with deterministic_mode():
@@ -450,8 +502,8 @@ class TestA2AOverlap:
             position_ids = torch.tensor(data, dtype=torch.int64).repeat((1, 1)).cuda()
             attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool).cuda()
             # get rotary pos emb
-            _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _ = gpt_model._preprocess(
-                input_ids, position_ids
+            _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _, _padding_mask = (
+                gpt_model._preprocess(input_ids, position_ids)
             )
             # reset model
             params = reset_model(gpt_model)
