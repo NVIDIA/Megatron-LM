@@ -373,26 +373,28 @@ class SFTDataset(MegatronDataset):
             num_samples = 1 if self.num_samples is None else self.num_samples
 
             packed_samples = pack_samples(sample_lengths, sequence_length)
-            document_index = [j for pack in packed_samples for j in pack]
-            sample_index = torch.cumsum(
-                torch.tensor([0] + [len(sample) for sample in packed_samples]), dim=0
+
+            document_index = numpy.concatenate(
+                [numpy.array(pack, dtype=numpy.int32) for pack in packed_samples]
+            )
+
+            sample_index = numpy.empty(len(packed_samples) + 1, dtype=numpy.int32)
+            sample_index[0] = 0
+            numpy.cumsum(
+                numpy.array([len(pack) for pack in packed_samples], dtype=numpy.int32),
+                out=sample_index[1:],
             )
 
             num_packed = len(packed_samples)
-            num_epochs = (
-                (num_samples // num_packed) + 1
-                if num_samples % num_packed
-                else num_samples // num_packed
-            )
-            generator = torch.Generator()
-            generator.manual_seed(self.config.random_seed)
-            shuffle_index = []
-            for epoch in range(num_epochs):
-                shuffle_index.extend(torch.randperm(num_packed, generator=generator).tolist())
+            num_epochs = -(-num_samples // num_packed)
 
-            document_index = numpy.array(document_index, dtype=numpy.int32)
-            sample_index = numpy.array(sample_index, dtype=numpy.int32)
-            shuffle_index = numpy.array(shuffle_index[:num_samples], dtype=numpy.int32)
+            numpy_random_state = numpy.random.RandomState(self.config.random_seed)
+            shuffle_index = numpy.empty(num_epochs * num_packed, dtype=numpy.int32)
+            for epoch in range(num_epochs):
+                epoch_perm = numpy.arange(num_packed, dtype=numpy.int32)
+                numpy_random_state.shuffle(epoch_perm)
+                shuffle_index[epoch * num_packed : (epoch + 1) * num_packed] = epoch_perm
+            shuffle_index = shuffle_index[:num_samples]
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
