@@ -350,9 +350,17 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
         )
         if _fr_path is not None:
+            _fr_dump_prefix = _fr_path
+            if os.path.isdir(_fr_path):
+                _fr_dump_prefix = os.path.join(_fr_path, '_dump_')
+                warn_rank_0(
+                    "Flight recorder: using directory "
+                    f"'{_fr_path}' for dump path, appending per-rank prefix "
+                    f"'{_fr_dump_prefix}'."
+                )
             _fr_env_defaults = {
-                'TORCH_FR_DUMP_TEMP_FILE': _fr_path,
-                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_path,
+                'TORCH_FR_DUMP_TEMP_FILE': _fr_dump_prefix,
+                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_dump_prefix,
                 'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
                 'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
                 'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
