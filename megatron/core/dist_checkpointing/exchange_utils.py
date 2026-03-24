@@ -11,7 +11,6 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, c
 import numpy as np
 import torch
 
-from ..utils import get_pg_rank, get_pg_size, log_single_rank
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
@@ -197,6 +196,8 @@ def determine_main_replica_uniform_distribution(
         parallelization. Returns None if the process_group is trivial (1 rank)
 
     """
+    from ..utils import get_pg_size
+
     if parallelization_group is None:
         parallelization_group = torch.distributed.group.WORLD
     group_size = get_pg_size(group=parallelization_group)
@@ -285,6 +286,8 @@ def exchange_loaded_tensors_gather_rounds(
             needed by this rank to load a given state dict. Includes
             previously loaded tensors (from `loaded_tensors` input)
     """
+    from ..utils import get_pg_rank, get_pg_size
+
     if parallelization_group is None:
         parallelization_group = torch.distributed.group.WORLD
     main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = shard_distribution
@@ -398,6 +401,8 @@ def exchange_loaded_tensors_gather_object(
             previously loaded tensors (from `loaded_tensors` input)
 
     """
+    from ..utils import log_single_rank
+
     all_loaded_tensors_list = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(
         all_loaded_tensors_list, loaded_tensors, group=parallelization_group
@@ -431,6 +436,8 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
+    from utils import log_single_rank
+
     all_loaded_objects_list = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
     all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)

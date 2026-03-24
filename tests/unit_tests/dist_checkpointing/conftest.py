@@ -5,7 +5,6 @@ from unittest import mock
 import pytest
 
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
-from megatron.core.msc_utils import MultiStorageClientFeature
 
 
 def pytest_sessionfinish(session, exitstatus):
