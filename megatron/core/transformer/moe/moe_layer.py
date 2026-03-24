@@ -195,7 +195,7 @@ class MoELayer(BaseMoELayer):
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
                 from megatron.core.tensor_parallel.inference_layers import InferenceTELinear
-                
+
                 linear_cls = InferenceTELinear
             else:
                 linear_cls = TELinear

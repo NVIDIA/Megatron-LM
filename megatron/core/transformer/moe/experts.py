@@ -561,11 +561,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
-            setattr(
-                self,
-                buf_name,
-                MXFP8Tensor(data=stacked_data, scale=stacked_scale),
-            )
+            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
 
             # Redirect per-expert weight .data to views into the stacked buffer,
             # mirroring _build_concatenated_weights. This frees the original
