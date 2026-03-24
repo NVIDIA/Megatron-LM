@@ -45,7 +45,7 @@ try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
-except ImportError:
+except (ImportError, RuntimeError):
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
@@ -809,13 +809,13 @@ def tensor_a2a_hp2cp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
-    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
-    ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
+    ), f"tensor_a2a_hp2cp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
     assert (
         tensor.dim() == 3
-    ), f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
+    ), f"tensor_a2a_hp2cp only supports 3-d input tensor for now, but got {tensor.dim()=}"
 
     # Redo attention load balancing first if needed.
     if redo_attention_load_balancing:
