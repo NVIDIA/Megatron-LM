@@ -284,6 +284,7 @@ def get_vision_submodules_spec(
 
     return ModuleSpec(
         module=VisionModalitySubmodules,
+        params={"pg_collection": pg_collection},
         submodules={
             "encoders": {"clip_encoder": vision_encoder_spec},
             "input_projections": [vision_projection_spec],
