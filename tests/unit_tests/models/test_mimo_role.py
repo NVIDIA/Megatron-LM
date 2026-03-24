@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Tests for MIMO role data classes."""
 
@@ -23,17 +23,13 @@ class TestMimoRole:
     def test_rank_role(self):
         """Test RankRole properties and methods."""
         # Encoder-only role
-        encoder_role = RankRole(
-            modules={"vision": ModuleStageInfo(True, False)},
-        )
+        encoder_role = RankRole(modules={"vision": ModuleStageInfo(True, False)})
         assert encoder_role.has_modality_modules is True
         assert encoder_role.has_language_module is False
         assert encoder_role.modality_module_names == ["vision"]
 
         # Language-only role
-        lang_role = RankRole(
-            modules={"language": ModuleStageInfo(True, True)},
-        )
+        lang_role = RankRole(modules={"language": ModuleStageInfo(True, True)})
         assert lang_role.has_modality_modules is False
         assert lang_role.has_language_module is True
 
@@ -42,7 +38,7 @@ class TestMimoRole:
             modules={
                 "vision": ModuleStageInfo(is_first_stage=True, is_last_stage=False),
                 "language": ModuleStageInfo(is_first_stage=False, is_last_stage=True),
-            },
+            }
         )
         assert mixed.is_first_stage("vision") is True
         assert mixed.is_last_stage("vision") is False
