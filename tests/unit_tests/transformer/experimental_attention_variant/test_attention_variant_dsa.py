@@ -26,6 +26,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _fused_qk_topk_lighting,
     _fused_qk_topk_lighting_with_streaming_sparse_kl,
+    _scatter_topk_into_index_mask,
+    _build_causal_mask_from_positions,
+    _build_packed_allgather_cp_query_positions_and_key_reorder,
     _generate_varlen_mask_params,
     _get_cp_positions_from_layout,
     _scatter_topk_into_index_mask,
@@ -387,6 +390,96 @@ class TestDSACPPositionHelpers:
             varlen_starts=starts,
             varlen_ends=ends,
             key_positions=key_idx,
+        )
+
+        torch.testing.assert_close(out_varlen, out_dense, rtol=0, atol=0)
+
+    def test_packed_allgather_cp_layout_reorders_gathered_kv_to_global_order(self):
+        """Packed allgather-CP helper should mirror zigzag local order and restore global KV order."""
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+
+        query_pos, key_reorder_idx = _build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=2,
+            cp_rank=0,
+            device=torch.device("cpu"),
+        )
+
+        assert query_pos.tolist() == [0, 1, 6, 7, 8, 9, 14, 15]
+
+        gathered_key_pos = torch.tensor(
+            [0, 1, 6, 7, 8, 9, 14, 15, 2, 3, 4, 5, 10, 11, 12, 13], dtype=torch.int64
+        )
+        restored = gathered_key_pos.index_select(0, key_reorder_idx)
+        assert restored.tolist() == list(range(16))
+
+    def test_cp_packed_zigzag_varlen_matches_dense_mask(self):
+        """Packed zigzag CP query positions + gathered-KV reorder should match dense masking."""
+        cp_size, cp_rank = 2, 1
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+        bsz, nheads, dim, vdim = 1, 2, 8, 6
+        topk = 4
+        softmax_scale = dim**-0.5
+
+        query_pos, key_reorder_idx = _build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            device=torch.device("cpu"),
+        )
+        sq, skv = query_pos.numel(), int(cu_seqlens[-1].item())
+        key_pos = torch.arange(skv, dtype=torch.int64)
+
+        gathered_key_order = torch.empty_like(key_reorder_idx)
+        gathered_key_order[key_reorder_idx] = torch.arange(skv, dtype=torch.int64)
+
+        starts_all, ends_all = _generate_varlen_mask_params(cu_seqlens.to(torch.int64))
+        starts = starts_all.index_select(0, query_pos)
+        ends = ends_all.index_select(0, query_pos)
+
+        q = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32)
+        k_for_index_global = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, nheads, dtype=torch.float32)
+        query = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32)
+        key_global = torch.randn(skv, bsz, nheads, dim, dtype=torch.float32)
+        value_global = torch.randn(skv, bsz, nheads, vdim, dtype=torch.float32)
+
+        dense_mask = _build_packed_causal_mask_for_test(query_pos, key_pos, cu_seqlens)
+        _, dense_idx = fused_qk_topk_naive(q, k_for_index_global, weights, topk, mask=dense_mask)
+        out_dense = unfused_dsa_fn(
+            query, key_global, value_global, dense_idx, softmax_scale, mask=dense_mask
+        )
+
+        k_for_index_gathered = k_for_index_global.index_select(0, gathered_key_order)
+        key_gathered = key_global.index_select(0, gathered_key_order)
+        value_gathered = value_global.index_select(0, gathered_key_order)
+
+        k_for_index_reordered = k_for_index_gathered.index_select(0, key_reorder_idx)
+        key_reordered = key_gathered.index_select(0, key_reorder_idx)
+        value_reordered = value_gathered.index_select(0, key_reorder_idx)
+
+        _, varlen_idx = fused_qk_topk_naive(
+            q,
+            k_for_index_reordered,
+            weights,
+            topk,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=key_pos,
+        )
+        out_varlen = unfused_dsa_fn(
+            query,
+            key_reordered,
+            value_reordered,
+            varlen_idx,
+            softmax_scale,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=key_pos,
         )
 
         torch.testing.assert_close(out_varlen, out_dense, rtol=0, atol=0)
