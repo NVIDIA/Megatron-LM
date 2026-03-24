@@ -347,7 +347,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     from megatron.core.models.common.model_chunk_schedule_plan import (
         TransformerModelChunkSchedulePlan,
     )
-    from megatron.core.pipeline_parallel.utils import reset_streams, set_streams
+    from megatron.core.pipeline_parallel.utils import set_streams
     from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 
     # EP overlap requires distributed initialization with EP groups.
@@ -568,5 +568,4 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                         f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
                     )
     finally:
-        reset_streams()
         Utils.destroy_model_parallel()
