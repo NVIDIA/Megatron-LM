@@ -1641,7 +1641,7 @@ def setup_model_and_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
+                use_gloo_process_groups=args.use_gloo_process_groups,
                 dump_param_to_param_group_map=args.dump_param_to_param_group_map,
             )
         else:
@@ -1649,7 +1649,7 @@ def setup_model_and_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
+                use_gloo_process_groups=args.use_gloo_process_groups,
                 layer_wise_distributed_optimizer='dist' in config.optimizer,
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
