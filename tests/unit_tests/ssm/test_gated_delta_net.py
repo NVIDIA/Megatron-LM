@@ -233,8 +233,8 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         transformer_impl="transformer_engine",
     )
 
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        experimental_attention_variant="gated_delta_net", normalization="RMSNorm"
+    transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config=transformer_config, vp_stage=None, pp_rank=0
     )
 
     if cp:
@@ -243,5 +243,15 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         atol, rtol = 5e-4, 5e-4
 
     _test_parallel_attention_correctness(
-        transformer_config, transformer_layer_spec, tmp_path_dist_ckpt, tp, sp, cp
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
+        micro_batch_size=4,
     )
