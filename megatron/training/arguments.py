@@ -2230,7 +2230,9 @@ def _add_regularization_args(parser):
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer')
+                       help='Scale mode for Muon optimizer. With MuP, set '
+                       '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
+                       'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
@@ -3205,10 +3207,10 @@ def _add_experimental_args(parser):
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
-                       help='Specify a hybrid layer pattern using M (mamba), * (attention), '
-                       '- (mlp), E (moe). Use | to define pipeline stage boundaries for '
-                       'flexible virtual pipeline parallel (fVPP). Use / to separate MTP '
-                       'patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
+                       '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
+                       'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
+                       'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
