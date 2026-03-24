@@ -38,16 +38,14 @@ try:
     from importlib.metadata import version as _pkg_version
 
     _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
-    if _eo_ver < (0, 2):
-        raise ImportError(
-            f"emerging_optimizers >= 0.2 is required, "
-            f"found {_pkg_version('emerging-optimizers')}"
-        )
-    from emerging_optimizers.scalar_optimizers import Lion
-
-    HAVE_EO_V02 = True
 except (ImportError, PackageNotFoundError):
-    HAVE_EO_V02 = False
+    _eo_ver = (0, 0)
+
+HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 1)
+HAVE_EO_V02 = _eo_ver >= (0, 2)
+
+if HAVE_EO_V02:
+    from emerging_optimizers.scalar_optimizers import Lion
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer

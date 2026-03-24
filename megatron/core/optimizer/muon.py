@@ -13,7 +13,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
 
-from . import HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
+from . import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
     ChainedOptimizer,
@@ -23,16 +23,13 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig, ParamKey
 
-try:
+if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.orthogonalized_optimizers import (
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
-
-    HAVE_EMERGING_OPTIMIZERS = True
-except ImportError:
-    HAVE_EMERGING_OPTIMIZERS = False
+else:
     OrthogonalizedOptimizer = object
 
 if HAVE_EO_V02:
