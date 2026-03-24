@@ -183,7 +183,7 @@ jobs:
           fi
 
           if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
-            MBRIDGE_SUITE="L2"
+            MBRIDGE_SUITE="L1"
           else
             MBRIDGE_SUITE="unit-only"
           fi
