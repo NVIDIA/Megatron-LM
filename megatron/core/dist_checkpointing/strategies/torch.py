@@ -946,12 +946,3 @@ class TorchDistLoadShardedStrategy:
             raise e
         else:
             fs_writer.fs.rm_file(old_path)
-
-    def can_handle_sharded_objects(self):
-        return True
-
-    def check_backend_compatibility(self, loaded_version):
-        pass  # TODO
-
-    def check_version_compatibility(self, loaded_version):
-        pass  # TODO
