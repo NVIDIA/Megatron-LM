@@ -85,7 +85,7 @@ class DistributedInitConfig:
     local_rank: int = field(default_factory=lambda: int(os.getenv("LOCAL_RANK", "0")))
     """local rank passed from distributed launcher."""
 
-    lazy_init: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--lazy-mpu-init"], "dest": "lazy_mpu_init"}})
+    lazy_mpu_init: bool = False
     """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
     Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
 
