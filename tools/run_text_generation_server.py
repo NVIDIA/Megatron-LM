@@ -7,8 +7,6 @@ import warnings
 from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
-import os
-import sys
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -18,7 +16,6 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -38,7 +35,7 @@ sys.path.append(
 )
 
 from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 

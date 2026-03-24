@@ -42,8 +42,6 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-import megatron.core.nccl_allocator as nccl_allocator
-
 
 class BufferType(Enum):
     """
