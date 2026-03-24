@@ -12,14 +12,11 @@ pretokenized chat conversations stored in Megatron's `IndexedDataset` format
 |-----|-------|-------|-------------|
 | `tokens` | `(S-1,)` | `int64` | Input token ids (all but the **last** token of the packed sample) |
 | `labels` | `(S-1,)` | `int64` | Target token ids (all but the **first** token — i.e. `tokens` shifted right by one) |
+| `loss_mask` | `(S-1,)` | `float32` | Per-token loss mask (`0.0`/`1.0`). Which tokens are trained on depends on config (see §3) |
 | `cu_seqlens` | `(D+1,)` | `int32` | Cumulative sequence lengths. `D` is the number of documents packed into this sample. First element is always `0`, last element equals `S` (total tokens). Used for Flash Attention varlen kernels and to reset position ids per document |
 
 `S` is the sum of the token lengths of every document packed into the sample
 (always `<= sequence_length`).
-
-> **Note** — `loss_mask` is computed internally
-> (`_query_document_sample_shuffle_indices`) but not yet surfaced in the return
-> dict. When wired up it will be a `(S-1,)` `int64` tensor of `0`/`1` values.
 
 ---
 

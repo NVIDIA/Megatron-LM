@@ -384,13 +384,15 @@ class SFTDataset(MegatronDataset):
                 if num_samples % num_packed
                 else num_samples // num_packed
             )
+            generator = torch.Generator()
+            generator.manual_seed(self.config.random_seed)
             shuffle_index = []
             for epoch in range(num_epochs):
-                shuffle_index.extend(torch.randperm(num_packed).tolist())
+                shuffle_index.extend(torch.randperm(num_packed, generator=generator).tolist())
 
             document_index = numpy.array(document_index, dtype=numpy.int32)
             sample_index = numpy.array(sample_index, dtype=numpy.int32)
-            shuffle_index = numpy.array(shuffle_index, dtype=numpy.int32)
+            shuffle_index = numpy.array(shuffle_index[:num_samples], dtype=numpy.int32)
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
