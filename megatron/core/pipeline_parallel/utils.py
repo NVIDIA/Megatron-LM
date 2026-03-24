@@ -345,12 +345,6 @@ def set_streams(comm_stream=None):
         _COMM_STREAM = comm_stream
 
 
-def reset_streams():
-    """Reset all stream state. Intended for testing or reinitialisation."""
-    global _COMM_STREAM
-    _COMM_STREAM = None
-
-
 def get_comp_stream():
     """Get the stream for computation"""
     return torch.cuda.current_stream()
