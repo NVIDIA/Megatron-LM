@@ -335,8 +335,29 @@ def num_floating_point_operations(args, batch_size):
             + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
         )
 
+    def gdn_layer_flops(batch_size, seq_len, hidden_size,
+                        qk_head_dim=128, v_head_dim=128,
+                        num_qk_heads=16, num_v_heads=32,
+                        conv_kernel_dim=4):
+        """Calculate FLOPs for a Gated Delta Net (GDN) layer."""
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        return (
+            2 * batch_size * seq_len * (
+                # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
+                hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                # conv1d
+                + conv_kernel_dim * (2 * qk_dim + v_dim)
+                # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                + num_v_heads * (v_head_dim ** 2) * 4
+                # out_proj: v_dim -> hidden_size
+                + hidden_size * v_dim
+            )
+        )
+
     def hybrid_flops(batch_size, seq_len, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
+                     num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
                      num_attn_heads=32, gqa=True,
@@ -344,6 +365,9 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
+                     gdn_qk_head_dim=128, gdn_v_head_dim=128,
+                     gdn_num_qk_heads=16, gdn_num_v_heads=32,
+                     gdn_conv_kernel_dim=4,
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
@@ -357,6 +381,10 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
+                num_gdn_layers * gdn_layer_flops(batch_size, seq_len, hidden_size,
+                                                  gdn_qk_head_dim, gdn_v_head_dim,
+                                                  gdn_num_qk_heads, gdn_num_v_heads,
+                                                  gdn_conv_kernel_dim) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
@@ -637,9 +665,11 @@ def num_floating_point_operations(args, batch_size):
         from operator import itemgetter
 
         from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
-        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = itemgetter(
-            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
+            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
+                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+            )
+        )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -653,6 +683,7 @@ def num_floating_point_operations(args, batch_size):
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
+            num_gdn_layers=num_gdn_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
@@ -669,6 +700,11 @@ def num_floating_point_operations(args, batch_size):
             shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
+            gdn_qk_head_dim=args.linear_key_head_dim or 128,
+            gdn_v_head_dim=args.linear_value_head_dim or 128,
+            gdn_num_qk_heads=args.linear_num_key_heads or 16,
+            gdn_num_v_heads=args.linear_num_value_heads or 32,
+            gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         )
@@ -694,6 +730,7 @@ def get_start_time_from_progress_log():
     start_time = None
     start_num_floating_point_operations = None
     latest_num_floating_point_operations = 0
+    latest_num_floating_point_operations_uncommitted = None
 
     def _get_field(string, type):
         return type(string.split(': ')[1])
@@ -705,6 +742,18 @@ def get_start_time_from_progress_log():
             world_size_in_line = _get_field(line_tokens[2], int)
             if line_tokens[3] == "Saved checkpoint":
                 latest_num_floating_point_operations = _get_field(line_tokens[7], float)
+            elif line_tokens[3] == "Saving async checkpoint":
+                # Checkpoint hasn't committed yet, so store for now in a different variable.
+                latest_num_floating_point_operations_uncommitted = _get_field(line_tokens[7], float)
+            elif line_tokens[3] == "Saved async checkpoint":
+                # Checkpoint has committed, so can update latest_num_floating_point_operations to
+                # value from latest 'Saving async checkpoint' message.
+                # Note: latest_num_floating_point_operations_uncommitted can be None if
+                # save_checkpoint was called directly (without save_checkpoint_and_time),
+                # which writes "Saved async checkpoint" but not "Saving async checkpoint".
+                if latest_num_floating_point_operations_uncommitted is not None:
+                    latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
+                    latest_num_floating_point_operations_uncommitted = None
             if world_size_in_line != args.world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
@@ -717,6 +766,8 @@ def get_start_time_from_progress_log():
     assert (
         start_time is not None and start_num_floating_point_operations is not None
     ), "Should have seen at least one 'Starting job' entry with same world_size"
+    print_rank_0(f"megatron.training.get_start_time_from_progress_log: "
+                 f"{start_time=}, {start_num_floating_point_operations=}")
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
 
 
@@ -1406,6 +1457,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
+            # Megatron-FSDP arguments.
+            kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
+            kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
+            kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+
+            # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -2900,7 +2957,7 @@ def train(
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
-        if iteration in args.iterations_to_skip:
+        if (iteration + 1) in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
