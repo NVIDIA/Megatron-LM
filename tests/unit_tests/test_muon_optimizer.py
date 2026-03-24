@@ -425,6 +425,14 @@ class TestMuonOptimizerMultiRankTP:
         ), "Weight should be updated with mode=blockwise"
 
 
+# All non-custom coefficient types supported by emerging_optimizers.
+_TESTABLE_COEFFICIENT_TYPES = [t for t in get_supported_coefficient_types() if t != "custom"]
+
+# A reasonable default NS step count for testing; get_coefficient_iterator
+# cycles/repeats coefficients so any step count works with any type.
+_DEFAULT_NS_STEPS = 5
+
+
 @pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
 def test_muon_optimizer_coefficient_types(coefficient_type):
     """Test TensorParallelMuon optimizer with different coefficient types."""
@@ -670,14 +678,6 @@ def test_validate_coefficient_type_rejects_invalid():
     """Test that validate_coefficient_type raises ValueError for an invalid type."""
     with pytest.raises(ValueError, match="Unsupported muon coefficient type"):
         validate_coefficient_type("nonexistent_type_xyz")
-
-
-# All non-custom coefficient types supported by emerging_optimizers.
-_TESTABLE_COEFFICIENT_TYPES = [t for t in get_supported_coefficient_types() if t != "custom"]
-
-# A reasonable default NS step count for testing; get_coefficient_iterator
-# cycles/repeats coefficients so any step count works with any type.
-_DEFAULT_NS_STEPS = 5
 
 
 

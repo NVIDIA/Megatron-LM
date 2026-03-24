@@ -45,9 +45,9 @@ try:
         )
     from emerging_optimizers.scalar_optimizers import Lion
 
-    HAVE_LION = True
+    HAVE_EO_V02 = True
 except (ImportError, PackageNotFoundError):
-    HAVE_LION = False
+    HAVE_EO_V02 = False
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -560,7 +560,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.initialize_state(p)
 
         elif config.optimizer == 'lion':
-            if not HAVE_LION:
+            if not HAVE_EO_V02:
                 raise ImportError(
                     "Lion optimizer requires the 'emerging_optimizers' package. "
                     "Please install it to use --optimizer lion."
