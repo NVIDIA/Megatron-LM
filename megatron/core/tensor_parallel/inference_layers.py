@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
@@ -55,9 +56,20 @@ def _apply_linear(
     Helper to apply either MXFP8 or standard GEMM based on the configuration.
     """
     kwargs = {"out": out} if out is not None else {}
-    if config.fp8_recipe == "mxfp8":
+    if isinstance(weight, MXFP8Tensor):
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
+
+
+class InferenceLinear(TELinear):
+    """Inference optimized version of TELinear."""
+
+    def __init__(self):
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        pass
+
+    def forward(self):
+        pass
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
