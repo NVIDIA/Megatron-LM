@@ -2134,9 +2134,7 @@ def preprocess_sft_batch(
         # so we need to remove it since TE expects cu_seqlens to be 1D
 
         if cp_size > 1:
-            divisibility_factor = 1
-            if cp_size > 1:
-                divisibility_factor *= cp_size * 2
+            divisibility_factor = cp_size * 2
             if tp_size > 1 and sp:
                 divisibility_factor *= tp_size
 
@@ -2197,7 +2195,7 @@ def preprocess_sft_batch(
             'loss_mask': loss_mask.unsqueeze(0),  # NOTE(asolergi-nv): Add batch dimension
             'position_ids': position_ids.unsqueeze(0),  # NOTE(asolergi-nv): Add batch dimension
             'cu_seqlens': cu_seqlens,
-            'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
         }
     return batch
@@ -2270,7 +2268,7 @@ def get_batch_on_this_tp_rank(
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
         'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
     """
-    # TODO(asolergi-nv): Enable PP wit sft
+    # TODO(asolergi-nv): Enable PP with sft
 
     def _broadcast(item):
         if item is not None:
@@ -2344,7 +2342,7 @@ def get_batch_on_this_tp_rank(
                 0, dtype=torch.int32, device=torch.cuda.current_device()
             )
             _broadcast(hybrid_cp_seq_length)
-            shape = (micro_batch_size, hybrid_cp_seq_length)
+            shape = (micro_batch_size, hybrid_cp_seq_length.item())
         else:
             shape = (micro_batch_size, seq_length)
 

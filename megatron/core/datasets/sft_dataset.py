@@ -72,10 +72,10 @@ class SFTDatasetConfig(GPTDatasetConfig):
     """
 
     train_on_assistant_responses_only: bool = True
-    """If True, only train on completitions, otherwise train on full conversations"""
+    """If True, only train on completions, otherwise train on full conversations"""
 
     train_on_thinking_traces: bool = True
-    """If False, mask thinking traces from the completitions"""
+    """If False, mask thinking traces from the completions"""
 
     train_on_tool_calls: bool = True
     """If True, include tool call content in the loss computation"""
@@ -272,7 +272,7 @@ class SFTDataset(MegatronDataset):
         # TODO(asolergi-nv): For PP add flag to JUST read cu_seqlens
 
         for i in range(doc_index_beg, doc_index_end):
-            sample = self.dataset.get(self.document_index[i])
+            sample = self.dataset.get(self.indices[self.document_index[i]])
             if self.config.train_on_assistant_responses_only:
                 segments = extract_segments(
                     sample.tolist(),
