@@ -1321,6 +1321,22 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     return 16
 
 
+def skip_routed_expert_padding(config: TransformerConfig) -> bool:
+    """Whether the expert module should skip quantization padding.
+
+    Returns True when padding is already applied by the router or the
+    HybridEP dispatcher.
+    """
+    if config.moe_router_padding_for_quantization:
+        return True
+    if (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    ):
+        return True
+    return False
+
+
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
 def get_default_pg_collection() -> ProcessGroupCollection:
