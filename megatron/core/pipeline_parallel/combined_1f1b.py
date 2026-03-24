@@ -52,7 +52,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
     """
 
-    set_streams(use_dynamic_comp_stream=config.use_dynamic_comp_stream)
+    set_streams()
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -178,7 +178,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 # backward_step_helper_postprocess()
     """
 
-    set_streams(use_dynamic_comp_stream=config.use_dynamic_comp_stream)
+    set_streams()
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None

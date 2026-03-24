@@ -275,14 +275,6 @@ class ModelParallelConfig:
     in 1f1b phase of pipelining or non-pipelining schedule.
     """
 
-    use_dynamic_comp_stream: bool = False
-    """Use dynamic computation stream selection instead of binding to the default stream.
-    When enabled, get_comp_stream() returns torch.cuda.current_stream() at call time,
-    allowing CUDA graph capture and replay on non-default streams. This is required for
-    full-iteration CUDA graph with 1f1b EP overlap where the capture stream differs
-    from the default stream.
-    """
-
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
