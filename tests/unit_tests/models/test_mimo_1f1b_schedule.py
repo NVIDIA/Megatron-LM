@@ -78,6 +78,7 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["tp", "pp"])
     grid.create_pg(["tp", "ep", "pp"])
     grid.create_pg(["dp", "ep"])
+    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
     _active_grids.append(grid)
     return grid
 
@@ -521,7 +522,9 @@ def run_mimo_1f1b_test(
         use_distributed_optimizer=True,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
-    logger.info(f"[Rank {dist.get_rank()}] MimoOptimizer created with {len(optimizer._active_optimizers)} active optimizers")
+    logger.info(
+        f"[Rank {dist.get_rank()}] MimoOptimizer created with {len(optimizer._active_optimizers)} active optimizers"
+    )
 
     logger.info(f"[Rank {dist.get_rank()}] Creating communicator...")
     communicator = MultiModulePipelineCommunicator(
@@ -576,7 +579,9 @@ def run_mimo_1f1b_test(
         output_tensor, loss_mask = model(**batch)
         return output_tensor, partial(loss_func, loss_mask)
 
-    logger.info(f"[Rank {dist.get_rank()}] Running 1F1B schedule with {num_microbatches} microbatches...")
+    logger.info(
+        f"[Rank {dist.get_rank()}] Running 1F1B schedule with {num_microbatches} microbatches..."
+    )
 
     # Zero gradients before forward/backward
     optimizer.zero_grad()
@@ -596,7 +601,9 @@ def run_mimo_1f1b_test(
     # Optimizer step with global gradient clipping
     logger.info(f"[Rank {dist.get_rank()}] Running optimizer step...")
     success, grad_norm, num_zeros = optimizer.step()
-    logger.info(f"[Rank {dist.get_rank()}] Optimizer step: success={success}, grad_norm={grad_norm}")
+    logger.info(
+        f"[Rank {dist.get_rank()}] Optimizer step: success={success}, grad_norm={grad_norm}"
+    )
 
     # Verify results on last LLM stage
     if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):

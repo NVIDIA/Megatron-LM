@@ -110,6 +110,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @property
     def param_groups(self) -> List[dict]:
+        """Combined param groups from all active module optimizers."""
         groups = []
         for opt in self._active_optimizers:
             groups.extend(opt.param_groups)
@@ -155,6 +156,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         grid.create_pg(["tp", "pp"])
         grid.create_pg(["tp", "ep", "pp"])
         grid.create_pg(["dp", "ep"])
+        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
@@ -180,9 +182,12 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
     pg.expt_dp = grid.get_pg(["dp", "ep"])
 
-    # Distributed optimizer group (same as dp_cp when num_distributed_optimizer_instances == 1)
-    # FIXME: Yash - handle multiple optimizer instances
-    pg.intra_dist_opt = grid.get_pg(["dp", "cp"])
+    # Distributed optimizer grad stats group: must span all dimensions so grad norm
+    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
+    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
+    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
+    # spans the full world when num_distributed_optimizer_instances == 1.
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
 
     return pg
 
@@ -211,6 +216,16 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
+                assert (
+                    not hasattr(module, 'ddp_config')
+                    or module.ddp_config is None
+                    or module.ddp_config.num_distributed_optimizer_instances == 1
+                ), (
+                    "MIMO optimizer does not yet support "
+                    "num_distributed_optimizer_instances > 1. "
+                    f"Module '{module_name}' has "
+                    f"{module.ddp_config.num_distributed_optimizer_instances} instances."
+                )
                 optimizer = get_megatron_optimizer(
                     config=config,
                     model_chunks=[module],

@@ -19,21 +19,11 @@ class TestModuleOptimizerInfo:
     """Tests for ModuleOptimizerInfo dataclass."""
 
     def test_create_active(self):
-        info = ModuleOptimizerInfo(
-            optimizer=None,
-            grid=None,
-            pg_collection=None,
-            is_active=True,
-        )
+        info = ModuleOptimizerInfo(optimizer=None, grid=None, pg_collection=None, is_active=True)
         assert info.is_active is True
 
     def test_create_inactive(self):
-        info = ModuleOptimizerInfo(
-            optimizer=None,
-            grid=None,
-            pg_collection=None,
-            is_active=False,
-        )
+        info = ModuleOptimizerInfo(optimizer=None, grid=None, pg_collection=None, is_active=False)
         assert info.is_active is False
 
 
@@ -69,9 +59,7 @@ class TestMimoOptimizerUnit:
         from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
         config = OptimizerConfig(optimizer='adam', lr=1e-4)
-        module_infos = {
-            "encoder": ModuleOptimizerInfo(None, None, None, is_active=False),
-        }
+        module_infos = {"encoder": ModuleOptimizerInfo(None, None, None, is_active=False)}
         opt = MimoOptimizer(module_infos, config)
 
         state = opt.state_dict()
@@ -82,6 +70,7 @@ class TestMimoOptimizerUnit:
 # ============================================================================
 # Integration tests (require torchrun)
 # ============================================================================
+
 
 def run_distributed_test():
     """Run distributed integration test."""
@@ -117,6 +106,7 @@ def run_distributed_test():
         grid.create_pg(["tp", "pp"])
         grid.create_pg(["tp", "ep", "pp"])
         grid.create_pg(["dp", "ep"])
+        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
         return grid
 
     def get_pg_collection(grid):
@@ -220,9 +210,7 @@ def run_distributed_test():
 
     # Wrap with DDP
     ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True,
-        bucket_size=10000,
-        use_distributed_optimizer=True,
+        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
     )
 
     if mimo_model.language_model is not None:
@@ -233,7 +221,10 @@ def run_distributed_test():
             pg_collection=llm_pg,
         )
 
-    if "images" in mimo_model.modality_submodules and mimo_model.modality_submodules["images"] is not None:
+    if (
+        "images" in mimo_model.modality_submodules
+        and mimo_model.modality_submodules["images"] is not None
+    ):
         submodule = mimo_model.modality_submodules["images"]
         mimo_model.modality_submodules["images"] = DistributedDataParallel(
             config=submodule.encoders['clip'].config,
@@ -254,7 +245,9 @@ def run_distributed_test():
 
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
-    print(f"[Rank {rank}] Created optimizer with {len(optimizer._active_optimizers)} active optimizers")
+    print(
+        f"[Rank {rank}] Created optimizer with {len(optimizer._active_optimizers)} active optimizers"
+    )
 
     # Verify structure
     assert "images" in optimizer.module_infos
