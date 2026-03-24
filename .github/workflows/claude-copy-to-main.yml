@@ -23,8 +23,10 @@ jobs:
       PR_NUMBER: ${{ github.event.issue.number }}
     steps:
       - name: Check commenter has write access
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
         run: |
-          PERMISSION=$(gh api repos/$REPO/collaborators/${{ github.event.comment.user.login }}/permission --jq .permission)
+          PERMISSION=$(gh api repos/$REPO/collaborators/$COMMENTER/permission --jq .permission)
           if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "write" ]]; then
             gh pr comment $PR_NUMBER --repo $REPO --body "❌ You do not have write access to use \`/claude copy\`."
             exit 1
