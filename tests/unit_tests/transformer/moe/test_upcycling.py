@@ -27,11 +27,12 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    unwrap_model,
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups,
 )
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.training.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
@@ -162,8 +163,43 @@ def get_batch(data_iterator):
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    batch = get_batch_on_this_tp_rank(data_iterator)
-    batch = get_batch_on_this_cp_rank(batch)
+    args = get_args()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+
+    BATCH_KEYS = [
+        "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
+        "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size",
+        "hybrid_cp_group",
+    ]
+
+    batch = {}
+    if tp_rank == 0:
+        batch = next(data_iterator)
+        for key in BATCH_KEYS:
+            batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
+
+    batch = get_batch_on_this_tp_rank(
+        batch,
+        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        is_sft=False,
+        is_hybrid_cp=False,
+        create_attention_mask_in_dataloader=getattr(args, 'create_attention_mask_in_dataloader', True),
+        cp_size=args.context_parallel_size,
+        tp_rank=tp_rank,
+        micro_batch_size=args.micro_batch_size,
+        seq_length=args.seq_length,
+        mtp_on_this_rank=False,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+    )
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=False,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+    )
 
     return batch.values()
 
