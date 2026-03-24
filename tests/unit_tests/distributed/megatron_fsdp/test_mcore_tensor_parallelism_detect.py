@@ -1,4 +1,4 @@
-import types
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import torch
 from torch import nn
