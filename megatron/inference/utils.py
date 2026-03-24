@@ -358,7 +358,6 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
         prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
         prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_compact_interval=getattr(args, 'inference_dynamic_batching_prefix_caching_compact_interval', 100),
         prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
         use_triton_conv1d=getattr(args, 'inference_dynamic_batching_mamba_triton_conv1d', False),
         metrics_writer=metrics_writer,
