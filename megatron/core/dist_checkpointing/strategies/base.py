@@ -11,13 +11,13 @@ logger = logging.getLogger(__name__)
 
 
 class LoadShardedStrategy:
-    """Base class for load strategies to be removed in v0.15"""
+    """Base class for load strategies to be removed in future releases."""
 
     pass
 
 
 class SaveShardedStrategy:
-    """Base class for save strategies to be removed in v0.15"""
+    """Base class for save strategies to be removed in future releases."""
 
     def __init__(self, backend: str, version: int):
         pass
@@ -25,7 +25,7 @@ class SaveShardedStrategy:
 
 class StrategyAction(Enum):
     """Specifies save vs load and sharded vs common action.
-    To be removed in v0.15"""
+    To be removed in future releases."""
 
     LOAD_COMMON = 'load_common'
     LOAD_SHARDED = 'load_sharded'
@@ -38,7 +38,7 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
 
     logger.warning(
         'megatron.core.dist_checkpointing.strategies.base.get_default_strategy'
-        ' is deprecated and will be removed in Megatron-Core v0.14. Please use'
+        ' is deprecated and will be removed in the future releases. Please use'
         ' TorchDistLoadShardedStrategy() and TorchDistSaveShardedStrategy()'
         ' to get the default load and save sharded strategies.'
     )
