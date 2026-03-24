@@ -15,6 +15,7 @@ This feature is intended for research teams exploring RL post-training and other
 ## Key Features
 
 - **Training-Inference Consistency** - Eliminates numerical differences by using the same kernels and parallelization for both training and inference
+- **Batch-Invariant Mode** - Provides bitwise identical results for dense models regardless of batch configuration (`--batch-invariant-mode`). Note: MoE models may still have minor numerical differences
 - **FP8 Consistency** - Maintains precision alignment for FP8 workflows across training and inference
 - **Native Integration** - No framework handoffs or external dependencies required
 - **RL Workflow Support** - Unified pipeline for training and rollout generation, usable with [NeMo RL](https://github.com/NVIDIA/NeMo-RL) and custom RL frameworks
@@ -71,11 +72,12 @@ Consistent teacher-student computations for distillation workflows:
 
 **Text Generation Controllers**
 - Handle prompt preprocessing and output detokenization
-- Support for GPT, T5, and VLM architectures
+- Support for GPT, T5, VLM, MoE, and hybrid (e.g., Mamba) architectures
 
 **Inference Contexts**
 - Manage KV cache and inference state
-- Support both static and dynamic memory allocation
+- Paged attention with block memory allocation (dynamic engine)
+- Memory offloading via torch memory saver or UVM for seamless training-inference switching in RL workflows
 
 ## Limitations and Performance Expectations
 
@@ -83,7 +85,7 @@ Megatron in-framework inference prioritizes numerical consistency over throughpu
 
 - **Lower throughput** than vLLM, SGLang, or TensorRT-LLM
 - **No continuous batching optimizations** found in production inference engines
-- **Limited kernel optimization** - uses training kernels rather than inference-optimized kernels
+- **Limited inference optimizations** - kernel optimizations are actively underway
 - **Research-focused** - designed for correctness, not production serving
 
 This is an intentional design tradeoff: Megatron in-framework inference uses the same code paths as training to guarantee numerical consistency, at the cost of inference performance.
