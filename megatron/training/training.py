@@ -176,7 +176,14 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer import (
+    get_megatron_optimizer,
+    AdamOptimizerConfig,
+    SGDOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    ParamWithNamePredicate,
+)
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1627,9 +1634,19 @@ def setup_model_and_optimizer(
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
         if 'muon' not in config.optimizer:
-            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-            # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-            # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+            if args.embedding_init_method_std is not None:
+                # Restore "spike no more" behavior by defaulting embedding params to wd_mult=0.
+                embedding_wd_skip_key = ParamKey(
+                    with_name_predicate=ParamWithNamePredicate(
+                        name="spike_no_more_embedding_params",
+                        fn=lambda _param, name: "embedding" in name,
+                    )
+                )
+                config_overrides = {
+                    **(config_overrides or {}),
+                    embedding_wd_skip_key: {"wd_mult": 0.0},
+                }
+
             optimizer = get_megatron_optimizer(
                 config,
                 model,
