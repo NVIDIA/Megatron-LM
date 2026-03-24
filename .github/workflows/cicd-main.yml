@@ -182,7 +182,12 @@ jobs:
             SCOPE=mr-github-slim; N_REPEAT=5; LIGHTWEIGHT=false
           fi
 
-          MBRIDGE_SUITE=$( [ "$HAS_MBRIDGE" == "true" ] && echo "all" || echo "unit-only" )
+          if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
+            MBRIDGE_SUITE="L2"
+          else
+            MBRIDGE_SUITE="unit-only"
+          fi
+
           DEV=true
 
           echo "scope=$SCOPE"                 | tee -a $GITHUB_OUTPUT
