@@ -222,12 +222,13 @@ def get_megatron_muon_optimizer(
     # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
     config.optimizer = config.muon_scalar_optimizer
 
-    assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
     if config.muon_scalar_optimizer == 'lion':
         assert HAVE_EO_V02, (
             "Lion optimizer requires emerging_optimizers >= 0.2. "
             "Please upgrade to use --muon-scalar-optimizer lion."
         )
+    else:
+        assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
     # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
     # In theory we can change DDP to enable use muon and dist-opt-adam together
