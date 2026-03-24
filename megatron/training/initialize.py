@@ -24,7 +24,6 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
-from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
@@ -196,48 +195,7 @@ def _compile_dependencies():
             flush=True,
         )
 
-    # ==================
-    # Load fused kernels
-    # ==================
-
-    # Custom kernel constraints check.
-    seq_len = args.seq_length
-    attn_batch_size = (
-        args.num_attention_heads / args.tensor_model_parallel_size
-    ) * args.micro_batch_size
-    # Constraints on sequence length and attn_batch_size to enable warp based
-    # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = (
-        seq_len > 16 and seq_len <= 16384 and seq_len % 4 == 0 and attn_batch_size % 4 == 0
-    )
-    # Print a warning.
-    if not ((args.fp16 or args.bf16) and custom_kernel_constraint and args.masked_softmax_fusion):
-        warn_rank_0(
-            "Constraints for invoking optimized fused softmax kernel are not met. "
-            "We default back to unfused kernel invocations."
-        )
-
-    # Always build on rank zero first.
-    if torch.distributed.get_rank() == 0:
-        start_time = time.time()
-        print("> compiling and loading fused kernels ...", flush=True)
-        fused_kernels.load(args)
-        torch.distributed.barrier()
-    else:
-        torch.distributed.barrier()
-        fused_kernels.load(args)
-    # Simple barrier to make sure all ranks have passed the
-    # compilation phase successfully before moving on to the
-    # rest of the program. We think this might ensure that
-    # the lock is released.
     torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print(
-            ">>> done with compiling and loading fused kernels. "
-            "Compilation time: {:.3f} seconds".format(time.time() - start_time),
-            flush=True,
-        )
-
 
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
