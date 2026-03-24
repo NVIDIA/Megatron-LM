@@ -64,12 +64,45 @@ def _apply_linear(
 class InferenceLinear(TELinear):
     """Inference optimized version of TELinear."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        tp_comm_buffer_name: Optional[str] = None,
+        is_expert: bool = False,
+        symmetric_ar_type: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
-        pass
+        super().__init__(
+            input_size,
+            output_size,
+            parallel_mode=parallel_mode,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            is_expert=is_expert,
+            symmetric_ar_type=symmetric_ar_type,
+            tp_group=tp_group,
+        )
 
-    def forward(self):
-        pass
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """Forward pass."""
+        if self.training:
+            return super().forward(x)
+
+        x = _apply_linear(x, self.weight, self.config)
+        return x, None
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
