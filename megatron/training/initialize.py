@@ -195,27 +195,6 @@ def _compile_dependencies():
             flush=True,
         )
 
-    # ==================
-    # Load fused kernels
-    # ==================
-
-    # Custom kernel constraints check.
-    seq_len = args.seq_length
-    attn_batch_size = (
-        args.num_attention_heads / args.tensor_model_parallel_size
-    ) * args.micro_batch_size
-    # Constraints on sequence length and attn_batch_size to enable warp based
-    # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = (
-        seq_len > 16 and seq_len <= 16384 and seq_len % 4 == 0 and attn_batch_size % 4 == 0
-    )
-    # Print a warning.
-    if not ((args.fp16 or args.bf16) and custom_kernel_constraint and args.masked_softmax_fusion):
-        warn_rank_0(
-            "Constraints for invoking optimized fused softmax kernel are not met. "
-            "We default back to unfused kernel invocations."
-        )
-
     torch.distributed.barrier()
 
 def _initialize_tp_communicators():
