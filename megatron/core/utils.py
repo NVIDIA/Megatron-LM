@@ -2125,15 +2125,6 @@ def preprocess_sft_batch(
         'max_seqlen'.
     """
     if tp_rank == 0:
-        # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
-        ### 1. Create cu_seqlens_padded if CP is enabled
-        ### 2. Pad or truncate tensors if necessary
-        ### 3. Process loss mask
-        ### 4. Create position ids
-        ### 5. Create max_seqlen
-        # From this point, all tensors have shape [1, sequence_length] (Except for cu_seqlens,
-        # cu_seqlens_padded and max_seqlen)
-
         tokens, labels, loss_mask, cu_seqlens = (
             batch["tokens"].squeeze(0),
             batch["labels"].squeeze(0),
@@ -2142,7 +2133,6 @@ def preprocess_sft_batch(
         )  # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension,
         # so we need to remove it since TE expects cu_seqlens to be 1D
 
-        # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled
         if cp_size > 1:
             divisibility_factor = 1
             if cp_size > 1:

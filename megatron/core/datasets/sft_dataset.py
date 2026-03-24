@@ -272,9 +272,6 @@ class SFTDataset(MegatronDataset):
         # TODO(asolergi-nv): For PP add flag to JUST read cu_seqlens
 
         for i in range(doc_index_beg, doc_index_end):
-            # Add the document id # TODO(asolergi-nv): Remove
-            document_ids.append(self.document_index[i])
-
             sample = self.dataset.get(self.document_index[i])
             if self.config.train_on_assistant_responses_only:
                 segments = extract_segments(
@@ -301,9 +298,6 @@ class SFTDataset(MegatronDataset):
             # Add the sample part & loss mask
             sample_parts.append(sample)
             loss_masks.append(loss_mask)
-        assert len(document_ids) == len(
-            sample_parts
-        ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
@@ -394,8 +388,6 @@ class SFTDataset(MegatronDataset):
             for epoch in range(num_epochs):
                 shuffle_index.extend(torch.randperm(num_packed).tolist())
 
-            # TODO(asolergi-nv): Refactor
-            # Convert to numpy arrays
             document_index = numpy.array(document_index, dtype=numpy.int32)
             sample_index = numpy.array(sample_index, dtype=numpy.int32)
             shuffle_index = numpy.array(shuffle_index, dtype=numpy.int32)

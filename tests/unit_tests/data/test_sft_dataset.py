@@ -8,9 +8,7 @@ import os
 import random
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import List
 
-import numpy
 import pytest
 import torch
 

@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import torch
 
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 
 try:
@@ -37,10 +37,8 @@ from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
-    get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
-    unwrap_model,
 )
 from megatron.legacy.model.module import param_is_not_shared
 
