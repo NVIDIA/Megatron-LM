@@ -4,12 +4,16 @@ on:
   pull_request_target:
     types: [ready_for_review]
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   label-complexity:
     name: Label PR Complexity
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       issues: write
       id-token: write
