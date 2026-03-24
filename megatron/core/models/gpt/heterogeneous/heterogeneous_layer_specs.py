@@ -3,6 +3,7 @@
 import warnings
 from typing import Optional
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -27,11 +28,10 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -41,10 +41,14 @@ try:
     from megatron.core.transformer.heterogeneous.linear_replacements import (
         TELayerNormColumnParallelLinearGathered,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinearGathered,
+    ) = (None, None, None, None, None)
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -110,8 +114,10 @@ def _get_heterogenous_attention_spec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                core_attention=TEDotProductAttention if use_te else DotProductAttention,
+                linear_qkv=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
+                core_attention=not_none(TEDotProductAttention) if use_te else DotProductAttention,
                 linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
                 q_layernorm=ln,
                 k_layernorm=ln,
@@ -134,8 +140,10 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
         mlp = ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                linear_fc1=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
+                linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
             ),
         )
     return mlp

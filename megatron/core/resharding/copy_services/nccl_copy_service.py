@@ -37,15 +37,18 @@ class NCCLCopyService(CopyService):
     a batch of point-to-point sends and recvs.
     """
 
-    def __init__(self):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+    def __init__(self, group=None):
+        self.group = group
+        # Use group.rank()/size() to support cross-cluster ProcessGroups
+        self.rank = group.rank() if group is not None else dist.get_rank()
+        self.world_size = group.size() if group is not None else dist.get_world_size()
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[RecvOp] = []
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
         # serialization with work on the default stream.
         self._copy_stream = torch.cuda.Stream()
-        logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
+        if self.rank == 0:
+            logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
@@ -64,12 +67,13 @@ class NCCLCopyService(CopyService):
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)
-        logger.info(
-            "Executing batched communication: %d sends + %d recvs = %d ops",
-            len(self.send_ops),
-            len(self.recv_ops),
-            total_ops,
-        )
+        if self.rank == 0:
+            logger.info(
+                "Executing batched communication: %d sends + %d recvs = %d ops",
+                len(self.send_ops),
+                len(self.recv_ops),
+                total_ops,
+            )
 
         local_sends = [op for op in self.send_ops if op.dest_rank == self.rank]
         remote_sends = [op for op in self.send_ops if op.dest_rank != self.rank]
@@ -109,9 +113,9 @@ class NCCLCopyService(CopyService):
 
         p2p_ops = []
         for op in remote_sends:
-            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank))
+            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
         for op in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank))
+            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)
@@ -121,6 +125,7 @@ class NCCLCopyService(CopyService):
         # Make sure the copy stream is finished
         torch.cuda.current_stream().wait_stream(self._copy_stream)
 
-        logger.info("Batched communication completed")
+        if self.rank == 0:
+            logger.info("Batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()

@@ -93,6 +93,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # disable_bucketing is True (e.g., we might not want to break up model parameters
         # into buckets for model chunks after the first in the interleaved schedule).
         self.bucket_size = self.ddp_config.bucket_size
+        self.force_all_reduce = False
         if isinstance(self.pp_group, list):
             pp_rank = self.pp_group[0].rank()
         else:
@@ -235,7 +236,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
-            if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+            # Note: overlap_param_gather covers both the distributed optimizer and the
+            # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+            # without use_distributed_optimizer.
+            if self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -343,9 +347,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
-        self.use_forward_hook = (
-            self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather
-        )
+        # Note: overlap_param_gather covers both the distributed optimizer and the
+        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+        # without use_distributed_optimizer.
+        self.use_forward_hook = self.ddp_config.overlap_param_gather
         self.remove_forward_pre_hook_handles = {}
         if self.use_forward_hook:
             self.enable_forward_pre_hook()
@@ -440,7 +445,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(param)
+                    self.param_to_bucket_group[param].register_grad_ready(
+                        param, self.force_all_reduce
+                    )
 
         return hook
 
@@ -487,10 +494,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 # in "finish_param_sync" stage after zeroing the shared gardient buffers.
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
+                        is_bf16_weight_bucket = False
                         for param in bucket.params:
+                            # Skip copying since bf16 weights in the mxfp8 model
+                            # are already mapped to param.data.
+                            if not is_float8tensor(param):
+                                is_bf16_weight_bucket = True
+                                break
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
                             param.data.copy_(param_slice.view(param.data.shape))
+                        if is_bf16_weight_bucket:
+                            continue
                         # All-gathered params are not needed after being copied to param.data.
                         # Zero out the param buffer (shared with grad buffer) for gradient
                         # accumulation. We cannot zero out the entire grad buffer because one grad
@@ -519,7 +534,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all model gradients.
@@ -529,7 +544,12 @@ class DistributedDataParallel(_BaseDataParallel):
         communication ops.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.finish_grad_sync()
+            bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    def free_overlap_buffers(self):
+        """Free overlap param-gather GPU buffers across all bucket groups."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
@@ -568,3 +588,41 @@ class DistributedDataParallel(_BaseDataParallel):
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
                 group=data_parallel_group,
             )
+
+    def offload_grad_buffers(self, synchronize: bool = True, empty_cache: bool = True) -> None:
+        """
+        Free all grad_data tensors to release GPU memory.
+
+        Uses storage().resize_(0) to release memory while keeping tensor views intact.
+        All bucket.grad_data and param.main_grad views remain valid tensor objects
+        (though accessing them during offload is undefined behavior).
+
+        Args:
+            synchronize: Whether to call torch.cuda.synchronize() before freeing.
+            empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
+        """
+        if synchronize:
+            torch.cuda.synchronize()
+
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.offload_to_cpu(move_params=False, move_grads=True)
+
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+    def restore_grad_buffers(self, synchronize: bool = True) -> None:
+        """
+        Reallocate grad_data tensors on GPU.
+
+        All existing views (bucket.grad_data, param.main_grad) automatically
+        become valid again since they share the same storage. The grad_data
+        is zeroed after reallocation.
+
+        Args:
+            synchronize: Whether to call torch.cuda.synchronize() after allocation.
+        """
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.reload_from_cpu(move_params=False, move_grads=True)
+
+        if synchronize:
+            torch.cuda.synchronize()

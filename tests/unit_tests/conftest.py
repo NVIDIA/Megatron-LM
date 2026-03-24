@@ -38,6 +38,14 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 0
 
 
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    yield
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+
+
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
@@ -74,7 +82,7 @@ def ensure_test_data():
 
         try:
             # Download assets to /opt/data
-            download_and_extract_asset(assets_dir=str(data_path))
+            download_and_extract_asset(assets_dir=data_path)
 
             print("Test data downloaded successfully.")
 

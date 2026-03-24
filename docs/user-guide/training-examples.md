@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Training Examples
 
 Get started with Megatron Core training using these practical examples.
@@ -24,7 +33,7 @@ This example:
 Train LLaMA-3 8B model with FP8 mixed precision on 8 GPUs:
 
 ```bash
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/llama/train_llama3_8b_h100_fp8.sh
 ```
 
 **Configuration:**

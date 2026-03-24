@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -37,12 +37,10 @@ class TestParallelSequentialMLP:
             moe_router_topk=1,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.sequential_mlp = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
+        self.sequential_mlp = MoELayer(transformer_config, submodules.mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

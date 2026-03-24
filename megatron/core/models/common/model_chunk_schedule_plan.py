@@ -122,14 +122,13 @@ class TransformerLayerSchedulePlan:
 
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        is_moe = (
-            isinstance(self.layer.transformer_layer.mlp, MoELayer)
-            if is_mtp
-            else isinstance(self.layer.mlp, MoELayer)
-        )
+        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
+        is_moe = isinstance(transformer_layer.mlp, MoELayer)
+        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
+        extra_args["num_local_experts"] = num_local_experts
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
 
@@ -281,6 +280,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         extra_block_kwargs=None,
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
+        padding_mask=None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -323,6 +323,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
+        self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.model = model

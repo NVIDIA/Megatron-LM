@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from argparse import Namespace
 from copy import deepcopy
 from unittest import mock
@@ -7,9 +9,6 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
@@ -77,19 +76,9 @@ class TestT5InferenceWrapper:
             add_decoder=True,
         ).cuda()
 
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=hidden_size,
-            inference_batch_times_seqlen_threshold=-1,
-            fp32_residual_connection=False,
-            params_dtype=torch.float,
-            padded_vocab_size=self.vocab_size,
-        )
+        inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
-
-        self.inference_wrapped_model = T5InferenceWrapper(
-            t5_model, inference_wrapper_config, inference_context
-        )
+        self.inference_wrapped_model = T5InferenceWrapper(t5_model, inference_context)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

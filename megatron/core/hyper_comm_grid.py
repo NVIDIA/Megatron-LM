@@ -158,9 +158,19 @@ class HyperCommGrid:
         rank_enum = self._gen_rank_enum(ordered_dims)
         pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
 
-        logging.info(f"Generated process group for {unique_group_key} with enumeration {rank_enum}")
+        if dist.get_rank() == 0:
+            logging.info(
+                f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
+            )
         self._pgs[unique_group_key] = pg
         return pg
+
+    def destroy(self) -> None:
+        """Destroy all process groups created by this grid."""
+        for pg in self._pgs.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        self._pgs.clear()
 
     def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
         r"""Get a process group based on a list of dimension names

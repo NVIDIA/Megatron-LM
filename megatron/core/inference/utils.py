@@ -1,13 +1,43 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 import multiprocessing
 import sys
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def device_memory_summary() -> str:
+    """One-line GPU memory summary for torch_memory_saver logging."""
+    dev = torch.cuda.current_device()
+    stats = torch.cuda.memory_stats(dev)
+    try:
+        segs = torch.cuda.memory_snapshot(include_traces=False)
+    except TypeError:  # include_traces was added in PyTorch 2.11
+        segs = torch.cuda.memory_snapshot()
+    M = 1024**2
+    private = sum(
+        s.get("active_size", 0)
+        for s in segs
+        if s.get("device", dev) == dev and tuple(s.get("segment_pool_id", (0, 0))) != (0, 0)
+    )
+    alloc = stats.get("allocated_bytes.all.current", 0)
+    resv = stats.get("reserved_bytes.all.current", 0)
+    dev_mem = torch.cuda.device_memory_used()
+    return (
+        f"alloc={alloc/M:.0f}MiB private={private/M:.0f}MiB "
+        f"resv-alloc={(resv-alloc)/M:.0f}MiB resv={resv/M:.0f}MiB dev_mem={dev_mem/M:.0f}MiB"
+    )
 
 
 class Counter:
@@ -132,6 +162,73 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
+def check_flashinfer_jit_cache_installed(log_version: bool = False):
+    """Verify that the flashinfer-jit-cache package is installed.
+
+    The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
+    so they don't need to be JIT-compiled at runtime. This avoids a multi-minute
+    compilation step during CUDA graph warmup.
+
+    Raises:
+        RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
+    """
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
+        if log_version:
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
+            )
+        return
+
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
+        )
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
+    raise RuntimeError(
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
+    )
+
+
+def set_inference_cuda_graphed_iteration_for_ep_inference(model):
+    """Enable CUDA graph compatibility for expert parallel inference.
+
+    Sets a flag in all MoELayers indicating the current iteration is being
+    captured/executed in a CUDA graph. This allows the dispatcher to adjust
+    its behavior for CUDA graph compatibility.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    for moe_layer in moe_layer_cache:
+        moe_layer.set_inference_cuda_graphed_iteration()
+
+
+def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
+    """Disable CUDA graph compatibility for expert parallel inference.
+
+    Clears the flag in all MoELayers, restoring standard dispatcher behavior.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    for moe_layer in moe_layer_cache:
+        moe_layer.unset_inference_cuda_graphed_iteration()
+
+
 def tensor_swap(x, src_idxs, dst_idxs):
     """
     Swap x[src_idxs] and x[dst_idxs]
@@ -139,10 +236,8 @@ def tensor_swap(x, src_idxs, dst_idxs):
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
 
-async def await_process_event(
-    event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
-) -> None:
-    """Repeatedly wait for a multiprocessing event to be set, aborting upon process failure.
+async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
+    """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
 
     Note that the timeout in this function is only for checking process liveness.
     Its value should be set to a relatively high number. The only problem a high timeout
@@ -155,8 +250,7 @@ async def await_process_event(
         timeout: The timeout for each wait iteration in seconds.
     """
     while True:
-        signal = await asyncio.to_thread(event.wait, timeout)
-        if signal:
+        if await asyncio.to_thread(call, timeout):
             return
         if not process.is_alive():
             raise RuntimeError(

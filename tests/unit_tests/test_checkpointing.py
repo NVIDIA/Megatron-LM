@@ -113,7 +113,6 @@ def create_args():
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
     args.swiglu = True

@@ -37,14 +37,22 @@ class GlooCopyService(CopyService):
     process group instead of NCCL.
     """
 
-    def __init__(self):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        self.gloo_pg = dist.new_group(backend="gloo")
+    def __init__(self, group=None):
+        if group is not None:
+            self.gloo_pg = group
+            self.rank = group.rank()
+            self.world_size = group.size()
+        else:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.gloo_pg = dist.new_group(backend="gloo")
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[Tuple[RecvOp, torch.Tensor]] = []
         self._copy_stream = torch.cuda.Stream()
-        logger.info(f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks")
+        if self.rank == 0:
+            logger.info(
+                f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks"
+            )
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
@@ -55,26 +63,30 @@ class GlooCopyService(CopyService):
 
     def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
         """Submit a receive operation."""
-        # Allocate a CPU buffer that matches the destination view; we'll
-        # copy into dest_tensor after the Gloo recv completes.
-        cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
+        # Allocate a pinned CPU buffer for faster CPU↔GPU transfer.
+        cpu_buffer = torch.empty(
+            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
+        )
         self.recv_ops.append(
             (RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
         )
 
     def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
         """Submit a receive operation with a unique task identifier."""
-        cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
+        cpu_buffer = torch.empty(
+            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
+        )
         self.recv_ops.append(
             (RecvOp(task_id=task_id, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
         )
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)
-        logger.info(
-            f"GlooCopyService rank {self.rank}: executing batched communication: "
-            f"{len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops"
-        )
+        if self.rank == 0:
+            logger.info(
+                f"GlooCopyService rank {self.rank}: executing batched communication: "
+                f"{len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops"
+            )
 
         p2p_ops: List[dist.P2POp] = []
 
@@ -118,13 +130,33 @@ class GlooCopyService(CopyService):
                     else:
                         dst_tensor.copy_(src_tensor)
 
-        # Build Gloo P2P ops over CPU tensors. For sends we clone to CPU;
-        # for recvs we use the preallocated CPU buffers.
+        # Build Gloo P2P ops over CPU tensors. For sends we stage all
+        # GPU→CPU copies with non_blocking, sync once, then build P2P ops.
+        # Use group_peer (not peer) to pass ranks directly in group space,
+        # avoiding the global-to-group rank conversion in P2POp which doesn't
+        # work for cross-world ProcessGroups.
+        cpu_send_bufs: List[torch.Tensor] = []
         for op in remote_sends:
-            cpu_tensor = op.tensor.detach().to("cpu").contiguous()
-            p2p_ops.append(dist.P2POp(dist.isend, cpu_tensor, op.dest_rank, group=self.gloo_pg))
+            cpu_tensor = torch.empty(
+                op.tensor.shape, dtype=op.tensor.dtype, device="cpu", pin_memory=True
+            )
+            cpu_tensor.copy_(op.tensor.detach(), non_blocking=True)
+            cpu_send_bufs.append(cpu_tensor)
+        # Single sync after all GPU→CPU copies are issued.
+        if cpu_send_bufs:
+            torch.cuda.synchronize()
+
+        for op in remote_sends:
+            op.tensor = None
+
+        for cpu_tensor, op in zip(cpu_send_bufs, remote_sends):
+            p2p_ops.append(
+                dist.P2POp(dist.isend, cpu_tensor, group=self.gloo_pg, group_peer=op.dest_rank)
+            )
         for recv, _dst_tensor in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, recv.tensor, recv.src_rank, group=self.gloo_pg))
+            p2p_ops.append(
+                dist.P2POp(dist.irecv, recv.tensor, group=self.gloo_pg, group_peer=recv.src_rank)
+            )
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)
@@ -132,15 +164,20 @@ class GlooCopyService(CopyService):
                 req.wait()
 
         # Copy received CPU buffers back into the original destination tensors.
+        # Use non_blocking with pinned memory for overlap.
         for recv, dst_tensor in remote_recvs:
             if dst_tensor.is_cuda:
-                dst_tensor.copy_(recv.tensor.to(dst_tensor.device))
+                dst_tensor.copy_(recv.tensor, non_blocking=True)
             else:
                 dst_tensor.copy_(recv.tensor)
 
         if self._copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self._copy_stream)
 
-        logger.info("GlooCopyService: batched communication completed")
+        # Ensure all async CPU→GPU copies are complete.
+        torch.cuda.synchronize()
+
+        if self.rank == 0:
+            logger.info("GlooCopyService: batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()

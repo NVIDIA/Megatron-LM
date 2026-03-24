@@ -12,6 +12,7 @@ from collections import defaultdict
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -239,7 +240,7 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -254,6 +255,7 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
         stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
     )
     if stat.item() == -1.0:
+        # No rank has a valid stat, so return None to indicate that it is None across all ranks.
         return None
     else:
         return stat.item()
@@ -276,12 +278,15 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 
 def report_memory(name):
     """Simple GPU memory report."""
+    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(torch.cuda.memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
-    string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
+    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
+    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
+    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
+    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
+    if args.log_device_memory_used:
+        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -391,11 +396,9 @@ def print_rank_0(message, rank=None):
     if rank is not None:
         if rank == 0:
             print(message, flush=True)
-    elif torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            print(message, flush=True)
     else:
-        print(message, flush=True)
+        if _safe_get_rank() == 0:
+            print(message, flush=True)
 
 
 def warn_rank_0(message, rank=None):
@@ -403,20 +406,20 @@ def warn_rank_0(message, rank=None):
     if rank is not None:
         if rank == 0:
             warnings.warn(message)
-    elif torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            warnings.warn(message)
     else:
-        warnings.warn(message)
+        if _safe_get_rank() == 0:
+            warnings.warn(message)
 
 
 def is_rank0():
-    """Returns true if called in the rank0, false otherwise"""
-    return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+    """Returns true if called in the rank0, false otherwise."""
+    return _safe_get_rank() == 0
 
 
 def is_last_rank():
-    return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
+    """Returns true if called on last rank, false otherwise."""
+    assert torch.distributed.is_initialized()
+    return _safe_get_rank() == (torch.distributed.get_world_size() - 1)
 
 
 def print_rank_last(message):
@@ -426,6 +429,11 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def is_hybrid_model(args):
+    """Returns True if the model is a hybrid Mamba-Transformer model."""
+    return args.hybrid_layer_pattern is not None
 
 
 def is_first_or_last_pipeline_stage(vp_stage):
@@ -598,25 +606,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
-        def _broadcast_cu_seqlens(cu_seqlens):
-            dev = torch.cuda.current_device()
-
-            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
-            _broadcast(n_tensor)
-
-            if n == 0:
-                buf = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                assert isinstance(cu_seqlens, torch.Tensor)
-                assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
-                buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
-            _broadcast(buf)
-
-        _broadcast_cu_seqlens(batch['cu_seqlens'])
-        _broadcast(batch['max_seqlen'])
-
     else:
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
@@ -655,7 +644,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         cu_seqlens = None
-        if args.sft:
+        if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
@@ -663,13 +652,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             )
         else:
             max_seqlen = None
-
-        cu_seqlens = None
-        max_seqlen = torch.empty(
-            1,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        ) if args.hybrid_context_parallel else None
+        
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,
@@ -724,24 +707,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(loss_mask)
             _broadcast(attention_mask)
 
-        def _broadcast_cu_seqlens():
-            dev = torch.cuda.current_device()
-
-            n = torch.empty((), dtype=torch.int64, device=dev)
-            _broadcast(n)
-            n = int(n.item())
-
-            if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
-            _broadcast(cu_seqlens)
-
-            return cu_seqlens if n > 0 else None
-
-        cu_seqlens = _broadcast_cu_seqlens()
-        _broadcast(max_seqlen)
-
         batch = {
             'tokens': tokens,
             'labels': labels,
@@ -789,26 +754,36 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager."""
+    """Create an NVTX range context manager.
+
+    Returns a context manager that:
+    - Creates an NVTX range for profiling (nsight-systems compatible)
+    - Optionally tracks time via Megatron timers when time=True
+
+    Args (for returned context manager):
+        msg: Name of the range/timer
+        time: If True, also track with Megatron timers (default: False)
+        log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
+    """
     try:
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg, time=False):
+        def nvtx_range(msg, time=False, log_level=1):
             if time:
                 timers = get_timers()
-                timers(msg, log_level=0).start()
+                timers(msg, log_level=log_level).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
                 if time:
-                    timers(msg, log_level=0).stop()
+                    timers(msg, log_level=log_level).stop()
 
         return nvtx_range
     except:
         @contextmanager
-        def dummy_range(msg):
+        def dummy_range(msg, time=False, log_level=1):
             yield
         return dummy_range
