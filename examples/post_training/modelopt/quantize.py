@@ -44,7 +44,8 @@ from megatron.post_training.utils import (
     print_distributed_quant_summary,
     report_current_memory_info,
 )
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -352,9 +353,8 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tokenizer = get_hf_tokenizer()
+
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -418,7 +418,7 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
-        if tokenizer.pad_token is None:
+        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"  # better for calibration
 
