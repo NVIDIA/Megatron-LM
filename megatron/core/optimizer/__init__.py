@@ -40,7 +40,7 @@ try:
     _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
     if _eo_ver < (0, 2):
         raise ImportError(
-            f"Lion optimizer requires emerging_optimizers >= 0.2, "
+            f"emerging_optimizers >= 0.2 is required, "
             f"found {_pkg_version('emerging-optimizers')}"
         )
     from emerging_optimizers.scalar_optimizers import Lion
@@ -562,8 +562,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         elif config.optimizer == 'lion':
             if not HAVE_EO_V02:
                 raise ImportError(
-                    "Lion optimizer requires the 'emerging_optimizers' package. "
-                    "Please install it to use --optimizer lion."
+                    "Lion optimizer requires emerging_optimizers >= 0.2. "
+                    "Please install or upgrade it to use --optimizer lion."
                 )
             optimizer = Lion(
                 param_groups,

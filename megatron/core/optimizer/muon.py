@@ -13,7 +13,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
 
-from . import _get_param_groups, get_megatron_optimizer
+from . import HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
     ChainedOptimizer,
@@ -35,22 +35,8 @@ except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
 
-try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
-    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
-    if _eo_ver < (0, 2):
-        raise ImportError(
-            f"NSCoeffT and Lion require emerging_optimizers >= 0.2, "
-            f"found {_pkg_version('emerging-optimizers')}"
-        )
+if HAVE_EO_V02:
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT
-    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-
-    HAVE_EO_V02 = True
-except (ImportError, PackageNotFoundError):
-    HAVE_EO_V02 = False
 
 
 logger = logging.getLogger(__name__)
