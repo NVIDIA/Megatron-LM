@@ -317,13 +317,6 @@ class LanguageModule(MegatronModule):
         This is called after speculative token verification to compute MTP
         predictions conditioned on verified tokens only.
 
-        The serial MTP computation in inference receives hidden states that are
-        replicated across TP ranks (not partitioned along the sequence
-        dimension).  Sequence-parallel scatter/gather operations in the shared
-        embedding layer, MTP layers, and output layer would produce incorrect
-        results on these replicated tensors, so SP is temporarily disabled on
-        all layers involved in the MTP computation.
-
         Args:
             hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
             next_token_ids (Tensor): Correct next token IDs [1, N].
@@ -334,6 +327,8 @@ class LanguageModule(MegatronModule):
         Returns:
             tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
         """
+        # Temporarily disable sequence parallelism since the input hidden_states
+        # are not guaranteed to be TP-aligned
         saved_sp_state = self._disable_sp_for_mtp(depth)
         try:
             layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
@@ -367,7 +362,7 @@ class LanguageModule(MegatronModule):
 
         saved = {}
 
-        # Embedding layer: prevent scatter/reduce-scatter to SP region.
+        # Disable sequence parallelism on the embedding layer
         saved['embedding_scatter'] = self.embedding.scatter_to_sequence_parallel
         saved['embedding_reduce_scatter'] = self.embedding.reduce_scatter_embeddings
         saved['word_emb_reduce_scatter'] = self.embedding.word_embeddings.reduce_scatter_embeddings
@@ -375,14 +370,8 @@ class LanguageModule(MegatronModule):
         self.embedding.reduce_scatter_embeddings = False
         self.embedding.word_embeddings.reduce_scatter_embeddings = False
 
-        # MTP layer: disable SP on the layer itself (controls scatter in
-        # _concat_embeddings) AND on every submodule that has a
-        # sequence_parallel attribute (eh_proj, transformer layer internals
-        # like ColumnParallelLinear/RowParallelLinear).  When SP is enabled,
-        # ColumnParallelLinear all-gathers the input along the sequence dim
-        # before the matmul; on replicated (non-scattered) inference tensors
-        # this inflates the sequence dimension by TP, causing a shape mismatch
-        # at the next depth's torch.cat.
+        # Disable sequence parallelism on the MTP layer itself and on every
+        # submodule that has a sequence_parallel attribute
         layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
         layer = self.mtp.layers[layer_idx]
         saved['mtp_layer_sp'] = layer.sequence_parallel
@@ -396,7 +385,7 @@ class LanguageModule(MegatronModule):
                 saved['mtp_submodule_sp'][name] = module.sequence_parallel
                 module.sequence_parallel = False
 
-        # Output layer: prevent gather from SP region on input.
+        # Disable sequence parallelism on the output layer
         saved['output_layer_sp'] = self.output_layer.sequence_parallel
         self.output_layer.sequence_parallel = False
 
