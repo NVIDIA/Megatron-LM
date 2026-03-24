@@ -37,7 +37,7 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
+from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 

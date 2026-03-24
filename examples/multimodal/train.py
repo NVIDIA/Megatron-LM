@@ -27,7 +27,8 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
+from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.training.utils import is_last_rank
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
