@@ -334,20 +334,9 @@ _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, comm_stream=None, use_dynamic_comp_stream=False):
-    """Set the streams for communication and computation.
-
-    When use_dynamic_comp_stream is True, get_comp_stream() will return
-    torch.cuda.current_stream() at call time instead of a cached stream,
-    which is required for full-iteration CUDA graph capture/replay where
-    the capture stream differs from the default stream.
-    """
-    global _COMP_STREAM
+def set_streams(comm_stream=None):
+    """Set the stream for communication operations."""
     global _COMM_STREAM
-    global _USE_DYNAMIC_COMP_STREAM
-
-    if _USE_DYNAMIC_COMP_STREAM is None:
-        _USE_DYNAMIC_COMP_STREAM = use_dynamic_comp_stream
 
     # Set communication stream
     if _COMM_STREAM is None:
@@ -355,31 +344,16 @@ def set_streams(comp_stream=None, comm_stream=None, use_dynamic_comp_stream=Fals
             comm_stream = torch.cuda.Stream(device="cuda")
         _COMM_STREAM = comm_stream
 
-    # In dynamic mode, comp stream is resolved at call time via current_stream()
-    if _USE_DYNAMIC_COMP_STREAM:
-        _COMP_STREAM = None
-        return
-    if _COMP_STREAM is None:
-        if comp_stream is None:
-            comp_stream = torch.cuda.current_stream()
-        _COMP_STREAM = comp_stream
-
 
 def reset_streams():
     """Reset all stream state. Intended for testing or reinitialisation."""
-    global _COMP_STREAM, _COMM_STREAM, _USE_DYNAMIC_COMP_STREAM
-    _USE_DYNAMIC_COMP_STREAM = None
-    _COMP_STREAM = None
+    global _COMM_STREAM
     _COMM_STREAM = None
 
 
 def get_comp_stream():
     """Get the stream for computation"""
-    global _COMP_STREAM
-    global _USE_DYNAMIC_COMP_STREAM
-    if _USE_DYNAMIC_COMP_STREAM:
-        return torch.cuda.current_stream()
-    return _COMP_STREAM
+    return torch.cuda.current_stream()
 
 
 def get_comm_stream():
