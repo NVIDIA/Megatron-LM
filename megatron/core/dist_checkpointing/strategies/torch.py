@@ -47,7 +47,7 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
-from .async_utils import AsyncRequest
+from .async_utils import AsyncCallsQueue, AsyncRequest
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .filesystem_async import FileSystemWriterAsync
@@ -74,6 +74,8 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 MSC_PREFIX = "msc://"
 
 _metadata_fn: str = ".metadata"
+
+async_calls = AsyncCallsQueue()
 
 
 # dummy class needed to load mcore v0.15 checkpoints with optim. states
