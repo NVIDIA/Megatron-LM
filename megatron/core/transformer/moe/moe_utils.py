@@ -1285,9 +1285,12 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
+    # CUTLASS kernel for grouped GEMM assumes 256 alignment.
+    if config.use_transformer_engine_op_fuser:
+        return 256
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
-    elif config.fp4:
+    if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
     return 16
 
@@ -1353,12 +1356,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
             outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
             valid_cudagraph_attrs = []
             for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
-                hier_attr_name = attr_name.split('.')
-                attr = self.moe_layer.token_dispatcher
-                for name in hier_attr_name:
-                    attr = getattr(attr, name, None)
-                    if attr is None:
-                        break
+                attr = self.moe_layer.token_dispatcher.get_cudagraph_attr(attr_name)
                 if isinstance(attr, torch.Tensor):
                     outputs.append(attr)
                     valid_cudagraph_attrs.append(attr_name)

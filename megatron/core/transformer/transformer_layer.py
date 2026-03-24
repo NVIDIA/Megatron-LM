@@ -1098,11 +1098,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     valid_cudagraph_attrs
                 ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
                 for i, attr_name in enumerate(valid_cudagraph_attrs):
-                    hier_attr_name = attr_name.split('.')
-                    attr = self.mlp.token_dispatcher
-                    for name in hier_attr_name[:-1]:
-                        attr = getattr(attr, name)
-                    setattr(attr, hier_attr_name[-1], attr_outputs[i])
+                    self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
             else:
                 # CUDA graph output is [hidden_states, probs, routing_map].
                 assert len(cuda_graph_output) == 3, (
@@ -1711,7 +1707,7 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            attr = getattr(self.mlp.token_dispatcher, attr_name)
+            attr = self.mlp.token_dispatcher.get_cudagraph_attr(attr_name)
             if torch.is_tensor(attr):
                 if attr_name in self.token_dispatcher_attrs:
                     self.token_dispatcher_attrs[attr_name].copy_(attr)
@@ -1730,7 +1726,7 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         for name, attr in self.token_dispatcher_attrs.items():
-            setattr(self.mlp.token_dispatcher, name, attr)
+            self.mlp.token_dispatcher.set_cudagraph_attr(name, attr)
 
         self.mlp.fwd_execution_map = "expert_compute"
         return self.mlp(None, intermediate_tensors=(hidden_states, probs))
