@@ -64,4 +64,7 @@ jobs:
             Use top-level comments for general observations.
 
             It's perfectly acceptable to not have anything to comment on.
-            If you do not have anything to comment on, post "LGTM".
+            If you do not have anything to comment on, approve the PR with "LGTM" by running:
+            ```
+            gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --approve --body "LGTM"
+            ```

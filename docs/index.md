@@ -85,6 +85,7 @@ user-guide/features/tokenizers
 developer/contribute
 developer/submit
 developer/oncall
+developer/claude_commands
 developer/generate_docs
 ```
 
