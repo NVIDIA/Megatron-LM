@@ -741,6 +741,15 @@ class TorchDistSaveShardedStrategy:
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
 
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """Each async strategy can be trivially used as a sync strategy."""
+        async_request = self.async_save(sharded_state_dict, checkpoint_dir)
+        # multiprocessing routines  may cause issue when called on parent process
+        # We keep this verbose call for now
+        global async_calls
+        async_calls.schedule_async_request(async_request)
+        async_calls.maybe_finalize_async_calls(blocking=True)
+
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
