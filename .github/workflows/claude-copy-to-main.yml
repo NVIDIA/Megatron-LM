@@ -119,3 +119,4 @@ jobs:
             - Do NOT force push.
           claude_args: |
             --allowedTools "Bash(git:*),Bash(gh:*),Read,Edit"
+            --model "claude-opus-4-6"
