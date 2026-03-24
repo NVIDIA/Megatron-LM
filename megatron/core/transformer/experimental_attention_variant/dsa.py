@@ -134,6 +134,84 @@ def _get_cp_positions_from_layout(
     return query_pos, key_pos
 
 
+def _build_packed_allgather_cp_local_positions(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build local packed-token positions for one CP rank under zigzag THD sharding.
+
+    This mirrors the packed THD CP layout used by the surrounding training stack:
+    each packed sequence is padded to a multiple of ``2 * cp_size`` and each rank
+    receives the rank-local front chunk followed by the mirrored back chunk.
+    """
+    cu_seqlens_i64 = cu_seqlens.to(dtype=torch.int64)
+    if cp_size <= 1:
+        return torch.arange(int(cu_seqlens_i64[-1].item()), dtype=torch.int64, device=device)
+
+    positions = []
+    cu_seqlens_list = cu_seqlens_i64.tolist()
+    for seq_start, seq_end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
+        seq_len = seq_end - seq_start
+        if seq_len == 0:
+            continue
+        if seq_len % cp_size != 0:
+            raise ValueError(
+                "Packed DSA CP expects per-sequence padded lengths divisible by cp_size, got "
+                f"seq_len={seq_len}, cp_size={cp_size}"
+            )
+        local_seq_len = seq_len // cp_size
+        if local_seq_len % 2 != 0:
+            raise ValueError(
+                "Packed DSA CP expects per-rank packed sequence lengths divisible by 2, got "
+                f"local_seq_len={local_seq_len}, seq_len={seq_len}, cp_size={cp_size}"
+            )
+        half_seq_len = local_seq_len // 2
+        if half_seq_len == 0:
+            continue
+
+        front_start = seq_start + cp_rank * half_seq_len
+        back_end = seq_end - cp_rank * half_seq_len
+        back_start = back_end - half_seq_len
+
+        positions.append(
+            torch.arange(front_start, front_start + half_seq_len, dtype=torch.int64, device=device)
+        )
+        positions.append(torch.arange(back_start, back_end, dtype=torch.int64, device=device))
+
+    if not positions:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    return torch.cat(positions, dim=0)
+
+
+def _build_packed_allgather_cp_query_positions_and_key_reorder(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build packed-query positions and gathered-KV reorder index for allgather CP.
+
+    Queries stay in the local zigzag THD order for ``cp_rank``. Keys/values are
+    manually all-gathered rank-by-rank, so their gathered tensor order is:
+    rank0-local-packed, rank1-local-packed, ..., rank{cp_size-1}-local-packed.
+    This helper returns the permutation that restores those gathered KV tensors
+    to global packed order, matching the Slime GLM5 implementation semantics.
+    """
+    query_positions = _build_packed_allgather_cp_local_positions(
+        cu_seqlens_q, cp_size, cp_rank, device
+    )
+    gathered_key_positions = [
+        _build_packed_allgather_cp_local_positions(cu_seqlens_kv, cp_size, rank, device)
+        for rank in range(cp_size)
+    ]
+    gathered_key_positions = torch.cat(gathered_key_positions, dim=0)
+    key_reorder_idx = torch.argsort(gathered_key_positions)
+    return query_positions, key_reorder_idx
+
+
 def _build_causal_mask_from_positions(
     query_pos: torch.Tensor, key_pos: torch.Tensor
 ) -> torch.Tensor:
@@ -451,6 +529,7 @@ def _build_dsattention_forward_mask(
     attention_mask: Optional[torch.Tensor],
     position_ids: Optional[torch.Tensor],
     packed_seq_params: Optional[PackedSeqParams],
+    packed_query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Build DSAttention mask.
 
@@ -466,15 +545,19 @@ def _build_dsattention_forward_mask(
             cu_seqlens_q = cu_seqlens_q.to(device=device, dtype=torch.int64)
             starts, ends = _generate_varlen_mask_params(cu_seqlens_q)
             if cp_size > 1:
-                query_idx, key_idx = _get_cp_positions_from_layout(
-                    sq=sq,
-                    skv=skv,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                    cp_comm_type=cp_comm_type,
-                    device=device,
-                    cp_group=cp_group,
-                )
+                if packed_query_positions is not None:
+                    query_idx = packed_query_positions.to(device=device, dtype=torch.int64)
+                    key_idx = torch.arange(skv, dtype=torch.int64, device=device)
+                else:
+                    query_idx, key_idx = _get_cp_positions_from_layout(
+                        sq=sq,
+                        skv=skv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        cp_comm_type=cp_comm_type,
+                        device=device,
+                        cp_group=cp_group,
+                    )
             else:
                 query_idx = torch.arange(sq, dtype=torch.int64, device=device)
                 key_idx = torch.arange(skv, dtype=torch.int64, device=device)
@@ -2821,6 +2904,20 @@ class DSAttention(MegatronModule):
         cp_group = getattr(self.indexer.pg_collection, "cp", None)
         cp_size = cp_group.size() if cp_group is not None else 1
         cp_rank = cp_group.rank() if cp_group is not None else 0
+        packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        packed_query_positions = None
+        packed_kv_reorder_idx = None
+        if packed_thd and cp_size > 1:
+            cu_seqlens_q, cu_seqlens_kv = _get_packed_qk_cu_seqlens(packed_seq_params)
+            packed_query_positions, packed_kv_reorder_idx = (
+                _build_packed_allgather_cp_query_positions_and_key_reorder(
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    device=query.device,
+                )
+            )
 
         if cp_size > 1:
             assert (
@@ -2828,10 +2925,29 @@ class DSAttention(MegatronModule):
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather only if inputs are local-sequence tensors.
+            gathered_cp_key = False
+            gathered_cp_value = False
             if key.size(0) == sq:
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
+                gathered_cp_key = True
             if value is not None and value.size(0) == sq:
                 value = gather_from_sequence_parallel_region(value, group=cp_group)
+                gathered_cp_value = True
+            if packed_kv_reorder_idx is not None:
+                if gathered_cp_key:
+                    if key.size(0) != packed_kv_reorder_idx.numel():
+                        raise RuntimeError(
+                            "Packed DSA gathered key length mismatch: "
+                            f"key_seqlen={key.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                        )
+                    key = key.index_select(0, packed_kv_reorder_idx)
+                if gathered_cp_value:
+                    if value.size(0) != packed_kv_reorder_idx.numel():
+                        raise RuntimeError(
+                            "Packed DSA gathered value length mismatch: "
+                            f"value_seqlen={value.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                        )
+                    value = value.index_select(0, packed_kv_reorder_idx)
 
         skv = key.size(0)
 
@@ -2854,6 +2970,7 @@ class DSAttention(MegatronModule):
             attention_mask=attention_mask,
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
+            packed_query_positions=packed_query_positions,
         )
         if varlen_params is not None:
             varlen_starts, varlen_ends, key_positions = varlen_params
@@ -2869,6 +2986,13 @@ class DSAttention(MegatronModule):
         q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
         if cp_size > 1 and k.size(0) == sq:
             k = gather_from_sequence_parallel_region(k, group=cp_group)
+            if packed_kv_reorder_idx is not None:
+                if k.size(0) != packed_kv_reorder_idx.numel():
+                    raise RuntimeError(
+                        "Packed DSA gathered indexer-key length mismatch: "
+                        f"k_seqlen={k.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                    )
+                k = k.index_select(0, packed_kv_reorder_idx)
         fused_bounds = _build_fused_indexer_varlen_bounds(
             sq=sq,
             skv=skv,
