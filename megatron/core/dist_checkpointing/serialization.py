@@ -30,8 +30,8 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.base import AsyncSaveShardedStrategy
 from .strategies.common import load_common, save_common
+from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -391,7 +391,7 @@ def save(
         metadata_finalize_fn()
         return None
 
-    if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
+    if not isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper):
         raise CheckpointingException(
             f'Cannot apply async_save to non-async strategy {sharded_strategy}'
         )
