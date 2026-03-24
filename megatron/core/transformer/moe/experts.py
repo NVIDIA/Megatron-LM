@@ -41,6 +41,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+    skip_routed_expert_padding,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -915,8 +916,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        if self.config.moe_router_padding_for_quantization:
-            # Padding has already been applied in router
+        if skip_routed_expert_padding(self.config):
             pass
         elif self.config.fp8 or self.config.fp4:
             tokens_per_expert = tokens_per_expert.tolist()
@@ -1033,8 +1033,7 @@ class TEGroupedMLP(MegatronModule):
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         permuted_probs = permuted_probs.unsqueeze(-1)
-        if self.config.moe_router_padding_for_quantization:
-            # Padding has already been applied in router
+        if skip_routed_expert_padding(self.config):
             pass
         elif self.config.fp8 or self.config.fp4:
             unpadded_tokens_per_expert = tokens_per_expert
