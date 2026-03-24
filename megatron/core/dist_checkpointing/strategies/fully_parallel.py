@@ -37,7 +37,6 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
-from megatron.core.utils import get_pg_rank, get_pg_size
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +204,7 @@ class FullyParallelLoadStrategyWrapper(TorchDistLoadShardedStrategy):
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
         """
+        from megatron.core.utils import get_pg_size
 
         loaded_state_dict = {}
 
@@ -416,6 +416,8 @@ def distribute_main_replicas_with_precomputed_distribution(
     rank1: A: 1, B: 0, C: 1
     rank2: A: 1, B: 1, C: 0
     """
+    from megatron.core.utils import get_pg_rank, get_pg_size
+
     if parallelization_group is None:
         parallelization_group = torch.distributed.group.WORLD
     if get_pg_size(group=parallelization_group) <= 1:
