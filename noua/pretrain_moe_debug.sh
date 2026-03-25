@@ -1,6 +1,7 @@
 #!/bin/bash
 # MoE model training script
 # Usage: SLURM_JOB_ID=22004084 bash noua/pretrain_moe_debug.sh
+#   srun --jobid=22004084 --overlap bash -c "pkill -SIGTERM -f pretrain_gpt.py"                                        
 
 set -euo pipefail
 export WANDB_API_KEY=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
@@ -8,7 +9,7 @@ export DEBUG_PORT=5678
 
 # ── Profiling ─────────────────────────────────────────────────────────────────
 PROFILE=${PROFILE:-0}
-PROFILE_RANKS=${PROFILE_RANKS:-"0,1,2,3"}  # Global GPU ranks for profiling
+PROFILE_RANKS=${PROFILE_RANKS:-"0 1 2 3"}  # Global GPU ranks for profiling
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 MEGATRON_LM=/fsx/nouamane/projects/Pai-Megatron-Patch/Megatron-LM-260325
@@ -55,7 +56,7 @@ if [[ ${PROFILE} -eq 1 ]]; then
 
     # Compute which nodes contain the profiled GPU ranks
     PROFILE_NODE_RANKS=""
-    for gpu_rank in ${PROFILE_RANKS//,/ }; do
+    for gpu_rank in ${PROFILE_RANKS}; do
         node_rank=$((gpu_rank / GPUS_PER_NODE))
         if [[ ! ",${PROFILE_NODE_RANKS}," == *",${node_rank},"* ]]; then
             PROFILE_NODE_RANKS="${PROFILE_NODE_RANKS:+${PROFILE_NODE_RANKS},}${node_rank}"
@@ -63,7 +64,7 @@ if [[ ${PROFILE} -eq 1 ]]; then
     done
 
     PROFILE_CMD_CHECK="if [[ \",${PROFILE_NODE_RANKS},\" == *\",\${SLURM_PROCID},\"* ]]; then PROFILE_CMD=\"${NSYS_CMD_BASE}\"; else PROFILE_CMD=\"\"; fi"
-    PROFILE_PARAMS="profiling.use_nsys_profiler=true profiling.profile_step_start=5 profiling.profile_step_end=7 'profiling.profile_ranks=[${PROFILE_RANKS}]'"
+    PROFILE_PARAMS="--profile --profile-step-start 5 --profile-step-end 7 --profile-ranks ${PROFILE_RANKS}"
 else
     PROFILE_CMD_CHECK=""
     NSYS_CMD_BASE=""
@@ -141,7 +142,7 @@ OPTIMIZER_ARGS=(
     --lr-decay-style WSD                      
     --lr-warmup-samples $((20 * GBS))   # TODO:                 
     --lr-wsd-decay-style cosine                     
-    --lr-wsd-decay-samples 0
+    --lr-wsd-decay-samples $((900 * GBS))   
     --clip-grad 1.0                             
 )
     # --rampup-batch-size 8 8 10000         # TODO:                 
@@ -151,8 +152,8 @@ OPTIMIZER_ARGS=(
 # Note: Muon/dist_muon does not support --use-distributed-optimizer
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 2
-    --num-virtual-stages-per-pipeline-rank 2
+    --pipeline-model-parallel-size 1
+    # --num-virtual-stages-per-pipeline-rank 2
     --expert-model-parallel-size 2
     --overlap-grad-reduce
     --overlap-param-gather
@@ -183,7 +184,7 @@ FUSING_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size ${MBS}
     --global-batch-size ${GBS}
-    --train-samples $((100 * GBS))
+    --train-samples $((1000 * GBS))
     --eval-interval 999999999
     --eval-iters 0
     --bf16
@@ -226,7 +227,7 @@ LOGGING_ARGS=(
     --moe-per-layer-logging
     --log-params-norm
     --log-progress
-    --timing-log-level 2  # TODO:
+    --timing-log-level 0  # TODO: 2 for granular
     --log-memory-interval 100
     --log-device-memory-used
     --log-max-attention-logit
@@ -322,7 +323,7 @@ export TOKENIZERS_PARALLELISM=False
 # mkdir -p \${TRITON_CACHE_DIR}
 
 # ── Wandb ──
-export WANDB_MODE=offline
+# export WANDB_MODE=offline
 export WANDB_API_KEY=\${WANDB_API_KEY:-}
 
 cd ${MEGATRON_LM}
