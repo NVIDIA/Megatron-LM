@@ -3,9 +3,14 @@ ENV_VARS:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   NVTE_FUSED_ATTN: 1
-  # NVTE_NORM_FWD_USE_CUDNN: 1
-  # Disable cudnn norm bwd with ep overlap: leads to nan in grad norm with multi-stream
-  # NVTE_NORM_BWD_USE_CUDNN: 1
+
+  # FSDP Perf settings
+  export CUDA_DEVICE_MAX_CONNECTIONS=32
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
   NCCL_GRAPH_REGISTER: 0
@@ -18,7 +23,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --expert-model-parallel-size: 
   --context-parallel-size: 1
-  --expert-tensor-parallel-size: 16
+  --expert-tensor-parallel-size: 2
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
@@ -56,6 +61,14 @@ MODEL_ARGS:
 
   # Transformer Engine args
   --transformer-impl: transformer_engine
+
+  # Recompute args
+  --recompute-granularity: selective
+  --recompute-modules: "layernorm,mla_up_proj,moe_act"
+
+  # CPU Offloading
+  --fine-grained-activation-offloading: true
+  --offload-modules: "core_attn,attn_proj"  
 
 
   # Data args
@@ -141,7 +154,7 @@ MODEL_ARGS:
   --ckpt-format: fsdp_dtensor
 
   # Logging
-  --save-interval: 25
+  #--save-interval: 25
   --init-method-std: 0.02
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
@@ -149,11 +162,11 @@ MODEL_ARGS:
   --log-params-norm: true
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
-  --log-interval: 1
-  --logging-level: 10
+  --log-interval: 100
+  #--logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
 
-  --exit-interval: 50
+  --exit-interval: 20000
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"
