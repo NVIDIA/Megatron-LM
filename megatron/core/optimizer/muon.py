@@ -48,7 +48,7 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
     assert (
         HAVE_EO_V02
     ), "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
-    return get_args(NSCoeffT)
+    return get_args(NSCoeffT)  # pylint: disable=possibly-used-before-assignment
 
 
 def validate_coefficient_type(coefficient_type: str) -> None:
@@ -108,7 +108,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
             if HAVE_EO_V02:
                 ns_kwargs["coefficient_type"] = coefficient_type
+            # pylint: disable-next=possibly-used-before-assignment
             orth_grad = newton_schulz_tp(grad, **ns_kwargs)
+            # pylint: disable-next=possibly-used-before-assignment
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
 

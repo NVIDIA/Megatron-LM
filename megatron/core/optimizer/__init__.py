@@ -587,7 +587,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     "Lion optimizer requires emerging_optimizers >= 0.2. "
                     "Please install or upgrade it to use --optimizer lion."
                 )
-            optimizer = Lion(
+            optimizer = Lion(  # pylint: disable=possibly-used-before-assignment
                 param_groups,
                 lr=config.lr,
                 betas=(config.lion_beta1, config.lion_beta2),
