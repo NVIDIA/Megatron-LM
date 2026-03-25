@@ -1419,7 +1419,7 @@ class TestTextGenerationController:
             torch.float32,
             static=False,
             num_speculative_tokens=num_spec,
-            max_requests=max(active_request_count, 2),
+            max_requests=(active_request_count % tp_size) + active_request_count,
         )
 
         ctrl = self.text_generation_controller
@@ -1502,7 +1502,7 @@ class TestTextGenerationController:
             torch.float32,
             static=False,
             num_speculative_tokens=num_spec,
-            max_requests=max(active_request_count, 2),
+            max_requests=(active_request_count % tp_size) + active_request_count,
         )
 
         ctrl = self.text_generation_controller

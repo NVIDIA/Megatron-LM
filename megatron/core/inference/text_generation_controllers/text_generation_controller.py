@@ -1663,9 +1663,7 @@ class TextGenerationController:
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            dummy_hidden = torch.zeros(
-                (padded_count, 1, hidden_size), device=device, dtype=dtype
-            )
+            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
