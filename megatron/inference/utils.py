@@ -273,6 +273,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Path to write coordinator request scheduling decisions as JSON",
     )
+    group.add_argument(
+        "--store-routing-indices-in-ray-block-store",
+        action='store_true',
+        default=False,
+        help="Write MoE routing indices to a Ray-based distributed block store "
+        "(from NeMo RL) instead of returning them inline. Requires "
+        "--moe-enable-routing-replay and a running DistributedBlockStore actor.",
+    )
     return parser
 
 
@@ -362,6 +370,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
+        store_routing_indices_in_ray_block_store=args.store_routing_indices_in_ray_block_store,
     )
 
 

@@ -298,7 +298,14 @@ class InferenceConfig:
     """
 
     use_synchronous_zmq_collectives: bool = False
-    """Whether to use synchronous ZMQ collectives for inference. If True, the 
-    all_reduce_max operation will be performed synchronously, which can help reduce 
+    """Whether to use synchronous ZMQ collectives for inference. If True, the
+    all_reduce_max operation will be performed synchronously, which can help reduce
     performance variability for MoEs.
+    """
+
+    store_routing_indices_in_ray_block_store: bool = False
+    """Whether to write MoE routing indices to a Ray-based distributed block store.
+    Requires a DistributedBlockStore actor (from NeMo RL) running on the same node.
+    When enabled, routing indices are written to the block store on request completion
+    and a block_cache_key is returned in the response instead of inline data.
     """

@@ -8,7 +8,16 @@ from enum import Enum, auto
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
+import uuid
+import numpy as np
 import torch
+
+try:
+    import ray
+    HAVE_RAY = True
+except ImportError:
+    ray = None
+    HAVE_RAY = False
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
@@ -44,6 +53,16 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
@@ -180,9 +199,13 @@ class InferenceRequest:
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        # Serialize tensors.
+        # Serialize tensors and numpy arrays.
         obj = {
-            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            k: (
+                ("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray)
+                else v
+            )
             for k, v in obj.items()
         }
         return obj
@@ -221,10 +244,12 @@ class InferenceRequest:
             else SamplingParams.deserialize(obj["inference_parameters"])
         )
 
-        # Deserialize tensors and sampling params.
+        # Deserialize tensors, numpy arrays, and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+            elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -361,11 +386,14 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
-    routing_indices: Optional[torch.Tensor] = None
+    # routing_indices is the concatenated result, set on finished requests only.
+    routing_indices: Optional[np.ndarray] = None
+    # routing_block_store_key is set when routing_indices are written to block store.
+    # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.
+    routing_block_store_key: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    _routing_indices_chunks: Optional[List[np.ndarray]] = field(default=None, repr=False)  # Internal storage for routin
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
@@ -387,6 +415,22 @@ class DynamicInferenceRequest(InferenceRequest):
             and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
+
+    def add_routing_indices(self, chunk: np.ndarray):
+        """Append a routing indices chunk to the staging list (O(1) in the critical path).
+
+        Args:
+            chunk (np.ndarray): Routing indices for this step, shape [num_tokens, num_layers, topk].
+        """
+        if self._routing_indices_chunks is None:
+            self._routing_indices_chunks = []
+        self._routing_indices_chunks.append(chunk)
+
+    def finalize_routing_chunks(self):
+        """Concatenate all staged routing chunks into routing_indices and delete the staging list."""
+        if self._routing_indices_chunks:
+            self.routing_indices = np.concatenate(self._routing_indices_chunks, axis=0)
+        self._routing_indices_chunks = None
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
@@ -430,9 +474,14 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        assert self._routing_indices_chunks is None, (
+            "Pending routing chunks during serialization. "
+            "Call finalize_routing_chunks() before serialize()."
+        )
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_routing_indices_chunks", None)
 
         # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
@@ -695,8 +744,10 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = np.concatenate(routing_parts)
+        routing_block_store_key = self.requests[-1].routing_block_store_key
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -727,12 +778,55 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            routing_block_store_key=routing_block_store_key,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request
+
+    def dump_routing_indices_to_block_store(self, block_store_instance, block_store_instance_rank, block_store_instance_id):
+        """Write routing indices to block store and replace with cache key.
+
+        Mirrors vLLM serving.py _maybe_store_moe_topk_indices.
+        Merges routing_indices across all sub-requests, writes to block store,
+        sets routing_block_store_key, and clears routing_indices to free memory.
+        """
+        import logging
+
+        parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if not parts:
+            return
+
+        routing_indices = np.concatenate(parts) if len(parts) > 1 else parts[0]
+        blockstore_uuid = str(uuid.uuid4())
+
+        ray.get(
+            block_store_instance.put_numpy.remote(
+                blockstore_uuid,
+                "moe_topk_indices",
+                routing_indices,
+            )
+        )
+
+        routing_block_store_key = {
+            "instance_rank": block_store_instance_rank,
+            "instance_id": block_store_instance_id,
+            "req_id": blockstore_uuid,
+            "key": "moe_topk_indices",
+        }
+
+        logging.info(
+            f"NeMo-RL block store put: req_id={blockstore_uuid} "
+            f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
+            f"instance_id={block_store_instance_id}"
+        )
+
+        # Set cache key and clear indices on all sub-requests.
+        for r in self.requests:
+            r.routing_block_store_key = routing_block_store_key
+            r.routing_indices = None
 
     def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.

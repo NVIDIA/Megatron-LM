@@ -16,6 +16,7 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -47,6 +48,7 @@ from megatron.core.inference.utils import (
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
+    connect_to_ray_block_store
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -194,6 +196,13 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
 
+        # Fail fast if block store is requested but prerequisites are missing.
+        if inference_config.store_routing_indices_in_ray_block_store:
+            assert model_config.moe_enable_routing_replay, (
+                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay."
+            )
+            connect_to_ray_block_store()  # validates ray + actor availability, then discards
+
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection
         else:
@@ -259,6 +268,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Routing replay config.
+        self._routing_replay_enabled = model_config.moe_enable_routing_replay
+
+        # Routing indices dtype for numpy storage.
+        _num_experts = model_config.num_moe_experts or 0
+        self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -494,6 +510,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
+
+        # Connect to block store only on the mp coordinator rank.
+        if self.context.config.store_routing_indices_in_ray_block_store and self.is_mp_coordinator:
+            conn = connect_to_ray_block_store()
+            self.block_store_instance = conn.instance
+            self.block_store_instance_rank = conn.instance_rank
+            self.block_store_instance_id = conn.instance_id
 
         local_ip = socket.gethostname()
 
@@ -1257,22 +1280,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
-            # Process routing indices if available (keyed by request_id)
+            # Process routing indices if available (list aligned with request_ids)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
-            if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
-            ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ]  # [num_tokens, num_layers, topk]
-                if request.routing_indices is None:
-                    request.routing_indices = step_routing.clone()
-                else:
-                    request.routing_indices = torch.cat(
-                        [request.routing_indices, step_routing], dim=0
-                    )
+            # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
+            # add_routing_indices will simply append this step's routing chunk to a list 
+            # Later when we finish the request, we will assemble the full routing map 
+            # from these chunks.
+            if routing_indices_per_request is not None and req_idx < len(routing_indices_per_request):
+                step_routing = routing_indices_per_request[req_idx]  # [num_tokens, num_layers, topk]
+                request.add_routing_indices(step_routing)
+            
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1751,6 +1768,21 @@ class DynamicInferenceEngine(AbstractEngine):
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
+
+        # Finalize routing chunks on all sub-requests before block store dump or merge/serialize.
+        if self._routing_replay_enabled and finished_request_records:
+            for record in finished_request_records:
+                for req in record.requests:
+                    req.finalize_routing_chunks()
+
+        # Dump routing indices to block store before coordinator communication.
+        if getattr(self, 'block_store_instance', None) is not None and finished_request_records:
+            for r in finished_request_records:
+                r.dump_routing_indices_to_block_store(
+                    self.block_store_instance,
+                    self.block_store_instance_rank,
+                    self.block_store_instance_id,
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
