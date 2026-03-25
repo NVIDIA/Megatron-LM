@@ -75,7 +75,7 @@ EXTRA_ARGS="$*"
 
 # ── Arg groups ───────────────────────────────────────────────────────────────
 MODEL_ARGS=(
-    --num-layers 2   # TODO:
+    --num-layers 4   # TODO:
     --hidden-size 2048
     --ffn-hidden-size 6144
     --num-attention-heads 20
@@ -111,7 +111,7 @@ MOE_ARGS=(
     --moe-ffn-hidden-size 768
     --moe-router-topk 7
     --moe-shared-expert-intermediate-size 768
-    --moe-layer-freq "'([0]+[1]*1)'"
+    --moe-layer-freq "'([0]+[1]*3)'"
     --moe-router-score-function sigmoid
     --moe-router-pre-softmax
     --moe-router-load-balancing-type seq_aux_loss
@@ -124,7 +124,7 @@ MOE_ARGS=(
 
 
 OPTIMIZER_ARGS=(
-    --optimizer dist_muon
+    --optimizer adam
     --lr 1e-3                          
     --min-lr 1e-4        
     --adam-beta1 0.9                         
@@ -149,13 +149,14 @@ OPTIMIZER_ARGS=(
 # Note: Muon/dist_muon does not support --use-distributed-optimizer
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 4
+    --pipeline-model-parallel-size 2
+    --num-virtual-stages-per-pipeline-rank 2
+    --expert-model-parallel-size 2
     --overlap-grad-reduce
-    --moe-grouped-gemm
+    --overlap-param-gather
     --moe-token-dispatcher-type alltoall
-    --moe-per-layer-logging
-    --overlap-moe-expert-parallel-comm
+    --overlap-moe-expert-parallel-comm              
+    # --moe-shared-expert-overlap  # disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm    
 )
 
 
@@ -167,6 +168,9 @@ FUSING_ARGS=(
     --moe-permute-fusion
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl te
+    --attention-backend fused # TODO: for return_max_logit
+    --transformer-impl transformer_engine
+    --no-check-for-nan-in-loss-and-grad
     --disable-symmetric-registration
     #TODO: fusion
     #TODO: recomputation
@@ -181,13 +185,12 @@ TRAINING_ARGS=(
     --eval-interval 999999999
     --eval-iters 0
     --bf16
-    --attention-backend fused # TODO: for return_max_logit
-    --transformer-impl transformer_engine
     --ckpt-format torch_dist
     --async-save
     --ckpt-fully-parallel-load
-    --no-check-for-nan-in-loss-and-grad
     --seed 41
+    --exit-signal-handler
+    # --exit-signal
 )
 
 
@@ -209,7 +212,6 @@ LOGGING_ARGS=(
     --log-interval 1
     --log-throughput
     --log-timers-to-tensorboard
-    --log-validation-ppl-to-tensorboard
     --tensorboard-queue-size 1
     --tensorboard-dir ${TB_DIR}
     --save-interval 1000
@@ -219,6 +221,14 @@ LOGGING_ARGS=(
     --distributed-timeout-minutes 600
     --manual-gc
     --manual-gc-interval 500
+    --moe-per-layer-logging
+    --log-params-norm
+    --log-progress
+    --timing-log-level 2  # TODO:
+    --log-memory-interval 100
+    --log-device-memory-used
+    --log-max-attention-logit
+    --logging-level 10
 )
 
 # ── Validate ─────────────────────────────────────────────────────────────────
