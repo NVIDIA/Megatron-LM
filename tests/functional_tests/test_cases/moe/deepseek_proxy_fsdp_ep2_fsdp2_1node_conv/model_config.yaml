@@ -68,7 +68,7 @@ MODEL_ARGS:
 
   # CPU Offloading
   --fine-grained-activation-offloading: true
-  --offload-modules: "core_attn,attn_proj"  
+  --offload-modules: "[core_attn attn_proj]"
 
 
   # Data args
