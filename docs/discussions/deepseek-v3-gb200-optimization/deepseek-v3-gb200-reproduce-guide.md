@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200
 
 ## 1. Dockerfile

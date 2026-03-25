@@ -121,8 +121,6 @@ def _get_qkv_split_shapes(model_cfg) -> List[int]:
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
 
-_EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
-
 
 # ===========================================================================
 # Muon
@@ -359,7 +357,7 @@ def _default_adam_based_eopt_config_to_kwargs(
 # -----------------------------------------------------------------------
 # Register emerging optimizers
 # -----------------------------------------------------------------------
-_EMERGING_OPTIMIZERS = {
+_EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {
     'muon': EmergingOptimizerEntry(
         optimizer_cls=TensorParallelMuon, config_to_kwargs=_muon_config_to_kwargs
     ),
