@@ -671,17 +671,21 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        output_layer_kwargs = dict(
-            input_=hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
+        mtp_hidden = hidden_states_list[mtp_layer_number + 1]
         if fuse_linear_cross_entropy:
             mtp_loss = output_layer(
-                output_cross_entropy_loss=True, labels=mtp_labels, **output_layer_kwargs
+                mtp_hidden,
+                output_cross_entropy_loss=True,
+                labels=mtp_labels,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
             )
         else:
-            mtp_logits, _ = output_layer(**output_layer_kwargs)
+            mtp_logits, _ = output_layer(
+                mtp_hidden,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
             if scale_logits_fn is not None:
                 mtp_logits = scale_logits_fn(mtp_logits)
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
