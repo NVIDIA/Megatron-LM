@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 
 try:
@@ -322,6 +324,70 @@ class LanguageModule(MegatronModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: int,
+        runtime_gather_output: bool = True,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        The caller passes tensors in full (ungathered) format.  When sequence
+        parallelism is active this method scatters ``hidden_states`` before the
+        MTP layer and gathers the resulting hidden states before returning, so
+        the caller never needs to handle SP partitioning.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int): MTP depth index (0-indexed).
+            runtime_gather_output (bool): Whether to gather output across TP.
+
+        Returns:
+            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
+        """
+        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
+
+        # When SP is active, the embedding inside forward_single_position
+        # produces scattered output [N/TP, 1, H].  hidden_states arrives in
+        # full format [N, 1, H] from the controller; scatter to match.
+        if self.config.sequence_parallel:
+            hidden_states = scatter_to_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(
+            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+
+        # Gather mtp_hidden back to full format so the caller can index and
+        # pad/strip without worrying about SP partitioning.
+        if self.config.sequence_parallel:
+            mtp_hidden = gather_from_sequence_parallel_region(
+                mtp_hidden, group=self.pg_collection.tp
+            )
+
+        return mtp_hidden, logits
 
     def sharded_state_dict(
         self,

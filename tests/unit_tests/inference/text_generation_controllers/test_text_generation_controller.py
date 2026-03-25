@@ -1543,15 +1543,12 @@ class TestTextGenerationController:
             assert shapes['tokens'] == (1, tp_size)
             assert shapes['positions'] == (1, tp_size)
 
-    def test_mtp_sp_dummy_hidden_uses_local_seq_len(self):
-        """Test that _dummy_serial_mtp_forward uses scattered seq len for hidden states.
+    def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
+        """Test that _dummy_serial_mtp_forward passes full-length hidden states.
 
-        When sequence_parallel is True on dummy EP ranks, the embedding
-        reduce-scatters its output along dim 0.  dummy_hidden must use
-        the post-scatter length (padded_count // tp_size) so it matches
-        decoder_input in _concat_embeddings.  token_ids/position_ids keep
-        the full padded_count because the embedding handles the scatter
-        internally.
+        compute_mtp_single_step handles SP scatter/gather internally, so the
+        controller always passes full-length (padded_count) tensors for all
+        inputs including hidden states.
         """
         tp_size = 4
         num_spec = 2
@@ -1594,12 +1591,10 @@ class TestTextGenerationController:
         ):
             ctrl._dummy_serial_mtp_forward()
 
-        local_seq_len = tp_size // tp_size  # = 1
-
         assert len(captured_shapes) == num_spec
         for shapes in captured_shapes:
-            # hidden uses post-scatter length
-            assert shapes['hidden'][0] == local_seq_len
-            # token_ids/position_ids keep full padded_count for the embedding
+            # All inputs use full padded_count; compute_mtp_single_step
+            # handles SP scatter/gather internally.
+            assert shapes['hidden'][0] == tp_size
             assert shapes['tokens'] == (1, tp_size)
             assert shapes['positions'] == (1, tp_size)

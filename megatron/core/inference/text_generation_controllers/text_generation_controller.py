@@ -837,6 +837,13 @@ class TextGenerationController:
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
             hidden_states = unwrapped_model._decoder_hidden_states_cache
+            # When SP is active the decoder output is in scattered format
+            # [S/TP, B, H], but _last_accepted_seq_indices are indices into
+            # the full (gathered) sequence.  Gather before indexing.
+            if self.model_config.sequence_parallel:
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.inference_wrapped_model.tp_group
+                )
             last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
             # Shape: [active_request_count, 1, hidden_size]
         else:
@@ -1660,18 +1667,13 @@ class TextGenerationController:
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         padded_count = tp_size  # 1 padded up to tp_size
 
-        # When SP is active the embedding reduce-scatters its output along
-        # dim 0, so dummy_hidden must use the local (post-scatter) length to
-        # match decoder_input in _concat_embeddings.  token_ids/position_ids
-        # keep the full padded_count because the embedding handles the scatter
-        # internally.
-        local_seq_len = padded_count // tp_size if self.model_config.sequence_parallel else padded_count
-
+        # compute_mtp_single_step handles SP scatter/gather internally, so all
+        # tensors use the full padded_count (not the local post-scatter length).
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            dummy_hidden = torch.zeros((local_seq_len, 1, hidden_size), device=device, dtype=dtype)
+            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
@@ -1684,12 +1686,12 @@ class TextGenerationController:
                     position_ids=dummy_position_ids,
                     depth=depth,
                 )
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [local_seq_len, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
             if self.model_is_pipeline_parallel:
                 broadcast_from_last_pipeline_stage(
-                    [local_seq_len, self.vocab_size],
+                    [padded_count, self.vocab_size],
                     dtype=dtype,
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
