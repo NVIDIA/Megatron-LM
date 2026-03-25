@@ -252,9 +252,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
-        self.use_triton_conv1d = inference_config.use_triton_conv1d
-        self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
-
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
@@ -641,7 +638,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -768,6 +767,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
 
         # Allocate large non-graphed buffers.
@@ -1512,20 +1512,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        requires_mamba_state_extraction = False
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
-            requires_mamba_state_extraction = (
-                self.mamba_slot_allocator.get_intermediate_offsets() is not None
-            )
-
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
-            explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
-            requires_mamba_state_extraction=requires_mamba_state_extraction,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1626,6 +1618,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
+            intermediate_offsets_gpu = None
+            intermediate_counts_gpu = None
+            if self.mamba_slot_allocator is not None:
+                intermediate_offsets_gpu, intermediate_counts_gpu = (
+                    self.mamba_slot_allocator.get_intermediate_gpu_data()
+                )
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
@@ -1633,15 +1631,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
             )
-
-            # Auto-enable Triton conv1d for CUDA graph steps. The per-request
-            # conv loop launches a variable number of kernels with .item()
-            # calls, which is incompatible with CUDA graph capture/replay.
-            if self._using_cuda_graph_this_step:
-                self._use_triton_conv1d_this_step = True
-            else:
-                self._use_triton_conv1d_this_step = self.use_triton_conv1d
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
@@ -1712,7 +1704,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self._use_triton_conv1d_this_step = self.use_triton_conv1d
         self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -1823,8 +1814,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
-        # Hybrid models with Mamba caching: skip based on Mamba match count
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+        # Hybrid models with Mamba caching: skip based on Mamba match count.
+        # Only applies to the first chunk (finished == 0); continuation chunks
+        # already had Mamba state restored during the first chunk.
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             assert (
                 num_mamba_matched <= num_matched
@@ -1844,7 +1837,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model:
+        elif self.is_hybrid_model and finished == 0:
             prefix_skip_tokens = 0
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
@@ -2219,8 +2212,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
-        if self.is_hybrid_model:
-            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
         return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
@@ -2247,13 +2238,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Clear intermediate offset entries for released requests
         if self.mamba_slot_allocator is not None:
-            idx_list = (
-                request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
-            )
-            for idx in idx_list:
-                self.mamba_slot_allocator._intermediate_offsets[idx] = None
-                self.mamba_slot_allocator._intermediate_block_ids[idx] = None
-                self.mamba_slot_allocator._eos_cache_block_id[idx] = None
+            sa = self.mamba_slot_allocator
+            sa._intermediate_counts_gpu[request_indexes] = 0
+            sa._intermediate_offsets_gpu[request_indexes] = 0
+            sa._intermediate_block_ids_gpu[request_indexes] = -1
+            sa._eos_cache_block_id_gpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor

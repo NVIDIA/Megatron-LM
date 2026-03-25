@@ -188,7 +188,6 @@ class TestMambaPrefixCachingE2E:
         buffer_size_gb=0.5,
         prefix_caching_mamba_gb=0.05,
         request_rounder=4,
-        use_triton_conv1d=False,
         num_cuda_graphs=None,
     ):
         set_rounder(request_rounder)
@@ -200,7 +199,6 @@ class TestMambaPrefixCachingE2E:
             materialize_only_last_token_logits=False,
             enable_prefix_caching=enable_prefix_caching,
             unified_memory_level=0,
-            use_triton_conv1d=use_triton_conv1d,
             num_cuda_graphs=num_cuda_graphs,
         )
         if enable_prefix_caching:
@@ -250,16 +248,11 @@ class TestMambaPrefixCachingE2E:
         enable_pc,
         base_req_id=0,
         num_tokens=NUM_TOKENS_TO_GENERATE,
-        use_triton_conv1d=False,
         **engine_kwargs,
     ):
         """Run all prompts with given pc setting, return (finished_dict, lifetime_prefill)."""
         engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=enable_pc,
-            use_triton_conv1d=use_triton_conv1d,
-            **engine_kwargs,
+            model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
         )
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(base_req_id + i, prompt, enable_pc, num_tokens))
@@ -331,11 +324,9 @@ class TestMambaPrefixCachingE2E:
             assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 6
             assert step_prefill == G * 288, f"step 4: expected {G * 288}, got {step_prefill}"
 
-    def _run_pc_on(self, model, mamba_config, prompts, use_triton_conv1d=False):
+    def _run_pc_on(self, model, mamba_config, prompts):
         """Run requests with prefix caching enabled, verifying per-step state."""
-        engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=True, use_triton_conv1d=use_triton_conv1d
-        )
+        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
@@ -366,9 +357,7 @@ class TestMambaPrefixCachingE2E:
 
         return finished, ctx.lifetime_prefill_token_count
 
-    def _run_multi_pc_on(
-        self, model, mamba_config, all_prompts, use_triton_conv1d=False, num_cuda_graphs=None
-    ):
+    def _run_multi_pc_on(self, model, mamba_config, all_prompts, num_cuda_graphs=None):
         """Run 4 groups with prefix caching enabled, verifying per-step state."""
         engine = self._build_engine(
             model,
@@ -376,7 +365,6 @@ class TestMambaPrefixCachingE2E:
             enable_prefix_caching=True,
             buffer_size_gb=2.0,
             prefix_caching_mamba_gb=0.2,
-            use_triton_conv1d=use_triton_conv1d,
             num_cuda_graphs=num_cuda_graphs,
         )
         alloc = engine.context.kv_block_allocator
@@ -419,21 +407,16 @@ class TestMambaPrefixCachingE2E:
 
         return finished, ctx.lifetime_prefill_token_count
 
-    @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
-    def test_mamba_prefix_caching_e2e(self, use_triton_conv1d):
+    def test_mamba_prefix_caching_e2e(self):
         """Verify output tokens match between pc=off and pc=on."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_prompts()
 
-        off_outputs, off_prefill = self._run_simple(
-            model, mamba_config, prompts, False, use_triton_conv1d=use_triton_conv1d
-        )
-        on_outputs, on_prefill = self._run_pc_on(
-            model, mamba_config, prompts, use_triton_conv1d=use_triton_conv1d
-        )
+        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
+        on_outputs, on_prefill = self._run_pc_on(model, mamba_config, prompts)
 
         for req_id in range(5):
             assert (
@@ -442,9 +425,8 @@ class TestMambaPrefixCachingE2E:
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
 
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
-    @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
-    def test_mamba_prefix_caching_multi_group_e2e(self, use_triton_conv1d, num_cuda_graphs):
+    def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
         """Verify multi-group prefix caching with 4 independent groups."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model(num_cuda_graphs=num_cuda_graphs)
@@ -457,17 +439,12 @@ class TestMambaPrefixCachingE2E:
             [p for group in all_prompts for p in group],
             False,
             num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
-            use_triton_conv1d=use_triton_conv1d,
             num_cuda_graphs=num_cuda_graphs,
             buffer_size_gb=2.0,
             prefix_caching_mamba_gb=0.2,
         )
         on_outputs, on_prefill = self._run_multi_pc_on(
-            model,
-            mamba_config,
-            all_prompts,
-            use_triton_conv1d=use_triton_conv1d,
-            num_cuda_graphs=num_cuda_graphs,
+            model, mamba_config, all_prompts, num_cuda_graphs=num_cuda_graphs
         )
 
         # verify per-group outputs match independent runs
@@ -479,7 +456,6 @@ class TestMambaPrefixCachingE2E:
                 True,
                 base_req_id=g * 5,
                 num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
-                use_triton_conv1d=use_triton_conv1d,
                 num_cuda_graphs=num_cuda_graphs,
             )
             for lid in range(5):
@@ -505,7 +481,7 @@ class TestMambaPrefixCachingE2E:
         assert [len(p) for p in prompts] == [256, 256, 512, 512]
         return prompts
 
-    def _run_eos_pc_on(self, model, mamba_config, prompts, use_triton_conv1d=False):
+    def _run_eos_pc_on(self, model, mamba_config, prompts):
         """Run block-aligned prompts with pc=on, per-step assertions.
 
         Scheduling with pending_block_hashes coordination:
@@ -513,9 +489,7 @@ class TestMambaPrefixCachingE2E:
           - step 2: B + C co-scheduled (D deferred: h1 pending from C)
           - step 3: D scheduled
         """
-        engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=True, use_triton_conv1d=use_triton_conv1d
-        )
+        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
@@ -561,21 +535,16 @@ class TestMambaPrefixCachingE2E:
 
         return finished, ctx.lifetime_prefill_token_count
 
-    @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
-    def test_mamba_block_aligned_eos_e2e(self, use_triton_conv1d):
+    def test_mamba_block_aligned_eos_e2e(self):
         """Verify block-aligned EOS caching and recompute-based back-off."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_block_aligned_prompts()
 
-        off_outputs, off_prefill = self._run_simple(
-            model, mamba_config, prompts, False, use_triton_conv1d=use_triton_conv1d
-        )
-        on_outputs, on_prefill = self._run_eos_pc_on(
-            model, mamba_config, prompts, use_triton_conv1d=use_triton_conv1d
-        )
+        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
+        on_outputs, on_prefill = self._run_eos_pc_on(model, mamba_config, prompts)
 
         for req_id in range(4):
             assert (
@@ -591,9 +560,8 @@ class TestMambaPrefixCachingE2E:
             torch.arange(8000, 8300, dtype=torch.int64, device=device),  # identical to E
         ]
 
-    @pytest.mark.parametrize("use_triton_conv1d", [False, True])
     @torch.inference_mode()
-    def test_mamba_lru_eviction_e2e(self, use_triton_conv1d):
+    def test_mamba_lru_eviction_e2e(self):
         """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
@@ -607,7 +575,6 @@ class TestMambaPrefixCachingE2E:
             buffer_size_gb=0.002,
             prefix_caching_mamba_gb=0.05,
             request_rounder=1,
-            use_triton_conv1d=use_triton_conv1d,
         )
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
