@@ -854,6 +854,11 @@ class TextGenerationController:
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
         current_hidden = last_accepted_hidden if has_mtp else None
 
+        # Compute padding needed to make batch a multiple of tp_size for SP compatibility.
+        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        pad_count = (tp_size - active_request_count % tp_size) % tp_size
+        padded_count = active_request_count + pad_count
+
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
             position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
@@ -861,12 +866,24 @@ class TextGenerationController:
 
             mtp_logits_2d = None
             if has_mtp:
+                # Pad inputs to nearest multiple of tp_size.
+                if pad_count > 0:
+                    current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+                    token_ids = F.pad(token_ids, (0, pad_count))
+                    position_ids = F.pad(position_ids, (0, pad_count))
+
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,
                     position_ids=position_ids,
                     depth=depth,
                 )
+
+                # Remove padding from outputs.
+                if pad_count > 0:
+                    current_hidden = current_hidden[:active_request_count]
+                    mtp_logits = mtp_logits[:active_request_count]
+
                 # mtp_logits: [active_request_count, 1, vocab_size]
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
 
@@ -1638,13 +1655,19 @@ class TextGenerationController:
         hidden_size = self.model_config.hidden_size
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
+        # Pad dummy batch to nearest multiple of tp_size for SP compatibility.
+        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        padded_count = tp_size  # 1 padded up to tp_size
+
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
-            dummy_token_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+            dummy_hidden = torch.zeros(
+                (padded_count, 1, hidden_size), device=device, dtype=dtype
+            )
+            dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
+            dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
         for depth in range(num_depths):
             mtp_logits_2d = None
@@ -1655,12 +1678,15 @@ class TextGenerationController:
                     position_ids=dummy_position_ids,
                     depth=depth,
                 )
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [1, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
             if self.model_is_pipeline_parallel:
                 broadcast_from_last_pipeline_stage(
-                    [1, self.vocab_size], dtype=dtype, tensor=mtp_logits_2d, pp_group=self.pp_group
+                    [padded_count, self.vocab_size],
+                    dtype=dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
                 )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:

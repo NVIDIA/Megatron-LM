@@ -1408,3 +1408,137 @@ class TestTextGenerationController:
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    @pytest.mark.parametrize("active_request_count", [1, 3, 5])
+    def test_mtp_sp_padding_real_ranks(self, active_request_count):
+        """Test that _compute_serial_mtp_and_sample pads inputs to a multiple of tp_size
+        and strips the padding from outputs so only real requests are sampled."""
+        tp_size = 2
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            max_requests=max(active_request_count, 2),
+        )
+
+        ctrl = self.text_generation_controller
+        ctrl.num_speculative_tokens = num_spec
+        ctrl.num_mtp_heads = num_spec
+        ctx = ctrl.inference_wrapped_model.inference_context
+        ctx.total_request_count = active_request_count
+        ctx.paused_request_count = 0
+
+        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+        ctx.request_query_lengths[:active_request_count] = torch.ones(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+
+        ctrl._init_mtp_sampling_tensor()
+        ctrl._sampled_tokens_cuda[:active_request_count] = torch.arange(
+            active_request_count, device='cuda'
+        )
+
+        unwrapped_model = ctrl.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = torch.randn(
+            active_request_count, 1, self.hidden_size, device='cuda'
+        )
+        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+
+        expected_pad = (tp_size - active_request_count % tp_size) % tp_size
+        expected_padded = active_request_count + expected_pad
+        captured_shapes = []
+
+        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+            captured_shapes.append(
+                {
+                    'hidden': hidden_states.shape,
+                    'tokens': next_token_ids.shape,
+                    'positions': position_ids.shape,
+                }
+            )
+            return hidden_states, torch.randn(
+                hidden_states.shape[0], 1, self.vocab_size, device='cuda'
+            )
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(side_effect=mock_mtp)
+        ctrl._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.zeros(active_request_count, dtype=torch.int64, device='cuda')
+        )
+
+        # Mock get_pg_size to return tp_size regardless of actual process group.
+        with mock.patch(
+            'megatron.core.inference.text_generation_controllers.text_generation_controller.get_pg_size',
+            return_value=tp_size,
+        ):
+            ctrl._compute_serial_mtp_and_sample()
+
+        # Verify inputs to compute_mtp_single_step were padded.
+        assert len(captured_shapes) == num_spec
+        for shapes in captured_shapes:
+            assert shapes['hidden'] == (expected_padded, 1, self.hidden_size)
+            assert shapes['tokens'] == (1, expected_padded)
+            assert shapes['positions'] == (1, expected_padded)
+
+        # Verify sampling received only real (unpadded) logits.
+        for call_args in ctrl._sample_from_logits_2d.call_args_list:
+            logits_arg = call_args[0][0]
+            assert logits_arg.shape[0] == active_request_count
+
+        # Verify sampled tokens were written only for real requests.
+        for depth in range(num_spec):
+            assert ctrl._sampled_mtp_tokens_cuda[depth, :active_request_count].shape == (
+                active_request_count,
+            )
+
+    @pytest.mark.parametrize("active_request_count", [1, 3, 5])
+    def test_mtp_sp_padding_dummy_ranks(self, active_request_count):
+        """Test that _dummy_serial_mtp_forward pads dummy tensors to a multiple of tp_size."""
+        tp_size = 2
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            max_requests=max(active_request_count, 2),
+        )
+
+        ctrl = self.text_generation_controller
+        ctrl.num_speculative_tokens = num_spec
+        ctrl.num_mtp_heads = num_spec
+        # Simulate EP > 1 so the dummy path is not short-circuited.
+        ctrl.model_config.expert_model_parallel_size = 2
+
+        unwrapped_model = ctrl.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = True  # trigger has_mtp=True
+
+        captured_shapes = []
+
+        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+            captured_shapes.append(
+                {
+                    'hidden': hidden_states.shape,
+                    'tokens': next_token_ids.shape,
+                    'positions': position_ids.shape,
+                }
+            )
+            return hidden_states, torch.randn(
+                hidden_states.shape[0], 1, self.vocab_size, device='cuda'
+            )
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(side_effect=mock_mtp)
+
+        with mock.patch(
+            'megatron.core.inference.text_generation_controllers.text_generation_controller.get_pg_size',
+            return_value=tp_size,
+        ):
+            ctrl._dummy_serial_mtp_forward()
+
+        # Dummy tensors should be padded to tp_size (the smallest valid multiple).
+        assert len(captured_shapes) == num_spec
+        for shapes in captured_shapes:
+            assert shapes['hidden'][0] == tp_size
+            assert shapes['tokens'] == (1, tp_size)
+            assert shapes['positions'] == (1, tp_size)
