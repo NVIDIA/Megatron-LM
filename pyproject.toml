@@ -8,12 +8,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = [
-    "megatron.core",
-    "megatron.core.*",
-    "megatron.training",
-    "megatron.training.*",
-]
+include = ["megatron.core", "megatron.core.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -68,16 +63,6 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
-training = [
-    "flask-restful",
-    "sentencepiece",
-    "tiktoken",
-    "wandb",
-    "transformers",
-    "accelerate",
-]
-
-### 'mlm' group is deprecated. please use 'training' instead ###
 mlm = [
     "flask-restful",
     "sentencepiece",
@@ -89,7 +74,7 @@ mlm = [
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -100,19 +85,18 @@ dev = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
+    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
+    "emerging_optimizers; python_version >= '3.12'",
     "flask[async]",
     "hypercorn",
-    "quart",
-    "openai[aiohttp]",
-    "orjson",
+    "openai",
 ]
 
 lts = [
@@ -124,6 +108,7 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -141,7 +126,6 @@ test = [
     "wrapt",
     "pytest==8.3.5",
     "pytest-mock",
-    "mock",
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
@@ -183,7 +167,6 @@ default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
     "nv-grouped-gemm",
-    "flash_mla",
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
@@ -205,11 +188,10 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "287770466f0f4433052260a765db5ff7b8be1320" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "v0.5.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -251,10 +233,8 @@ markers = [
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
-    "/opt/megatron-lm/tests/*",
-    "/opt/megatron-lm/tools/*",
+    "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
-    "/opt/megatron-lm/_remote_module_non_scriptable",
 ]
 parallel = true
 sigterm = false
