@@ -1,5 +1,4 @@
 ENV_VARS:
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   NVTE_FUSED_ATTN: 1
@@ -21,9 +20,9 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
-  --expert-model-parallel-size: 
+  --expert-model-parallel-size: 2
   --context-parallel-size: 1
-  --expert-tensor-parallel-size: 2
+  --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
@@ -34,23 +33,21 @@ MODEL_ARGS:
   --use-megatron-fsdp: true
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
-  
-  --deterministic-mode: true
+
   --ckpt-format: "fsdp_dtensor"
   #--no-gradient-accumulation-fusion: true
 
-# Precision
+  # Precision
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
   --fp8-param-gather: true
 
-
-# Training args
+  # Training args
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 1
-  --global-batch-size: 16
+  --global-batch-size: 128
   --train-iters: 20
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
@@ -58,6 +55,8 @@ MODEL_ARGS:
   --cross-entropy-fusion-impl: te
   --manual-gc: true
   --manual-gc-interval: 10
+  --deterministic-mode: true
+  --exit-interval: 20000
 
   # Transformer Engine args
   --transformer-impl: transformer_engine
@@ -81,7 +80,7 @@ MODEL_ARGS:
 
 
   # Network
-  --num-layers: 61
+  --num-layers: 2
   --hidden-size: 7168
   --ffn-hidden-size: 18432
   --num-attention-heads: 128
@@ -114,8 +113,8 @@ MODEL_ARGS:
   --adam-beta2: 0.95
   
   # MoE args (DeepSeek-style)
-  --num-experts: 256
-  --moe-layer-freq: ([0]*3+[1]*58)
+  --num-experts: 8
+  --moe-layer-freq: ([0]*1+[1]*1)
   --moe-ffn-hidden-size: 2048
   --moe-shared-expert-intermediate-size: 2048
   --moe-router-load-balancing-type: seq_aux_loss
@@ -130,8 +129,12 @@ MODEL_ARGS:
   --moe-router-bias-update-rate: 1e-3
   --moe-router-dtype: fp32
   --moe-permute-fusion: true
-  --moe-router-fusion: true  
+  --moe-router-fusion: true
+  --moe-router-pre-softmax: true
   
+  # MoE Dispatcher
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
   
   # MLA args (DeepSeek-style)
   --q-lora-rank: 1536
@@ -166,7 +169,6 @@ MODEL_ARGS:
   #--logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
 
-  --exit-interval: 20000
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"
