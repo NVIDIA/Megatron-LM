@@ -28,8 +28,7 @@ pytestmark = [
         reason="Skip muon optimizer for LTS test",
     ),
     pytest.mark.skipif(
-        not HAVE_EMERGING_OPTIMIZERS,
-        reason="emerging_optimizers package is not installed",
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
     ),
     pytest.mark.skipif(
         not HAVE_EO_V02,
