@@ -394,3 +394,33 @@ class TestAudioSubmodule:
         print(
             f"Model {model_name} (d_model={self.d_model}) successfully processed audio and projected to dimension 768"
         )
+
+
+class TestAudioSubmoduleStageAware:
+    """Tests for stage-aware forward in AudioModalitySubmodules."""
+
+    def test_stage_aware_forward(self):
+        """Test stage-aware forward: hidden_states input and projection skipping."""
+        import torch.nn as nn
+
+        hidden_size = 64
+        projection_size = 128
+        hidden_states = torch.randn(10, hidden_size)
+
+        # Non-first stage uses hidden_states, last stage projects
+        submodule_last = AudioModalitySubmodules(
+            input_projections=[nn.Linear(hidden_size, projection_size)],
+            is_first_stage=False,
+            is_last_stage=True,
+        )
+        output = submodule_last.forward(hidden_states=hidden_states)
+        assert output.shape == (10, projection_size)  # Projected
+
+        # Non-last stage skips projection
+        submodule_mid = AudioModalitySubmodules(
+            input_projections=[nn.Linear(hidden_size, projection_size)],
+            is_first_stage=False,
+            is_last_stage=False,
+        )
+        output = submodule_mid.forward(hidden_states=hidden_states)
+        assert output.shape == (10, hidden_size)  # Not projected

@@ -107,6 +107,12 @@ def add_text_generate_ptq_args(parser):
         help="Input texts. Please use | to separate different batches.",
     )
     group.add_argument(
+        "--skip-generate",
+        action="store_true",
+        default=False,
+        help="Skip the post-quantization generate/validation step.",
+    )
+    group.add_argument(
         "--references",
         type=str,
         default="",
@@ -440,5 +446,11 @@ if __name__ == "__main__":
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
 
+    # Free calibration/quantization memory before generate
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # Do this after saving in case it causes issues
-    _custom_prompt_forward_loop_func(unwrapped_model)
+    if not args.skip_generate:
+        _custom_prompt_forward_loop_func(unwrapped_model)
