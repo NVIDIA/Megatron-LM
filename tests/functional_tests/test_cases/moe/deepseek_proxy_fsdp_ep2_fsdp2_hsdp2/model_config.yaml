@@ -8,7 +8,7 @@ ENV_VARS:
   NCCL_ALGO: Ring
 
 MODEL_ARGS:
-# Distributed args
+  # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
@@ -32,12 +32,12 @@ MODEL_ARGS:
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
 
-# Precision
+  # Precision
   --fp8-format: "e4m3"
   --fp8-recipe: "tensorwise"
   --fp8-param-gather: true
 
-# Training args
+  # Training args
   --use-mcore-models: true
   --disable-bias-linear: true
   --micro-batch-size: 4
@@ -50,6 +50,10 @@ MODEL_ARGS:
   --manual-gc: true
   --manual-gc-interval: 100
   --transformer-impl: transformer_engine
+
+  # Recompute args
+  --recompute-granularity: selective
+  --recompute-modules: "layernorm,mla_up_proj,moe_act"
 
   # Data args
   --seq-length: 1024
