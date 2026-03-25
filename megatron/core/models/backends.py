@@ -13,7 +13,11 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import InferenceGroupedMLP, SequentialMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLPSubmodules,
+    InferenceGroupedMLP,
+    SequentialMLP,
+)
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
@@ -190,7 +194,7 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which module and submodules to use for grouped mlp"""
         return partial(
             InferenceGroupedMLP,
-            submodules=MLPSubmodules(
+            submodules=GroupedMLPSubmodules(
                 linear_fc1=TEColumnParallelGroupedLinear,
                 linear_fc2=TERowParallelGroupedLinear,
                 activation_func=self.activation_func(),
