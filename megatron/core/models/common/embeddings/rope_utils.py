@@ -303,7 +303,7 @@ def apply_rotary_pos_emb(
                 use_unfused = True
             if mla_rotary_interleaved:
                 warnings.warn(
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
                     "Using unfused implementation."
                 )
                 use_unfused = True
