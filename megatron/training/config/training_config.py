@@ -526,3 +526,7 @@ class CheckpointConfig:
 
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
+
+    def __post_init__(self):
+        assert self.async_strategy in ["nvrx", "mcore"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
