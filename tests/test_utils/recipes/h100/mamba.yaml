@@ -94,3 +94,9 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
+
+  - test_case: [hybrid_nemotron_nano_30b_a3b_tp2_ep4_ptq_kd_dgx_h100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_h100]

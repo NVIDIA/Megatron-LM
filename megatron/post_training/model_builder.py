@@ -52,14 +52,8 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     should specify any model architecture settings which differ from the main student model's.
     The field names should match those returned by get_args() and not TransformerConfig.
     """
-    _required_teacher_fields = (
-        "num_layers",
-        "hidden_size",
-        "ffn_hidden_size",
-        "num_attention_heads",
-    )
-
     args = get_args()
+
     if args.export_kd_teacher_model_config is not None:
         config_path = args.export_kd_teacher_model_config
         if not os.path.exists(config_path):
@@ -76,10 +70,6 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     if config_path is not None:
         with open(config_path) as f:
             config = yaml.safe_load(f)
-        if missing_keys := [k for k in _required_teacher_fields if k not in config]:
-            raise ValueError(
-                f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
-            )
     else:
         config = {}
 
