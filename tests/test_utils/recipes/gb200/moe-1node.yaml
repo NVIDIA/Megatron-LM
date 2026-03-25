@@ -66,5 +66,5 @@ products:
   - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node_conv]
     products:
       - environment: [dev]
-        scope: [mr-github, mr-github-slim]
+        scope: [mr-github]
         platforms: [dgx_gb200]

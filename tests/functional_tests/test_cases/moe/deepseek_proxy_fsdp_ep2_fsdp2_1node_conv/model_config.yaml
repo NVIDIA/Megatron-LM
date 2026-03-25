@@ -51,7 +51,7 @@ MODEL_ARGS:
   --train-iters: 20
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
-  --cross-entropy-loss-fusion: true
+  # --cross-entropy-loss-fusion: true  # Not deterministic yet.
   --cross-entropy-fusion-impl: te
   --manual-gc: true
   --manual-gc-interval: 10
