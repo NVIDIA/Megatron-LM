@@ -248,6 +248,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
+    # Cache first batch and reuse it every iteration for debugging
+    global _cached_batch
+    if tokens is not None:
+        if not hasattr(forward_step, '_cached'):
+            forward_step._cached = True
+            _cached_batch = (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
+        else:
+            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = _cached_batch
+
+    if torch.distributed.get_rank() == 0 and tokens is not None:
+        print(f"[DEBUG] input_ids shape={tokens.shape}, first 20 tokens={tokens[0, :20].tolist()}", flush=True)
+
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
