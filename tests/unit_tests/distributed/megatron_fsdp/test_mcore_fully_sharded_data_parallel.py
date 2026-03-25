@@ -11,6 +11,9 @@ from torch.testing import assert_close
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import (
+    _resolve_suggested_communication_unit_size,
+)
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -74,6 +77,27 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)  # Set seed for all GPUs
     torch.backends.cudnn.deterministic = True  # Ensure deterministic behavior
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
+
+
+def test_resolve_suggested_communication_unit_size_caps_prefetch_window():
+    ddp_config = DistributedDataParallelConfig(
+        data_parallel_sharding_strategy="optim_grads_params",
+        suggested_communication_unit_size=None,
+    )
+
+    avg_fsdp_unit_size = 152_502_592
+    total_fsdp_module = 4
+    total_param_elements = avg_fsdp_unit_size * total_fsdp_module
+
+    suggested_communication_unit_size = _resolve_suggested_communication_unit_size(
+        ddp_config=ddp_config,
+        bucket_size=None,
+        total_param_elements=total_param_elements,
+        total_fsdp_module=total_fsdp_module,
+    )
+
+    assert suggested_communication_unit_size == avg_fsdp_unit_size * 2
+    assert suggested_communication_unit_size // 2 == avg_fsdp_unit_size
 
 
 @pytest.mark.flaky

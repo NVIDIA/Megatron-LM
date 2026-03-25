@@ -108,6 +108,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._fix_tensor_parallel_attributes(module)
 
+        # Avoid forcing module.to(device) in MegatronFSDP when any meta tensors are present.
+        # Passing device=None keeps initialization in the FSDP buffer-init path.
+        module_has_meta_tensors = any(p.is_meta for p in module.parameters()) or any(
+            b.is_meta for b in module.buffers()
+        )
+        fsdp_device = (
+            None if config.init_model_with_meta_device or module_has_meta_tensors else self.device
+        )
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -115,7 +124,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,
-                device=self.device,
+                device=fsdp_device,
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
