@@ -1542,3 +1542,64 @@ class TestTextGenerationController:
             assert shapes['hidden'][0] == tp_size
             assert shapes['tokens'] == (1, tp_size)
             assert shapes['positions'] == (1, tp_size)
+
+    def test_mtp_sp_dummy_hidden_uses_local_seq_len(self):
+        """Test that _dummy_serial_mtp_forward uses scattered seq len for hidden states.
+
+        When sequence_parallel is True on dummy EP ranks, the embedding
+        reduce-scatters its output along dim 0.  dummy_hidden must use
+        the post-scatter length (padded_count // tp_size) so it matches
+        decoder_input in _concat_embeddings.  token_ids/position_ids keep
+        the full padded_count because the embedding handles the scatter
+        internally.
+        """
+        tp_size = 4
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            max_requests=4,
+        )
+
+        ctrl = self.text_generation_controller
+        ctrl.num_speculative_tokens = num_spec
+        ctrl.num_mtp_heads = num_spec
+        ctrl.model_config.expert_model_parallel_size = 2
+        # Simulate the SP flag being left on (as it would be on dummy ranks).
+        ctrl.model_config.sequence_parallel = True
+
+        unwrapped_model = ctrl.inference_wrapped_model.model
+        unwrapped_model._decoder_hidden_states_cache = True
+
+        captured_shapes = []
+
+        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+            captured_shapes.append(
+                {
+                    'hidden': hidden_states.shape,
+                    'tokens': next_token_ids.shape,
+                    'positions': position_ids.shape,
+                }
+            )
+            return hidden_states, torch.randn(
+                hidden_states.shape[0], 1, self.vocab_size, device='cuda'
+            )
+
+        unwrapped_model.compute_mtp_single_step = mock.MagicMock(side_effect=mock_mtp)
+
+        with mock.patch(
+            'megatron.core.inference.text_generation_controllers.text_generation_controller.get_pg_size',
+            return_value=tp_size,
+        ):
+            ctrl._dummy_serial_mtp_forward()
+
+        local_seq_len = tp_size // tp_size  # = 1
+
+        assert len(captured_shapes) == num_spec
+        for shapes in captured_shapes:
+            # hidden uses post-scatter length
+            assert shapes['hidden'][0] == local_seq_len
+            # token_ids/position_ids keep full padded_count for the embedding
+            assert shapes['tokens'] == (1, tp_size)
+            assert shapes['positions'] == (1, tp_size)

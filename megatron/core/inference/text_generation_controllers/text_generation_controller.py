@@ -1655,15 +1655,23 @@ class TextGenerationController:
         hidden_size = self.model_config.hidden_size
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
-        # Pad dummy batch to nearest multiple of tp_size for SP compatibility.
+        # Pad token_ids/position_ids to nearest multiple of tp_size so that the
+        # embedding can reduce-scatter evenly across TP ranks.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         padded_count = tp_size  # 1 padded up to tp_size
+
+        # When SP is active the embedding reduce-scatters its output along
+        # dim 0, so dummy_hidden must use the local (post-scatter) length to
+        # match decoder_input in _concat_embeddings.  token_ids/position_ids
+        # keep the full padded_count because the embedding handles the scatter
+        # internally.
+        local_seq_len = padded_count // tp_size if self.model_config.sequence_parallel else padded_count
 
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
+            dummy_hidden = torch.zeros((local_seq_len, 1, hidden_size), device=device, dtype=dtype)
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
@@ -1676,12 +1684,12 @@ class TextGenerationController:
                     position_ids=dummy_position_ids,
                     depth=depth,
                 )
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [local_seq_len, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
             if self.model_is_pipeline_parallel:
                 broadcast_from_last_pipeline_stage(
-                    [padded_count, self.vocab_size],
+                    [local_seq_len, self.vocab_size],
                     dtype=dtype,
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
