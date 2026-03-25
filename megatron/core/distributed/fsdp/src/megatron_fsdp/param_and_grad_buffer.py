@@ -1642,6 +1642,7 @@ class ParamAndGradBuffer:
         )
 
         self.ddp_config = ddp_config
+        self.use_precision_aware_optimizer = ddp_config.use_precision_aware_optimizer
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
@@ -2842,7 +2843,7 @@ class ParamAndGradBuffer:
                 item_id, only_shard=sharded_optimizer_state
             )
             if group.main_weight_buffer is not None:
-                if not getattr(self, "use_precision_aware_optimizer", False):
+                if not self.use_precision_aware_optimizer:
                     # Convert the gradient to the main weight buffer dtype.
                     optimizer_grad = optimizer_grad.to(param.dtype)
 
@@ -2869,7 +2870,7 @@ class ParamAndGradBuffer:
 
             # The presence of main_grad_buffer but no main_weight_buffer may imply
             # that a precision-aware optimizer is used.
-            if getattr(self, "use_precision_aware_optimizer", False):
+            if self.use_precision_aware_optimizer:
                 setattr(param, "decoupled_grad", grad)
             else:
                 # Attach the gradient to the optimizer parameter.
