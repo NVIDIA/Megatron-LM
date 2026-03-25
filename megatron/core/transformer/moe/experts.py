@@ -689,7 +689,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            if isinstance(self.linear_fc1.weight0, MXFP8Tensor):
+            w = self.linear_fc1.weight0
+            if isinstance(w, MXFP8Tensor) or (
+                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+            ):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
