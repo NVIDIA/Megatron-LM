@@ -1510,10 +1510,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+            self.delay_wgrad_compute = (
+                self.config.delay_wgrad_compute
+                or self.config.delay_wgrad_compute_for_te_grouped_gemm
+            )
 
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                    extra_kwargs["delay_wgrad_compute"] = True
                 else:
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
@@ -1905,7 +1909,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             Compute weight gradients during the backward pass
             if delay_wgrad_compute is enabled.
             """
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 super().backward_dw()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):

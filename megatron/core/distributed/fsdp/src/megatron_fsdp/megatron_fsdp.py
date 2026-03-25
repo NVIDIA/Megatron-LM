@@ -17,6 +17,7 @@ import importlib
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -69,6 +70,34 @@ class TrainingState(Enum):
     # Before and after module forward computaton or before pre-backward and
     # after post-backward states, where no un/sharding activity happens
     IDLE = auto()
+
+
+def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
+    """Configure delayed wgrad gradient processing for MoE expert parameters.
+
+    When ``delay_wgrad_compute_for_te_grouped_gemm`` is enabled on a TransformerLayer,
+    this function:
+      1. Marks expert parameters so the normal post-accumulate-grad hook is skipped.
+      2. Registers a callback on the MoE layer that invokes FSDP's gradient
+         reduce-scatter after the delayed wgrad computation completes.
+
+    Args:
+        module: The module being processed in the forward pre-hook. Only
+            ``TransformerLayer`` instances with the delayed wgrad config flag
+            enabled are affected; all other modules are no-ops.
+        process_post_backward_gradients_fn: The FSDP gradient processing function
+            (``_process_post_backward_gradients``) to be called after the delayed
+            wgrad computation finishes.
+    """
+    from functools import partial
+
+    need_backward_dw = getattr(module, "need_backward_dw", lambda: False)
+    if not need_backward_dw():
+        return
+
+    for param in module.parameters():
+        if getattr(param, 'skip_backward_post_hook', False):
+            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
 
 
 class MegatronFSDP(torch.nn.Module):
@@ -833,7 +862,7 @@ class MegatronFSDP(torch.nn.Module):
 
         self._root_pre_backward_hook_issued = False
 
-        def _root_pre_backward(module: nn.Module, *unused):
+        def _root_pre_backward(module: nn.Module, *unused, skip_backward_hook: bool = False):
             """Marks the module's training state as PRE_BACKWARD before the
             backprop, this function is registered on the root module.
 
@@ -870,7 +899,8 @@ class MegatronFSDP(torch.nn.Module):
                     param.grad_added_to_main_grad = False
             # Queue the root post-backward hook to reduce leftover gradients after
             # the backward pass.
-            torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
+            if not skip_backward_hook:
+                torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
         def _post_forward(module: nn.Module, input: Any, output: Any):
@@ -957,8 +987,16 @@ class MegatronFSDP(torch.nn.Module):
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
 
+        # Saved function handle for manual hook management.
+        self.post_forward_release_module = partial(_post_forward, input=None, output=None)
+        self.post_backward_release_module = _post_backward_release_module
+        self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
+        self.post_backward = _root_post_backward
+
         fsdp_modules = []
         for name, module in root_module.named_modules():
+            # Set post backward hook for TE grouped gemm if enabled comm overlap
+            setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
                 _register_pre_backward_param_unshard_hook(module)
@@ -1014,7 +1052,11 @@ class MegatronFSDP(torch.nn.Module):
             for param in grad_acc_param_list:
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
-                        lambda p: _process_post_backward_gradients([p])
+                        lambda p: (
+                            None
+                            if getattr(p, 'skip_backward_post_hook', False)
+                            else _process_post_backward_gradients([p])
+                        )
                     )
                 )
 

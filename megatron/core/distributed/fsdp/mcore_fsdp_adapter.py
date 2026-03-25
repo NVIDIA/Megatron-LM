@@ -108,6 +108,21 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._fix_tensor_parallel_attributes(module)
 
+        # The EP overlap 1f1b schedule interleaves forward and backward
+        # all-gathers that share the same FixedPoolAllocator.  Increase the
+        # pool from 2 to 3 so that both passes can hold buffers concurrently
+        # without exhausting the pool.
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            assert self.fsdp_unit_modules == [TransformerLayer], (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+            )
+            if ddp_config.fsdp_double_buffer:
+                ddp_config.fsdp_double_buffer_pool_size = 3
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -119,8 +134,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                # EP overlap schedule calls sub-modules directly instead of
+                # TransformerLayer.forward(), so fine-grained hooks are needed
+                # to all-gather each sub-module's parameters individually.
                 enable_fine_grained_param_gather_hook=(
-                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or (
+                        config.overlap_moe_expert_parallel_comm
+                        and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    )
                 ),
             ),
         )
