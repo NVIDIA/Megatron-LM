@@ -65,6 +65,22 @@ try:
 except Exception:
     has_nvidia_modelopt = False
 
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue, AsyncRequest
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        init_checkpoint_metadata_cache,
+        save_state_dict_async_finalize,
+        save_state_dict_async_plan,
+    )
+    HAVE_NVRX = True
+    async_queue = AsyncCallsQueue()
+except (ImportError, ModuleNotFoundError):
+    HAVE_NVRX = False
+    async_queue = None
+
+
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
 
@@ -478,7 +494,8 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, async_queue=None,
+                    tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -582,7 +599,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if args.async_save:
         if ckpt_type == CheckpointType.LEGACY:
             raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
-        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format != 'torch_dist':
+        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format not in ['torch_dist', 'torch_dcp', 'fsdp_dtensor']:
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.ckpt_format} distributed checkpoint format')
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -667,11 +684,25 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
-            fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-            torch.distributed.checkpoint.save(
-                state_dict=state_dict,
-                storage_writer=fs_storage_writer,
-            )
+            if args.async_save:
+                planner = torch.distributed.checkpoint.DefaultSavePlanner()
+                coordinator_rank = 0
+                use_msc = True if MultiStorageClientFeature.is_enabled() else False
+                fs_storage_writer = FileSystemWriterAsync(
+                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=use_msc
+                )
+
+                save_state_dict_ret = save_state_dict_async_plan(
+                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=True
+                )
+                save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                async_queue.schedule_async_request(save_request)
+            else:
+                fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
+                torch.distributed.checkpoint.save(
+                    state_dict=state_dict,
+                    storage_writer=fs_storage_writer,
+                )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -2063,3 +2094,17 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
+
+
+def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
+    """Creates an async save request with a finalize function."""
+    save_fn, preload_fn, save_args = writer.get_save_function_and_args()
+
+    def finalize_fn():
+        """Finalizes async checkpointing and synchronizes processes."""
+        save_state_dict_async_finalize(*save_state_dict_ret)
+        torch.distributed.barrier()
+
+    return AsyncRequest(
+        save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
+    )
