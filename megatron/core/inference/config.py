@@ -266,10 +266,6 @@ class InferenceConfig:
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
     block boundaries are cached and reused across requests with matching prefixes."""
 
-    use_triton_conv1d: bool = False
-    """Use Triton varlen conv1d kernel for Mamba prefill instead of
-    per-request causal_conv1d_fn calls."""
-
     # =================================
     # Logging config
     # =================================
