@@ -14,6 +14,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
+    expert_max_violation_batchwise,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -170,16 +171,17 @@ class TopKRouter(Router):
         self.input_jitter = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        # Always track local_tokens_per_expert for global batch metrics logging.
+        self.register_buffer(
+            'local_tokens_per_expert',
+            torch.zeros(
+                self.config.num_moe_experts,
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            ),
+            persistent=False,
+        )
         if self.enable_expert_bias:
-            self.register_buffer(
-                'local_tokens_per_expert',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -189,7 +191,6 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
 
         # Initialize global tokens per expert for global aux loss
@@ -578,7 +579,7 @@ class TopKRouter(Router):
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        if torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask)
@@ -669,6 +670,37 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+
+        # Log expert max violation metric (logging only, no gradient impact)
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+
+                # Don't count the padding tokens in the max violation calculation.
+                expert_max_violation_routing_map = routing_map
+                total_num_tokens = routing_map.shape[0]
+                if padding_mask is not None:
+                    expert_max_violation_routing_map = routing_map & (
+                        ~padding_mask.unsqueeze(-1)
+                    )
+                    total_num_tokens = (~padding_mask).sum().item()
+
+                tokens_per_expert = expert_max_violation_routing_map.sum(dim=0).float()
+                max_violation = expert_max_violation_batchwise(
+                    tokens_per_expert=tokens_per_expert,
+                    num_experts=self.config.num_moe_experts,
+                    total_num_tokens=total_num_tokens,
+                    topk=self.topk,
+                )
+                save_to_aux_losses_tracker(
+                    "expert_max_violation",
+                    max_violation,
+                    self.layer_number,
+                    num_layers,
+                    reduce_group=self.tp_cp_group,
+                )
 
         return probs, routing_map
 

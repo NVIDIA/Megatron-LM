@@ -21,7 +21,8 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..num_microbatches_calculator import get_num_microbatches
+from ..transformer.moe.moe_utils import expert_max_violation_batchwise, get_updated_expert_bias, save_to_aux_losses_tracker
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -281,13 +282,62 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if hasattr(module, 'local_tokens_per_expert') and module.local_tokens_per_expert is not None:
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+
+
+def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    Log global-batch MoE routing metrics (expert max violation) for all MoE routers.
+    Performs an all-reduce of local_tokens_per_expert across TPxCPxDP ranks, then logs via
+    save_to_aux_losses_tracker. Called for all routers regardless of whether expert bias is used.
+    """
+    router_modules = []
+    tokens_per_expert_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'local_tokens_per_expert') and module.local_tokens_per_expert is not None:
+                router_modules.append(module)
+                tokens_per_expert_list.append(module.local_tokens_per_expert)
+
+    if len(router_modules) == 0:
+        return
+
+    stacked = torch.stack(tokens_per_expert_list, dim=0).clone()
+    torch.distributed.all_reduce(
+        stacked,
+        group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+    )
+
+    num_layers = config.num_layers
+    if config.mtp_num_layers is not None:
+        num_layers += config.mtp_num_layers
+
+    # track_moe_metrics applies value times loss_scale=1/num_microbatches, so pre-multiply
+    # to cancel it out, because this already contains all the necessary information.
+    num_microbatches = get_num_microbatches()
+    with torch.no_grad():
+        for module, global_tokens_per_expert in zip(router_modules, stacked):
+            total_num_tokens = int(global_tokens_per_expert.sum().item()) // module.topk
+            max_violation = expert_max_violation_batchwise(
+                tokens_per_expert=global_tokens_per_expert,
+                num_experts=global_tokens_per_expert.shape[0],
+                total_num_tokens=total_num_tokens,
+                topk=module.topk,
+            )
+            layer = module.layer_number
+            save_to_aux_losses_tracker(
+                "global_expert_max_violation",
+                max_violation * num_microbatches,
+                layer,
+                num_layers,
+                reduce_group_has_dp=True,
+            )
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
@@ -479,6 +529,8 @@ def finalize_model_grads(
 
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
+
+    _log_global_router_metrics(model, config)
 
     reset_model_temporary_tensors(config, model)
 
