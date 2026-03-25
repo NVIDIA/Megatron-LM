@@ -140,7 +140,6 @@ class MegatronCheckpointSaverBase:
         try:
             from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
-            from megatron.legacy import fused_kernels
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -179,7 +178,6 @@ class MegatronCheckpointSaverBase:
         mpu._DATA_PARALLEL_GROUP = fake_dp_group
         mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        fused_kernels.load(self.margs)
         
         try:
             import torch_llm_debug_tools

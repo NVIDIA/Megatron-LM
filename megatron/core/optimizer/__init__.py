@@ -139,6 +139,8 @@ def get_mup_config_overrides(
     - Non-Adam optimizers:
       - hidden (matrix-like) lr = base_lr / width_mult
       - no eps override is applied.
+      - for Muon optimizers, matrix-like params managed by Muon itself are
+        excluded from these Adam-style MuP overrides.
 
     With decoupled_lr enabled, embedding/output params continue using decoupled LR
     and MuP will not override those explicit decoupled values.
@@ -154,6 +156,7 @@ def get_mup_config_overrides(
     optimizer_type_lower = optimizer_type.lower()
     is_sgd_optimizer = optimizer_type_lower == 'sgd'
     is_adam_optimizer = 'adam' in optimizer_type_lower
+    is_muon_optimizer = 'muon' in optimizer_type_lower
 
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
@@ -165,6 +168,18 @@ def get_mup_config_overrides(
         if is_adam_optimizer:
             message += " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
         log_single_rank(logger, logging.WARNING, message)
+
+    if is_muon_optimizer:
+        muon_scale_mode = getattr(config, 'muon_scale_mode', 'spectral')
+        if muon_scale_mode == 'spectral':
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Both MuP and muon_scale_mode=spectral are enabled. "
+                "Muon-managed matrix parameters will continue using spectral Muon scaling. "
+                "Set --muon-scale-mode unit_rms_norm to use unit_rms_norm scaling for "
+                "Muon-managed matrices with MuP.",
+            )
 
     if mup_width_mult == 1.0:
         # No scaling needed when width_mult is 1
@@ -191,8 +206,15 @@ def get_mup_config_overrides(
             return True
         return False
 
+    def is_muon_managed_matrix_parameter(param: torch.nn.Parameter, _: str) -> bool:
+        if not is_muon_optimizer:
+            return False
+        return param.dim() == 2 and not getattr(param, 'is_embedding_or_output_parameter', False)
+
     def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
+            return False
+        if is_muon_managed_matrix_parameter(param, param_name):
             return False
         return not is_vector_like_parameter(param, param_name)
 
@@ -203,6 +225,8 @@ def get_mup_config_overrides(
 
     def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if is_vector_like_parameter(param, param_name):
+            return False
+        if is_muon_managed_matrix_parameter(param, param_name):
             return False
         # MuP Appendix B.3: eps scales with fan_in when non-negligible.
         # This implementation follows the common denominator form: sqrt(v) + eps.
