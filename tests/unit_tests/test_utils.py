@@ -6,7 +6,7 @@ import urllib.request as req
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import mock
+from unittest import mock
 import numpy as np
 import pytest
 import torch

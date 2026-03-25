@@ -598,6 +598,7 @@ class AbsorbedMLASelfAttention(Attention):
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -607,6 +608,7 @@ class AbsorbedMLASelfAttention(Attention):
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
                 )
 
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
