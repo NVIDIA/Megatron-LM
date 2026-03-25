@@ -30,11 +30,11 @@ pytestmark = [
     pytest.mark.skipif(
         not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
     ),
-    pytest.mark.skipif(
-        not HAVE_EO_V02,
-        reason="emerging_optimizers >= 0.2 is required for coefficient type support",
-    ),
 ]
+
+requires_eo_v02 = pytest.mark.skipif(
+    not HAVE_EO_V02, reason="emerging_optimizers >= 0.2 is required"
+)
 
 
 class Net(nn.Module):
@@ -663,6 +663,7 @@ def test_muon_optimizer_extra_scale_factor():
     ), "Weight should be updated with extra_scale_factor"
 
 
+@requires_eo_v02
 def test_get_supported_coefficient_types_returns_tuple():
     """Test that get_supported_coefficient_types returns a non-empty tuple of strings."""
     supported = get_supported_coefficient_types()
@@ -672,6 +673,7 @@ def test_get_supported_coefficient_types_returns_tuple():
         assert isinstance(t, str)
 
 
+@requires_eo_v02
 def test_get_supported_coefficient_types_contains_known_types():
     """Test that the known coefficient types are present in the supported set."""
     supported = get_supported_coefficient_types()
@@ -679,6 +681,7 @@ def test_get_supported_coefficient_types_contains_known_types():
         assert expected in supported, f"Expected '{expected}' in supported types {supported}"
 
 
+@requires_eo_v02
 def test_validate_coefficient_type_accepts_valid():
     """Test that validate_coefficient_type does not raise for valid types."""
     for t in get_supported_coefficient_types():
