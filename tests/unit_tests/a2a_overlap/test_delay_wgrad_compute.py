@@ -153,9 +153,19 @@ class TestDelayWgradCompute:
         This test checks that the deferred reduce-scatter produces identical
         per-step loss and final weights as the non-delayed FSDP baseline.
         """
+        from torch.distributed import DeviceMesh
+
+        from megatron.core import parallel_state
         from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
             fully_shard_model,
             fully_shard_optimizer,
+        )
+
+        # Build expert device mesh required by MegatronFSDP for expert parallelism.
+        expt_dp_group = parallel_state.get_expert_data_parallel_group()
+        expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
+        expt_device_mesh = DeviceMesh.from_group(
+            expt_dp_group, device_type="cuda", mesh=expt_dp_ranks, mesh_dim_names=("fsdp",)
         )
 
         num_layers = 4
@@ -171,7 +181,11 @@ class TestDelayWgradCompute:
             ref_model = _build_gpt_model(ref_config)
             init_params = reset_model(ref_model)
 
-            ref_fsdp = fully_shard_model(module=ref_model, fsdp_unit_modules=[TransformerLayer])
+            ref_fsdp = fully_shard_model(
+                module=ref_model,
+                fsdp_unit_modules=[TransformerLayer],
+                expt_device_mesh=expt_device_mesh,
+            )
             ref_opt = torch.optim.SGD(ref_fsdp.parameters(), lr=LR)
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
@@ -181,7 +195,11 @@ class TestDelayWgradCompute:
             test_model = _build_gpt_model(test_config)
             reset_model(test_model, init_params)
 
-            test_fsdp = fully_shard_model(module=test_model, fsdp_unit_modules=[TransformerLayer])
+            test_fsdp = fully_shard_model(
+                module=test_model,
+                fsdp_unit_modules=[TransformerLayer],
+                expt_device_mesh=expt_device_mesh,
+            )
             test_opt = torch.optim.SGD(test_fsdp.parameters(), lr=LR)
             test_opt = fully_shard_optimizer(optimizer=test_opt)
 
