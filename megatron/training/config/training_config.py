@@ -84,7 +84,7 @@ class TrainingConfig:
     """
 
     iterations_to_skip: list[int] = field(default_factory=list)
-    """List of iterations to skip during training, empty by default."""
+    """List of 1-indexed iterations to skip during training, empty by default."""
 
 
 @dataclass(kw_only=True)
@@ -433,7 +433,7 @@ class CheckpointConfig:
     The legacy format was deprecated on Feb 13, 2024.
     """
 
-    ckpt_fully_parallel_save: bool = True
+    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
@@ -454,7 +454,7 @@ class CheckpointConfig:
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
 
-    ckpt_fully_parallel_load: bool = False
+    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
     ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"

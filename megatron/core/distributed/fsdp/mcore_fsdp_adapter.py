@@ -70,9 +70,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
-        main_params_dtype: Optional[torch.dtype] = torch.float32,
-        main_grads_dtype: Optional[torch.dtype] = torch.float32,
-        grad_comm_dtype: Optional[torch.dtype] = torch.float32,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -90,10 +87,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
         self.mp_policy = MixedPrecisionPolicy(
-            main_params_dtype=main_params_dtype,
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
             # Grandfathered Argument: grad_reduce_in_fp32
-            main_grads_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else main_grads_dtype,
-            grad_comm_dtype=grad_comm_dtype,
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
         )
         log_single_rank(
             logger,

@@ -140,6 +140,22 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
+def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+
+    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
+    Before applying the chat template, we must inline those tags back into content.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.pop("reasoning_content", None)
+        if reasoning_content is not None:
+            content = message.get("content") or ""
+            message["content"] = f"<think>{reasoning_content}</think>{content}"
+    return messages
+
+
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -228,6 +244,7 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -247,15 +264,6 @@ try:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
-                    eos_token_id = tokenizer.eos_id
-                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                    warnings.warn(
-                        "Avoiding prefix retokenization."
-                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
-                    )
-
                     # Find the last assistant message
                     last_assistant_message_idx = None
                     for i in reversed(range(len(template_messages))):
@@ -263,8 +271,28 @@ try:
                             last_assistant_message_idx = i
                             break
 
-                    # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
-                    if last_assistant_message_idx is not None:
+                    last_assistant_message = (
+                        template_messages[last_assistant_message_idx]
+                        if last_assistant_message_idx is not None
+                        else None
+                    )
+
+                    # Only proceed if the last assistant message has the token IDs from a previous generation.
+                    # Dataset-provided conversation history won't have these fields.
+                    if (
+                        last_assistant_message is not None
+                        and "prompt_token_ids" in last_assistant_message
+                        and "generation_token_ids" in last_assistant_message
+                    ):
+                        eos_token_id = tokenizer.eos_id
+                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                        warnings.warn(
+                            "Avoiding prefix retokenization."
+                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                        )
+
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
                         ]
@@ -279,11 +307,6 @@ try:
                         )
 
                         # Replace the prefix tokens with the tokens from the previous generation
-                        last_assistant_message = template_messages[last_assistant_message_idx]
-                        assert (
-                            "prompt_token_ids" in last_assistant_message
-                            and "generation_token_ids" in last_assistant_message
-                        ), "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
                         previous_turn_token_ids = (
                             last_assistant_message["prompt_token_ids"]
                             + last_assistant_message["generation_token_ids"]
@@ -369,26 +392,38 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format OpenAI Response ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+
+        # --- 5. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
 
         request_idx = 0
         for result_item in batch_results:
-            result = result_item if isinstance(result_item, dict) else result_item.serialize()
-            result = unwrap_serialized_tensors(result)
-
-            if result["status"] == "FAILED":
-                if result["sampling_params"]["num_tokens_to_generate"] <= 0:
-                    return Response(
-                        f"Request {request_idx} failed due to context length overflow", status=400
-                    )
-                else:
-                    return Response(
-                        f"Request {request_idx} failed due to internal error {result['events']}",
-                        status=500,
-                    )
+            result = unwrap_serialized_tensors(result_item)
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
@@ -441,7 +476,7 @@ try:
             if metadata.get("tool_calls", []):
                 message["tool_calls"] = metadata["tool_calls"]
             if "reasoning" in metadata:
-                message["reasoning"] = metadata["reasoning"]
+                message["reasoning_content"] = metadata["reasoning"]
 
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
@@ -468,8 +503,8 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_staleness"] = result["policy_staleness"]
-            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )

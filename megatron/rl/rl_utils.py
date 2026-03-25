@@ -63,8 +63,11 @@ from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
+    GroupedRollouts,
     RewardEvaluationResult,
     Rollout,
+    RolloutGroup,
+    Rollouts,
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
@@ -264,8 +267,6 @@ def verify_model_weights_swap(
         if inf_was_training:
             inf_core.train()
 
-Rollouts = list[TokenRollout | Rollout]
-GroupedRollouts = list[Rollouts]
 
 
 @dataclass(slots=True)
@@ -285,9 +286,9 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_staleness: list[list[int]]
-    kv_cache_staleness: list[list[int]]
-    completed_at_steps: list[list[int]]
+    policy_epoch: list[list[int]]
+    kv_cache_epoch: list[list[int]]
+    completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
 
 
@@ -456,11 +457,11 @@ _ROLLOUT_GENERATOR = None
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
-    if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
+    if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
-        # Collect Rollouts
         request = GroupedRolloutRequest(
-            num_groups=-1 if args.rl_partial_rollouts else n_prompts,
+            num_groups=args.rl_generation_batch_size,
+            streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -470,6 +471,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
+            enforce_order=args.rl_enforce_generation_order,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
@@ -493,21 +495,22 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
+        with nvtx_range("rl/offload-optimizer-before-inference", time=True):
             if not args.rl_training_cuda_graphs:
-                model[0].offload_grad_buffers()
+                with nvtx_range("rl/offload/grad-buffers", time=True):
+                    model[0].offload_grad_buffers()
             else:
                 logger.warning(
-                    "Gradient buffers will not be offloaded when training cudagraphs are used!"
-                )
-            optimizer.offload_to_cpu()
+                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+            with nvtx_range("rl/offload/optimizer-state", time=True):
+                optimizer.offload_to_cpu()
 
     # If we have separate training and inference models we to refit weights from the training model to the inference model.
     has_separate_inference_model = inference_model is not None
     if has_separate_inference_model:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
-        with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+        with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         swap_model_weights(model, inference_model, args.refit_method)
@@ -525,7 +528,7 @@ def get_environment_rollouts(
     pg_size = get_pg_size(inference_pg_collection.ep)
     assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
-    with nvtx_range("rollout-collection"):
+    with nvtx_range("rl/rollout-collection", time=True):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
             inference_model,
@@ -533,10 +536,9 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
-            increment_staleness_on_suspend=True,
         ) as inference_interface:
 
-            with nvtx_range("inference-setup"):
+            with nvtx_range("rl/inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
                 rollout_generator = get_rollout_generator(
                     args, inference_interface, n_prompts, samples_per_group
@@ -544,7 +546,7 @@ def get_environment_rollouts(
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
-            with nvtx_range("collect-rollouts"):
+            with nvtx_range("rl/collect-rollouts", time=True):
                 if rank == 0:
                     log_single_rank(
                         logger,
@@ -569,16 +571,18 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("sync-rollouts"):
+        with nvtx_range("rl/sync-rollouts", time=True):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):
-            model[0].restore_grad_buffers()
-            optimizer.restore_from_cpu()
+        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+            with nvtx_range("rl/restore/grad-buffers", time=True):
+                model[0].restore_grad_buffers()
+            with nvtx_range("rl/restore/optimizer-state", time=True):
+                optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -679,8 +683,8 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
     nvtx_range = get_nvtx_range()
 
-    with nvtx_range("get-logprobs", time=False):
-        with nvtx_range("forward-pass", time=False):
+    with nvtx_range("rl/get-logprobs", time=True):
+        with nvtx_range("rl/forward-pass", time=True):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
 
             attention_mask_for_forward = None
@@ -707,7 +711,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
-            with nvtx_range("log-softmax", time=False):
+            with nvtx_range("rl/log-softmax", time=True):
                 # We do not need logprobs for the n+1 token.
                 logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
             return logprobs
@@ -762,18 +766,18 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    all_policy_staleness = []
-    all_kv_cache_staleness = []
-    all_completed_at_steps = []
+    all_policy_epoch = []
+    all_kv_cache_epoch = []
+    all_completed_epochs = []
     all_num_evictions = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_policy_staleness = []
-        group_kv_staleness = []
-        group_completed_at_steps = []
+        group_policy_epoch = []
+        group_kv_epoch = []
+        group_completed_epochs = []
         group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
@@ -795,13 +799,15 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_staleness.extend(s for turn in rollout.policy_staleness for s in turn)
-            group_kv_staleness.extend(s for turn in rollout.kv_cache_staleness for s in turn)
-            group_completed_at_steps.extend(rollout.completed_at_step)
+            assert rollout.policy_epoch, "Rollout has no policy_epoch data"
+            assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
+            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
+            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
-        all_policy_staleness.append(group_policy_staleness)
-        all_kv_cache_staleness.append(group_kv_staleness)
-        all_completed_at_steps.append(group_completed_at_steps)
+        all_policy_epoch.append(group_policy_epoch)
+        all_kv_cache_epoch.append(group_kv_epoch)
+        all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
@@ -830,42 +836,13 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        policy_staleness=all_policy_staleness,
-        kv_cache_staleness=all_kv_cache_staleness,
-        completed_at_steps=all_completed_at_steps,
+        policy_epoch=all_policy_epoch,
+        kv_cache_epoch=all_kv_cache_epoch,
+        completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
     )
     return stats
 
-
-def compute_true_staleness(
-    per_token_staleness: list[list[int]],
-    completed_at_steps: list[list[int]],
-    turn_lens: list[list[int]],
-    current_iteration: int,
-) -> list[int]:
-    """Compute true per-token staleness by adding the completion gap.
-
-    Args:
-        per_token_staleness: Grouped flat list of per-token raw staleness values.
-        completed_at_steps: Grouped list of per-turn completion steps.
-        turn_lens: Grouped list of per-turn token counts.
-        current_iteration: Current training iteration.
-
-    Returns:
-        Flat list of true staleness values (one per token across all groups).
-    """
-    result = []
-    for group_staleness, group_completed, group_turn_lens in zip(
-        per_token_staleness, completed_at_steps, turn_lens
-    ):
-        token_idx = 0
-        for completed_at, num_tokens in zip(group_completed, group_turn_lens):
-            gap = current_iteration - completed_at
-            for _ in range(num_tokens):
-                result.append(group_staleness[token_idx] + gap)
-                token_idx += 1
-    return result
 
 
 def prep_wandb_metrics(
@@ -875,10 +852,10 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_staleness: List[List[int]],
-        kv_cache_staleness: List[List[int]],
+        policy_epoch: List[List[int]],
+        kv_cache_epoch: List[List[int]],
+        completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
-        completed_at_steps: List[List[int]],
         current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
@@ -893,10 +870,10 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_staleness: Grouped list of per-token policy staleness.
-        kv_cache_staleness: Grouped list of per-token KV cache staleness.
+        policy_epoch: Grouped list of per-rollout min policy epoch stamps.
+        kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
-        completed_at_steps: Grouped list of per-turn completed at steps.
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
@@ -907,10 +884,8 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = compute_true_staleness(
-        policy_staleness, completed_at_steps, turn_lens, current_iteration)
-    true_kv_staleness = compute_true_staleness(
-        kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
+    true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
+    true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -962,7 +937,7 @@ def prep_wandb_metrics(
             'min_kv_cache_staleness': min(true_kv_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
-            'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
+            'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
     }
     if example_group:
         if tokenizer is None:
@@ -1021,15 +996,15 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    policy_staleness = group_stats.policy_staleness
-    kv_cache_staleness = group_stats.kv_cache_staleness
+    policy_epoch = group_stats.policy_epoch
+    kv_cache_epoch = group_stats.kv_cache_epoch
+    completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
-    completed_at_steps = group_stats.completed_at_steps
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
-        completed_at_steps=completed_at_steps, current_iteration=current_iteration)
+        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
+        num_evictions=num_evictions, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1048,10 +1023,10 @@ def maybe_log_training_metrics(
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
-            policy_staleness=env_stats(policy_staleness, env_idx),
-            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
+            policy_epoch=env_stats(policy_epoch, env_idx),
+            kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
+            completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
-            completed_at_steps=env_stats(completed_at_steps, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
@@ -1304,8 +1279,8 @@ def prepare_data_for_update(
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    with nvtx_range("prepare-data-for-update"):
-        with nvtx_range("compute-group-stats"):
+    with nvtx_range("rl/prepare-data-for-update", time=True):
+        with nvtx_range("rl/compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
@@ -1345,7 +1320,7 @@ def prepare_data_for_update(
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
-        with nvtx_range("prepare_trajectories"):
+        with nvtx_range("rl/prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
@@ -1353,7 +1328,7 @@ def prepare_data_for_update(
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
-            with nvtx_range("sequence_packing", time=True):
+            with nvtx_range("rl/sequence-packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
@@ -1373,7 +1348,7 @@ def prepare_data_for_update(
                 logprobs_batch_size = 1
         else:
             # Always compute standard masks for the original data (we'll need them later)
-            with nvtx_range("get_ltor_masks_and_position_ids"):
+            with nvtx_range("rl/get-ltor-masks", time=True):
                 _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
                     trajs,
                     tokenizer.eod,
@@ -1392,7 +1367,8 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-        with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
+
+        with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             forward_backward_func = get_forward_backward_func()
@@ -1408,7 +1384,7 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1423,7 +1399,7 @@ def prepare_data_for_update(
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
@@ -1446,13 +1422,14 @@ def prepare_data_for_update(
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
 
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+                with nvtx_range("rl/synchronize-cuda-and-collect-garbage", time=True):
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
 
         if sequence_packing:
-            with nvtx_range("pack_logprobs", time=True):
+            with nvtx_range("rl/pack-logprobs", time=True):
                 # Store logprobs on gpu in packing context
                 # Since PackingContext is a dataclass, we add these as new attributes
                 packing_context.old_logprobs = old_logprobs.cuda()
@@ -1480,7 +1457,7 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("rl/create-dataloader", time=True):
                 # @vitalyk: This function also reconfigures the data loader to count the
                 # global_batch_size in the bins frame of reference.
                 # I think it will be a better design if we split the data loader creating and logic
@@ -1497,7 +1474,7 @@ def prepare_data_for_update(
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
         else:
-            with nvtx_range("align_inference_logprobs", time=True):
+            with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
                     inference_logprobs = align_unpacked_inference_logprobs(
                         inference_logprobs=inference_logprobs,
@@ -1510,7 +1487,7 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("rl/create-dataloader", time=True):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
                 runtime_state.packing_context = None
@@ -1539,6 +1516,13 @@ def prepare_data_for_update(
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
+        with nvtx_range("rl/log-wandb-tb", time=True):
+            maybe_log_training_metrics(
+                group_stats=group_stats,
+                current_iteration=args.curr_iteration,
+                tokenizer=tokenizer,
+                example_groups=example_groups,
+            )
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
@@ -1667,9 +1651,10 @@ def evaluate_and_print_results_rl(
                         'top_k': args.rl_default_top_k,
                     },
                 )
-                evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
-                if not isinstance(evaluation_responses, list):
-                    evaluation_responses = [evaluation_responses]
+                with get_nvtx_range()("rl/run-evaluation", time=True):
+                    evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
+                    if not isinstance(evaluation_responses, list):
+                        evaluation_responses = [evaluation_responses]
             else:
                 evaluation_responses = None
 
@@ -1829,7 +1814,6 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
-    increment_staleness_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1866,7 +1850,7 @@ def megatron_rl_inference_mode(
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
     # before any CUDA-graph capture/replay or inference. This is a no-op if already on GPU.
     model_core = unwrap_model(model[0])
-    with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+    with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -1879,31 +1863,29 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
+            with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not args.rl_training_cuda_graphs:
-                    # Offload grad buffers from the training model (if separate inference model is used)
-                    # or from the inference model (if they're the same model)
-                    model_for_grad_offload = training_model if training_model is not None else model
-                    model_for_grad_offload[0].offload_grad_buffers()
+                    with nvtx_range("rl/offload/grad-buffers", time=True):
+                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are used!"
-                    )
-                optimizer.offload_to_cpu()
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                with nvtx_range("rl/offload/optimizer-state", time=True):
+                    optimizer.offload_to_cpu()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
+        inference_interface.set_generation_epoch(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
         yield inference_interface
 
-        with nvtx_range("suspend-engine"):
+        with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
-            if increment_staleness_on_suspend:
-                inference_interface.increment_staleness()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
@@ -1930,12 +1912,12 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                # Restore grad buffers to the training model (if separate inference model is used)
-                # or to the inference model (if they're the same model)
-                model_for_grad_offload = training_model if training_model is not None else model
-                model_for_grad_offload[0].restore_grad_buffers()
-                optimizer.restore_from_cpu()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model_for_grad_offload = training_model if training_model is not None else model
+                    model_for_grad_offload[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
         training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
@@ -2007,4 +1989,3 @@ def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) ->
             # Create zero tensor for None logprobs
             padded_data.append(torch.zeros(max_len))
     return torch.stack(padded_data)
-
