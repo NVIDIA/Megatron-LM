@@ -53,9 +53,7 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
 
 def validate_coefficient_type(coefficient_type: str) -> None:
     """Raise ``ValueError`` if *coefficient_type* is not supported."""
-    if not HAVE_EO_V02:
-        return
-    supported = get_supported_coefficient_types()
+    supported = get_supported_coefficient_types() if HAVE_EO_V02 else ("quintic",)
     if coefficient_type not in supported:
         raise ValueError(
             f"Unsupported muon coefficient type '{coefficient_type}'. "
