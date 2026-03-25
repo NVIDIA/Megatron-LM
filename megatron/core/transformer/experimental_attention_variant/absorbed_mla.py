@@ -19,6 +19,7 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
