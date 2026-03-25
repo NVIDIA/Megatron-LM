@@ -15,7 +15,6 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -214,10 +213,12 @@ class DataParallelInferenceCoordinator:
         n_ranks = len(sorted_identities)
         self._identities_list = list(sorted_identities)  # rank_index → identity
         self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
-        self._active_mask = np.ones(n_ranks, dtype=bool)
 
-        # Hash → rank timestamp table for prefix cache affinity routing.
-        self.hash_table = HashRankTable(n_ranks)
+        # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
+        # Each key is a block hash; each value maps rank indices to assignment
+        # timestamps (positive int).  Missing entries are implicitly zero.
+        self._hash_table: dict[int, dict[int, int]] = {}
+        self._hash_assignment_counter = 0
 
     def get_next_data_parallel_rank(self):
         """
@@ -236,13 +237,6 @@ class DataParallelInferenceCoordinator:
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
-        idx = self.identity_to_rank_index.get(identity)
-        if idx is not None:
-            self._active_mask[idx] = False
-            # Zero out the removed rank's column so rows with no remaining
-            # live timestamps can be reclaimed by compact().
-            self.hash_table._timestamps[:, idx] = 0
-            self.hash_table.compact()
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -303,11 +297,7 @@ class DataParallelInferenceCoordinator:
         if not self.enable_prefix_caching or not request_hashes:
             return self.get_next_data_parallel_rank()
 
-        # Build policy-aware match vector (binary for first_prefix_block,
-        # normalized prefix depth for longest_prefix).
-        match = self.hash_table.match_vector(
-            request_hashes, policy=self.prefix_caching_coordinator_policy
-        )
+        match, recency = self._match_vector(request_hashes)
 
         alpha = self.prefix_caching_routing_alpha
 
@@ -315,15 +305,11 @@ class DataParallelInferenceCoordinator:
         free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
         scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
 
-        # Mask out inactive ranks.
-        scores[~self._active_mask] = -1.0
-
-        # np.argmax returns the first max index, which is the lowest rank index
-        # among ties — matching the desired deterministic tiebreaking.
-        best_idx = int(np.argmax(scores))
-        if scores[best_idx] >= 0.0:
-            return self._identities_list[best_idx]
-        return self.get_next_data_parallel_rank()
+        # Tiebreak: highest score, then highest recency, then lowest rank index.
+        n_ranks = len(self._identities_list)
+        order = np.lexsort((np.arange(n_ranks), -recency, -scores))
+        best_idx = int(order[0])
+        return self._identities_list[best_idx]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
@@ -333,7 +319,38 @@ class DataParallelInferenceCoordinator:
             request_hashes: List of block hashes assigned to this rank.
         """
         rank_idx = self.identity_to_rank_index[rank_identity]
-        self.hash_table.record(rank_idx, request_hashes)
+        self._hash_assignment_counter += 1
+        ts = self._hash_assignment_counter
+        for h in request_hashes:
+            self._hash_table.setdefault(h, {})[rank_idx] = ts
+
+    def _match_vector(self, hashes):
+        """Return ``(match, recency)`` vectors of shape ``(n_ranks,)``.
+
+        *match* is binary depth: ``(depth + 1) / len(hashes)`` for ranks that
+        have the deepest cached block, 0 otherwise.  *recency* is the raw
+        assignment timestamp for each matching rank (0 for non-matching ranks).
+
+        For ``FIRST_PREFIX_BLOCK`` the caller already truncates *hashes* to a
+        single element, so the same logic yields a binary 0/1 match score.
+        """
+        n_ranks = len(self._identities_list)
+        n = len(hashes)
+        zeros = np.zeros(n_ranks, dtype=np.float64)
+        if n == 0:
+            return zeros, zeros.copy()
+        for i in range(n - 1, -1, -1):
+            row = self._hash_table.get(hashes[i])
+            if row is None:
+                continue
+            present = np.zeros(n_ranks, dtype=bool)
+            recency = np.zeros(n_ranks, dtype=np.float64)
+            for rank_idx, ts in row.items():
+                present[rank_idx] = True
+                recency[rank_idx] = ts
+            if present.any():
+                return present.astype(np.float64) * ((i + 1.0) / n), recency
+        return zeros, zeros.copy()
 
     def start(self):
         """
@@ -354,17 +371,6 @@ class DataParallelInferenceCoordinator:
             if serialized_payload == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
-                    idx = self.identity_to_rank_index.get(sender_identity)
-                    if idx is not None:
-                        # Known engine reconnecting — reactivate it.
-                        self._active_mask[idx] = True
-                    else:
-                        # Brand-new engine — expand all tracking structures.
-                        new_idx = self.hash_table.add_rank()
-                        self.identity_to_rank_index[sender_identity] = new_idx
-                        self._identities_list.append(sender_identity)
-                        self._pending_counts = np.append(self._pending_counts, np.int32(0))
-                        self._active_mask = np.append(self._active_mask, True)
                 continue
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
@@ -534,8 +540,6 @@ class DataParallelInferenceCoordinator:
                         ]
                     )
 
-                # Compact the hash table to reclaim stale rows and shrink if under-utilized.
-                self.hash_table.compact()
 
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:

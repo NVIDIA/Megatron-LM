@@ -11,7 +11,6 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.hash_rank_table import HashRankTable
 
 
 def make_coordinator_direct(
@@ -63,7 +62,8 @@ def make_coordinator_direct(
     )
 
     n_ranks = data_parallel_size
-    coordinator.hash_table = HashRankTable(n_ranks)
+    coordinator._hash_table = {}
+    coordinator._hash_assignment_counter = 0
     coordinator._round_robin_idx = 0
 
     sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
@@ -73,6 +73,5 @@ def make_coordinator_direct(
 
     coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
     coordinator._identities_list = list(sorted_identities)
-    coordinator._active_mask = np.ones(n_ranks, dtype=bool)
 
     return coordinator

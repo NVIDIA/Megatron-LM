@@ -24,7 +24,6 @@ from megatron.core.inference.engines.dynamic_engine import (
     EngineState,
     RequestEntry,
 )
-from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -676,9 +675,9 @@ class TestCoordinator:
 
 
 def _set_hash_rank(coord, h, rank_identity, timestamp):
-    """Test helper: set a hash→rank timestamp via HashRankTable."""
+    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
     rank_idx = coord.identity_to_rank_index[rank_identity]
-    coord.hash_table.set(h, rank_idx, timestamp)
+    coord._hash_table.setdefault(h, {})[rank_idx] = timestamp
 
 
 def _make_routing_coordinator(

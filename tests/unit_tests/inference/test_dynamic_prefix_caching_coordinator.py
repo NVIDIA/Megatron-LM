@@ -23,7 +23,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
-from megatron.core.inference.hash_rank_table import HashRankTable
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -56,9 +55,9 @@ BLOCK_SIZE = 4
 
 
 def _set_hash_rank(coordinator, h, rank_identity, timestamp):
-    """Test helper: set a hash→rank timestamp via HashRankTable."""
+    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
     rank_idx = coordinator.identity_to_rank_index[rank_identity]
-    coordinator.hash_table.set(h, rank_idx, timestamp)
+    coordinator._hash_table.setdefault(h, {})[rank_idx] = timestamp
 
 
 class DummyTokenizer:
@@ -340,13 +339,13 @@ class TestCoordinatorPrefixRouting:
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
 
-        # Both ranks have same pending counts and same match.
+        # Both ranks have same pending counts, same match, and same timestamp.
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
         for h in hashes:
             _set_hash_rank(coordinator, h, rank_0, 1)
-            _set_hash_rank(coordinator, h, rank_1, 5)
+            _set_hash_rank(coordinator, h, rank_1, 1)
 
         # Equal scores → lowest rank index (rank_0) wins.
         selected = coordinator.get_best_data_parallel_rank(hashes)
@@ -378,10 +377,11 @@ class TestCoordinatorShadowState:
         """_update_rank_hashes adds hashes to the rank's set."""
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        idx_0 = coordinator.identity_to_rank_index[rank_0]
 
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
         assert all(
-            coordinator.hash_table.has(h, coordinator.identity_to_rank_index[rank_0])
+            coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0
             for h in [100, 200, 300]
         )
 
@@ -390,22 +390,23 @@ class TestCoordinatorShadowState:
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
 
-        assert coordinator.hash_table.assignment_counter == 0
+        assert coordinator._hash_assignment_counter == 0
         coordinator._update_rank_hashes(rank_0, [100])
-        assert coordinator.hash_table.assignment_counter == 1
+        assert coordinator._hash_assignment_counter == 1
         coordinator._update_rank_hashes(rank_0, [200])
-        assert coordinator.hash_table.assignment_counter == 2
+        assert coordinator._hash_assignment_counter == 2
 
     def test_timestamps_updated_on_reassignment(self):
         """Re-assigning a hash to the same rank updates its timestamp."""
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        idx_0 = coordinator.identity_to_rank_index[rank_0]
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts1 = coordinator.hash_table.get_timestamp(100, coordinator.identity_to_rank_index[rank_0])
+        ts1 = coordinator._hash_table[100][idx_0]
 
         coordinator._update_rank_hashes(rank_0, [100])
-        ts2 = coordinator.hash_table.get_timestamp(100, coordinator.identity_to_rank_index[rank_0])
+        ts2 = coordinator._hash_table[100][idx_0]
 
         assert ts2 > ts1
 
@@ -413,11 +414,12 @@ class TestCoordinatorShadowState:
         """Multiple requests to the same rank accumulate their hashes."""
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        idx_0 = coordinator.identity_to_rank_index[rank_0]
 
         coordinator._update_rank_hashes(rank_0, [10, 20])
         coordinator._update_rank_hashes(rank_0, [30, 40])
         assert all(
-            coordinator.hash_table.has(h, coordinator.identity_to_rank_index[rank_0])
+            coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0
             for h in [10, 20, 30, 40]
         )
 
@@ -426,12 +428,14 @@ class TestCoordinatorShadowState:
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        idx_0 = coordinator.identity_to_rank_index[rank_0]
+        idx_1 = coordinator.identity_to_rank_index[rank_1]
 
         coordinator._update_rank_hashes(rank_0, [100])
         coordinator._update_rank_hashes(rank_1, [100])
 
-        assert coordinator.hash_table.has(100, coordinator.identity_to_rank_index[rank_0])
-        assert coordinator.hash_table.has(100, coordinator.identity_to_rank_index[rank_1])
+        assert coordinator._hash_table[100].get(idx_0, 0) > 0
+        assert coordinator._hash_table[100].get(idx_1, 0) > 0
 
     def test_routing_then_state_update_flow(self):
         """Full flow: compute hashes, route, update state, then re-route to same rank."""
@@ -447,6 +451,29 @@ class TestCoordinatorShadowState:
         # Second request with same tokens: should go to same rank.
         rank2 = coordinator.get_best_data_parallel_rank(hashes)
         assert rank2 == rank
+
+    def test_recency_breaks_tie_at_equal_load(self):
+        """When two ranks match the same prefix and have equal load, the more
+        recently assigned rank wins."""
+        coordinator = make_coordinator_direct()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hashes = coordinator.compute_request_hashes(tokens)
+
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+
+        # Equal load on both ranks.
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
+
+        # Both have the prefix, but rank_1 was assigned more recently.
+        for h in hashes:
+            _set_hash_rank(coordinator, h, rank_0, 1)
+            _set_hash_rank(coordinator, h, rank_1, 5)
+
+        # rank_1 wins via recency despite rank_0 having a lower index.
+        selected = coordinator.get_best_data_parallel_rank(hashes)
+        assert selected == rank_1
 
 
 @pytest.mark.skipif(ZMQ_FLAKY_SHUTDOWN, reason="ZMQ shutdown is flaky")
@@ -567,9 +594,9 @@ class TestFirstPrefixBlockRouting:
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
 
-        # Both ranks have the first block.
+        # Both ranks have the first block with the same timestamp.
         _set_hash_rank(coordinator, hashes[0], rank_0, 3)
-        _set_hash_rank(coordinator, hashes[0], rank_1, 7)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 3)
 
         # Equal scores → lowest rank index wins.
         selected = coordinator.get_best_data_parallel_rank(hashes[:1])
@@ -872,28 +899,3 @@ class TestScoringFunctionRouting:
         assert selected == rank_1
 
 
-class TestCompactInterval:
-    """Tests for compaction triggered via the coordinator."""
-
-    def test_remove_engine_zeros_column_and_compacts(self):
-        """_remove_engine zeros the rank's hash column and compacts the table."""
-        coordinator = make_coordinator_direct(data_parallel_size=3)
-        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
-        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-        rank_2 = coordinator.identities_of_data_parallel_ranks[2]
-
-        # Record hashes: hash 10 only on rank_1, hash 20 on rank_0 and rank_2.
-        idx_0 = coordinator.identity_to_rank_index[rank_0]
-        idx_1 = coordinator.identity_to_rank_index[rank_1]
-        idx_2 = coordinator.identity_to_rank_index[rank_2]
-        coordinator.hash_table.set(10, idx_1, 1)
-        coordinator.hash_table.set(20, idx_0, 2)
-        coordinator.hash_table.set(20, idx_2, 3)
-
-        # Remove rank_1 — hash 10's row should become all-zero and be compacted.
-        coordinator._remove_engine(rank_1)
-
-        assert not coordinator.hash_table.has(10, idx_1)
-        # Hash 20 is still live on rank_0 and rank_2.
-        assert coordinator.hash_table.has(20, idx_0)
-        assert coordinator.hash_table.has(20, idx_2)
