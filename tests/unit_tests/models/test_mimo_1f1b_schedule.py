@@ -524,10 +524,21 @@ def run_mimo_1f1b_test(
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
     communicator = MultiModulePipelineCommunicator(
-        module_to_grid_map, topology, mimo_model.config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
+        module_to_grid_map,
+        topology,
+        mimo_model.config,
+        dim_mapping={'s': 0, 'h': 2, 'b': 1},
+        module_output_ndim={encoder_name: 2},
     )
 
-    # Create data iterator on ranks that need it
+    # Compute per-rank micro-batch size for asymmetric DP.
+    # The LLM's MBS is the schedule-level MBS. The encoder's MBS is adjusted
+    # by the DP ratio so that total work is conserved across the bridge.
+    llm_mbs = micro_batch_size
+    encoder_mbs = micro_batch_size * llm_dp // encoder_dp
+
+    # Create data iterator on ranks that need it, with per-role micro-batch size.
+    # Encoder ranks use encoder_mbs, LLM ranks use llm_mbs.
     data_iterator = None
     encoder_needs_data = is_rank_in_grid(encoder_grid) and is_pp_first_stage(
         encoder_grid.get_pg("pp")
@@ -535,7 +546,13 @@ def run_mimo_1f1b_test(
     llm_needs_data = is_rank_in_grid(llm_grid) and (
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
     )
-    if encoder_needs_data or llm_needs_data:
+    if encoder_needs_data and not llm_needs_data:
+        data_iterator = DataIterator(hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name)
+    elif llm_needs_data and not encoder_needs_data:
+        data_iterator = DataIterator(hidden_size, seq_length, llm_mbs, vocab_size, encoder_name)
+    elif encoder_needs_data and llm_needs_data:
+        # Colocated: both encoder and LLM on same rank. Use LLM's MBS since
+        # the LLM drives the schedule. (encoder_dp == llm_dp when colocated)
         data_iterator = DataIterator(
             hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
         )
@@ -709,6 +726,84 @@ class TestMimo1F1BSchedule:
             llm_offset=4,
             hidden_size=256,
             num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=4,
+        )
+
+    def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):
+        """Fan-in 4→1: Encoder DP=4 → LLM TP=2 PP=2 DP=1, on 8 GPUs.
+
+        High fan-in ratio. Each encoder rank processes MBS=1, bridge concatenates
+        4 × [img_seq, H] → [4*img_seq, H]. LLM has both TP and PP.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=4,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=2,
+            llm_dp=1,
+            llm_offset=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=4,
+            num_microbatches=4,
+        )
+
+    def test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu(self):
+        """Fan-out 1→4: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
+
+        Encoder has PP and TP. Bridge fan-out splits encoder output into
+        4 parts for 4 LLM DP ranks each with MBS=1.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=2,
+            encoder_pp=2,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=1,
+            llm_dp=4,
+            llm_offset=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=1,
+            num_microbatches=4,
+        )
+
+    def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self):
+        """Fan-in 2→1: Encoder DP=2 → LLM TP=2 PP=3, on 8 GPUs.
+
+        Tests fan-in with deep LLM pipeline (PP=3). The 2D tensor goes through
+        bridge fan-in then P2P across 3 LLM PP stages.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=2,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=3,
+            llm_dp=1,
+            llm_offset=2,
+            hidden_size=256,
+            num_layers=3,
             vocab_size=1000,
             seq_length=64,
             micro_batch_size=2,
