@@ -10,7 +10,7 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, OptimizerConfig
 from megatron.core.optimizer.muon import (
     TensorParallelMuon,
     get_megatron_muon_optimizer,
@@ -21,11 +21,21 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-# Skip all tests in this file for LTS versions
-pytestmark = pytest.mark.skipif(
-    Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
-    reason="Skip muon optimizer for LTS test",
-)
+# Skip all tests in this file for LTS versions or when emerging_optimizers is missing
+pytestmark = [
+    pytest.mark.skipif(
+        Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
+        reason="Skip muon optimizer for LTS test",
+    ),
+    pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS,
+        reason="emerging_optimizers package is not installed",
+    ),
+    pytest.mark.skipif(
+        not HAVE_EO_V02,
+        reason="emerging_optimizers >= 0.2 is required for coefficient type support",
+    ),
+]
 
 
 class Net(nn.Module):
@@ -426,7 +436,9 @@ class TestMuonOptimizerMultiRankTP:
 
 
 # All non-custom coefficient types supported by emerging_optimizers.
-_TESTABLE_COEFFICIENT_TYPES = [t for t in get_supported_coefficient_types() if t != "custom"]
+_TESTABLE_COEFFICIENT_TYPES = (
+    [t for t in get_supported_coefficient_types() if t != "custom"] if HAVE_EO_V02 else []
+)
 
 # A reasonable default NS step count for testing; get_coefficient_iterator
 # cycles/repeats coefficients so any step count works with any type.
