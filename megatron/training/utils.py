@@ -41,7 +41,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
