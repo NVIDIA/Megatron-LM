@@ -64,10 +64,7 @@ MODEL_ARGS:
 
   # Recompute args
   --recompute-granularity: selective
-  --recompute-modules:
-    - layernorm
-    - mla_up_proj
-    - moe_act
+  --recompute-modules: "[layernorm mla_up_proj moe_act]"
 
   # CPU Offloading
   --fine-grained-activation-offloading: true
