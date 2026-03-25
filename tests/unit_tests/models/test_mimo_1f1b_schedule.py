@@ -24,8 +24,10 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -73,6 +75,11 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["dp", "cp"])
     grid.create_pg(["ep"])
     grid.create_pg(["expt_dp"])
+    # Required by _get_pg_collection_for_optimizer
+    grid.create_pg(["tp", "pp"])
+    grid.create_pg(["tp", "ep", "pp"])
+    grid.create_pg(["dp", "ep"])
+    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
     _active_grids.append(grid)
     return grid
 
@@ -505,6 +512,17 @@ def run_mimo_1f1b_test(
         else loss
     )
 
+    # Create optimizer
+    opt_config = OptimizerConfig(
+        optimizer='adam',
+        lr=1e-4,
+        weight_decay=0.01,
+        clip_grad=1.0,
+        bf16=True,
+        use_distributed_optimizer=True,
+    )
+    optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
     communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, mimo_model.config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
     )
@@ -557,6 +575,8 @@ def run_mimo_1f1b_test(
         output_tensor, loss_mask = model(**batch)
         return output_tensor, partial(loss_func, loss_mask)
 
+    optimizer.zero_grad()
+
     losses = schedule.forward_backward_pipelining_without_interleaving(
         forward_step_func=step_func,
         data_iterator=data_iterator,
@@ -568,6 +588,11 @@ def run_mimo_1f1b_test(
         p2p_communicator=communicator,
         pg_collection=pg_collection,
     )
+
+    # Optimizer step with global gradient clipping
+    success, grad_norm, num_zeros = optimizer.step()
+    assert success, "Optimizer step failed"
+    assert grad_norm is not None and grad_norm > 0, f"Expected positive grad norm, got {grad_norm}"
 
     # Verify results on last LLM stage
     if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
