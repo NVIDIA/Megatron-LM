@@ -495,8 +495,7 @@ class TestFP32LocalGradAccumulation:
         mutually exclusive."""
         with pytest.raises(AssertionError):
             DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                param_name_patterns_for_fp32_local_accumulation=('all',),
+                grad_reduce_in_fp32=True, param_name_patterns_for_fp32_local_accumulation=('all',)
             )
 
     def test_pattern_matching_creates_fp32_main_grad(self):
@@ -508,18 +507,16 @@ class TestFP32LocalGradAccumulation:
 
         for name, param in model.module.named_parameters():
             if 'weight' in name:
-                assert param.main_grad.dtype == torch.float32, (
-                    f"{name} main_grad should be float32"
-                )
+                assert param.main_grad.dtype == torch.float32, f"{name} main_grad should be float32"
                 assert hasattr(param, 'main_grad_copy_in_grad_buffer')
                 assert param.main_grad_copy_in_grad_buffer is not None
                 # The copy in grad buffer should be in the buffer's grad dtype (bf16).
                 assert param.main_grad_copy_in_grad_buffer.dtype == buf.grad_dtype
             else:
                 # Bias params should not be promoted.
-                assert param.main_grad.dtype == buf.grad_dtype, (
-                    f"{name} main_grad should remain in grad_dtype"
-                )
+                assert (
+                    param.main_grad.dtype == buf.grad_dtype
+                ), f"{name} main_grad should remain in grad_dtype"
                 assert getattr(param, 'main_grad_copy_in_grad_buffer', None) is None
 
         Utils.destroy_model_parallel()
@@ -530,9 +527,9 @@ class TestFP32LocalGradAccumulation:
         model, buf, _ = self._make_model(patterns=('all',))
 
         for name, param in model.module.named_parameters():
-            assert param.main_grad.dtype == torch.float32, (
-                f"{name} main_grad should be float32 with 'all' pattern"
-            )
+            assert (
+                param.main_grad.dtype == torch.float32
+            ), f"{name} main_grad should be float32 with 'all' pattern"
             assert getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None
 
         Utils.destroy_model_parallel()
@@ -557,9 +554,9 @@ class TestFP32LocalGradAccumulation:
                 bucket.params_with_extra_main_grads
             ).issubset(bucket.params)
 
-        assert bucket_promoted == promoted_params, (
-            "Bucket-tracked promoted params should match the set of pattern-matched params"
-        )
+        assert (
+            bucket_promoted == promoted_params
+        ), "Bucket-tracked promoted params should match the set of pattern-matched params"
 
         Utils.destroy_model_parallel()
 
@@ -603,13 +600,13 @@ class TestFP32LocalGradAccumulation:
 
         buf.scale_gradients(0.5)
 
-        assert torch.allclose(buf.grad_data, torch.tensor(1.0, dtype=buf.grad_data.dtype)), (
-            "grad_data should be scaled"
-        )
+        assert torch.allclose(
+            buf.grad_data, torch.tensor(1.0, dtype=buf.grad_data.dtype)
+        ), "grad_data should be scaled"
         for grad in buf.extra_main_grads:
-            assert torch.allclose(grad, torch.tensor(2.0, dtype=grad.dtype)), (
-                "extra main_grads should be scaled"
-            )
+            assert torch.allclose(
+                grad, torch.tensor(2.0, dtype=grad.dtype)
+            ), "extra main_grads should be scaled"
 
         Utils.destroy_model_parallel()
 

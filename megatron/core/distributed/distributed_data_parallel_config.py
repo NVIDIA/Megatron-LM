@@ -59,9 +59,10 @@ class DistributedDataParallelConfig:
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
 
-    param_name_patterns_for_fp32_local_accumulation: Tuple[str] = ()
-    """List of param_name patterns to match against to do local gradient accumulation
-       in FP32. Do not specify when grad_reduce_in_fp32 is already True."""
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
+    """List of param_name patterns (in Python's fnmatch format) to match against to do
+       local gradient accumulation in FP32. The special pattern 'all' matches every
+       parameter. Do not specify when grad_reduce_in_fp32 is already True."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
