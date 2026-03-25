@@ -53,6 +53,8 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
 
 def validate_coefficient_type(coefficient_type: str) -> None:
     """Raise ``ValueError`` if *coefficient_type* is not supported."""
+    if not HAVE_EO_V02:
+        return
     supported = get_supported_coefficient_types()
     if coefficient_type not in supported:
         raise ValueError(
