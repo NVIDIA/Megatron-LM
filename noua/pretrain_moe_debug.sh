@@ -124,9 +124,9 @@ MOE_ARGS=(
 
 
 OPTIMIZER_ARGS=(
-    --optimizer adam
-    --use-distributed-optimizer
-    # --optimizer dist_muon
+    # --optimizer adam
+    # --use-distributed-optimizer
+    --optimizer dist_muon
     --lr 1e-3                          
     --min-lr 1e-4        
     --adam-beta1 0.9                         

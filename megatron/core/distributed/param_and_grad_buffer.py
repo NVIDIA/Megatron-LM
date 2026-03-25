@@ -333,8 +333,8 @@ class _ParamAndGradBucketGroup:
                 # fp32 when grad_reduce_in_fp32 is enabled).
                 param_dtype = bucket.params_list[0].dtype
 
-                if max(bucket.layerwise_param_flat_sizes) == 0:
-                    # All ranks have empty params for this bucket — skip.
+                if bucket.layerwise_param_flat_sizes is None or max(bucket.layerwise_param_flat_sizes) == 0:
+                    # Bucket has no layerwise params assigned (or all empty) — skip.
                     bucket.layerwise_gather_list = None
                     continue
 
