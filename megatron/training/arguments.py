@@ -1483,10 +1483,6 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'soap', "adaptive_muon", "lion"],
-                       help='Optimizer function. '
-                            'Note: dist_muon is deprecated; use --optimizer muon '
-                            'with --use-distributed-optimizer instead.')
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
@@ -2483,11 +2479,10 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-        if args.optimizer == 'muon':
-            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
-            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
-
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'soap', 'adaptive_muon', 'lion'],
+                       help='Optimizer function. '
+                            'Note: dist_muon is deprecated; use --optimizer muon '
+                            'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,

@@ -294,23 +294,9 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    pp_group: torch.distributed.ProcessGroup = None,
-    is_recv: bool = True,
-):
-    """
-    Determine right tensor sizes (based on position of rank with respect to split rank) and
-    model size.
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
-    For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
-    with dimension hidden_size * num_residual_streams.
-
-    Args:
-        is_recv: If True, compute shape for receiving; if False, for sending.
-                 This matters for hyper connections where first/last stages have different
-                 send/recv dimensions.
-    """
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -2132,8 +2118,22 @@ def get_tensor_shapes(
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
-            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: torch.distributed.ProcessGroup = None,
+    is_recv: bool = True,
+):
+    """
+    Determine right tensor sizes (based on position of rank with respect to split rank) and
+    model size.
+
+    For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
+    with dimension hidden_size * num_residual_streams.
+
+    Args:
+        is_recv: If True, compute shape for receiving; if False, for sending.
+                 This matters for hyper connections where first/last stages have different
+                 send/recv dimensions.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
