@@ -769,6 +769,7 @@ class TestMegatronFsdpFullyShard:
             device_mesh=device_mesh,
             hybrid_fsdp_group=device_mesh[HSDP].get_group(),
             outer_dp_sharding_strategy=OPTIM,
+            dp_outer_dim=DP_OUTER,
             fsdp_unit_modules=[te.pytorch.TransformerLayer, te.pytorch.Linear],
             # Only ZeRO-3 / FSDP supports FP8 parameters.
             zero_dp_strategy=3,
