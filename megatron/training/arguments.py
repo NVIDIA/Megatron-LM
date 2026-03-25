@@ -1377,7 +1377,7 @@ def validate_args(args, defaults={}):
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
-    if not args.enable_gloo_process_groups:
+    if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
@@ -1394,8 +1394,8 @@ def validate_args(args, defaults={}):
         args.check_for_nan_in_loss_and_grad = False
         warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
         # Disable gloo process groups for fake process group
-        args.enable_gloo_process_groups = False
-        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
+        args.use_gloo_process_groups = False
+        warn_rank_0('use_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
