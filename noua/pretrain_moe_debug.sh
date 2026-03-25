@@ -315,26 +315,26 @@ export WANDB_API_KEY=\${WANDB_API_KEY:-}
 
 cd ${MEGATRON_LM}
 
-# ── Log package versions ──
-echo '=== Package Versions ==='
-python -c '
-import subprocess, pathlib
-def git_info(pkg_path):
-    try:
-        d = str(pathlib.Path(pkg_path).resolve().parent)
-        fmt = \"%h %s (%ci)\"
-        return subprocess.check_output([\"git\", \"log\", \"-1\", \"--format=\" + fmt], cwd=d, stderr=subprocess.DEVNULL).decode().strip()
-    except Exception:
-        return \"unknown\"
-import megatron.core as mc; print(f\"megatron-core: {mc.__version__} | {git_info(mc.__file__)}\")
-import transformer_engine as te; print(f\"transformer-engine: {te.__version__} | {git_info(te.__file__)}\")
-try:
-    import transformer_engine_torch as te_torch
-    print(f\"  TE .so: {te_torch.__file__}\")
-except Exception as e:
-    print(f\"  TE .so: failed to load ({e})\")
-' 2>&1 || echo 'WARNING: version check failed'
-echo '========================'
+# # ── Log package versions ──
+# echo '=== Package Versions ==='
+# python -c '
+# import subprocess, pathlib
+# def git_info(pkg_path):
+#     try:
+#         d = str(pathlib.Path(pkg_path).resolve().parent)
+#         fmt = \"%h %s (%ci)\"
+#         return subprocess.check_output([\"git\", \"log\", \"-1\", \"--format=\" + fmt], cwd=d, stderr=subprocess.DEVNULL).decode().strip()
+#     except Exception:
+#         return \"unknown\"
+# import megatron.core as mc; print(f\"megatron-core: {mc.__version__} | {git_info(mc.__file__)}\")
+# import transformer_engine as te; print(f\"transformer-engine: {te.__version__} | {git_info(te.__file__)}\")
+# try:
+#     import transformer_engine_torch as te_torch
+#     print(f\"  TE .so: {te_torch.__file__}\")
+# except Exception as e:
+#     print(f\"  TE .so: failed to load ({e})\")
+# ' 2>&1 || echo 'WARNING: version check failed'
+# echo '========================'
 
 PROFILE_CMD=\"\"
 ${PROFILE_CMD_CHECK}
