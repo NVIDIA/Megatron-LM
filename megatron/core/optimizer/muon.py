@@ -45,9 +45,9 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
     Reads the members of the ``NSCoeffT`` Literal type so that new types
     added upstream are automatically available without code changes here.
     """
-    assert HAVE_EO_V02, (
-        "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
-    )
+    assert (
+        HAVE_EO_V02
+    ), "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
     return get_args(NSCoeffT)
 
 
@@ -102,14 +102,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
             mode_value = "duplicated" if mode == "blockwise" else mode
-            mode_kwarg = (
-                {"tp_mode": mode_value} if HAVE_EO_V02 else {"mode": mode_value}
-            )
+            mode_kwarg = {"tp_mode": mode_value} if HAVE_EO_V02 else {"mode": mode_value}
             ns_kwargs = dict(
-                steps=num_ns_steps,
-                tp_group=tp_group,
-                partition_dim=partition_dim,
-                **mode_kwarg,
+                steps=num_ns_steps, tp_group=tp_group, partition_dim=partition_dim, **mode_kwarg
             )
             if HAVE_EO_V02:
                 ns_kwargs["coefficient_type"] = coefficient_type
@@ -125,9 +120,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         nesterov_kwarg = (
-            {"nesterov": use_nesterov}
-            if HAVE_EO_V02
-            else {"use_nesterov": use_nesterov}
+            {"nesterov": use_nesterov} if HAVE_EO_V02 else {"use_nesterov": use_nesterov}
         )
         super().__init__(
             params,
