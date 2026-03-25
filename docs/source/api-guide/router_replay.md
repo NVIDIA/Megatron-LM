@@ -55,7 +55,7 @@ The implementation cleanly separates the replay logic from the router's core com
         *   `record_indices()`: A method to save the computed indices.
     *   The `topk_routing_with_score_function` is modified to contain the core logic. It checks the `router_replay_action` on the `router_replay` instance and accordingly performs one of the following actions: computes and records indices, replays indices from `target_topk_idx` (for forward), replays indices from `replay_backward_list` (for backward), or falls through to the default dynamic routing.
 
-#### Training recompute usage
+### Training recompute usage
 - During forward replay, `set_target_indices()` prepares `replay_backward_list` so each micro-batch’s indices are available for recomputation.
 - During recompute/backward, set action to `REPLAY_BACKWARD` so indices are consumed in FIFO order to mirror the forward sequence.
 
@@ -77,7 +77,7 @@ The implementation cleanly separates the replay logic from the router's core com
 5.  **Cleanup**
     - Use `RouterReplay.clear_global_indices()`, `RouterReplay.clear_global_router_replay_action()`, and `RouterReplay.clear_global_router_replay_instances()` to restore default behavior and prevent memory leaks.
 
-#### Quick usage with `topk_routing_with_score_function`
+### Quick usage with `topk_routing_with_score_function`
 
 ```python
 import torch
