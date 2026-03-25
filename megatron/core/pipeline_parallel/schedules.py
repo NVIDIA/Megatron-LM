@@ -297,7 +297,6 @@ def forward_step_calc_loss(
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
-
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.

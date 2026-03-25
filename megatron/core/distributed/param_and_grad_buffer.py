@@ -318,7 +318,6 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-
         if not self.ddp_config.use_distributed_optimizer:
             # Layer-wise optimizer path: use all_gather for variable-size
             # param gather.

@@ -1832,7 +1832,6 @@ class MoETransformerLayer(TransformerLayer):
         for name, attr in self.token_dispatcher_attrs.items():
             self.mlp.token_dispatcher.set_cudagraph_attr(name, attr)
 
-
         self.mlp.fwd_execution_map = "expert_compute"
         return self.mlp(None, intermediate_tensors=(hidden_states, probs))
 
