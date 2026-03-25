@@ -22,4 +22,6 @@ def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """
     from . import get_megatron_optimizer
 
+    # Strip dev-specific kwarg not accepted by get_megatron_optimizer
+    kwargs.pop('layer_wise_distributed_optimizer', None)
     return get_megatron_optimizer(*args, **kwargs)
