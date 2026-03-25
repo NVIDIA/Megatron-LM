@@ -682,9 +682,7 @@ def process_mtp_loss(
             )
         else:
             mtp_logits, _ = output_layer(
-                mtp_hidden,
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
+                mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
             if scale_logits_fn is not None:
                 mtp_logits = scale_logits_fn(mtp_logits)
