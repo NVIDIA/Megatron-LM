@@ -46,7 +46,7 @@ MODEL_ARGS:
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 1
+  --micro-batch-size: 32
   --global-batch-size: 128
   --train-iters: 20
   --exit-duration-in-mins: 60
