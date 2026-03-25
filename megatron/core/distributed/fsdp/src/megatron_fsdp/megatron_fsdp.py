@@ -690,18 +690,7 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
-        def _pre_forward_param_unshard(
-            module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
-        ):
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
+        def _pre_forward_param_unshard(module: nn.Module, *unused):
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -728,14 +717,14 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-            return args, kwargs
+            return None
 
         @torch.compiler.disable
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
+            args: Optional[Tuple[Any, ...]],
+            kwargs: Optional[Dict[str, Any]],
         ):
             """
             Register a post-backward hook for the given module by inserting an autograd
@@ -744,13 +733,6 @@ class MegatronFSDP(torch.nn.Module):
             since such operations can trigger an autograd error that
             "the output is a view and is being modified in-place".
             """
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
             if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
                 return args, kwargs
