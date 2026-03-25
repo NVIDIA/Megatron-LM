@@ -433,41 +433,227 @@ else:
     TEActivationOp = None
 
 
+if HAVE_TE and is_te_min_version("1.13.0"):
+
+    class TEFusedResidualRMSNorm(te.pytorch.RMSNorm):
+        """
+        RMSNorm with fused residual output for Megatron Core.
+
+        Inherits from te.pytorch.RMSNorm to maintain all parameter management,
+        checkpoint compatibility, and Megatron-specific features. Creates a fused
+        implementation using TE's ops API that shares the base class parameters.
+
+        The fused implementation uses:
+        - MakeExtraOutput: Forks the residual connection
+        - RMSNorm: Normalizes the main path
+
+        Forward pass returns: (normalized_output, residual)
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Fused implementation (stored in tuple to avoid submodule registration)
+            self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """
+            Construct fused ops pipeline that shares parameters with base RMSNorm.
+
+            Creates MakeExtraOutput + RMSNorm ops, where the RMSNorm op shares
+            the weight parameter with self.weight from the base class.
+            """
+
+            fused_impl = te.pytorch.ops.Sequential()
+
+            # Op 1: MakeExtraOutput - forks the residual
+            fused_impl.append(te.pytorch.ops.MakeExtraOutput())
+
+            # Op 2: RMSNorm - shares weight parameter with self
+            kwargs = {
+                "eps": self.eps,
+                "device": "meta",  # Already initialized
+                "dtype": self.weight.dtype,
+                "zero_centered_gamma": self.zero_centered_gamma,
+            }
+
+            # Add sm_margin if available (TE 2.5+)
+            if hasattr(self, '_sm_margins'):
+                kwargs["sm_margin"] = self._sm_margins
+
+            rmsnorm_op = te.pytorch.ops.RMSNorm(self.weight.shape, **kwargs)
+
+            rmsnorm_op.weight = self.weight
+
+            fused_impl.append(rmsnorm_op)
+
+            self._register_hooks_on_fused_impl(fused_impl)
+
+            return fused_impl
+
+        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
+
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            backward_pre_hooks = []
+            backward_post_hooks = []
+
+            for submodule in self.modules():
+                for hook in submodule._forward_pre_hooks.values():
+                    forward_pre_hooks.append((submodule, hook))
+                for hook in submodule._forward_hooks.values():
+                    forward_post_hooks.append((submodule, hook))
+                for hook in submodule._backward_pre_hooks.values():
+                    backward_pre_hooks.append((submodule, hook))
+                for hook in submodule._backward_hooks.values():
+                    backward_post_hooks.append((submodule, hook))
+
+            # Pre-forward hooks
+            # Note: DDP pre-forward hooks are safe since they do not
+            # interact with input tensor.
+            if forward_pre_hooks:
+                from megatron.core.distributed import distributed_data_parallel
+
+                if any(
+                    inspect.getmodule(hook) != distributed_data_parallel
+                    for _, hook in forward_pre_hooks
+                ):
+                    warnings.warn(
+                        "TEFusedResidualRMSNorm module has a submodule with a pre-forward hook. "
+                        "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
+                        "so the hook may have incorrect behavior if it attempts to "
+                        "access the input tensor."
+                    )
+
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook in forward_pre_hooks:
+                        # Assume that hook does not interact with input
+                        ret = hook(submodule, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedResidualRMSNorm module does not expose "
+                                "intermediate tensors, but submodule has "
+                                "pre-forward hook that modifies input tensor."
+                            )
+
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+            # Post-forward hooks
+            if forward_post_hooks:
+                warnings.warn(
+                    "TEFusedResidualRMSNorm module has a submodule with a post-forward hook. "
+                    "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
+                    "so the hook may have incorrect behavior if it attempts to "
+                    "access the input or output tensors."
+                )
+
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook in forward_post_hooks:
+                        # Assume that hook does not interact with input or output
+                        ret = hook(submodule, None, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedResidualRMSNorm module does not expose "
+                                "intermediate tensors, but submodule has "
+                                "post-forward hook that modifies output tensor."
+                            )
+
+                fused_impl.register_forward_hook(forward_post_hook)
+
+            # Backward hooks
+            if backward_pre_hooks:
+                raise RuntimeError(
+                    "TEFusedResidualRMSNorm module does not support "
+                    "submodules with pre-backward hooks"
+                )
+            if backward_post_hooks:
+                raise RuntimeError(
+                    "TEFusedResidualRMSNorm module does not support "
+                    "submodules with post-backward hooks"
+                )
+
+        def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            """
+            Forward pass with fused residual output.
+
+            Args:
+                hidden_states: Input tensor [s, b, h]
+
+            Returns:
+                Tuple of (normalized_output, residual), both [s, b, h]
+
+            Note:
+                Sequential.forward() automatically returns (output, extra_outputs...)
+                when MakeExtraOutput is present, so we don't need manual unpacking.
+            """
+
+            # Construct fused impl lazily on first forward
+            # (in case parameters are modified after __init__)
+            if self._fused_impl is None:
+                self._fused_impl = (self._make_fused_impl(),)
+
+            # Apply fused implementation
+            # Sequential returns (normalized_output, residual) automatically
+            return self._fused_impl[0](hidden_states)
+
+else:
+    TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
-    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
+    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
+
+    Residual fusion is a two-level opt-in mechanism:
+
+    1. Global capability: config.fused_residual_rmsnorm must be True (enables the feature)
+    2. Local intent: has_residual=True must be passed at build site (declares this specific
+       norm is followed by a residual connection)
+
+    Fusion only happens when BOTH conditions are met.
+
+    """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
-    ) -> LayerNormInterface:
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        has_residual: bool = False,
+    ):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
 
+        use_fused_residual = config.fused_residual_rmsnorm and has_residual
+        if use_fused_residual and config.normalization != "RMSNorm":
+            raise ValueError("Fused residual is only supported " "for RMSNorm normalization")
+
         if config.normalization == "LayerNorm":
-            instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
-            )
+            norm_module = te.pytorch.LayerNorm
         elif config.normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
-            )
+            if use_fused_residual:
+                assert (
+                    TEFusedResidualRMSNorm is not None
+                ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
+                norm_module = TEFusedResidualRMSNorm
+            else:
+                norm_module = te.pytorch.RMSNorm
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception("Only LayerNorm and RMSNorm are currently supported")
+
+        instance = norm_module(
+            normalized_shape=hidden_size,
+            eps=eps,
+            sequence_parallel=config.sequence_parallel,
+            zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            **_get_extra_te_kwargs(config),
+        )
 
         return cast(LayerNormInterface, instance)
 
@@ -1324,6 +1510,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        self.kept_packed_seq_params.discard("total_tokens")
+        self.kept_packed_seq_params.discard("seq_idx")
+
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
             assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
@@ -1538,6 +1728,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
+            # Save original parallel_mode before clearing it for explicit_expert_comm.
+            # When explicit_expert_comm is True, Megatron handles TP communication externally
+            # and passes parallel_mode=None to TE. This causes TE to set partition_dim=0 on
+            # all weights (its default for non-parallel mode). We need to fix this after init
+            # so that refit/resharding can correctly identify which dimension is TP-partitioned.
+            original_parallel_mode = parallel_mode
+
             if self.explicit_expert_comm:
                 if parallel_mode == "column":
                     output_size = divide(output_size, tp_size)
@@ -1611,6 +1808,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._register_load_state_dict_pre_hook(
                 normalize_grouped_parameter_keys, with_module=True
             )
+
+            # Explicitly stamp partition_dim and partition_stride on expert weight
+            # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12
+            # set these internally; TE ≥2.13 no longer does (parallel_mode=None
+            # is passed due to explicit_expert_comm).  The resharding/refit planner
+            # relies on partition_dim to correctly plan TP gather/scatter operations.
+            # NOTE: we intentionally do NOT stamp tensor_model_parallel here —
+            # doing so would change num-zeros gradient counting.
+            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+                part_dim = 0 if original_parallel_mode == "column" else 1
+                for i in range(num_gemms):
+                    weight = getattr(self, f"weight{i}", None)
+                    if weight is not None:
+                        setattr(weight, "partition_dim", part_dim)
+                        setattr(weight, "partition_stride", 1)
 
             def merge_extra_states(
                 self,
@@ -2409,6 +2621,7 @@ try:
         activation_offloading,
         weight_offloading,
         double_buffering,
+        retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
@@ -2420,6 +2633,7 @@ try:
                 activation_offloading,
                 weight_offloading,
                 double_buffering,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
@@ -2569,7 +2783,13 @@ except ImportError:
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
-    from transformer_engine.pytorch.module.base import get_workspace
+
+    try:
+        from transformer_engine.pytorch.module.base import get_workspace
+
+        _get_workspace = get_workspace
+    except ImportError:
+        _get_workspace = None
 
     def te_general_gemm(
         A: torch.Tensor,
@@ -2587,10 +2807,7 @@ try:
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
         """
-        return general_gemm(
-            A,
-            B,
-            workspace=get_workspace(),
+        kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
@@ -2606,6 +2823,9 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
+        if _get_workspace is not None:
+            kwargs["workspace"] = _get_workspace()
+        return general_gemm(A, B, **kwargs)
 
 except ImportError:
     te_general_gemm = None  # type: ignore[assignment, misc]

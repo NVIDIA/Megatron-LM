@@ -3,11 +3,19 @@
 import asyncio
 import logging
 
+import httpx
 import torch.distributed as dist
+from openai import AsyncOpenAI, DefaultAioHttpClient
 from pydantic import PrivateAttr
 
+try:
+    import h2  # noqa: F401
+    use_http2 = True
+except ImportError:
+    use_http2 = False
+
 from megatron.core.inference.config import KVCacheManagementMode
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
@@ -23,7 +31,7 @@ from ..inference.inference_interface import (
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
-
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -31,21 +39,19 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     host: str
     port: int
 
-    _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
+    _openai_client: AsyncOpenAI = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-
-        assert self._server_task is not None, "Inference server is not initialized"
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
+        # Use the shared, optimized client instead of spinning up a new one
+        client = self._openai_client
 
-        # Things that may be problematic when doign this switch
+        # Things that may be problematic when doing this switch
         # - Add BOS token
         # - Skip prompt logprobs
         response = await client.chat.completions.create(
@@ -70,6 +76,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
             prompt_length=len(choice.prompt_token_ids),
+            policy_epoch=choice.policy_epoch,
+            kv_cache_epoch=choice.kv_cache_epoch,
+            num_evictions=getattr(choice, 'num_evictions', 0),
         )
 
     @classmethod
@@ -93,44 +102,90 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
-            loop = asyncio.get_event_loop()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+
             client = InferenceClient(inference_coordinator_address=dp_addr)
-            await client.start()
-            server_task = loop.create_task(run_flask_server_on_client(
-                client=client,
+            client.start()
+
+            start_text_gen_server(
+                coordinator_addr=dp_addr,
                 tokenizer=inference_engine.controller.tokenizer,
-                flask_port=kwargs.get('port', 8294),
+                rank=dist.get_rank(),
+                server_port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
-            ))
+            )
         else:
             client = None
-            server_task = None
-            
+
         launched_server = cls(**kwargs)
         launched_server._client = client
-        launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
         )
 
+        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        custom_limits = httpx.Limits(
+            max_connections=concurrency_limit,
+            max_keepalive_connections=concurrency_limit,
+        )
+        http_client = DefaultAioHttpClient(
+            timeout=None,
+            limits=custom_limits,
+            http2=use_http2
+        )
+
+        launched_server._openai_client = AsyncOpenAI(
+            base_url=f"http://{launched_server.host}:{launched_server.port}",
+            api_key="NONE",
+            http_client=http_client
+        )
+
         return launched_server
 
     async def kill(self):
+        # Gracefully close the shared OpenAI client connections
+        if self._openai_client is not None:
+            await self._openai_client.close()
+
         if dist.get_rank() == 0:
-            await self._client.stop_engines()
-        await self._inference_engine.stopped.wait()
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
+            self._client.stop_engines()
+        await self._inference_engine.wait_until(EngineState.STOPPED)
+
+        if dist.get_rank() == 0:
+            self._client.shutdown_coordinator()
+            self._client.stop()
+
+        if dist.get_rank() == 0:
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            stop_text_gen_server()
+
+    def set_generation_epoch(self, generation_epoch: int):
+        if dist.get_rank() == 0:
+            self._client.set_generation_epoch(generation_epoch)
 
     async def suspend(self):
         if dist.get_rank() == 0:
+            self._client.pause_engines()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        if dist.get_rank() == 0:
             self._client.suspend_engines()
-        await self._inference_engine.paused.wait()
-        self._inference_engine.suspend()
+        await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
     async def resume(self):
+        if self._inference_engine._state_events[EngineState.RUNNING].is_set():
+            return
+
         if dist.get_rank() == 0:
             self._client.resume_engines()
-        await self._inference_engine.running.wait()
-        self._inference_engine.resume()
+        await self._inference_engine.wait_until(EngineState.RESUMED)
+
+        if dist.get_rank() == 0:
+            self._client.unpause_engines()
+        await self._inference_engine.wait_until(EngineState.RUNNING)

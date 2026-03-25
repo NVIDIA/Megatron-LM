@@ -12,6 +12,8 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -67,8 +69,17 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        quantize_model_to_mxfp8(unwrap_model(model))
-
+        backend = args.inference_grouped_gemm_backend
+        if backend == "auto":
+            quant_backend = "flashinfer"
+        elif backend == "torch":
+            quant_backend = "triton"
+        elif backend == "te":
+            raise ValueError(
+                "MXFP8 quantization is not supported with "
+                "inference_grouped_gemm_backend='te'."
+            )
+        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
 
@@ -174,6 +185,13 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "results of every `n` requests.",
     )
     group.add_argument(
+        "--output-request-events",
+        action='store_true',
+        default=False,
+        help="Include request events (lifecycle + per-token block allocator metrics) "
+        "in the JSON output.",
+    )
+    group.add_argument(
         "--prompt-file",
         help='Jsonl file containing input prompts, where each item (i.e., line) '
         'contains the field \'text\' where the value is the prompt. All other '
@@ -215,8 +233,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Suspend and resume the dynamic engine every "
-        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "`suspend_resume_interval` requests. This is used to test the suspend/resume "
         "system.",
+    )
+    group.add_argument(
+        "--suspend-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep while the engine is suspended (simulates a training step).",
     )
     group.add_argument(
         "--inference-repeat-n",
@@ -230,7 +254,25 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=False,
         help="If true, only run throughput check without verifying outputs.",
     )
-
+    group.add_argument(
+        "--drain-between-batches",
+        action='store_true',
+        default=False,
+        help="Process requests in batches, draining all active requests between batches.",
+    )
+    group.add_argument(
+        "--batch-boundaries",
+        type=str,
+        default=None,
+        help="Comma-separated list of request indices where each batch starts. "
+        "Used with --drain-between-batches.",
+    )
+    group.add_argument(
+        "--coordinator-schedule-output-path",
+        type=str,
+        default=None,
+        help="Path to write coordinator request scheduling decisions as JSON",
+    )
     return parser
 
 
@@ -259,7 +301,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     if args.inference_dynamic_batching_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
-    mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+    mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+        model,
+        conv_states_dtype=args.mamba_inference_conv_states_dtype,
+        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
+    )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get inference logging configuration from args
@@ -304,11 +350,19 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-        materialize_only_last_token_logits=not args.return_log_probs,
+        materialize_only_last_token_logits=(not args.return_log_probs and args.num_speculative_tokens == 0),
+        track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
+        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        use_triton_conv1d=getattr(args, 'inference_dynamic_batching_mamba_triton_conv1d', False),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
+        num_speculative_tokens=args.num_speculative_tokens,
+        use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
     )
 
 

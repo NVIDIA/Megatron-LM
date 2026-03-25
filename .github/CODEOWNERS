@@ -1,5 +1,8 @@
 * @NVIDIA/core-nemo @NVIDIA/core-devtech
 
+megatron/training/ @NVIDIA/training-adlr @NVIDIA/training-nemo
+megatron/training/arguments.py
+
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
 .gitlab-ci.yml @NVIDIA/ci

@@ -236,7 +236,7 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is None:
         packed_seq_params = None
     else:
-        # TODO(duncan): This class seems overly complex for what needs to be conveyed
+        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
@@ -245,6 +245,7 @@ def forward_step(data_iterator, model: MambaModel):
             cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            total_tokens=total_tokens,
         )
 
     timers('batch-generator').stop()

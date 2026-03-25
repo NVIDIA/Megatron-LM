@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
-from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import pytest
@@ -22,6 +21,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
@@ -123,11 +123,11 @@ class MockCoreAttention(torch.nn.Module):
 def get_mock_mla_config(
     tensor_model_parallel_size: int,
     context_parallel_size: int,
-    sequence_parallel: bool,
-    recompute_mla_up_proj: bool,
-) -> SimpleNamespace:
+    sequence_parallel: bool = True,
+    recompute_mla_up_proj: bool = False,
+) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
-    return SimpleNamespace(
+    return MLATransformerConfig(
         multi_latent_attention=True,
         hidden_size=7168,
         num_attention_heads=128,

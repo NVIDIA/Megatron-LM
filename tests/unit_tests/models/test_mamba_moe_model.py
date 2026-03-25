@@ -63,6 +63,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading": False,
     "cpu_offloading_activations": True,
     "cpu_offloading_double_buffering": False,
+    "cpu_offloading_retain_pinned_cpu_buffers": False,
     "cpu_offloading_num_layers": 0,
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
@@ -115,6 +116,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
     "fp8_wgrad": True,
+    "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
@@ -193,10 +195,15 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
     "moe_token_dropping": False,
-    "moe_use_legacy_grouped_gemm": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
     "mrope_section": None,
+    "mup_attn_scale_power": 1.0,
+    "mup_base_head_dim": None,
+    "mup_base_hidden_size": None,
+    "mup_embedding_mult": 1.0,
+    "mup_output_mult": 1.0,
+    "mup_width_mult": 1.0,
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
@@ -268,6 +275,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_kitchen": False,
     "use_kitchen_attention": False,
     "use_mamba_mem_eff_path": True,
+    "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
     "use_te_rng_tracker": False,
@@ -288,6 +296,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
+    "inference_disable_triton_nvls_kernels": False,
+    "inference_grouped_gemm_backend": "auto",
+    "inference_moe_disable_fused_quant_kernels": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -401,7 +412,6 @@ class TestMambaMoEModel:
         args = parse_args()
 
         # The following args would be set from the nano v3 checkpoint.
-        args.num_layers = 52
         args.hidden_size = 2688
         args.ffn_hidden_size = 1856
         args.num_attention_heads = 32
@@ -424,10 +434,9 @@ class TestMambaMoEModel:
         args.apply_query_key_layer_scaling = False
         args.attention_dropout = 0.0
         args.hidden_dropout = 0.0
-        args.hybrid_override_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+        args.hybrid_layer_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+        args.hybrid_override_pattern = None
         args.spec = ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
-        args.hybrid_attention_ratio = 0.0
-        args.hybrid_mlp_ratio = 0.0
         args.num_experts = 128
         args.moe_layer_freq = 1
         args.moe_ffn_hidden_size = 1856
@@ -442,7 +451,6 @@ class TestMambaMoEModel:
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
         args.mamba_num_heads = 64
-        args.is_hybrid_model = True
         args.tokenizer_type = "TikTokenizer"
         args.tiktoken_pattern = "v2"
         args.tokenizer_model = "/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
@@ -506,9 +514,7 @@ class TestMambaMoEModel:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=args.vocab_size,
             max_sequence_length=args.seq_length,
-            hybrid_attention_ratio=args.hybrid_attention_ratio,
-            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-            hybrid_override_pattern=args.hybrid_override_pattern,
+            hybrid_layer_pattern=args.hybrid_layer_pattern,
             position_embedding_type=args.position_embedding_type,
             rotary_base=args.rotary_base,
             rotary_percent=args.rotary_percent,
@@ -526,11 +532,9 @@ class TestMambaMoEModel:
 
         assert self.model.pre_process is True, "pre_process should be True"
         assert self.model.post_process is True, "post_process should be True"
-        assert self.model.hybrid_attention_ratio == 0.0, "hybrid_attention_ratio should be 0.0"
-        assert self.model.hybrid_mlp_ratio == 0.0, "hybrid_mlp_ratio should be 0.0"
         assert (
-            self.model.hybrid_override_pattern == args.hybrid_override_pattern
-        ), f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
+            self.model.hybrid_layer_pattern == args.hybrid_layer_pattern
+        ), f"hybrid_layer_pattern should be {args.hybrid_layer_pattern}"
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 8449294624, f"Expected 8449294624 parameters, got {num_weights}"
 
