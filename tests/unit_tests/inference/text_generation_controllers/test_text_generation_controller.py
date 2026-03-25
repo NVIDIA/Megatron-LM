@@ -1575,10 +1575,7 @@ class TestTextGenerationController:
         tp_size = 4
         num_spec = 2
         self.setup_model(
-            torch.float32,
-            static=False,
-            num_speculative_tokens=num_spec,
-            max_requests=4,
+            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=4
         )
 
         ctrl = self.text_generation_controller

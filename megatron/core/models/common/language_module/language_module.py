@@ -7,9 +7,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy

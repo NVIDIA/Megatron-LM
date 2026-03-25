@@ -3,7 +3,6 @@
 import logging
 from typing import Literal, Optional
 
-import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -474,5 +473,3 @@ class MambaModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-
