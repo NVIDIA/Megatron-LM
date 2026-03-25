@@ -1148,7 +1148,7 @@ class PagedStashRunner:
             if iterator0 is not None:
                 for b in range(num_microbatches):
                     data_list.append(next(iterator0))
-                data_iterator_saved.append(data_list)
+                data_iterator_saved.append(iter(data_list))
                 data_list = [iter(data_list)]
             else:
                 data_list.append(None)
