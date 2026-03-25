@@ -2252,7 +2252,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             logits = torch.zeros(
@@ -2377,7 +2383,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2463,7 +2475,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2550,7 +2568,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2668,7 +2692,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict wildly wrong tokens (+ 5) to guarantee rejection
@@ -2751,7 +2781,13 @@ class TestDynamicInferenceEngine:
             return base_logits
 
         def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            runtime_gather_output=True,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             logits = torch.zeros(

@@ -822,6 +822,10 @@ class TextGenerationController:
         Each MTP depth receives the correctly sampled token from the previous depth
         (or the base token for depth 0) rather than stale speculative tokens from
         the previous step.
+
+        When sequence parallelism is active, hidden states are kept in SP format
+        (scattered along the first dimension) between MTP depths to avoid a
+        redundant gather + scatter round-trip per depth.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -865,6 +869,13 @@ class TextGenerationController:
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         pad_count = (tp_size - active_request_count % tp_size) % tp_size
         padded_count = active_request_count + pad_count
+        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+
+        # Pad hidden states once before the loop.  When SP is enabled, the
+        # hidden states stay in SP format (and padded) across depths — only
+        # logits are stripped per iteration.
+        if has_mtp and pad_count > 0:
+            current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
 
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
@@ -873,22 +884,26 @@ class TextGenerationController:
 
             mtp_logits_2d = None
             if has_mtp:
-                # Pad inputs to nearest multiple of tp_size.
+                # Pad token_ids and position_ids each iteration (they change per depth).
                 if pad_count > 0:
-                    current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
                     token_ids = F.pad(token_ids, (0, pad_count))
                     position_ids = F.pad(position_ids, (0, pad_count))
 
+                # Depth 0: hidden is full-format [padded_N, 1, H] → scatter inside.
+                # Depth 1+: hidden is already SP-format [padded_N/TP, 1, H] → skip scatter.
+                # All depths: keep hidden in SP format on output → skip gather.
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,
                     position_ids=position_ids,
                     depth=depth,
+                    scatter_hidden_input=(depth == 0) if sp_enabled else True,
+                    gather_hidden_output=not sp_enabled,
                 )
 
-                # Remove padding from outputs.
+                # Strip padding from logits only.  Hidden states stay padded+SP
+                # between depths to avoid redundant gather/scatter round-trips.
                 if pad_count > 0:
-                    current_hidden = current_hidden[:active_request_count]
                     mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
@@ -1666,13 +1681,13 @@ class TextGenerationController:
         # embedding can reduce-scatter evenly across TP ranks.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         padded_count = tp_size  # 1 padded up to tp_size
+        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
 
-        # compute_mtp_single_step handles SP scatter/gather internally, so all
-        # tensors use the full padded_count (not the local post-scatter length).
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
+            # Depth 0 uses full-format hidden; subsequent depths use SP format.
             dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
@@ -1680,11 +1695,16 @@ class TextGenerationController:
         for depth in range(num_depths):
             mtp_logits_2d = None
             if has_mtp:
+                # Mirror the scatter/gather pattern of _compute_serial_mtp_and_sample:
+                # depth 0 scatters full-format input; subsequent depths receive SP format.
+                # Hidden output stays in SP format between depths.
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
                     position_ids=dummy_position_ids,
                     depth=depth,
+                    scatter_hidden_input=(depth == 0) if sp_enabled else True,
+                    gather_hidden_output=not sp_enabled,
                 )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 

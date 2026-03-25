@@ -1382,7 +1382,14 @@ class TestTextGenerationController:
 
         captured_position_ids = []
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
+        ):
             captured_position_ids.append(position_ids.clone())
             return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
 
@@ -1451,7 +1458,14 @@ class TestTextGenerationController:
         expected_padded = active_request_count + expected_pad
         captured_shapes = []
 
-        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+        def mock_mtp(
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
+        ):
             captured_shapes.append(
                 {
                     'hidden': hidden_states.shape,
@@ -1516,7 +1530,14 @@ class TestTextGenerationController:
 
         captured_shapes = []
 
-        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+        def mock_mtp(
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
+        ):
             captured_shapes.append(
                 {
                     'hidden': hidden_states.shape,
@@ -1544,11 +1565,12 @@ class TestTextGenerationController:
             assert shapes['positions'] == (1, tp_size)
 
     def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
-        """Test that _dummy_serial_mtp_forward passes full-length hidden states.
+        """Test that _dummy_serial_mtp_forward passes correctly-sized hidden states.
 
-        compute_mtp_single_step handles SP scatter/gather internally, so the
-        controller always passes full-length (padded_count) tensors for all
-        inputs including hidden states.
+        Depth 0 receives full-format hidden [padded_count, 1, H] and scatters
+        internally.  Subsequent depths receive SP-format hidden from the previous
+        depth's output.  Since the mock returns hidden_states unchanged, all
+        depths see the same shape in this test.
         """
         tp_size = 4
         num_spec = 2
@@ -1571,7 +1593,14 @@ class TestTextGenerationController:
 
         captured_shapes = []
 
-        def mock_mtp(hidden_states, next_token_ids, position_ids, depth):
+        def mock_mtp(
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            scatter_hidden_input=True,
+            gather_hidden_output=True,
+        ):
             captured_shapes.append(
                 {
                     'hidden': hidden_states.shape,
@@ -1593,8 +1622,9 @@ class TestTextGenerationController:
 
         assert len(captured_shapes) == num_spec
         for shapes in captured_shapes:
-            # All inputs use full padded_count; compute_mtp_single_step
-            # handles SP scatter/gather internally.
+            # The mock returns hidden_states unchanged, so all depths see
+            # the initial full padded_count.  In real code, depth 1+ would
+            # receive SP-format [padded_count/tp_size, 1, H].
             assert shapes['hidden'][0] == tp_size
             assert shapes['tokens'] == (1, tp_size)
             assert shapes['positions'] == (1, tp_size)
