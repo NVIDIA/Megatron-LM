@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.utils import sharded_state_dict_default
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class ModalitySubmodules(ABC, nn.Module):
         output_projections: Optional[List[nn.Module]] = None,
         is_first_stage: bool = True,
         is_last_stage: bool = True,
+        pg_collection=None,
         **kwargs,
     ) -> None:
         """Initialize the modality submodules.
@@ -55,14 +57,14 @@ class ModalitySubmodules(ABC, nn.Module):
             output_projections: List of output projection modules
             is_first_stage: Whether this is the first PP stage for this module
             is_last_stage: Whether this is the last PP stage for this module
+            pg_collection: Process group collection for this module
         """
         super().__init__()
         self.encoders = nn.ModuleDict(encoders or {})
         self.decoders = nn.ModuleDict(decoders or {})
         self.input_projections = nn.ModuleList(input_projections or [])
         self.output_projections = nn.ModuleList(output_projections or [])
-
-        # Stage info for multi-module pipeline parallelism (immutable after init)
+        self.pg_collection = pg_collection
         self._is_first_stage: bool = is_first_stage
         self._is_last_stage: bool = is_last_stage
 
@@ -72,6 +74,29 @@ class ModalitySubmodules(ABC, nn.Module):
             category=UserWarning,
             stacklevel=2,
         )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Iterate into ModuleDict/ModuleList children for TP-aware checkpointing.
+
+        Injects dp_cp_group from pg_collection into metadata to avoid
+        parallel_state global fallback in ensure_metadata_has_dp_cp_group.
+        """
+        if self.pg_collection is not None:
+            assert (
+                hasattr(self.pg_collection, 'dp_cp') and self.pg_collection.dp_cp is not None
+            ), "pg_collection is missing dp_cp group"
+            metadata = dict(metadata) if metadata else {}
+            metadata['dp_cp_group'] = self.pg_collection.dp_cp
+
+        sharded_sd = {}
+        for name, container in self.named_children():
+            for sub_name, module in container.named_children():
+                sharded_sd.update(
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.{sub_name}.', sharded_offsets, metadata
+                    )
+                )
+        return sharded_sd
 
     @property
     def is_first_stage(self) -> bool:

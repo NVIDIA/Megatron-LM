@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -136,22 +138,146 @@ class MimoOptimizer(MegatronOptimizer):
         }
 
     def load_state_dict(self, state_dict: Dict):
+        """Load per-module optimizer state dicts.
+
+        Reassembles param_groups and grad_scaler that were extracted and saved
+        as ShardedObjects by sharded_state_dict(), then delegates to each
+        per-module optimizer's load_state_dict.
+        """
         for name, info in self.module_infos.items():
-            if info.is_active and info.optimizer and state_dict.get(name):
-                info.optimizer.load_state_dict(state_dict[name])
+            if not (info.is_active and info.optimizer):
+                continue
+            module_sd = state_dict.get(name)
+            if module_sd is None:
+                continue
+
+            for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
+                _restore_param_groups(sub_sd, inner_opt, name)
+                _restore_grad_scaler(sub_sd)
+
+            info.optimizer.load_state_dict(module_sd)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
+        """Build sharded state dict, routing param_groups and grad_scaler
+        through distributed save as ShardedObjects (common.pt is rank-0 only,
+        which misses LLM optimizer state in non-colocated mode).
+        """
         sharded_state = {}
         for name, info in self.module_infos.items():
             if info.is_active and info.optimizer:
-                sharded_state[name] = info.optimizer.sharded_state_dict(
+                module_sd = info.optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
+                replica_id = _get_replica_id(info.pg_collection)
+
+                for idx, (sub_sd, _) in enumerate(
+                    _iter_optimizer_sub_dicts(module_sd, info.optimizer)
+                ):
+                    suffix = f'.{idx}' if idx > 0 else ''
+                    _extract_param_groups(sub_sd, name, suffix, replica_id)
+                    _extract_grad_scaler(sub_sd, name, suffix, replica_id)
+
+                sharded_state[name] = module_sd
+            else:
+                sharded_state[name] = {}
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
+
+
+def _iter_optimizer_sub_dicts(module_sd, optimizer):
+    """Yield (sub_state_dict, inner_optimizer) pairs.
+
+    For a single optimizer, yields (module_sd, optimizer) once.
+    For ChainedOptimizer with N>1 inner optimizers, yields
+    (module_sd[i], chained_optimizers[i]) for each.
+    """
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    if isinstance(optimizer, ChainedOptimizer) and len(optimizer.chained_optimizers) > 1:
+        for idx, inner_opt in enumerate(optimizer.chained_optimizers):
+            yield module_sd[idx], inner_opt
+    else:
+        yield module_sd, optimizer
+
+
+def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
+    """Save: extract param_groups from optimizer sub-dict into a ShardedObject."""
+    opt_sub = sub_sd.get('optimizer')
+    if isinstance(opt_sub, dict) and 'param_groups' in opt_sub:
+        pg = deepcopy(opt_sub['param_groups'])
+        for group in pg:
+            group['params'] = []
+        sub_sd[f'_mimo_param_groups{suffix}'] = ShardedObject(
+            f'optimizer.mimo.{module_name}{suffix}.param_groups',
+            pg,
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+        del opt_sub['param_groups']
+
+
+def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
+    """Save: extract grad_scaler into a ShardedObject."""
+    if 'grad_scaler' in sub_sd and sub_sd['grad_scaler'] is not None:
+        sub_sd[f'_mimo_grad_scaler{suffix}'] = ShardedObject(
+            f'optimizer.mimo.{module_name}{suffix}.grad_scaler',
+            sub_sd.pop('grad_scaler'),
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+
+
+def _restore_param_groups(sub_sd, inner_optimizer, module_name):
+    """Load: restore param_groups with current param IDs from the inner optimizer."""
+    # Find the _mimo_param_groups key (may have a suffix for chained optimizers)
+    pg_key = None
+    for k in list(sub_sd.keys()):
+        if k.startswith('_mimo_param_groups'):
+            pg_key = k
+            break
+    if pg_key is None:
+        return
+
+    loaded_pg = sub_sd.pop(pg_key)
+    # Get current param IDs from the inner torch optimizer's state_dict
+    current_pg = inner_optimizer.optimizer.state_dict()['param_groups']
+    if len(loaded_pg) != len(current_pg):
+        raise ValueError(
+            f"Optimizer '{module_name}': checkpoint has {len(loaded_pg)} param_groups "
+            f"but current optimizer has {len(current_pg)}"
+        )
+    for loaded_g, current_g in zip(loaded_pg, current_pg):
+        loaded_g['params'] = current_g['params']
+    sub_sd['optimizer']['param_groups'] = loaded_pg
+
+
+def _restore_grad_scaler(sub_sd):
+    """Load: restore grad_scaler from ShardedObject key."""
+    for k in list(sub_sd.keys()):
+        if k.startswith('_mimo_grad_scaler'):
+            sub_sd['grad_scaler'] = sub_sd.pop(k)
+            break
+
+
+def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
+    """Build replica_id tuple for ShardedObject deduplication.
+
+    Includes pp_rank so only one PP stage writes the metadata,
+    and dp_rank so only dp_rank=0 writes (others are replicas).
+    """
+    assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'pp') and pg_collection.pp is not None
+    ), "pg_collection.pp must be set for checkpoint deduplication"
+    assert (
+        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
+    ), "pg_collection.dp must be set for checkpoint deduplication"
+    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
@@ -164,6 +290,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["tp"])
+        grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
         grid.create_pg(["tp", "ep", "pp"])
         grid.create_pg(["dp", "ep"])
@@ -183,10 +310,11 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     """
     pg = ProcessGroupCollection()
 
-    # Core groups needed by optimizer
+    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
+    pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
     # Expert groups
