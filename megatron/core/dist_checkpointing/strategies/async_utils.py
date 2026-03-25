@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.utils import log_single_rank
 
 from ..utils import debug_time
@@ -227,7 +228,7 @@ class AsyncCaller(ABC):
     @abstractmethod
     def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.debug(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
+        raise NotImplementedError
 
     def __del__(self):
         raise NotImplementedError("This should be implemented")
@@ -323,12 +324,10 @@ class TemporalAsyncCaller(AsyncCaller):
                 the checkpoint async process needs to be aborted.
         """
         if self.process:
-            logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
+            logger.debug(f"rank: {safe_get_rank()}, joining self.process")
             if abort:
                 log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Temporal worker aborted in rank {torch.distributed.get_rank()}",
+                    logger, logging.WARNING, f"Temporal worker aborted in rank {safe_get_rank()}"
                 )
                 self.process.kill()
             else:
@@ -493,15 +492,11 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.debug(
-            f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
-        )
+        logger.debug(f"PersistentAsyncCaller: {safe_get_rank()}, Destroying Async Caller")
         if self.process:
             if abort:
                 log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
+                    logger, logging.WARNING, f"Persistent worker aborted in rank {safe_get_rank()}"
                 )
                 self.process.kill()
             else:
