@@ -1797,7 +1797,7 @@ class TextGenerationController:
         input_ids, position_ids = self._dynamic_step_context_init()
 
         cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
 
         # Enable routing recording before forward pass if routing replay is enabled
