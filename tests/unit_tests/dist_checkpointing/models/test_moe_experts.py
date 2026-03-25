@@ -20,11 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import (
-    SequentialMLP,
-    TEGroupedMLP,
-    TEGroupedMLPSubmodules,
-)
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.spec_utils import get_submodules
@@ -63,7 +59,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         mlp_submodules = get_submodules(layer_submodules.mlp)
         assert isinstance(mlp_submodules, MoESubmodules)
         experts_submodules = get_submodules(mlp_submodules.experts)
-        assert isinstance(experts_submodules, TEGroupedMLPSubmodules)
+        assert isinstance(experts_submodules, GroupedMLPSubmodules)
         model = TEGroupedMLP(
             num_local_experts, transformer_config, experts_submodules, pg_collection
         )
