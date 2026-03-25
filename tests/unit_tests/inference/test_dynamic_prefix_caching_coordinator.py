@@ -380,10 +380,7 @@ class TestCoordinatorShadowState:
         idx_0 = coordinator.identity_to_rank_index[rank_0]
 
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
-        assert all(
-            coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0
-            for h in [100, 200, 300]
-        )
+        assert all(coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0 for h in [100, 200, 300])
 
     def test_update_rank_hashes_increments_counter(self):
         """Each call to _update_rank_hashes increments the assignment counter."""
@@ -418,10 +415,7 @@ class TestCoordinatorShadowState:
 
         coordinator._update_rank_hashes(rank_0, [10, 20])
         coordinator._update_rank_hashes(rank_0, [30, 40])
-        assert all(
-            coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0
-            for h in [10, 20, 30, 40]
-        )
+        assert all(coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0 for h in [10, 20, 30, 40])
 
     def test_hash_can_appear_in_multiple_ranks(self):
         """The same hash can be owned by multiple ranks."""
@@ -897,5 +891,3 @@ class TestScoringFunctionRouting:
         #            score(rank_1) = 0 + 0.5*(8/10) = 0.4
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_1
-
-

@@ -1894,11 +1894,6 @@ def _add_inference_args(parser):
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
                        'states at block boundaries are cached for reuse.')
-    group.add_argument('--inference-dynamic-batching-mamba-triton-conv1d',
-                       action='store_true', default=False,
-                       dest='inference_dynamic_batching_mamba_triton_conv1d',
-                       help='Use Triton varlen conv1d kernel for Mamba prefill '
-                       'instead of per-request causal_conv1d_fn calls.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -2672,6 +2667,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
+                       help='List of param_name patterns (in Python\'s fnmatch format) to match against '
+                       'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
+                       'every parameter.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',

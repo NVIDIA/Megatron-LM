@@ -540,7 +540,6 @@ class DataParallelInferenceCoordinator:
                         ]
                     )
 
-
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
