@@ -374,7 +374,7 @@ class MoELayer(BaseMoELayer):
         """
         self._delayed_wgrad_event: Optional[torch.cuda.Event] = None
         self._delayed_wgrad_stream: Optional[torch.cuda.Stream] = None
-        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+        if self.config.overlap_dispatch_backward_with_experts_wgrad:
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
@@ -448,7 +448,7 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
-        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+        if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
@@ -488,7 +488,7 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        if self.config.delay_wgrad_compute_for_te_grouped_gemm:
+        if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )

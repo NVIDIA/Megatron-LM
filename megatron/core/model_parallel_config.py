@@ -261,7 +261,7 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
-    delay_wgrad_compute_for_te_grouped_gemm: bool = False
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
     """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
     When enabled with FSDP, the expert weight gradients are computed on a separate
     CUDA stream after the data gradients finish, allowing overlap of wgrad compute

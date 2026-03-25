@@ -72,7 +72,7 @@ def _assert_models_equal(ref_model, test_model):
 
 
 class TestDelayWgradCompute:
-    """Verify that delay_wgrad_compute_for_te_grouped_gemm produces identical
+    """Verify that overlap_dispatch_backward_with_experts_wgrad produces identical
     training behaviour (per-step loss and final weights) as the non-delayed baseline
     across multiple forward-backward-optimizer steps on the full GPTModel.
     """
@@ -91,10 +91,10 @@ class TestDelayWgradCompute:
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    def test_delay_wgrad_compute_for_te_grouped_gemm(
+    def test_overlap_dispatch_backward_with_experts_wgrad(
         self, shared_expert_intermediate_size, dispatcher_type, fp8_flag
     ):
-        """Verify that delay_wgrad_compute_for_te_grouped_gemm produces identical
+        """Verify that overlap_dispatch_backward_with_experts_wgrad produces identical
         per-step loss and final weights as the non-delayed baseline across multiple
         forward-backward-optimizer steps on the full GPTModel.
 
@@ -116,7 +116,7 @@ class TestDelayWgradCompute:
             ref_model = _build_gpt_model(ref_config)
             init_params = reset_model(ref_model)
 
-            delay_kwargs = {**extra_kwargs, "delay_wgrad_compute_for_te_grouped_gemm": True}
+            delay_kwargs = {**extra_kwargs, "overlap_dispatch_backward_with_experts_wgrad": True}
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=delay_kwargs)
             test_model = _build_gpt_model(test_config)
             reset_model(test_model, init_params)
@@ -143,7 +143,7 @@ class TestDelayWgradCompute:
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
-    def test_delay_wgrad_compute_for_te_grouped_gemm_with_fsdp(
+    def test_overlap_dispatch_backward_with_experts_wgrad_with_fsdp(
         self, shared_expert_intermediate_size, dispatcher_type
     ):
         """Verify delayed wgrad with MegatronFSDP wrapping.
@@ -176,7 +176,7 @@ class TestDelayWgradCompute:
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
             # Build test model (with delay) and wrap with FSDP
-            delay_kwargs = {**extra_kwargs, "delay_wgrad_compute_for_te_grouped_gemm": True}
+            delay_kwargs = {**extra_kwargs, "overlap_dispatch_backward_with_experts_wgrad": True}
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=delay_kwargs)
             test_model = _build_gpt_model(test_config)
             reset_model(test_model, init_params)

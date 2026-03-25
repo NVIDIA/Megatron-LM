@@ -76,7 +76,7 @@ class TrainingState(Enum):
 def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
     """Configure delayed wgrad gradient processing for MoE expert parameters.
 
-    When ``delay_wgrad_compute_for_te_grouped_gemm`` is enabled on a TransformerLayer,
+    When ``overlap_dispatch_backward_with_experts_wgrad`` is enabled on a TransformerLayer,
     this function:
       1. Marks expert parameters so the normal post-accumulate-grad hook is skipped.
       2. Registers a callback on the MoE layer that invokes FSDP's gradient
@@ -698,8 +698,10 @@ class MegatronFSDP(torch.nn.Module):
             param_list = [
                 p
                 for p in param_list
-                if not getattr(p, 'skip_backward_post_hook', False)
-                or not hasattr(p, 'post_wgrad_grad_acc_hook')
+                if not (
+                    getattr(p, 'skip_backward_post_hook', False)
+                    and hasattr(p, 'post_wgrad_grad_acc_hook')
+                )
             ]
 
             if not param_list:

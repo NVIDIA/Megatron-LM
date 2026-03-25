@@ -1709,7 +1709,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs = _get_extra_te_kwargs(config)
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
-                or self.config.delay_wgrad_compute_for_te_grouped_gemm
+                or self.config.overlap_dispatch_backward_with_experts_wgrad
             )
 
             if self.delay_wgrad_compute:
