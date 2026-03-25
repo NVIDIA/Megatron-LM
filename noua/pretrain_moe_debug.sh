@@ -8,7 +8,7 @@ export WANDB_API_KEY=wandb_v1_GsgjPi7p8CWJz2yquANlgJIyHfQ_P24pvfE24JuB6GBIitFE8F
 export DEBUG_PORT=5678
 
 # ── Profiling ─────────────────────────────────────────────────────────────────
-PROFILE=${PROFILE:-0}
+PROFILE=${PROFILE:-1}
 PROFILE_RANKS=${PROFILE_RANKS:-"0 1 2 3"}  # Global GPU ranks for profiling
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -23,8 +23,8 @@ CONTAINER_MOUNTS="/scratch:/scratch,/fsx:/fsx"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # ── Cluster ──────────────────────────────────────────────────────────────────
-NNODES=${NNODES:-1}
-GPUS_PER_NODE=4
+NNODES=${NNODES:-2}
+GPUS_PER_NODE=8
 TOTAL_GPUS=$((NNODES * GPUS_PER_NODE))
 
 # ── Training ─────────────────────────────────────────────────────────────────
@@ -152,8 +152,8 @@ OPTIMIZER_ARGS=(
 # Note: Muon/dist_muon does not support --use-distributed-optimizer
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
-    # --num-virtual-stages-per-pipeline-rank 2
+    --pipeline-model-parallel-size 2
+    --num-virtual-stages-per-pipeline-rank 2
     --expert-model-parallel-size 2
     --overlap-grad-reduce
     --overlap-param-gather
@@ -231,6 +231,7 @@ LOGGING_ARGS=(
     --log-memory-interval 100
     --log-device-memory-used
     --log-max-attention-logit
+    --log-pre-final-ln-norm
     --logging-level 10
 )
 

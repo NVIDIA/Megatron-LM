@@ -21,6 +21,25 @@ import megatron.legacy.model  # isort: skip
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
 
+def _register_pre_final_ln_norm_hook(model):
+    """Register a hook to capture the pre-final-layernorm activation norm."""
+    decoder = getattr(model, "decoder", None)
+    final_ln = getattr(decoder, "final_layernorm", None) if decoder is not None else None
+    if final_ln is None:
+        return None
+
+    def _capture_pre_ln_norm(module, inputs):
+        if not inputs:
+            return
+        with torch.no_grad():
+            activations = inputs[0]
+            module._last_pre_ln_norm = torch.linalg.vector_norm(
+                activations.float(), ord=2, dim=-1
+            ).mean()
+
+    return final_ln.register_forward_pre_hook(_capture_pre_ln_norm)
+
+
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
@@ -60,7 +79,13 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+    model = model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+
+    # Capture pre-final-layernorm activation norm for logging (only on stages with final LN).
+    if args.log_pre_final_ln_norm:
+        _register_pre_final_ln_norm_hook(model)
+
+    return model
 
 
 def count_parameters_in_layer(model, layer_name):

@@ -276,6 +276,9 @@ class LoggerConfig:
     log_max_attention_logit: bool = False
     """Enable max attention logit logging to tensorboard."""
 
+    log_pre_final_ln_norm: bool = False
+    """If set, log the pre-final-layernorm activation norm."""
+
     log_runtime_to_tensorboard: bool = False
     """Enable runtime metrics logging to tensorboard."""
 

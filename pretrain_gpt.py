@@ -30,7 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector, unwrap_model
 from megatron.training import (
     get_args,
     get_timers,
@@ -225,6 +225,18 @@ def loss_func(
             tolerance=0.0,  # forward pass calculations are determinisic
             fatal=False,
         )
+
+    # Pre-final-layernorm activation norm (if captured by hook).
+    if model is not None and args.log_pre_final_ln_norm:
+        unwrapped = unwrap_model(model)
+        decoder = getattr(unwrapped, "decoder", None)
+        final_ln = getattr(decoder, "final_layernorm", None) if decoder is not None else None
+        pre_ln_norm = getattr(final_ln, "_last_pre_ln_norm", None) if final_ln is not None else None
+        if pre_ln_norm is not None:
+            pre_ln_norm = pre_ln_norm.clone().detach()
+            report["pre_final_ln_norm"] = torch.stack(
+                (pre_ln_norm, torch.tensor(1.0, device=pre_ln_norm.device))
+            )
 
     return loss, num_tokens, report
 
