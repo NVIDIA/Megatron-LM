@@ -173,9 +173,8 @@ if HAVE_TE:
         if is_te_min_version("2.7.0.dev0"):
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
-                    # Enable SR after debugging, will remove after merging this PR
                     fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(
-                        fp8_dpa=config.fp8_dot_product_attention, disable_stochastic_rounding=True
+                        fp8_dpa=config.fp8_dot_product_attention
                     )
                 except AttributeError:
                     raise ValueError(
