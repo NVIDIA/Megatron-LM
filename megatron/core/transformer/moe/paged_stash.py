@@ -161,8 +161,12 @@ def _paged_stash_copy_kernel(
     cap = cap_cuda
     new_head_cuda = head_cuda + required_pages
     new_head_host = head_host
-    
+
     if overflow == 1:
+        # No stash; preserve heads so Python copy_ does not write garbage into the buffer.
+        if pid == 0:
+            tl.store(new_free_list_head_ptr, head_cuda)
+            tl.store(new_free_list_head_ptr + 1, head_host)
         return
 
     # Only when CUDA is full: load host state and maybe switch to host
@@ -262,6 +266,13 @@ def _paged_stash_pop_kernel(
     tail_host = tl.load(free_list_tail_ptr + 1)
     cap_cuda = tl.load(free_list_capacity_ptr)
 
+    if overflow == 1:
+        # No pop; preserve tails so Python copy_ does not write garbage into the buffer.
+        if pid == 0:
+            tl.store(new_free_list_tail_ptr, tail_cuda)
+            tl.store(new_free_list_tail_ptr + 1, tail_host)
+        return
+
     # Assume CUDA path
     src_ptr = cuda_src_ptr
     free_list_ptr = free_list_cuda_ptr
@@ -274,6 +285,10 @@ def _paged_stash_pop_kernel(
     if spill == 1:
         cap_host = tl.load(free_list_capacity_ptr + 1)
         if cap_host == 0:
+            # Cannot pop from host; preserve tails (no-op for free-list state).
+            if pid == 0:
+                tl.store(new_free_list_tail_ptr, tail_cuda)
+                tl.store(new_free_list_tail_ptr + 1, tail_host)
             return
         src_ptr = host_src_ptr
         free_list_ptr = free_list_host_ptr
@@ -281,9 +296,6 @@ def _paged_stash_pop_kernel(
         cap = cap_host
         new_tail_cuda = tail_cuda
         new_tail_host = tail_host + required_pages
-
-    if overflow == 1:
-        return
 
     token_idx = pid
     while token_idx < num_tokens:
@@ -801,7 +813,6 @@ class PagedStashManager:
 
         if self.status == 'capture':
             self._pp_schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
-            num_tokens = self.num_tokens_tensor.item()
 
         expected = self.get_schedule_layer(vp_stage, layer_no, microbatch_no)
         actual = self._pp_schedule[self.current_schedule_index]
@@ -986,7 +997,6 @@ class PagedStashContext:
 
 def paged_stash_group_start(tensor):
     """Mark the start of a layer group and prepare for stash/reload."""
-    rank = torch.distributed.get_rank()
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return tensor
