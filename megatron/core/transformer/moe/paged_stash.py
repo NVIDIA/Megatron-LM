@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from contextlib import nullcontext
 from typing import Any
 
@@ -7,9 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.utils import get_attr_wrapped_model
+
+logger = logging.getLogger(__name__)
 
 GLOBAL_BLOCK_SIZE = 1024
 SCALE_INV_BLOCK_SIZE = 32
@@ -24,7 +28,9 @@ class PagedStashBuffer:
     Uses per-buffer free lists (circular buffer) tracked as two-element state: [0]=CUDA, [1]=host.
     """
 
-    def __init__(self, num_tokens, hidden_size, page_size, device, overflow, dtype, num_tokens_host=0):
+    def __init__(
+        self, num_tokens, hidden_size, page_size, device, overflow, host_spill, dtype, num_tokens_host=0
+    ):
         """
         Args:
             num_tokens: Maximum number of tokens the CUDA buffer can hold
@@ -32,6 +38,7 @@ class PagedStashBuffer:
             page_size: Number of tokens per page
             device: Device for the buffer
             overflow: Overflow flag tensor (shared across all buffers)
+            host_spill: Global flag set to 1 if any stash used pinned host (shared)
             dtype: Data type
             num_tokens_host: If > 0, allocate pinned host buffer with this many tokens for spillover.
         """
@@ -40,6 +47,7 @@ class PagedStashBuffer:
         self.device = device
         self.dtype = dtype
         self.overflow = overflow  # GPU flag (shared)
+        self.host_spill = host_spill
 
         # CUDA buffer
         self.num_cuda_pages = (num_tokens + page_size - 1) // page_size
@@ -118,6 +126,7 @@ def _paged_stash_copy_kernel(
     free_list_capacity_ptr,
     page_record_ptr,
     overflow_ptr,
+    host_spill_global_ptr,  # 1 if any successful host spill (not set on overflow path)
     spilled_to_host_ptr,   # Output: 0 = stored in CUDA, 1 = stored in host or overflow
     new_free_list_head_ptr,  # Output: shape (2,) updated heads
     PAGE_SIZE: tl.constexpr,
@@ -179,6 +188,8 @@ def _paged_stash_copy_kernel(
 
     if pid == 0:
         tl.store(spilled_to_host_ptr, spill)
+        if spill == 1:
+            tl.store(host_spill_global_ptr, 1)
 
     # Copy loop: strided over tokens
     token_idx = pid
@@ -411,6 +422,7 @@ class PagedTensor:
             paged_stash_buffer.free_list_capacity,
             self.page_record,
             paged_stash_buffer.overflow,
+            paged_stash_buffer.host_spill,
             self.spilled_to_host,
             new_free_list_head,
             PAGE_SIZE=self.page_size,
@@ -418,10 +430,6 @@ class PagedTensor:
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_HOST_BUFFER=has_host,
         )
-        # if self.spilled_to_host.item() == 1:
-        #     print(f"PagedTensor {self.layer_name} spilled to host", flush=True)
-        # else:
-        #     print(f"PagedTensor {self.layer_name} stashed to cuda", flush=True)
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
         self._original_tensor = self._tensor
         self._tensor = None
@@ -606,6 +614,7 @@ class PagedStashManager:
         self.avg_num_tokens = None
         self.stash_buffers = None
         self.overflow = None
+        self.host_spill = None
         self.device = None
 
         # Page size for paged memory management (default; overwritten from config in paged_stash_reset)
@@ -719,6 +728,7 @@ class PagedStashManager:
         """Allocate stash buffers organized by [dtype][hidden_size]."""
         self.stash_buffers = {}
         self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self.host_spill = torch.zeros(1, dtype=torch.int64, device=self.device)
 
         cuda_factor = stash_buffer_size_factor_cuda
         cpu_factor = stash_buffer_size_factor_cpu
@@ -765,6 +775,7 @@ class PagedStashManager:
                 self.page_size,
                 self.device,
                 self.overflow,
+                self.host_spill,
                 buf_dtype,
                 num_tokens_host=num_tokens_host,
             )
@@ -772,7 +783,8 @@ class PagedStashManager:
             msg = f'allocate_stash_buffers cuda: {sb.cuda_buffer.shape}'
             if sb.host_buffer is not None:
                 msg += f' host: {sb.host_buffer.shape}'
-            print(f'{msg} dtype={sb.dtype} ({dtype})')
+            msg += f' dtype={sb.dtype} ({dtype})'
+            log_single_rank(logger, logging.INFO, msg)
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -822,10 +834,6 @@ class PagedStashManager:
             return tensor.detach()
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
-        #if hasattr(tensor, 'grouped_name'):
-        #    print (f'on_save_for_backward {self.status} tensor: num_tokens: {self.num_tokens_tensor.item()}-{type(tensor)}-{tensor.shape}-{tensor.dtype}-{hex(tensor.data_ptr())}-grouped: name: {tensor.grouped_name} element_size: {tensor.element_size()} logical_shape: {tensor.logical_shape if hasattr(tensor, 'logical_shape') else None}')
-        #else:
-        #    print (f'on_save_for_backward {self.status} tensor: num_tokens: {self.num_tokens_tensor.item()}-{type(tensor)}-{tensor.shape}-{tensor.dtype}-{hex(tensor.data_ptr())} element_size: {tensor.element_size()} logical_shape: {tensor.logical_shape if hasattr(tensor, 'logical_shape') else None}')
 
         original_shape = tensor.shape
         grouped_name = tensor.grouped_name
@@ -1049,7 +1057,6 @@ def paged_stash_reset(enabled=True, config=None):
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
-        print (f'schedule {stash_manager._pp_schedule}')
         cuda_factor = config.stash_buffer_size_factor_cuda if config is not None else 1.10
         cpu_factor = config.stash_buffer_size_factor_cpu if config is not None else 0.0
         stash_manager.allocate_stash_buffers(
@@ -1060,14 +1067,11 @@ def paged_stash_reset(enabled=True, config=None):
         pass
 
     if stash_manager.status == 'captured':
-        if not torch.cuda.is_current_stream_capturing():
-            overflow = stash_manager.overflow.item()
-            assert overflow == 0, f"PagedStashManager overflow!!!"
-
         for dtype in stash_manager.stash_buffers.keys():
             for hidden_size in stash_manager.stash_buffers[dtype].keys():
                 stash_manager.stash_buffers[dtype][hidden_size].reset()
         stash_manager.overflow.zero_()
+        stash_manager.host_spill.zero_()
         stash_manager.current_layer = [1 for _ in range(stash_manager.vp_size)]
         stash_manager.current_microbatch = [0 for _ in range(stash_manager.vp_size)]
         assert (
@@ -1085,6 +1089,15 @@ def check_paged_stash_overflow():
         return torch.zeros(1, dtype=torch.bool, device='cuda')
     overflow = stash_manager.overflow.ne(0)
     return overflow
+
+
+def check_paged_stash_host_spill():
+    """True if any activation was stashed to pinned host (successful spill, not overflow path)."""
+    stash_manager = PagedStashManager.get_instance()
+    if not stash_manager.enabled or stash_manager.host_spill is None:
+        return torch.zeros(1, dtype=torch.bool, device='cuda')
+    return stash_manager.host_spill.ne(0)
+
 
 class PagedStashRunner:
     """Runner for paged stash"""
@@ -1114,7 +1127,6 @@ class PagedStashRunner:
                         mlp.token_dispatcher, 'check_over_budget'
                     ):
                         self.moe_layers.append(mlp)
-        print (f"PagedStashRunner: Moe layers {len(self.moe_layers)}!!!")
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -1145,21 +1157,34 @@ class PagedStashRunner:
         return data_iterator_saved, data_list
 
     def check_moe_overflow(self):
-        # check for paged stash overflow
-        overflow = check_paged_stash_overflow()
-        # check for token dispatcher overflow
+        """(stash_overflow_rank_sum, overbudget_rank_sum, host_spill_rank_sum); one all_reduce."""
+        stash_overflow = check_paged_stash_overflow().view(-1)[0]
+        host_spill = check_paged_stash_host_spill().view(-1)[0]
+        overbudget = torch.zeros(1, dtype=torch.bool, device=stash_overflow.device).view(-1)[0]
         for mlp in self.moe_layers:
-            overbudget = mlp.token_dispatcher.check_over_budget()
-            overflow |= overbudget
+            ob = mlp.token_dispatcher.check_over_budget()
+            if ob is not None:
+                overbudget |= ob.view(-1)[0]
 
-        overflow_int = overflow.to(torch.int32)
-        torch.distributed.all_reduce(overflow_int, op=torch.distributed.ReduceOp.SUM)
-        overflow_int = overflow_int.item()
-        return overflow_int
+        flags = torch.stack(
+            [
+                stash_overflow.to(torch.int32),
+                overbudget.to(torch.int32),
+                host_spill.to(torch.int32),
+            ],
+            dim=0,
+        )
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
+        return flags[0].item(), flags[1].item(), flags[2].item()
 
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
-        print (f"!!!!!!!! Attempting to run without expert_rank_capacity_factor padding")
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Paged stash: rerunning forward-backward without moe_expert_rank_capacity_factor padding "
+            "and with moe_paged_stash disabled.",
+        )
         # check for token dispatcher overflow
         for mlp in self.moe_layers:
             if hasattr(mlp, 'token_dispatcher') and hasattr(
@@ -1168,6 +1193,8 @@ class PagedStashRunner:
                 mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
                 mlp.token_dispatcher._comm_manager.over_budget.fill_(0)
         self.stash_manager.overflow.zero_()
+        if self.stash_manager.host_spill is not None:
+            self.stash_manager.host_spill.zero_()
         self.config.moe_paged_stash = False
 
         # Set grad to zero.
@@ -1224,9 +1251,17 @@ class PagedStashRunner:
             kwargs['data_iterator'] = data_list
             result = self.forward_backward_func(*args, **kwargs)
 
-            overflow_int = self.check_moe_overflow()
+            stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
             # if no overflow, set the expert_rank_capacity_factor to the original value
-            if overflow_int == 0:
+            if stash_overflow_ranks == 0 and overbudget_ranks == 0:
+                if host_spill_ranks > 0:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "Paged stash: spilled activations to pinned host "
+                        f"on {host_spill_ranks} rank(s) (CUDA stash full). "
+                        "Consider increasing stash_buffer_size_factor_cuda for potentially better performance.",
+                    )
                 for mlp in self.moe_layers:
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
                         mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
@@ -1235,7 +1270,22 @@ class PagedStashRunner:
                 self.config.moe_paged_stash = saved_moe_paged_stash
                 break
 
-            # if overflow, set the expert_rank_capacity_factor to None
-            print(f"MBridge train(): PagedStashManager or Token Dispatcher overflow detected across ranks {overflow_int} config.moe_paged_stash: {self.config.moe_paged_stash}!!!")
+            # if overflow or overbudget, set the expert_rank_capacity_factor to None
+            if overbudget_ranks > 0:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "Paged stash: token drop during MoE token dispatch (over budget) "
+                    f"on {overbudget_ranks} rank(s). "
+                    "Consider increasing moe_expert_rank_capacity_factor.",
+                )
+            if stash_overflow_ranks > 0:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "Paged stash: stashing buffer overflow "
+                    f"on {stash_overflow_ranks} rank(s). "
+                    "Consider increasing stash_buffer_size_factor_cuda or stash_buffer_size_factor_cpu.",
+                )
             self.prepare_for_rerun(is_training=training)
         return result
