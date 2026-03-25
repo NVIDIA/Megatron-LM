@@ -389,10 +389,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
-        use_mxfp8 = self.config.fp8_recipe == "mxfp8"
+        use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
-            # Remove batch dimension for FlashInfer mxfp8
+            # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
