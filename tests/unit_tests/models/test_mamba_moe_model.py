@@ -284,6 +284,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_triton_nvls_kernels": False,
+    "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "auto",
     "inference_moe_disable_fused_quant_kernels": False,
 }

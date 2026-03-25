@@ -1377,7 +1377,7 @@ def validate_args(args, defaults={}):
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
-    if not args.enable_gloo_process_groups:
+    if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
@@ -1394,8 +1394,8 @@ def validate_args(args, defaults={}):
         args.check_for_nan_in_loss_and_grad = False
         warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
         # Disable gloo process groups for fake process group
-        args.enable_gloo_process_groups = False
-        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
+        args.use_gloo_process_groups = False
+        warn_rank_0('use_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1887,11 +1887,6 @@ def _add_inference_args(parser):
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
                        'states at block boundaries are cached for reuse.')
-    group.add_argument('--inference-dynamic-batching-mamba-triton-conv1d',
-                       action='store_true', default=False,
-                       dest='inference_dynamic_batching_mamba_triton_conv1d',
-                       help='Use Triton varlen conv1d kernel for Mamba prefill '
-                       'instead of per-request causal_conv1d_fn calls.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -2230,7 +2225,9 @@ def _add_regularization_args(parser):
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer')
+                       help='Scale mode for Muon optimizer. With MuP, set '
+                       '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
+                       'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
@@ -2663,6 +2660,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
+                       help='List of param_name patterns (in Python\'s fnmatch format) to match against '
+                       'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
+                       'every parameter.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
