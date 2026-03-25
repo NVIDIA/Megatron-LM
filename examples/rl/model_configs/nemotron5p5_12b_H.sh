@@ -74,9 +74,8 @@ MODEL_OPTIONS="\
   --num-layers-at-end-in-bf16 2 \
   --fp8-param-gather \
   --disable-gloo-process-groups \
-  --is-hybrid-model \
   --mamba-head-dim 80 \
-  --hybrid-override-pattern M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M- \
+  --hybrid-layer-pattern M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M- \
   --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
   --tiktoken-pattern v2 \
   --distributed-timeout-minutes 10 \
@@ -89,7 +88,6 @@ MODEL_OPTIONS="\
    --init-method-std 0.0125 \
     --position-embedding-type none \
   --squared-relu \
-    --num-layers 62 \
     --hidden-size 5120 \
     --num-attention-heads 40 \
     --group-query-attention \

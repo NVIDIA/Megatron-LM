@@ -27,10 +27,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
@@ -591,7 +587,7 @@ class TestCrossRanksReads:
         state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
-                get_default_save_sharded_strategy(), parallelization_group
+                TorchDistSaveShardedStrategy(), parallelization_group
             )
             save_strategy.save(state_dict, ckpt_dir)
 

@@ -18,7 +18,7 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
-from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -47,18 +47,15 @@ except ImportError:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,
         set_save_original_input,
     )
     from megatron.core.post_training.modelopt.layers import Linear
-
-    HAVE_TE = True
-except ImportError:
+else:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
-    HAVE_TE = False
 
 
 @dataclass
@@ -174,6 +171,39 @@ class AbsorbedMLASelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
+
+        # Output.
+        self.linear_proj = build_module(
+            submodules.linear_proj,
+            self.query_projection_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
+        )
+
+        if (
+            HAVE_TE
+            and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
+        ):
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
 
         if self.config.q_lora_rank is None:
             # Not projecting query
@@ -308,39 +338,6 @@ class AbsorbedMLASelfAttention(Attention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
-
-        # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
-            self.query_projection_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=False,
-            tp_comm_buffer_name='proj',
-            tp_group=self.pg_collection.tp,
-        )
-
-        if (
-            HAVE_TE
-            and isinstance(self.linear_proj, TELinear)
-            and (
-                (
-                    self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
-                    and is_te_min_version("2.6.0dev0")
-                )
-                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
-            )
-        ):
-            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
-            # linear_proj also saves the quantized tensor of this output. Here we set the
-            # linear_proj to save the original input tensors to avoid the extra memory usage of
-            # the quantized tensor.
-            set_save_original_input(self.linear_proj)
 
     def get_query_key_value_tensors(
         self,
