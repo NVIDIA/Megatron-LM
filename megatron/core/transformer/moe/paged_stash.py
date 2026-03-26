@@ -347,7 +347,7 @@ class PagedTensor:
         vp_stage=None,
         original_shape=None,
         schedule_layer_no=None,
-        layer_name=None,
+        is_columnwise_scale_inv=None,
         max_num_tokens=None,
         hidden_size=None,
         page_size=64,
@@ -373,7 +373,7 @@ class PagedTensor:
         self.avg_num_tokens = avg_num_tokens
         self.vp_stage = vp_stage
         self.schedule_layer_no = schedule_layer_no
-        self.layer_name = layer_name
+        self.is_columnwise_scale_inv = is_columnwise_scale_inv
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.page_size = page_size
@@ -402,7 +402,7 @@ class PagedTensor:
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
-        if 'columnwise_scale_inv' in self.layer_name:
+        if self.is_columnwise_scale_inv:
             num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
             max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
         else:
@@ -451,7 +451,7 @@ class PagedTensor:
         self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
         tensor_to_reload = self._tensor
 
-        if 'columnwise_scale_inv' in self.layer_name:
+        if self.is_columnwise_scale_inv:
             num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
             max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
         else:
@@ -770,6 +770,13 @@ class PagedStashManager:
             host_tokens_dict = None
             cpu_scale = 0.0
 
+        if max_tokens_dict is None:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Paged stash: max_tokens_dict is None, skipping stash buffer allocation",
+            )
+            return
         for dtype, hidden_size in max_tokens_dict:
             if dtype not in self.stash_buffers:
                 self.stash_buffers[dtype] = {}
@@ -839,7 +846,7 @@ class PagedStashManager:
         if (
             self.max_num_tokens is None
             or tensor.dim() == 0
-            or not hasattr(tensor, 'grouped_name')
+            or not hasattr(tensor, 'grouped_tensor_scale_inv')
             or (tensor.size(0) != self.max_num_tokens and (tensor.logical_shape is None or tensor.logical_shape[0] != self.max_num_tokens))
         ):
             return tensor.detach()
@@ -847,10 +854,9 @@ class PagedStashManager:
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
 
         original_shape = tensor.shape
-        grouped_name = tensor.grouped_name
+        columnwise_scale_inv = tensor.grouped_tensor_scale_inv
         tensor = tensor.flatten()
         dtype = tensor.dtype
-        columnwise_scale_inv = 'columnwise_scale_inv' in grouped_name
         hidden_size = tensor.numel() // (self.max_num_tokens if not columnwise_scale_inv else self.max_num_tokens // SCALE_INV_BLOCK_SIZE)
 
         if self.max_tokens_across_vp_stages is None:
@@ -897,7 +903,7 @@ class PagedStashManager:
             tensor_truncated.copy_(tensor[: actual_num_tokens * hidden_size])
             tensor = tensor_truncated
 
-        tensor.grouped_name = grouped_name
+        tensor.grouped_tensor_scale_inv = columnwise_scale_inv
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
@@ -910,7 +916,7 @@ class PagedStashManager:
                 and self.current_schedule_index < len(self._pp_schedule)
                 else None
             ),
-            layer_name=tensor.grouped_name,
+            is_columnwise_scale_inv=columnwise_scale_inv,
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
             page_size=self.page_size,
@@ -926,7 +932,7 @@ class PagedStashManager:
         Returns the actual tensor (potentially reloading from CPU).
         """
         if isinstance(saved_state, (PagedTensor)):
-            columnwise_scale_inv = 'columnwise_scale_inv' in saved_state.layer_name
+            columnwise_scale_inv = saved_state.is_columnwise_scale_inv
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
                 key = (saved_state.dtype, saved_state.hidden_size)
