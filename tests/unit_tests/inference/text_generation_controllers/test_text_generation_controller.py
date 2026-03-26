@@ -1387,8 +1387,6 @@ class TestTextGenerationController:
             next_token_ids,
             position_ids,
             depth,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             captured_position_ids.append(position_ids.clone())
             return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
@@ -1463,8 +1461,6 @@ class TestTextGenerationController:
             next_token_ids,
             position_ids,
             depth,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             captured_shapes.append(
                 {
@@ -1535,8 +1531,6 @@ class TestTextGenerationController:
             next_token_ids,
             position_ids,
             depth,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             captured_shapes.append(
                 {
@@ -1595,8 +1589,6 @@ class TestTextGenerationController:
             next_token_ids,
             position_ids,
             depth,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             captured_shapes.append(
                 {

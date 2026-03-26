@@ -2256,9 +2256,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             logits = torch.zeros(
@@ -2387,9 +2384,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2479,9 +2473,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2572,9 +2563,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
@@ -2696,9 +2684,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             # Predict wildly wrong tokens (+ 5) to guarantee rejection
@@ -2785,9 +2770,6 @@ class TestDynamicInferenceEngine:
             next_token_ids,
             position_ids,
             depth,
-            runtime_gather_output=True,
-            scatter_hidden_input=True,
-            gather_hidden_output=True,
         ):
             n = hidden_states.size(0)
             logits = torch.zeros(
