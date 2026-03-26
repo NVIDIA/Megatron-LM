@@ -46,7 +46,7 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f"Apex is not installed. Falling back to Torch Norm")
+    warnings.warn(f"Apex is not installed. Falling back to Torch Norm", stacklevel=2)
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
 

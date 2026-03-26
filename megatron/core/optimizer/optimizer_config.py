@@ -385,7 +385,8 @@ class OptimizerConfig:
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
-                    "recommended for mxfp8 training."
+                    "recommended for mxfp8 training.",
+                    stacklevel=2,
                 )
 
         if self.use_precision_aware_optimizer:

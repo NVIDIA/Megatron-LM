@@ -3714,6 +3714,7 @@ class AllGatherPipeline:
                     f"Bucket status: {self.bucket_status}."
                 ),
                 UserWarning,
+                stacklevel=2,
             )
             while len(self.param_gather_event_map) > 0:
                 (bucket_id, bwd) = next(iter(self.param_gather_event_map))
@@ -4194,7 +4195,8 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
                 if p._typed_storage()._size() == 0:
                     warnings.warn(
                         "The parameter may be sharded by Megatron-FSDP, "
-                        "no actual 'to' operation is performed."
+                        "no actual 'to' operation is performed.",
+                        stacklevel=3,
                     )
                     return torch.empty([])
                 return to_function(*args, **kwargs)
@@ -4208,7 +4210,8 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
                 if p._typed_storage()._size() == 0:
                     warnings.warn(
                         "The parameter may be sharded by Megatron-FSDP, "
-                        "no actual 'cpu' operation is performed."
+                        "no actual 'cpu' operation is performed.",
+                        stacklevel=3,
                     )
                     return torch.empty([], device="cpu")
                 return cpu_function(*args, **kwargs)

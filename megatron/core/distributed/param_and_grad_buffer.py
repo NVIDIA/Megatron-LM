@@ -461,7 +461,8 @@ class _ParamAndGradBucketGroup:
                         "The next bucket's parameter all-gather operation has already been "
                         "dispatched. This may be caused by a mismatch between the order of "
                         "parameter registration and forward pass execution, which will "
-                        "hurt the communication-computation overlap performance."
+                        "hurt the communication-computation overlap performance.",
+                        stacklevel=2,
                     )
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()

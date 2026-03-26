@@ -12,7 +12,7 @@ if HAVE_FUSED_LAYER_NORM:
 else:
     import warnings
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm', stacklevel=2)
     from megatron.core.transformer.torch_norm import WrappedTorchNorm as LNImpl
 
 
