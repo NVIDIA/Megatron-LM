@@ -216,6 +216,6 @@ mamba_inference_stack_spec = ModuleSpec(
                     )
                 ]
             ),
-        )
+        ),
     ),
 )
