@@ -112,7 +112,7 @@ def _make_stage2_kernel(
 
                     T.clear(softmax_attn)
 
-                    for h in T.Parallel(AH):
+                    for h in T.serial(AH):
                         T.clear(h_scores)
                         for d_blk in T.Pipelined(num_dk_blocks):
                             d_off = d_blk * BLOCK_D
@@ -695,14 +695,15 @@ def fwd_fused_indexer_loss(
         if sparse_loss:
             out_loss = kernel(
                 attn_query, attn_key,
-                index_scores, index_mask,
+                index_scores.contiguous(), 
+                index_mask,
                 softmax_m, softmax_d,
                 softmax_m1, softmax_d1,
             )
         else:
             out_loss = kernel(
                 attn_query, attn_key,
-                index_scores,
+                index_scores.contiguous(),
                 softmax_m, softmax_d,
                 softmax_m1, softmax_d1,
             )
