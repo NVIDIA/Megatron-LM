@@ -34,11 +34,18 @@ except ImportError:
         USING_PYTORCH_OPTIMIZER = True
 
 try:
-    from emerging_optimizers.scalar_optimizers import Lion
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
 
-    HAVE_LION = True
-except ImportError:
-    HAVE_LION = False
+    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
+except (ImportError, PackageNotFoundError):
+    _eo_ver = (0, 0)
+
+HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 1)
+HAVE_EO_V02 = _eo_ver >= (0, 2)
+
+if HAVE_EO_V02:
+    from emerging_optimizers.scalar_optimizers import Lion
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -575,12 +582,12 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.initialize_state(p)
 
         elif config.optimizer == 'lion':
-            if not HAVE_LION:
+            if not HAVE_EO_V02:
                 raise ImportError(
-                    "Lion optimizer requires the 'emerging_optimizers' package. "
-                    "Please install it to use --optimizer lion."
+                    "Lion optimizer requires emerging_optimizers >= 0.2. "
+                    "Please install or upgrade it to use --optimizer lion."
                 )
-            optimizer = Lion(
+            optimizer = Lion(  # pylint: disable=possibly-used-before-assignment
                 param_groups,
                 lr=config.lr,
                 betas=(config.lion_beta1, config.lion_beta2),
