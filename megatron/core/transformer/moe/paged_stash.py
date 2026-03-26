@@ -847,7 +847,6 @@ class PagedStashManager:
             self.max_num_tokens is None
             or tensor.dim() == 0
             or not hasattr(tensor, 'grouped_tensor_scale_inv')
-            or (tensor.size(0) != self.max_num_tokens and (tensor.logical_shape is None or tensor.logical_shape[0] != self.max_num_tokens))
         ):
             return tensor.detach()
 
