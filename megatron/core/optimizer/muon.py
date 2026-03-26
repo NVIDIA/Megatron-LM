@@ -106,8 +106,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             ns_kwargs = dict(
                 steps=num_ns_steps, tp_group=tp_group, partition_dim=partition_dim, **mode_kwarg
             )
-            if HAVE_EO_V02:
-                ns_kwargs["coefficient_type"] = coefficient_type
+            ns_kwargs["coefficient_type"] = coefficient_type
             # pylint: disable-next=possibly-used-before-assignment
             orth_grad = newton_schulz_tp(grad, **ns_kwargs)
             # pylint: disable-next=possibly-used-before-assignment
