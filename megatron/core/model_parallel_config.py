@@ -298,8 +298,11 @@ class ModelParallelConfig:
 
     batch_p2p_sync: bool = True
     """When using batch_isend_irecv, do a cuda.device.synchronize afterward to work around a bug in
-       older version of PyTorch.
+    older version of PyTorch.
     """
+
+    scatter_gather_tensors_in_pipeline: bool = True
+    """If True, use scatter/gather to optimize communication of tensors in pipeline."""
 
     use_ring_exchange_p2p: bool = False
     """Use custom ring_exchange kernel instead of torch.distributed.batch_isend_irecv(). Requires

@@ -394,6 +394,14 @@ class P2PCommunicator:
         if tensor_recv_next_func is not None:
             tensor_recv_next = tensor_recv_next_func()
 
+        # Scatter tensors before sending if configured
+        if config.scatter_gather_tensors_in_pipeline:
+            from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
+            if tensor_send_prev is not None:
+                tensor_send_prev = scatter_to_tensor_model_parallel_region(tensor_send_prev)
+            if tensor_send_next is not None:
+                tensor_send_next = scatter_to_tensor_model_parallel_region(tensor_send_next)
+
         p2p_reqs = p2p_func(
             tensor_send_prev=tensor_send_prev,
             tensor_recv_prev=tensor_recv_prev,
@@ -417,6 +425,14 @@ class P2PCommunicator:
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()
+
+        # Gather tensors after receiving if configured
+        if config.scatter_gather_tensors_in_pipeline:
+            from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+            if tensor_recv_prev is not None:
+                tensor_recv_prev = gather_from_tensor_model_parallel_region(tensor_recv_prev)
+            if tensor_recv_next is not None:
+                tensor_recv_next = gather_from_tensor_model_parallel_region(tensor_recv_next)
 
         return tensor_recv_prev, tensor_recv_next, reqs
 
