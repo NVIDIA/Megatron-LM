@@ -584,6 +584,7 @@ class DataParallelInferenceCoordinator:
         ready_event: Event,
         data_parallel_size: int,
         tokenizer,
+        max_requests,
         inference_coordinator_port: int | None = None,
         deterministic_mode: bool = False,
         block_size_tokens: int | None = None,
@@ -591,9 +592,8 @@ class DataParallelInferenceCoordinator:
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
-        schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
-        max_requests: int = 0,
+        schedule_output_path: str | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.

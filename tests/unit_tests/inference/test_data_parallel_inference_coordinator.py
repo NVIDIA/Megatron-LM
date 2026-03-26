@@ -306,7 +306,15 @@ def coordinator():
         ready_event = spawn_context.Event()
         proc = spawn_context.Process(
             target=DataParallelInferenceCoordinator.entrypoint,
-            args=(pipe_child, ready_event, 0, DummyTokenizer(), DEFAULT_PORT, False),
+            kwargs={
+                "pipe_connection": pipe_child,
+                "ready_event": ready_event,
+                "data_parallel_size": 0,
+                "tokenizer": DummyTokenizer(),
+                "max_requests": 16,
+                "inference_coordinator_port": DEFAULT_PORT,
+                "deterministic_mode": False,
+            },
         )
         proc.start()
 

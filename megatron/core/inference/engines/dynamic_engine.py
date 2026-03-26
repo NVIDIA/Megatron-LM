@@ -505,20 +505,20 @@ class DynamicInferenceEngine(AbstractEngine):
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
-                args=(
-                    dp_process_pipe,
-                    coordinator_ready_event,
-                    get_pg_size(self.pg_collection.dp),
-                    self.controller.tokenizer,
-                    inference_coordinator_port,
-                    deterministic_mode,
-                    self.context.block_size_tokens,
-                    self.context.enable_prefix_caching,
-                    self.context.prefix_caching_coordinator_policy,
-                    coordinator_schedule_output_path,
-                    self.context.prefix_caching_routing_alpha,
-                    self.context.max_requests,
-                ),
+                kwargs={
+                    "pipe_connection": dp_process_pipe,
+                    "ready_event": coordinator_ready_event,
+                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "tokenizer": self.controller.tokenizer,
+                    "max_requests": self.context.max_requests,
+                    "inference_coordinator_port": inference_coordinator_port,
+                    "deterministic_mode": deterministic_mode,
+                    "block_size_tokens": self.context.block_size_tokens,
+                    "enable_prefix_caching": self.context.enable_prefix_caching,
+                    "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
+                    "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "schedule_output_path": coordinator_schedule_output_path,
+                },
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
