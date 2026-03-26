@@ -288,5 +288,6 @@ def set_tensor_grad_fn_sequence_sr(tensor, value):
     else:
         warnings.warn(
             "WARNING : PyTorch is too old to set sequence_sr and the performance may not "
-            "be optimal. Please use PyTorch >= 2.2.0 for better performance."
+            "be optimal. Please use PyTorch >= 2.2.0 for better performance.",
+            stacklevel=3,
         )

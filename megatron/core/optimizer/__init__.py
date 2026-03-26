@@ -490,7 +490,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             if torch.__version__ < '2.3.0':
                 warnings.warn(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
-                    "untested versions below this may have convergence issues."
+                    "untested versions below this may have convergence issues.",
+                    stacklevel=2,
                 )
             assert (
                 config.decoupled_weight_decay

@@ -523,7 +523,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         "TEFusedResidualRMSNorm module has a submodule with a pre-forward hook. "
                         "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
                         "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
+                        "access the input tensor.",
+                        stacklevel=2,
                     )
 
                 def forward_pre_hook(module, *_) -> None:
@@ -547,7 +548,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     "TEFusedResidualRMSNorm module has a submodule with a post-forward hook. "
                     "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
                     "so the hook may have incorrect behavior if it attempts to "
-                    "access the input or output tensors."
+                    "access the input or output tensors.",
+                    stacklevel=2,
                 )
 
                 def forward_post_hook(module, *_) -> None:
@@ -734,7 +736,8 @@ class TELinear(te.pytorch.Linear):
             warnings.warn(
                 f"The user buffer name {tp_comm_buffer_name} is not supported in"
                 "Transformer Engine. Disabling TP communication overlap "
-                "for this layer."
+                "for this layer.",
+                stacklevel=2,
             )
 
         if is_te_min_version("0.8.0"):
@@ -2355,7 +2358,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         "TEFusedMLP module has a submodule with a pre-forward hook. "
                         "TEFusedMLP module does not expose intermediate tensors, "
                         "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
+                        "access the input tensor.",
+                        stacklevel=2,
                     )
 
                 def forward_pre_hook(module, *_) -> None:
@@ -2378,7 +2382,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     "TEFusedMLP module has a submodule with a post-forward hook. "
                     "TEFusedMLP module does not expose intermediate tensors, "
                     "so the hook may have incorrect behavior if it attempts to "
-                    "access the input or output tensors."
+                    "access the input or output tensors.",
+                    stacklevel=2,
                 )
 
                 def forward_post_hook(module, *_) -> None:
@@ -2456,7 +2461,7 @@ class TEDelayedScaling(te.common.recipe.DelayedScaling):
         if get_te_version() < PkgVersion("1.8.0"):
             extra_kwargs["interval"] = config.fp8_interval
         elif config.fp8_interval != 1:
-            warnings.warn("fp8_interval is deprecated and ignored from Transformer-Engine v1.8.0.")
+            warnings.warn("fp8_interval is deprecated and ignored from Transformer-Engine v1.8.0.", DeprecationWarning, stacklevel=2)
 
         super().__init__(
             margin=config.fp8_margin,
@@ -2593,7 +2598,8 @@ try:
         """Apply rotary positional embedding to input tensor T in `sbhd` format."""
         if transpose_output_memory:
             warnings.warn(
-                "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
+                "transpose_output_memory is not supported by TE's fused RoPE and will be ignored.",
+                stacklevel=2,
             )
         if is_te_min_version("2.3.0"):
             return apply_rotary_pos_emb(

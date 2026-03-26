@@ -30,7 +30,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         if prompts_tokens is not None:
             warnings.warn(
                 "Passing `prompts_tokens` is deprecated and this argument will be ignored."
-                "This parameter will be removed in `megatron-core` 0.13."
+                "This parameter will be removed in `megatron-core` 0.13.",
+                DeprecationWarning,
+                stacklevel=2,
             )
 
         super().prep_model_for_inference()

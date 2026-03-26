@@ -273,13 +273,15 @@ def apply_rotary_pos_emb(
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
                 warnings.warn(
                     "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
-                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                    "Please set apply_rope_fusion to false. This will become an error in v0.16.",
+                    stacklevel=3,
                 )
                 use_unfused = True
             if mscale != 1.0:
                 warnings.warn(
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
+                    stacklevel=3,
                 )
                 use_unfused = True
             if not use_unfused:

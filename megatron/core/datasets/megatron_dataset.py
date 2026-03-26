@@ -100,7 +100,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 warnings.warn(
                     "The pad token id in the tokenizer collides with another special token id. "
                     "This may cause instability and lack of covergence during training. "
-                    "Do not ignore this warning if you do not understand the implications. "
+                    "Do not ignore this warning if you do not understand the implications. ",
+                    stacklevel=2,
                 )
             else:
                 # Reset the pad token id to a value which is guaranteed not to be in the dataset.
@@ -110,7 +111,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                     "This may cause instability and lack of covergence during training. "
                     "As such, the training flow will avoid masking out any pad tokens already "
                     "present in the dataset. If you would like to disable this behavior, "
-                    "please provide a tokenizer with a uniquely-defined pad token id."
+                    "please provide a tokenizer with a uniquely-defined pad token id.",
+                    stacklevel=2,
                 )
 
     @staticmethod
