@@ -1925,11 +1925,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        _instance_counter = 0
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
             # Fused implementation
             self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
+            self._layer_idx = TEFusedMLP._instance_counter
+            TEFusedMLP._instance_counter += 1
+
+        def set_layer_number(self, layer_number: int):
+            """Called by TransformerLayer to propagate the real layer index."""
+            self._layer_idx = layer_number
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
@@ -2190,8 +2198,206 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if self._fused_impl is None:
                 self._fused_impl = (self._make_fused_impl(),)
 
+            # Register forward hook on the activation op to capture actual post-FC1 and
+            # post-SwiGLU tensors from the real kernel (not a manual BF16 recompute).
+            if not getattr(self, '_intermediate_fwd_hooks_registered', False):
+                self._intermediate_fwd_hooks_registered = True
+                _L_ref = self._layer_idx
+                for _op in self._fused_impl[0].children():
+                    _opname = type(_op).__name__
+                    if _opname in ('SwiGLU', 'GEGLU', 'ScaledSwiGLU', 'ReGLU', 'SiLU', 'GELU', 'ReLU'):
+                        def _act_fwd_hook(module, inp, out_act, _L=_L_ref):
+                            import os as _os, sys as _sys
+                            _step = getattr(self, '_dbg_fwd_step', 0)
+                            _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                            if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                                if inp and inp[0] is not None:
+                                    _fc1 = inp[0].detach().float()
+                                    _sys.__stdout__.write(
+                                        f"[BASELINE_POST_FC1_REAL step={_step} L={_L}]"
+                                        f"  nan={_fc1.isnan().any().item()} min={_fc1.min().item():.4g} max={_fc1.max().item():.4g} norm={_fc1.norm().item():.4g}"
+                                        f"  shape={tuple(_fc1.shape)}\n"
+                                        f"  fc1_out[0,:8]={_fc1[0,:8].tolist()}\n"
+                                    )
+                                _out_t = out_act if isinstance(out_act, torch.Tensor) else (out_act[0] if out_act else None)
+                                if _out_t is not None:
+                                    _sg = _out_t.detach().float()
+                                    _sys.__stdout__.write(
+                                        f"[BASELINE_POST_SWIGLU_REAL step={_step} L={_L}]"
+                                        f"  nan={_sg.isnan().any().item()} min={_sg.min().item():.4g} max={_sg.max().item():.4g} norm={_sg.norm().item():.4g}"
+                                        f"  shape={tuple(_sg.shape)}\n"
+                                        f"  swiglu_out[0,:8]={_sg[0,:8].tolist()}\n"
+                                    )
+                                _sys.__stdout__.flush()
+                        _op.register_forward_hook(_act_fwd_hook)
+                        break
+
             # Apply fused impl
             out = self._fused_impl[0](hidden_states)
+
+            _dbg_step = getattr(self, '_dbg_fwd_step', 0)
+            import os as _os
+            _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+            if not torch.cuda.is_current_stream_capturing() and _dbg_step < _dbg_limit:
+                import os as _os, sys as _sys
+                if int(_os.getenv("SLURM_PROCID", 0)) == 0:
+                    _o = out.float()
+                    _fc1w = self.linear_fc1.weight.float()
+                    _fc2w = self.linear_fc2.weight.float()
+                    _L = self._layer_idx
+                    try:
+                        _h2d = hidden_states.view(-1, hidden_states.size(-1)).float()
+                        _lnw = self.linear_fc1.layer_norm_weight.float()
+                        _norm_type = self.linear_fc1.normalization
+                        if _norm_type == "RMSNorm":
+                            _var = _h2d.pow(2).mean(-1, keepdim=True)
+                            _normed = _h2d / (_var + self.linear_fc1.eps).sqrt() * _lnw
+                        else:
+                            _normed = torch.nn.functional.layer_norm(
+                                _h2d, [_h2d.size(-1)], _lnw,
+                                self.linear_fc1.layer_norm_bias.float(),
+                                self.linear_fc1.eps,
+                            )
+                        _fc1_out = torch.mm(_normed.to(torch.bfloat16),
+                                            _fc1w.to(torch.bfloat16).T).float()
+                        _sys.__stdout__.write(
+                            f"[BASELINE_NORMED L={_L}]"
+                            f"  hidden min={_h2d.min().item():.4g} max={_h2d.max().item():.4g}"
+                            f"  normed min={_normed.min().item():.4g} max={_normed.max().item():.4g}"
+                            f"  fc1_out min={_fc1_out.min().item():.4g} max={_fc1_out.max().item():.4g}\n"
+                            f"  normed[0,:8]={_normed[0,:8].tolist()}\n"
+                            f"  fc1_out[0,:8]={_fc1_out[0,:8].tolist()}\n"
+                        )
+                        # Post-FC1 stats
+                        _sys.__stdout__.write(
+                            f"[BASELINE_POST_FC1 step={_dbg_step} L={_L}]"
+                            f"  nan={_fc1_out.isnan().any().item()} min={_fc1_out.min().item():.4g} max={_fc1_out.max().item():.4g} norm={_fc1_out.norm().item():.4g}"
+                            f"  shape={tuple(_fc1_out.shape)}\n"
+                            f"  fc1_out[0,:8]={_fc1_out[0,:8].tolist()}\n"
+                        )
+                        # Post-SwiGLU stats (standard split: first half=gate, second half=up)
+                        _half = _fc1_out.size(-1) // 2
+                        _gate = _fc1_out[:, :_half]
+                        _up   = _fc1_out[:, _half:]
+                        import torch.nn.functional as _F
+                        _swiglu_out = _F.silu(_gate) * _up
+                        _sys.__stdout__.write(
+                            f"[BASELINE_POST_SWIGLU step={_dbg_step} L={_L}]"
+                            f"  nan={_swiglu_out.isnan().any().item()} min={_swiglu_out.min().item():.4g} max={_swiglu_out.max().item():.4g} norm={_swiglu_out.norm().item():.4g}"
+                            f"  shape={tuple(_swiglu_out.shape)}\n"
+                            f"  swiglu_out[0,:8]={_swiglu_out[0,:8].tolist()}\n"
+                        )
+                    except Exception as _e:
+                        _sys.__stdout__.write(f"[BASELINE_NORMED L={_L}] error: {_e}\n")
+                    _sys.__stdout__.write(
+                        f"[BASELINE_FWD step={_dbg_step} L={_L}]"
+                        f"  out nan={_o.isnan().any().item()} min={_o.min().item():.4g} max={_o.max().item():.4g} norm={_o.norm().item():.4g}"
+                        f"  fc1w nan={_fc1w.isnan().any().item()} max={_fc1w.abs().max().item():.4g} shape={tuple(_fc1w.shape)}"
+                        f"  fc2w nan={_fc2w.isnan().any().item()} max={_fc2w.abs().max().item():.4g} shape={tuple(_fc2w.shape)}\n"
+                        f"  fc1w[0,:4]={_fc1w[0,:4].tolist()}"
+                        f"  fc1w[32,:4]={_fc1w[32,:4].tolist()}"
+                        f"  fc1w[64,:4]={_fc1w[64,:4].tolist()}\n"
+                    )
+                    try:
+                        _fc1w_raw = self.linear_fc1.weight
+                        _si = getattr(_fc1w_raw, '_rowwise_scale_inv', None)
+                        if _si is not None:
+                            _si_fp8 = _si.view(dtype=torch.float8_e4m3fn).float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_FWD scale_inv L={_L}]"
+                                f"  fc1w scale_inv(as fp8) min={_si_fp8.min().item():.4f} max={_si_fp8.max().item():.4f}"
+                                f"  shape={_si.shape}\n"
+                            )
+                        _si2 = getattr(_fc1w_raw, 'scale_inv', None)
+                        if _si2 is not None and _si2 is not _si:
+                            _si2_fp8 = _si2.view(dtype=torch.float8_e4m3fn).float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_FWD scale_inv2 L={_L}]"
+                                f"  fc1w scale_inv2(as fp8) min={_si2_fp8.min().item():.4f} max={_si2_fp8.max().item():.4f}"
+                                f"  shape={_si2.shape}\n"
+                            )
+                    except Exception as _e2:
+                        _sys.__stdout__.write(f"[BASELINE_FWD scale_inv L={_L}] error: {_e2}\n")
+                    _sys.__stdout__.flush()
+            if not getattr(self, '_bwd_hook_registered', False):
+                self._bwd_hook_registered = True
+                _L_ref = self._layer_idx
+                def _module_bwd_hook(module, grad_input, grad_output, _L=_L_ref):
+                    import os as _os, sys as _sys
+                    _step = getattr(module, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        if grad_output[0] is not None:
+                            _g = grad_output[0].detach().float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_BWD step={_step} L={_L}]"
+                                f"  dy(upstream) nan={_g.isnan().any().item()} min={_g.min().item():.4g} max={_g.abs().max().item():.4g} norm={_g.norm().item():.4g}\n"
+                            )
+                        if grad_input[0] is not None:
+                            _gi = grad_input[0].detach().float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_GRAD_INPUT step={_step} L={_L}]"
+                                f"  grad_input nan={_gi.isnan().any().item()} min={_gi.min().item():.4g} max={_gi.abs().max().item():.4g} norm={_gi.norm().item():.4g}\n"
+                            )
+                        _sys.__stdout__.flush()
+                self.register_full_backward_hook(_module_bwd_hook)
+            if hidden_states.requires_grad and not getattr(self, '_baseline_hidden_bwd_hook_registered', False):
+                self._baseline_hidden_bwd_hook_registered = True
+                _L_ref_h = self._layer_idx
+                def _baseline_hidden_bwd_hook(grad, _L=_L_ref_h):
+                    import os as _os, sys as _sys
+                    _step = getattr(self, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        _g = grad.detach().float()
+                        _sys.__stdout__.write(
+                            f"[BASELINE_BWD_HIDDEN step={_step} L={_L}]"
+                            f"  grad nan={_g.isnan().any().item()} min={_g.min().item():.4g} max={_g.abs().max().item():.4g} norm={_g.norm().item():.4g}\n"
+                        )
+                        _sys.__stdout__.flush()
+                hidden_states.register_hook(_baseline_hidden_bwd_hook)
+            if not getattr(self, '_bwd_hook_fc2_registered', False):
+                self._bwd_hook_fc2_registered = True
+                _L_ref2 = self._layer_idx
+                def _fc2_bwd_hook(module, grad_input, grad_output, _L=_L_ref2):
+                    import os as _os, sys as _sys
+                    _step = getattr(self, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        if grad_output[0] is not None:
+                            _g = grad_output[0].detach().float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_FC2_DY step={_step} L={_L}]"
+                                f"  dy nan={_g.isnan().any().item()} min={_g.min().item():.4g} max={_g.abs().max().item():.4g} norm={_g.norm().item():.4g}\n"
+                            )
+                        if grad_input[0] is not None:
+                            _gi = grad_input[0].detach().float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_FC2_DGRAD step={_step} L={_L}]"
+                                f"  d_swiglu_out nan={_gi.isnan().any().item()} min={_gi.min().item():.4g} max={_gi.abs().max().item():.4g} norm={_gi.norm().item():.4g}\n"
+                            )
+                        _sys.__stdout__.flush()
+                self.linear_fc2.register_full_backward_hook(_fc2_bwd_hook)
+            if not getattr(self, '_bwd_hook_act_registered', False) and self._fused_impl is not None:
+                self._bwd_hook_act_registered = True
+                _L_ref3 = self._layer_idx
+                def _act_bwd_hook(module, grad_input, grad_output, _L=_L_ref3):
+                    import os as _os, sys as _sys
+                    _step = getattr(self, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        if grad_input[0] is not None:
+                            _gi = grad_input[0].detach().float()
+                            _sys.__stdout__.write(
+                                f"[BASELINE_DSWIGLU step={_step} L={_L}]"
+                                f"  d_fc1_out nan={_gi.isnan().any().item()} min={_gi.min().item():.4g} max={_gi.abs().max().item():.4g} norm={_gi.norm().item():.4g}\n"
+                            )
+                            _sys.__stdout__.flush()
+                for _op in self._fused_impl[0].children():
+                    if type(_op).__name__ in ('SwiGLU', 'GEGLU', 'ReGLU', 'SiLU', 'GELU', 'ReLU'):
+                        _op.register_full_backward_hook(_act_bwd_hook)
+                        break
+            self._dbg_fwd_step = _dbg_step + 1
 
             # Return bias tensor if requested
             bias = None
@@ -2202,8 +2408,390 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             return out, bias
 
+    class TEFusedDenseMLP(TEFusedMLP):
+        """Dense MLP using GroupedLinear(num_groups=1) to trigger
+        ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+
+        Subclass of TEFusedMLP -> does not modify TEFusedMLP or TEGroupedMLP.
+        The fused kernel fires automatically via the TE op fuser when it detects
+        the GroupedLinear -> ScaledSwiGLU -> GroupedLinear pattern with MXFP8 recipe.
+        """
+
+        _instance_counter: int = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            TEFusedDenseMLP._instance_counter += 1
+            self._layer_idx = TEFusedDenseMLP._instance_counter
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
+
+            fused_impl = te.pytorch.ops.Sequential()
+
+            # Tensor parallelism configuration
+            tp_world_size = get_tensor_model_parallel_world_size()
+            tp_group = None
+            if tp_world_size > 1:
+                tp_group = get_tensor_model_parallel_group()
+
+            # RNG state
+            rng_state_tracker_function = None
+            if get_cuda_rng_tracker().is_initialized():
+                rng_state_tracker_function = get_cuda_rng_tracker
+
+            # Check submodule types (same as TEFusedMLP)
+            if not isinstance(self.linear_fc1, te.pytorch.LayerNormLinear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC1 to be "
+                    "Transformer Engine LayerNormLinear, but found "
+                    f"{self.linear_fc1.__class__.__name__}."
+                )
+            if not isinstance(self.linear_fc2, te.pytorch.Linear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC2 to be "
+                    "Transformer Engine Linear, but found "
+                    f"{self.linear_fc2.__class__.__name__}."
+                )
+
+            # Norm op (same as TEFusedMLP)
+            norm_type = self.linear_fc1.normalization
+            norm_shape = self.linear_fc1.weight.size(1)
+            kwargs = {
+                "eps": self.linear_fc1.eps,
+                "device": "meta",
+                "dtype": self.linear_fc1.layer_norm_weight.dtype,
+                "zero_centered_gamma": self.linear_fc1.zero_centered_gamma,
+            }
+            op = None
+            if norm_type == "LayerNorm":
+                op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+                op.bias = self.linear_fc1.layer_norm_bias
+            elif norm_type == "RMSNorm":
+                op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+            else:
+                raise ValueError(f"Unsupported normalization ({norm_type})")
+            # Store norm in a separate Sequential applied OUTSIDE the MXFP8 autocast
+            # in forward(). Running norm inside MXFP8 context corrupts the saved rstd
+            # used in RMSNorm backward, causing gradient amplification up to 10^6.
+            self._norm_seq = te.pytorch.ops.Sequential()
+            self._norm_seq.append(op)
+            # fused_impl starts with FC1-> norm is applied separately before it.
+
+            # Helper: dequantize any QuantizedTensor -> BF16 for weight processing.
+            def _to_bf16(w):
+                from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+                if isinstance(w, QuantizedTensor):
+                    return w.dequantize().to(torch.bfloat16)
+                return w.to(torch.bfloat16)
+
+            # Helper: MXFP8-quantize a BF16 weight (rowwise only, no optimize_for_gemm).
+            def _quantize_mxfp8(w_bf16):
+                from transformer_engine.pytorch.tensor import MXFP8Quantizer
+                import transformer_engine_torch as _tex
+                _q = MXFP8Quantizer(
+                    fp8_dtype=_tex.DType.kFloat8E4M3,
+                    rowwise=True,
+                    columnwise=False,
+                )
+                torch.cuda.empty_cache()
+                result = _q(w_bf16.detach())
+                torch.cuda.empty_cache()
+                return result
+
+            # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
+            _GLU_INTERLEAVE_SIZE = 32
+
+            # FC1: GroupedLinear(num_groups=1) instead of BasicLinear
+            weight = self.linear_fc1.weight
+            import sys as _sys
+            _sys.__stdout__.write(
+                f"[MAKE_FUSED_IMPL L={self._layer_idx}]"
+                f"  fc1.weight type={type(weight).__name__}"
+                f"  dtype={getattr(weight,'dtype',None)}"
+                f"  has_rowwise_data={hasattr(weight,'_rowwise_data')}"
+                f"  scaling_mode={getattr(weight,'_scaling_mode',getattr(weight,'scaling_mode','N/A'))}\n"
+            )
+            _sys.__stdout__.flush()
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0) * tp_world_size,
+                device="meta",
+                dtype=weight.dtype,
+                bias=False,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            )
+            # Keep original (non-interleaved) weight for backward wgrad computation.
+            # _mxfp8_weight0 is NOT pre-created here to avoid storing 80-layer FP8
+            # copies (~56 GB). Interleaving + MXFP8 quantization is done per-step
+            # inside fuser_forward (forward_grouped_mlp.py) via the _glu_interleave_size
+            # attribute checked in the weight prep loop.
+            op.weight0 = weight
+            op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
+            op._te_dense_mlp_op = True # identifies TEFusedDenseMLP ops in _patched_fuser_backward
+            op._layer_idx = self._layer_idx
+            fused_impl.append(op)
+
+            # ScaledSwiGLU with glu_interleave_size=32
+            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+
+            # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
+            weight = self.linear_fc2.weight
+            _sys.__stdout__.write(
+                f"[MAKE_FUSED_IMPL L={self._layer_idx}]"
+                f"  fc2.weight type={type(weight).__name__}"
+                f"  dtype={getattr(weight,'dtype',None)}"
+                f"  has_rowwise_data={hasattr(weight,'_rowwise_data')}"
+                f"  scaling_mode={getattr(weight,'_scaling_mode',getattr(weight,'scaling_mode','N/A'))}\n"
+            )
+            _sys.__stdout__.flush()
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0),
+                device="meta",
+                dtype=weight.dtype,
+                bias=False,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            )
+            op.weight0 = weight
+            # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
+            # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
+            op._te_dense_mlp_op = True # identifies TEFusedDenseMLP ops in _patched_fuser_backward
+            op._layer_idx = self._layer_idx
+            fused_impl.append(op)
+
+            if tp_world_size > 1:
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
+
+            self._register_hooks_on_fused_impl(fused_impl)
+            return fused_impl
+
+        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
+
+            orig_shape = hidden_states.shape
+            hidden_size = hidden_states.size(-1)
+            hidden_states_2d = hidden_states.view(-1, hidden_size)
+            total_tokens = hidden_states_2d.size(0)
+
+            # Extra inputs: tokens_per_expert for FC1/FC2, scales=ones for ScaledSwiGLU.
+            # Keep on GPU — split_sizes.to(device) inside fuser_forward fails during
+            # CUDA graph capture if the tensor is on CPU.
+            # Cache both tensors: they depend only on total_tokens (fixed for MLPerf).
+            _tpe_key = (total_tokens, hidden_states.device, hidden_states.dtype)
+            if getattr(self, '_cached_tpe_key', None) != _tpe_key:
+                self._cached_tpe_key = _tpe_key
+                self._tokens_per_expert = torch.full(
+                    (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+                )
+                self._scales = torch.ones(
+                    total_tokens, device=hidden_states.device, dtype=hidden_states.dtype
+                )
+            tokens_per_expert = self._tokens_per_expert
+            scales = self._scales
+
+            import os as _os_recipe
+            if _os_recipe.getenv("FP4_RECIPE", "") == "nvfp4":
+                _recipe = te.common.recipe.NVFP4BlockScaling()
+            else:
+                _recipe = te.common.recipe.MXFP8BlockScaling()
+
+            # Build fused impl lazily on first forward pass, inside autocast so
+            # that GroupedLinear quantizers are initialised with the right recipe and
+            # OperationFuser pattern detection sees the recipe on the first call.
+            if self._fused_impl is None:
+                with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=_recipe):
+                    self._fused_impl = (self._make_fused_impl(),)
+
+            # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
+            # tensor used by RMSNorm backward (running it inside causes up to 10^6
+            # gradient amplification, and causes convergence issues).
+            normed = self._norm_seq(hidden_states_2d)
+
+            if hidden_states_2d.requires_grad and not getattr(self, '_hidden_bwd_hook_registered', False):
+                self._hidden_bwd_hook_registered = True
+                _L_ref = self._layer_idx
+                def _hidden_bwd_hook(grad, _L=_L_ref):
+                    import os as _os, sys as _sys
+                    _step = getattr(self, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        _g = grad.detach().float()
+                        _sys.__stdout__.write(
+                            f"[BWD_HIDDEN step={_step} L={_L}]"
+                            f"  grad nan={_g.isnan().any().item()} min={_g.min().item():.4g} max={_g.abs().max().item():.4g} norm={_g.norm().item():.4g}\n"
+                        )
+                        _sys.__stdout__.flush()
+                hidden_states_2d.register_hook(_hidden_bwd_hook)
+
+            if not torch.cuda.is_current_stream_capturing():
+                import os as _os, sys as _sys
+                if int(_os.getenv("SLURM_PROCID", 0)) == 0 and getattr(self, '_dbg_fwd_step', 0) == 0:
+                    _n = normed.float()
+                    _h = hidden_states_2d.float()
+                    _sys.__stdout__.write(
+                        f"[FWD_NORMED L={self._layer_idx}]"
+                        f"  hidden min={_h.min().item():.4g} max={_h.max().item():.4g}"
+                        f"  normed min={_n.min().item():.4g} max={_n.max().item():.4g}\n"
+                    )
+                    _sys.__stdout__.flush()
+
+            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=_recipe):
+                if not torch.cuda.is_current_stream_capturing():
+                    import sys as _sys, os as _os
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and getattr(self, '_dbg_fwd_step', 0) == 0:
+                        try:
+                            _seq = self._fused_impl[0]
+                            for _op in _seq._ops if hasattr(_seq, '_ops') else []:
+                                _name = type(_op).__name__
+                                _q = _op.get_quantizer("forward", 0) if hasattr(_op, 'get_quantizer') else None
+                                _sys.__stdout__.write(
+                                    f"[QUANTIZER_DBG L={self._layer_idx}] op={_name} "
+                                    f"input_quantizer[0]={type(_q).__name__}\n"
+                                )
+                            _sys.__stdout__.flush()
+                        except Exception as _e:
+                            _sys.__stdout__.write(f"[QUANTIZER_DBG] error: {_e}\n")
+                            _sys.__stdout__.flush()
+                out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
+
+            # DEBUG: check weights + MLP output for NaN/inf on first few steps outside capture.
+            _dbg_step = getattr(self, '_dbg_fwd_step', 0)
+            import os as _os
+            _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+            if not torch.cuda.is_current_stream_capturing() and _dbg_step < _dbg_limit:
+                import os as _os, sys as _sys
+                _rank = int(_os.getenv("SLURM_PROCID", 0))
+                if _rank == 0:
+                    _o = out.float()
+                    _fc1w = self.linear_fc1.weight.float()
+                    _fc2w = self.linear_fc2.weight.float()
+                    _sys.__stdout__.write(
+                        f"[FWD step={_dbg_step} L={getattr(self,'layer_number',getattr(self,'_layer_idx',id(self)%10000))}]"
+                        f"  out nan={_o.isnan().any().item()} min={_o.min().item():.4g} max={_o.max().item():.4g} norm={_o.norm().item():.4g}"
+                        f"  fc1w nan={_fc1w.isnan().any().item()} max={_fc1w.abs().max().item():.4g} shape={tuple(_fc1w.shape)}"
+                        f"  fc2w nan={_fc2w.isnan().any().item()} max={_fc2w.abs().max().item():.4g} shape={tuple(_fc2w.shape)}\n"
+                        f"  fc1w[0,:4]={_fc1w[0,:4].tolist()}"
+                        f"  fc1w[32,:4]={_fc1w[32,:4].tolist()}"
+                        f"  fc1w[64,:4]={_fc1w[64,:4].tolist()}\n"
+                    )
+                    _sys.__stdout__.flush()
+            if not getattr(self, '_bwd_hook_registered', False):
+                self._bwd_hook_registered = True
+                _L_ref = self._layer_idx
+                def _module_bwd_hook(module, grad_input, grad_output, _L=_L_ref):
+                    import os as _os, sys as _sys
+                    _step = getattr(module, '_dbg_fwd_step', 1) - 1
+                    _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+                    if int(_os.getenv("SLURM_PROCID", 0)) == 0 and grad_output[0] is not None and _step < _dbg_limit and not torch.cuda.is_current_stream_capturing():
+                        _g = grad_output[0].detach().float()
+                        _sys.__stdout__.write(
+                            f"[FUSED_MLP_BWD step={_step} L={_L}]"
+                            f"  grad nan={_g.isnan().any().item()} min={_g.min().item():.4g} max={_g.abs().max().item():.4g} norm={_g.norm().item():.4g}\n"
+                        )
+                        _sys.__stdout__.flush()
+                self.register_full_backward_hook(_module_bwd_hook)
+            self._dbg_fwd_step = _dbg_step + 1
+
+            # Reshape output back to original leading dims
+            out = out.view(*orig_shape[:-1], out.size(-1))
+
+            # Return bias tensor if requested
+            bias = None
+            if self.linear_fc2.te_return_bias:
+                bias = self.linear_fc2.bias
+                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                    bias = None
+
+            return out, bias
+
+    # -------------------------------------------------------------------------
+    # Monkey-patch GroupedLinear.fuser_backward for TEFusedDenseMLP ops.
+    #
+    # Problem: BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8 is not supported on this
+    # system, so TE falls back to calling GroupedLinear.fuser_backward for FC1 and
+    # FC2. The standard backward tries to swizzle the MXFP8 weight with 1D scaling
+    # mode, which is unsupported and crashes.
+    #
+    # Fix: intercept fuser_backward for ops that have _te_dense_mlp_op (only our
+    # TEFusedDenseMLP ops set this).  Use a simple BF16 dgrad via torch.mm instead.
+    # Regular MoE GroupedLinear ops (no _te_dense_mlp_op) fall through unchanged.
+    #
+    # Weight for dgrad is derived on-the-fly from self.weight0 (BF16 original parameter):
+    #   - FC1 ops (have _glu_interleave_size): re-interleave weight to match forward GEMM.
+    #   - FC2 ops (no _glu_interleave_size): use weight0 directly.
+    # This avoids persisting pre-computed MXFP8 tensors for all 80 layers (~56 GB).
+    # -------------------------------------------------------------------------
+    _orig_gl_fuser_backward = te.pytorch.ops.GroupedLinear.fuser_backward
+
+    def _patched_fuser_backward(self, basic_op_ctxs, grad_output, **kwargs):
+        if not getattr(self, '_te_dense_mlp_op', False):
+            return _orig_gl_fuser_backward(self, basic_op_ctxs, grad_output, **kwargs)
+
+        num_groups = self.num_groups  # always 1 for dense path
+        dtype = getattr(basic_op_ctxs[0], 'dtype', torch.bfloat16)
+
+        # Get BF16 weight from self.weight0 (original checkpoint weight, never quantized).
+        w = self.weight0
+        from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+        if isinstance(w, QuantizedTensor):
+            w = w.dequantize()
+        w_bf16 = w.to(torch.bfloat16).detach()
+
+        # BF16 dgrad: dx = grad_output @ W
+        # grad_output from ScaledSwiGLU backward is in standard layout (same as unfused),
+        # so we use original W here — identical to the unfused path.
+        # W is (N, K), grad_output is (M, N) → dx is (M, K).
+        grad_out_2d = grad_output.view(-1, grad_output.size(-1)).to(torch.bfloat16)
+        dx = torch.mm(grad_out_2d, w_bf16).to(dtype)
+        dx = dx.view(*grad_output.shape[:-1], dx.size(-1))
+
+        # DEBUG: log dgrad stats for first 2 steps outside CUDA graph capture.
+        _dbg_bwd_step = getattr(self, '_dbg_bwd_step', 0)
+        import os as _os
+        _dbg_limit = int(_os.getenv("PROFILE_START_STEP", "3"))
+        if not torch.cuda.is_current_stream_capturing() and _dbg_bwd_step < _dbg_limit:
+            import os as _os, sys as _sys
+            _rank = int(_os.getenv("SLURM_PROCID", 0))
+            if _rank == 0:
+                _N_in, _N_out = w_bf16.size(1), w_bf16.size(0)
+                _sys.__stdout__.write(
+                    f"[BWD step={_dbg_bwd_step} L={getattr(self,'layer_number',getattr(self,'_layer_idx',id(self)%10000))} in={_N_in} out={_N_out}]"
+                    f"  w nan={w_bf16.isnan().any().item()} max={w_bf16.abs().max().item():.4g}"
+                    f"  grad nan={grad_out_2d.isnan().any().item()} min={grad_out_2d.min().item():.4g} max={grad_out_2d.abs().max().item():.4g} norm={grad_out_2d.norm().item():.4g}"
+                    f"  dx nan={dx.isnan().any().item()} min={dx.min().item():.4g} max={dx.abs().max().item():.4g} norm={dx.norm().item():.4g}"
+                    f"  glu={getattr(self, '_glu_interleave_size', None)}\n"
+                )
+                _sys.__stdout__.flush()
+        self._dbg_bwd_step = _dbg_bwd_step + 1
+
+        # wgrad: skip — base weights are frozen in LoRA training.
+        grad_params = [[None]] * num_groups  # one param (weight0) per group
+
+        # grad_extra_inputs: split_sizes has no gradient.
+        grad_extra_inputs = [None]
+
+        return dx, grad_params, grad_extra_inputs
+
+    # Only apply BF16 dgrad fallback when fused MXFP8 backward is not available.
+    # When TE_DENSE_MLP_UNFUSED_BWD=1, BackwardGroupedMLP handles dgrad via separate GEMMs.
+    import os as _os
+    if _os.getenv("TE_DENSE_MLP_UNFUSED_BWD", "0") != "1":
+        te.pytorch.ops.GroupedLinear.fuser_backward = _patched_fuser_backward
+
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
+    TEFusedDenseMLP = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
@@ -2557,3 +3145,20 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+# Patch DDP.disable_forward_pre_hook to be idempotent.
+# train.py calls disable_forward_pre_hook() right after on_train_start() returns,
+# assuming hooks are currently enabled. If the warmup callback leaves them disabled
+# for any reason, that call crashes with KeyError/AssertionError at line 375 of
+# distributed_data_parallel.py. Making it a no-op when already disabled is safe.
+try:
+    from megatron.core.distributed import DistributedDataParallel as _DDP
+    _orig_ddp_disable = _DDP.disable_forward_pre_hook
+    def _safe_ddp_disable(self, param_sync=True):
+        handles = getattr(self, 'remove_forward_pre_hook_handles', {})
+        if not handles or all(v is None for v in handles.values()):
+            return
+        _orig_ddp_disable(self, param_sync=param_sync)
+    _DDP.disable_forward_pre_hook = _safe_ddp_disable
+except Exception:
+    pass
