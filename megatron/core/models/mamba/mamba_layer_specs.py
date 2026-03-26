@@ -18,6 +18,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
+    InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
@@ -199,6 +200,22 @@ mamba_inference_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
-        mtp_block_spec=_mamba_mtp_block_spec,
+        mtp_block_spec=ModuleSpec(
+            module=MultiTokenPredictionBlock,
+            submodules=MultiTokenPredictionBlockSubmodules(
+                layer_specs=[
+                    ModuleSpec(
+                        module=MultiTokenPredictionLayer,
+                        submodules=MultiTokenPredictionLayerSubmodules(
+                            enorm=TENorm,
+                            hnorm=TENorm,
+                            eh_proj=InferenceColumnParallelLinear,
+                            mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                            layer_norm=TENorm,
+                        ),
+                    )
+                ]
+            ),
+        )
     ),
 )

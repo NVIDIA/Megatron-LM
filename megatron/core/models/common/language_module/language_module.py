@@ -332,51 +332,22 @@ class LanguageModule(MegatronModule):
         next_token_ids: Tensor,
         position_ids: Tensor,
         depth: int,
-        runtime_gather_output: bool = True,
-        scatter_hidden_input: bool = True,
-        gather_hidden_output: bool = True,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
         This is called after speculative token verification to compute MTP
         predictions conditioned on verified tokens only.
 
-        By default, the caller passes ``hidden_states`` in full (ungathered)
-        format and receives them back in full format.  The ``scatter_hidden_input``
-        and ``gather_hidden_output`` flags allow the caller to keep tensors in SP
-        (sequence-parallel) format between successive MTP depths, eliminating a
-        redundant gather + scatter round-trip per depth.
-
         Args:
             hidden_states (Tensor): Hidden states at last accepted positions.
-                Full format [N, 1, H] when ``scatter_hidden_input=True``;
-                SP format [N/TP, 1, H] when ``scatter_hidden_input=False``.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
             depth (int): MTP depth index (0-indexed).
-            runtime_gather_output (bool): Whether to gather output across TP.
-            scatter_hidden_input (bool): If True (default), scatter ``hidden_states``
-                from full to SP format before the MTP layer.  Set to False when
-                ``hidden_states`` is already in SP format (e.g. from a previous
-                MTP depth).
-            gather_hidden_output (bool): If True (default), gather the output
-                hidden states back to full format before returning.  Set to False
-                to keep them in SP format for the next MTP depth.
-
+        
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
-                ``new_hidden_states`` is [N, 1, H] when ``gather_hidden_output=True``,
-                or [N/TP, 1, H] when ``gather_hidden_output=False``.
         """
         layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-
-        # When SP is active, the embedding inside forward_single_position
-        # produces scattered output [N/TP, 1, H].  Scatter hidden_states to
-        # match unless the caller already provides SP-format input.
-        if self.config.sequence_parallel and scatter_hidden_input:
-            hidden_states = scatter_to_sequence_parallel_region(
-                hidden_states, group=self.pg_collection.tp
-            )
 
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
@@ -390,17 +361,9 @@ class LanguageModule(MegatronModule):
             output_weight = self.shared_embedding_or_output_weight()
 
         logits, _ = self.output_layer(
-            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+            mtp_hidden, weight=output_weight, runtime_gather_output=True,
         )
         logits = self._scale_logits(logits)
-
-        # Optionally gather mtp_hidden back to full format.  When the caller
-        # chains multiple MTP depths it is more efficient to keep hidden states
-        # in SP format and skip this gather.
-        if self.config.sequence_parallel and gather_hidden_output:
-            mtp_hidden = gather_from_sequence_parallel_region(
-                mtp_hidden, group=self.pg_collection.tp
-            )
 
         return mtp_hidden, logits
 

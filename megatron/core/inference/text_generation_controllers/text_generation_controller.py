@@ -27,7 +27,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -841,9 +841,10 @@ class TextGenerationController:
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
             hidden_states = unwrapped_model._decoder_hidden_states_cache
+
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
-            # the full (gathered) sequence.  Gather before indexing.
+            # the full (gathered) sequence.
             if self.model_config.sequence_parallel:
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states, group=self.inference_wrapped_model.tp_group
@@ -867,15 +868,21 @@ class TextGenerationController:
 
         # Compute padding needed to make batch a multiple of tp_size for SP compatibility.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        pad_count = (tp_size - active_request_count % tp_size) % tp_size
-        padded_count = active_request_count + pad_count
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+        if sp_enabled:
+            pad_count = (tp_size - active_request_count % tp_size) % tp_size
+            padded_count = active_request_count + pad_count
+        else:
+            pad_count = 0
 
-        # Pad hidden states once before the loop.  When SP is enabled, the
-        # hidden states stay in SP format (and padded) across depths — only
-        # logits are stripped per iteration.
-        if has_mtp and pad_count > 0:
-            current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+        # Pad hidden states to align with the tensor parallel size.
+        if has_mtp and sp_enabled:
+            if pad_count > 0:
+                current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+
+            current_hidden = scatter_to_sequence_parallel_region(
+                current_hidden, group=self.inference_wrapped_model.tp_group
+            )
 
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
@@ -889,16 +896,11 @@ class TextGenerationController:
                     token_ids = F.pad(token_ids, (0, pad_count))
                     position_ids = F.pad(position_ids, (0, pad_count))
 
-                # Depth 0: hidden is full-format [padded_N, 1, H] → scatter inside.
-                # Depth 1+: hidden is already SP-format [padded_N/TP, 1, H] → skip scatter.
-                # All depths: keep hidden in SP format on output → skip gather.
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,
                     position_ids=position_ids,
                     depth=depth,
-                    scatter_hidden_input=(depth == 0) if sp_enabled else True,
-                    gather_hidden_output=not sp_enabled,
                 )
 
                 # Strip padding from logits only.  Hidden states stay padded+SP
@@ -1680,31 +1682,26 @@ class TextGenerationController:
         # Pad token_ids/position_ids to nearest multiple of tp_size so that the
         # embedding can reduce-scatter evenly across TP ranks.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        padded_count = tp_size  # 1 padded up to tp_size
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+        padded_count = tp_size if sp_enabled else 1
 
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
             # Depth 0 uses full-format hidden; subsequent depths use SP format.
-            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
+            dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
         for depth in range(num_depths):
             mtp_logits_2d = None
             if has_mtp:
-                # Mirror the scatter/gather pattern of _compute_serial_mtp_and_sample:
-                # depth 0 scatters full-format input; subsequent depths receive SP format.
-                # Hidden output stays in SP format between depths.
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
                     position_ids=dummy_position_ids,
                     depth=depth,
-                    scatter_hidden_input=(depth == 0) if sp_enabled else True,
-                    gather_hidden_output=not sp_enabled,
                 )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
