@@ -25,7 +25,8 @@ from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
-from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
+# Lazy: NVSHMEMCopyService triggers heavy CUDA/nvshmem init on import
+# from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 
 # Supported refit backend names
@@ -118,6 +119,7 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
+        from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
         service = NVSHMEMCopyService(group=group)
     else:
         raise ValueError(f"Unknown backend '{backend}'")
