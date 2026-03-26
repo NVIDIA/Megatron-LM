@@ -564,18 +564,6 @@ def _pad_unpad(inp, pad):
     return result
 
 
-class PadUnpadFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inp, pad):
-        result = _pad_unpad(inp, pad)
-        ctx.pad = not pad
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        return _pad_unpad(grad_out, ctx.pad), None
-
-
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -1013,11 +1001,6 @@ class TEGroupedMLP(MegatronModule):
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
         # if the number of tokens is 0, pad the hidden states to 256
-        apply_pad_unpad = False
-        if permuted_local_hidden_states.shape[0] == 0 and not torch.cuda.is_current_stream_capturing():
-            apply_pad_unpad = True
-            permuted_local_hidden_states = PadUnpadFunction.apply(permuted_local_hidden_states, True)
-            permuted_probs = PadUnpadFunction.apply(permuted_probs, True)
 
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
@@ -1044,8 +1027,6 @@ class TEGroupedMLP(MegatronModule):
                 permuted_probs,  # Scaled SwiGLU
                 tokens_per_expert,  # FC2
             )
-        if apply_pad_unpad:
-            output = PadUnpadFunction.apply(output, False)
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
