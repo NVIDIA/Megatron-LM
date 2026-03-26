@@ -24,19 +24,11 @@ _TOKEN_ID_FIELDS_TO_REDACT = {
     "generation_token_ids",
 }
 
-_INDEX_FIELDS_TO_REDACT = {
-    "routing_indices",
-    "moe_topk_indices",
-    "prompt_moe_topk_indices",
-}
+_INDEX_FIELDS_TO_REDACT = {"routing_indices", "moe_topk_indices", "prompt_moe_topk_indices"}
 
-_HASH_FIELDS_TO_REDACT = {
-    "precomputed_block_hashes",
-}
+_HASH_FIELDS_TO_REDACT = {"precomputed_block_hashes"}
 
-_NUMERIC_SERIES_FIELDS_TO_REDACT = {
-    "tpot",
-}
+_NUMERIC_SERIES_FIELDS_TO_REDACT = {"tpot"}
 
 
 def _is_int_list_like(value):
@@ -50,10 +42,7 @@ def _is_numeric_list_like(value):
     """Return True for numeric lists, including nested numeric lists."""
     if not isinstance(value, list):
         return False
-    return all(
-        isinstance(item, (int, float)) or _is_numeric_list_like(item)
-        for item in value
-    )
+    return all(isinstance(item, (int, float)) or _is_numeric_list_like(item) for item in value)
 
 
 def _redact_token_id_lists_for_logging(value):
@@ -62,21 +51,15 @@ def _redact_token_id_lists_for_logging(value):
         redacted = {}
         for key, item in value.items():
             if (
-                (
-                    key in _TOKEN_ID_FIELDS_TO_REDACT
-                    or key in _INDEX_FIELDS_TO_REDACT
-                    or key in _HASH_FIELDS_TO_REDACT
-                    or key.endswith("_token_ids")
-                    or key.endswith("_topk_indices")
-                    or key.endswith("_hashes")
-                )
-                and _is_int_list_like(item)
-            ):
+                key in _TOKEN_ID_FIELDS_TO_REDACT
+                or key in _INDEX_FIELDS_TO_REDACT
+                or key in _HASH_FIELDS_TO_REDACT
+                or key.endswith("_token_ids")
+                or key.endswith("_topk_indices")
+                or key.endswith("_hashes")
+            ) and _is_int_list_like(item):
                 redacted[key] = "...truncated..."
-            elif (
-                key in _NUMERIC_SERIES_FIELDS_TO_REDACT
-                and _is_numeric_list_like(item)
-            ):
+            elif key in _NUMERIC_SERIES_FIELDS_TO_REDACT and _is_numeric_list_like(item):
                 redacted[key] = "...truncated..."
             else:
                 redacted[key] = _redact_token_id_lists_for_logging(item)
@@ -201,9 +184,7 @@ def _normalize_tool_calls(tool_calls, tools=None):
                 )
         elif isinstance(fn_args, dict):
             fn_args = json.dumps(
-                _normalize_structured_tool_arguments(
-                    fn_args, fn_name, tool_argument_schemas
-                ),
+                _normalize_structured_tool_arguments(fn_args, fn_name, tool_argument_schemas),
                 ensure_ascii=False,
             )
         else:
@@ -713,7 +694,9 @@ try:
             message_text = text_output
 
             if parsers:
-                message_text, metadata = apply_parsers(message_text, tools, parsers, tools_requested)
+                message_text, metadata = apply_parsers(
+                    message_text, tools, parsers, tools_requested
+                )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
             message = {
