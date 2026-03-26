@@ -1044,13 +1044,6 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
     stash_manager.current_vp_stage = vp_stage if vp_stage is not None else 0
     stash_manager.update_model_chunk(stash_manager.current_vp_stage)
 
-def paged_stash_set_last_layer(is_last_layer=False):
-    """Set the last layer flag."""
-    stash_manager = PagedStashManager.get_instance()
-    if not stash_manager.enabled:
-        return
-    stash_manager._last_layer = is_last_layer
-
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
