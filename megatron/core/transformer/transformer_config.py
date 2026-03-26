@@ -1194,6 +1194,14 @@ class TransformerConfig(ModelParallelConfig):
                     "(e.g. squared_relu)."
                 )
 
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
+
             assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
