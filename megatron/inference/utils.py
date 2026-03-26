@@ -70,9 +70,7 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
         backend = args.inference_grouped_gemm_backend
-        if backend == "auto":
-            quant_backend = "flashinfer"
-        elif backend == "torch":
+        if backend == "auto" or backend == "torch":
             quant_backend = "triton"
         elif backend == "te":
             raise ValueError(
