@@ -343,11 +343,11 @@ class DataParallelInferenceCoordinator:
             row = self._hash_table.get(hashes[i])
             if row is None:
                 continue
+            rank_idxs = np.fromiter(row.keys(), dtype=np.intp)
             present = np.zeros(n_ranks, dtype=bool)
+            present[rank_idxs] = True
             recency = np.zeros(n_ranks, dtype=np.float64)
-            for rank_idx, ts in row.items():
-                present[rank_idx] = True
-                recency[rank_idx] = ts
+            recency[rank_idxs] = np.fromiter(row.values(), dtype=np.float64)
             if present.any():
                 return present.astype(np.float64) * ((i + 1.0) / n), recency
         return zeros, zeros.copy()
