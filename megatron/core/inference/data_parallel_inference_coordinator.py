@@ -235,6 +235,26 @@ class DataParallelInferenceCoordinator:
         self._round_robin_idx = idx + 1
         return identities[idx]
 
+    def _register_rank_identity(self, identity):
+        """Register a new rank identity in the scoring data structures.
+
+        Called when a rank dynamically connects to a running coordinator
+        (e.g. in tests that spawn the coordinator with data_parallel_size=0
+        and let engines register after the fact).
+        """
+        if identity in self.identity_to_rank_index:
+            return
+        new_idx = len(self._identities_list)
+        self.identity_to_rank_index[identity] = new_idx
+        self._identities_list.append(identity)
+        self._pending_counts = np.append(self._pending_counts, np.int32(0))
+        logging.info(
+            "Coordinator: registered engine %s as rank index %d (now %d engines)",
+            identity,
+            new_idx,
+            len(self._identities_list),
+        )
+
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
@@ -372,6 +392,7 @@ class DataParallelInferenceCoordinator:
             if serialized_payload == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
+                    self._register_rank_identity(sender_identity)
                 continue
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
