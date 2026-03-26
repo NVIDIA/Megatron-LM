@@ -88,6 +88,7 @@ class DataParallelInferenceCoordinator:
         pipe_connection: Connection,
         data_parallel_size: int,
         tokenizer,
+        max_requests,
         inference_coordinator_port: int | None = None,
         deterministic_mode: bool = False,
         block_size_tokens: int | None = None,
@@ -95,9 +96,9 @@ class DataParallelInferenceCoordinator:
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
-        schedule_output_path: str | None = None,
         prefix_caching_routing_alpha: float = 0.5,
-        max_requests: int = 0,
+        schedule_output_path: str | None = None,
+        hostname: str | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -137,7 +138,7 @@ class DataParallelInferenceCoordinator:
         #    the user that had submitted the request originally.
 
         # Get local IP.
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
         # Raise error if the other side of the connection has dropped.
@@ -594,6 +595,7 @@ class DataParallelInferenceCoordinator:
         ),
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
+        hostname: str | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -619,14 +621,15 @@ class DataParallelInferenceCoordinator:
             pipe_connection,
             data_parallel_size,
             tokenizer,
+            max_requests,
             inference_coordinator_port,
             deterministic_mode=deterministic_mode,
             block_size_tokens=block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
-            schedule_output_path=schedule_output_path,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
-            max_requests=max_requests,
+            schedule_output_path=schedule_output_path,
+            hostname=hostname,
         )
         ready_event.set()
         try:

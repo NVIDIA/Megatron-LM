@@ -426,6 +426,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -463,6 +464,9 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to `socket.gethostname()`. Should be set to a routable
+                address in multi-node settings where gethostname() may return 127.0.0.1.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -495,7 +499,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
@@ -518,6 +522,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
+                    "hostname": hostname,
                 },
             )
             self.inference_coordinator_process.start()
@@ -603,13 +608,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep
+                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=None, hostname=hostname
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
