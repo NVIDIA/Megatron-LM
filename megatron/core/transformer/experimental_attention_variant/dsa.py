@@ -529,7 +529,7 @@ def fwd_fused_indexer_loss(
     softmax_scale: float,
     loss_coeff: float,
     sparse_loss: Optional[bool] = False,
-    index_mask: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     ASq, AB, AH, AD = attn_query.shape
     ASk = attn_key.shape[0]
@@ -545,6 +545,9 @@ def fwd_fused_indexer_loss(
     attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
 
     if sparse_loss:
+        index_mask = torch.full(
+            (AB, ASq, ASk), float("-inf"), dtype=torch.float32, device=index_scores.device
+        ).scatter_(-1, topk_indices, 0)
         stride_imb = index_mask.stride(0)
         stride_ims = index_mask.stride(1)
         stride_imk = index_mask.stride(2)
@@ -692,10 +695,11 @@ def fwd_fused_indexer_loss(
             dtype=tl_dtype,
         )
 
+        index_scores = index_scores.contiguous()
         if sparse_loss:
             out_loss = kernel(
                 attn_query, attn_key,
-                index_scores.contiguous(), 
+                index_scores, 
                 index_mask,
                 softmax_m, softmax_d,
                 softmax_m1, softmax_d1,
@@ -703,7 +707,7 @@ def fwd_fused_indexer_loss(
         else:
             out_loss = kernel(
                 attn_query, attn_key,
-                index_scores.contiguous(),
+                index_scores,
                 softmax_m, softmax_d,
                 softmax_m1, softmax_d1,
             )
@@ -1027,15 +1031,6 @@ def fwd_fused_indexer_loss_naive(
         )
     else:
         print("###############use fused indexer loss################")
-        sq, b, np, hn = query.size()
-        sk = key.size(0)
-
-        if sparse_loss:
-            index_mask = torch.full(
-                (b, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
-            ).scatter_(-1, topk_indices, 0)
-        else:
-            index_mask = None
         indexer_loss = fwd_fused_indexer_loss(
             index_scores,
             query,
@@ -1043,7 +1038,7 @@ def fwd_fused_indexer_loss_naive(
             softmax_scale,
             loss_coeff,
             sparse_loss,
-            index_mask,
+            topk_indices,
         )
 
     return topk_indices, indexer_loss
