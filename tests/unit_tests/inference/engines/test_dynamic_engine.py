@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import math
+import os
 import random
 import types
 from dataclasses import dataclass, field
@@ -2920,3 +2921,226 @@ class TestDynamicInferenceEngine:
 
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
+
+
+CHUNKED_CG_BLOCK_SIZE = 256
+CHUNKED_CG_VOCAB_SIZE = 10000
+CHUNKED_CG_MAX_SEQ_LEN = 2048
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
+class TestChunkedPrefillCudaGraphs:
+    """Verify correctness across chunked prefill and CUDA graph combinations.
+
+    For each model type, runs a baseline config (no chunked prefill, no CUDA graphs)
+    and compares output tokens against every other combination.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    def _create_model(self, model_provider, num_cuda_graphs):
+        """Create a GPT or Mamba model with optional CUDA graph support."""
+        cuda_graph_impl = "local" if num_cuda_graphs else "none"
+
+        if model_provider == "gpt":
+            config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=4,
+                hidden_size=32,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                cuda_graph_impl=cuda_graph_impl,
+                inference_rng_tracker=True,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                pipeline_dtype=torch.bfloat16,
+                add_bias_linear=True,
+            )
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_local_spec(),
+                vocab_size=CHUNKED_CG_VOCAB_SIZE,
+                max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
+            ).cuda()
+        elif model_provider == "mamba":
+            config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=3,
+                hidden_size=256,
+                mamba_num_heads=16,
+                num_attention_heads=16,
+                use_cpu_initialization=True,
+                cuda_graph_impl=cuda_graph_impl,
+                inference_rng_tracker=True,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                pipeline_dtype=torch.bfloat16,
+                add_bias_linear=True,
+                is_hybrid_model=True,
+            )
+            model = MambaModel(
+                config=config,
+                mamba_stack_spec=mamba_stack_spec,
+                vocab_size=CHUNKED_CG_VOCAB_SIZE,
+                max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
+                parallel_output=True,
+                hybrid_layer_pattern="M*-",
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
+            ).cuda()
+        else:
+            raise ValueError(f"Invalid model_provider {model_provider}")
+
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+        return model
+
+    def _reset_cuda_graph_state(self, model):
+        """Reset all CUDA graph global and per-module state."""
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        CudaGraphManager.global_mempool = None
+        for module in model.modules():
+            if isinstance(module, CudaGraphManager):
+                module.cudagraph_runners.clear()
+                module.inference_cudagraphs_lookup_table.clear()
+
+    def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
+        """Build an engine with the given chunked prefill / CUDA graph config."""
+        set_rounder(4)
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        inference_config_kwargs = dict(
+            max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
+            buffer_size_gb=0.5,
+            block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
+            materialize_only_last_token_logits=False,
+            unified_memory_level=0,
+            num_cuda_graphs=num_cuda_graphs,
+            use_cuda_graphs_for_non_decode_steps=True,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_tokens=context_max_tokens,
+            max_requests=128,
+        )
+        if mamba_config is not None:
+            inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
+        context = DynamicInferenceContext(
+            model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
+        )
+        wrapper = GPTInferenceWrapper(model, context)
+        wrapper.model_is_pipeline_parallel = not (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        )
+        controller = TextGenerationController(
+            inference_wrapped_model=wrapper,
+            tokenizer=types.SimpleNamespace(
+                vocab_size=CHUNKED_CG_VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
+            ),
+        )
+        self._reset_cuda_graph_state(model)
+        return DynamicInferenceEngine(controller, context)
+
+    def _run_to_completion(self, engine, prompts, num_tokens_to_generate):
+        """Add all prompts and run to completion, returning {req_id: generated_tokens}."""
+        for i, prompt in enumerate(prompts):
+            request = DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
+                ),
+                block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
+            )
+            engine._add_request(request)
+
+        finished = {}
+        step_count = 0
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            step_count += 1
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = list(merged.generated_tokens)
+
+        return finished, step_count
+
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("chunked_prefill", [False, True])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @torch.inference_mode()
+    def test_chunked_prefill_cuda_graphs(self, model_provider, chunked_prefill, num_cuda_graphs):
+        """Verify generated tokens match across chunked prefill and CUDA graph configs."""
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        # Clear NVTE env vars set by conftest set_env fixture.
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+        # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
+        model = self._create_model(model_provider, num_cuda_graphs=2)
+
+        # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
+        device = torch.cuda.current_device()
+        prompts = [
+            torch.arange(i * 600, i * 600 + 512, dtype=torch.int64, device=device) for i in range(3)
+        ]
+        num_tokens_to_generate = 8
+
+        # Token budget: 768 forces chunking when chunked_prefill=True
+        # (only ~1.5 of the 512-token prompts fit per step).
+        context_max_tokens = 768 if chunked_prefill else None
+
+        # Baseline: no chunked prefill, no CUDA graphs.
+        baseline_engine = self._build_engine(
+            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+        )
+        baseline_outputs, baseline_steps = self._run_to_completion(
+            baseline_engine, prompts, num_tokens_to_generate
+        )
+
+        # Test config.
+        test_engine = self._build_engine(
+            model,
+            enable_chunked_prefill=chunked_prefill,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=context_max_tokens,
+        )
+        test_outputs, test_steps = self._run_to_completion(
+            test_engine, prompts, num_tokens_to_generate
+        )
+
+        # Correctness: generated tokens must match baseline.
+        for req_id in range(3):
+            assert baseline_outputs[req_id] == test_outputs[req_id], (
+                f"req {req_id}: baseline {baseline_outputs[req_id]} != "
+                f"test {test_outputs[req_id]} "
+                f"(chunked_prefill={chunked_prefill}, num_cuda_graphs={num_cuda_graphs})"
+            )
+
+        # When chunked prefill is enabled with a constrained token budget, the engine
+        # needs more scheduling steps than the non-chunked baseline.
+        if chunked_prefill:
+            assert test_steps > baseline_steps, (
+                f"chunked prefill should need more steps than baseline "
+                f"({test_steps} <= {baseline_steps})"
+            )
