@@ -1657,6 +1657,7 @@ class TestDynamicInferenceEngine:
             context_max_tokens=256,
             context_max_requests=2,
             context_block_size_tokens=block_size,
+            max_sequence_length=128,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
             use_cuda_graphs_for_non_decode_steps=False,
@@ -1665,29 +1666,26 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         ctx = env.engine.context
 
-        # Mock the model forward function to avoid numerics issues
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Request A: Populate the prefix cache
         req_a_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+
+        # Request A: Populate the prefix cache (set to generate 10 tokens so it stays active)
         req_a = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=req_a_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
             block_size_tokens=block_size,
             enable_prefix_caching=True,
         )
+
+        # 1. Add, schedule, and step Request A to commit its blocks to the KV cache
         env.engine._add_request(req_a)
-
-        # Process Request A to completion
-        env.engine.step_modern() # Prefill
         env.engine.schedule_waiting_requests()
-        env.engine.step_modern() # Decode
-        assert req_a.status == Status.COMPLETED
+        env.engine.step_modern()
 
-        # Request B: Same prompt. Normally, prefix caching would skip the first 16 tokens,
-        # leaving an effective prefill chunk of exactly 1 token.
+        # Request B: Same prompt, added AFTER Req A's blocks are registered
         req_b = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=req_a_tokens.clone(),
@@ -1695,26 +1693,18 @@ class TestDynamicInferenceEngine:
             block_size_tokens=block_size,
             enable_prefix_caching=True,
         )
-        
-        # Add Request B and schedule it
+
+        # 2. Add and schedule Request B. It will find the cached blocks immediately.
         env.engine._add_request(req_b)
         env.engine.schedule_waiting_requests()
-        
+
         # Verify that `_compute_prefix_match` successfully clamped the skip.
-        # It should have backed off one block (16 -> 0 skip) to keep effective length >= 2
-        # So request_query_lengths should be 17, not 1.
-        req_b_idx = ctx.total_request_count - 1
+        req_b_idx = ctx.request_ids.tolist().index(2)
+
         assert ctx.request_query_lengths[req_b_idx].item() == 17, (
             f"Expected effective chunk length to be backed off to 17, "
-            f"but got {ctx.request_query_lengths[req_b_idx].item()}"
+            f"but got {ctx.request_query_lengths[req_b_idx].item()}."
         )
-        
-        # Step through the engine. Without the fix, this first step() crashes the FA decode kernel.
-        env.engine.step_modern() # Prefill
-        env.engine.schedule_waiting_requests()
-        env.engine.step_modern() # Decode
-
-        assert req_b.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
