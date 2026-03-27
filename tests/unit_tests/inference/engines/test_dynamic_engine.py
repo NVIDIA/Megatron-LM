@@ -1640,6 +1640,86 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_prefix_caching_avoid_single_token_effective_chunk(self):
+        """
+        Test that prefix caching combined with chunked prefill avoids leaving exactly
+        1 token for the effective prefill chunk. A 1-token prefill chunk routes to
+        the Flash Attention decode kernel, which crashes due to shape mismatches.
+        """
+        block_size = 16
+        prompt_len = 17  # 1 full block (16) + 1 token
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=1,
+            context_max_tokens=256,
+            context_max_requests=2,
+            context_block_size_tokens=block_size,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid numerics issues
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Request A: Populate the prefix cache
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        env.engine._add_request(req_a)
+
+        # Process Request A to completion
+        env.engine.step_modern() # Prefill
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern() # Decode
+        assert req_a.status == Status.COMPLETED
+
+        # Request B: Same prompt. Normally, prefix caching would skip the first 16 tokens,
+        # leaving an effective prefill chunk of exactly 1 token.
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_a_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        
+        # Add Request B and schedule it
+        env.engine._add_request(req_b)
+        env.engine.schedule_waiting_requests()
+        
+        # Verify that `_compute_prefix_match` successfully clamped the skip.
+        # It should have backed off one block (16 -> 0 skip) to keep effective length >= 2
+        # So request_query_lengths should be 17, not 1.
+        req_b_idx = ctx.total_request_count - 1
+        assert ctx.request_query_lengths[req_b_idx].item() == 17, (
+            f"Expected effective chunk length to be backed off to 17, "
+            f"but got {ctx.request_query_lengths[req_b_idx].item()}"
+        )
+        
+        # Step through the engine. Without the fix, this first step() crashes the FA decode kernel.
+        env.engine.step_modern() # Prefill
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern() # Decode
+
+        assert req_b.status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
