@@ -135,7 +135,6 @@ class MegatronCheckpointLoaderBase:
         try:
             from megatron.training.global_vars import set_global_variables
             from megatron.core import mpu
-            from megatron.legacy import fused_kernels
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             self.queue.put("exit")
@@ -152,7 +151,6 @@ class MegatronCheckpointLoaderBase:
         fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-        fused_kernels.load(self.margs)
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
