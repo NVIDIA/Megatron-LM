@@ -4,13 +4,15 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
-    'ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator'
+    'ConstantNumMicroBatchesCalculator',
+    'RampupBatchsizeNumMicroBatchesCalculator',
+    'StepBatchsizeNumMicroBatchesCalculator',
 ] = None
 
 
@@ -230,7 +232,11 @@ def _build_num_microbatches_calculator(
     decrease_batch_size_if_needed: bool,
     step_batch_size_schedule: Optional[str] = None,
     seq_length: Optional[int] = None,
-) -> Union['ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator']:
+) -> Union[
+    'ConstantNumMicroBatchesCalculator',
+    'RampupBatchsizeNumMicroBatchesCalculator',
+    'StepBatchsizeNumMicroBatchesCalculator',
+]:
     """Build number of microbatches calculator. Internal helper method.
 
     Args:
@@ -259,9 +265,7 @@ def _build_num_microbatches_calculator(
 
     # Validate mutually exclusive options
     if step_batch_size_schedule is not None and rampup_batch_size is not None:
-        raise ValueError(
-            'Cannot specify both --step-batch-size-schedule and --rampup-batch-size'
-        )
+        raise ValueError('Cannot specify both --step-batch-size-schedule and --rampup-batch-size')
 
     # Step batch size schedule
     if step_batch_size_schedule is not None:
@@ -271,9 +275,7 @@ def _build_num_microbatches_calculator(
                 '--decrease-batch-size-if-needed'
             )
         if global_batch_size is not None and rank == 0:
-            logger.warning(
-                '--global-batch-size is ignored when using --step-batch-size-schedule'
-            )
+            logger.warning('--global-batch-size is ignored when using --step-batch-size-schedule')
         num_microbatches_calculator = StepBatchsizeNumMicroBatchesCalculator(
             micro_batch_size=micro_batch_size,
             data_parallel_size=data_parallel_size,
@@ -285,9 +287,9 @@ def _build_num_microbatches_calculator(
 
     # Batch size ramp up
     elif rampup_batch_size is not None:
-        assert global_batch_size is not None, (
-            '--global-batch-size is required when using --rampup-batch-size'
-        )
+        assert (
+            global_batch_size is not None
+        ), '--global-batch-size is required when using --rampup-batch-size'
         assert len(rampup_batch_size) == 3, (
             'expected the following '
             'format: --rampup-batch-size <start batch size> '
@@ -315,9 +317,9 @@ def _build_num_microbatches_calculator(
 
     # Constant batch size
     else:
-        assert global_batch_size is not None, (
-            '--global-batch-size is required when not using --step-batch-size-schedule'
-        )
+        assert (
+            global_batch_size is not None
+        ), '--global-batch-size is required when not using --step-batch-size-schedule'
         num_microbatches_calculator = ConstantNumMicroBatchesCalculator(
             global_batch_size,
             micro_batch_size,
@@ -582,6 +584,7 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             self.current_running_global_batch_size // self.micro_batch_times_data_parallel_size
         )
 
+
 class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
     """Calculator of number of microbatches with arbitrary step-wise batch size schedule.
 
@@ -637,7 +640,9 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         if rank == 0:
             logger.info(f'> initializing step batch size schedule')
             logger.info(f'  raw schedule string: "{schedule}"')
-            logger.info(f'  seq_length: {seq_length} (thresholds interpreted as {"tokens" if seq_length else "samples"})')
+            logger.info(
+                f'  seq_length: {seq_length} (thresholds interpreted as {"tokens" if seq_length else "samples"})'
+            )
             logger.info(f'  micro_batch_size: {micro_batch_size}')
             logger.info(f'  data_parallel_size: {data_parallel_size}')
             logger.info(f'step batch size schedule ({len(self.schedule)} steps):')
@@ -645,9 +650,13 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 num_microbatches = batch_size // self.micro_batch_times_data_parallel_size
                 if seq_length:
                     tokens = threshold * seq_length
-                    logger.info(f'  >= {tokens:,} tokens ({threshold:,} samples) -> batch_size={batch_size}, num_microbatches={num_microbatches}')
+                    logger.info(
+                        f'  >= {tokens:,} tokens ({threshold:,} samples) -> batch_size={batch_size}, num_microbatches={num_microbatches}'
+                    )
                 else:
-                    logger.info(f'  >= {threshold:,} samples -> batch_size={batch_size}, num_microbatches={num_microbatches}')
+                    logger.info(
+                        f'  >= {threshold:,} samples -> batch_size={batch_size}, num_microbatches={num_microbatches}'
+                    )
         # Initialize
         self.update(0, consistency_check=False, verbose=True)
 
@@ -673,9 +682,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         return int(float(value_str) * multiplier)
 
     @classmethod
-    def _parse_schedule(
-        cls, schedule_str: str, seq_length: Optional[int]
-    ) -> List[Tuple[int, int]]:
+    def _parse_schedule(cls, schedule_str: str, seq_length: Optional[int]) -> List[Tuple[int, int]]:
         """Parse schedule string into list of (threshold_samples, batch_size) tuples.
 
         Args:
@@ -712,9 +719,9 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
     def _validate_schedule(self) -> None:
         """Validate the parsed schedule."""
         assert len(self.schedule) > 0, 'schedule must have at least one entry'
-        assert self.schedule[0][0] == 0, (
-            f'first schedule entry must have threshold 0, got {self.schedule[0][0]}'
-        )
+        assert (
+            self.schedule[0][0] == 0
+        ), f'first schedule entry must have threshold 0, got {self.schedule[0][0]}'
 
         # Check strictly increasing thresholds
         for i in range(1, len(self.schedule)):
@@ -753,7 +760,9 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
 
         # Consistency check
         if consistency_check:
-            assert self.current_global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
+            assert (
+                self.current_global_batch_size % self.micro_batch_times_data_parallel_size == 0
+            ), (
                 f'current global batch size ({self.current_global_batch_size}) is not divisible by '
                 f'micro_batch_size ({self.micro_batch_size}) * '
                 f'data_parallel_size ({self.data_parallel_size})'
