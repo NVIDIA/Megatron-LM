@@ -3342,9 +3342,11 @@ class GradReducePipeline:
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > 1:
                 keep_n -= 1
-        self.wait_for_previous_grad_reduce(keep_n)
+
+        with torch.cuda.stream(self.rs_stream):
+            self.wait_for_previous_grad_reduce(keep_n)
 
     def get_ready_bucket_group_for_reduction(self, bucket_id: int) -> Optional[List[int]]:
         """Checks if all buckets in the bucket group containing the given bucket_id
