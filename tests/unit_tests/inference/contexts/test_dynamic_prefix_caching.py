@@ -824,7 +824,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
     def _setup_mixed_batch(self, model_type):
-        """Set up mixed batch: req0 (decode), reqs 1-4 (mixed cached/fresh prefill)."""
+        """Set up mixed batch: req0 (decode), reqs 1-4 (mixed cached/fresh prefill).
+
+        Uses 2-block + tail prompts so cached requests skip 2 full blocks and
+        prefill only the tail, avoiding the single-token-chunk clamp while still
+        producing distinct query lengths for cached vs fresh requests.
+        """
         if model_type == "gpt":
             ctx = self._ctx(block_size_tokens=32)
         else:
@@ -835,63 +840,64 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
                 max_sequence_length=4096,
             )
         bs = ctx.block_size_tokens
+        tail = 5
+        prompt_len = bs * 2 + tail
 
-        prompt0 = self._prompt(bs)
+        prompt0 = self._prompt(prompt_len)
         req0 = self._req(ctx, prompt0.clone())
         ctx.add_request(req0)
 
-        vocab_size = bs + 50
+        vocab_size = prompt_len + 50
         block_hash = req0.precomputed_block_hashes[0]
 
         if model_type == "hybrid":
-            block_id = ctx.kv_block_allocator.kv_hash_to_block_id[block_hash]
-            ctx.mamba_slot_allocator.register_block_hashes_batch([block_id], [block_hash])
+            block_ids_0 = self._block_ids(ctx, 0, 2)
+            for bid in block_ids_0:
+                bh = ctx.kv_block_allocator.block_hashes[bid].item()
+                ctx.mamba_slot_allocator.register_block_hashes_batch([bid], [bh])
 
-        ctx.request_kv_length_offsets[0] += bs
+        ctx.request_kv_length_offsets[0] += prompt_len
         ctx.request_query_lengths[0] = 1
         ctx.request_last_kv_block_offset[0] = 0
         ctx.num_prefill_requests = 0
         ctx.active_token_count = 1
         ctx.token_to_input_ids[0] = 42
-        ctx.token_to_pos_ids[0] = bs
+        ctx.token_to_pos_ids[0] = prompt_len
         ctx.token_to_request_idx[0] = 0
 
         req1 = self._req(ctx, prompt0.clone(), request_id=2)
-        req2 = self._req(ctx, self._prompt(bs, offset=50), request_id=3)
+        req2 = self._req(ctx, self._prompt(prompt_len, offset=50), request_id=3)
         req3 = self._req(ctx, prompt0.clone(), request_id=4)
-        req4 = self._req(ctx, self._prompt(bs, offset=40), request_id=5)
+        req4 = self._req(ctx, self._prompt(prompt_len, offset=40), request_id=5)
 
         if model_type == "hybrid":
-            req1._mamba_num_matched_blocks = 1
+            req1._mamba_num_matched_blocks = 2
             req2._mamba_num_matched_blocks = 0
-            req3._mamba_num_matched_blocks = 1
+            req3._mamba_num_matched_blocks = 2
             req4._mamba_num_matched_blocks = 0
 
         for r in [req1, req2, req3, req4]:
             ctx.add_request(r)
 
-        return ctx, bs, vocab_size, block_hash
+        return ctx, bs, tail, prompt_len, vocab_size, block_hash
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
     def test_mixed_batch(self, model_type):
-        ctx, bs, vocab_size, block_hash = self._setup_mixed_batch(model_type)
+        ctx, bs, tail, prompt_len, vocab_size, block_hash = self._setup_mixed_batch(model_type)
 
-        # For GPT: req1/req3 (identical, 1-block) have effective_prefill_chunk_length=1
-        # For hybrid: req1/req3 have 1 mamba match but 1-block prompt, back-off
-        #   finds no previous block, so prefix_skip_tokens=0, effective=bs
-        if model_type == "gpt":
-            cached_ql = 1
-        else:
-            cached_ql = bs
+        # Cached requests (req1/req3) skip 2 full blocks → query_length == tail.
+        # Fresh requests (req2/req4) have no match → query_length == prompt_len.
+        cached_ql = tail
+        fresh_ql = prompt_len
 
-        # query lengths: decode=1, cached_recompute=cached_ql, fresh=bs
+        # query lengths: decode=1, cached=tail, fresh=prompt_len
         assert ctx.request_query_lengths[0].item() == 1
         assert ctx.request_query_lengths[1].item() == cached_ql
-        assert ctx.request_query_lengths[2].item() == bs
+        assert ctx.request_query_lengths[2].item() == fresh_ql
         assert ctx.request_query_lengths[3].item() == cached_ql
-        assert ctx.request_query_lengths[4].item() == bs
-        assert ctx.active_token_count == 1 + 2 * cached_ql + 2 * bs
+        assert ctx.request_query_lengths[4].item() == fresh_ql
+        assert ctx.active_token_count == 1 + 2 * cached_ql + 2 * fresh_ql
 
         # last_token_logits
         ctx.initialize_attention_state()
@@ -907,9 +913,9 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list) == 5
         assert len(log_probs_list[0]) == 1
         assert len(log_probs_list[1]) == cached_ql
-        assert len(log_probs_list[2]) == bs
+        assert len(log_probs_list[2]) == fresh_ql
         assert len(log_probs_list[3]) == cached_ql
-        assert len(log_probs_list[4]) == bs
+        assert len(log_probs_list[4]) == fresh_ql
 
 
 class TestMambaSlotAllocator(PrefixCachingTestBase):
