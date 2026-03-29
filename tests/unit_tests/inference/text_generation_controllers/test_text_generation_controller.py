@@ -60,6 +60,7 @@ class TestTextGenerationController:
         mtp_num_layers: int = 0,
         sequence_parallel: bool = False,
         expert_model_parallel_size: int = 1,
+        num_moe_experts: int = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -92,6 +93,8 @@ class TestTextGenerationController:
             mtp_num_layers=mtp_num_layers if mtp_num_layers > 0 else None,
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
+            num_moe_experts=num_moe_experts,
+            add_bias_linear=num_moe_experts is None,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -1447,7 +1450,7 @@ class TestTextGenerationController:
             static=False,
             tensor_model_parallel_size=tp_size,
             num_speculative_tokens=num_spec,
-            max_requests=active_request_count + tp_size,
+            max_requests=active_request_count // tp_size * (tp_size * 2),
             mtp_num_layers=num_spec,
             sequence_parallel=True,
         )
@@ -1525,6 +1528,7 @@ class TestTextGenerationController:
             mtp_num_layers=num_spec,
             sequence_parallel=True,
             expert_model_parallel_size=2,
+            num_moe_experts=2,
         )
 
         ctrl = self.text_generation_controller
@@ -1532,20 +1536,37 @@ class TestTextGenerationController:
         # The attribute just needs to exist so the has_mtp check passes.
         unwrapped_model._decoder_hidden_states_cache = True
 
-        # Run the dummy MTP forward pass.
+        # Run the dummy MTP forward path end-to-end.
         ctrl._dummy_serial_mtp_forward()
 
-        # If we get here without error, the MTP forward with SP padding succeeded.
-        assert ctrl.num_mtp_heads == num_spec
+        # Verify compute_mtp_single_step produces correctly-shaped outputs
+        # with the same dummy tensor shapes that _dummy_serial_mtp_forward uses.
+        # padded_count == tp_size when SP is enabled.
+        dummy_hidden = torch.zeros(
+            (1, 1, self.hidden_size), device='cuda', dtype=torch.float32
+        )
+        dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+        dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+
+        hidden_out, logits_out = unwrapped_model.compute_mtp_single_step(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=dummy_positions,
+            depth=0,
+        )
+
+        # Hidden output is in SP format: [padded_count/tp_size, 1, H] = [1, 1, H].
+        assert hidden_out.shape == (1, 1, self.hidden_size)
+        # Logits are gathered: [padded_count, 1, vocab_size] = [tp_size, 1, vocab_size].
+        assert logits_out.shape == (tp_size, 1, self.vocab_size)
 
     def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
-        """Test _dummy_serial_mtp_forward hidden state dimensions with real MTP layers.
+        """Test that chaining MTP depths produces correct SP-format shapes throughout.
 
-        Verifies that the dummy forward path creates correctly-sized tensors and
-        runs the real MTP transformer layers. Depth 0 receives dummy hidden
-        states of shape [1, 1, H]; subsequent depths receive the actual MTP
-        output in SP format [1, 1, H] (since padded_count == tp_size, and
-        SP scatter produces padded_count/tp_size = 1).
+        Calls compute_mtp_single_step for multiple depths, feeding each depth's
+        hidden output into the next, verifying that hidden states stay in SP
+        format [padded_count/tp_size, 1, H] and logits are always gathered to
+        [padded_count, 1, vocab_size].
         """
         tp_size = 2
         num_spec = 2
@@ -1558,17 +1579,34 @@ class TestTextGenerationController:
             mtp_num_layers=num_spec,
             sequence_parallel=True,
             expert_model_parallel_size=2,
+            num_moe_experts=2,
         )
 
         ctrl = self.text_generation_controller
         unwrapped_model = ctrl.inference_wrapped_model.model
-        unwrapped_model._decoder_hidden_states_cache = True
 
-        # Run twice to verify it's repeatable (important for stateful SP operations).
-        for _ in range(2):
-            unwrapped_model._decoder_hidden_states_cache = True
-            ctrl._dummy_serial_mtp_forward()
+        # Simulate the dummy forward tensor shapes: padded_count == tp_size.
+        current_hidden = torch.zeros(
+            (1, 1, self.hidden_size), device='cuda', dtype=torch.float32
+        )
+        dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+        dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
-        # Verify the model's MTP block is intact after dummy forwards.
-        assert unwrapped_model.mtp is not None
-        assert len(unwrapped_model.mtp.layers) == num_spec
+        for depth in range(num_spec):
+            current_hidden, logits = unwrapped_model.compute_mtp_single_step(
+                hidden_states=current_hidden,
+                next_token_ids=dummy_tokens,
+                position_ids=dummy_positions,
+                depth=depth,
+            )
+
+            # Hidden stays in SP format across all depths.
+            assert current_hidden.shape == (1, 1, self.hidden_size), (
+                f"Depth {depth}: expected hidden shape (1, 1, {self.hidden_size}), "
+                f"got {current_hidden.shape}"
+            )
+            # Logits are always gathered to full padded_count.
+            assert logits.shape == (tp_size, 1, self.vocab_size), (
+                f"Depth {depth}: expected logits shape ({tp_size}, 1, {self.vocab_size}), "
+                f"got {logits.shape}"
+            )
