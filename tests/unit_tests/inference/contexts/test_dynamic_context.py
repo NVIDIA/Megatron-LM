@@ -2189,7 +2189,11 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 3, device='cuda')
+        # Use bs * 3 + 5 tokens so the prompt extends past the last full block.
+        # This avoids the single-token-chunk clamp (effective_prefill >= 2) and
+        # verifies that the prefix skip actually works.
+        tail = 5
+        prompt = torch.arange(bs * 3 + tail, device='cuda')
 
         # First request registers blocks.
         req1 = DynamicInferenceRequest(
@@ -2222,11 +2226,9 @@ class TestDynamicContext:
         for bid in first_blocks:
             assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
-        # Second request should skip prefix tokens. The clamping logic in
-        # _compute_prefix_match prevents effective_prefill_chunk_length == 1
-        # (which would mis-route into the decode kernel), so with 3 blocks the
-        # skip is rounded down to 2 blocks (64 tokens) leaving query_length == 32.
-        assert ctx.request_query_lengths[1].item() == 32
+        # Second request should skip the 3 full cached blocks (96 tokens),
+        # leaving only the trailing tokens as the query.
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2247,7 +2249,10 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        # Use bs * 2 + 5 tokens so the prompt extends past the last full block,
+        # avoiding the single-token-chunk clamp while still testing the skip.
+        tail = 5
+        prompt = torch.arange(bs * 2 + tail, device='cuda')
 
         # First request.
         req1 = DynamicInferenceRequest(
@@ -2269,10 +2274,10 @@ class TestDynamicContext:
         )
         ctx.add_request(req2)
 
-        # Full match: prefix_skip = min(2 * bs, 2*bs - 1) = 2*bs - 1
-        expected_skip = 2 * bs - 1
+        # 2 full blocks match → prefix_skip = 2 * bs = 64, query_length = tail.
+        expected_skip = 2 * bs
         assert ctx.request_kv_length_offsets[1].item() == expected_skip
-        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
