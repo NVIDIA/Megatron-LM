@@ -20,11 +20,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import (
-    SequentialMLP,
-    TEGroupedMLP,
-    TEGroupedMLPSubmodules,
-)
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
@@ -81,7 +77,7 @@ class TESpecProvider(BackendSpecProvider):
         if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
             return partial(
                 TEGroupedMLP,
-                submodules=TEGroupedMLPSubmodules(
+                submodules=GroupedMLPSubmodules(
                     linear_fc1=TEColumnParallelGroupedLinear,
                     linear_fc2=TERowParallelGroupedLinear,
                     activation_func=self.activation_func(),
