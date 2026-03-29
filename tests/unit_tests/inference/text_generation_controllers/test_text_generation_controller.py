@@ -29,7 +29,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_mtp_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -104,9 +107,7 @@ class TestTextGenerationController:
         mtp_block_spec = None
         if mtp_num_layers > 0:
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config=transformer_config,
-                spec=layer_spec,
-                use_transformer_engine=False,
+                config=transformer_config, spec=layer_spec, use_transformer_engine=False
             )
 
         gpt_model = GPTModel(
@@ -1402,12 +1403,7 @@ class TestTextGenerationController:
 
         captured_position_ids = []
 
-        def mock_compute_mtp_single_step(
-            hidden_states,
-            next_token_ids,
-            position_ids,
-            depth,
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             captured_position_ids.append(position_ids.clone())
             return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
 
@@ -1480,9 +1476,7 @@ class TestTextGenerationController:
         s_total = active_request_count + pad
 
         torch.manual_seed(42)
-        full_hidden = torch.randn(
-            s_total, 1, self.hidden_size, device='cuda', dtype=torch.float32
-        )
+        full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=torch.float32)
         # Broadcast so every rank starts from the same full tensor.
         torch.distributed.broadcast(full_hidden, src=0)
 
@@ -1493,9 +1487,7 @@ class TestTextGenerationController:
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [
-            (list(range(active_request_count)), 1.0, 1, 0.0)
-        ]
+        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
@@ -1542,9 +1534,7 @@ class TestTextGenerationController:
         # Verify compute_mtp_single_step produces correctly-shaped outputs
         # with the same dummy tensor shapes that _dummy_serial_mtp_forward uses.
         # padded_count == tp_size when SP is enabled.
-        dummy_hidden = torch.zeros(
-            (1, 1, self.hidden_size), device='cuda', dtype=torch.float32
-        )
+        dummy_hidden = torch.zeros((1, 1, self.hidden_size), device='cuda', dtype=torch.float32)
         dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
@@ -1586,9 +1576,7 @@ class TestTextGenerationController:
         unwrapped_model = ctrl.inference_wrapped_model.model
 
         # Simulate the dummy forward tensor shapes: padded_count == tp_size.
-        current_hidden = torch.zeros(
-            (1, 1, self.hidden_size), device='cuda', dtype=torch.float32
-        )
+        current_hidden = torch.zeros((1, 1, self.hidden_size), device='cuda', dtype=torch.float32)
         dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
