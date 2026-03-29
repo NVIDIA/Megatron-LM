@@ -254,9 +254,12 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
     def test_prefill_token_savings(self):
         bs = 32
 
-        # enabled vs disabled
+        # enabled vs disabled – use a non-block-aligned prompt so the second
+        # request's effective prefill chunk after prefix skipping is > 1, which
+        # avoids the single-token-chunk clamp in _compute_prefix_match.
+        tail = 5
         ctx_on = self._ctx()
-        prompt = self._prompt(bs * 4)
+        prompt = self._prompt(bs * 4 + tail)
         ctx_on.add_request(self._req(ctx_on, prompt.clone()))
         ctx_on.add_request(self._req(ctx_on, prompt.clone(), request_id=2))
         ctx_off = self._ctx(enable_prefix_caching=False)
@@ -264,8 +267,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx_off.add_request(
             self._req(ctx_off, prompt.clone(), request_id=2, enable_prefix_caching=False)
         )
-        assert ctx_on.lifetime_prefill_token_count == bs * 4 + 1
-        assert ctx_off.lifetime_prefill_token_count == bs * 4 * 2
+        # With caching: first request prefills all tokens, second skips 4 full blocks.
+        assert ctx_on.lifetime_prefill_token_count == (bs * 4 + tail) + tail
+        assert ctx_off.lifetime_prefill_token_count == (bs * 4 + tail) * 2
 
         # partial match reduces proportionally
         ctx2 = self._ctx()
@@ -276,20 +280,21 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2b, request_id=2))
         assert ctx2.lifetime_prefill_token_count == bs * 3 + bs
 
-        # full match: recompute-based back-off (1 token recomputed per duplicate)
+        # full match: duplicates skip all full cached blocks
+        tail = 5
         ctx3 = self._ctx()
         alloc3 = ctx3.kv_block_allocator
-        p3 = self._prompt(bs * 3)
+        p3 = self._prompt(bs * 3 + tail)
         ctx3.add_request(self._req(ctx3, p3.clone()))
         tokens_after = ctx3.active_token_count
         first_blocks = self._block_ids(ctx3, 0, 3)
         for i in range(5):
             ctx3.add_request(self._req(ctx3, p3.clone(), request_id=i + 2))
-            assert ctx3.request_query_lengths[i + 1].item() == 1
-        assert ctx3.active_token_count - tokens_after == 5
+            assert ctx3.request_query_lengths[i + 1].item() == tail
+        assert ctx3.active_token_count - tokens_after == 5 * tail
         for bid in first_blocks:
             assert alloc3.block_ref_counts[bid].item() == 6
-        assert ctx3.lifetime_prefill_token_count == bs * 3 + 5
+        assert ctx3.lifetime_prefill_token_count == (bs * 3 + tail) + 5 * tail
 
         # no match: full prompt added
         ctx4 = self._ctx()
