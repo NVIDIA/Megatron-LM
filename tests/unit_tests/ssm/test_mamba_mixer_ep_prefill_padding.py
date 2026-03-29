@@ -24,6 +24,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -76,6 +77,7 @@ class TestMambaMixerEPPrefillPadding:
             use_cpu_initialization=True,
             params_dtype=torch.bfloat16,
             bf16=True,
+            attention_backend=AttnBackend.local,
         )
         model = MambaModel(
             config=config,
@@ -151,9 +153,7 @@ class TestMambaMixerEPPrefillPadding:
         if rank % 2 == 1:
             new_req = DynamicInferenceRequest(
                 request_id=100 + rank,
-                prompt_tokens=torch.arange(
-                    self.PROMPT_LEN * 2, dtype=torch.long, device="cuda"
-                ),
+                prompt_tokens=torch.arange(self.PROMPT_LEN * 2, dtype=torch.long, device="cuda"),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
             ctx.add_request(new_req)
@@ -167,9 +167,9 @@ class TestMambaMixerEPPrefillPadding:
         # Verify: on even ranks (decode-only), strict EP sync should have
         # given us padded_prefill_count > 0 because odd ranks have prefill.
         if rank % 2 == 0:
-            assert ctx.batch_dimensions.prefill_req_count == 0, (
-                "Even ranks should have 0 real prefill requests"
-            )
+            assert (
+                ctx.batch_dimensions.prefill_req_count == 0
+            ), "Even ranks should have 0 real prefill requests"
             # The padded dims should have prefill slots due to EP sync
             assert padded.prefill_req_count > 0, (
                 f"Rank {rank}: expected padded_prefill_count > 0 after EP sync, "
@@ -185,18 +185,14 @@ class TestMambaMixerEPPrefillPadding:
         ep_group = parallel_state.get_expert_model_parallel_group()
         dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
         dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
-        assert tc_max.item() == tc_min.item(), (
-            f"Padded token count mismatch: min={tc_min.item()}, max={tc_max.item()}"
-        )
+        assert (
+            tc_max.item() == tc_min.item()
+        ), f"Padded token count mismatch: min={tc_min.item()}, max={tc_max.item()}"
 
         # Phase 4: Run the Mamba mixer directly with padded hidden states.
         mixer = _get_mamba_mixer(model)
         hidden_states = torch.randn(
-            padded.token_count,
-            1,
-            self.HIDDEN_SIZE,
-            device="cuda",
-            dtype=model.config.params_dtype,
+            padded.token_count, 1, self.HIDDEN_SIZE, device="cuda", dtype=model.config.params_dtype
         )
 
         out, out_bias = mixer._dynamic_inference(hidden_states, ctx)
