@@ -6,8 +6,10 @@ import torch
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dca import (
+    HAVE_FLASH_ATTN,
     DCASubmodules,
     DualChunkAttention,
+    _get_yarn_mscale,
     _merge_chunk_attention_outputs,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -338,3 +340,42 @@ class TestDualChunkAttentionForward:
             f"Causality violated. Max diff: "
             f"{(output_full[:prefix_len] - output_prefix).abs().max().item()}"
         )
+
+    def test_yarn_mscale_is_applied(self):
+        """Verify that YARN mscale factor is retrieved from config."""
+        config_no_yarn = self._make_config()
+        mscale = _get_yarn_mscale(config_no_yarn)
+        assert mscale == 1.0, f"Default mscale should be 1.0, got {mscale}"
+
+    def test_flash_attn_availability_flag(self):
+        """HAVE_FLASH_ATTN should be a boolean."""
+        assert isinstance(HAVE_FLASH_ATTN, bool)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_FLASH_ATTN,
+        reason="CUDA and FlashAttention required",
+    )
+    def test_flash_attn_vs_unfused_equivalence(self):
+        """FlashAttention and unfused paths should produce similar results."""
+        config = self._make_config(
+            chunk_size=16, local_size=4, num_heads=2, num_kv_heads=2, hidden=32
+        )
+        dca = self._make_dca(config).cuda()
+        head_dim = config.hidden_size // config.num_attention_heads
+
+        seq_len, batch = 32, 1
+        torch.manual_seed(42)
+        query = torch.randn(seq_len, batch, config.num_attention_heads, head_dim).cuda()
+        key = torch.randn(seq_len, batch, config.num_query_groups, head_dim).cuda()
+        value = torch.randn(seq_len, batch, config.num_query_groups, head_dim).cuda()
+        rotary = self._make_rotary_pos_emb(seq_len, head_dim, device='cuda')
+
+        fa_output = dca._flash_attention_with_lse(query[:8], key[:8], value[:8], causal=True)
+        unfused_kv = key[:8].repeat_interleave(1, dim=2)
+        unfused_output = dca._unfused_attention_with_lse(
+            query[:8], unfused_kv, value[:8], causal=True
+        )
+
+        assert torch.allclose(
+            fa_output[0], unfused_output[0], atol=1e-3
+        ), f"FA vs unfused max diff: {(fa_output[0] - unfused_output[0]).abs().max().item()}"
