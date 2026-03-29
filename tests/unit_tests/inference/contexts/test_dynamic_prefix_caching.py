@@ -711,15 +711,17 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
-        # recompute-based back-off for KV-only (block-aligned)
+        # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
+        # are skipped and only the trailing tokens remain for prefill.
         ctx4 = self._ctx()
         bs4 = ctx4.block_size_tokens
-        p4 = self._prompt(bs4 * 3)
+        tail = 5
+        p4 = self._prompt(bs4 * 3 + tail)
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
         (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
-        assert len(m4) == 3 and ps4 == 3 * bs4 - 1 and ec4 == 1
+        assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
         # KV eviction invalidates mamba
