@@ -2204,10 +2204,11 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req1)
-        first_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
+        # 3 full blocks are prefix-cacheable; the 4th (partial) block is not.
+        first_full_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
         avail_after_first = ctx.kv_block_allocator.total_avail
 
-        # Second request with same prefix should share all blocks.
+        # Second request with same prefix should share the 3 full blocks.
         req2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
@@ -2216,14 +2217,16 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req2)
-        second_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
+        second_full_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
 
-        # Blocks should be shared (same IDs, no pool consumption).
-        assert first_blocks == second_blocks
-        assert ctx.kv_block_allocator.total_avail == avail_after_first
+        # The 3 full blocks should be shared (same IDs).
+        assert first_full_blocks == second_full_blocks
 
-        # Ref counts should be 2.
-        for bid in first_blocks:
+        # Only 1 new block allocated for the partial tail of the second request.
+        assert ctx.kv_block_allocator.total_avail == avail_after_first - 1
+
+        # Ref counts on the shared full blocks should be 2.
+        for bid in first_full_blocks:
             assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
         # Second request should skip the 3 full cached blocks (96 tokens),
