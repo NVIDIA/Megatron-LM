@@ -2222,8 +2222,11 @@ class TestDynamicContext:
         for bid in first_blocks:
             assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
-        # Second request should skip prefix tokens (query_length == 1 for full match).
-        assert ctx.request_query_lengths[1].item() == 1
+        # Second request should skip prefix tokens. The clamping logic in
+        # _compute_prefix_match prevents effective_prefill_chunk_length == 1
+        # (which would mis-route into the decode kernel), so with 3 blocks the
+        # skip is rounded down to 2 blocks (64 tokens) leaving query_length == 32.
+        assert ctx.request_query_lengths[1].item() == 32
 
     @pytest.mark.internal
     @rounder_override(64)
