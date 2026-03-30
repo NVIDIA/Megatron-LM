@@ -60,8 +60,12 @@ jobs:
             - Architectural opinions or refactoring ideas
             - Performance unless there is a clear, measurable issue
 
-            Provide feedback using inline comments for specific code suggestions.
-            Use top-level comments for general observations.
+            Only use inline ```suggestion blocks for simple, self-contained line replacements (typos,
+            renames, single-line fixes). For structural changes that add, remove, or reorganize blocks
+            of code (e.g. adding a new function, inserting a YAML step, reordering logic), use a
+            top-level PR comment with a code block showing the proposed change instead — inline
+            suggestions cannot express insertions or multi-block restructuring and will break the code
+            if applied.
 
             It's perfectly acceptable to not have anything to comment on.
-            If you do not have anything to comment on, post "LGTM".
+            If you do not have anything to comment on, approve the PR with: gh pr review $PR_NUMBER --repo $REPO --approve --body "LGTM"

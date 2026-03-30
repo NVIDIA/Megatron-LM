@@ -115,7 +115,6 @@ RL_LOGGABLE_TIMER_NAMES = [
     'rl/wait-for-decode-only',
 ]
 
-from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -1040,6 +1039,8 @@ def pretrain(
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
         ):
+            from megatron.rl.parallel_utils import build_inference_pg_collection
+
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
@@ -1456,6 +1457,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
+            kwargs['param_name_patterns_for_fp32_local_accumulation'] = \
+                tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             # Megatron-FSDP arguments.
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
@@ -1640,7 +1643,7 @@ def setup_model_and_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
+                use_gloo_process_groups=args.use_gloo_process_groups,
                 dump_param_to_param_group_map=args.dump_param_to_param_group_map,
             )
         else:
@@ -1648,7 +1651,7 @@ def setup_model_and_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
+                use_gloo_process_groups=args.use_gloo_process_groups,
                 layer_wise_distributed_optimizer='dist' in config.optimizer,
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
