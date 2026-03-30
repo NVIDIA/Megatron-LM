@@ -5,11 +5,18 @@ from unittest import mock
 import pytest
 
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
+
+
+@pytest.fixture(scope='session', autouse=True)
+def disable_msc():
+    MultiStorageClientFeature.disable()
+    yield
 
 
 @pytest.fixture(scope="class")
