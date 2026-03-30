@@ -1063,43 +1063,10 @@ class _ParamAndGradBuffer:
                 bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
                 # For NVFP4, compute grad bucket boundaries separately
                 if self.has_nvfp4_params:
-                    # grad_start of new param = end of current bucket
                     grad_bucket_end_index = _pad_end_of_bucket_if_needed(grad_start)
-                    self.buckets.append(
-                        self._new_bucket(
-                            bucket_params=bucket_params,
-                            start_index=bucket_start_index,
-                            end_index=bucket_end_index,
-                            numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                            bucket_id=cur_bucket_id,
-                            grad_start_index=grad_bucket_start_index,
-                            grad_end_index=grad_bucket_end_index,
-                        )
-                    )
-                    grad_bucket_start_index = grad_bucket_end_index
                 else:
-                    self.buckets.append(
-                        self._new_bucket(
-                            bucket_params=bucket_params,
-                            start_index=bucket_start_index,
-                            end_index=bucket_end_index,
-                            numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                            bucket_id=cur_bucket_id,
-                        )
-                    )
-                bucket_start_index = bucket_end_index
-                bucket_params = []
-                assert cur_bucket_id + 1 == len(self.buckets)
-                assert bucket_id == cur_bucket_id + 1
-                cur_bucket_id = bucket_id
-            bucket_params.append(param)
-
-        # Add remaining params to a new bucket.
-        if len(bucket_params) > 0:
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
-            if self.has_nvfp4_params:
-                # Pad grad_numel for last bucket
-                grad_bucket_end_index = self.grad_numel
+                    grad_bucket_start_index = None
+                    grad_bucket_end_index = None
                 self.buckets.append(
                     self._new_bucket(
                         bucket_params=bucket_params,
@@ -1111,16 +1078,34 @@ class _ParamAndGradBuffer:
                         grad_end_index=grad_bucket_end_index,
                     )
                 )
+                if self.has_nvfp4_params:
+                    grad_bucket_start_index = grad_bucket_end_index
+                bucket_start_index = bucket_end_index
+                bucket_params = []
+                assert cur_bucket_id + 1 == len(self.buckets)
+                assert bucket_id == cur_bucket_id + 1
+                cur_bucket_id = bucket_id
+            bucket_params.append(param)
+
+        # Add remaining params to a new bucket.
+        if len(bucket_params) > 0:
+            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            if self.has_nvfp4_params:
+                grad_bucket_end_index = self.grad_numel
             else:
-                self.buckets.append(
-                    self._new_bucket(
-                        bucket_params=bucket_params,
-                        start_index=bucket_start_index,
-                        end_index=bucket_end_index,
-                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                        bucket_id=cur_bucket_id,
-                    )
+                grad_bucket_start_index = None
+                grad_bucket_end_index = None
+            self.buckets.append(
+                self._new_bucket(
+                    bucket_params=bucket_params,
+                    start_index=bucket_start_index,
+                    end_index=bucket_end_index,
+                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                    bucket_id=cur_bucket_id,
+                    grad_start_index=grad_bucket_start_index,
+                    grad_end_index=grad_bucket_end_index,
                 )
+            )
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
