@@ -2866,7 +2866,6 @@ def train(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            moe_expert_rank_capacity_factor=args.moe_expert_rank_capacity_factor,
         )
 
     def get_e2e_base_metrics():
@@ -3373,7 +3372,6 @@ def evaluate(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            moe_expert_rank_capacity_factor=args.moe_expert_rank_capacity_factor,
         )
 
     if has_nvidia_modelopt:

@@ -1102,8 +1102,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
-    packed_moe_expert_offloading: bool = False
-    """If True, enable packed moe expert offloading."""
+    
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward
     (requires fused grouped GEMM via use_transformer_engine_op_fuser)."""
@@ -1692,9 +1691,8 @@ class TransformerConfig(ModelParallelConfig):
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
         if self.moe_paged_stash:
-            assert not self.cpu_offloading and not self.fine_grained_activation_offloading, (
-                "moe_paged_stash cannot be enabled with cpu_offloading or "
-                "fine_grained_activation_offloading."
+            assert not self.cpu_offloading, (
+                "moe_paged_stash cannot be enabled with cpu_offloading."
             )
             assert self.use_transformer_engine_op_fuser, (
                 "moe_paged_stash currently only works with fused grouped GEMM through "
@@ -1710,16 +1708,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"expert_fc1 or moe_act (paged stash covers those activations). "
                 f"Remove: {moe_offload_conflict}"
             )
-        # Check that Full/Selective recompute for MOE not enabled when paged stash is enabled
-        if self.moe_paged_stash:
-            if self.recompute_granularity == "full":
-                raise ValueError(
-                    "Full recompute is not supported when paged stash is enabled."
-                )
-            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                raise ValueError(
-                    "Selective recompute for MOE is not supported when paged stash is enabled."
-                )
+
         if (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None

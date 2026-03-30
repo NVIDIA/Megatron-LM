@@ -1575,3 +1575,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             return self._comm_manager.over_budget
         else:
             return None
+
+    def reset_over_budget(self):
+        """Reset the accumulated over-budget flag on the communication manager."""
+        if hasattr(self._comm_manager, 'over_budget'):
+            self._comm_manager.over_budget.fill_(0)
