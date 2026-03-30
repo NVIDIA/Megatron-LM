@@ -990,10 +990,16 @@ class TransformerConfig(ModelParallelConfig):
     """The minimum size of the tensor to be offloaded."""
 
     delay_offload_until_cuda_graph: bool = False
-    """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead."""
+    """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead.
+    For more details, see the documentation:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#cuda-graph-integration.
+    """
 
     delta_offload_bytes_across_pp_ranks: int = 0
-    """Difference of offload bytes across PP ranks to balance the offload load."""
+    """Difference of offload bytes across PP ranks to balance the offload load.
+    For more details, see the documentation:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#tuning-parameters.
+    """
 
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
