@@ -1105,18 +1105,11 @@ class TransformerConfig(ModelParallelConfig):
     packed_moe_expert_offloading: bool = False
     """If True, enable packed moe expert offloading."""
     moe_paged_stash: bool = False
-    """If True, enable paged stash for MoE expert activations."""
+    """If True, enable paged stash for all routed-expert activations needed for backward
+    (requires fused grouped GEMM via use_transformer_engine_op_fuser)."""
 
     moe_paged_stash_page_size: int = 64
     """Number of tokens per page for paged stash memory management."""
-
-    stash_modules: Optional[list[str]] = None
-    """The MoE submodules to stash activations for.
-    choices: "expert_fc1", "moe_act", "expert_fc2".
-    "expert_fc1": stash the input of the expert fc1 part.
-    "moe_act": stash the input of the moe activation part.
-    "expert_fc2": stash the input of the expert fc2 part.
-    """
 
     stash_buffer_size_factor_cuda: float = 1.10
     """Scale factor for paged stash CUDA buffer allocation. Sign selects sizing: positive = avg-based,
@@ -1698,32 +1691,24 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
-        if self.packed_moe_expert_offloading:
         if self.moe_paged_stash:
-            assert (
-                not self.cpu_offloading and not self.fine_grained_activation_offloading
-            ), "paged_stash cannot be enabled with cpu_offloading."
-        if self.moe_paged_stash:# vasu
-        if self.moe_paged_stash:
-            assert (
-                self.stash_modules is not None and len(self.stash_modules) > 0
-            ), "stash_modules must be specified when moe_paged_stash is enabled."
-            allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
-            invalid_modules = set(self.stash_modules) - allowed_modules
-            assert not invalid_modules, (
-                f'Invalid choices for stash_modules: {invalid_modules}. '
-                f'Allowed modules are: {allowed_modules}'
+            assert not self.cpu_offloading and not self.fine_grained_activation_offloading, (
+                "moe_paged_stash cannot be enabled with cpu_offloading or "
+                "fine_grained_activation_offloading."
             )
-            assert (
-                self.moe_expert_rank_capacity_factor is not None
-            ), "moe_expert_rank_capacity_factor must be set when moe_paged_stash is enabled."
-
-        # Check that no module is both stashed and offloaded
-        if self.stash_modules and self.offload_modules:
-            overlap = set(self.stash_modules) & set(self.offload_modules)
-            assert not overlap, (
-                f"A module cannot be stashed and offloaded at the same time. "
-                f"Found overlapping modules: {overlap}"
+            assert self.use_transformer_engine_op_fuser, (
+                "moe_paged_stash currently only works with fused grouped GEMM through "
+                "use_transformer_engine_op_fuser."
+            )
+            assert self.moe_expert_rank_capacity_factor is not None, (
+                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                "there is no need to use paged stashing without it."
+            )
+            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            assert not moe_offload_conflict, (
+                "When moe_paged_stash is enabled, offload_modules must not include "
+                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"Remove: {moe_offload_conflict}"
             )
         # Check that Full/Selective recompute for MOE not enabled when paged stash is enabled
         if self.moe_paged_stash:
