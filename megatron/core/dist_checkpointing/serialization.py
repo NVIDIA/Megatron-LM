@@ -391,10 +391,6 @@ def save(
         metadata_finalize_fn()
         return None
 
-    if not isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper):
-        raise CheckpointingException(
-            f'Cannot apply async_save to non-async strategy {sharded_strategy}'
-        )
     async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     return async_request

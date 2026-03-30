@@ -616,6 +616,8 @@ class TorchDistSaveShardedStrategy:
             separation_hint(str, optional): If provided, all tensors whose keys have this
                 prefix will be saved to a separate file.
         """
+        self.backend = backend
+        self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
