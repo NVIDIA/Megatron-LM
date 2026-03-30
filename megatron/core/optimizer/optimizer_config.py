@@ -271,6 +271,10 @@ class OptimizerConfig:
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
+
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
