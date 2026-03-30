@@ -350,11 +350,10 @@ class MultiLatentAttention(Attention):
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn) # this assumes mbs=1
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(hidden_states.size(0), hidden_states.size(1), -1)
+            # Unflatten back: (mbs*seq, np*hn) -> (mbs, seq, np*hn) -> (seq, mbs, np*hn)
+            core_attn_out = core_attn_out.view(
+                hidden_states.size(1), hidden_states.size(0), -1
+            ).transpose(0, 1).contiguous()
 
         if self.recompute_up_proj:
             assert self.qkv_up_checkpoint is not None
@@ -647,12 +646,11 @@ class MLASelfAttention(MultiLatentAttention):
             # kv_compressed = kv_compressed.squeeze(1)
             # k_pos_emb = k_pos_emb.squeeze(1)
 
-            # in case mbs>1 qkv is [t, mbs, h, d]
-            # btw i have (t, mbs, h*d) and not (t, mbs, h, d)
-            seq, mbs, h = q_compressed.size()
-            q_compressed = q_compressed.view(seq*mbs, -1)
-            kv_compressed = kv_compressed.view(seq*mbs, -1)
-            k_pos_emb = k_pos_emb.view(seq*mbs, -1)
+            # Flatten [t, mbs, h] → [mbs*t, h] with transpose so sample 0's
+            # tokens come first, matching cu_seqlens offset ordering.
+            q_compressed = q_compressed.transpose(0, 1).contiguous().view(-1, q_compressed.shape[-1])
+            kv_compressed = kv_compressed.transpose(0, 1).contiguous().view(-1, kv_compressed.shape[-1])
+            k_pos_emb = k_pos_emb.transpose(0, 1).contiguous().view(-1, k_pos_emb.shape[-1])
 
         # =========================================
         # Apply norm
