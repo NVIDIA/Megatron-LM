@@ -616,7 +616,6 @@ class TorchDistSaveShardedStrategy:
             separation_hint(str, optional): If provided, all tensors whose keys have this
                 prefix will be saved to a separate file.
         """
-        super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
@@ -782,7 +781,6 @@ class TorchDistLoadShardedStrategy:
     def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
