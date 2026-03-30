@@ -143,8 +143,8 @@ class SFTDataset(torch.utils.data.Dataset):
             num_shards: number of shards for distributed training
             shard_index: shard index for distributed training
         """
-        if not isinstance(tokenizer, HuggingFaceTokenizer):
-            raise ValueError("SFTDataset only supports HuggingFaceTokenizer!")
+        if not isinstance(tokenizer, (HuggingFaceTokenizer, transformers.PreTrainedTokenizerBase)):
+            raise ValueError("SFTDataset only supports HuggingFaceTokenizer or transformers.PreTrainedTokenizerBase!")
 
         self.num_packed_samples = num_packed_samples
         self.hf_dataset = hf_dataset
@@ -284,7 +284,11 @@ class SFTDataset(torch.utils.data.Dataset):
                 return None
 
         # We always add eos between samples for training purpose.
-        input_ids = self.tokenizer.apply_chat_template(example, self.tokenizer.chat_template)["input_ids"]
+        # apply_chat_template returns List[int] when tokenize=True (default, return_dict=False).
+        # For HuggingFaceTokenizer the chat_template is a required positional arg; for
+        # transformers.PreTrainedTokenizerBase it is a keyword arg - use keyword form for compat.
+        result = self.tokenizer.apply_chat_template(example, chat_template=self.tokenizer.chat_template)
+        input_ids = result["input_ids"] if isinstance(result, dict) else result
         current_loss_mask = [1] * len(input_ids)
         input_ids = input_ids + [get_eos_id()]
         current_loss_mask += [0]
@@ -344,8 +348,8 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     args = get_args()
     tokenizer = get_tokenizer()
 
-    if not isinstance(tokenizer._tokenizer, HuggingFaceTokenizer):
-        raise ValueError("SFTDataset only supports HuggingFaceTokenizer!")
+    if not isinstance(tokenizer._tokenizer, (HuggingFaceTokenizer, transformers.PreTrainedTokenizerBase)):
+        raise ValueError("SFTDataset only supports HuggingFaceTokenizer or transformers.PreTrainedTokenizerBase!")
 
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
