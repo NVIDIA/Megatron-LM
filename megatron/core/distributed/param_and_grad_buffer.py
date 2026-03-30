@@ -1240,9 +1240,9 @@ class _ParamAndGradBuffer:
         end_index: int,
         numel_unpadded: int,
         bucket_id: int,
+        bucket_params_with_extra_main_grads: List[torch.Tensor],
         grad_start_index: int = None,
         grad_end_index: int = None,
-        bucket_params_with_extra_main_grads: List[torch.Tensor],
     ) -> _ParamAndGradBucket:
         """
         Helper function that creates a new bucket. Also updates param->bucket mapping.
