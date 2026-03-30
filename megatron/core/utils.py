@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -2366,13 +2366,15 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
 # Backward Compatibility Decorators
 # ============================================================================
 
+_Wrapped = TypeVar('_Wrapped', bound=Union[type, Callable])
+
 
 def deprecated(
     version: str,
     removal_version: Optional[str] = None,
     alternative: Optional[str] = None,
     reason: Optional[str] = None,
-) -> Callable:
+):
     """
     Mark a function as deprecated.
 
@@ -2401,7 +2403,7 @@ def deprecated(
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: _Wrapped) -> _Wrapped:
         # Add metadata
         func._deprecated = True
         func._deprecated_version = version
@@ -2432,7 +2434,7 @@ def deprecated(
     return decorator
 
 
-def internal_api(func: Callable) -> Callable:
+def internal_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as internal API (not for external use).
 
@@ -2465,7 +2467,7 @@ def internal_api(func: Callable) -> Callable:
     return func
 
 
-def experimental_api(func: Callable) -> Callable:
+def experimental_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as experimental API.
 
@@ -2509,7 +2511,7 @@ def deprecate_args(
         message: Custom error message string. Use {name} as a placeholder.
     """
 
-    def decorator(func):
+    def decorator(func: _Wrapped) -> _Wrapped:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Check if any deprecated key is present in kwargs
