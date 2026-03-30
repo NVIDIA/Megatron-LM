@@ -63,6 +63,12 @@ myst_enable_extensions = [
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
 
+# Suppress "more than one target found for cross-reference" warnings for Python symbols
+# that have the same name across multiple modules (e.g. DistributedDataParallelConfig,
+# ModelType). These are structural ambiguities in the codebase – the cross-reference
+# still resolves; Sphinx just cannot pick the unique target automatically.
+suppress_warnings = ["ref.python"]
+
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -81,6 +87,11 @@ if not skip_autodoc:
     autodoc2_docstring_parser_regexes = [
         (r".*", "docs.autodoc2_docstrings_parser"),
     ]
+    # Regex patterns whose values contain raw regex syntax (e.g. \p{L}) that docutils
+    # mis-parses as footnote/reference markup. Exclude them from the generated docs.
+    autodoc2_hidden_regexes = [
+        r".*\._PATTERN_TIKTOKEN.*",
+    ]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
@@ -98,16 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "extra_head": {
-        """
-    <script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js" ></script>
-    """
-    },
-    "extra_footer": {
-        """
-    <script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
-    """
-    },
+    "public_docs_features": True
 }
 html_extra_path = ["project.json", "versions1.json"]
 

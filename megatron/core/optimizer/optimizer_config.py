@@ -289,7 +289,7 @@ class OptimizerConfig:
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
-    adaptive_muon_moment2_method: str = "adamuon"
+    adaptive_muon_moment2_method: str = 'adamuon'
     """The method to use for the moment2 update in Adaptive Muon optimizer."""
 
     adaptive_muon_beta2: float = 0.95
@@ -297,6 +297,18 @@ class OptimizerConfig:
 
     adaptive_muon_eps: float = 1e-8
     """The eps parameter for the Adaptive Muon optimizer."""
+
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
+    One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    # Lion.
+    lion_beta1: float = 0.95
+    """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
+
+    lion_beta2: float = 0.98
+    """Second beta coefficient for Lion optimizer (used in momentum EMA update).
+    Defaults to 0.98."""
 
     #######################
     # Distributed optimizer

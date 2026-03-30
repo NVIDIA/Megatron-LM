@@ -11,12 +11,16 @@ import random
 import sys
 import warnings
 
-import modelopt.torch.quantization as mtq
 import torch
 import torch.distributed
+from tqdm import tqdm
+
+# NOTE: Needs to be before modelopt imports in case megatron.core is not installed.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
+import modelopt.torch.quantization as mtq
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
-from tqdm import tqdm
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -31,8 +35,6 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
-
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -42,7 +44,8 @@ from megatron.post_training.utils import (
     print_distributed_quant_summary,
     report_current_memory_info,
 )
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -102,6 +105,12 @@ def add_text_generate_ptq_args(parser):
         type=str,
         default=("Hello!|Born in California, Soyer trained as a"),
         help="Input texts. Please use | to separate different batches.",
+    )
+    group.add_argument(
+        "--skip-generate",
+        action="store_true",
+        default=False,
+        help="Skip the post-quantization generate/validation step.",
     )
     group.add_argument(
         "--references",
@@ -350,9 +359,8 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tokenizer = get_hf_tokenizer()
+
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -416,7 +424,7 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
-        if tokenizer.pad_token is None:
+        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"  # better for calibration
 
@@ -438,5 +446,11 @@ if __name__ == "__main__":
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
 
+    # Free calibration/quantization memory before generate
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # Do this after saving in case it causes issues
-    _custom_prompt_forward_loop_func(unwrapped_model)
+    if not args.skip_generate:
+        _custom_prompt_forward_loop_func(unwrapped_model)

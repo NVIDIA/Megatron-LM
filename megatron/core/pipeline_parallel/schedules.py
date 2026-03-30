@@ -3,7 +3,7 @@
 import contextlib
 from functools import partial
 from itertools import zip_longest
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -12,6 +12,7 @@ from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -19,8 +20,11 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
+from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -157,9 +161,28 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     This method should be called right after the output tensor has been
     sent to the next pipeline stage. At this point, the output tensor is
     only useful for its '.grad_fn' field, and not its '.data'.
+
+    Supports multiple formats:
+    - torch.Tensor: Deallocates the tensor directly
+    - List[Tensor]: Recursively deallocates each element
+    - Dict[str, Tensor]: Recursively deallocates each value (for multi-module pipelines)
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
+
+    # Handle dict format (multi-module pipelines)
+    if isinstance(out, dict):
+        for value in out.values():
+            deallocate_output_tensor(value, deallocate_pipeline_outputs)
+        return
+
+    # Handle list format
+    if isinstance(out, list):
+        for item in out:
+            deallocate_output_tensor(item, deallocate_pipeline_outputs)
+        return
+
+    # Base case: deallocate tensor
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
@@ -197,27 +220,6 @@ def custom_backward(output, grad_output):
     )
 
 
-def set_current_microbatch(model, microbatch_id):
-    """Set the current microbatch."""
-    decoder_exists = True
-    model_with_decoder = None
-    try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
-    except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
-        for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
-
-
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -247,9 +249,9 @@ def forward_step_calc_loss(
             ignore_virtual=False, vp_stage=vp_stage
         )
     else:
-        assert (
-            cp_group_size is not None and is_last_stage is not None
-        ), "cp_group_size and is_last_stage must be provided"
+        assert is_last_stage is not None, "is_last_stage must be provided"
+        if is_last_stage:
+            assert cp_group_size is not None, "cp_group_size must be provided on last stage"
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
@@ -294,7 +296,8 @@ def forward_step_calc_loss(
         else:
             # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
             # of scaling by cp_group_size
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -448,14 +451,13 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
     with respect to stage's output tensor.
 
-    Returns gradient of loss with respect to input tensor (None if first
-    stage)."""
+    Returns gradient of loss with respect to input tensor (None if first stage)."""
 
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
@@ -512,6 +514,67 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     return input_tensor_grad
 
 
+def backward_step_multimodule(
+    input_tensor: Dict[str, torch.Tensor],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Optional[Dict[str, torch.Tensor]],
+    config,
+    language_model_module_name: str,
+) -> Dict[str, torch.Tensor]:
+    """Backward step for multi-module pipelines.
+
+    In multi-module pipelines, tensors are organized as dictionaries with
+    module names as keys. Each module's backward pass is performed independently.
+    """
+    # Retain gradients on all input tensors.
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is not None:
+            tensor.retain_grad()
+
+    # Last stage: output_tensor is a scalar loss from the language model.
+    # Associate it with the language_model_module_name.
+    if not isinstance(output_tensor, dict):
+        output_tensor = {language_model_module_name: output_tensor}
+
+    # Handle output_tensor_grad: None (last stage) or dict (intermediate stages).
+    if not output_tensor_grad:
+        output_tensor_grad = {key: None for key in output_tensor.keys()}
+
+    # Apply grad scaling if needed (for last stage only).
+    for module_name in output_tensor.keys():
+        if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
+            output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
+
+    # Perform backward pass for each module.
+    for module_name in output_tensor.keys():
+        output_tensor_module = output_tensor[module_name]
+        output_tensor_grad_module = output_tensor_grad[module_name]
+
+        # In multi-modal models like VLM, some batches may not have images.
+        # In such cases, skip backward while preserving zero gradients.
+        if output_tensor_module is not None and output_tensor_module.requires_grad:
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor_module, output_tensor_grad_module)
+            else:
+                torch.autograd.backward(
+                    output_tensor_module, grad_tensors=output_tensor_grad_module
+                )
+
+    # Collect gradients for input tensors.
+    input_tensor_grad = {}
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is None:
+            input_tensor_grad[module_name] = None
+        else:
+            input_tensor_grad[module_name] = tensor.grad
+
+    return input_tensor_grad
+
+
 def check_first_val_step(first_val_step, forward_only, cond):
     """Check if it is the first validation step."""
     if (first_val_step is not None) and forward_only:
@@ -556,23 +619,8 @@ def forward_backward_no_pipelining(
         )
 
     elif pg_collection is not None:
-        assert hasattr(pg_collection, 'tp')
-        assert hasattr(pg_collection, 'cp')
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. If you are "
-            "using the default process group, please use `parallel_state.get_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group. "
-            "If you are using the default process group, "
-            "please use `parallel_state.get_position_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp')
-        assert hasattr(pg_collection, 'dp_cp')
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
 
     if isinstance(model, list):
         assert len(model) == 1, "non-pipeline-parallel schedule does not support model chunking"
@@ -653,9 +701,7 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
-                    backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
-                    )
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -677,7 +723,7 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -998,6 +1044,7 @@ def forward_backward_pipelining_with_interleaving(
         )
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
+        cp_size = cp_group.size()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
@@ -1015,25 +1062,11 @@ def forward_backward_pipelining_with_interleaving(
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. If you are "
-            "using the default process group, please use `parallel_state.get_embedding_group()` "
-            "to get the process group. If you don't need explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group."
-            " If you are using the default process group, please use "
-            "`parallel_state.get_position_embedding_group()` "
-            "If you don't need pos_embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have a pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have a dp_cp_group"
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
         tp_group = pg_collection.tp
         cp_group = pg_collection.cp
+        cp_size = cp_group.size()
     else:
         raise ValueError(
             "Invalid combination of p2p_communicator, pg_collection"
@@ -1373,7 +1406,7 @@ def forward_backward_pipelining_with_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=cp_size,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
@@ -1438,9 +1471,7 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
-        )
+        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -2048,7 +2079,7 @@ def forward_backward_pipelining_with_interleaving(
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         finish_embedding_wgrad_compute(
-            config, embedding_module, is_pp_last_stage(p2p_communicator.pp_group), tp_group
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
         )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -2088,14 +2119,12 @@ def get_tensor_shapes(
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
-    tp_group: torch.distributed.ProcessGroup,
-    cp_group: torch.distributed.ProcessGroup,
-    pp_group: torch.distributed.ProcessGroup = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
     is_recv: bool = True,
 ):
-    """
-    Determine right tensor sizes (based on position of rank with respect to split rank) and
-    model size.
+    """Determine tensor shapes for pipeline communication.
 
     For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
     with dimension hidden_size * num_residual_streams.
@@ -2104,10 +2133,18 @@ def get_tensor_shapes(
         is_recv: If True, compute shape for receiving; if False, for sending.
                  This matters for hyper connections where first/last stages have different
                  send/recv dimensions.
-    """
 
+    Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
+    or computed shapes for fixed sequence length mode.
+    """
     tensor_shapes = []
-    # Use decoder_seq_length if provided, otherwise use seq_length
+
+    if config.variable_seq_lengths:
+        # Shapes exchanged dynamically during P2P communication
+        tensor_shapes.append(())
+        return tensor_shapes
+
+    # Fixed sequence lengths - compute shape
     effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
     effective_seq_length = effective_seq_length // cp_group.size()
 
@@ -2152,7 +2189,9 @@ def forward_backward_pipelining_without_interleaving(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    pg_collection: Optional[
+        Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
+    ] = None,
     force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
@@ -2175,12 +2214,22 @@ def forward_backward_pipelining_without_interleaving(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
 
+    tp_group, cp_group, cp_size = None, None, None
+
+    # Determine if this is a multi-module pipeline
+    # (used for validation and backward function selection)
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
+        p2p_communicator, MultiModulePipelineCommunicator
+    )
+
     if p2p_communicator is None and pg_collection is None:
+        # Default: single-module with parallel_state groups
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
+        cp_size = cp_group.size()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -2194,39 +2243,42 @@ def forward_backward_pipelining_without_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+
     elif p2p_communicator is not None and pg_collection is not None:
-        model_type = get_model_type(model)
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. "
-            " If you are using the default process group, please use "
-            " `parallel_state.get_embedding_group()` "
-            "If you don't need embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group. "
-            " If you are using the default process group, please use  "
-            " `parallel_state.get_position_embedding_group()` "
-            "If you don't need pos_embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
+
+        if is_multimodule:
+            # Multi-module: use language model's CP size for loss scaling
+            if not config.variable_seq_lengths:
+                raise ValueError(
+                    "config.variable_seq_lengths=True required for multi-module pipelines"
+                )
+            if pg_collection.has_language_model():
+                cp_size = pg_collection.get_language_model_cp_size()
+            else:
+                # Encoder-only ranks should not use CP loss scaling.
+                cp_size = None
+
+        elif isinstance(pg_collection, ProcessGroupCollection):
+            # Single-module: extract tp/cp groups and cp_size
+            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
+            tp_group = pg_collection.tp
+            cp_group = pg_collection.cp
+            cp_size = cp_group.size()
+
+        else:
+            raise TypeError(
+                f"pg_collection must be ProcessGroupCollection or "
+                f"MultiModuleProcessGroupCollection, got {type(pg_collection)}"
+            )
     else:
-        raise ValueError(
-            "Invalid combination of p2p_communicator, pg_collection "
-            "provide none or provide all the process groups"
-        )
+        raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
-            config, model, is_pp_last_stage(p2p_communicator.pp_group)
+            config, model, p2p_communicator.is_pp_last_stage
         )
 
     if config.timers is not None:
@@ -2255,9 +2307,7 @@ def forward_backward_pipelining_without_interleaving(
     disable_grad_sync()
 
     # Compute number of warmup microbatches.
-    num_warmup_microbatches = (
-        p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
-    )
+    num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
@@ -2273,9 +2323,15 @@ def forward_backward_pipelining_without_interleaving(
     if config.num_microbatches_with_partial_activation_checkpoints is not None:
         max_outstanding_backprops = num_warmup_microbatches + 1
 
-    model_type = get_model_type(model)
+    # Select backward function based on whether multi-module or single-module
+    if is_multimodule:
+        backward_func = partial(
+            backward_step_multimodule,
+            language_model_module_name=pg_collection.language_model_module_name,
+        )
+    else:
+        backward_func = backward_step
 
-    rank = p2p_communicator.pp_group.rank()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2283,7 +2339,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_group=p2p_communicator.pp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
         is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
@@ -2293,7 +2349,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_group=p2p_communicator.pp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
         is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
@@ -2323,7 +2379,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
+            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -2333,27 +2389,27 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=cp_size,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
-            is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
+        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
         input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
+            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
 
     # Run 1F1B in steady state.
@@ -2376,34 +2432,32 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=cp_size,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
             current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            is_last_stage=p2p_communicator.is_pp_last_stage,
         )
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(
-                output_tensor, is_pp_last_stage(p2p_communicator.pp_group)
-            )
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
                 input_tensor = p2p_communicator.recv_forward(
-                    recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
+                    recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
         else:
             output_tensor_grad = p2p_communicator.send_forward_recv_backward(
-                output_tensor, send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
+                output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
@@ -2413,23 +2467,21 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or rank == 0:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
             )
 
             if last_iteration:
                 input_tensor = None
                 p2p_communicator.send_backward(
-                    input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad,
-                    recv_tensor_shapes,
-                    is_pp_first_stage(p2p_communicator.pp_group),
+                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
 
     # Run cooldown backward passes.
@@ -2442,23 +2494,21 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or rank == 0:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
             output_tensor_grad = p2p_communicator.recv_backward(
-                send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
+                send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
             )
 
-            p2p_communicator.send_backward(
-                input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
-            )
+            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -2471,7 +2521,7 @@ def forward_backward_pipelining_without_interleaving(
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         finish_embedding_wgrad_compute(
-            config, embedding_module, is_pp_last_stage(p2p_communicator.pp_group), tp_group
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
         )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for

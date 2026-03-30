@@ -4,6 +4,15 @@
 
 from typing import Any
 
+# TODO: Remove this separate try/except once the next version of emerging_optimizers
+# (which includes Lion) is released. Then Lion can be imported in the block above.
+try:
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
+
+    HAVE_LION = True
+except ImportError:
+    HAVE_LION = False
+
 
 def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """Backward compatible muon optimizer getter.
@@ -12,5 +21,10 @@ def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
         Use :func:`megatron.core.optimizer.get_megatron_optimizer` instead.
     """
     from . import get_megatron_optimizer
+
+    if kwargs.pop('layer_wise_distributed_optimizer', False):
+        config = args[0] if args else kwargs.get('config')
+        if config is not None:
+            config.use_layer_wise_distributed_optimizer = True
 
     return get_megatron_optimizer(*args, **kwargs)

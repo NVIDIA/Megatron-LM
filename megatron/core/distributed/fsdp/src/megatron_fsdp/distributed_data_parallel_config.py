@@ -3,13 +3,15 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
-    """Configuration for DistributedDataParallel."""
-
-    grad_reduce_in_fp32: bool = False
-    """If true, reduce grads in fp32."""
+    """
+    Megatron-FSDP `fully_shard` API sub-configuration
+    derived from Megatron-Core DistributedDataParallel.
+    """
 
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
@@ -17,37 +19,16 @@ class DistributedDataParallelConfig:
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute."""
 
-    align_param_gather: bool = False
-    """If true, all PP stages will launch param all-gathers simultaneously. Otherwise, each
-    PP stage will independently launch as needed.
-    """
-
-    use_distributed_optimizer: bool = False
-    """If true, issue reduce-scatter collectives to aggregate gradients and clean up
-       originally allocated model parameters, otherwise issue all-reduce collectives.
-    """
-
-    num_distributed_optimizer_instances: int = 1
-    """Sets the factor by which the DP domain is sharded to have the partial DistOpt
-       enabled. Defaults to 1, which means DistOpt is across entire DP domain.
-    """
-
     check_for_nan_in_grad: bool = False
-    """If true, check for NaNs and Infs in gradients _before_ communication collective."""
-
-    check_for_large_grads: bool = False
-    """If true, check for unexpectedly large gradients _before_ communication collective."""
+    """
+    If True, check for NaNs and Infs in gradients _before_ communication collective.
+    Invoked by `start_grad_sync` such as in the Megatron-LM DDP training API.
+    """
 
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
-
-    pad_buckets_for_high_nccl_busbw: bool = False
-    """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
-       ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
-       message size (which for ring algorithms is bucket_size / dp_size) apparently needs
-       to be divisible by a power of 2 for high busbw."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
@@ -57,23 +38,9 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
-    reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
-
-    use_megatron_fsdp: bool = False
-    """If true, use the FSDP code path for DDP."""
-
-    use_custom_fsdp: bool = False
-    """
-    NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
-    Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
-    Future updates will drop support for `use_custom_fsdp` to avoid confusion.
-    """
-
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
-        'optim_grads', 'optim_grads_params'."""
+      'optim_grads', 'optim_grads_params'."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -86,9 +53,6 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
-    preserve_fp32_weights: bool = True
-    """If true, preserve fp32 weights in the Megatron FSDP ParamAndGradBuffer."""
-
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
@@ -100,7 +64,6 @@ class DistributedDataParallelConfig:
       The follwoing will be the expected number of SM usage for various cases.
       (Note that this is just a reference number and the number of SM usage could vary 
       on message size, communication domain size and nccl version.)
-      ----------------------------------------------------------
       | Communication domain | use_sharp | SM usage of "AG/RS" |
       |----------------------|-----------|---------------------|
       | NVL                  | N/A       | 4 / 5               |
@@ -108,7 +71,6 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
-      ----------------------------------------------------------
     """
 
     fsdp_double_buffer: bool = False
@@ -156,13 +118,37 @@ class DistributedDataParallelConfig:
       to minimize the registration time.
     """
 
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
-
         if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(

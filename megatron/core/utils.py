@@ -29,20 +29,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import numpy
 import torch
 
-try:
-    import torch.distributed._symmetric_memory as symm_mem
-
-    HAVE_TORCH_SYMM_MEM = True
-except ImportError:
-    HAVE_TORCH_SYMM_MEM = False
-
-try:
-    import triton  # pylint: disable=unused-import
-
-    HAVE_TRITON = True
-except ImportError:
-    HAVE_TRITON = False
-
 from megatron.core import config
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.package_info import __version__ as mcore_version
@@ -310,28 +296,6 @@ def experimental_cls(introduced_with_version: str):
     return validator
 
 
-def get_torch_version():
-    """Get pytorch version from __version__; if not available use pip's. Use caching."""
-
-    if not HAVE_PACKAGING:
-        raise ImportError(
-            "packaging is not installed. Please install it with `pip install packaging`."
-        )
-
-    def get_torch_version_str():
-        import torch
-
-        if hasattr(torch, "__version__"):
-            return str(torch.__version__)
-        else:
-            return version("torch")
-
-    global _torch_version
-    if _torch_version is None:
-        _torch_version = PkgVersion(get_torch_version_str())
-    return _torch_version
-
-
 def get_te_version():
     """Get TE version from __version__; if not available use pip's. Use caching."""
     if not HAVE_PACKAGING:
@@ -355,8 +319,11 @@ def get_te_version():
             return version("transformer-engine")
 
     global _te_version
-    if _te_version is None and HAVE_TE:
-        _te_version = PkgVersion(get_te_version_str())
+    if _te_version is None:
+        if HAVE_TE:
+            _te_version = PkgVersion(get_te_version_str())
+        else:
+            _te_version = PkgVersion("0.0.0")
     return _te_version
 
 
@@ -685,65 +652,6 @@ class GlobalMemoryBuffer:
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
 
-class GlobalSymmetricMemoryBuffer:
-    """
-    Global symmetric memory buffer used in inference.
-    This buffer is used by mcore-inference's low-latency
-    NVLS all-gather and reduce-scatter collectives.
-    """
-
-    def __init__(self, size_in_mb, process_group):
-        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
-            # This should be hit if the user is running an older
-            # version of torch, or if they do not have triton
-            # installed.
-            self.symm_buffer = None
-            self.symm_mem_hdl = None
-        else:
-            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
-            try:
-                symm_mem.enable_symm_mem_for_group(process_group.group_name)
-                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
-                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
-            except RuntimeError as e:
-                # If symmetric memory initialization fails, set buffer and handle to None
-                # This should happen if the process group is not contained within NVlink
-                self.symm_buffer = None
-                self.symm_mem_hdl = None
-
-    def _can_allocate(self, numel, dtype) -> bool:
-        """
-        Returns whether enough symmetric memory is available
-        for the given tensor shape and dtype.
-        """
-        if self.symm_mem_hdl is None:
-            return False
-        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
-        required_len = numel * size_of_dtype
-        return required_len <= self.symm_buffer.numel()
-
-    def _allocate(self, numel, dtype) -> torch.Tensor:
-        """
-        Allocates a sub-tensor from the self.symm_buffer for the given numel and dtype"""
-        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
-        return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
-
-    def maybe_get_tensor(self, tensor_shape, dtype):
-        """
-        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
-        If enough symmetric memory is not available, returns None.
-        """
-        if self.symm_mem_hdl is None:
-            return {"tensor": None, "handle": None}
-        numel = reduce(operator.mul, tensor_shape, 1)
-        if not self._can_allocate(numel, dtype):
-            return {"tensor": None, "handle": None}
-        return {
-            "tensor": self._allocate(numel, dtype).view(*tensor_shape),
-            "handle": self.symm_mem_hdl,
-        }
-
-
 def _kernel_make_viewless_tensor(inp, requires_grad):
     """Make a viewless tensor.
 
@@ -859,6 +767,26 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
     std = sigma / math.sqrt(multiplier * num_layers)
 
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
+def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0):
+    """MuP scaled init method for output layers: N(0, sigma / (sqrt(2*L) * sqrt(m))).
+
+    Combines the standard scaled initialization (for output projection layers)
+    with MuP width scaling. This ensures that both depth and width scaling
+    are accounted for in the initialization.
+
+    Args:
+        sigma (float): Base standard deviation for initialization.
+        num_layers (int): Number of transformer layers.
+        width_mult (float): Width multiplier (hidden_size / base_hidden_size).
+        multiplier (float): Multiplier for depth scaling (default: 2.0).
+
+    Returns:
+        Callable: Initialization function for torch.nn.init.
+    """
+    std = sigma / (math.sqrt(multiplier * num_layers) * math.sqrt(width_mult))
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
