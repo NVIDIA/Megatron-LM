@@ -221,7 +221,8 @@ def bagel_packed_batch_to_mimo_batch(packed_batch, diffusion_wrapper: DiffusionW
         labels[:, ce_loss_indexes] = batch_dict['packed_label_ids']
 
         loss_mask = torch.zeros((1, seq_len), dtype=torch.float)
-        loss_mask[:, ce_loss_indexes] = torch.tensor(batch_dict['ce_loss_weights'])
+        ce_weights = batch_dict['ce_loss_weights']
+        loss_mask[:, ce_loss_indexes] = ce_weights if isinstance(ce_weights, torch.Tensor) else torch.tensor(ce_weights)
     else:
         labels = None
         loss_mask = None
@@ -313,7 +314,7 @@ def bagel_process_gen_data(batch_dict: dict, diffusion_wrapper: DiffusionWrapper
     # if visual generation is needed.
     modality_inputs = {}
     if "packed_timesteps" in batch_dict:
-        packed_timesteps = batch_dict['packed_timesteps'].cuda()
+        packed_timesteps = batch_dict['packed_timesteps'].cuda(non_blocking=True)
         shifted_timesteps = diffusion_wrapper.shift_timesteps(packed_timesteps)
         shifted_timesteps.requires_grad = True # for fsdp backward hook
         modality_inputs['shifted_timesteps'] = shifted_timesteps
@@ -323,7 +324,7 @@ def bagel_process_gen_data(batch_dict: dict, diffusion_wrapper: DiffusionWrapper
     loss_inputs['packed_vae_token_indexes'] = batch_dict['packed_vae_token_indexes']
 
     #vae encode
-    padded_images = batch_dict['padded_images'].cuda()
+    padded_images = batch_dict['padded_images'].cuda(non_blocking=True)
     latents = diffusion_wrapper.vae_encode(padded_images, batch_dict['patchified_vae_latent_shapes'])
     #add noise and get target for mse loss
     if 'packed_timesteps' in batch_dict:
