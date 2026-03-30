@@ -21,14 +21,27 @@ from megatron.core.parallel_state import (
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
-from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
-from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
+try:
+    from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
+    from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
+    from model_providers.llava_avlm import model_provider_llava_avlm
+    from model_providers.llava_vlm import model_provider_llava_vlm
+    _ENERGON_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _ENERGON_AVAILABLE = False
+    llava_avlm_dataloader_provider = None
+    llava_vlm_dataloader_provider = None
+    model_provider_llava_avlm = None
+    model_provider_llava_vlm = None
+
 from data.mock import (
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 )
-from model_providers.llava_avlm import model_provider_llava_avlm
-from model_providers.llava_vlm import model_provider_llava_vlm
+from data.qwen35_vlm_mock import (
+    train_valid_test_datasets_provider as qwen35_vlm_train_valid_test_datasets_provider,
+)
 from model_providers.mock import model_provider_mock_vlm_single_encoder
+from model_providers.qwen35.vlm import model_provider_qwen35_vlm
 from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
@@ -36,17 +49,25 @@ from megatron.training import get_args, pretrain
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
-    "llava_vlm": model_provider_llava_vlm,
-    "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
-    "llava_avlm": model_provider_llava_avlm,
+    "qwen35_vlm": model_provider_qwen35_vlm,
 }
-
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
-    "llava_vlm": llava_vlm_dataloader_provider,
-    "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
-    "llava_avlm": llava_avlm_dataloader_provider,
+    "qwen35_vlm": qwen35_vlm_train_valid_test_datasets_provider,
 }
+
+# Energon-dependent providers registered only when the library is available
+if _ENERGON_AVAILABLE:
+    _MODEL_PROVIDERS.update({
+        "llava_vlm": model_provider_llava_vlm,
+        "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
+        "llava_avlm": model_provider_llava_avlm,
+    })
+    _DATASET_PROVIDERS.update({
+        "llava_vlm": llava_vlm_dataloader_provider,
+        "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
+        "llava_avlm": llava_avlm_dataloader_provider,
+    })
 
 def add_mimo_args(parser):
     """Add MIMO-specific arguments to the parser."""
@@ -73,6 +94,9 @@ def add_mimo_args(parser):
                        help='Assigning unused tokens to special tokens. Example: '
                        '--hf-assign-unused-tokens "<audio>,32002" "<video>,32003"'
     )
+    # model variant (controls architecture size for multi-variant models)
+    group.add_argument('--model-variant', type=str, default='397b_a17b',
+                       help='Model variant: proxy, 397b_a17b, 9b, 35b_a3b, 35b_a3b_light')
     # checkpoint related args
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
     # energon dataloader related args
@@ -135,6 +159,24 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
     batch = broadcast_nested_data_batch(data)
+
+    input_ids = batch.get("input_ids")
+    expected_seq_len = getattr(args, "seq_length", None)
+    if (
+        getattr(args, "dataset_provider", None) in ("mock", "qwen35_vlm")
+        and input_ids is not None
+        and expected_seq_len is not None
+    ):
+        actual_seq_len = input_ids.size(1)
+        if actual_seq_len != expected_seq_len:
+            raise ValueError(
+                "Decoder seq length mismatch: "
+                f"actual batch seq_len={actual_seq_len}, "
+                f"but --seq-length={expected_seq_len}. "
+                "Ensure the dataset provider emits fixed-length sequences "
+                "that match the configured decoder sequence length."
+            )
+
     return batch
 
 def loss_func(loss_mask, output_tensor):
@@ -199,8 +241,11 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    **kwargs: Any,
 ):
     """Model provider for MIMO model training.
+
+    ``**kwargs`` absorbs extras from ``get_model`` (``config``, ``pg_collection``, ``vp_stage``, …).
 
     Args:
         pre_process: Whether to pre-process the model
@@ -220,17 +265,27 @@ def model_provider(
             f"Available providers: {list(_MODEL_PROVIDERS.keys())}"
         ) from e
 
-    if runtime_args.model_provider == "llava_vlm":
+    name = runtime_args.model_provider
+    if name in ("llava_vlm", "video_llava_vlm"):
         kwargs = {
             "image_special_token_id": image_special_token_id,
         }
-    elif runtime_args.model_provider == "llava_avlm":
+    elif name == "llava_avlm":
         kwargs = {
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
         }
+    elif name == "qwen35_vlm":
+        kwargs = {
+            "image_special_token_id": getattr(runtime_args, "image_token_id", 248056),
+        }
+    elif name == "mock":
+        kwargs = {"special_token_id": image_special_token_id}
     else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(
+            f"No builder kwargs wired for model provider {name!r}. "
+            f"Add a branch in model_provider() in train.py (see llava / qwen35 / mock)."
+        )
 
     return builder_fn(
         pre_process,
