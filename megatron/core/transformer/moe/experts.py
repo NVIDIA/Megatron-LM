@@ -723,15 +723,6 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
-        stash_modules = self.config.stash_modules or []
-        self.moe_paged_stash_expert_fc1 = (
-            self.config.moe_paged_stash and "expert_fc1" in stash_modules
-        )
-        self.moe_paged_stash_moe_act = self.config.moe_paged_stash and "moe_act" in stash_modules
-        self.moe_paged_stash_expert_fc2 = (
-            self.config.moe_paged_stash and "expert_fc2" in stash_modules
-        )
-
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -1217,24 +1208,7 @@ class TEGroupedMLP(MegatronModule):
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        if self.moe_paged_stash_expert_fc2:
-            max_num_tokens = bias_act_output.shape[0]
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
-            )
-            offload_context = get_paged_stash_context(
-                name="expert_fc2",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            offload_context = nullcontext()
-        with offload_context:
-            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.config.moe_paged_stash:
-            output = paged_stash_group_commit(output, name="expert_fc2")
+        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
