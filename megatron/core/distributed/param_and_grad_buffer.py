@@ -243,6 +243,9 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+        # Track grad mode used to create cached param views. Rebuild if mode changes to avoid
+        # mixing no_grad-created views with in-place updates in grad-enabled mode.
+        self._cached_param_buffer_shards_grad_enabled = None
 
     def reset(self):
         """
@@ -399,6 +402,7 @@ class _ParamAndGradBucketGroup:
                     bucket.layerwise_gather_list = None
                     bucket._layerwise_src_buffer = None
                 self.param_gather_handle = None
+
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and

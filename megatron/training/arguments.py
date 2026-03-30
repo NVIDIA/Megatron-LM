@@ -1472,17 +1472,30 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
-    # Muon optimizer check
-    if 'muon' in args.optimizer:
+    # emerging optimizer check
+    if not hasattr(args, 'use_layer_wise_distributed_optimizer'):
+        args.use_layer_wise_distributed_optimizer = False
+    if args.optimizer not in ('sgd', 'adam'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
+
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
 
         if args.optimizer == 'muon':
             assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
             assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
 
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+        assert args.experimental_attention_variant is None, "Muon optimizer does not support attention variant for now."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1494,6 +1507,11 @@ def validate_args(args, defaults={}):
             "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
+
+    if args.offload_optimizer_states:
+        assert args.use_distributed_optimizer, "offload_optimizer_states is only supported with distributed optimizer"
+        assert args.optimizer == 'adam', "offload_optimizer_states is only supported with adam optimizer"
+        assert not args.use_megatron_fsdp, "offload_optimizer_states does not support Megatron-FSDP for now."
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -2228,7 +2246,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
-    group.add_argument('--muon-use-nesterov', action='store_true',
+    group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
@@ -2476,8 +2494,10 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion'],
-                       help='Optimizer function')
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'soap', "adaptive_muon", "lion"],
+                       help='Optimizer function. '
+                            'Note: dist_muon is deprecated; use --optimizer muon '
+                            'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
@@ -2494,6 +2514,14 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--offload-optimizer-states',
+                       action='store_true',
+                       dest='offload_optimizer_states',
+                       help='Offload optimizer states to CPU after each optimizer step and '
+                       'reload them before the next optimizer step. '
+                       'Only support TE FusedAdam optimizer.'
+                       'Note that this still uses pure GPU optimizer instead of '
+                       'HybridDeviceOptimizer for --optimizer-cpu-offload.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
