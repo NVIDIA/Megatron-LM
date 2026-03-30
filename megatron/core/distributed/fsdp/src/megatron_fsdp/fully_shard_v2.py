@@ -49,7 +49,7 @@ def fully_shard(
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
-    _register_post_accumulate_grad_hooks(module)
+    # _register_post_accumulate_grad_hooks(module)
 
     return module
 
@@ -146,9 +146,10 @@ def _register_backward_pre_hook(module: FSDPModule):
 
 
 def _register_backward_hook(module: FSDPModule):
-    def reshard_param_groups(module, grads):
+    def post_backward(module, grads):
         for fsdp_param_group in module._fsdp_param_groups:
             fsdp_param_group.reshard()
+            fsdp_param_group.grad_reduce()
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -204,7 +205,7 @@ def _register_backward_hook(module: FSDPModule):
         return args, kwargs
 
     module._mfsdp_backward_hook = module.register_forward_pre_hook(
-        functools.partial(_register_post_backward_hook, reshard_param_groups), with_kwargs=True
+        functools.partial(_register_post_backward_hook, post_backward), with_kwargs=True
     )
 
 
