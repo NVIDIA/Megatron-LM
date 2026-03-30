@@ -1,0 +1,363 @@
+#!/bin/bash
+
+# Launch script for Qwen3.5-VL MIMO training.
+#
+# Usage (from the Megatron-LM repo root):
+#   # Quick proxy test (2 GPUs, no real data needed):
+#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2 \
+#       ./examples/mimo/scripts/run_qwen35_vlm_train.sh
+#
+#   # Proxy with explicit mock data:
+#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2 \
+#       ./examples/mimo/scripts/run_qwen35_vlm_train.sh mock
+#
+#   # Full 397B production run:
+#   ./examples/mimo/scripts/run_qwen35_vlm_train.sh /path/to/dataset [/path/to/llm/ckpt]
+#
+# MODEL_VARIANT choices:
+#   proxy       (default for quick testing) 4 layers, 16 experts
+#   397b_a17b   production: 60 layers, 512 experts
+#   9b          dense 9B model
+#   35b_a3b     MoE 35B-A3B
+#   35b_a3b_light  reduced 35B-A3B for single-node
+#
+# PROFILE=1 to enable Nsight Systems profiling (default: 0)
+# PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
+#
+# NOTE: MIMO currently requires PP=1 and CP=1.
+
+# claude --resume e8964c72-5ad1-406b-975a-442d2998e80c
+set -euo pipefail
+
+# Repo root must be on PYTHONPATH for megatron and multimodal_v2 imports.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/Megatron-LM-mimo"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_IB_SL=1
+export NVTE_FUSED_ATTN=1
+
+MODEL_VARIANT=${MODEL_VARIANT:-397b_a17b}
+DRY_RUN=${DRY_RUN:-false}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+NUM_NODES=${NNODES:-1}
+PROFILE=${PROFILE:-0}
+PROFILE_STEP_START=${PROFILE_STEP_START:-4}
+PROFILE_STEP_END=${PROFILE_STEP_END:-5}
+PROFILE_RANKS=${PROFILE_RANKS:-0}
+
+DATASET_PATH=${1:-"mock"}
+PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH=${2:-"None"}
+
+LANGUAGE_MODEL_CKPT_ARG=()
+if [ "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH" != "None" ]; then
+    LANGUAGE_MODEL_CKPT_ARG=(--language-model-checkpoint "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH")
+fi
+
+# Batch sizes
+MBS=${MBS:-1}
+SEQ_LEN=${SEQ_LEN:-4096}
+
+# Parallelism — MIMO requires PP=1, CP=1
+# Proxy defaults: TP=1, EP=2 so 2 GPUs suffice
+if [ "$MODEL_VARIANT" = "proxy" ]; then
+    TP=${TP:-1}
+    EP=${EP:-2}
+    GBS=${GBS:-64}
+else
+    TP=${TP:-8}
+    EP=${EP:-32}
+    GBS=${GBS:-64}
+fi
+
+WANDB_PROJECT='mimo-qwen35-vlm'
+EXP_NAME="qwen35_${MODEL_VARIANT}_mbs_${MBS}_gbs_${GBS}_tp${TP}_ep${EP}"
+
+ROOT_DIR='./local/'
+CHECKPOINT_STORE_PATH="${ROOT_DIR}${EXP_NAME}"
+mkdir -p "$CHECKPOINT_STORE_PATH"
+
+TENSORBOARD_LOGS_PATH='./logs'
+mkdir -p "$TENSORBOARD_LOGS_PATH"
+
+DISTRIBUTED_ARGS=(
+    --nproc_per_node "$GPUS_PER_NODE"
+    --nnodes "$NUM_NODES"
+)
+
+if [ "$NUM_NODES" -gt 1 ]; then
+    DISTRIBUTED_ARGS+=(
+        --master_addr "${MASTER_ADDR:-localhost}"
+        --master_port "${MASTER_PORT:-6000}"
+    )
+fi
+
+# --- Parallelism ---
+MODEL_PARALLEL_ARGS=(
+    --tensor-model-parallel-size "$TP"
+    --pipeline-model-parallel-size 1
+    --expert-model-parallel-size "$EP"
+    --context-parallel-size 1
+    --expert-tensor-parallel-size 1
+    --use-distributed-optimizer
+    --sequence-parallel
+)
+
+# --- Training ---
+TRAINING_ARGS=(
+    --micro-batch-size "$MBS"
+    --global-batch-size "$GBS"
+    --train-iters 2000
+    --adam-beta1 0.9
+    --adam-beta2 0.95
+    --lr 1.2e-4
+    --min-lr 1.2e-5
+    --lr-decay-style cosine
+    --lr-warmup-iters 100
+    --lr-decay-iters 2000
+    --weight-decay 0.1
+    --clip-grad 1.0
+    --auto-detect-ckpt-format
+    --accumulate-allreduce-grads-in-fp32
+    --model-provider qwen35_vlm
+    --model-variant "$MODEL_VARIANT"
+    --bf16
+    --use-mcore-models
+    --use-flash-attn
+    --transformer-impl transformer_engine
+    --cross-entropy-loss-fusion
+    --cross-entropy-fusion-impl te
+    --enable-experimental
+    --manual-gc
+    --manual-gc-interval 5
+)
+
+PROFILE_ARGS=()
+NSYS_CMD=()
+if [ "$PROFILE" = "1" ]; then
+    PROFILE_ARGS=(
+        --profile
+        --profile-step-start "$PROFILE_STEP_START"
+        --profile-step-end "$PROFILE_STEP_END"
+        --profile-ranks "$PROFILE_RANKS"
+    )
+
+    NSYS_OUTPUT_DIR="${CHECKPOINT_STORE_PATH}/nsys"
+    mkdir -p "$NSYS_OUTPUT_DIR"
+    NSYS_CMD=(
+        nsys profile
+        --sample=none
+        --cpuctxsw=none
+        --trace=cuda,nvtx,cublas,cudnn
+        --force-overwrite=true
+        --capture-range=cudaProfilerApi
+        --capture-range-end=stop
+        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S)"
+    )
+fi
+
+# --- Logging & Checkpointing ---
+EVAL_AND_LOGGING_ARGS=(
+    --log-interval 1
+    --save-interval 500
+    --eval-interval 500
+    --save "$CHECKPOINT_STORE_PATH"
+    --eval-iters 10
+    --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
+    --wandb-project "$WANDB_PROJECT"
+    --wandb-exp-name "$EXP_NAME"
+    --wandb-save-dir "$CHECKPOINT_STORE_PATH"
+    --log-throughput
+    "${LANGUAGE_MODEL_CKPT_ARG[@]}"
+)
+
+# --- Tokenizer ---
+TOKENIZER_ARGS=(
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model 'Qwen/Qwen3.5-397B-A17B'
+)
+
+# --- Dataset ---
+DATASET_ARGS=(
+    --dataset-provider qwen35_vlm
+    --image-token-id 248056
+    --total-seq-length "$SEQ_LEN"
+)
+if [ "$DATASET_PATH" = "mock" ]; then
+    DATASET_ARGS=(
+        --dataset-provider qwen35_vlm
+        --image-token-id 248056
+        --total-seq-length "$SEQ_LEN"
+    )
+else
+    DATASET_ARGS=(
+        --dataloader-type external
+        --dataset-provider qwen35_vlm
+        --data-path "$DATASET_PATH"
+        --image-token-id 248056
+    )
+fi
+
+# --- Qwen3-Next Decoder Architecture (variant-specific) ---
+# Architecture values must match multimodal_v2/models/qwen35_vl/configuration.py.
+if [ "$MODEL_VARIANT" = "proxy" ]; then
+    # Proxy: 4 layers, 16 experts (same hidden dims as 397b_a17b for TP compatibility)
+    GPT_MODEL_ARGS=(
+        --num-layers 4
+        --hidden-size 4096
+        --ffn-hidden-size 10240
+        --num-attention-heads 32
+        --group-query-attention
+        --num-query-groups 2
+        --kv-channels 256
+        --max-position-embeddings 262144
+        --seq-length "$SEQ_LEN"
+        --normalization RMSNorm
+        --apply-layernorm-1p
+        --norm-epsilon 1e-06
+        --swiglu
+        --disable-bias-linear
+        --untie-embeddings-and-output-weights
+        --position-embedding-type rope
+        --rotary-percent 0.25
+        --rotary-base 10000000
+        --rotary-seq-len-interpolation-factor 1
+        --qk-layernorm
+        --attention-output-gate
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --experimental-attention-variant gated_delta_net
+        --linear-attention-freq 4
+        --linear-conv-kernel-dim 4
+        --linear-key-head-dim 128
+        --linear-value-head-dim 128
+        --linear-num-key-heads 16
+        --linear-num-value-heads 64
+        --num-experts 16
+        --moe-ffn-hidden-size 1024
+        --moe-shared-expert-intermediate-size 1024
+        --moe-shared-expert-gate
+        --moe-router-load-balancing-type aux_loss
+        --moe-router-topk 2
+        --moe-grouped-gemm
+        --moe-aux-loss-coeff 1e-3
+        --moe-token-dispatcher-type alltoall
+        --moe-router-dtype fp32
+        --make-vocab-size-divisible-by 485
+    )
+    RECOMPUTE_ARGS=(
+        --recompute-granularity selective
+        --recompute-modules moe_act shared_experts layernorm
+    )
+    MTP_ARGS=(
+        --mtp-num-layers 1
+        --mtp-loss-scaling-factor 0.1
+    )
+
+else
+    # Full 397B-A17B production model
+    GPT_MODEL_ARGS=(
+        --num-layers 60
+        --hidden-size 4096
+        --ffn-hidden-size 10240
+        --num-attention-heads 32
+        --group-query-attention
+        --num-query-groups 2
+        --kv-channels 256
+        --max-position-embeddings 262144
+        --seq-length "$SEQ_LEN"
+        --normalization RMSNorm
+        --apply-layernorm-1p
+        --norm-epsilon 1e-06
+        --swiglu
+        --disable-bias-linear
+        --untie-embeddings-and-output-weights
+        --position-embedding-type rope
+        --rotary-percent 0.25
+        --rotary-base 10000000
+        --rotary-seq-len-interpolation-factor 1
+        --qk-layernorm
+        --attention-output-gate
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --experimental-attention-variant gated_delta_net
+        --linear-attention-freq 4
+        --linear-conv-kernel-dim 4
+        --linear-key-head-dim 128
+        --linear-value-head-dim 128
+        --linear-num-key-heads 16
+        --linear-num-value-heads 64
+        --num-experts 512
+        --moe-ffn-hidden-size 1024
+        --moe-shared-expert-intermediate-size 1024
+        --moe-shared-expert-gate
+        --moe-router-load-balancing-type aux_loss
+        --moe-router-topk 10
+        --moe-grouped-gemm
+        --moe-aux-loss-coeff 1e-3
+        --moe-token-dispatcher-type flex
+        --moe-router-dtype fp32
+        --make-vocab-size-divisible-by 485
+    )
+    RECOMPUTE_ARGS=(
+        --recompute-granularity selective
+        --recompute-modules moe_act shared_experts layernorm
+    )
+    MTP_ARGS=(
+        --mtp-num-layers 1
+        --mtp-loss-scaling-factor 0.1
+    )
+fi
+
+# --- FSDP ---
+USE_FSDP=${USE_FSDP:-1}
+if [ "$USE_FSDP" -eq 1 ]; then
+    FSDP_ARGS=(
+        --use-megatron-fsdp
+        --data-parallel-sharding-strategy optim_grads_params
+        --no-gradient-accumulation-fusion
+        --init-model-with-meta-device
+        --use-distributed-optimizer
+        --ckpt-format fsdp_dtensor
+    )
+    export CUDA_DEVICE_MAX_CONNECTIONS=8
+else
+    FSDP_ARGS=()
+fi
+
+echo "================================================================"
+echo "Qwen3.5-VL MIMO Training  [variant: $MODEL_VARIANT]"
+echo "  GPUs per node: $GPUS_PER_NODE"
+echo "  Num nodes:     $NUM_NODES"
+echo "  TP=$TP  EP=$EP  PP=1  CP=1"
+echo "  MBS=$MBS  GBS=$GBS  SEQ=$SEQ_LEN"
+echo "  Dataset:       $DATASET_PATH"
+echo "  FSDP:          $USE_FSDP"
+echo "  PROFILE:       $PROFILE"
+if [ "$PROFILE" = "1" ]; then
+    echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
+    echo "  Profile ranks: $PROFILE_RANKS"
+fi
+echo "================================================================"
+
+cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" examples/mimo/train.py \
+    "${TRAINING_ARGS[@]}" \
+    "${PROFILE_ARGS[@]}" \
+    "${MODEL_PARALLEL_ARGS[@]}" \
+    "${EVAL_AND_LOGGING_ARGS[@]}" \
+    "${TOKENIZER_ARGS[@]}" \
+    "${GPT_MODEL_ARGS[@]}" \
+    "${DATASET_ARGS[@]}" \
+    "${RECOMPUTE_ARGS[@]}" \
+    "${MTP_ARGS[@]}" \
+    "${FSDP_ARGS[@]}" )
+
+echo "${cmd[@]}"
+
+if [ "$DRY_RUN" = true ]; then
+    echo "=== DRY RUN ==="
+    exit 0
+else
+    "${cmd[@]}"
+fi
