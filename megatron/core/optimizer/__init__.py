@@ -51,6 +51,7 @@ from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
+    Lion,
     _create_emerging_optimizer,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -587,7 +588,6 @@ def _get_megatron_optimizer_based_on_param_groups(
                     "Lion optimizer requires the 'emerging_optimizers' package. "
                     "Please install it to use --optimizer lion."
                 )
-            from emerging_optimizers.scalar_optimizers import Lion
 
             optimizer = Lion(
                 param_groups,
