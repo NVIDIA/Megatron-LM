@@ -336,13 +336,12 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     Dynamic CP scheduler that balances workload across variable CP sizes.
     """
 
-    def __init__(self, *args, min_cp_size=1, max_cp_size=None, **kwargs):
+    def __init__(self, *args, min_cp_size=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
-        self.max_cp_size = max_cp_size if max_cp_size is not None else self.cp_size
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -351,13 +350,12 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         """
         mslpr = self.max_seq_len_per_rank
         min_cp = self.min_cp_size
-        max_cp = self.max_cp_size
         workload_fn = lambda seq_len, cp_size=None: dcp_get_total_workload(
-            seq_len, mslpr, cp_size, min_cp, max_cp
+            seq_len, mslpr, cp_size, min_cp
         )
-        gpus_fn = lambda seq_len: dcp_gpus_needed(seq_len, mslpr, min_cp, max_cp)
+        gpus_fn = lambda seq_len: dcp_gpus_needed(seq_len, mslpr, min_cp)
         buckets_fn = lambda sample_seqlens, compute_est: dcp_make_buckets_equal(
-            sample_seqlens, compute_est, mslpr, min_cp, max_cp
+            sample_seqlens, compute_est, mslpr, min_cp
         )
 
         groups = []
@@ -434,7 +432,6 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
-        scheduler_kwargs['max_cp_size'] = cp_size
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,

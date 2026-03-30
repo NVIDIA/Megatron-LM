@@ -69,12 +69,13 @@ class ModelParallelConfig:
     """
     If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
+    Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
+    Please set max_seqlen_per_dp_cp_rank.
     """
 
     min_dynamic_context_parallel_size: int = 1
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
-    The maximum is always context_parallel_size."""
+    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
 
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
@@ -460,22 +461,6 @@ class ModelParallelConfig:
                 raise ValueError(
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
-                )
-
-            if self.min_dynamic_context_parallel_size > self.context_parallel_size:
-                raise ValueError(
-                    f"min_dynamic_context_parallel_size ({self.min_dynamic_context_parallel_size}) "
-                    f"must be <= context_parallel_size ({self.context_parallel_size}), "
-                    f"since context_parallel_size is the maximum dynamic CP group size."
-                )
-
-            if self.min_dynamic_context_parallel_size > 1:
-                warnings.warn(
-                    f"min_dynamic_context_parallel_size is set to {self.min_dynamic_context_parallel_size}. "
-                    f"Dynamic CP groups will range from {self.min_dynamic_context_parallel_size} "
-                    f"to {self.context_parallel_size} (context_parallel_size). "
-                    f"This may cause padding overhead for short sequences.",
-                    UserWarning,
                 )
 
         if self.sequence_parallel:
