@@ -28,10 +28,25 @@ logger = logging.getLogger(__name__)
 _async_calls_queue = None
 
 
+def _get_async_calls_queue():
+    """Get or lazily initialize the async calls queue."""
+    global _async_calls_queue
+
+    if _async_calls_queue is None:
+        args = get_args()
+        _, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
+        AsyncCallsQueue = async_modules["AsyncCallsQueue"]
+        _async_calls_queue = AsyncCallsQueue(
+            persistent=getattr(args, "use_persistent_ckpt_worker", False)
+        )
+
+    return _async_calls_queue
+
+
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     global _async_calls_queue
     args = get_args()
-    async_strategy, async_modules = get_async_strategy(args.async_strategy)
+    async_strategy, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
     AsyncCallsQueue = async_modules["AsyncCallsQueue"]
     get_write_results_queue = async_modules["get_write_results_queue"]
     # Recreate the async_calls_queue for persistent worker
@@ -63,7 +78,7 @@ def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
     Args:
         async_request (AsyncRequest | NVRxAsyncRequest): the async save request.
     """
-    _async_calls_queue.schedule_async_request(async_request)
+    _get_async_calls_queue().schedule_async_request(async_request)
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate=False):
@@ -83,15 +98,17 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
     if blocking and not is_empty_async_queue():
         print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')
 
-    _async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
+    async_calls_queue = _async_calls_queue
+    if async_calls_queue is not None:
+        async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
 
     # Clean up finished deletion processes to prevent zombies
     # Import here to avoid circular dependency
     from .checkpointing import finalize_deletion_processes
     finalize_deletion_processes(blocking=blocking or terminate)
 
-    if terminate:
-        _async_calls_queue.close()
+    if terminate and async_calls_queue is not None:
+        async_calls_queue.close()
 
 
 def is_empty_async_queue() -> bool:
@@ -100,7 +117,7 @@ def is_empty_async_queue() -> bool:
     Returns:
         bool: True if there is any ongoing async call.
     """
-    return _async_calls_queue.get_num_unfinalized_calls() == 0
+    return _async_calls_queue is None or _async_calls_queue.get_num_unfinalized_calls() == 0
 
 
 def reset_persistent_async_worker(async_strategy):
