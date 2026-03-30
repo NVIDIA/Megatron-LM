@@ -419,20 +419,14 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, max_cp_size=None):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
     """
     Creates groups required for dynamic DPxCP.
-    Creates a new group for every power of 2 from min_cp_size up to max_cp_size.
-    max_cp_size defaults to len(ranks) (the full DPxCP group size).
+    Creates a new group for every power of 2 from min_cp_size up to len(ranks).
     Returns a dictionary indexed by group size.
     """
-    if max_cp_size is None:
-        max_cp_size = len(ranks)
     dynamic_dp_cp_groups = {}
-    group_sizes = [
-        2**i for i in range(int(log2(len(ranks))))
-        if 2**i >= min_cp_size and 2**i <= max_cp_size
-    ]
+    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -957,17 +951,17 @@ def initialize_model_parallel(
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
-                    max_cp_size=context_parallel_size,
                 )
             )
 
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
         group_sizes = [
-            2**i for i in range(int(log2(data_parallel_size_with_cp)))
-            if 2**i >= min_dynamic_context_parallel_size and 2**i <= context_parallel_size
+            2**i
+            for i in range(int(log2(data_parallel_size_with_cp)))
+            if 2**i >= min_dynamic_context_parallel_size
         ]
-        if context_parallel_size == data_parallel_size_with_cp:
-            group_sizes.append(context_parallel_size)
+        if data_parallel_size_with_cp not in group_sizes:
+            group_sizes.append(data_parallel_size_with_cp)
         for group_size in group_sizes:
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
@@ -1497,7 +1491,6 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
-    # If the group size is the same as the entire DPxCP group, return the original group
     if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None

@@ -968,28 +968,19 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
 
 
 @lru_cache(maxsize=128)
-def dcp_gpus_needed(
-    seq_len: int, max_seq_len_per_rank: int, min_cp_size: int = 1, max_cp_size: Optional[int] = None
-) -> int:
-    """Number of GPUs needed, rounded up to the next power of 2, clamped to [min_cp_size, max_cp_size]."""
+def dcp_gpus_needed(seq_len: int, max_seq_len_per_rank: int, min_cp_size: int = 1) -> int:
+    """Number of GPUs needed, rounded up to the next power of 2, lower-bounded by min_cp_size."""
     raw = max(1, 2 ** ceil(log2(seq_len / max_seq_len_per_rank)))
-    clamped = max(min_cp_size, raw)
-    if max_cp_size is not None:
-        clamped = min(clamped, max_cp_size)
-    return clamped
+    return max(min_cp_size, raw)
 
 
 @lru_cache(maxsize=128)
 def dcp_get_total_workload(
-    seq_length: int,
-    max_seq_len_per_rank: int,
-    cp_size: Optional[int] = None,
-    min_cp_size: int = 1,
-    max_cp_size: Optional[int] = None,
+    seq_length: int, max_seq_len_per_rank: int, cp_size: Optional[int] = None, min_cp_size: int = 1
 ) -> float:
     """Estimate workload of a sub-sample for scheduling balance."""
     if cp_size is None:
-        cp_size = dcp_gpus_needed(seq_length, max_seq_len_per_rank, min_cp_size, max_cp_size)
+        cp_size = dcp_gpus_needed(seq_length, max_seq_len_per_rank, min_cp_size)
     return (seq_length * seq_length) / cp_size
 
 
@@ -998,15 +989,14 @@ def dcp_make_buckets_equal(
     compute_estimator: Callable,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
-    max_cp_size: Optional[int] = None,
 ) -> List[deque]:
     """Split samples into buckets of roughly equal work, one per unique CP size."""
     seqlens = [seq_len for _, seq_len in sample_seqlens]
-    k = len({dcp_gpus_needed(L, max_seq_len_per_rank, min_cp_size, max_cp_size) for L in seqlens})
+    k = len({dcp_gpus_needed(L, max_seq_len_per_rank, min_cp_size) for L in seqlens})
 
     work = []
     for _, s in sample_seqlens:
-        cp_size = dcp_gpus_needed(s, max_seq_len_per_rank, min_cp_size, max_cp_size)
+        cp_size = dcp_gpus_needed(s, max_seq_len_per_rank, min_cp_size)
         work.append(compute_estimator(s, cp_size))
     total_work = sum(work)
     target = total_work / k

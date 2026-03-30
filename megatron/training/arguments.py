@@ -1208,20 +1208,21 @@ def validate_args(args, defaults={}):
 
         import warnings
         warnings.warn(
-            f"Dynamic CP enabled: context_parallel_size={args.context_parallel_size} "
+            f"Dynamic CP enabled: dp_size * context_parallel_size="
+            f"{args.data_parallel_size * args.context_parallel_size} "
             f"will be used as the maximum dynamic CP group size. "
             f"Dynamic CP groups will range from "
             f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
-            f"to {args.context_parallel_size}."
+            f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
     if args.sequence_packing_scheduler is not None:
         if args.sequence_packing_scheduler == 'dp_balanced':
-            max_cp_size = args.context_parallel_size
+            total_cp_ranks = args.context_parallel_size
         else:
-            max_cp_size = args.data_parallel_size * args.context_parallel_size
-        assert max_cp_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
-            f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) ' \
             f'must be >= single sequence max length ({args.seq_length})'
 
     # disable async_tensor_model_parallel_allreduce when
