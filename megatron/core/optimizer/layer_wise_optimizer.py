@@ -46,7 +46,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
         model_chunks: Optional[List] = None,
-        async_allgather: bool = False,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -57,14 +56,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
             model_chunks: DDP-wrapped model chunks (needed for async_allgather).
-            async_allgather: If True, defer param all-gather to forward pre-hooks.
         """
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
 
         # Set up async all-gather using DDP bucket infrastructure.
-        self.async_allgather = async_allgather
+        self.async_allgather = config.overlap_param_gather
         if self.async_allgather:
             assert (
                 model_chunks is not None

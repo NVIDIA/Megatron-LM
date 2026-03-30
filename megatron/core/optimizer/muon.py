@@ -22,5 +22,9 @@ def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """
     from . import get_megatron_optimizer
 
-    kwargs.pop('layer_wise_distributed_optimizer', None)
+    if kwargs.pop('layer_wise_distributed_optimizer', False):
+        config = args[0] if args else kwargs.get('config')
+        if config is not None:
+            config.use_layer_wise_distributed_optimizer = True
+
     return get_megatron_optimizer(*args, **kwargs)
