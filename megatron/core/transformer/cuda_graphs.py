@@ -2279,6 +2279,7 @@ class TECudaGraphHelper:
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
         if self.config.fine_grained_activation_offloading:
             off_interface.reset()
         torch.cuda.synchronize()
