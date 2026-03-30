@@ -1,12 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Full iteration CUDA graph for training."""
+"""CUDA graph wrapper for ADAM optimizer."""
 
 import logging
 
 import torch
-
-from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
 

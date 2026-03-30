@@ -56,7 +56,6 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    on_device: bool = False,
 ) -> float:
     """Calculate the norm of gradients in fp32.
 
@@ -135,7 +134,7 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        if on_device:
+        if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
             total_norm = total_norm.item() ** (1.0 / norm_type)
