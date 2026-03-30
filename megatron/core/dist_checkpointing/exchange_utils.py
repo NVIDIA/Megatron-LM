@@ -436,7 +436,7 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
-    from utils import log_single_rank
+    from ..utils import log_single_rank
 
     all_loaded_objects_list = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
