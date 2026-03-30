@@ -74,7 +74,6 @@ class FullyParallelSaveStrategyWrapper:
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
     ):
-        super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = torch.distributed.group.WORLD
