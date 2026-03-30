@@ -16,6 +16,36 @@ from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
+def _packed_collate_fn(batch):
+    """Collate function for packed sequences with variable-length cu_seqlens.
+
+    Stacks all fixed-size tensors normally. For cu_seqlens, concatenates
+    per-sample boundaries with offsets so the result describes one merged
+    packed sequence of length B * S (for use with flash-attn varlen).
+    """
+    if 'cu_seqlens' not in batch[0]:
+        return torch.utils.data.dataloader.default_collate(batch)
+
+    seq_length = batch[0]['tokens'].numel()
+
+    merged_cu_seqlens = [0]
+    merged_max_seqlen = 0
+    for i, sample in enumerate(batch):
+        offset = i * seq_length
+        merged_cu_seqlens.extend((sample['cu_seqlens'][1:] + offset).tolist())
+        merged_max_seqlen = max(merged_max_seqlen, sample['max_seqlen'].item())
+
+    result = {}
+    for key in batch[0]:
+        if key == 'cu_seqlens':
+            result['cu_seqlens'] = torch.tensor(merged_cu_seqlens, dtype=torch.int32).unsqueeze(0)
+        elif key == 'max_seqlen':
+            result['max_seqlen'] = torch.tensor([merged_max_seqlen], dtype=torch.int32)
+        else:
+            result[key] = torch.stack([sample[key] for sample in batch])
+    return result
+
+
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
 
@@ -98,7 +128,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
-        extra_kwargs = {}
+        extra_kwargs = {"collate_fn": _packed_collate_fn,}
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

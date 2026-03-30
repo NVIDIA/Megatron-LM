@@ -268,6 +268,22 @@ class GPTDataset(MegatronDataset):
             loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
 
+        # Build cu_seqlens from EOD token boundaries
+        seq_length = tokens.numel()
+        eod_positions = (tokens == self.config.tokenizer.eod).nonzero(as_tuple=False).squeeze(-1)
+
+        cu_seqlens_list = [0]
+        if eod_positions.numel() > 0:
+            for pos in eod_positions:
+                cu_seqlens_list.append(pos.item() + 1)
+        # Extend last segment to cover remaining tokens (padding or partial doc)
+        if cu_seqlens_list[-1] != seq_length:
+            cu_seqlens_list.append(seq_length)
+
+        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32)
+        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = adjacent_diffs.max()  # 0-D tensor
+
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
 
@@ -286,6 +302,8 @@ class GPTDataset(MegatronDataset):
                 "attention_mask": attention_mask,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
             }
         else:
             return {
@@ -293,6 +311,8 @@ class GPTDataset(MegatronDataset):
                 "labels": labels,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
             }
 
     def _query_document_sample_shuffle_indices(

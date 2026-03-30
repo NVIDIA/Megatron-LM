@@ -351,10 +351,10 @@ class MultiLatentAttention(Attention):
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # (t, np, hn) -> (t, b=1, h=np*hn) # this assumes mbs=1
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            core_attn_out = core_attn_out.reshape(hidden_states.size(0), hidden_states.size(1), -1)
 
         if self.recompute_up_proj:
             assert self.qkv_up_checkpoint is not None
@@ -639,13 +639,20 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None: #TODO: i have (t, mbs, h, d)
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
-            q_compressed = q_compressed.squeeze(1)
-            kv_compressed = kv_compressed.squeeze(1)
-            k_pos_emb = k_pos_emb.squeeze(1)
+            # q_compressed = q_compressed.squeeze(1)
+            # kv_compressed = kv_compressed.squeeze(1)
+            # k_pos_emb = k_pos_emb.squeeze(1)
+
+            # in case mbs>1 qkv is [t, mbs, h, d]
+            # btw i have (t, mbs, h*d) and not (t, mbs, h, d)
+            seq, mbs, h = q_compressed.size()
+            q_compressed = q_compressed.view(seq*mbs, -1)
+            kv_compressed = kv_compressed.view(seq*mbs, -1)
+            k_pos_emb = k_pos_emb.view(seq*mbs, -1)
 
         # =========================================
         # Apply norm
