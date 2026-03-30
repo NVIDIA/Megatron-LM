@@ -200,9 +200,16 @@ class MimoModel(MegatronModule):
         batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
         input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
 
-        position_ids_text = (
-            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
-        )
+        if position_ids is not None:
+            if position_ids.dim() == 3:
+                # MRoPE: [3, B, S] — embedding layer doesn't use position_ids for RoPE variants,
+                # but pass correctly-shaped ids in case the impl changes.
+                position_ids_text = position_ids[:, batch_idx, seq_idx].unsqueeze(1)  # [3, 1, T]
+            else:
+                # Standard: [B, S]
+                position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)  # [1, T]
+        else:
+            position_ids_text = None
 
         text_embeddings = self.language_model.embedding(
             input_ids=input_ids_text, position_ids=position_ids_text
@@ -280,7 +287,7 @@ class MimoModel(MegatronModule):
         # 3. Forward pass through language model
         lm_output = self.language_model(
             input_ids=None,
-            position_ids=None,
+            position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
             attention_mask=attention_mask,
