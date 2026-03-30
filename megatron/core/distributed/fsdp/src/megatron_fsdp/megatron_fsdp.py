@@ -723,8 +723,8 @@ class MegatronFSDP(torch.nn.Module):
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
-            args: Optional[Tuple[Any, ...]],
-            kwargs: Optional[Dict[str, Any]],
+            args: Tuple[Any, ...],
+            kwargs: Dict[str, Any],
         ):
             """
             Register a post-backward hook for the given module by inserting an autograd
