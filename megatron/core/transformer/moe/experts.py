@@ -541,24 +541,6 @@ class GroupedMLP(MegatronModule):
         """
         pass
 
-def _pad_unpad(inp, pad):
-    if pad:
-        if inp.ndim == 2:
-            result = torch.nn.functional.pad(inp, (0, 0, 0, 256))
-        elif inp.ndim == 1:
-            result = torch.nn.functional.pad(inp, (0, 256))
-        else:
-            raise ValueError(f"Input dimension {inp.ndim} not supported")
-    else:
-        if inp.ndim == 2:
-            result = inp[:-256, :]
-        elif inp.ndim == 1:
-            result = inp[:-256]
-        else:
-            raise ValueError(f"Input dimension {inp.ndim} not supported")
-        assert result.shape[0] == 0
-    return result
-
 
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
@@ -816,8 +798,6 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_func != F.silu or not self.config.gated_linear_unit:
             return False  # Expected SwiGLU activation
 
-        if not self.config.use_transformer_engine_op_fuser:
-            return False
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -931,8 +911,6 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
-        if self.config.moe_expert_rank_capacity_factor is not None:
-            assert self.config.moe_router_padding_for_quantization, "moe_expert_rank_capacity_factor requires moe_router_padding_for_quantization"
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -970,15 +948,15 @@ class TEGroupedMLP(MegatronModule):
             avg_num_tokens = (
                 int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
             )
-            offload_context = get_paged_stash_context(
+            stash_context = get_paged_stash_context(
                 name="expert_fc1_fused",
                 max_num_tokens=max_num_tokens,
                 num_tokens_tensor=tokens_per_expert.sum(),
                 avg_num_tokens=avg_num_tokens,
             )
         else:
-            offload_context = nullcontext()
-        with offload_context:
+            stash_context = nullcontext()
+        with stash_context:
             # Call fused impl
             output = ops(
                 permuted_local_hidden_states,

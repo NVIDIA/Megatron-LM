@@ -1199,7 +1199,7 @@ class PagedStashRunner:
                 mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
             ):
                 mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
-                mlp.token_dispatcher._comm_manager.over_budget.fill_(0)
+                mlp.token_dispatcher.reset_over_budget()
         self.stash_manager.overflow.zero_()
         if self.stash_manager.host_spill is not None:
             self.stash_manager.host_spill.zero_()
