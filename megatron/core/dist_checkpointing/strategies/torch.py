@@ -760,9 +760,6 @@ class TorchDistSaveShardedStrategy:
 
         return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 
-    def can_handle_sharded_objects(self):
-        return True
-
 
 def _get_filesystem_reader(
     checkpoint_dir: Union[str, Path], cache_metadata: bool = False
