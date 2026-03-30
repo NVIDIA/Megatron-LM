@@ -73,20 +73,27 @@ class FullyParallelSaveStrategyWrapper:
         strategy: TorchDistSaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
+        backend: str = "torch_dist",
+        version: int = 1,
     ):
+        """ """
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = torch.distributed.group.WORLD
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
+        self.backend = backend
+        self.version = version
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
     def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
