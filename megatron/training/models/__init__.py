@@ -2,6 +2,7 @@
 
 from megatron.training.models.base import ModelBuilder, ModelConfig, Serializable, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models, build_virtual_pipeline_stages
+from megatron.training.models.mamba import MambaModelBuilder, MambaModelConfig
 
 
 __all__ = [
@@ -11,4 +12,6 @@ __all__ = [
     "compose_hooks",
     "build_virtual_pipeline_stages",
     "unimodal_build_distributed_models",
+    "MambaModelConfig",
+    "MambaModelBuilder"
 ]
