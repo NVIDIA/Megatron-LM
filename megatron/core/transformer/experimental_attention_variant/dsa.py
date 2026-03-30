@@ -16,7 +16,7 @@ from megatron.core.models.common.embeddings import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -26,12 +26,7 @@ try:
 except ImportError:
     hadamard_transform = None
 
-try:
-    from megatron.core.transformer.experimental_attention_variant.dsa_fused_kernels import (
-        FusedDSAMQA,
-    )
-except ImportError:
-    FusedDSAMQA = None
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_kernels import DSAFunction
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -163,480 +158,6 @@ class DSAIndexerLossLoggingHelper:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-
-
-def compute_dsa_indexer_loss(
-    index_scores: torch.Tensor,
-    topk_indices: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    softmax_scale: float,
-    loss_coeff: float,
-    sparse_loss: bool,
-    pg_collection: ProcessGroupCollection,
-) -> torch.Tensor:
-    """
-    Compute KL divergence loss between index_scores and true attention_scores.
-
-    This loss trains the indexer to predict which tokens are important by matching the distribution
-    of true attention scores.
-
-    Reference: Section 2.1 of
-        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
-
-    Args:
-        index_scores: Scores predicted by indexer [batch, seqlen_q, seqlen_k].
-        topk_indices: Top-k indices [batch, seqlen_q, index_topk].
-        query: Query tensor [seqlen_q, batch, heads, dim].
-        key: Key tensor [seqlen_k, batch, heads, dim].
-        softmax_scale: Scale coefficient after q @ k^T.
-        loss_coeff: Coefficient for the indexer KL divergence loss.
-        sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
-            indices will be used to compute the loss.
-        pg_collection: Process group collection, must have TP process group.
-
-    Returns:
-        index_loss: KL divergence loss (scalar).
-    """
-    sq, b, np, hn = query.size()
-    sk = key.size(0)
-
-    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
-    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
-    # Compute attention scores [b * np, sq, sk]
-    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
-    # Reshape to [b, np, sq, sk]
-    attention_scores = attention_scores.reshape(b, np, sq, sk)
-
-    # causal_mask [sq, sk]
-    causal_mask = torch.triu(
-        torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
-        diagonal=1,
-    )
-    # index_mask [b, sq, sk]
-    index_mask = torch.full(
-        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
-    ).scatter_(-1, topk_indices, 0)
-
-    # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
-    attention_scores += causal_mask.view(1, 1, sq, sk)
-    if sparse_loss:
-        # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
-        attention_scores += index_mask.view(b, 1, sq, sk)
-        # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
-        index_scores += index_mask
-
-    # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-    # [b, sq, sk] -> [b, sq, sk]
-    index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
-
-    # Sum attention scores across heads.
-    # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
-    attention_scores = attention_scores.sum(dim=1)
-    if pg_collection.tp.size() > 1:
-        # attention scores are scattered to TP ranks in head dimension.
-        torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
-    # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
-    # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True)
-
-    # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
-    # kl_per_element [b, sq, sk]
-    kl_per_element = attention_scores * (
-        torch.log(attention_scores + 1e-10) - torch.log(index_scores + 1e-10)
-    )
-
-    # [b, sq, sk] -> [b, sq] -> [1]
-    # Each token has same weight in the loss.
-    kl_div = kl_per_element.sum(dim=-1).mean()
-
-    # Scale by coefficient.
-    indexer_loss = kl_div * loss_coeff
-
-    return indexer_loss
-
-
-def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """
-    Perform index score using BF16 precision.
-
-    Reference:
-        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
-    This is a BF16 implementation of the `fp8_index` logic:
-        1. Compute attention scores: q @ k^T;
-        2. Apply ReLU activation;
-        3. Weight by attention weights;
-        4. Sum across attention heads.
-
-    Args:
-        q: BF16 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
-        weights: BF16 [seqlen_q, batch, index_n_heads], the attention weights.
-        k: BF16 [seqlen_k, batch, index_head_dim], the key tensor.
-
-    Returns:
-        index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
-    """
-    # Compute attention scores: q @ k^T
-    # [seqlen_q, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
-
-    # Apply ReLU activation.
-    index_scores = torch.relu(index_scores)
-
-    # Weight each head by attention weights.
-    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores = index_scores * weights.unsqueeze(-1)
-
-    # Sum across attention heads.
-    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
-    index_scores = index_scores.sum(dim=2)
-
-    # Transpose to [batch, seqlen_q, seqlen_k].
-    index_scores = index_scores.transpose(0, 1)
-
-    return index_scores
-
-
-def fused_qk_topk_naive(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    index_topk: int,
-    mask: Optional[torch.Tensor] = None,
-):
-    """Naive implementation of QK Topk."""
-    seqlen = q.size(0)
-    # =========================================
-    # Compute index scores
-    # =========================================
-    # [batch, seqlen, seqlen]
-    index_scores = _compute_index_scores(q, weights, k)
-    if mask is not None:
-        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
-        index_scores = index_scores + mask
-
-    # =========================================
-    # Select top-k indices
-    # =========================================
-    topk_k = min(index_topk, seqlen)
-    # [batch, seqlen, index_topk]
-    topk_indices = index_scores.topk(topk_k, dim=-1)[1]
-
-    return index_scores, topk_indices
-
-
-def fwd_fused_indexer_loss_naive(
-    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, pg_collection
-):
-    """Naive implementation of forward pass for indexer loss."""
-    index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
-
-    indexer_loss = compute_dsa_indexer_loss(
-        index_scores,
-        topk_indices,
-        query,
-        key,
-        softmax_scale,
-        loss_coeff,
-        sparse_loss,
-        pg_collection,
-    )
-
-    return topk_indices, indexer_loss
-
-
-def bwd_fused_indexer_loss_naive(
-    q,
-    weights,
-    k,
-    query,
-    key,
-    topk_indices,
-    softmax_scale,
-    loss_coeff,
-    sparse_loss,
-    grad_loss,
-    pg_collection,
-):
-    """Naive implementation of backward pass for indexer loss."""
-    index_scores = _compute_index_scores(q, weights, k)  # [B, Sq, Sk]
-
-    sq, b, np, hn = query.size()
-    sk = key.size(0)
-
-    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-    query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
-    key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
-    # Compute attention scores [b * np, sq, sk]
-    attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
-    # Free reshaped tensors - no longer needed after bmm
-    del query_reshaped, key_reshaped
-
-    # Reshape to [b, np, sq, sk]
-    attention_scores = attention_scores.reshape(b, np, sq, sk)
-
-    # causal_mask [sq, sk]
-    causal_mask = torch.triu(
-        torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
-        diagonal=1,
-    )
-    # index_mask [b, sq, sk]
-    index_mask = torch.full(
-        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
-    ).scatter_(-1, topk_indices, 0)
-
-    # Apply causal mask to both attention and index scores
-    # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
-    attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
-    # [b, sq, sk] + [1, sq, sk] -> [b, sq, sk]
-    index_scores = index_scores + causal_mask.unsqueeze(0)
-    # Free causal_mask - no longer needed
-    del causal_mask
-
-    if sparse_loss:
-        # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
-        attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
-        # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
-        index_scores = index_scores + index_mask
-
-    # Compute softmax for both
-    attention_scores_softmax = torch.nn.functional.softmax(
-        attention_scores, dim=-1, dtype=torch.float32
-    )
-    # Free attention_scores immediately
-    del attention_scores
-
-    index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
-    # Free index_scores - no longer needed after softmax
-    del index_scores
-
-    # Sum attention scores across heads: [b, np, sq, sk] -> [b, sq, sk]
-    attention_scores_sum = attention_scores_softmax.sum(dim=1)
-    # Free attention_scores_softmax
-    del attention_scores_softmax
-
-    if pg_collection.tp.size() > 1:
-        # attention scores are scattered to TP ranks in head dimension.
-        torch.distributed.all_reduce(attention_scores_sum.contiguous(), group=pg_collection.tp)
-
-    # L1 normalize
-    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
-        dim=-1, keepdim=True
-    )
-    # Free attention_scores_sum - no longer needed after normalization
-    del attention_scores_sum
-
-    # Backward through loss = kl_div * loss_coeff
-    # where kl_div = kl_per_element.sum(dim=-1).mean()
-    grad_kl_div = grad_loss * loss_coeff  # scalar
-
-    # Backward through mean: distribute gradient equally
-    grad_kl_per_row = grad_kl_div / (b * sq)  # scalar value for each row
-
-    # Backward through sum(dim=-1): broadcast back to [b, sq, sk]
-    # Each element in a row contributes to the sum, so gradient is same for all
-    grad_kl_per_element = grad_kl_per_row.view(1, 1, 1).expand(b, sq, sk)
-
-    # Backward through kl_per_element = target * (log(target) - log(index))
-    # ∂kl/∂index_softmax = -target / index_softmax
-    grad_index_scores_softmax = (
-        -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
-    )
-    # Free attention_scores_normalized - no longer needed
-    del attention_scores_normalized
-
-    # Backward through softmax: ∂L/∂x = softmax * (∂L/∂softmax - sum(∂L/∂softmax * softmax))
-    sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
-    grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
-    # Free intermediate tensors
-    del index_scores_softmax, grad_index_scores_softmax, sum_grad
-
-    # Zero out gradients for masked positions
-    # Create a mask for valid (non-masked) positions
-    # Causal mask: position (i, j) is valid if j <= i
-    causal_valid_mask = torch.tril(
-        torch.ones((sq, sk), device=q.device, dtype=torch.bool)
-    )  # [sq, sk]
-    if sparse_loss:
-        # Also apply index mask - only topk positions are valid
-        index_valid_mask = index_mask == 0  # [b, sq, sk]
-        del index_mask  # Free index_mask immediately after use
-        valid_mask = causal_valid_mask.unsqueeze(0) & index_valid_mask  # [b, sq, sk]
-        del index_valid_mask
-    else:
-        del index_mask  # Free index_mask even if not used for sparse_loss
-        valid_mask = causal_valid_mask.unsqueeze(0).expand(b, sq, sk)  # [b, sq, sk]
-    del causal_valid_mask
-
-    grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
-    del valid_mask
-
-    # Transpose from [b, sq, sk] to [sq, b, sk]
-    grad_index_scores = grad_index_scores_logits.transpose(0, 1)  # [sq, b, sk]
-    del grad_index_scores_logits
-
-    # Backward through sum over heads: expand gradient
-    grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
-    del grad_index_scores
-
-    # Compute forward values needed for backward
-    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
-    # Compute relu_mask before relu (saves memory vs keeping both scores and relu output)
-    relu_mask = scores > 0
-    scores_after_relu = torch.relu(scores)
-    del scores
-
-    # Backward through multiplication by weights: index_scores_per_head * weights
-    # ∂L/∂weights = grad * relu_scores (sum over sk)
-    grad_weights = (grad_weighted_scores * scores_after_relu).sum(dim=-1)  # [sq, b, h]
-
-    # ∂L/∂relu_scores = grad * weights
-    grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
-    del grad_weighted_scores, scores_after_relu
-
-    # Backward through ReLU
-    grad_scores = grad_scores_after_relu * relu_mask.float()  # [sq, b, h, sk]
-    del grad_scores_after_relu, relu_mask
-
-    # Backward through einsum 'sbhd,tbd->sbht'
-    # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
-    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())  # [sq, b, h, d]
-    # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)
-    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())  # [sk, b, d]
-    del grad_scores
-
-    return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
-
-
-class FusedDSAIndexerLoss(torch.autograd.Function):
-    """Fused implementation of DSA Indexer Loss."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        weights,
-        k,
-        query,
-        key,
-        softmax_scale,
-        topk,
-        loss_coeff,
-        mask,
-        sparse_loss,
-        pg_collection,
-    ):
-        """
-        Fused forward: index_scores never materialized in full.
-        """
-        topk_indices, loss = fwd_fused_indexer_loss_naive(
-            q,
-            weights,
-            k,
-            query,
-            key,
-            topk,
-            softmax_scale,
-            loss_coeff,
-            mask,
-            sparse_loss,
-            pg_collection,
-        )
-
-        # Save for backward (recomputation strategy)
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices)
-        ctx.softmax_scale = softmax_scale
-        ctx.loss_coeff = loss_coeff
-        ctx.sparse_loss = sparse_loss
-        ctx.pg_collection = pg_collection
-
-        return topk_indices, loss
-
-    @staticmethod
-    def backward(ctx, grad_topk_indices, grad_loss):
-        """
-        Backward: Recompute what we need.
-        """
-        q, weights, k, query, key, topk_indices = ctx.saved_tensors
-
-        grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
-            q,
-            weights,
-            k,
-            query,
-            key,
-            topk_indices,
-            ctx.softmax_scale,
-            ctx.loss_coeff,
-            ctx.sparse_loss,
-            grad_loss,
-            ctx.pg_collection,
-        )
-
-        # query and key are detached in forward, so return None for their gradients
-        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None
-
-
-class DSAIndexerLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that triggers the backward pass and scales the grad for indexer loss.
-
-    This custom autograd function attaches a KL divergence loss to the activation
-    to train the indexer to predict attention scores without affecting the forward pass.
-    """
-
-    main_loss_backward_scale: torch.Tensor = None
-
-    @staticmethod
-    def forward(ctx, output: torch.Tensor, indexer_loss: torch.Tensor):
-        """Preserve the indexer_loss by storing it in the context to avoid garbage collection.
-
-        Args:
-            output: The output tensor (activation).
-            indexer_loss: The indexer KL divergence loss tensor.
-
-        Returns:
-            torch.Tensor: The output tensor unchanged.
-        """
-        ctx.save_for_backward(indexer_loss)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Compute and scale the gradient for indexer loss.
-
-        Args:
-            grad_output: The gradient of the output.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled indexer loss
-                gradient.
-        """
-        (indexer_loss,) = ctx.saved_tensors
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=indexer_loss.device
-            )
-        indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
-        scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
-        return grad_output, scaled_indexer_loss_grad
-
-    @staticmethod
-    def set_loss_scale(scale: torch.Tensor):
-        """Set the scale of the indexer loss.
-
-        Args:
-            scale: The scale value to set.
-        """
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
-        else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
 @dataclass
@@ -802,7 +323,7 @@ class DSAIndexer(MegatronModule):
         x = torch.cat([x_nope, x_pe], dim=-1)
         return x
 
-    def forward_before_topk(
+    def forward(
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
@@ -867,175 +388,6 @@ class DSAIndexer(MegatronModule):
 
         return q, k, weights
 
-    def forward_with_scores(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for DSA Indexer that returns both index scores and top-k indices.
-
-        This is used when KL loss is enabled to compare indexer scores with true attention scores.
-
-        Args:
-            x: hidden states [seqlen, batch, hidden_size].
-            qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
-            mask: Attention mask [batch, seqlen, seqlen].
-            packed_seq_params: Packed sequence parameters for variable length sequences.
-
-        Returns:
-            index_scores: Index scores [batch, seqlen, seqlen].
-            topk_indices: Top-k indices [batch, seqlen, index_topk].
-        """
-        assert packed_seq_params is None, "Packed sequence is not supported for DSAttention"
-
-        # [seqlen, batch, index_n_heads * index_head_dim]
-        # [seqlen, batch, index_head_dim]
-        # [seqlen, batch, index_n_heads]
-        q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
-
-        # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
-
-        return index_scores, topk_indices
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ):
-        """
-        Forward pass for DSA Indexer.
-
-        Args:
-            x: hidden states [seqlen, batch, hidden_size].
-            qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
-            mask: Attention mask [batch, seqlen, seqlen].
-            packed_seq_params: Packed sequence parameters for variable length sequences.
-
-        Returns:
-            topk_indices: Top-k indices for sparse attention [batch, seqlen, index_topk].
-        """
-        _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
-        return topk_indices
-
-
-def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
-    """
-    Unfused sparse attention implementation.
-    """
-    sq, b, np, hn = query.size()
-    skv = key.size(0)
-    hnv = value.size(3)
-
-    # ===================================
-    # Raw attention scores [b, np, sq, skv]
-    # ===================================
-    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    # [skv, b, np, hn] -> [b, np, hn, skv] -> [b * np, hn, skv]
-    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, skv)
-    # Compute attention scores [b * np, sq, skv]
-    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
-    # Reshape to [b, np, sq, skv]
-    attention_scores = attention_scores.reshape(b, np, sq, skv)
-
-    # ===================================
-    # Apply sparse mask from indexer
-    # ===================================
-    # index_mask [b, sq, skv]
-    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
-    index_mask.scatter_(-1, topk_indices, 0)
-    # causal_mask [sq, skv]
-    causal_mask = torch.triu(
-        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
-        diagonal=1,
-    )
-    # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
-    index_mask += causal_mask.view(1, sq, skv)
-    # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
-    attention_scores += index_mask.unsqueeze(1)
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-
-    # ===================================
-    # Output
-    # ===================================
-    # [skv, b, np, hnv] -> [b, np, skv, hnv] -> [b * np, skv, hnv]
-    value = value.permute(1, 2, 0, 3).reshape(b * np, skv, hnv)
-    # Reshape attention_scores: [b, np, sq, skv] -> [b * np, sq, skv]
-    attention_scores = attention_scores.reshape(b * np, sq, skv)
-    # Compute output: [b * np, sq, hnv]
-    output = torch.bmm(attention_scores.to(value.dtype), value)
-    # Reshape output: [b * np, sq, hnv] -> [b, np, sq, hnv] -> [sq, b, np, hnv]
-    output = output.reshape(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
-    # Flatten: [sq, b, np, hnv] -> [sq, b, np * hnv]
-    output = output.reshape(sq, b, np * hnv)
-    return output
-
-
-def unfused_dsa_fn_mqa(query, key, v_channels, topk_indices, softmax_scale):
-    """Unfused sparse attention implementation with MQA."""
-    value = key[..., :v_channels]
-
-    sq, b, np, hn = query.size()
-    skv = key.size(0)
-    hnv = value.size(-1)
-
-    # Verify MQA format
-    assert key.size(-2) == 1, f"Expected key to have 1 head (MQA), got {key.size(-2)}"
-    assert value.size(-2) == 1, f"Expected value to have 1 head (MQA), got {value.size(-2)}"
-
-    # ===================================
-    # Raw attention scores [b, np, sq, skv]
-    # ===================================
-    # query: [sq, b, np, hn] -> [b, np, sq, hn]
-    query = query.permute(1, 2, 0, 3)
-    # key: [skv, b, 1, hn] -> [b, 1, hn, skv] -> broadcast to [b, np, hn, skv]
-    key = key.permute(1, 2, 3, 0)  # [b, 1, hn, skv]
-
-    # Compute attention scores with broadcasting
-    # [b, np, sq, hn] @ [b, 1, hn, skv] -> [b, np, sq, skv]
-    attention_scores = torch.matmul(query.float(), key.float()) * softmax_scale
-
-    # ===================================
-    # Apply sparse mask from indexer
-    # ===================================
-    # index_mask [b, sq, skv]
-    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
-    index_mask.scatter_(-1, topk_indices, 0)
-    # causal_mask [sq, skv]
-    causal_mask = torch.triu(
-        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
-        diagonal=1,
-    )
-    # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
-    index_mask += causal_mask.view(1, sq, skv)
-    # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
-    attention_scores += index_mask.unsqueeze(1)
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-
-    # ===================================
-    # Output with MQA broadcasting
-    # ===================================
-    # value: [skv, b, 1, hnv] -> [b, 1, skv, hnv]
-    value = value.permute(1, 2, 0, 3)  # [b, 1, skv, hnv]
-
-    # Compute output with broadcasting
-    # attention_scores: [b, np, sq, skv]
-    # value: [b, 1, skv, hnv] -> broadcast to [b, np, skv, hnv]
-    # output: [b, np, sq, hnv]
-    output = torch.matmul(attention_scores.to(value.dtype), value)
-
-    # Reshape output: [b, np, sq, hnv] -> [sq, b, np, hnv]
-    output = output.permute(2, 0, 1, 3).contiguous()
-
-    output = output.reshape(*output.shape[:-2], -1)
-    return output
-
 
 class DSAttention(MegatronModule):
     """
@@ -1073,8 +425,8 @@ class DSAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
-        self.k_channels = k_channels
         self.v_channels = v_channels
+        self.pg_collection = pg_collection
 
     def forward(
         self,
@@ -1092,9 +444,9 @@ class DSAttention(MegatronModule):
         Forward pass for Sparse Attention.
 
         Args:
-            query: Query tensor [sq, b, np, hn].
-            key: Key tensor [skv, b, np, hn].
-            value: Value tensor [skv, b, np, hnv].
+            query: Query tensor [sq, b, np, hn] or [sq, np, hn] in THD mode.
+            key: Key tensor [skv, b, 1, hn] or [skv, 1, hn] in THD mode.
+            value: Must be None (value is derived from key).
             x: Original hidden states [sq, b, hidden_size].
             qr: Low-rank query representation [sq, b, q_lora_rank].
             attention_mask: Attention mask tensor [b, 1, sq, sk].
@@ -1103,133 +455,44 @@ class DSAttention(MegatronModule):
             packed_seq_params: Packed sequence parameters.
 
         Returns:
-            output: Output tensor [sq, b, hidden_size]
+            output: Output tensor [sq, b, np * v_channels] or [sq, np * v_channels] in THD mode.
         """
-        is_mqa = value is None
-        if is_mqa:
-            assert key.size(-2) == 1, "Key must have 1 head in MQA mode"
-            assert query.size(-1) == self.k_channels
-            assert key.size(-1) == self.k_channels
+        assert value is None
+        assert key.size(-2) == 1
+        assert attn_mask_type == AttnMaskType.causal, "Only causal mask is supported for now"
 
-        sq, b, np, hn = query.size()
-        skv = key.size(0)
+        use_unfused = getattr(self.config, "attention_backend", None) == AttnBackend.unfused
+        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
         qr = qr.detach()
 
-        # Get a FP32 mask with -inf for masked positions.
-        if attn_mask_type is not None:
-            assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
-            # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
-            # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
-            # float_mask [sq, skv]
-            float_mask = torch.triu(
-                torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
-                diagonal=1,
-            )
-        else:
-            assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
-            # [b, 1, sq, skv] -> [b, sq, skv]
-            mask = attention_mask.squeeze()
-            # float_mask [b, sq, skv]
-            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
-                mask, float('-inf')
+        q, k, weights = self.indexer(x, qr, packed_seq_params)
+
+        def indexer_loss_logging_helper(loss):
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )
 
-        if self.training and torch.is_grad_enabled():
-            # ===================================
-            # Prepare inputs for indexer loss
-            # ===================================
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        output = DSAFunction.apply(
+            query,
+            key,
+            q,
+            k,
+            weights,
+            cu_seqlens,
+            self.indexer.index_topk,
+            self.v_channels,
+            self.softmax_scale,
+            indexer_loss_coeff,
+            indexer_loss_logging_helper,
+            self.pg_collection.tp,
+            use_unfused,
+        )
 
-            # ===================================
-            # Attach indexer topk and loss
-            # ===================================
-            # For MQA mode, expand key to match query heads for loss computation
-            key_for_loss = key.detach().expand(-1, -1, np, -1) if is_mqa else key.detach()
-            # Compute KL divergence loss between indexer scores and true attention scores
-            topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                q,
-                weights,
-                k,
-                query.detach(),
-                key_for_loss,
-                self.softmax_scale,
-                self.indexer.index_topk,
-                indexer_loss_coeff,
-                float_mask,
-                getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                self.indexer.pg_collection,
-            )
-            # Save indexer loss for logging
-            if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
-                )
-
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            if is_mqa:
-                # MQA mode: use the MQA-optimized function
-                force_unfused = getattr(self, 'force_unfused_dsa', False)
-                if (
-                    not force_unfused
-                    and FusedDSAMQA is not None
-                    and self.k_channels == 576
-                    and self.v_channels == 512
-                ):
-                    # Currently fused kernel only supports specific config combination.
-                    output = FusedDSAMQA.apply(
-                        query, key, self.v_channels, topk_indices, self.softmax_scale
-                    )
-                else:
-                    output = unfused_dsa_fn_mqa(
-                        query, key, self.v_channels, topk_indices, self.softmax_scale
-                    )
-            else:
-                # Standard MHA mode
-                # Output shape: [sq, b, np * hnv] (flattened)
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
-            # Attach loss to output
-            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
-
-        else:
-            # ===================================
-            # Get index scores and top-k indices
-            # ===================================
-            _, topk_indices = self.indexer.forward_with_scores(
-                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
-            )
-
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            if is_mqa:
-                # MQA mode: use the MQA-optimized function
-                force_unfused = getattr(self, 'force_unfused_dsa', False)
-                if (
-                    not force_unfused
-                    and FusedDSAMQA is not None
-                    and self.k_channels == 576
-                    and self.v_channels == 512
-                ):
-                    # Currently fused kernel only supports specific config combination.
-                    output = FusedDSAMQA.apply(
-                        query, key, self.v_channels, topk_indices, self.softmax_scale
-                    )
-                else:
-                    output = unfused_dsa_fn_mqa(
-                        query, key, self.v_channels, topk_indices, self.softmax_scale
-                    )
-            else:
-                # Standard MHA mode
-                # Output shape: [sq, b, np * hnv] (flattened)
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+        # merge last dimension of output: [sq, b, np, hn] -> [sq, b, np * hn]
+        output = output.flatten(start_dim=2)
 
         return output
