@@ -272,6 +272,10 @@ class OptimizerConfig:
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
+
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
@@ -280,6 +284,18 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
+    One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    # Lion.
+    lion_beta1: float = 0.95
+    """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
+
+    lion_beta2: float = 0.98
+    """Second beta coefficient for Lion optimizer (used in momentum EMA update).
+    Defaults to 0.98."""
 
     #######################
     # Distributed optimizer

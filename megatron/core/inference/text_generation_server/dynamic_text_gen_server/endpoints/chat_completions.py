@@ -8,12 +8,65 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
+
+_TOKEN_ID_FIELDS_TO_REDACT = {
+    "prompt_tokens",
+    "remaining_prompt_tokens",
+    "generated_tokens",
+    "prompt_token_ids",
+    "generation_token_ids",
+}
+
+_INDEX_FIELDS_TO_REDACT = {"routing_indices", "moe_topk_indices", "prompt_moe_topk_indices"}
+
+_HASH_FIELDS_TO_REDACT = {"precomputed_block_hashes"}
+
+_NUMERIC_SERIES_FIELDS_TO_REDACT = {"tpot"}
+
+
+def _is_int_list_like(value):
+    """Return True for integer lists, including nested integer lists."""
+    if not isinstance(value, list):
+        return False
+    return all(isinstance(item, int) or _is_int_list_like(item) for item in value)
+
+
+def _is_numeric_list_like(value):
+    """Return True for numeric lists, including nested numeric lists."""
+    if not isinstance(value, list):
+        return False
+    return all(isinstance(item, (int, float)) or _is_numeric_list_like(item) for item in value)
+
+
+def _redact_token_id_lists_for_logging(value):
+    """Redact verbose token-id arrays from logs."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if (
+                key in _TOKEN_ID_FIELDS_TO_REDACT
+                or key in _INDEX_FIELDS_TO_REDACT
+                or key in _HASH_FIELDS_TO_REDACT
+                or key.endswith("_token_ids")
+                or key.endswith("_topk_indices")
+                or key.endswith("_hashes")
+            ) and _is_int_list_like(item):
+                redacted[key] = "...truncated..."
+            elif key in _NUMERIC_SERIES_FIELDS_TO_REDACT and _is_numeric_list_like(item):
+                redacted[key] = "...truncated..."
+            else:
+                redacted[key] = _redact_token_id_lists_for_logging(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_token_id_lists_for_logging(item) for item in value]
+    return value
 
 
 def _get_field(obj, key, default=None):
@@ -23,8 +76,93 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-def _normalize_tool_calls(tool_calls):
+_TRANSFER_TOOL_NAME = "transfer_to_human_agents"
+_TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
+_RESERVATION_UPDATE_TOOLS = {
+    "update_reservation_flights",
+    "update_reservation_passengers",
+    "update_reservation_baggages",
+}
+_RESERVATION_DESTRUCTIVE_TOOLS = {"cancel_reservation", "book_reservation"}
+
+
+def _try_parse_jsonish(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except (TypeError, ValueError):
+        return value
+
+
+def _extract_declared_types(schema):
+    """Recursively extract declared JSON-schema type names."""
+    declared = set()
+    if not isinstance(schema, dict):
+        return declared
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        declared.add(schema_type.strip().lower())
+    elif isinstance(schema_type, list):
+        for item in schema_type:
+            if isinstance(item, str):
+                declared.add(item.strip().lower())
+
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        options = schema.get(combinator)
+        if isinstance(options, list):
+            for option in options:
+                declared.update(_extract_declared_types(option))
+    return declared
+
+
+def _get_tool_argument_schemas(tools):
+    """Build function-name to argument-schema mapping from request tools."""
+    schemas = {}
+    if not isinstance(tools, list):
+        return schemas
+
+    for tool in tools:
+        function = _get_field(tool, "function", {}) or {}
+        function_name = _get_field(function, "name")
+        params = _get_field(function, "parameters", {})
+        if not isinstance(function_name, str) or not isinstance(params, dict):
+            continue
+        if isinstance(params.get("properties"), dict):
+            schemas[function_name] = params.get("properties")
+        else:
+            schemas[function_name] = params
+    return schemas
+
+
+def _normalize_structured_tool_arguments(arguments, function_name, tool_argument_schemas):
+    """Coerce structured (array/object) args from JSON strings to native types."""
+    if not isinstance(arguments, dict):
+        return arguments
+
+    function_schema = tool_argument_schemas.get(function_name, {})
+    if not isinstance(function_schema, dict):
+        return arguments
+
+    normalized = dict(arguments)
+    for key in normalized:
+        param_schema = function_schema.get(key)
+        declared_types = _extract_declared_types(param_schema)
+        if not (declared_types & {"array", "arr", "object", "dict", "list"}):
+            continue
+        parsed = _try_parse_jsonish(normalized[key])
+        if isinstance(parsed, (dict, list)):
+            normalized[key] = parsed
+    return normalized
+
+
+def _normalize_tool_calls(tool_calls, tools=None):
     """Normalize tool calls to OpenAI-compatible JSON primitives."""
+    tool_argument_schemas = _get_tool_argument_schemas(tools)
     normalized = []
     for call in tool_calls or []:
         fn = _get_field(call, "function", {}) or {}
@@ -32,7 +170,24 @@ def _normalize_tool_calls(tool_calls):
         fn_args = _get_field(fn, "arguments", "")
         if fn_name is None:
             continue
-        if not isinstance(fn_args, str):
+        if isinstance(fn_args, str):
+            try:
+                parsed_args = json.loads(fn_args)
+            except (TypeError, ValueError):
+                parsed_args = None
+            if isinstance(parsed_args, dict):
+                fn_args = json.dumps(
+                    _normalize_structured_tool_arguments(
+                        parsed_args, fn_name, tool_argument_schemas
+                    ),
+                    ensure_ascii=False,
+                )
+        elif isinstance(fn_args, dict):
+            fn_args = json.dumps(
+                _normalize_structured_tool_arguments(fn_args, fn_name, tool_argument_schemas),
+                ensure_ascii=False,
+            )
+        else:
             try:
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             except TypeError:
@@ -44,7 +199,46 @@ def _normalize_tool_calls(tool_calls):
                 "function": {"name": str(fn_name), "arguments": fn_args},
             }
         )
-    return normalized
+    return _apply_tool_call_guardrails(normalized)
+
+
+def _apply_tool_call_guardrails(tool_calls):
+    """Apply conservative post-parse guardrails to tool call lists.
+
+    If update-style reservation tools are already present in the same response,
+    suppress cancel+book style calls to avoid destructive replanning patterns.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+
+    call_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in tool_calls
+        if isinstance(call, dict)
+    }
+    if call_names & _RESERVATION_UPDATE_TOOLS:
+        return [
+            call
+            for call in tool_calls
+            if _get_field(_get_field(call, "function", {}), "name")
+            not in _RESERVATION_DESTRUCTIVE_TOOLS
+        ]
+    return tool_calls
+
+
+def _normalize_assistant_content(message_text, tool_calls):
+    """Normalize assistant content for policy-sensitive tool transitions."""
+    if not isinstance(message_text, str):
+        message_text = "" if message_text is None else str(message_text)
+
+    tool_names = {
+        _get_field(_get_field(call, "function", {}), "name")
+        for call in (tool_calls or [])
+        if isinstance(call, dict)
+    }
+    if _TRANSFER_TOOL_NAME in tool_names:
+        return _TRANSFER_HOLD_MESSAGE
+    return message_text
 
 
 def _coerce_arguments_mapping(arguments):
@@ -91,6 +285,27 @@ def _sanitize_messages_for_template(messages):
             sanitized.append(message)
             continue
         msg_copy = dict(message)
+        content = msg_copy.get("content")
+        # OpenAI-style multimodal/text content may arrive as a list of blocks.
+        # HF/Jinja chat templates used by this server expect plain strings.
+        if isinstance(content, list):
+            text_chunks = []
+            for chunk in content:
+                if isinstance(chunk, dict):
+                    if chunk.get("type") == "text":
+                        text_chunks.append(str(chunk.get("text", "")))
+                    elif "text" in chunk:
+                        text_chunks.append(str(chunk.get("text", "")))
+                elif isinstance(chunk, str):
+                    text_chunks.append(chunk)
+            msg_copy["content"] = "".join(text_chunks)
+        elif isinstance(content, dict):
+            msg_copy["content"] = str(content.get("text", ""))
+        elif content is None:
+            msg_copy["content"] = ""
+        elif not isinstance(content, str):
+            msg_copy["content"] = str(content)
+
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
             sanitized_tool_calls = []
@@ -137,6 +352,22 @@ def _sanitize_tools_for_template(tools):
             tool_copy["function"] = function_copy
         sanitized.append(tool_copy)
     return sanitized
+
+
+def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+
+    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
+    Before applying the chat template, we must inline those tags back into content.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.pop("reasoning_content", None)
+        if reasoning_content is not None:
+            content = message.get("content") or ""
+            message["content"] = f"<think>{reasoning_content}</think>{content}"
+    return messages
 
 
 def _replace_prefix_tokens(
@@ -189,7 +420,9 @@ try:
             prev_text = message_text
             parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
             if "tool_calls" in new_info:
-                new_info["tool_calls"] = _normalize_tool_calls(new_info.get("tool_calls", []))
+                new_info["tool_calls"] = _normalize_tool_calls(
+                    new_info.get("tool_calls", []), tools=tools
+                )
                 if not tools_requested:
                     # Ignore incidental tool-call syntax in plain chat mode.
                     parsed_text = prev_text
@@ -227,10 +460,14 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            if hasattr(tokenizer, 'apply_chat_template'):
+            if (
+                hasattr(tokenizer, 'apply_chat_template')
+                and getattr(tokenizer, "chat_template", None) is not None
+            ):
                 prompt_tokens = tokenizer.apply_chat_template(
                     template_messages,
                     tokenize=True,
@@ -243,15 +480,6 @@ try:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
-                    eos_token_id = tokenizer.eos_id
-                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                    warnings.warn(
-                        "Avoiding prefix retokenization."
-                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
-                    )
-
                     # Find the last assistant message
                     last_assistant_message_idx = None
                     for i in reversed(range(len(template_messages))):
@@ -259,8 +487,28 @@ try:
                             last_assistant_message_idx = i
                             break
 
-                    # If there was a previous assistant message, we need to replace the prefix tokens with the tokens from the previous generation
-                    if last_assistant_message_idx is not None:
+                    last_assistant_message = (
+                        template_messages[last_assistant_message_idx]
+                        if last_assistant_message_idx is not None
+                        else None
+                    )
+
+                    # Only proceed if the last assistant message has the token IDs from a previous generation.
+                    # Dataset-provided conversation history won't have these fields.
+                    if (
+                        last_assistant_message is not None
+                        and "prompt_token_ids" in last_assistant_message
+                        and "generation_token_ids" in last_assistant_message
+                    ):
+                        eos_token_id = tokenizer.eos_id
+                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                        warnings.warn(
+                            "Avoiding prefix retokenization."
+                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                        )
+
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
                         ]
@@ -274,22 +522,27 @@ try:
                             **chat_template_kwargs,
                         )
 
-                        # Replace the prefix tokens with the tokens from the previous generation
-                        last_assistant_message = template_messages[last_assistant_message_idx]
-                        assert (
-                            "prompt_token_ids" in last_assistant_message
-                            and "generation_token_ids" in last_assistant_message
-                        ), "Last assistant message must have prompt_token_ids and generation_token_ids from previous generation to avoid prefix retokenization"
-                        previous_turn_token_ids = (
-                            last_assistant_message["prompt_token_ids"]
-                            + last_assistant_message["generation_token_ids"]
-                        )
-                        prompt_tokens = _replace_prefix_tokens(
-                            eos_token_id,
-                            previous_turn_token_ids,
-                            retokenized_previous_turn_token_ids,
-                            prompt_tokens,
-                        )
+                        # Replace the prefix tokens with the tokens from the previous generation.
+                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
+                        # instead of failing the request.
+                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+                        generation_token_ids = last_assistant_message.get("generation_token_ids")
+
+                        if isinstance(prompt_token_ids, list) and isinstance(
+                            generation_token_ids, list
+                        ):
+                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
+                            prompt_tokens = _replace_prefix_tokens(
+                                eos_token_id,
+                                previous_turn_token_ids,
+                                retokenized_previous_turn_token_ids,
+                                prompt_tokens,
+                            )
+                        else:
+                            logger.warning(
+                                "Last assistant message missing prompt_token_ids/"
+                                "generation_token_ids; skipping prefix replacement."
+                            )
 
             else:
                 warnings.warn(
@@ -365,30 +618,38 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format OpenAI Response ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+
+        # --- 5. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge().serialize()
-
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in result.items()
-            }
-
-            if result["status"] == "FAILED":
-                if result["sampling_params"]["num_tokens_to_generate"] <= 0:
-                    return Response(
-                        f"Request {request_idx} failed due to context length overflow", status=400
-                    )
-                else:
-                    return Response(
-                        f"Request {request_idx} failed due to internal error {result['events']}",
-                        status=500,
-                    )
+        for result_item in batch_results:
+            result = unwrap_serialized_tensors(result_item)
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
@@ -434,14 +695,18 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, req.get("tools", None), parsers, tools_requested
+                    message_text, tools, parsers, tools_requested
                 )
 
-            message = {"role": "assistant", "content": message_text}
-            if metadata.get("tool_calls", []):
-                message["tool_calls"] = metadata["tool_calls"]
+            normalized_tool_calls = metadata.get("tool_calls", [])
+            message = {
+                "role": "assistant",
+                "content": _normalize_assistant_content(message_text, normalized_tool_calls),
+            }
+            if normalized_tool_calls:
+                message["tool_calls"] = normalized_tool_calls
             if "reasoning" in metadata:
-                message["reasoning"] = metadata["reasoning"]
+                message["reasoning_content"] = metadata["reasoning"]
 
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
@@ -468,13 +733,13 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_staleness"] = result["policy_staleness"]
-            choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
             if current_app.config['verbose']:
-                logging.info(result)
+                logging.info(_redact_token_id_lists_for_logging(result))
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -486,7 +751,8 @@ try:
             choices.append(choice_data)
             if choice_data["generation_log_probs"] is None:
                 logger.warning(
-                    "Generation log probs is None for request:\n%s", json.dumps(result, indent=4)
+                    "Generation log probs is None for request:\n%s",
+                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
                 )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
