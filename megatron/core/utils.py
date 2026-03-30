@@ -2335,6 +2335,8 @@ def get_batch_on_this_tp_rank(
             # tensor parallel ranks on the last stage.
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            if create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
 
     else:
         if is_hybrid_cp:
@@ -2431,6 +2433,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            if create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
 
         batch = {
             'tokens': tokens,
