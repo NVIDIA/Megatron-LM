@@ -15,9 +15,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_config import  TransformerConfig
 
-from megatron.training.models import ModelConfig, ModelBuilder, compose_hooks
+from megatron.training.models.base import ModelConfig, ModelBuilder, compose_hooks
 from megatron.training.vocab_utils import calculate_padded_vocab_size
-from megatron.training.models import unimodal_build_distributed_models
+from megatron.training.models.base import unimodal_build_distributed_models
 
 logger = logging.getLogger(__name__)
 
