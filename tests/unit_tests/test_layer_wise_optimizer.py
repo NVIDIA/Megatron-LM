@@ -417,7 +417,7 @@ class TestLayerWiseOptimizer:
             optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=False
         )
         with pytest.raises(
-            TypeError, match='LayerWiseDistributedOptimizer received Float16 optimizer already'
+            TypeError, match='LayerWiseDistributedOptimizer expects base torch optimizers'
         ):
             LayerWiseDistributedOptimizer([wrapped_optimizer], lw_config, pg_collection)
 

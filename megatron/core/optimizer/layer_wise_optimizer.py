@@ -46,7 +46,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
         model_chunks: Optional[List] = None,
-        async_allgather: bool = False,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -57,14 +56,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
             model_chunks: DDP-wrapped model chunks (needed for async_allgather).
-            async_allgather: If True, defer param all-gather to forward pre-hooks.
         """
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
 
         # Set up async all-gather using DDP bucket infrastructure.
-        self.async_allgather = async_allgather
+        self.async_allgather = config.overlap_param_gather
         if self.async_allgather:
             assert (
                 model_chunks is not None
@@ -76,19 +74,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # wrap optimizer after sharding to avoid unnecessary master weight creation
-        # for higher precision, optimizers are wrapped with megatron already
+        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Callers pass base optimizers; wrapping happens here *after*
+        # shard_params so master weights are only created for the local shard.
         if config.bf16:
-            # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
             for i in range(len(optimizers)):
                 opt = optimizers[i]
-                if isinstance(opt, Float16OptimizerWithFloat16Params):
+                if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
                     raise TypeError(
-                        'LayerWiseDistributedOptimizer received Float16 optimizer already.'
+                        'LayerWiseDistributedOptimizer expects base torch optimizers, '
+                        f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                # unwrap FP32 optimizer from reusing get_megatron_optimizer for adam
-                if isinstance(opt, FP32Optimizer):
-                    opt = opt.optimizer
                 optimizers[i] = Float16OptimizerWithFloat16Params(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
