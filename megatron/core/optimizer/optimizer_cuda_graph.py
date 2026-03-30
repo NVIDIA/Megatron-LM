@@ -14,13 +14,9 @@ class OptimizerCudaGraphWrapper:
 
     curr_iteration = 0
     cuda_graph = None
-    result = None # result of the optimizer.step() function
+    result = None  # result of the optimizer.step() function
 
-    def __init__(
-        self,
-        optimizer_step_func,
-        cuda_graph_warmup_steps=1,
-    ):
+    def __init__(self, optimizer_step_func, cuda_graph_warmup_steps=1):
         self.optimizer_step_func = optimizer_step_func
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
 
@@ -36,10 +32,7 @@ class OptimizerCudaGraphWrapper:
             OptimizerCudaGraphWrapper.cuda_graph = torch.cuda.CUDAGraph()
             torch.cuda.synchronize()
             capture_stream = torch.cuda.Stream()
-            with torch.cuda.graph(
-                OptimizerCudaGraphWrapper.cuda_graph,
-                stream=capture_stream,
-            ):
+            with torch.cuda.graph(OptimizerCudaGraphWrapper.cuda_graph, stream=capture_stream):
                 OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
             torch.cuda.synchronize()
             torch.distributed.barrier()

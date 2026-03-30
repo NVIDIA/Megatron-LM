@@ -180,7 +180,9 @@ def clip_grad_by_total_norm_fp32(
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
-        assert multi_tensor_scale_tensor_impl is not None, "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+        assert (
+            multi_tensor_scale_tensor_impl is not None
+        ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
         multi_tensor_applier(
             multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
