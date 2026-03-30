@@ -65,9 +65,26 @@ Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabl
 - Requires `torch >= 2.9.0` and `transformer_engine >= 2.13.0`.
 
 ```bash
-# Delay offloading until CUDA graph launch to hide CPU overhead
+# Optional: defer D2H enqueue for offloads *outside* cuda_graph_scope (MoE experts; see below)
 --delay-offload-until-cuda-graph
 ```
+
+**`--delay-offload-until-cuda-graph` (`TransformerConfig.delay_offload_until_cuda_graph`)**
+
+**Inside vs outside `cuda_graph_scope`.** Offload boundaries that lie **inside** the captured `cuda_graph_scope` (for example `qkv_linear`, `core_attn`, and `attn_proj` when `attn` is in scope) are part of CUDA graph **capture and replay**. Their offload-related work is replayed with the graph rather than re-driven from Python each step, so they do **not** incur the same per-step CPU launch overhead as a purely eager path.
+
+Boundaries that run **outside** the captured region still execute as normal eager PyTorch each forward—for the recommended MoE setup, that includes expert compute after a graphed `moe_router` (e.g. offloading `expert_fc1` / `moe_act`). For those groups, each `group_offload` would otherwise submit D2H work from the host as soon as the forward hits the commit point.
+
+**What this flag does.** It only affects offload commits that are explicitly wired with **delayed** group commit (currently the MoE expert path: `expert_fc1`, `moe_act`). Around each layer’s `TransformerEngine` CUDA graph replay, the offload manager enters **replay mode**; delayed commits **enqueue** `(callback, group name, forced tensors)` instead of launching D2H immediately, then **flush_delayed_groups** runs **after** that graph replay returns and issues the queued D2H copies in forward order, without changing the offload/reload semantics.
+
+**When this actually buys time (EP A2A after replay).** The benefit assumes a **real CPU/GPU synchronization gap right after graph replay**—in the usual MoE training layout, **expert parallel (EP) all-to-all** and related dispatch follows the graphed `moe_router` region. That A2A path typically needs the host to coordinate collectives and to **sync with the GPU** (e.g. wait for graph work to finish or for communication staging), so the CPU is not fully overlapped with useful launch work during that interval. Scheduling `flush_delayed_groups` **immediately after** `cudaGraphLaunch` returns uses that window to issue D2H copies from the host: the enqueue cost is largely **hidden** in slack that EP A2A would already incur. If there were no such post-replay sync (or expert work were fully captured inside the graph with no host-visible gap), deferring commits would not provide the same “free” host time.
+
+**Behavioral notes**
+
+- Does **not** replace or “delay” attention-side offloads inside the graphed `attn` region; those are not on the delayed path in the implementation.
+- Warmup and non-replay forwards still commit delayed-eligible groups immediately (no replay-mode deferral).
+- Must be used together with **fine-grained activation offloading** and **CUDA graph** under the same rules as this section (TE `cuda_graph_impl`, scope including `attn` and `moe_router`, etc.).
+- Stream ordering between the graph compute path and `d2h_stream` still uses the existing events (`forward_record` / `backward_record`); this option only changes **when** eligible D2H work is submitted from the host.
 
 ### Combining with Fine-Grained Recomputation
 
@@ -143,8 +160,8 @@ A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(
 
 ### CUDA Graph Support
 
-When offloading modules captured inside a CUDA graph:
+When offloading interacts with CUDA graphs:
 
-- A dedicated `cuda_graph_stream` runs the captured computation, while `d2h_stream` overlaps D2H transfers.
+- A dedicated `cuda_graph_stream` runs the captured computation, while `d2h_stream` overlaps D2H transfers for regions that are **inside** the graph capture.
 - During CUDA graph **warmup**, offloading is disabled (`pre_warmup_hook` / `post_warmup_hook`).
 - The `delay_offload_until_cuda_graph` option defers D2H launches until graph replay, utilizing the CPU idle time during `cudaGraphLaunch` to issue offload commands with near-zero CPU overhead.
