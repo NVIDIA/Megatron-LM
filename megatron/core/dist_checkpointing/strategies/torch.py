@@ -1058,9 +1058,11 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             }
             async_strategy = "nvrx"
         except (ImportError, ModuleNotFoundError):
-            # do mcore async imports
-            imports = _import_mcore_async()
-            async_strategy = "mcore"
+            raise ModuleNotFoundError(
+                "nvidia-resiliency-ext package is not installed. "
+                "Please, install nvidia-resiliency-ext package or set `async_strategy` to `mcore` "
+                "to enable async save strategy."
+            )
     elif async_strategy == "mcore":
         # do mcore async imports
         imports = _import_mcore_async()

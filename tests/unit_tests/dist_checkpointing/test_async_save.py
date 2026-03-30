@@ -99,7 +99,11 @@ class TestAsyncSave:
                 AsyncRequest as MCoreAsyncRequest,
             )
 
-            strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
+            if async_strategy == "nvrx":
+                with pytest.raises(ModuleNotFoundError):
+                    strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
+            else:
+                strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
 
-            assert strategy == "mcore"
-            assert module == MCoreAsyncRequest
+                assert strategy == "mcore"
+                assert module == MCoreAsyncRequest
