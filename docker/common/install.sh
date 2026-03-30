@@ -120,6 +120,8 @@ main() {
 
         # Create virtual environment and install dependencies
         uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+        uv pip install --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+            pybind11 wheel packaging "setuptools<80.0.0,>=77.0.0"
 
         # Install dependencies
         uv sync --locked --only-group build ${UV_ARGS[@]}

@@ -59,7 +59,7 @@ runs:
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v6
 
     - name: Change ownership of /home/runner/
       shell: bash
@@ -98,7 +98,8 @@ runs:
           --environment dev \
           --platform dgx_h100 \
           --tag ${{ inputs.tag }} \
-          --container-image ${{ inputs.container-image }}
+          --container-image ${{ inputs.container-image }} \
+          --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
         RUN_TEST_EOF
         )
@@ -186,6 +187,7 @@ runs:
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
+          --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
         RUN_TEST_EOF
         )

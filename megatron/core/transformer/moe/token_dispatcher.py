@@ -49,8 +49,6 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
-logger = logging.getLogger(__name__)
-
 
 class MoETokenDispatcher:
     """
@@ -682,6 +680,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
+
         # Perform expert parallel AlltoAll communication
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert

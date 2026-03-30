@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 try:
-    import grouped_gemm
+    import grouped_gemm  # pyright: ignore[reportMissingImports]
 except ImportError:
     grouped_gemm = None
 
