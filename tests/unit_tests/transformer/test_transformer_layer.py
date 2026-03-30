@@ -1009,7 +1009,9 @@ class TestMHCWithOffloading:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         mgr = PipelineOffloadManager.get_instance()
-        mgr.init_model_chunk_offload_handler(vp_size=1, vp_stage=0, min_offloaded_tensor_size=0)
+        mgr.init_model_chunk_offload_handler(
+            pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
+        )
 
         output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
@@ -1078,7 +1080,9 @@ class TestMHCWithOffloading:
         layer_offload.train()
 
         mgr = PipelineOffloadManager.get_instance()
-        mgr.init_model_chunk_offload_handler(vp_size=1, vp_stage=0, min_offloaded_tensor_size=0)
+        mgr.init_model_chunk_offload_handler(
+            pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
+        )
 
         h2 = input_data.clone().detach().requires_grad_(True)
         out2, _ = layer_offload(hidden_states=h2, attention_mask=attention_mask)
