@@ -2424,6 +2424,7 @@ def get_batch_on_this_tp_rank(
             # is fixed on the last stage, so we need to broadcast tokens and position_ids
             # to all of the tensor parallel ranks on the last stage.
             tokens = None
+            position_ids = None
             cu_seqlens = None
             cu_seqlens_padded = None
             max_seqlen = None
