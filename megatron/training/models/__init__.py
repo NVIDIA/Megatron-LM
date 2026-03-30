@@ -6,6 +6,7 @@ from megatron.training.models.dist_utils import (
     unimodal_build_distributed_models,
 )
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 
 MambaModelConfig = HybridModelConfig
 MambaModelBuilder = HybridModelBuilder
@@ -21,4 +22,6 @@ __all__ = [
     "HybridModelBuilder",
     "MambaModelConfig",
     "MambaModelBuilder",
+    "GPTModelConfig",
+    "GPTModelBuilder"
 ]
