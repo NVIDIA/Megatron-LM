@@ -271,6 +271,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         shutdown_task = asyncio.create_task(shutdown_queue_when_done())
 
         try:
+            # Forced lag involves strict ordering at steady-state.
+            # However, the initial conditions do not require (and are harmed by) strict ordering.
             next_batch_id = 0
             pending: dict[int, GroupedRollouts] = {}
             while True:
@@ -281,9 +283,20 @@ class GroupedRolloutGenerator(Agent, ABC):
                 if request.enforce_order:
                     # Accumulate groups and enforce submission order across batches.
                     pending.setdefault(group.batch_id, []).append(group)
-                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
-                        assert l == groups_per_worker
-                        batch = pending.pop(next_batch_id)
+                    while True:
+                        # Track the desired batch to yield.
+                        bid = None
+                        if next_batch_id < num_workers:
+                            # Warmup: all initial batches are equally desirable to yield.
+                            ready = (b for b in pending if len(pending[b]) >= groups_per_worker)
+                            bid = next(ready, None)
+                        elif len(pending.get(next_batch_id, [])) >= groups_per_worker:
+                            # Steady state: batches must be yielded in strict order.
+                            bid = next_batch_id
+                        if bid is None:
+                            # No complete batches ready to yield.
+                            break
+                        batch = pending.pop(bid)
                         batch.sort(key=lambda g: g.index_in_batch)
                         next_batch_id += 1
                         for g in batch:
