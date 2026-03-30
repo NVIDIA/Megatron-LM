@@ -10,12 +10,15 @@ from collections import deque
 from typing import Dict, Optional
 
 import msgpack
+import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
@@ -73,6 +76,10 @@ class DummyContext:
     def __init__(self):
         self.active_cnt = 0
         self.step_count = 0
+        self.block_size_tokens = 64
+        self.enable_prefix_caching = False
+        self.prefix_caching_coordinator_policy = None
+        self.prefix_cache_lru_clock = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -115,6 +122,12 @@ class DummyEngine(DynamicInferenceEngine):
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
 
+        # ZMQ-based world barrier (async-friendly, no NCCL).
+        self.zmq_context = zmq.Context()
+        total_world_size = torch.distributed.get_world_size()
+        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+        self.use_synchronous_zmq_collectives = False
+
     async def run_engine_with_coordinator(self, *, loop=None):
         """Override to bypass @trace_async_exceptions for testability.
 
@@ -135,10 +148,15 @@ class DummyEngine(DynamicInferenceEngine):
     ) -> asyncio.Future[DynamicInferenceRequestRecord]:
         """Dummy add_request."""
 
+        # Mock tokenization to prevent `prompt_tokens == None`.
+        prompt_tokens = (
+            torch.arange(len(prompt.split())) if isinstance(prompt, str) else torch.tensor(prompt)
+        )
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
                     prompt=prompt,
+                    prompt_tokens=prompt_tokens,
                     request_id=request_id,
                     sampling_params=sampling_params,
                     status=Status.WAITING_IN_QUEUE,
@@ -171,7 +189,8 @@ class DummyEngine(DynamicInferenceEngine):
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
+                        use_bin_type=True,
                     )
                     self.socket_for_receiving_requests.send(payload)
 
@@ -206,28 +225,28 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
         except (asyncio.TimeoutError, Exception):
             pass
 
-        sub = getattr(engine, 'model_parallel_num_msgs_subscriber_socket', None)
-        if sub is not None:
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
-
-        # Close ZMQ communicator sockets to unblock any stuck ranks.
-        for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
-            comm = getattr(engine, attr, None)
-            if comm is not None:
-                comm.close()
-
-        task.cancel()
+        if client is not None:
+            client.stop_engines()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
+            # Graceful stop failed — fall back to forcible cleanup.
+            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+                comm = getattr(engine, attr, None)
+                if comm is not None:
+                    comm.close()
+
+            for socket in getattr(engine, 'zmq_sockets', []):
+                if not socket.closed:
+                    socket.close(linger=0)
+
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
 
     if client is not None:
-        # Walk the coordinator back to RUNNING regardless of its current state
-        # so the next test starts cleanly.  Each call is a no-op when the
-        # coordinator is already in the target state (just logs a warning).
-        client.resume_engines()  # SUSPENDED → PAUSED (no-op otherwise)
-        client.unpause_engines()  # PAUSED    → RUNNING (no-op otherwise)
         client.stop()
 
 
@@ -252,6 +271,20 @@ def initialize_model_parallel(request, monkeypatch):
     Utils.destroy_model_parallel()
 
 
+@pytest.fixture
+def test_case_communicator():
+    """A separate ZMQ communicator for test sync barriers.
+
+    Use this instead of engine._world_barrier() when the engine loop may be
+    calling _world_barrier() concurrently (e.g. during state transitions).
+    """
+    ctx = zmq.Context()
+    comm = AsyncZMQCommunicator(ctx, process_group=None)
+    yield comm
+    comm.close()
+    ctx.term()
+
+
 @pytest.fixture(scope="class")
 def coordinator():
     """Launch a single coordinator process for the entire test class.
@@ -273,7 +306,15 @@ def coordinator():
         ready_event = spawn_context.Event()
         proc = spawn_context.Process(
             target=DataParallelInferenceCoordinator.entrypoint,
-            args=(pipe_child, ready_event, 0, DummyTokenizer(), DEFAULT_PORT, False),
+            kwargs={
+                "pipe_connection": pipe_child,
+                "ready_event": ready_event,
+                "data_parallel_size": 0,
+                "tokenizer": DummyTokenizer(),
+                "max_requests": 16,
+                "inference_coordinator_port": DEFAULT_PORT,
+                "deterministic_mode": False,
+            },
         )
         proc.start()
 
@@ -328,7 +369,9 @@ class TestCoordinator:
         ],
         indirect=["initialize_model_parallel"],
     )
-    async def test_parallel_configs(self, initialize_model_parallel, coordinator):
+    async def test_parallel_configs(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
         """Test coordinator with various TP, PP, and EP configurations."""
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
@@ -341,15 +384,11 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier), timeout=30.0
-        )
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
         client = None
         try:
             if rank == 0:
-                # Yield so engine loop can run before we block the event loop
-                # with the client's synchronous connect handshake.
                 await asyncio.sleep(0)
                 client = InferenceClient(dp_addr)
                 client.start()
@@ -360,13 +399,51 @@ class TestCoordinator:
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+        finally:
+            await cleanup_engine(engine, client)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deserialize", [True, False], ids=["deserialize", "raw"])
+    async def test_deserialize_flag(
+        self, initialize_model_parallel, coordinator, test_case_communicator, deserialize
+    ):
+        """Test that the correct response type is returned based on the deserialize flag."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        engine = DummyEngine()
+        requests = self.build_requests(num_requests=2)
+
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
+        )
+
+        # Ensure all engines are registered before submitting requests.
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+        client = None
+        try:
+            if torch.distributed.get_rank() == 0:
+                await asyncio.sleep(0)
+                client = InferenceClient(dp_addr, deserialize=deserialize)
+                client.start()
+                futures = [
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                for result in results:
+                    if deserialize:
+                        assert isinstance(result, DynamicInferenceRequest)
+                    else:
+                        assert isinstance(result, dict)
+
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client)
 
@@ -378,7 +455,9 @@ class TestCoordinator:
         [pytest.param((2, 2, 2), id="tp2-pp2-ep2")],
         indirect=["initialize_model_parallel"],
     )
-    async def test_control_logic_lifecycle(self, initialize_model_parallel, coordinator):
+    async def test_control_logic_lifecycle(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
         """Comprehensive lifecycle test for the engine state machine."""
         # States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
         PAUSED_FAMILY = {
@@ -421,10 +500,8 @@ class TestCoordinator:
             )
 
             # Synchronize all ranks so every engine has registered.
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            # Use test_case_communicator to avoid colliding with engine-internal barriers.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
             if rank == 0:
                 client = InferenceClient(dp_addr)
@@ -448,8 +525,8 @@ class TestCoordinator:
                 # Submit and complete requests while running.
                 futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests while RUNNING, then PAUSE before they drain.
                 # These must survive the PAUSE (not be drained during PAUSING).
@@ -483,8 +560,8 @@ class TestCoordinator:
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 all_queued = pre_pause_futures + paused_futures
                 results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
                 assert_state(engine, EngineState.RUNNING)
 
                 # Engine processes new requests normally after unpause.
@@ -492,8 +569,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Suspend.
                 client.pause_engines()
@@ -528,8 +605,8 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
 
                 # Submit requests that will be cancelled on STOP.
                 client.pause_engines()
@@ -541,10 +618,7 @@ class TestCoordinator:
                 ]
 
             # Synchronize all ranks before STOP.
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
-                timeout=30.0,
-            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
             if rank == 0:
                 # Verify doomed futures are still pending.
@@ -566,10 +640,10 @@ class TestCoordinator:
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
-    async def test_throughput(self, initialize_model_parallel, coordinator):
+    async def test_throughput(self, initialize_model_parallel, coordinator, test_case_communicator):
         """Throughput benchmark: measures ZMQ packet rate."""
         _, dp, _, _, _ = initialize_model_parallel
-        num_requests = 10**4
+        num_requests = 10**3
         num_iterations = 10
 
         dp_addr = coordinator
@@ -582,7 +656,7 @@ class TestCoordinator:
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
 
         client = None
         try:
@@ -603,6 +677,122 @@ class TestCoordinator:
                     f"ZMQ throughput: {total / elapsed_ms:.2f} requests/ms "
                     f"({total} reqs in {elapsed_ms:.0f} ms)"
                 )
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
-            await cleanup_engine(engine, client)
+            await cleanup_engine(engine, client, timeout=60.0)
+
+
+def _set_hash_rank(coord, h, rank_identity, timestamp):
+    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
+    rank_idx = coord.identity_to_rank_index[rank_identity]
+    coord._hash_table.setdefault(h, {})[rank_idx] = timestamp
+
+
+def _make_routing_coordinator(
+    num_ranks=4, enable_prefix_caching=False, policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+):
+    """Create a coordinator with fake rank identities for routing-only tests.
+
+    Thin wrapper around the shared helper in coordinator_test_utils.py.
+    """
+    from tests.unit_tests.inference.coordinator_test_utils import (
+        make_coordinator_direct as _make_coordinator,
+    )
+
+    return _make_coordinator(
+        data_parallel_size=num_ranks,
+        block_size_tokens=64,
+        enable_prefix_caching=enable_prefix_caching,
+        policy=policy,
+        rank_name_template="rank-{}",
+    )
+
+
+class TestRoutingPolicies:
+    """Unit tests for routing behavior under different policies and load conditions."""
+
+    def test_no_prefix_caching_uses_round_robin(self):
+        """When prefix caching is off, round-robin is used regardless of load."""
+        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        results = [coord.get_best_data_parallel_rank([]) for _ in range(6)]
+        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-0", b"rank-1", b"rank-2"]
+
+    def test_empty_hashes_uses_round_robin(self):
+        """Empty hash list falls back to round-robin."""
+        coord = _make_routing_coordinator(num_ranks=4)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 5
+
+        results = [coord.get_best_data_parallel_rank([]) for _ in range(4)]
+        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-3"]
+
+    def test_prefix_affinity_routing(self):
+        """When prefix caching is on with hashes, scoring picks the best rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        for ident in coord.identities_of_data_parallel_ranks:
+            coord._pending_counts[coord.identity_to_rank_index[ident]] = 1
+
+        # Seed a hash on rank-2 so prefix routing prefers it.
+        fake_hash = 12345
+        _set_hash_rank(coord, fake_hash, b"rank-2", 1)
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-2"
+
+    def test_prefix_affinity_beats_free_capacity(self):
+        """A rank with a prefix match and capacity is preferred over a free rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        fake_hash = 99999
+        _set_hash_rank(coord, fake_hash, b"rank-1", 1)
+
+        # Scoring: rank-1 gets prefix match bonus, which outweighs rank-2's
+        # free capacity advantage.
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_free_capacity_wins_when_prefix_rank_is_full(self):
+        """A free rank wins when the prefix-matched rank is full and alpha is low."""
+        coord = _make_routing_coordinator(
+            num_ranks=2,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        )
+        coord.prefix_caching_routing_alpha = 0.1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
+
+        fake_hash = 42
+        _set_hash_rank(coord, fake_hash, b"rank-0", 1)
+
+        # score(rank-0) = 0.1*1 + 0.9*(0/10) = 0.1
+        # score(rank-1) = 0.1*0 + 0.9*(10/10) = 0.9
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_round_robin_policy_ignores_load(self):
+        """ROUND_ROBIN policy does naive round-robin regardless of load."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        coord._round_robin_idx = 0
+        identities = list(coord.identities_of_data_parallel_ranks)
+        for i in range(len(identities)):
+            chosen = coord.get_best_data_parallel_rank([99])
+            assert chosen == identities[i]

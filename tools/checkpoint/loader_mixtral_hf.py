@@ -168,7 +168,6 @@ def _load_checkpoint(queue, args):
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -247,7 +246,6 @@ def _load_checkpoint(queue, args):
     fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
     mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
     mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-    fused_kernels.load(margs)
 
     # Metadata.
     md = types.SimpleNamespace()

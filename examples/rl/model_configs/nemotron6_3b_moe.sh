@@ -55,10 +55,10 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
 MODEL_OPTIONS="\
+  --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
-  --rl-offload-optimizer-during-inference \
   --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
@@ -102,8 +102,9 @@ MODEL_OPTIONS="\
   --weight-decay 0.01 \
   --clip-grad 1.0 \
   --tiktoken-pattern v2 \
-  --tokenizer-type TikTokenizer \
+  --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
+  --tokenizer-hf-include-special-tokens \
   --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \
