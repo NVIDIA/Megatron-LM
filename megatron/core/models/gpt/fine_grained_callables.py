@@ -3,7 +3,7 @@
 import weakref
 from contextlib import nullcontext
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
@@ -330,6 +330,8 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with torch.cuda.stream(self.stream):
             torch.cuda.nvtx.range_push(f"{self.name} wgrad")
             for module in self.bwd_dw_callables:
