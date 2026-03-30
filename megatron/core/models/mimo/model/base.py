@@ -6,12 +6,14 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import unwrap_model
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,44 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Build sharded state dict, bypassing parallel_state global fallbacks.
+
+        Iterates modality_submodules manually (ModuleDict lacks sharded_state_dict)
+        and injects dp_cp_group from each module's pg_collection.
+        """
+        sharded_sd = {}
+        for name, module in self.named_children():
+            if name == 'modality_submodules':
+                # Unwrap DDP, call ModalitySubmodules.sharded_state_dict directly
+                # (which injects dp_cp_group from its pg_collection)
+                for mod_name, mod in module.items():
+                    is_ddp = isinstance(mod, DistributedDataParallel)
+                    inner = mod.module if is_ddp else mod
+                    child_prefix = f'{prefix}{name}.{mod_name}.'
+                    if is_ddp:
+                        child_prefix += 'module.'
+                    sharded_sd.update(
+                        inner.sharded_state_dict(child_prefix, sharded_offsets, metadata)
+                    )
+            else:
+                # Inject dp_cp_group from pg_collection for language_model
+                inner = module.module if isinstance(module, DistributedDataParallel) else module
+                pg = getattr(inner, 'pg_collection', None)
+                mod_metadata = metadata
+                if pg is not None:
+                    assert (
+                        hasattr(pg, 'dp_cp') and pg.dp_cp is not None
+                    ), f"pg_collection on '{name}' is missing dp_cp group"
+                    mod_metadata = dict(metadata) if metadata else {}
+                    mod_metadata['dp_cp_group'] = pg.dp_cp
+                sharded_sd.update(
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.', sharded_offsets, mod_metadata
+                    )
+                )
+        return sharded_sd
 
     def align_embeddings_by_token_positions(
         self,
