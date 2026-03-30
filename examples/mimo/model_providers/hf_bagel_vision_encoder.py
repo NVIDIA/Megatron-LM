@@ -8,6 +8,8 @@ from bagel.modeling.bagel import SiglipVisionModel
 from bagel.modeling.bagel.modeling_utils import PositionEmbedding
 import numpy as np
 
+_DEBUG = os.environ.get("BAGEL_DEBUG", "0") == "1"
+
 
 class HFBagelVisionEncoderWrapper(torch.nn.Module):
     """
@@ -42,16 +44,18 @@ class HFBagelVisionEncoderWrapper(torch.nn.Module):
             encoder = SiglipVisionModel(vit_config)
         else:
             encoder = SiglipVisionModel.from_pretrained(vit_path, config=vit_config)
-        print("=== vit_model ===")
-        for name, param in encoder.named_parameters():
-            print(f"{name}: {param.shape}, {param.sum()}")
-        print("================================================")
+        if _DEBUG:
+            print("=== vit_model ===")
+            for name, param in encoder.named_parameters():
+                print(f"{name}: {param.shape}, {param.sum()}")
+            print("================================================")
         encoder.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
         encoder.to(dtype)
 
         # Store encoder as a plain attribute so its parameters are NOT registered
         # as submodule parameters, keeping them invisible to FSDP.
         object.__setattr__(self, '_encoder', encoder)
+        self._encoder_on_device = False
 
         add_postion_embedding = True
         self.add_postion_embedding = add_postion_embedding
@@ -71,28 +75,27 @@ class HFBagelVisionEncoderWrapper(torch.nn.Module):
     ):
         """Input: packed_vit_tokens of shape (num_patches, patch_dim)."""
 
-        # Ensure encoder is on the same device as input (it is hidden from
-        # nn.Module so .to(device) calls on the parent don't reach it).
-        target_device = packed_vit_tokens.device
-        encoder_param = next(self._encoder.parameters())
-        if encoder_param.device != target_device:
+        # Ensure encoder is on the same device as input (only once).
+        if not self._encoder_on_device:
+            target_device = packed_vit_tokens.device
             self._encoder.to(target_device)
-            encoder_param = next(self._encoder.parameters())
+            self._encoder_on_device = True
 
         # Convert input to the same dtype as the encoder
-        packed_vit_tokens = packed_vit_tokens.to(dtype=encoder_param.dtype)
+        packed_vit_tokens = packed_vit_tokens.to(dtype=self.dtype)
 
-        # Process through encoder and extract last_hidden_state
+        # Process through encoder (no_grad since ViT is not managed by FSDP optimizer)
         cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
         cu_seqlens = cu_seqlens.to(torch.int32)
         max_seqlen = torch.max(vit_token_seqlens).item()
 
-        packed_vit_token_embed = self._encoder(
-            packed_pixel_values=packed_vit_tokens,
-            packed_flattened_position_ids=packed_vit_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
+        with torch.no_grad():
+            packed_vit_token_embed = self._encoder(
+                packed_pixel_values=packed_vit_tokens,
+                packed_flattened_position_ids=packed_vit_position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         if self.add_postion_embedding:
             vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
         return [packed_vit_token_embed, vit_token_pos_emb] if self.add_postion_embedding else packed_vit_token_embed

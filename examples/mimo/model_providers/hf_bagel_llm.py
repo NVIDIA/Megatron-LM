@@ -1,8 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import os
 import torch
 import logging
 import torch.nn.functional as F
+
+_DEBUG = os.environ.get("BAGEL_DEBUG", "0") == "1"
 
 from megatron.core.models.huggingface import HuggingFaceModule
 
@@ -155,11 +158,12 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
                     packed_und_token_indexes=packed_und_token_indexes,
                     packed_gen_token_indexes=packed_gen_token_indexes,
                 )
-                print("BagelLLMHuggingFaceModel packed_und_token_indexes:", packed_und_token_indexes.shape)
-                if packed_gen_token_indexes is not None:
-                    print("BagelLLMHuggingFaceModel packed_gen_token_indexes:", packed_gen_token_indexes.shape)
-                else:
-                    print("BagelLLMHuggingFaceModel packed_gen_token_indexes is None")
+                if _DEBUG:
+                    print("BagelLLMHuggingFaceModel packed_und_token_indexes:", packed_und_token_indexes.shape)
+                    if packed_gen_token_indexes is not None:
+                        print("BagelLLMHuggingFaceModel packed_gen_token_indexes:", packed_gen_token_indexes.shape)
+                    else:
+                        print("BagelLLMHuggingFaceModel packed_gen_token_indexes is None")
 
         last_hidden_state = self.model.forward_train(
             packed_sequence=packed_sequence,
@@ -168,21 +172,20 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
             packed_position_ids=kwargs["packed_position_ids"],
             **extra_inputs,
         )
-        print("after language_model forward, last_hidden_state", last_hidden_state.shape, last_hidden_state.to(torch.float32).sum(), last_hidden_state.flatten()[:10])
-        print("================================================")
+        if _DEBUG:
+            print("after language_model forward, last_hidden_state", last_hidden_state.shape, last_hidden_state.to(torch.float32).sum(), last_hidden_state.flatten()[:10])
 
         if ce_loss_indexes is not None:
-            print("language_model.lm_head and ce loss")
-            print("ce_loss_indexes", ce_loss_indexes.shape, ce_loss_indexes.sum())
-            if packed_label_ids is not None:
-                print("packed_label_ids", packed_label_ids.shape, packed_label_ids.sum())
+            if _DEBUG:
+                print("ce_loss_indexes", ce_loss_indexes.shape, ce_loss_indexes.sum())
+                if packed_label_ids is not None:
+                    print("packed_label_ids", packed_label_ids.shape, packed_label_ids.sum())
             packed_ce_preds = self.model.lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
-            print("after language_model.lm_head forward, ce", ce.shape, ce.sum(), ce)
-            print("================================================")
+            if _DEBUG:
+                print("after language_model.lm_head forward, ce", ce.shape, ce.sum(), ce)
         else:
             ce = None
-        print("****************************************************")
         return dict(last_hidden_state=last_hidden_state, ce=ce)
 
     def embedding(self, input_ids, position_ids=None):
