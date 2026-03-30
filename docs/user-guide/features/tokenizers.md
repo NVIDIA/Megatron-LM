@@ -146,7 +146,24 @@ tokenizer = MegatronTokenizer.from_pretrained(
 
 ### Null Tokenizer
 
-Use a null tokenizer for testing or non-text models:
+The Null tokenizer is a lightweight, zero-I/O tokenizer that requires no model files.
+It is useful in three scenarios:
+
+1. **Performance benchmarking** with `--mock-data` where real tokenization is unnecessary.
+2. **Testing** in functional tests and CI pipelines where tokenizer model files may not
+   be available. The Null tokenizer removes the dependency on external files, making
+   tests self-contained and portable.
+3. **Pretraining with pretokenized data** where all data is already tokenized into
+   `.bin`/`.idx` files. In this case the tokenizer is only needed for metadata
+   (`vocab_size`, `eod`, `pad`) — not for actual tokenization. Using the Null tokenizer
+   avoids redundant filesystem access at scale, which is particularly beneficial on
+   shared filesystems like Lustre where thousands of ranks would otherwise all load the
+   same tokenizer files.
+
+Properties derived from `--vocab-size N`:
+- `vocab_size` = `N` (the exact value passed)
+- `eod` = `N - 1` (last token in the vocabulary)
+- `pad` = `0`
 
 ```python
 tokenizer = MegatronTokenizer.from_pretrained(
@@ -162,10 +179,20 @@ tokenizer = MegatronTokenizer.from_pretrained(
 The tokenizer system integrates seamlessly with Megatron-LM training:
 
 ```bash
-# Null tokenizer for testing
+# Null tokenizer for benchmarking with mock data
 torchrun --nproc_per_node=8 pretrain_gpt.py \
     --tokenizer-type NullTokenizer \
     --vocab-size 131072 \
+    --mock-data \
+    ...
+```
+
+```bash
+# Null tokenizer for pretraining with pretokenized data (no tokenizer files needed)
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --tokenizer-type NullTokenizer \
+    --vocab-size 128256 \
+    --data-path /path/to/pretokenized_data \
     ...
 ```
 
@@ -190,7 +217,7 @@ If `--tokenizer-metadata` is not specified, a default metadata file is generated
 | **SentencePiece** | Google's tokenizer | GPT-style models, custom vocabularies |
 | **TikToken** | OpenAI's tokenizer | GPT-3.5/GPT-4 style tokenization |
 | **Megatron** | Built-in tokenizers | Legacy GPT-2 BPE |
-| **Null** | No-op tokenizer | Testing, non-text modalities |
+| **Null** | Zero-I/O tokenizer | Benchmarking, pretokenized data |
 
 ## Common Tokenizer Types
 
