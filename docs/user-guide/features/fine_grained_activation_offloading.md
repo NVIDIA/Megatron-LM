@@ -62,7 +62,7 @@ Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabl
 - `attn_norm` and `mlp_norm` **cannot** be offloaded (they cross CUDA graph boundaries).
 - `cuda_graph_scope` must include `attn` and `moe_router`.
 - `cuda_graph_impl` must be `transformer_engine`.
-- Requires `torch >= 2.9.0` and `transformer_engine >= 2.13.0`.
+- Requires `torch >= 2.9.0` and `transformer_engine >= 2.14.0`.
 
 ```bash
 # Optional: defer D2H enqueue for offloads *outside* cuda_graph_scope (MoE experts; see below)
