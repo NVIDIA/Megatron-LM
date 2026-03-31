@@ -41,6 +41,7 @@ jobs:
       release-type: ${{ inputs.release-type }}
       freeze-commit: ${{ inputs.freeze-commit }}
       dry-run: ${{ inputs.dry-run }}
+      release-branch-prefix: core_
     secrets:
       SLACK_WEBHOOK: ${{ inputs.dry-run && secrets.SLACK_CI_CHANNEL_WEBHOOK ||secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
