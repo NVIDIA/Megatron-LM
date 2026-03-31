@@ -34,7 +34,7 @@ on:
         default: true
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.69.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@ko3n1g/feat/code-freeze-release-branch-prefix
     with:
       library-name: Megatron-Core
       python-package: megatron.core
