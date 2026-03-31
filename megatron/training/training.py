@@ -938,6 +938,7 @@ def pretrain(
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
+            or args.context_parallel_size != 1
         ):
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
@@ -951,6 +952,7 @@ def pretrain(
                 tp_size=args.rl_inference_tensor_model_parallel_size,
                 pp_size=args.rl_inference_pipeline_model_parallel_size,
                 ep_size=args.rl_inference_expert_model_parallel_size,
+                cp_size=1,
                 expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
@@ -971,6 +973,7 @@ def pretrain(
                 inference_config.expert_tensor_parallel_size = (
                     args.rl_inference_expert_tensor_model_parallel_size
                 )
+            inference_config.context_parallel_size = 1
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.

@@ -168,6 +168,53 @@ class TestRLUtils:
         else:
             assert logprobs.shape == (BATCH, SEQ, VOCAB)
 
+    def test_cp_split_rl_batch_builds_labels_and_pads_aux_tensors(self, monkeypatch):
+        tokens = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])
+        position_ids = torch.arange(tokens.shape[1]).unsqueeze(0)
+        short = torch.tensor([[1.0] * 7])
+
+        monkeypatch.setattr(rl_utils.mpu, "get_context_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(rl_utils, "get_batch_on_this_cp_rank", lambda batch: batch)
+
+        result = rl_utils.cp_split_rl_batch(
+            tokens,
+            position_ids,
+            pad_token=42,
+            old_logprobs=short,
+            ref_logprobs=short,
+            loss_mask=short,
+            inference_logprobs=short,
+        )
+
+        assert torch.equal(result["tokens"], tokens)
+        assert torch.equal(result["position_ids"], position_ids)
+        assert result["labels"].tolist() == [[11, 12, 13, 14, 15, 16, 17, 42]]
+        assert result["old_logprobs"].shape[1] == tokens.shape[1]
+        assert result["ref_logprobs"].shape[1] == tokens.shape[1]
+        assert result["loss_mask"].shape[1] == tokens.shape[1]
+        assert result["inference_logprobs"].shape[1] == tokens.shape[1]
+
+    def test_get_logprobs_uses_labels_for_cp_nonpacked_path(self, monkeypatch):
+        self.create_test_args(rl_use_sequence_packing=False)
+
+        recorded = {}
+
+        class RecordingMockModel(MockModel):
+            def __call__(self, x, position_ids, attention_mask, **kwargs):
+                recorded["packed_seq_params"] = kwargs.get("packed_seq_params")
+                return super().__call__(x, position_ids, attention_mask, **kwargs)
+
+        monkeypatch.setattr(rl_utils.mpu, "get_context_parallel_world_size", lambda: 2)
+
+        model = RecordingMockModel(batch=1, seq=SEQ, vocab=VOCAB)
+        tokens = torch.ones((1, SEQ), dtype=torch.long)
+        labels = torch.full((1, SEQ), 3, dtype=torch.long)
+        logprobs = rl_utils.get_logprobs(model, tokens, position_ids=None, labels=labels)
+
+        assert recorded["packed_seq_params"] is None
+        assert logprobs.shape == labels.shape
+        assert torch.all(logprobs == logprobs[0, 0]).item()
+
     def test_grpo_loss_calculation_all_pi_eq(self):
         # All policies are equal: clamping is inactive, ratios are ones.
         current_logprobs = torch.ones(BATCH, SEQ)

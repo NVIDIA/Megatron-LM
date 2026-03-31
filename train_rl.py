@@ -17,11 +17,12 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
+    cp_split_rl_batch,
     get_logprobs,
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -123,7 +124,8 @@ def loss_func(
     # Avoid division by zero for empty bins
     if total_tokens == 0:
         total_tokens = torch.tensor(1.0, device=loss_mask_flat.device)
-    loss = torch.cat([torch.sum(losses_flat * loss_mask_flat).view(1), total_tokens.view(1)])
+    partial_loss = torch.sum(losses_flat * loss_mask_flat)
+    loss = torch.cat([partial_loss.clone().detach().view(1), total_tokens.view(1)])
 
     # Ensure all tensors are on the same device as losses
     device = losses.device
@@ -138,9 +140,6 @@ def loss_func(
     masked_entropy = torch.sum(loss_mask_flat * entropy_term_flat)
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
-
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -187,7 +186,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
+    return (partial_loss, total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -200,6 +199,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     runtime_state = get_rl_runtime_state()
     args = get_args()
     timers = get_timers()
+    labels = None
 
     timers('batch-generator', log_level=2).start()
     global stimer
@@ -227,16 +227,25 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
-        # Extract unpacked data
-        (
-            tokens,
-            advantages,
-            old_logprobs,
-            loss_mask,
-            position_ids,
-            ref_logprobs,
-            inference_logprobs,
-        ) = batch_data
+        # Extract unpacked data.
+        if isinstance(batch_data, dict):
+            tokens = batch_data['tokens']
+            advantages = batch_data['advantages']
+            old_logprobs = batch_data['old_logprobs']
+            loss_mask = batch_data['loss_mask']
+            position_ids = batch_data['position_ids']
+            ref_logprobs = batch_data['ref_logprobs']
+            inference_logprobs = batch_data['inference_logprobs']
+        else:
+            (
+                tokens,
+                advantages,
+                old_logprobs,
+                loss_mask,
+                position_ids,
+                ref_logprobs,
+                inference_logprobs,
+            ) = batch_data
 
         seq_starts = None
         seq_lengths = None
@@ -253,10 +262,29 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
+        cp_batch = cp_split_rl_batch(
+            tokens,
+            position_ids,
+            get_tokenizer().pad,
+            old_logprobs=old_logprobs,
+            ref_logprobs=ref_logprobs,
+            loss_mask=loss_mask,
+            inference_logprobs=inference_logprobs,
+        )
+        if cp_batch is not None:
+            tokens = cp_batch['tokens']
+            position_ids = cp_batch['position_ids']
+            labels = cp_batch['labels']
+            old_logprobs = cp_batch['old_logprobs']
+            ref_logprobs = cp_batch['ref_logprobs']
+            loss_mask = cp_batch['loss_mask']
+            inference_logprobs = cp_batch.get('inference_logprobs')
+
         runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
+    cp_size = mpu.get_context_parallel_world_size()
 
     if packed_seq_params is None:
         if args.rl_use_sequence_packing:
@@ -265,6 +293,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
+        elif cp_size > 1:
+            packed_seq_params = None
         else:
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
             packed_seq_params = PackedSeqParams(
@@ -290,7 +320,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
+            packed_seq_params=packed_seq_params,
+            labels=labels,
         )
 
         if not is_pipeline_last_stage():
