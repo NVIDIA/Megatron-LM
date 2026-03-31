@@ -43,7 +43,7 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
         ' to get the default load and save sharded strategies.'
     )
     if backend != 'torch_dist':
-        logger.warning(f'{backend} is not supported')
+        logger.warning(f'{backend} is not supported. `torch_dist` backend will be used.')
     if action == StrategyAction.LOAD_SHARDED:
         return TorchDistLoadShardedStrategy()
     else:

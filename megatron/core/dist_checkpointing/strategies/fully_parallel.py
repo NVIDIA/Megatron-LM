@@ -139,7 +139,7 @@ class FullyParallelSaveStrategyWrapper:
         logger.debug(f"parallel save sharding, time: {end - start}")
 
 
-class FullyParallelLoadStrategyWrapper(TorchDistLoadShardedStrategy):
+class FullyParallelLoadStrategyWrapper():
     """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
@@ -172,7 +172,6 @@ class FullyParallelLoadStrategyWrapper(TorchDistLoadShardedStrategy):
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
     ):
-        super().__init__()
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = (

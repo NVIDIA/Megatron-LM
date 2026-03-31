@@ -48,7 +48,7 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
-from .async_utils import AsyncCallsQueue, AsyncRequest
+from .async_utils import AsyncRequest
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
@@ -57,9 +57,13 @@ try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
+
+    HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC
     NVRxAsyncRequest = ABC
+
+    HAVE_NVRX = False
 
 try:
     if not torch.cuda.is_available():
@@ -83,8 +87,6 @@ MSC_PREFIX = "msc://"
 
 _metadata_fn: str = ".metadata"
 
-async_calls = AsyncCallsQueue()
-
 
 # dummy class needed to load mcore v0.15 checkpoints with optim. states
 class MCoreMetadata:
@@ -98,16 +100,6 @@ class MCoreSavePlan:
     """ """
 
     pass
-
-
-def register_default_torch_strategies():
-    """Register default strategies related to PyT Distributed backend."""
-    register_default_strategy(
-        StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
-    )
-    register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy()
-    )
 
 
 logger = getLogger(__name__)
@@ -654,12 +646,10 @@ class TorchDistSaveShardedStrategy:
     
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir)
-        # multiprocessing routines  may cause issue when called on parent process
-        # We keep this verbose call for now
-        global async_calls
-        async_calls.schedule_async_request(async_request)
-        async_calls.maybe_finalize_async_calls(blocking=True)
+        strategy = "nvrx" if HAVE_NVRX else "mcore"
+        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
+        async_request.execute_sync()
+        del async_request
 
     def async_save(
         self,
