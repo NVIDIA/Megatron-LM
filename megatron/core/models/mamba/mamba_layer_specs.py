@@ -148,7 +148,7 @@ def get_mamba_stack_spec(config=None):
                         module=MLP,
                         submodules=MLPSubmodules(
                             linear_fc1=TELayerNormColumnParallelLinear,
-                            linear_fc2=TERowParallelLinear
+                            linear_fc2=TERowParallelLinear,
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
