@@ -49,7 +49,6 @@ from ..mapping import (
     is_main_replica,
 )
 from .async_utils import AsyncRequest
-from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
 try:
