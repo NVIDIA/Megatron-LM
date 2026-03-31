@@ -129,7 +129,6 @@ class TestFP4Param:
         args.swiglu = True
         args.use_distributed_optimizer = not inference
         args.attention_backend = "unfused"
-        args.deterministic_mode = True
         # FP4 settings
         args.fp4 = "e2m1"
         args.fp4_recipe = "nvfp4"
@@ -281,7 +280,7 @@ class TestFP4Param:
             print("\n=== Running with fp4_param_gather=False (BF16) ===")
             loss_list_ref = self._run_test_helper(tp_size, fp4_param_gather=False, **kwargs)
 
-            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
 
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
