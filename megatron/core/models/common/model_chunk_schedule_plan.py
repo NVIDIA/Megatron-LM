@@ -176,8 +176,8 @@ class TransformerLayerSchedulePlan:
 
         # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            self.mlp.manual_grads_release = False
-            self.moe_combine.manual_grads_release = False
+            self.mlp.manual_release_grads = False
+            self.moe_combine.manual_release_grads = False
 
     def get_fp8_context(self):
         """
