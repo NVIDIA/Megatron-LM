@@ -771,6 +771,7 @@ class TestMegatronFsdpFullyShard:
             outer_dp_sharding_strategy=OPTIM,
             dp_outer_dim=DP_OUTER,
             dp_shard_dim=DP_SHARD_CP,
+            tp_dim=TP,
             fsdp_unit_modules=[te.pytorch.TransformerLayer, te.pytorch.Linear],
             # Only ZeRO-3 / FSDP supports FP8 parameters.
             zero_dp_strategy=3,

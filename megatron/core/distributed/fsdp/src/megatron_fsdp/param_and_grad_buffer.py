@@ -4636,7 +4636,12 @@ def make_fsdp_dtensor(
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
         )
-
+        # Verify a DeviceMesh TP dimension exists.
+        assert dist_index.tp_dim is not None, (
+            "[Megatron-FSDP] TP dimension is missing from DeviceMesh / FSDPDistributedIndex! "
+            "Required for Megatron-Core or TransformerEngine modules that use TP. "
+            "If TP=1, a trivial TP dimension of size 1 should be provided."
+        )
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
         global_shape = list(param.shape)
         if tp_mesh.mesh.numel() > 1:
