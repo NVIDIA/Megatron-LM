@@ -183,6 +183,7 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    **kwargs,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -206,7 +207,10 @@ def _apply_rotary_pos_emb_thd(
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
     #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
+    # 2. If kwargs has offsets: t is a local packed shard and freqs contains max sequence length
+    #    positions.
+    #    -> Use per-fragment offsets to recover the correct global positions.
+    # 3. Otherwise: freqs contains only max sequence length positions
     #    -> Use traditional mapping without offsets (map first :seqlen part)
     if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
         # CASE 1: Exact mapping with offsets
@@ -229,8 +233,27 @@ def _apply_rotary_pos_emb_thd(
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
         ).squeeze(1)
+    elif 'offsets' in kwargs:
+        # CASE 2: Local packed shards with per-fragment offsets.
+        offsets = kwargs['offsets']
+        sequence_splits = torch.split(t, seqlens)
+        freqs_packed = torch.cat(
+            [
+                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
+                for x, seq_start_offset in zip(sequence_splits, offsets)
+            ],
+            dim=0,
+        )
+
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs_packed,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=multi_latent_attention,
+            mscale=mscale,
+        ).squeeze(1)
     else:
-        # CASE 2: Traditional mapping without offsets
+        # CASE 3: Traditional mapping without offsets
         # Build packed freqs for all sequences using the standard mapping, then apply once
         sequence_splits = torch.split(t, seqlens)
         freqs_packed = torch.cat(
@@ -254,6 +277,7 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    **kwargs,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -313,6 +337,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
+            **kwargs,
         )
 
 
