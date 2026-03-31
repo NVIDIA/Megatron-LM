@@ -44,11 +44,16 @@ MIXED = "mixed"  # >0 decode, >0 prefill
 
 ALL_STATES = [NONE, DECODE, PREFILL, MIXED]
 
+# Fixed expert-parallel size.  When world_size > _EP_SIZE the remaining
+# ranks form data-parallel replicas, each running the same EP combo
+# independently.
+_EP_SIZE = 4
+
 # Combinatorial sweep: unordered combinations with repetition of ALL_STATES
-# across all EP ranks.  Since rank assignment is symmetric (shuffling ranks
+# across the EP ranks.  Since rank assignment is symmetric (shuffling ranks
 # with the same multiset of states is not a distinct configuration), we use
 # combinations_with_replacement rather than the full Cartesian product.
-_EP_SIZE = Utils.world_size
+# For _EP_SIZE=4 this gives C(4+4-1, 4) = 35 test cases.
 _STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
 
 # Batch dimensions used to set up each non-dummy state via
@@ -79,13 +84,20 @@ class TestDynamicInference:
             pytest.skip(reason, allow_module_level=True)
         if not is_fa_min_version("2.7.3"):
             pytest.skip("need flash-attn >= 2.7.3 for dynamic batching", allow_module_level=True)
-        if Utils.world_size < 2:
-            pytest.skip("EP test requires at least 2 GPUs", allow_module_level=True)
+        if Utils.world_size < _EP_SIZE:
+            pytest.skip(
+                f"EP test requires at least {_EP_SIZE} GPUs", allow_module_level=True
+            )
+        if Utils.world_size % _EP_SIZE != 0:
+            pytest.skip(
+                f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})",
+                allow_module_level=True,
+            )
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            expert_model_parallel_size=Utils.world_size,
+            expert_model_parallel_size=_EP_SIZE,
         )
 
     def teardown_method(self, method):
@@ -202,7 +214,7 @@ class TestDynamicInference:
         )
 
     # ------------------------------------------------------------------
-    # test_ep_state_cross_product: full 4x4 matrix with mixed CUDA graphs
+    # test_ep_state_cross_product: combinatorial sweep with mixed CUDA graphs
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
@@ -226,8 +238,8 @@ class TestDynamicInference:
         mamba state allocation with zeroed conv/ssm states).  No forward
         passes or request lifecycle transitions are needed.
         """
-        rank = dist.get_rank()
-        my_state = rank_states[rank]
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        my_state = rank_states[ep_rank]
         is_dummy = my_state == NONE
 
         model = self._build_model()
@@ -248,7 +260,7 @@ class TestDynamicInference:
         # ranks whose EP-adjusted dimensions inherit prefill/decode counts
         # from peers — must find a matching graph.
         assert ctx.using_cuda_graph_this_step(), (
-            f"Rank {rank} (state={my_state}): expected a CUDA graph match "
+            f"EP rank {ep_rank} (state={my_state}): expected a CUDA graph match "
             f"with use_cuda_graphs_for_non_decode_steps=True "
             f"(rank_states={rank_states})"
         )
@@ -267,9 +279,9 @@ class TestDynamicInference:
             f"(rank_states={rank_states})"
         )
 
-        self._assert_dynamic_inference_shape(model, ctx, rank, my_state)
+        self._assert_dynamic_inference_shape(model, ctx, ep_rank, my_state)
         self._assert_cuda_graphs_were_replayed(
-            True, rank, f"state={my_state}, rank_states={rank_states}"
+            True, ep_rank, f"state={my_state}, rank_states={rank_states}"
         )
 
     # ------------------------------------------------------------------
@@ -299,10 +311,10 @@ class TestDynamicInference:
             output (padded_batch_dimensions is computed via the non-graph
             fallback path).
 
-        Even ranks are dummy; odd ranks have the parametrized peer_state.
+        Even EP ranks are dummy; odd EP ranks have the parametrized peer_state.
         """
-        rank = dist.get_rank()
-        is_even = rank % 2 == 0
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_even = ep_rank % 2 == 0
 
         model = self._build_model()
         ctx = self._build_context(model, use_cuda_graphs_for_non_decode_steps=False)
@@ -320,19 +332,19 @@ class TestDynamicInference:
         # Verify: no rank should have matched a CUDA graph because the
         # peer has prefill but only decode graphs are available.
         assert not ctx.using_cuda_graph_this_step(), (
-            f"Rank {rank}: expected no CUDA graph match with "
+            f"EP rank {ep_rank}: expected no CUDA graph match with "
             f"decode-only graphs and peer_state={peer_state}"
         )
 
         if is_even:
             # Dummy rank bailed out — exercise the eager fallback.
-            self._assert_dummy_forward_shape(model, rank)
+            self._assert_dummy_forward_shape(model, ep_rank)
         else:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # non-graph fallback path in initialize_attention_state.
-            self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, peer_state)
         self._assert_cuda_graphs_were_replayed(
-            False, rank, f"decode-only graphs, peer_state={peer_state}"
+            False, ep_rank, f"decode-only graphs, peer_state={peer_state}"
         )
 
     # ------------------------------------------------------------------
@@ -364,8 +376,8 @@ class TestDynamicInference:
             padded_batch_dimensions fallback.
           - All non-dummy EP ranks agree on the padded token count.
         """
-        rank = dist.get_rank()
-        is_even = rank % 2 == 0
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_even = ep_rank % 2 == 0
 
         model = self._build_model()
 
@@ -377,7 +389,7 @@ class TestDynamicInference:
             model, use_cuda_graphs_for_non_decode_steps=True, max_requests=small_max_requests
         )
 
-        # Even ranks are dummy (no requests).  Odd ranks get a state
+        # Even EP ranks are dummy (no requests).  Odd EP ranks get a state
         # whose token count exceeds small_max_requests.
         overflow_token_count = small_max_requests + 16  # 32 tokens > 16 capacity
         overflow_dims = {
@@ -401,18 +413,18 @@ class TestDynamicInference:
         # No rank should have matched a CUDA graph — the EP-adjusted
         # token count exceeds every graph's capacity.
         assert not ctx.using_cuda_graph_this_step(), (
-            f"Rank {rank}: expected no CUDA graph match when token count "
+            f"EP rank {ep_rank}: expected no CUDA graph match when token count "
             f"({overflow_token_count}) exceeds max_requests ({small_max_requests}), "
             f"peer_state={peer_state}"
         )
 
         if is_even:
             # Dummy rank bailed out — exercise the eager fallback.
-            self._assert_dummy_forward_shape(model, rank)
+            self._assert_dummy_forward_shape(model, ep_rank)
         else:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # eager fallback path.  Verify shape correctness.
-            self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, peer_state)
         self._assert_cuda_graphs_were_replayed(
-            False, rank, f"overflow tokens, peer_state={peer_state}"
+            False, ep_rank, f"overflow tokens, peer_state={peer_state}"
         )
