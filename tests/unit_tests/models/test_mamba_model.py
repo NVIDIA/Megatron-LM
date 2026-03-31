@@ -16,8 +16,8 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.mamba.mamba_layer_specs import (
-    get_mamba_stack_spec,
     get_mamba_inference_stack_spec,
+    get_mamba_stack_spec,
     mamba_stack_spec,
 )
 from megatron.core.models.mamba.mamba_model import MambaModel
