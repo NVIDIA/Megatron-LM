@@ -16,6 +16,8 @@ for every combination of these states across EP ranks, using the real EP
 synchronization path (strict matching + MAX-reduce on batch dimensions).
 """
 
+import itertools
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -41,6 +43,13 @@ PREFILL = "prefill"  # 0 decode, >0 prefill
 MIXED = "mixed"  # >0 decode, >0 prefill
 
 ALL_STATES = [NONE, DECODE, PREFILL, MIXED]
+
+# Combinatorial sweep: unordered combinations with repetition of ALL_STATES
+# across all EP ranks.  Since rank assignment is symmetric (shuffling ranks
+# with the same multiset of states is not a distinct configuration), we use
+# combinations_with_replacement rather than the full Cartesian product.
+_EP_SIZE = Utils.world_size
+_STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
 
 # Batch dimensions used to set up each non-dummy state via
 # add_dummy_requests_for_cudagraph_capture.  These are intentionally small
@@ -197,14 +206,15 @@ class TestDynamicInference:
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
-        "even_state,odd_state",
-        [(a, b) for a in ALL_STATES for b in ALL_STATES],
-        ids=[f"even={a}_odd={b}" for a in ALL_STATES for b in ALL_STATES],
+        "rank_states",
+        _STATE_COMBOS,
+        ids=[",".join(s) for s in _STATE_COMBOS],
     )
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_state_cross_product(self, even_state, odd_state):
-        """Test all 16 combinations of EP rank request states.
+    def test_ep_state_cross_product(self, rank_states):
+        """Test all combinatorial (unordered, with repetition) assignments of
+        the four request states across EP ranks.
 
         The context is built with use_cuda_graphs_for_non_decode_steps=True,
         so the CUDA graph list contains decode-only, mixed, and prefill-only
@@ -217,7 +227,7 @@ class TestDynamicInference:
         passes or request lifecycle transitions are needed.
         """
         rank = dist.get_rank()
-        my_state = even_state if rank % 2 == 0 else odd_state
+        my_state = rank_states[rank]
         is_dummy = my_state == NONE
 
         model = self._build_model()
@@ -240,7 +250,7 @@ class TestDynamicInference:
         assert ctx.using_cuda_graph_this_step(), (
             f"Rank {rank} (state={my_state}): expected a CUDA graph match "
             f"with use_cuda_graphs_for_non_decode_steps=True "
-            f"(even={even_state}, odd={odd_state})"
+            f"(rank_states={rank_states})"
         )
 
         # All EP ranks must agree on padded token count.
@@ -254,12 +264,12 @@ class TestDynamicInference:
         assert tc_max.item() == tc_min.item(), (
             f"Padded token count mismatch across EP ranks: "
             f"min={tc_min.item()}, max={tc_max.item()} "
-            f"(even={even_state}, odd={odd_state})"
+            f"(rank_states={rank_states})"
         )
 
         self._assert_dynamic_inference_shape(model, ctx, rank, my_state)
         self._assert_cuda_graphs_were_replayed(
-            True, rank, f"state={my_state}, even={even_state}, odd={odd_state}"
+            True, rank, f"state={my_state}, rank_states={rank_states}"
         )
 
     # ------------------------------------------------------------------
