@@ -34,13 +34,16 @@ on:
         default: true
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.22.5
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.85.0
     with:
-      library-name: Megatron-Bridge
-      python-package: megatron.bridge
+      library-name: Megatron-Core
+      python-package: megatron.core
       release-type: ${{ inputs.release-type }}
       freeze-commit: ${{ inputs.freeze-commit }}
       dry-run: ${{ inputs.dry-run }}
+      release-branch-prefix: core_
+      use-pat: true
     secrets:
-      SLACK_WEBHOOK: ${{ secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
+      SLACK_WEBHOOK: ${{ inputs.dry-run && secrets.SLACK_CI_CHANNEL_WEBHOOK ||secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
+      PAT: ${{ secrets.PAT }}
