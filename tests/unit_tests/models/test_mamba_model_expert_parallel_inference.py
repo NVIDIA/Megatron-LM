@@ -3,7 +3,7 @@
 """Tests for full MambaModel inference with expert-parallel batch dimension sync.
 
 When expert parallelism > 1 with strict matching (hybrid models), batch
-dimensions are MAX-reduced across EP ranks.  Different EP ranks can be in
+dimensions are MAX-reduced across EP ranks. Different EP ranks can be in
 one of four request states:
 
   - NONE:    0 requests (dummy rank, uses is_expert_parallel_dummy_cuda_graph_step)
@@ -44,28 +44,28 @@ MIXED = "mixed"  # >0 decode, >0 prefill
 
 ALL_STATES = [NONE, DECODE, PREFILL, MIXED]
 
-# Fixed expert-parallel size.  When world_size > _EP_SIZE the remaining
+# Fixed expert-parallel size. When world_size > _EP_SIZE the remaining
 # ranks form data-parallel replicas, each running the same EP combo
 # independently.
 _EP_SIZE = 4
 
 # Combinatorial sweep: unordered combinations with repetition of ALL_STATES
-# across the EP ranks.  Since rank assignment is symmetric (shuffling ranks
+# across the EP ranks. Since rank assignment is symmetric (shuffling ranks
 # with the same multiset of states is not a distinct configuration), we use
 # combinations_with_replacement rather than the full Cartesian product.
 # For _EP_SIZE=4 this gives C(4+4-1, 4) = 35 test cases.
 _STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
 
 # Batch dimensions used to set up each non-dummy state via
-# add_dummy_requests_for_cudagraph_capture.  These are intentionally small
+# add_dummy_requests_for_cudagraph_capture. These are intentionally small
 # to keep the tests fast while still exercising the EP padding logic.
 _STATE_DIMS = {
     # 2 decode requests, 1 token each -> 2 tokens total
     DECODE: InferenceBatchDimensions(token_count=2, prefill_req_count=0, decode_req_count=2),
     # 2 prefill requests with 16 tokens each -> 32 tokens total
     PREFILL: InferenceBatchDimensions(token_count=32, prefill_req_count=2, decode_req_count=0),
-    # 2 decode (2 tokens) + 1 prefill (30 tokens) = 32 tokens
-    MIXED: InferenceBatchDimensions(token_count=32, prefill_req_count=1, decode_req_count=2),
+    # 4 decode (4 tokens) + 2 prefill (60 tokens) = 64 tokens
+    MIXED: InferenceBatchDimensions(token_count=64, prefill_req_count=2, decode_req_count=4),
 }
 
 
@@ -224,13 +224,11 @@ class TestDynamicInference:
 
         The context is built with use_cuda_graphs_for_non_decode_steps=True,
         so the CUDA graph list contains decode-only, mixed, and prefill-only
-        graphs.  After the EP all-reduce in match_graph_config, every rank
+        graphs. After the EP all-reduce in match_graph_config, every rank
         (including dummy ranks) should always find a matching graph.
 
         State setup uses add_dummy_requests_for_cudagraph_capture to populate
-        the context directly with the desired request configuration (including
-        mamba state allocation with zeroed conv/ssm states).  No forward
-        passes or request lifecycle transitions are needed.
+        the context directly with the desired request configuration.
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         my_state = rank_states[ep_rank]
@@ -292,10 +290,10 @@ class TestDynamicInference:
         are available.
 
         With use_cuda_graphs_for_non_decode_steps=False, the CUDA graph list
-        contains only decode-only graphs.  When any EP rank has prefill
+        contains only decode-only graphs. When any EP rank has prefill
         requests, adjust_batch_dims_for_expert_parallelism returns None
         (forcing eager mode), and match_graph_config returns None for all
-        ranks.  A dummy rank then bails out of initialize_attention_state
+        ranks. A dummy rank then bails out of initialize_attention_state
         early (padded_batch_dimensions is not set).
 
         This test verifies that:
@@ -355,20 +353,19 @@ class TestDynamicInference:
         a rank's token count exceeds the CUDA graph capacity.
 
         With use_cuda_graphs_for_non_decode_steps=True, the CUDA graph
-        list includes mixed and prefill-only graphs.  However, the
+        list includes mixed and prefill-only graphs. However, the
         maximum CUDA graph token capacity is bounded by max_requests
         (specifically, max_requests * (num_speculative_tokens + 1)).
 
         When one EP rank has a token count exceeding this capacity, no
         CUDA graph can accommodate the EP-adjusted dimensions.
         match_graph_config returns None for all ranks, forcing eager
-        mode globally.  This test verifies that:
+        mode globally. This test verifies that:
           - No rank matches a CUDA graph (eager mode is forced).
           - Dummy ranks bail out and produce correct shapes via the
             eager dummy_forward path.
           - Non-dummy ranks produce correct shapes via the eager
             padded_batch_dimensions fallback.
-          - All non-dummy EP ranks agree on the padded token count.
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_even = ep_rank % 2 == 0
@@ -383,7 +380,7 @@ class TestDynamicInference:
             model, use_cuda_graphs_for_non_decode_steps=True, max_requests=small_max_requests
         )
 
-        # Even EP ranks are dummy (no requests).  Odd EP ranks get a state
+        # Even EP ranks are dummy (no requests). Odd EP ranks get a state
         # whose token count exceeds small_max_requests.
         overflow_token_count = small_max_requests + 16  # 32 tokens > 16 capacity
         overflow_dims = {
