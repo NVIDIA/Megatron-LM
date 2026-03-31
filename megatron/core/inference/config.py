@@ -39,6 +39,9 @@ class MambaInferenceStateConfig:
     ssm_states_dtype: torch.dtype
     """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
 
+    mamba_chunk_size: int = 128
+    """The chunk size used by the Mamba SSM Triton kernels."""
+
     @classmethod
     def from_model(
         cls,
@@ -59,12 +62,18 @@ class MambaInferenceStateConfig:
                 conv_states_dtype = model.config.params_dtype
             if ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
+            mamba_chunk_size = 128
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    mamba_chunk_size = layer.mixer.chunk_size
+                    break
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
+                mamba_chunk_size=mamba_chunk_size,
             )
         return None
 
@@ -251,6 +260,18 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
+    prefix_caching_routing_alpha: float = 0.5
+    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
+    Higher alpha favors prefix cache hits; lower alpha favors load balance.
+    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_caching_mamba_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
+    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
+    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    block boundaries are cached and reused across requests with matching prefixes."""
+
     # =================================
     # Logging config
     # =================================
@@ -283,7 +304,14 @@ class InferenceConfig:
     """
 
     use_synchronous_zmq_collectives: bool = False
-    """Whether to use synchronous ZMQ collectives for inference. If True, the 
-    all_reduce_max operation will be performed synchronously, which can help reduce 
+    """Whether to use synchronous ZMQ collectives for inference. If True, the
+    all_reduce_max operation will be performed synchronously, which can help reduce
     performance variability for MoEs.
     """
+
+    def __post_init__(self):
+        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+            raise ValueError(
+                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"got {self.prefix_caching_routing_alpha}"
+            )
