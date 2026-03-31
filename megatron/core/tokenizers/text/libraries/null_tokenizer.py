@@ -47,7 +47,7 @@ class NullTokenizer:
         return OrderedDict(
             {
                 "class": f"{type(self).__module__}.{type(self).__qualname__}",
-                "vocab_size": str(self._vocab_size),
+                "vocab_size": self._vocab_size,
             }
         )
 
