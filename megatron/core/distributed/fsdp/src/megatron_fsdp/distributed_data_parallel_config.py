@@ -145,11 +145,10 @@ class DistributedDataParallelConfig:
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
 
-    use_precision_aware_optimizer: bool = False
+    megatron_fsdp_use_decoupled_grad: bool = False
     """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
       gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
-      main gradients to parameter dtype for `.grad`. Should match the training optimizer
-      setting when using Megatron Core.
+      main gradients to parameter dtype for `.grad`.
     """
 
     def __post_init__(self):
