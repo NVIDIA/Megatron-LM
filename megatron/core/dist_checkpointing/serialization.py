@@ -139,7 +139,8 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+    async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -293,6 +294,7 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
+    async_strategy: Optional[str] = "nvrx",
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -389,7 +391,7 @@ def save(
         metadata_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
     async_request.finalize_fns.append(metadata_finalize_fn)
     return async_request
 
