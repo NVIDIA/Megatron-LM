@@ -182,8 +182,8 @@ def _apply_rotary_pos_emb_thd(
     rotary_interleaved: bool = False,
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
-    cp_group: torch.distributed.ProcessGroup = None,
-    **kwargs,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    offsets: Optional[Tensor] = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -207,7 +207,7 @@ def _apply_rotary_pos_emb_thd(
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
     #    -> Use offset-based mapping for exact positional correspondence
-    # 2. If kwargs has offsets: t is a local packed shard and freqs contains max sequence length
+    # 2. If offsets are provided: t is a local packed shard and freqs contains max sequence length
     #    positions.
     #    -> Use per-fragment offsets to recover the correct global positions.
     # 3. Otherwise: freqs contains only max sequence length positions
@@ -233,10 +233,14 @@ def _apply_rotary_pos_emb_thd(
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
         ).squeeze(1)
-    elif 'offsets' in kwargs:
+    elif offsets is not None:
         # CASE 2: Local packed shards with per-fragment offsets.
-        offsets = kwargs['offsets']
         sequence_splits = torch.split(t, seqlens)
+        if offsets.numel() != len(sequence_splits):
+            raise ValueError(
+                f"offsets must provide one entry per local sequence split, got {offsets.numel()} "
+                f"offsets for {len(sequence_splits)} splits."
+            )
         freqs_packed = torch.cat(
             [
                 _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
@@ -276,9 +280,9 @@ def apply_rotary_pos_emb(
     config: TransformerConfig,
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
-    cp_group: torch.distributed.ProcessGroup = None,
-    **kwargs,
-):
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    offsets: Optional[Tensor] = None,
+) -> Tensor:
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
@@ -310,15 +314,22 @@ def apply_rotary_pos_emb(
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb_thd(
-                t,
-                cu_seqlens,
-                freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
-                interleaved=config.rotary_interleaved,
-            )
+            if offsets is not None:
+                warnings.warn(
+                    "offsets are not supported by fused THD RoPE. Using unfused implementation."
+                )
+            else:
+                assert (
+                    fused_apply_rotary_pos_emb_thd is not None
+                ), "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    cp_size=cp_group.size(),
+                    cp_rank=cp_group.rank(),
+                    interleaved=config.rotary_interleaved,
+                )
     # use unfused implementation
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
@@ -337,7 +348,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
-            **kwargs,
+            offsets=offsets,
         )
 
 

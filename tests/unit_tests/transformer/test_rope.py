@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb, rope_utils
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -154,33 +154,24 @@ class TestQKVRotaryEmbedding:
 
 
 class _FakeCpGroup:
-    def __init__(self, size: int, rank: int):
+    def __init__(self, size: int, rank: int) -> None:
         self._size = size
         self._rank = rank
 
-    def size(self):
+    def size(self) -> int:
         return self._size
 
-    def rank(self):
+    def rank(self) -> int:
         return self._rank
 
 
 def test_apply_rotary_pos_emb_thd_uses_offsets_for_local_packed_shards():
     config = TransformerConfig(
-        num_layers=1,
-        hidden_size=4,
-        num_attention_heads=1,
-        apply_rope_fusion=False,
+        num_layers=1, hidden_size=4, num_attention_heads=1, apply_rope_fusion=False
     )
     cp_group = _FakeCpGroup(size=1, rank=0)
 
-    t = torch.tensor(
-        [
-            [[1.0, 2.0, 3.0, 4.0]],
-            [[2.0, 3.0, 4.0, 5.0]],
-            [[6.0, 7.0, 8.0, 9.0]],
-        ]
-    )
+    t = torch.tensor([[[1.0, 2.0, 3.0, 4.0]], [[2.0, 3.0, 4.0, 5.0]], [[6.0, 7.0, 8.0, 9.0]]])
     freqs = (torch.arange(16, dtype=torch.float32).view(4, 1, 1, 4) + 1.0) / 10.0
     cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
     offsets = torch.tensor([2, 1], dtype=torch.int32)
@@ -200,13 +191,41 @@ def test_apply_rotary_pos_emb_thd_uses_offsets_for_local_packed_shards():
     ).squeeze(1)
 
     output = apply_rotary_pos_emb(
-        t,
-        freqs,
-        config,
-        cu_seqlens=cu_seqlens,
-        cp_group=cp_group,
-        offsets=offsets,
+        t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, offsets=offsets
     )
 
     assert torch.allclose(output, expected)
     assert not torch.allclose(output, legacy_expected)
+
+
+def test_apply_rotary_pos_emb_thd_falls_back_from_fusion_when_offsets_are_provided(monkeypatch):
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb", object())
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=4, num_attention_heads=1, apply_rope_fusion=True
+    )
+    cp_group = _FakeCpGroup(size=1, rank=0)
+
+    t = torch.tensor([[[1.0, 2.0, 3.0, 4.0]], [[2.0, 3.0, 4.0, 5.0]], [[6.0, 7.0, 8.0, 9.0]]])
+    freqs = (torch.arange(16, dtype=torch.float32).view(4, 1, 1, 4) + 1.0) / 10.0
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    offsets = torch.tensor([2, 1], dtype=torch.int32)
+
+    def _unexpected_fused(*args, **kwargs):
+        raise AssertionError("fused THD RoPE should not be used when offsets are provided")
+
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", _unexpected_fused)
+
+    expected = _apply_rotary_pos_emb_bshd(
+        t.unsqueeze(1),
+        torch.cat([freqs[2:4], freqs[1:2]], dim=0),
+        rotary_interleaved=config.rotary_interleaved,
+        multi_latent_attention=config.multi_latent_attention,
+    ).squeeze(1)
+
+    with pytest.warns(UserWarning, match="offsets are not supported by fused THD RoPE"):
+        output = apply_rotary_pos_emb(
+            t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, offsets=offsets
+        )
+
+    assert torch.allclose(output, expected)
