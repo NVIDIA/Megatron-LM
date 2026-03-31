@@ -15,7 +15,11 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_layer_specs import (
+    get_mamba_stack_spec,
+    get_mamba_inference_stack_spec,
+    mamba_stack_spec,
+)
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -290,6 +294,107 @@ class TestMambaModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
+
+
+class TestMambaQKLayernorm:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _get_attention_submodules(self, spec):
+        return spec.submodules.attention_layer.submodules.self_attention.submodules
+
+    def test_spec_default_no_qk_norm(self):
+        """Default spec (no config) uses IdentityOp for q/k layernorm."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        spec = get_mamba_stack_spec()
+        attn = self._get_attention_submodules(spec)
+        assert attn.q_layernorm is IdentityOp
+        assert attn.k_layernorm is IdentityOp
+
+    def test_spec_qk_layernorm_enabled(self):
+        """When qk_layernorm=True, spec uses TENorm for q/k layernorm."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True,
+        )
+        spec = get_mamba_stack_spec(config)
+        attn = self._get_attention_submodules(spec)
+        assert attn.q_layernorm is TENorm
+        assert attn.k_layernorm is TENorm
+
+    def test_spec_qk_l2_norm_enabled(self):
+        """When qk_l2_norm=True, spec uses L2Norm for q/k layernorm."""
+        from megatron.core.transformer.torch_norm import L2Norm
+
+        config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_l2_norm=True,
+        )
+        spec = get_mamba_stack_spec(config)
+        attn = self._get_attention_submodules(spec)
+        assert attn.q_layernorm is L2Norm
+        assert attn.k_layernorm is L2Norm
+
+    def test_inference_spec_qk_layernorm_enabled(self):
+        """Inference spec also respects qk_layernorm."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True,
+        )
+        spec = get_mamba_inference_stack_spec(config)
+        attn = self._get_attention_submodules(spec)
+        assert attn.q_layernorm is TENorm
+        assert attn.k_layernorm is TENorm
+
+    def test_backward_compat_constant_matches_default(self):
+        """Module-level mamba_stack_spec constant matches get_mamba_stack_spec()."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        attn = self._get_attention_submodules(mamba_stack_spec)
+        assert attn.q_layernorm is IdentityOp
+        assert attn.k_layernorm is IdentityOp
+
+    def test_forward_with_qk_layernorm(self):
+        """MambaModel forward pass works with qk_layernorm enabled."""
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_layernorm=True,
+        )
+        model = MambaModel(
+            config=config,
+            mamba_stack_spec=get_mamba_stack_spec(config),
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+        model.cuda()
+
+        sequence_length = 4
+        micro_batch_size = 2
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == 100
 
 
 class TestMambaWithDynamicInference:
