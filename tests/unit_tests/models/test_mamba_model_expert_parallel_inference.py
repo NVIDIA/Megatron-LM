@@ -29,6 +29,7 @@ from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -79,10 +80,11 @@ class TestDynamicInference:
         )
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
     def _build_model(self):
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         config = TransformerConfig(
             num_layers=3,
             mtp_hybrid_override_pattern="ME*",
@@ -94,6 +96,7 @@ class TestDynamicInference:
             attention_backend=AttnBackend.fused,
             num_moe_experts=2,
             moe_token_dispatcher_type="alltoall",
+            cuda_graph_impl="local",
         )
         model = MambaModel(
             config=config,
@@ -146,6 +149,34 @@ class TestDynamicInference:
             f"(1, {padded.token_count}, {self.VOCAB_SIZE}), "
             f"got {tuple(out.shape)}"
         )
+
+    @staticmethod
+    def _assert_cuda_graphs_were_replayed(expect_replayed, rank, label):
+        """Assert that CUDA graphs were (or were not) recorded and replayed
+        during the preceding model.forward() call.
+
+        The inference path in CudaGraphManager records each layer's runner
+        into _CudagraphGlobalRecord.cudagraph_inference_record the first time
+        a graph is captured.  A non-empty record with fwd_graph_recorded=True
+        on every runner confirms the graph was both recorded and replayed.
+        """
+        record = _CudagraphGlobalRecord.cudagraph_inference_record
+        if expect_replayed:
+            assert len(record) > 0, (
+                f"Rank {rank} ({label}): expected CUDA graphs to be recorded and "
+                f"replayed, but cudagraph_inference_record is empty"
+            )
+            for runner, _graph_type, _args, _kwargs in record:
+                assert runner.fwd_graph_recorded, (
+                    f"Rank {rank} ({label}): CUDA graph runner for "
+                    f"{runner.base_module.__class__.__name__} (layer "
+                    f"{runner.base_module.layer_number}) was not recorded"
+                )
+        else:
+            assert len(record) == 0, (
+                f"Rank {rank} ({label}): expected no CUDA graph replay, "
+                f"but cudagraph_inference_record has {len(record)} entries"
+            )
 
     def _assert_dummy_forward_shape(self, model, rank):
         """Run model.forward with a single dummy token (no inference context),
@@ -227,6 +258,9 @@ class TestDynamicInference:
         )
 
         self._assert_dynamic_inference_shape(model, ctx, rank, my_state)
+        self._assert_cuda_graphs_were_replayed(
+            True, rank, f"state={my_state}, even={even_state}, odd={odd_state}"
+        )
 
     # ------------------------------------------------------------------
     # test_dummy_bailout_with_decode_only_cuda_graphs: dedicated bail-out
@@ -287,6 +321,9 @@ class TestDynamicInference:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # non-graph fallback path in initialize_attention_state.
             self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+        self._assert_cuda_graphs_were_replayed(
+            False, rank, f"decode-only graphs, peer_state={peer_state}"
+        )
 
     # ------------------------------------------------------------------
     # test_mixed_cuda_graphs_tokens_exceed_max_requests: eager fallback
@@ -366,3 +403,6 @@ class TestDynamicInference:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # eager fallback path.  Verify shape correctness.
             self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+        self._assert_cuda_graphs_were_replayed(
+            False, rank, f"overflow tokens, peer_state={peer_state}"
+        )
