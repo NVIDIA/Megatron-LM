@@ -111,7 +111,6 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
-            moe_use_legacy_grouped_gemm=kwargs.get("moe_use_legacy_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_router_padding_for_fp8=kwargs.get("moe_router_padding_for_fp8", True),
