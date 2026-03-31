@@ -83,6 +83,10 @@ _mamba_ssm_version = None
 _causal_conv1d_version = None
 
 
+_Wrapped = TypeVar('_Wrapped', bound=Callable)
+"""A function or class which has been wrapped by a decorator."""
+
+
 @contextmanager
 def null_decorator(*args, **kwargs):
     """
@@ -120,7 +124,7 @@ def experimental_fn(introduced_with_version: str):
     """
     logged_functions = set()
 
-    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(func: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -186,7 +190,7 @@ def experimental_cls(introduced_with_version: str):
     """
     logged_classes = set()
 
-    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(cls: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -2209,7 +2213,9 @@ def _nvtx_decorator_get_func_path(func):
     return f"{module.__name__}.{caller_func}"
 
 
-def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+def nvtx_decorator(
+    message: Optional[str] = None, color: Optional[str] = None
+) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
 
     Args:
@@ -2229,7 +2235,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: _Wrapped) -> _Wrapped:
         if _nvtx_enabled:
             return nvtx.annotate(
                 message=message or _nvtx_decorator_get_func_path(func), color=color
@@ -2366,15 +2372,13 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
 # Backward Compatibility Decorators
 # ============================================================================
 
-_Wrapped = TypeVar('_Wrapped', bound=Union[type, Callable])
-
 
 def deprecated(
     version: str,
     removal_version: Optional[str] = None,
     alternative: Optional[str] = None,
     reason: Optional[str] = None,
-):
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Mark a function as deprecated.
 
@@ -2501,8 +2505,8 @@ def experimental_api(func: _Wrapped) -> _Wrapped:
 
 
 def deprecate_args(
-    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
-):
+    *deprecated_keys: str, message="Argument '{name}' has been deprecated and should not be used."
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Intercepts specific keyword arguments to raise a custom TypeError.
 
