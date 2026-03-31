@@ -354,21 +354,21 @@ class TestMambaQKLayernorm:
 
     def test_spec_provided_norm_not_overwritten(self):
         """When the spec already provides q/k layernorm, config doesn't override it."""
-        from megatron.core.transformer.identity_op import IdentityOp
-        from megatron.core.transformer.attention import SelfAttentionSubmodules
-        from megatron.core.transformer.spec_utils import ModuleSpec
-        from megatron.core.transformer.transformer_layer import (
-            TransformerLayer,
-            TransformerLayerSubmodules,
-        )
+        import copy
+
         from megatron.core.extensions.transformer_engine import (
             TEDotProductAttention,
             TELayerNormColumnParallelLinear,
             TERowParallelLinear,
         )
+        from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
         from megatron.core.transformer.enums import AttnMaskType
-        from megatron.core.transformer.attention import SelfAttention
-        import copy
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.core.transformer.transformer_layer import (
+            TransformerLayer,
+            TransformerLayerSubmodules,
+        )
 
         # Build a spec that explicitly sets q/k layernorm to IdentityOp
         spec = copy.deepcopy(mamba_stack_spec)
