@@ -344,6 +344,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -381,10 +382,12 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            fuse_permute_dispatch=fused,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.fused = fused
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -400,7 +403,11 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            fuse_unpermute_combine=ctx.fused,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
@@ -412,16 +419,17 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x, handle=handle, pad_multiple=pad_multiple, fuse_unpermute_combine=fused
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fused = fused
         return combined_hidden
 
     @staticmethod
@@ -436,6 +444,7 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            fuse_permute_dispatch=ctx.fused,
         )
         return dispatched_hidden, None, None, None, None
 
@@ -451,6 +460,7 @@ if HAVE_HYBRIDEP:
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -489,12 +499,13 @@ if HAVE_HYBRIDEP:
             num_local_experts,
             num_sms_dispatch_api,
             num_sms_combine_api,
+            fused,
             num_permuted_tokens,
             pad_multiple,
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -511,7 +522,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
 
 else:
     hybrid_ep_dispatch = None

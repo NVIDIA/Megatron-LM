@@ -772,6 +772,9 @@ class TransformerConfig(ModelParallelConfig):
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
 
+    moe_hybridep_permute_fusion: bool = False
+    """Fuse token rearrangement ops during token dispatching for HybridEP."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 

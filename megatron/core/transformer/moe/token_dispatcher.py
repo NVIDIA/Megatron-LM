@@ -1067,6 +1067,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
+                fused=self.config.moe_hybridep_permute_fusion,
             )
         )
 
@@ -1088,6 +1089,7 @@ class _HybridEPManager(_DispatchManager):
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            fused=self.config.moe_hybridep_permute_fusion,
         )
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
