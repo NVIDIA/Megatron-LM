@@ -333,14 +333,14 @@ class TestMambaQKLayernorm:
         assert attn.k_layernorm is None
 
     def test_qk_layernorm_from_config(self):
-        """config.qk_layernorm=True creates TENorm q/k layernorm even with static spec."""
-        from megatron.core.extensions.transformer_engine import TENorm
-
+        """config.qk_layernorm=True creates q/k layernorm even with static spec."""
         model = self._build_model(qk_layernorm=True)
         attn = self._get_attention_layer(model)
         assert attn is not None
-        assert isinstance(attn.q_layernorm, TENorm)
-        assert isinstance(attn.k_layernorm, TENorm)
+        # TENorm is a factory (__new__ returns a TE LayerNorm/RMSNorm), so we
+        # verify the norm was created rather than checking for a specific type.
+        assert attn.q_layernorm is not None
+        assert attn.k_layernorm is not None
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
