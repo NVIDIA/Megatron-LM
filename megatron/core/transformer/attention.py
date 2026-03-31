@@ -143,7 +143,7 @@ class LinearQkvBuilder(Protocol):
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: str,
-        tp_group: torch.distributed.ProcessGroup | None = None,
+        tp_group: torch.distributed.ProcessGroup | None,
     ) -> LinearQkv: ...
 
 

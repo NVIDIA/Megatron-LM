@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
+from megatron.core.models.protocols import ColumnParallelLinearBuilder, RowParallelLinearBuilder
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
@@ -54,12 +55,12 @@ class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
     @abstractmethod
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module the backend uses"""
         ...
 
     @abstractmethod
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module the backend uses"""
         ...
 
@@ -99,11 +100,11 @@ class BackendSpecProvider(Protocol):
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
@@ -153,11 +154,11 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which linear module TE backend uses"""
         return TELinear
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module TE backend uses"""
         return InferenceColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 

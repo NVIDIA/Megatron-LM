@@ -18,6 +18,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.protocols import ColumnParallelLinearBuilder, RowParallelLinearBuilder
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
@@ -40,11 +41,11 @@ class TESpecProvider(BackendSpecProvider):
         """Which linear module TE backend uses"""
         return TELinear
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 
