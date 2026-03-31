@@ -85,9 +85,7 @@ class TestDynamicInference:
         if not is_fa_min_version("2.7.3"):
             pytest.skip("need flash-attn >= 2.7.3 for dynamic batching", allow_module_level=True)
         if Utils.world_size < _EP_SIZE:
-            pytest.skip(
-                f"EP test requires at least {_EP_SIZE} GPUs", allow_module_level=True
-            )
+            pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs", allow_module_level=True)
         if Utils.world_size % _EP_SIZE != 0:
             pytest.skip(
                 f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})",
@@ -217,11 +215,7 @@ class TestDynamicInference:
     # test_ep_state_cross_product: combinatorial sweep with mixed CUDA graphs
     # ------------------------------------------------------------------
 
-    @pytest.mark.parametrize(
-        "rank_states",
-        _STATE_COMBOS,
-        ids=[",".join(s) for s in _STATE_COMBOS],
-    )
+    @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
     @pytest.mark.internal
     @torch.inference_mode()
     def test_ep_state_cross_product(self, rank_states):
