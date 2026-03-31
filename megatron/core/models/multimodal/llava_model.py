@@ -726,9 +726,12 @@ class LLaVAModel(MegatronModule):
                 batch["new_loss_mask"] = new_loss_mask
             # Distribute sequence across CP ranks
             if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
-                from megatron.training.utils import get_batch_on_this_cp_rank
+                from megatron.core.parallel_state import get_context_parallel_group
+                from megatron.core.utils import get_batch_on_this_cp_rank
 
-                batch = get_batch_on_this_cp_rank(batch)
+                batch = get_batch_on_this_cp_rank(
+                    batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                )
             else:
                 assert HAVE_TEX and is_te_min_version(
                     "1.10.0"
