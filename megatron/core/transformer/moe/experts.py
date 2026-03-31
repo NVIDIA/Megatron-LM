@@ -828,6 +828,7 @@ class TEGroupedMLP(MegatronModule):
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -860,6 +861,7 @@ class TEGroupedMLP(MegatronModule):
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -1240,6 +1242,14 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
+        if self._with_fused_impl and self.config.delay_wgrad_compute:
+            if self._fused_ops is not None:
+                (seq,) = self._fused_ops
+                fused_children = list(seq.children())
+                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
+            return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
