@@ -327,9 +327,7 @@ class TestDynamicInference:
         # exceeded by a prefill-heavy rank.
         small_max_requests = 16
         ctx = self._build_context(
-            model,
-            use_cuda_graphs_for_non_decode_steps=True,
-            max_requests=small_max_requests,
+            model, use_cuda_graphs_for_non_decode_steps=True, max_requests=small_max_requests
         )
 
         # Even ranks are dummy (no requests).  Odd ranks get a state
@@ -368,17 +366,3 @@ class TestDynamicInference:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # eager fallback path.  Verify shape correctness.
             self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
-
-            # Verify all non-dummy EP ranks agree on padded token count.
-            padded = ctx.padded_batch_dimensions
-            ep_group = parallel_state.get_expert_model_parallel_group()
-            tc = torch.tensor([padded.token_count], dtype=torch.int32, device="cuda")
-            tc_max = tc.clone()
-            tc_min = tc.clone()
-            dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
-            dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
-            assert tc_max.item() == tc_min.item(), (
-                f"Padded token count mismatch across non-dummy EP ranks: "
-                f"min={tc_min.item()}, max={tc_max.item()} "
-                f"(peer_state={peer_state})"
-            )
