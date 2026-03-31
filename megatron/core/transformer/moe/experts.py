@@ -58,6 +58,7 @@ from megatron.core.typed_torch import apply_module, not_none
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+    import transformer_engine as te
 else:
     Fp8Padding, Fp8Unpadding = None, None
 
