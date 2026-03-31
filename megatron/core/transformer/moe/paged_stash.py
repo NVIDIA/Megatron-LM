@@ -717,10 +717,6 @@ class PagedStashManager:
         with torch.cuda.stream(self.unpack_stream):
             if self.status == 'captured':
                 self._unpack_stream_status = 'reloading'
-                count = 0
-                for item in self.paged_tensors_to_reload:
-                    if len(self.paged_tensors_to_reload[item]) > 0:
-                        count += 1
                 while len(self.paged_tensors_to_reload[pp_schedule_layer]) > 0:
                     paged_tensor = self.paged_tensors_to_reload[pp_schedule_layer].pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
@@ -980,11 +976,6 @@ class PagedStashContext:
         )
 
     def __enter__(self):
-        from megatron.core.extensions.transformer_engine import cpu_offload
-
-        if cpu_offload is not None:
-            cpu_offload.CPUOffloadEnabled = True
-        # Call the underlying context manager's __enter__
         result = self.saved_tensors_context.__enter__()
 
         # Add more custom logic after entering if needed
@@ -993,10 +984,6 @@ class PagedStashContext:
     def __exit__(self, *args: Any):
         # Call the underlying context manager's __exit__
         result = self.saved_tensors_context.__exit__(*args)
-        from megatron.core.extensions.transformer_engine import cpu_offload
-
-        if cpu_offload is not None:
-            cpu_offload.CPUOffloadEnabled = False
         return result
 
 
@@ -1029,7 +1016,6 @@ def get_paged_stash_context(
 
 def paged_stash_group_commit(tensor, name=None):
     """Mark the end of a layer group and prepare for stash/reload."""
-    rank = torch.distributed.get_rank()
     stash_manager = PagedStashManager.get_instance()
     stash_manager.device = tensor.device
     if not stash_manager.enabled:
