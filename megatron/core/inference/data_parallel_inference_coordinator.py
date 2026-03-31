@@ -380,13 +380,6 @@ class DataParallelInferenceCoordinator:
                 for _ in range(len(self.identities_of_data_parallel_ranks)):
                     next_identity = self.get_best_data_parallel_rank(request_hashes)
                     if self._send_to_engine(next_identity, payload):
-                        logging.info(
-                            "Coordinator: routed request_id=%s client_request_id=%s to rank_index=%s prompt_len=%s",
-                            request_id,
-                            client_request_id,
-                            self.identity_to_rank_index[next_identity],
-                            len(prompt),
-                        )
                         break
                 else:
                     # If all engines have died, we are in an abnormal state, and must exit cleanly.
@@ -470,13 +463,6 @@ class DataParallelInferenceCoordinator:
                     fid = finished_request["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
-                    logging.info(
-                        "Coordinator: returning request_id=%s client_request_id=%s status=%s generated_tokens=%s",
-                        fid,
-                        client_request_identity,
-                        finished_request.get("status"),
-                        len(finished_request.get("generated_tokens", []) or []),
-                    )
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
 

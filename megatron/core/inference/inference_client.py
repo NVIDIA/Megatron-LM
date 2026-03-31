@@ -109,13 +109,6 @@ class InferenceClient:
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        prompt_len = len(prompt) if not isinstance(prompt, str) else len(prompt)
-        logging.info(
-            "Client: submitting request_id=%s prompt_len=%s max_new_tokens=%s",
-            request_id,
-            prompt_len,
-            sampling_params.num_tokens_to_generate,
-        )
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
         self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
@@ -143,12 +136,6 @@ class InferenceClient:
                     request_id, reply = data[1:]
                     reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
                         request_id
-                    )
-                    logging.info(
-                        "Client: received reply for request_id=%s status=%s latency=%.3fs",
-                        request_id,
-                        reply.get("status"),
-                        reply["latency"],
                     )
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():

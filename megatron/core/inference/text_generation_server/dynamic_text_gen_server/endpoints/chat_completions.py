@@ -353,20 +353,12 @@ try:
 
         # --- 3. Send Requests to Engine ---
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
-        logger.info(
-            "chat_completions: submitting %d request(s), prompt_tokens=%d, max_new_tokens=%s",
-            len(tasks),
-            len(prompt_tokens),
-            sampling_params.num_tokens_to_generate,
-        )
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
-            logger.info("chat_completions: awaiting %d inference result(s)", len(tasks))
             batch_results = await asyncio.gather(*tasks)
-            logger.info("chat_completions: received %d inference result(s)", len(batch_results))
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)

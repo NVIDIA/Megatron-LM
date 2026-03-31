@@ -10,7 +10,6 @@ import math
 import logging
 import json
 import os
-import socket
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -440,18 +439,13 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
-def _get_reachable_inference_host() -> str:
-    """Return a host/IP clients can connect to, not the wildcard bind address."""
-    return os.getenv("MEGATRON_RL_INFERENCE_HOST", socket.gethostbyname(socket.gethostname()))
-
-
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
-                host=_get_reachable_inference_host(),
+                host='0.0.0.0',
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
         )
