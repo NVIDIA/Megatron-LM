@@ -107,7 +107,12 @@ class TestDynamicInference:
         return model
 
     def _build_context(
-        self, model, *, num_cuda_graphs=16, use_cuda_graphs_for_non_decode_steps=True
+        self,
+        model,
+        *,
+        num_cuda_graphs=16,
+        use_cuda_graphs_for_non_decode_steps=True,
+        max_requests=None,
     ):
         mamba_config = MambaInferenceStateConfig.from_model(model)
         return DynamicInferenceContext(
@@ -120,6 +125,7 @@ class TestDynamicInference:
                 mamba_inference_state_config=mamba_config,
                 num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+                max_requests=max_requests,
             ),
         )
 
@@ -281,3 +287,98 @@ class TestDynamicInference:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # non-graph fallback path in initialize_attention_state.
             self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+
+    # ------------------------------------------------------------------
+    # test_mixed_cuda_graphs_tokens_exceed_max_requests: eager fallback
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "peer_state", [PREFILL, MIXED], ids=[f"peer={s}" for s in [PREFILL, MIXED]]
+    )
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_mixed_cuda_graphs_tokens_exceed_max_requests(self, peer_state):
+        """Verify eager fallback when mixed CUDA graphs are allowed but
+        a rank's token count exceeds the CUDA graph capacity.
+
+        With use_cuda_graphs_for_non_decode_steps=True, the CUDA graph
+        list includes mixed and prefill-only graphs.  However, the
+        maximum CUDA graph token capacity is bounded by max_requests
+        (specifically, max_requests * (num_speculative_tokens + 1)).
+
+        When one EP rank has a token count exceeding this capacity, no
+        CUDA graph can accommodate the EP-adjusted dimensions.
+        match_graph_config returns None for all ranks, forcing eager
+        mode globally.  This test verifies that:
+          - No rank matches a CUDA graph (eager mode is forced).
+          - Dummy ranks bail out and produce correct shapes via the
+            eager dummy_forward path.
+          - Non-dummy ranks produce correct shapes via the eager
+            padded_batch_dimensions fallback.
+          - All non-dummy EP ranks agree on the padded token count.
+        """
+        rank = dist.get_rank()
+        is_even = rank % 2 == 0
+
+        model = self._build_model()
+
+        # Use a small max_requests so that the CUDA graph capacity
+        # (max_requests tokens with no speculative decoding) is easily
+        # exceeded by a prefill-heavy rank.
+        small_max_requests = 16
+        ctx = self._build_context(
+            model,
+            use_cuda_graphs_for_non_decode_steps=True,
+            max_requests=small_max_requests,
+        )
+
+        # Even ranks are dummy (no requests).  Odd ranks get a state
+        # whose token count exceeds small_max_requests.
+        overflow_token_count = small_max_requests + 16  # 32 tokens > 16 capacity
+        overflow_dims = {
+            PREFILL: InferenceBatchDimensions(
+                token_count=overflow_token_count, prefill_req_count=2, decode_req_count=0
+            ),
+            MIXED: InferenceBatchDimensions(
+                token_count=overflow_token_count, prefill_req_count=1, decode_req_count=2
+            ),
+        }
+
+        if not is_even:
+            ctx.add_dummy_requests_for_cudagraph_capture(overflow_dims[peer_state])
+
+        # Initialize attention state (EP collective).
+        if is_even:
+            ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        else:
+            ctx.initialize_attention_state()
+
+        # No rank should have matched a CUDA graph — the EP-adjusted
+        # token count exceeds every graph's capacity.
+        assert not ctx.using_cuda_graph_this_step(), (
+            f"Rank {rank}: expected no CUDA graph match when token count "
+            f"({overflow_token_count}) exceeds max_requests ({small_max_requests}), "
+            f"peer_state={peer_state}"
+        )
+
+        if is_even:
+            # Dummy rank bailed out — exercise the eager fallback.
+            self._assert_dummy_forward_shape(model, rank)
+        else:
+            # Non-dummy rank: padded_batch_dimensions is set via the
+            # eager fallback path.  Verify shape correctness.
+            self._assert_dynamic_inference_shape(model, ctx, rank, peer_state)
+
+            # Verify all non-dummy EP ranks agree on padded token count.
+            padded = ctx.padded_batch_dimensions
+            ep_group = parallel_state.get_expert_model_parallel_group()
+            tc = torch.tensor([padded.token_count], dtype=torch.int32, device="cuda")
+            tc_max = tc.clone()
+            tc_min = tc.clone()
+            dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
+            dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
+            assert tc_max.item() == tc_min.item(), (
+                f"Padded token count mismatch across non-dummy EP ranks: "
+                f"min={tc_min.item()}, max={tc_max.item()} "
+                f"(peer_state={peer_state})"
+            )
