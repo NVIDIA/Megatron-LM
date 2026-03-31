@@ -984,7 +984,7 @@ class TEGroupedMLP(MegatronModule):
                 int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
             )
             stash_context = get_paged_stash_context(
-                name="expert_fc1_fused",
+                name="grouped_mlp",
                 max_num_tokens=max_num_tokens,
                 num_tokens_tensor=tokens_per_expert.sum(),
                 avg_num_tokens=avg_num_tokens,
@@ -1003,7 +1003,7 @@ class TEGroupedMLP(MegatronModule):
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
         if self.config.moe_paged_stash:
-            output = paged_stash_group_commit(output, name="expert_fc1_fused")
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
