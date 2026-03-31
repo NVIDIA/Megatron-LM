@@ -33,6 +33,7 @@ SAFE_GLOBALS = [
     RerunState,
     BytesIO,
     Signals,
+    torch._C.Generator,
 ]
 
 
