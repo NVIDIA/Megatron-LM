@@ -214,11 +214,7 @@ def test_prepare_cache_builds_and_hits_per_split_dataset_cache(tmp_path):
 
 @pytest.mark.parametrize(
     ("flag_name", "flag_value", "message"),
-    [
-        ("mock_data", True, "--mock-data"),
-        ("sft", True, "--sft"),
-        ("fim_data", True, "--fim-data"),
-    ],
+    [("mock_data", True, "--mock-data"), ("sft", True, "--sft"), ("fim_data", True, "--fim-data")],
 )
 def test_prepare_cache_rejects_unsupported_modes(tmp_path, flag_name, flag_value, message):
     args = _build_prepare_cache_args([], tmp_path / "cache", **{flag_name: flag_value})
