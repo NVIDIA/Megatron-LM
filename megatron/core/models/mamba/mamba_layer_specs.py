@@ -23,7 +23,6 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -32,7 +31,6 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayerSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayer,
@@ -71,176 +69,137 @@ _mamba_mtp_block_spec = ModuleSpec(
 )
 
 
-def _get_qk_layernorm(config):
-    """Resolve q/k layernorm class from config."""
-    if config and config.qk_l2_norm:
-        return L2Norm
-    if config and config.qk_layernorm:
-        return TENorm
-    return IdentityOp
-
-
-def get_mamba_stack_spec(config=None):
-    """Get the Mamba stack spec with Transformer Engine modules.
-
-    Args:
-        config: TransformerConfig. When provided, config-dependent features
-            (e.g. qk_layernorm) are applied. When None, defaults are used.
-    """
-    qk_norm = _get_qk_layernorm(config)
-
-    return ModuleSpec(
-        module=MambaStack,
-        submodules=MambaStackSubmodules(
-            mamba_layer=ModuleSpec(
-                module=MambaLayer,
-                submodules=MambaLayerSubmodules(
-                    mixer=ModuleSpec(
-                        module=MambaMixer,
-                        submodules=MambaMixerSubmodules(
-                            in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
-                        ),
+mamba_stack_spec = ModuleSpec(
+    module=MambaStack,
+    submodules=MambaStackSubmodules(
+        mamba_layer=ModuleSpec(
+            module=MambaLayer,
+            submodules=MambaLayerSubmodules(
+                mixer=ModuleSpec(
+                    module=MambaMixer,
+                    submodules=MambaMixerSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                     ),
-                    mamba_bda=get_bias_dropout_add,
                 ),
+                mamba_bda=get_bias_dropout_add,
             ),
-            gdn_layer=ModuleSpec(
-                module=TransformerLayer,
-                submodules=TransformerLayerSubmodules(
-                    self_attention=ModuleSpec(
-                        module=GatedDeltaNet,
-                        submodules=GatedDeltaNetSubmodules(
-                            in_proj=TELayerNormColumnParallelLinear,
-                            out_norm=TENorm,
-                            out_proj=TERowParallelLinear,
-                        ),
-                    ),
-                    self_attn_bda=get_bias_dropout_add,
-                ),
-            ),
-            # Started with spec from gpt_layer_specs.py (with MLP removed)
-            # Using the TE spec because we had problems getting the non-TE spec
-            # working
-            attention_layer=ModuleSpec(
-                module=TransformerLayer,
-                submodules=TransformerLayerSubmodules(
-                    self_attention=ModuleSpec(
-                        module=SelfAttention,
-                        params={"attn_mask_type": AttnMaskType.causal},
-                        submodules=SelfAttentionSubmodules(
-                            linear_qkv=TELayerNormColumnParallelLinear,
-                            core_attention=TEDotProductAttention,
-                            linear_proj=TERowParallelLinear,
-                            q_layernorm=qk_norm,
-                            k_layernorm=qk_norm,
-                        ),
-                    ),
-                    self_attn_bda=get_bias_dropout_add,
-                ),
-            ),
-            # Started with spec from gpt_layer_specs.py
-            # Using the TE spec because we had problems getting the non-TE spec
-            # working
-            mlp_layer=ModuleSpec(
-                module=MLPLayer,
-                submodules=TransformerLayerSubmodules(
-                    mlp=ModuleSpec(
-                        module=MLP,
-                        submodules=MLPSubmodules(
-                            linear_fc1=TELayerNormColumnParallelLinear,
-                            linear_fc2=TERowParallelLinear,
-                        ),
-                    ),
-                    mlp_bda=get_bias_dropout_add,
-                ),
-            ),
-            moe_layer=ModuleSpec(
-                module=MoETransformerLayer,
-                submodules=TransformerLayerSubmodules(
-                    pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
-                ),
-            ),
-            mtp_block_spec=_mamba_mtp_block_spec,
         ),
-    )
-
-
-# Backward-compatible constant (no QK norm).
-mamba_stack_spec = get_mamba_stack_spec()
-
-
-def get_mamba_inference_stack_spec(config=None):
-    """Get the inference-optimized Mamba stack spec.
-
-    Args:
-        config: TransformerConfig. When provided, config-dependent features
-            (e.g. qk_layernorm) are applied. When None, defaults are used.
-    """
-    qk_norm = _get_qk_layernorm(config)
-
-    return ModuleSpec(
-        module=MambaStack,
-        submodules=MambaStackSubmodules(
-            mamba_layer=ModuleSpec(
-                module=MambaLayer,
-                submodules=MambaLayerSubmodules(
-                    mixer=ModuleSpec(
-                        module=MambaMixer,
-                        submodules=MambaMixerSubmodules(
-                            in_proj=InferenceLayerNormColumnParallelLinear,
-                            out_proj=InferenceRowParallelLinear,
-                        ),
+        gdn_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=TERowParallelLinear,
                     ),
-                    mamba_bda=get_bias_dropout_add,
                 ),
+                self_attn_bda=get_bias_dropout_add,
             ),
-            # Started with spec from gpt_layer_specs.py (with MLP removed)
-            # Using the TE spec because we had problems getting the non-TE spec
-            # working
-            attention_layer=ModuleSpec(
-                module=TransformerLayer,
-                submodules=TransformerLayerSubmodules(
-                    self_attention=ModuleSpec(
-                        module=SelfAttention,
-                        params={"attn_mask_type": AttnMaskType.causal},
-                        submodules=SelfAttentionSubmodules(
-                            linear_qkv=InferenceLayerNormColumnParallelLinear,
-                            core_attention=TEDotProductAttention,
-                            linear_proj=InferenceRowParallelLinear,
-                            q_layernorm=qk_norm,
-                            k_layernorm=qk_norm,
-                        ),
-                    ),
-                    self_attn_bda=get_bias_dropout_add,
-                ),
-            ),
-            # Started with spec from gpt_layer_specs.py
-            # Using the TE spec because we had problems getting the non-TE spec
-            # working
-            mlp_layer=ModuleSpec(
-                module=MLPLayer,
-                submodules=TransformerLayerSubmodules(
-                    mlp=ModuleSpec(
-                        module=MLP,
-                        submodules=MLPSubmodules(
-                            linear_fc1=InferenceLayerNormColumnParallelLinear,
-                            linear_fc2=InferenceRowParallelLinear,
-                        ),
-                    ),
-                    mlp_bda=get_bias_dropout_add,
-                ),
-            ),
-            moe_layer=ModuleSpec(
-                # Use inference-optimized MoE layer for end-to-end CUDA graph support
-                module=TransformerLayer,
-                submodules=TransformerLayerSubmodules(
-                    pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
-                ),
-            ),
-            mtp_block_spec=_mamba_mtp_block_spec,
         ),
-    )
+        # Started with spec from gpt_layer_specs.py (with MLP removed)
+        # Using the TE spec because we had problems getting the non-TE spec
+        # working
+        attention_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=SelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=TELayerNormColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        # Started with spec from gpt_layer_specs.py
+        # Using the TE spec because we had problems getting the non-TE spec
+        # working
+        mlp_layer=ModuleSpec(
+            module=MLPLayer,
+            submodules=TransformerLayerSubmodules(
+                mlp=ModuleSpec(
+                    module=MLP,
+                    submodules=MLPSubmodules(
+                        linear_fc1=TELayerNormColumnParallelLinear,
+                        linear_fc2=TERowParallelLinear,
+                    ),
+                ),
+                mlp_bda=get_bias_dropout_add,
+            ),
+        ),
+        moe_layer=ModuleSpec(
+            module=MoETransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+            ),
+        ),
+        mtp_block_spec=_mamba_mtp_block_spec,
+    ),
+)
 
 
-# Backward-compatible constant (no QK norm).
-mamba_inference_stack_spec = get_mamba_inference_stack_spec()
+mamba_inference_stack_spec = ModuleSpec(
+    module=MambaStack,
+    submodules=MambaStackSubmodules(
+        mamba_layer=ModuleSpec(
+            module=MambaLayer,
+            submodules=MambaLayerSubmodules(
+                mixer=ModuleSpec(
+                    module=MambaMixer,
+                    submodules=MambaMixerSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        # Started with spec from gpt_layer_specs.py (with MLP removed)
+        # Using the TE spec because we had problems getting the non-TE spec
+        # working
+        attention_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=SelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=InferenceLayerNormColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        # Started with spec from gpt_layer_specs.py
+        # Using the TE spec because we had problems getting the non-TE spec
+        # working
+        mlp_layer=ModuleSpec(
+            module=MLPLayer,
+            submodules=TransformerLayerSubmodules(
+                mlp=ModuleSpec(
+                    module=MLP,
+                    submodules=MLPSubmodules(
+                        linear_fc1=InferenceLayerNormColumnParallelLinear,
+                        linear_fc2=InferenceRowParallelLinear,
+                    ),
+                ),
+                mlp_bda=get_bias_dropout_add,
+            ),
+        ),
+        moe_layer=ModuleSpec(
+            # Use inference-optimized MoE layer for end-to-end CUDA graph support
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
+            ),
+        ),
+        mtp_block_spec=_mamba_mtp_block_spec,
+    ),
+)

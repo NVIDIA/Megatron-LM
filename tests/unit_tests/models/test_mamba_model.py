@@ -15,11 +15,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.models.mamba.mamba_layer_specs import (
-    get_mamba_inference_stack_spec,
-    get_mamba_stack_spec,
-    mamba_stack_spec,
-)
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -305,64 +301,86 @@ class TestMambaQKLayernorm:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _get_attention_submodules(self, spec):
-        return spec.submodules.attention_layer.submodules.self_attention.submodules
+    def _build_model(self, **config_overrides):
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **config_overrides,
+        )
+        return MambaModel(
+            config=config,
+            mamba_stack_spec=mamba_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
 
-    def test_spec_default_no_qk_norm(self):
-        """Default spec (no config) uses IdentityOp for q/k layernorm."""
-        from megatron.core.transformer.identity_op import IdentityOp
+    def _get_attention_layer(self, model):
+        """Return the SelfAttention submodule from the attention layer."""
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and hasattr(
+                layer.self_attention, 'q_layernorm'
+            ):
+                return layer.self_attention
+        return None
 
-        spec = get_mamba_stack_spec()
-        attn = self._get_attention_submodules(spec)
-        assert attn.q_layernorm is IdentityOp
-        assert attn.k_layernorm is IdentityOp
+    def test_no_qk_norm_by_default(self):
+        """Without qk_layernorm, attention has no q/k layernorm."""
+        model = self._build_model()
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert attn.q_layernorm is None
+        assert attn.k_layernorm is None
 
-    def test_spec_qk_layernorm_enabled(self):
-        """When qk_layernorm=True, spec uses TENorm for q/k layernorm."""
+    def test_qk_layernorm_from_config(self):
+        """config.qk_layernorm=True creates TENorm q/k layernorm even with static spec."""
         from megatron.core.extensions.transformer_engine import TENorm
 
-        config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True
-        )
-        spec = get_mamba_stack_spec(config)
-        attn = self._get_attention_submodules(spec)
-        assert attn.q_layernorm is TENorm
-        assert attn.k_layernorm is TENorm
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert isinstance(attn.q_layernorm, TENorm)
+        assert isinstance(attn.k_layernorm, TENorm)
 
-    def test_spec_qk_l2_norm_enabled(self):
-        """When qk_l2_norm=True, spec uses L2Norm for q/k layernorm."""
+    def test_qk_l2_norm_from_config(self):
+        """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
         from megatron.core.transformer.torch_norm import L2Norm
 
-        config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_l2_norm=True
-        )
-        spec = get_mamba_stack_spec(config)
-        attn = self._get_attention_submodules(spec)
-        assert attn.q_layernorm is L2Norm
-        assert attn.k_layernorm is L2Norm
+        model = self._build_model(qk_l2_norm=True)
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert isinstance(attn.q_layernorm, L2Norm)
+        assert isinstance(attn.k_layernorm, L2Norm)
 
-    def test_inference_spec_qk_layernorm_enabled(self):
-        """Inference spec also respects qk_layernorm."""
-        from megatron.core.extensions.transformer_engine import TENorm
-
-        config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True
-        )
-        spec = get_mamba_inference_stack_spec(config)
-        attn = self._get_attention_submodules(spec)
-        assert attn.q_layernorm is TENorm
-        assert attn.k_layernorm is TENorm
-
-    def test_backward_compat_constant_matches_default(self):
-        """Module-level mamba_stack_spec constant matches get_mamba_stack_spec()."""
+    def test_spec_provided_norm_not_overwritten(self):
+        """When the spec already provides q/k layernorm, config doesn't override it."""
         from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.attention import SelfAttentionSubmodules
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.core.transformer.transformer_layer import (
+            TransformerLayer,
+            TransformerLayerSubmodules,
+        )
+        from megatron.core.extensions.transformer_engine import (
+            TEDotProductAttention,
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.transformer.enums import AttnMaskType
+        from megatron.core.transformer.attention import SelfAttention
+        import copy
 
-        attn = self._get_attention_submodules(mamba_stack_spec)
-        assert attn.q_layernorm is IdentityOp
-        assert attn.k_layernorm is IdentityOp
+        # Build a spec that explicitly sets q/k layernorm to IdentityOp
+        spec = copy.deepcopy(mamba_stack_spec)
+        spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
+            IdentityOp
+        )
+        spec.submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
+            IdentityOp
+        )
 
-    def test_forward_with_qk_layernorm(self):
-        """MambaModel forward pass works with qk_layernorm enabled."""
         config = TransformerConfig(
             num_layers=3,
             hidden_size=256,
@@ -372,11 +390,19 @@ class TestMambaQKLayernorm:
         )
         model = MambaModel(
             config=config,
-            mamba_stack_spec=get_mamba_stack_spec(config),
+            mamba_stack_spec=spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
         )
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert isinstance(attn.q_layernorm, IdentityOp)
+        assert isinstance(attn.k_layernorm, IdentityOp)
+
+    def test_forward_with_qk_layernorm(self):
+        """MambaModel forward pass works with qk_layernorm enabled."""
+        model = self._build_model(qk_layernorm=True)
         model.cuda()
 
         sequence_length = 4

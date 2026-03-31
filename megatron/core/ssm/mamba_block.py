@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -25,6 +26,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymb
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -105,6 +107,23 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             "--hybrid-layer-pattern by MambaModel."
         )
         self.layer_type_list = layer_type_list
+
+        # Apply config-driven QK norm to the attention spec when it doesn't
+        # already specify one.  This lets static specs (e.g. mamba_stack_spec)
+        # pick up --qk-layernorm / --qk-l2-norm from TransformerConfig.
+        if (self.config.qk_layernorm or self.config.qk_l2_norm) and hasattr(
+            submodules.attention_layer, 'submodules'
+        ):
+            attn_sub = submodules.attention_layer.submodules.self_attention.submodules
+            if attn_sub.q_layernorm is None and attn_sub.k_layernorm is None:
+                norm_cls = L2Norm if self.config.qk_l2_norm else TENorm
+                submodules = copy.deepcopy(submodules)
+                submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
+                    norm_cls
+                )
+                submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
+                    norm_cls
+                )
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
