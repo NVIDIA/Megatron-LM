@@ -243,7 +243,9 @@ def _apply_rotary_pos_emb_thd(
             )
         freqs_packed = torch.cat(
             [
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
+                _get_thd_freqs_on_this_cp_rank(
+                    cp_rank, cp_size, x, freqs, int(seq_start_offset.item())
+                )
                 for x, seq_start_offset in zip(sequence_splits, offsets)
             ],
             dim=0,

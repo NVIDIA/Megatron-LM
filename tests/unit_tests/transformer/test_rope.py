@@ -229,3 +229,31 @@ def test_apply_rotary_pos_emb_thd_falls_back_from_fusion_when_offsets_are_provid
         )
 
     assert torch.allclose(output, expected)
+
+
+def test_apply_rotary_pos_emb_thd_converts_offsets_to_python_ints(monkeypatch):
+    config = TransformerConfig(
+        num_layers=1, hidden_size=4, num_attention_heads=1, apply_rope_fusion=False
+    )
+    cp_group = _FakeCpGroup(size=1, rank=0)
+
+    t = torch.tensor([[[1.0, 2.0, 3.0, 4.0]], [[2.0, 3.0, 4.0, 5.0]], [[6.0, 7.0, 8.0, 9.0]]])
+    freqs = (torch.arange(16, dtype=torch.float32).view(4, 1, 1, 4) + 1.0) / 10.0
+    cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+    offsets = torch.tensor([2, 1], dtype=torch.int32)
+
+    seen_offsets = []
+    original_get_freqs = rope_utils._get_thd_freqs_on_this_cp_rank
+
+    def _tracking_get_freqs(cp_rank, cp_size, x, freqs, offset=0):
+        seen_offsets.append(offset)
+        return original_get_freqs(cp_rank, cp_size, x, freqs, offset)
+
+    monkeypatch.setattr(rope_utils, "_get_thd_freqs_on_this_cp_rank", _tracking_get_freqs)
+
+    apply_rotary_pos_emb(
+        t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, offsets=offsets
+    )
+
+    assert seen_offsets == [2, 1]
+    assert all(isinstance(offset, int) for offset in seen_offsets)
