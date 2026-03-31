@@ -322,7 +322,7 @@ class TestMambaQKLayernorm:
         from megatron.core.extensions.transformer_engine import TENorm
 
         config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True,
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True
         )
         spec = get_mamba_stack_spec(config)
         attn = self._get_attention_submodules(spec)
@@ -334,7 +334,7 @@ class TestMambaQKLayernorm:
         from megatron.core.transformer.torch_norm import L2Norm
 
         config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_l2_norm=True,
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_l2_norm=True
         )
         spec = get_mamba_stack_spec(config)
         attn = self._get_attention_submodules(spec)
@@ -346,7 +346,7 @@ class TestMambaQKLayernorm:
         from megatron.core.extensions.transformer_engine import TENorm
 
         config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True,
+            num_layers=1, hidden_size=256, num_attention_heads=4, qk_layernorm=True
         )
         spec = get_mamba_inference_stack_spec(config)
         attn = self._get_attention_submodules(spec)
