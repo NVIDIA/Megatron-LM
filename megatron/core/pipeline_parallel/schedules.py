@@ -27,7 +27,6 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
