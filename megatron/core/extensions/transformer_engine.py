@@ -1783,7 +1783,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             ):
                 """Make grouped checkpoint keys compatible across parameter layouts."""
 
-                def maybe_remap_param(param_name: str) -> None:
+                def maybe_remap_param(param_name: str, single_grouped: bool) -> None:
                     grouped_key = f"{prefix}{param_name}"
                     indexed_keys = [
                         f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
@@ -1792,7 +1792,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     has_any_indexed_key = any(key in state_dict for key in indexed_keys)
                     has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
 
-                    if getattr(self, "single_grouped_parameter", False):
+                    if single_grouped:
                         if has_grouped_key or not has_all_indexed_keys:
                             return
                         state_dict[grouped_key] = torch.stack(
@@ -1807,9 +1807,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         for gemm_idx, tensor in enumerate(split_tensors):
                             state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
 
-                maybe_remap_param("weight")
+                maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
                 if self.use_bias:
-                    maybe_remap_param("bias")
+                    maybe_remap_param(
+                        "bias", getattr(self, "single_grouped_bias", False)
+                    )
 
             self._register_load_state_dict_pre_hook(
                 normalize_grouped_parameter_keys, with_module=True
