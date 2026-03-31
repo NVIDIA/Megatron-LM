@@ -643,7 +643,7 @@ class TorchDistSaveShardedStrategy:
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
-    
+
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
         strategy = "nvrx" if HAVE_NVRX else "mcore"

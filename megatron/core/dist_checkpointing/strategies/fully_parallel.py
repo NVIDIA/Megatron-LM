@@ -139,7 +139,7 @@ class FullyParallelSaveStrategyWrapper:
         logger.debug(f"parallel save sharding, time: {end - start}")
 
 
-class FullyParallelLoadStrategyWrapper():
+class FullyParallelLoadStrategyWrapper:
     """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
