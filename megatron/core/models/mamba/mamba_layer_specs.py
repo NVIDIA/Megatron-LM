@@ -125,8 +125,7 @@ mamba_stack_spec = ModuleSpec(
                 mlp=ModuleSpec(
                     module=MLP,
                     submodules=MLPSubmodules(
-                        linear_fc1=TELayerNormColumnParallelLinear,
-                        linear_fc2=TERowParallelLinear,
+                        linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear,
                     ),
                 ),
                 mlp_bda=get_bias_dropout_add,

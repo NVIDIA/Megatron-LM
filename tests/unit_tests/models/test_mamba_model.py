@@ -320,9 +320,7 @@ class TestMambaQKLayernorm:
     def _get_attention_layer(self, model):
         """Return the SelfAttention submodule from the attention layer."""
         for layer in model.decoder.layers:
-            if hasattr(layer, 'self_attention') and hasattr(
-                layer.self_attention, 'q_layernorm'
-            ):
+            if hasattr(layer, 'self_attention') and hasattr(layer.self_attention, 'q_layernorm'):
                 return layer.self_attention
         return None
 
