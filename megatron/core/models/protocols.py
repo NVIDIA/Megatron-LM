@@ -43,18 +43,6 @@ class LinearBuilder(Protocol):
     ) -> LinearInterface: ...
 
 
-class ColumnParallelLinearInterface(Protocol):
-    """Interface for ColumnParallelLinear modules."""
-
-    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Applies the column parallel linear module to the input hidden states."""
-        ...
-
-    def backward_dw(self) -> None:
-        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        ...
-
-
 class ColumnParallelLinearBuilder(Protocol):
     """Interface for building column_parallel_linear layers."""
 
@@ -73,19 +61,7 @@ class ColumnParallelLinearBuilder(Protocol):
         tp_comm_buffer_name: str | None,
         tp_group: torch.distributed.ProcessGroup | None,
         stride: int = 1,
-    ) -> ColumnParallelLinearInterface: ...
-
-
-class RowParallelLinearInterface(Protocol):
-    """Interface for RowParallelLinear modules."""
-
-    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Applies the row parallel linear module to the input hidden states."""
-        ...
-
-    def backward_dw(self) -> None:
-        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
-        ...
+    ) -> LinearInterface: ...
 
 
 class RowParallelLinearBuilder(Protocol):
@@ -105,4 +81,4 @@ class RowParallelLinearBuilder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         tp_group: torch.distributed.ProcessGroup | None,
-    ) -> RowParallelLinearInterface: ...
+    ) -> LinearInterface: ...

@@ -60,7 +60,7 @@ class TESpecProvider(BackendSpecProvider):
         return TERowParallelLinear
 
     @override
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> Optional[ColumnParallelLinearBuilder]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
