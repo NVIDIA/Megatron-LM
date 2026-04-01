@@ -491,7 +491,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, async_queue=None,
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False,
                     tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -701,7 +701,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=True
                 )
                 async_save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
-                async_queue.schedule_async_request(async_save_request)
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
