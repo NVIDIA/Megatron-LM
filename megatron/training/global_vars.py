@@ -310,8 +310,32 @@ def _set_telemetry(args):
         config.service_name = args.otel_service_name
     if getattr(args, 'otel_span_groups', None):
         config.span_groups = args.otel_span_groups
+    # Attach training config as resource attributes so they appear as
+    # Process tags in Jaeger, making it easy to identify and compare runs.
+    resource_attrs = {}
+    for attr, arg_name in [
+        ('dl.local_rank', 'local_rank'),
+        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
+        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
+        ('dl.data_parallel.size', 'data_parallel_size'),
+        ('dl.batch_size', 'global_batch_size'),
+        ('dl.sequence_length', 'seq_length'),
+        ('megatron.num_layers', 'num_layers'),
+        ('megatron.hidden_size', 'hidden_size'),
+        ('megatron.num_attention_heads', 'num_attention_heads'),
+        ('megatron.train_iters', 'train_iters'),
+        ('megatron.micro_batch_size', 'micro_batch_size'),
+        ('megatron.fp16', 'fp16'),
+        ('megatron.bf16', 'bf16'),
+        ('megatron.ckpt_format', 'ckpt_format'),
+    ]:
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            resource_attrs[attr] = val
+
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=args.world_size
+        config, rank=args.rank, world_size=args.world_size,
+        resource_attributes=resource_attrs,
     )
 
 
