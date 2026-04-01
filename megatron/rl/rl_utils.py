@@ -305,13 +305,16 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
-        # Derived throughput metrics (set by training_log, read by RLProfiler)
+        # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
+        # Per-GPU variants are available via methods that divide by world_size.
+        self.world_size = None
+        # batch_size * seq_length / time: nominal throughput based on batch configuration
         self.tokens_per_sec = None
-        self.tokens_per_sec_per_gpu = None
+        # Total tokens in packed bins across all DP ranks / time: what the GPU actually processes.
         self.compute_tokens_per_sec = None
-        self.compute_tokens_per_sec_per_gpu = None
+        # Real non-padding tokens across all DP ranks / time: true useful throughput.
         self.actual_tokens_per_sec = None
-        self.actual_tokens_per_sec_per_gpu = None
+        # Fraction of bin capacity filled with real tokens (actual / total capacity)
         self.packing_efficiency = None
 
     def reset_iteration_counters(self, iteration):
@@ -319,11 +322,8 @@ class RLRuntimeState:
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
         self.tokens_per_sec = None
-        self.tokens_per_sec_per_gpu = None
         self.compute_tokens_per_sec = None
-        self.compute_tokens_per_sec_per_gpu = None
         self.actual_tokens_per_sec = None
-        self.actual_tokens_per_sec_per_gpu = None
         self.packing_efficiency = None
 
     def increment_sequences(self, count):
@@ -412,13 +412,12 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
 
     # Store derived throughput metrics on RLRuntimeState so that
     # downstream consumers (e.g. RLProfiler) can read them.
+    # Per-GPU values are derived via methods on RLRuntimeState.
     runtime_state = get_rl_runtime_state()
+    runtime_state.world_size = args.world_size
     runtime_state.tokens_per_sec = tokens_per_sec
-    runtime_state.tokens_per_sec_per_gpu = tokens_per_sec_per_gpu
     runtime_state.compute_tokens_per_sec = compute_tokens_per_sec
-    runtime_state.compute_tokens_per_sec_per_gpu = compute_tokens_per_sec_per_gpu
     runtime_state.actual_tokens_per_sec = actual_tokens_per_sec
-    runtime_state.actual_tokens_per_sec_per_gpu = actual_tokens_per_sec_per_gpu
     runtime_state.packing_efficiency = packing_efficiency
 
     # Log average sequence length. With packing this shows real sequence
