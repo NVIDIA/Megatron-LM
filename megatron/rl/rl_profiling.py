@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 RL Profiling Infrastructure
@@ -353,12 +353,17 @@ class RLProfiler:
         if has_rl_runtime_state:
             rs = get_rl_runtime_state()
             tokens_per_sec = getattr(rs, 'tokens_per_sec', None)
-            tokens_per_sec_per_gpu = getattr(rs, 'tokens_per_sec_per_gpu', None)
             compute_tokens_per_sec = getattr(rs, 'compute_tokens_per_sec', None)
-            compute_tokens_per_sec_per_gpu = getattr(rs, 'compute_tokens_per_sec_per_gpu', None)
             actual_tokens_per_sec = getattr(rs, 'actual_tokens_per_sec', None)
-            actual_tokens_per_sec_per_gpu = getattr(rs, 'actual_tokens_per_sec_per_gpu', None)
             packing_efficiency = getattr(rs, 'packing_efficiency', None)
+            world_size = getattr(rs, 'world_size', None)
+            if world_size:
+                if tokens_per_sec is not None:
+                    tokens_per_sec_per_gpu = tokens_per_sec / world_size
+                if compute_tokens_per_sec is not None:
+                    compute_tokens_per_sec_per_gpu = compute_tokens_per_sec / world_size
+                if actual_tokens_per_sec is not None:
+                    actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / world_size
 
         # Collect timer data (min, max across ranks) and rank0 times
         timer_data, rank0_timers = self._collect_timer_data(timers)
@@ -384,6 +389,8 @@ class RLProfiler:
             global_batch_size=global_batch_size,
             tokens_per_sec=tokens_per_sec,
             tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+            compute_tokens_per_sec=compute_tokens_per_sec,
+            compute_tokens_per_sec_per_gpu=compute_tokens_per_sec_per_gpu,
             actual_tokens_per_sec=actual_tokens_per_sec,
             actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
             packing_efficiency=packing_efficiency,

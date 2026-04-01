@@ -66,16 +66,12 @@ try:
 except ImportError:
     has_rl_utils = False
 
-try:
-    from megatron.rl.rl_profiling import (
-        initialize_rl_profiler,
-        log_iteration_profile,
-        shutdown_rl_profiler,
-        RL_LOGGABLE_TIMER_NAMES,
-    )
-    has_rl_profiling = True
-except ImportError:
-    has_rl_profiling = False
+from megatron.rl.rl_profiling import (
+    initialize_rl_profiler,
+    log_iteration_profile,
+    shutdown_rl_profiler,
+    RL_LOGGABLE_TIMER_NAMES,
+)
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -1130,7 +1126,7 @@ def pretrain(
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
     # Initialize RL profiler if enabled
-    if has_rl_profiling and getattr(args, 'rl_profile', False):
+    if args.rl_profile:
         # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
         profile_dir = getattr(args, 'rl_profile_dir', None)
         if profile_dir is None:
@@ -2020,7 +2016,7 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size.
@@ -2267,7 +2263,7 @@ def training_log(
             report_memory(f'(after {iteration} iterations)')
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
-        if has_rl_profiling and getattr(args, 'rl_profile', False):
+        if args.rl_profile:
             log_iteration_profile(
                 iteration=iteration,
                 timers=timers,
@@ -3249,7 +3245,7 @@ def train(
         energy_monitor.shutdown()
 
     # Shutdown RL profiler and export summary
-    if has_rl_profiling and getattr(args, 'rl_profile', False):
+    if args.rl_profile:
         shutdown_rl_profiler()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
