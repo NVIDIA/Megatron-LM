@@ -41,10 +41,9 @@ try:
 except (ImportError, PackageNotFoundError):
     _eo_ver = (0, 0)
 
-HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 1)
-HAVE_EO_V02 = _eo_ver >= (0, 2)
+HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 
-if HAVE_EO_V02:
+if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
 from megatron.core import parallel_state
@@ -582,7 +581,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.initialize_state(p)
 
         elif config.optimizer == 'lion':
-            if not HAVE_EO_V02:
+            if not HAVE_EMERGING_OPTIMIZERS:
                 raise ImportError(
                     "Lion optimizer requires emerging_optimizers >= 0.2. "
                     "Please install or upgrade it to use --optimizer lion."
