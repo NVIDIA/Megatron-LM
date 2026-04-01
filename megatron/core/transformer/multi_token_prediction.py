@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -37,7 +37,7 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
-    from megatron.core.ssm.mamba_block import MambaStackSubmodules
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -738,7 +738,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional[MambaStackSubmodules] = None,
+        mamba_submodules: Optional[HybridStackSubmodules] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -753,11 +753,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.submodules.mtp_model_layer is not None and hasattr(
             self.submodules.mtp_model_layer, 'submodules'
         ):
-            from megatron.core.ssm.mamba_block import MambaStackSubmodules
+            from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
             from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 
             layer_submodules = None
-            if isinstance(self.submodules.mtp_model_layer.submodules, MambaStackSubmodules):
+            if isinstance(self.submodules.mtp_model_layer.submodules, HybridStackSubmodules):
                 attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
                 if hasattr(attention_layer_spec, 'submodules'):
                     assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
@@ -809,13 +809,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         # Build inner layers: two possible paths
-        # 1. Mamba path: use MambaStack for hybrid pattern support
+        # 1. Hybrid path: use HybridStack for hybrid pattern support
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
-            from megatron.core.ssm.mamba_block import MambaStack
+            from megatron.core.models.hybrid.hybrid_block import HybridStack
             from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 
-            self.mtp_model_layer = MambaStack(
+            self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=mamba_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
@@ -1272,7 +1272,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # New: For Mamba path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        mamba_submodules: Optional["HybridStackSubmodules"] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import gc
@@ -46,8 +46,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -406,9 +406,9 @@ class TestDynamicInferenceEngine:
             )
 
             # Mamba model.
-            model = MambaModel(
+            model = HybridModel(
                 config=transformer_config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -3074,9 +3074,9 @@ class TestChunkedPrefillCudaGraphs:
                 add_bias_linear=True,
                 is_hybrid_model=True,
             )
-            model = MambaModel(
+            model = HybridModel(
                 config=config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=CHUNKED_CG_VOCAB_SIZE,
                 max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
                 parallel_output=True,

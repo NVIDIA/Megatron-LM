@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 
 def add_modelopt_args(parser):
@@ -10,7 +10,7 @@ def add_modelopt_args(parser):
         "--export-model-type",
         type=str,
         default="GPTModel",
-        choices=["GPTModel", "MambaModel"],
+        choices=["GPTModel", "HybridModel", "MambaModel"],
         help="Model type to use in model_provider.",
     )
     group.add_argument(

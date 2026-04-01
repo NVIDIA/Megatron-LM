@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -13,7 +13,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -49,9 +49,9 @@ moe = get_moe_module_spec(
 moe_inference = get_inference_optimized_moe_spec()
 
 
-# MTP block spec for Mamba - provides norms and projection only.
-# Inner layers are built by MultiTokenPredictionLayer using nested MambaStack
-_mamba_mtp_block_spec = ModuleSpec(
+# MTP block spec - provides norms and projection only.
+# Inner layers are built by MultiTokenPredictionLayer using nested HybridStack
+_hybrid_mtp_block_spec = ModuleSpec(
     module=MultiTokenPredictionBlock,
     submodules=MultiTokenPredictionBlockSubmodules(
         layer_specs=[
@@ -70,9 +70,9 @@ _mamba_mtp_block_spec = ModuleSpec(
 )
 
 
-mamba_stack_spec = ModuleSpec(
-    module=MambaStack,
-    submodules=MambaStackSubmodules(
+hybrid_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
         mamba_layer=ModuleSpec(
             module=MambaLayer,
             submodules=MambaLayerSubmodules(
@@ -138,14 +138,14 @@ mamba_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
-        mtp_block_spec=_mamba_mtp_block_spec,
+        mtp_block_spec=_hybrid_mtp_block_spec,
     ),
 )
 
 
-mamba_inference_stack_spec = ModuleSpec(
-    module=MambaStack,
-    submodules=MambaStackSubmodules(
+hybrid_inference_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
         mamba_layer=ModuleSpec(
             module=MambaLayer,
             submodules=MambaLayerSubmodules(
@@ -219,3 +219,8 @@ mamba_inference_stack_spec = ModuleSpec(
         ),
     ),
 )
+
+
+# Backward-compatible aliases
+mamba_stack_spec = hybrid_stack_spec
+mamba_inference_stack_spec = hybrid_inference_stack_spec

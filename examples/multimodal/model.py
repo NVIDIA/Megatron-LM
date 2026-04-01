@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
 import warnings
 import logging
 from copy import deepcopy
@@ -6,7 +6,7 @@ from copy import deepcopy
 import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
 from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
-                         get_mamba_layer_spec_te)
+                         get_hybrid_layer_spec_te)
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
@@ -99,7 +99,7 @@ def model_provider(
         # Padding mask needed for SP/CP.
         padding = args.context_parallel_size > 1 and args.sequence_parallel
         if args.language_model_type.startswith('nemotron5-hybrid'):
-            language_transformer_layer_spec = get_mamba_layer_spec_te(padding=padding)
+            language_transformer_layer_spec = get_hybrid_layer_spec_te(padding=padding)
         else:
             language_transformer_layer_spec = get_layer_spec_te(
                 is_vit=False, padding=padding

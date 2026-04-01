@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -30,7 +30,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid import HybridModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
@@ -149,7 +149,7 @@ def get_batch(data_iterator, vp_stage=None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None):
     """Loss function.
 
     Args:
@@ -207,12 +207,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: MambaModel):
+def forward_step(data_iterator, model: HybridModel):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (MambaModel): The GPT Model
+        model (HybridModel): The Model
     """
     timers = get_timers()
 

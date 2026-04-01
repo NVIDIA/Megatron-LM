@@ -1,12 +1,12 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
 import torch
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_block import MambaStackSubmodules
+from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -39,16 +39,16 @@ class TestMambaMixer:
             use_cpu_initialization=True,
             use_mamba_mem_eff_path=use_mem_eff_path,
         )
-        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
-        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
         assert isinstance(
-            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             MambaMixerSubmodules,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             transformer_config,
-            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             transformer_config.hidden_size,
             layer_number=1,
             pg_collection=pg_collection,
@@ -126,17 +126,17 @@ class TestMambaMixerErrorChecks:
             use_cpu_initialization=True,
             mamba_num_groups=ngroups,
         )
-        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
-        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
         assert isinstance(
-            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             MambaMixerSubmodules,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         with pytest.raises(AssertionError, match=expected_error_message):
             MambaMixer(
                 transformer_config,
-                mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+                hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
                 transformer_config.hidden_size,
                 pg_collection=pg_collection,
             )

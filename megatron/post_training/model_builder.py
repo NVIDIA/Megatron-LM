@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 """ModelOpt GPT model provider."""
 
@@ -16,7 +16,7 @@ from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
-from megatron.core.models.mamba import MambaModel as MCoreMambaModel
+from megatron.core.models.hybrid import HybridModel as MCoreHybridModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
@@ -124,7 +124,7 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
         # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
         model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
 
-        teacher = MCoreMambaModel(config=config, **model_kwargs)
+        teacher = MCoreHybridModel(config=config, **model_kwargs)
     else:
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
@@ -165,7 +165,7 @@ def modelopt_gpt_mamba_builder(
     vp_stage=None,
     config=None,
     pg_collection=None,
-) -> MCoreGPTModel | MCoreMambaModel:
+) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
 
     Args:
@@ -179,7 +179,7 @@ def modelopt_gpt_mamba_builder(
             attached to the returned model for downstream routing/resharding utilities.
 
     Returns:
-        MCoreGPTModel | MCoreMambaModel: The returned model
+        MCoreGPTModel | MCoreHybridModel: The returned model
     """
     print_rank_0("building GPT model ...")
 
@@ -259,8 +259,8 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel" or getattr(args, 'hybrid_layer_pattern', None) is not None:
-        from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+    elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+        from megatron.core.post_training.modelopt.mamba.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
             logging.getLogger(__name__).warning(
@@ -269,12 +269,12 @@ def modelopt_gpt_mamba_builder(
             )
             args.export_te_mcore_model = False
 
-        mamba_stack_spec = get_mamba_stack_modelopt_spec(
+        hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
             use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
-            "mamba_stack_spec": mamba_stack_spec,
+            "hybrid_stack_spec": hybrid_stack_spec,
             "vocab_size": args.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
@@ -289,7 +289,7 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
 
-        model = MCoreMambaModel(config=config, **model_kwargs)
+        model = MCoreHybridModel(config=config, **model_kwargs)
 
         for l in range(model.decoder.num_layers_per_pipeline_rank):
             layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -33,9 +33,9 @@ from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_
 
 
 @dataclass
-class MambaStackSubmodules:
+class HybridStackSubmodules:
     """
-    A class for the module specs for the MambaStack.
+    A class for the module specs for the HybridStack.
     """
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
@@ -46,17 +46,17 @@ class MambaStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
-class MambaStack(GraphableMegatronModule, MegatronModule):
+class HybridStack(GraphableMegatronModule, MegatronModule):
     """
-    Constructor for the MambaStack class.
+    Constructor for the HybridStack class.
 
     Args:
         config (TransformerConfig): the model configuration
-        submodules (MambaStackSubmodules): the submodules for the stack
+        submodules (HybridStackSubmodules): the submodules for the stack
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
         layer_type_list (list, optional): pre-computed list of layer type symbols for
-            this pipeline segment. When provided (by MambaModel), pipeline stage
+            this pipeline segment. When provided (by HybridModel), pipeline stage
             selection has already been done via '|' separators in the pattern.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
@@ -74,7 +74,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: MambaStackSubmodules,
+        submodules: HybridStackSubmodules,
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
         pp_layer_offset: int = 0,
@@ -91,7 +91,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
 
-        assert pg_collection is not None, "pg_collection must be provided for MambaStack"
+        assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
@@ -102,7 +102,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
 
         assert layer_type_list is not None, (
             "layer_type_list must be provided. It should be pre-computed from "
-            "--hybrid-layer-pattern by MambaModel."
+            "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
 
@@ -240,7 +240,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         padding_mask=None,
     ):
         """
-        Forward function of the MambaStack class.
+        Forward function of the HybridStack class.
 
         It either returns the Loss values if labels are given or the
             final hidden units
@@ -418,3 +418,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 )
 
         return sharded_state_dict
+
+
+# Backward-compatible aliases
+MambaStackSubmodules = HybridStackSubmodules
+MambaStack = HybridStack

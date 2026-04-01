@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 from typing import Literal, Optional
@@ -33,12 +33,12 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
-class MambaModel(LanguageModule):
-    """Mamba language model.
+class HybridModel(LanguageModule):
+    """Hybrid language model.
 
     Args:
         config (TransformerConfig): Model config
-        mamba_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
@@ -84,7 +84,7 @@ class MambaModel(LanguageModule):
     def __init__(
         self,
         config: TransformerConfig,
-        mamba_stack_spec: ModuleSpec,
+        hybrid_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         hybrid_layer_pattern: Optional[str] = None,
@@ -110,15 +110,15 @@ class MambaModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        if self.config.use_mup and not getattr(MambaModel, "mup_warning_printed", False):
+        if self.config.use_mup and not getattr(HybridModel, "mup_warning_printed", False):
             log_single_rank(
                 logger,
                 logging.WARNING,
-                "MuP for MambaModel is experimental and not fully validated yet.",
+                "MuP for HybridModel is experimental and not fully validated yet.",
             )
-            MambaModel.mup_warning_printed = True
+            HybridModel.mup_warning_printed = True
 
-        self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
+        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
@@ -224,7 +224,7 @@ class MambaModel(LanguageModule):
             )
 
         self.decoder = build_module(
-            mamba_stack_spec,
+            hybrid_stack_spec,
             self.config,
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
@@ -234,13 +234,13 @@ class MambaModel(LanguageModule):
             pg_collection=self.pg_collection,
         )
 
-        # MTP block - uses mtp_block_spec from mamba_stack_spec.submodules
+        # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
-            mamba_submodules = mamba_stack_spec.submodules
+            mamba_submodules = hybrid_stack_spec.submodules
             mtp_block_spec = mamba_submodules.mtp_block_spec
             assert mtp_block_spec is not None, (
-                "MTP pattern specified but mtp_block_spec is None in mamba_stack_spec.submodules. "
-                "Ensure mamba_stack_spec includes mtp_block_spec for MTP support."
+                "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
+                "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
 
             self.mtp = MultiTokenPredictionBlock(
@@ -312,7 +312,7 @@ class MambaModel(LanguageModule):
         padding_mask: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
-        """Forward function of the Mamba model. This function passes the input tensors
+        """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
@@ -473,3 +473,7 @@ class MambaModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+
+# Backward-compatible alias
+MambaModel = HybridModel

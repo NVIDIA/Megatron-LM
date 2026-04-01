@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
 """Common functions used in train_*.py and pretrain_*.py scripts."""
 
@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import torch
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid import HybridModel
 from megatron.training import get_args, print_rank_0
 
 try:
@@ -23,7 +23,7 @@ import megatron.legacy.model  # isort: skip
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
-) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
+) -> Union[GPTModel, megatron.legacy.model.GPTModel, HybridModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -34,7 +34,7 @@ def model_provider(
         post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
 
     Returns:
-        Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel, HybridModel]: The returned model
     """
     args = get_args()
 

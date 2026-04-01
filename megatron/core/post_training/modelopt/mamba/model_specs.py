@@ -1,10 +1,10 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.post_training.modelopt.layers import Norm
-from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -17,12 +17,12 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 
 
 # Use this spec for ModelOpt PTQ and TensorRT-LLM export
-def get_mamba_stack_modelopt_spec(
+def get_hybrid_stack_modelopt_spec(
     local_core_attention: bool = False,
     remap_te_layernorm: bool = False,
     use_default_te_spec: bool = False,
 ) -> ModuleSpec:
-    """Get the Mamba stack spec for ModelOpt PTQ and TensorRT-LLM export.
+    """Get the hybrid stack spec for ModelOpt PTQ and TensorRT-LLM export.
 
     When use_default_te_spec=False (default), this is the native local spec with TENorm
     from Transformer-Engine for the layernorm implementation (since FusedLayerNorm from
@@ -30,8 +30,8 @@ def get_mamba_stack_modelopt_spec(
     can be used to add sharded state_dict key remapping for TE-compatible checkpoint
     saving/loading.
 
-    When use_default_te_spec=True, this returns the standard mamba_stack_spec from
-    mamba_layer_specs.py which uses full TE modules (TELayerNormColumnParallelLinear,
+    When use_default_te_spec=True, this returns the standard hybrid_stack_spec from
+    hybrid_layer_specs.py which uses full TE modules (TELayerNormColumnParallelLinear,
     TERowParallelLinear, TEDotProductAttention, TENorm, moe_grouped_gemm=True).
 
 
@@ -43,19 +43,23 @@ def get_mamba_stack_modelopt_spec(
         use_default_te_spec: whether to use the default Transformer-Engine spec
     """
     if use_default_te_spec:
-        from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
-        return mamba_stack_spec
+        return hybrid_stack_spec
 
-    return _get_mamba_stack_local_spec(
+    return _get_hybrid_stack_local_spec(
         local_core_attention=local_core_attention, remap_te_layernorm=remap_te_layernorm
     )
 
 
-def _get_mamba_stack_local_spec(
+# Backward-compatible alias
+get_mamba_stack_modelopt_spec = get_hybrid_stack_modelopt_spec
+
+
+def _get_hybrid_stack_local_spec(
     local_core_attention: bool = False, remap_te_layernorm: bool = False
 ) -> ModuleSpec:
-    """Get the Mamba stack spec with local (non-TE) modules.
+    """Get the hybrid stack spec with local (non-TE) modules.
 
     This is essentially the native local spec except for the layernorm implementation
     is using TENorm from Transformer-Engine.
@@ -131,8 +135,8 @@ def _get_mamba_stack_local_spec(
     )
 
     return ModuleSpec(
-        module=MambaStack,
-        submodules=MambaStackSubmodules(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
             mamba_layer=mamba_layer,
             attention_layer=attention_layer,
             mlp_layer=mlp_layer,

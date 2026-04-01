@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -426,7 +426,7 @@ def select_pipeline_segment(
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
-            f"MambaModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
+            f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
             f"layers='{''.join(selected)}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
         )
@@ -459,7 +459,7 @@ def select_pipeline_segment(
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
-        f"MambaModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
+        f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
         f"segment_index={segment_index}/{len(segments)}, "
         f"layers='{my_segment}' ({len(layer_type_list)} layers), "
         f"layer_offset={layer_offset}",

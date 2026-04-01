@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import namedtuple
 from functools import partial
@@ -11,7 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid import HybridModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -196,9 +196,9 @@ class LLaVAModel(MegatronModule):
                 )
                 self.language_model = build_hf_model(language_transformer_config)
             elif language_model_type.startswith('nemotron5-hybrid'):
-                self.language_model = MambaModel(
+                self.language_model = HybridModel(
                     config=language_transformer_config,
-                    mamba_stack_spec=language_transformer_layer_spec,
+                    hybrid_stack_spec=language_transformer_layer_spec,
                     vocab_size=language_vocab_size,
                     max_sequence_length=language_max_sequence_length,
                     parallel_output=parallel_output,
