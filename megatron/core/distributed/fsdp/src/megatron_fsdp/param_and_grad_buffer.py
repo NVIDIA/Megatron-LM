@@ -1946,14 +1946,14 @@ class ParamAndGradBuffer:
         Hybrid FSDP (HFSDP) helper buffers for outer-DP optimizer-state sharding.
 
         Design goal
-        -----------
+        ==========
         This design extends Megatron-FSDP's Hybrid / Fully Sharded Data Parallelism
         to support *outer* data-parallel (DP) optimizer-state sharding, without
         complicating the per-rank model weight / grad views that are used by the
         forward and backward passes.
 
         Core idea
-        ---------
+        ==========
         We introduce two(or three) persistent helper buffers:
 
         - `hfsdp_helper_wbuf`: stores the *true* persistent parameter payload
@@ -1986,7 +1986,7 @@ class ParamAndGradBuffer:
             dimensions on each iteration.
 
         Data flow per iteration
-        -----------------------
+        =======================
         Compared to the usual Hybrid FSDP data flow (where the last micro-batch
         backward issues a DP all-reduce on gradients), this design explicitly
         uses parameter all-gather and gradient reduce-scatter between the DP and
@@ -2027,7 +2027,7 @@ class ParamAndGradBuffer:
                 through the model weight buffer.
 
         Implementation details
-        ----------------------
+        ======================
         - `hfsdp_helper_wbuf` / `hfsdp_helper_gbuf` (and optionally
             `hfsdp_helper_wtbuf`) are allocated as the canonical storage for all
             HFSDP-managed parameters / gradients. They encode the inner-DP
@@ -2067,7 +2067,7 @@ class ParamAndGradBuffer:
                 data.
 
         Notes for maintainers
-        ---------------------
+        =====================
         - When adding new parameters to HFSDP, register them with the helper
             buffers first. The model weight / grad DP buffers should be treated as
             *views* for compute, not as owners of persistent storage.
@@ -3142,25 +3142,6 @@ class ParamAndGradBuffer:
         )
         _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
-    @torch.no_grad()
-    def copy_model_weights_to_main_weights(self):
-        """Copy the model weights to the main weights."""
-        for group in self.parameter_groups:
-            mbuf = group.main_weight_buffer
-            if mbuf is None:
-                continue
-            wbuf = group.model_weight_buffer
-            if mbuf.is_data_distributed:
-                copyin_data = wbuf.get_shard_from_local_buffer()
-            else:
-                copyin_data = wbuf.data
-            assert mbuf.data.numel() == copyin_data.numel(), (
-                f"Master weight buffer size {mbuf.data.numel()} does not match "
-                f"model weight buffer size {copyin_data.numel()}"
-            )
-            # TODO(mxfp8): Make sure it's not a fp8 buf?
-            mbuf.data.copy_(copyin_data.data)
-
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
         Args:
@@ -3281,7 +3262,7 @@ def _create_hfsdp_helper_buffer(
     (`bucket_index`) with the fully DP buffer.
 
     Parameters
-    ----------
+    ==========
     dp_buffer : DataParallelBuffer
         The existing fully data-parallel buffer whose configuration
         and bucket layout should be mirrored.
@@ -3293,7 +3274,7 @@ def _create_hfsdp_helper_buffer(
         across ranks in `inner_dp_group`.
 
     Returns
-    -------
+    =======
     DataParallelBuffer
         A new DataParallelBuffer configured as the HFSDP helper buffer
         for the given `inner_dp_group`, sharing the same bucket index
@@ -3344,7 +3325,7 @@ def _init_hfsdp_helper_and_dp_buffer_data(
     buffer rather than owning separate storage.
 
     Parameters
-    ----------
+    ==========
     hfsdp_helper_buffer : DataParallelBuffer
         The HFSDP helper buffer that owns the full inner-/outer-DP bucket
         storage.
