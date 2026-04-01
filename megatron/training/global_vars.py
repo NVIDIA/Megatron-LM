@@ -344,6 +344,11 @@ def _set_telemetry(args):
         resource_attributes=resource_attrs,
     )
 
+    # Bridge Python logging to OTel so logs get exported with trace correlation.
+    if config.enabled and config.logs_enabled and _GLOBAL_TELEMETRY_HANDLE.is_exporting:
+        from nemo.lens.logging_bridge import setup_logging_bridge
+        setup_logging_bridge()
+
 
 def destroy_global_vars():
     global _GLOBAL_ARGS
