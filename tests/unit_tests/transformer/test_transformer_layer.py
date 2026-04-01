@@ -7,7 +7,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -26,7 +28,7 @@ class TestParallelTransformerLayer:
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
         self.parallel_transformer_layer = TransformerLayer(
-            transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules
+            transformer_config, get_gpt_layer_with_transformer_engine_submodules()
         )
 
     def teardown_method(self, method):
@@ -81,7 +83,7 @@ class TestParallelTransformerLayer:
                     use_cpu_initialization=True,
                 )
                 parallel_transformer_layer = TransformerLayer(
-                    transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules
+                    transformer_config, get_gpt_layer_with_transformer_engine_submodules()
                 )
 
                 parallel_transformer_layer.cuda()
@@ -265,7 +267,7 @@ class TestParallelTransformerLayer:
             num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
         )
         parallel_transformer_layer = TransformerLayer(
-            transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules
+            transformer_config, get_gpt_layer_with_transformer_engine_submodules()
         )
 
         sharded_state_dict = parallel_transformer_layer.sharded_state_dict()

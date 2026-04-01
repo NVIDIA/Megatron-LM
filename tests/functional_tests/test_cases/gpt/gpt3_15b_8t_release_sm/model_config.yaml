@@ -70,8 +70,8 @@ MODEL_ARGS:
   # Add checkpointing args
   --load: ${CHECKPOINT_LOAD_PATH}
   --save: ${CHECKPOINT_SAVE_PATH}
-  --save-interval: 5000
-  --save-retain-interval: 2500
+  --save-interval: 1000
+  --save-retain-interval: 5000
   # Add initialization args
   --init-method-std: 0.0134
   # Add logging args
@@ -90,6 +90,8 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 13000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 METRICS:
   - "iteration-time"
   - "lm loss"

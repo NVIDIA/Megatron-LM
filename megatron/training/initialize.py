@@ -24,7 +24,6 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
-from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
@@ -83,9 +82,6 @@ def initialize_megatron(
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
 
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker()
-
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
@@ -97,6 +93,9 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
     def state_save_func():
@@ -196,48 +195,7 @@ def _compile_dependencies():
             flush=True,
         )
 
-    # ==================
-    # Load fused kernels
-    # ==================
-
-    # Custom kernel constraints check.
-    seq_len = args.seq_length
-    attn_batch_size = (
-        args.num_attention_heads / args.tensor_model_parallel_size
-    ) * args.micro_batch_size
-    # Constraints on sequence length and attn_batch_size to enable warp based
-    # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = (
-        seq_len > 16 and seq_len <= 16384 and seq_len % 4 == 0 and attn_batch_size % 4 == 0
-    )
-    # Print a warning.
-    if not ((args.fp16 or args.bf16) and custom_kernel_constraint and args.masked_softmax_fusion):
-        warn_rank_0(
-            "Constraints for invoking optimized fused softmax kernel are not met. "
-            "We default back to unfused kernel invocations."
-        )
-
-    # Always build on rank zero first.
-    if torch.distributed.get_rank() == 0:
-        start_time = time.time()
-        print("> compiling and loading fused kernels ...", flush=True)
-        fused_kernels.load(args)
-        torch.distributed.barrier()
-    else:
-        torch.distributed.barrier()
-        fused_kernels.load(args)
-    # Simple barrier to make sure all ranks have passed the
-    # compilation phase successfully before moving on to the
-    # rest of the program. We think this might ensure that
-    # the lock is released.
     torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print(
-            ">>> done with compiling and loading fused kernels. "
-            "Compilation time: {:.3f} seconds".format(time.time() - start_time),
-            flush=True,
-        )
-
 
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
@@ -337,6 +295,49 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
+        # Set flight recorder env vars if specified.
+        # Priority: pre-existing environment variable > MLM argument.
+        # All vars follow the same setdefault semantics: if already set in the
+        # environment we warn and keep the user's value; otherwise we apply the
+        # value derived from the MLM argument / flag.
+        # The block is also triggered when either path env var is already set
+        # so that the remaining defaults are applied consistently.
+        _fr_path = (
+            args.flight_recorder_dump_path
+            or os.environ.get('TORCH_FR_DUMP_TEMP_FILE')
+            or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
+        )
+        if _fr_path is not None:
+            _fr_dump_prefix = _fr_path
+            if os.path.isdir(_fr_path):
+                _fr_dump_prefix = os.path.join(_fr_path, '_dump_')
+                warn_rank_0(
+                    "Flight recorder: using directory "
+                    f"'{_fr_path}' for dump path, appending per-rank prefix "
+                    f"'{_fr_dump_prefix}'."
+                )
+            _fr_env_defaults = {
+                'TORCH_FR_DUMP_TEMP_FILE': _fr_dump_prefix,
+                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_dump_prefix,
+                'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
+                'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
+                'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
+                'TORCH_INCLUDE_ONLY_ACTIVE': str(int(args.flight_recorder_include_only_active)),
+                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(int(args.flight_recorder_extra_dump_on_exec)),
+            }
+            for _var, _default in _fr_env_defaults.items():
+                if _var in os.environ:
+                    warn_rank_0(
+                        f"Flight recorder: environment variable {_var} is already set to "
+                        f"'{os.environ[_var]}'; ignoring config value '{_default}'."
+                    )
+                else:
+                    os.environ[_var] = _default
+            print_rank_0(
+                "Flight recorder env vars:\n"
+                + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
+            )
+
         # Call the init process
         init_process_group_kwargs = {
             'backend': args.distributed_backend,
@@ -378,7 +379,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
-                create_gloo_process_groups=args.enable_gloo_process_groups,
+                create_gloo_process_groups=args.use_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
                 create_all_gather_group=args.create_all_gather_group,

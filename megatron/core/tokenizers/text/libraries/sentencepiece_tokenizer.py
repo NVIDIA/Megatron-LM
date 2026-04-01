@@ -310,6 +310,10 @@ class SentencePieceTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerCha
                 "Expected special_tokens to be a list or a dict " + str(type(special_tokens))
             )
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        return [p.begin for p in self.tokenizer.decode_ids_as_immutable_proto(ids).pieces]
+
     @property
     def pad_id(self) -> int:
         """Returns id of padding token."""

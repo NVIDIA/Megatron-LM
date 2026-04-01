@@ -82,7 +82,7 @@ def ensure_test_data():
 
         try:
             # Download assets to /opt/data
-            download_and_extract_asset(assets_dir=str(data_path))
+            download_and_extract_asset(assets_dir=data_path)
 
             print("Test data downloaded successfully.")
 

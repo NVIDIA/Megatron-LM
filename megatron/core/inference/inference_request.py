@@ -5,6 +5,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
+from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -45,6 +46,21 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def unwrap_serialized_tensors(serialized_request: dict) -> dict:
+    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+
+    Args:
+        serialized_request (dict): A dict produced by `serialize()`.
+
+    Returns:
+        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+    """
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in serialized_request.items()
+    }
+
+
 # class syntax
 class Status(Enum):
     """Enum for status"""
@@ -54,6 +70,61 @@ class Status(Enum):
     ACTIVE_BUT_NOT_GENERATING_TOKENS = 3
     COMPLETED = 4
     FAILED = 5
+
+
+# =========================================================================
+# Hash computation for prefix caching
+# =========================================================================
+
+# Constants for hash computation
+# Using 2^61 - 1 (Mersenne prime) for ~10^18 hash space, reducing collision probability
+# from ~10^-9 to ~10^-18 compared to the previous prime (1000000007).
+HASH_PRIME = 2305843009213693951
+HASH_BASE = 31
+
+_hash_powers: Optional[torch.Tensor] = None
+
+
+def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+    """Compute hashes for all complete blocks in a prompt in one batched operation.
+
+    Reshapes prompt tokens into [num_blocks, block_size], computes all per-block
+    token hashes via a single GPU matmul, transfers results with one .tolist() call,
+    and chains parent hashes on CPU.
+
+    Args:
+        prompt_tokens: All prompt token IDs, shape [seq_len].
+        block_size: Number of tokens per block.
+
+    Returns:
+        List of positive integer hash values (1 to HASH_PRIME), one per complete block.
+    """
+    num_complete_blocks = len(prompt_tokens) // block_size
+    if num_complete_blocks == 0:
+        return []
+
+    global _hash_powers
+    if _hash_powers is None or _hash_powers.shape[0] != block_size:
+        positions = torch.arange(block_size, device=prompt_tokens.device, dtype=torch.int64)
+        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+
+    # Reshape to [num_blocks, block_size] (zero-copy view) and compute all token hashes
+    blocks = prompt_tokens[: num_complete_blocks * block_size].view(num_complete_blocks, block_size)
+    token_hashes = (blocks.to(torch.int64) * _hash_powers).sum(dim=1) % HASH_PRIME
+
+    # Single GPU→CPU transfer
+    token_hashes_list = token_hashes.tolist()
+
+    # Chain parent hashes on CPU (C-level accumulate, no Python loop)
+    hashes = list(
+        accumulate(
+            token_hashes_list,
+            lambda parent, th: (parent * HASH_BASE + th) % HASH_PRIME + 1,
+            initial=0,
+        )
+    )[1:]
+
+    return hashes
 
 
 @dataclass(kw_only=True)
@@ -159,7 +230,9 @@ class InferenceRequest:
 class DynamicInferenceEventType(Enum):
     """Dynamic inference event type."""
 
-    ADD = auto()
+    ADD_ENGINE = auto()  # When request is added to engine via _add_request()
+    ADD_CONTEXT = auto()  # When request is added to context (scheduled for prefill)
+    GENERATED_TOKEN = auto()  # When an output token is generated (payload = {"token_id": int})
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -202,22 +275,30 @@ class DynamicInferenceEvent:
             DynamicInferenceEventType.ERROR_NONTRANSIENT,
         ):
             assert self.payload is not None
+        elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            assert (
+                self.payload is not None
+                and isinstance(self.payload, dict)
+                and "token_id" in self.payload
+            )
         else:
             assert self.payload is None
 
     def __str__(self):
-        payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
+        if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            payload_str = f", token={self.payload['token_id']}"
+        elif self.payload is None:
+            payload_str = ""
+        else:
+            payload_str = f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
     def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.
 
         Returns:
-            (dict) A dictionary representation of the instance suitable for
-                serialization.
+            dict: Full event dict.
         """
-
-        # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
@@ -225,10 +306,15 @@ class DynamicInferenceEvent:
         obj["type"] = self.type.name
 
         # Serialize payload.
-        if self.payload:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+        if self.payload is not None:
+            if self.type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+                obj["payload"] = ContextErrorFactory.serialize(self.payload)
+
         torch.cuda.nvtx.range_pop()
         return obj
 
@@ -237,22 +323,25 @@ class DynamicInferenceEvent:
         """Deserialize event.
 
         Args:
-            obj (dict): Serialized event data.
+            obj: Serialized event data dict.
 
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
+        event_type = DynamicInferenceEventType[obj["type"]]
 
-        # Initialize event.
-        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
+        # Pre-process payload before construction (since __post_init__ validates types).
+        init_obj = {**obj, "type": event_type}
+        if obj["payload"] is not None:
+            if event_type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-        # Deserialize payload.
-        if obj["payload"]:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+                init_obj["payload"] = ContextErrorFactory.deserialize(obj["payload"])
 
-            event.payload = ContextErrorFactory.deserialize(obj["payload"])
-
-        return event
+        return cls(**init_obj)
 
 
 @experimental_api
@@ -265,19 +354,50 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
-    generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
+    policy_epoch: Optional[list[tuple[int, int]]] = None
+    kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
+    # routing_indices stores MoE routing decisions for all tokens generated so far.
+    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
+    routing_indices: Optional[torch.Tensor] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+
+    # Prefix caching fields
+    block_size_tokens: Optional[int] = None  # Block size for hash computation
+    enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+
+    # Computed field - not passed by caller
+    precomputed_block_hashes: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
+
+        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+            and not self.precomputed_block_hashes
+        ):
+            self._compute_block_hashes()
+
+    def _compute_block_hashes(self) -> None:
+        """Compute hashes for all complete blocks in the prompt.
+
+        After this call:
+        - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
+        - precomputed_block_hashes is [hash1, ...] for N complete blocks
+        """
+        self.precomputed_block_hashes = compute_block_hashes_batched(
+            self.prompt_tokens, self.block_size_tokens
+        )
 
     @property
     def remaining_prompt_length(self):
@@ -286,7 +406,10 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         return len(self.remaining_prompt_tokens)
 
+    ttft: Optional[float] = None
     events: List[DynamicInferenceEvent] = field(default_factory=list)
+    event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
+    generated_tokens: List[int] = field(default_factory=list)
 
     def __str__(self):
         return ", ".join(
@@ -299,7 +422,7 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self) -> dict:
+    def serialize(self):
         """Converts the instance into a serializable dictionary.
 
         Returns:
@@ -309,12 +432,24 @@ class DynamicInferenceRequest(InferenceRequest):
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+
+        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
+        if self.routing_indices is not None:
+            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            # the last generated token does not undergo a forward pass
+            # hence we expect routing indices for total_tokens - 1
+            assert self.routing_indices.shape[0] == total_tokens - 1, (
+                f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                f"total tokens {total_tokens-1}."
+            )
+
         torch.cuda.nvtx.range_pop()
         return obj
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
-        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
 
     @property
     def tracked_metadata(self) -> List[Any]:
@@ -356,13 +491,58 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
 
-    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
+    def add_event(
+        self, type: DynamicInferenceEventType, payload: Optional[Any] = None
+    ) -> DynamicInferenceEvent:
         """Add event."""
-        self.events.append(DynamicInferenceEvent(type=type, payload=payload))
+        event = DynamicInferenceEvent(type=type, payload=payload)
+        self.events.append(event)
+        return event
 
-    def add_event_add(self):
-        """Add 'add' event."""
-        return self.add_event(DynamicInferenceEventType.ADD)
+    def add_event_add_engine(self):
+        """Add 'add_engine' event - called when request enters the engine queue."""
+        self.event_add_engine = self.add_event(DynamicInferenceEventType.ADD_ENGINE)
+        return self.event_add_engine
+
+    def add_event_add_context(self):
+        """Add 'add_context' event - called when request is added to context for prefill."""
+        return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
+
+    def add_event_generated_token(
+        self,
+        token: int,
+        blocks_total: Optional[int] = None,
+        blocks_hashed_total: Optional[int] = None,
+        blocks_hashed_active: Optional[int] = None,
+        blocks_ref_count: Optional[int] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
+    ):
+        """Add 'generated_token' event - records each generated token.
+
+        Args:
+            token (int): The token ID that was generated.
+            blocks_total (int): Total block capacity from allocator.
+            blocks_hashed_total (int): All allocated (hashed) blocks.
+            blocks_hashed_active (int): Blocks with ref_count > 0.
+            blocks_ref_count (int): Sum of block ref counts from allocator.
+            pre_fwd_active_token_count (int): Active token count before forward pass.
+            pre_fwd_step_count (int): Step count before forward pass.
+        """
+        payload = {"token_id": token}
+        if blocks_total is not None:
+            payload["blocks_total"] = blocks_total
+        if blocks_hashed_total is not None:
+            payload["blocks_hashed_total"] = blocks_hashed_total
+        if blocks_hashed_active is not None:
+            payload["blocks_hashed_active"] = blocks_hashed_active
+        if blocks_ref_count is not None:
+            payload["blocks_ref_count"] = blocks_ref_count
+        if pre_fwd_active_token_count is not None:
+            payload["pre_fwd_active_token_count"] = pre_fwd_active_token_count
+        if pre_fwd_step_count is not None:
+            payload["pre_fwd_step_count"] = pre_fwd_step_count
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
 
     def add_event_pause(self):
         """Add 'pause' event."""
@@ -449,6 +629,13 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
+        # Carry forward policy_epoch as-is.
+        policy_epoch = old_request.policy_epoch
+
+        # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
+        # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
+        kv_cache_epoch = None
+
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
             (
@@ -478,7 +665,15 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
         )
+        # Preserve event_add_engine from old request if it exists, otherwise set it.
+        # This ensures TTFT calculation works correctly for evicted/resumed requests.
+        if old_request.event_add_engine is not None:
+            new_request.event_add_engine = old_request.event_add_engine
+        else:
+            new_request.add_event_add_engine()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
@@ -499,11 +694,17 @@ class DynamicInferenceRequestRecord:
 
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
+        routing_indices = None
+        if self.requests[0].routing_indices is not None:
+            routing_indices = torch.cat([r.routing_indices for r in self.requests])
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
+
+        policy_epoch = self.requests[-1].policy_epoch
+        kv_cache_epoch = self.requests[-1].kv_cache_epoch
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -518,10 +719,17 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
+            ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
+            routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request

@@ -24,8 +24,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
 from model_provider import model_provider
 
 sys.path.append(
@@ -162,19 +163,9 @@ def main():
 
     args = get_args()
 
-    # Set up model and load checkpoint
-    if args.model_provider == "gpt":
-        model_builder = gpt_builder
-    elif args.model_provider == "mamba":
-        model_builder = mamba_builder
-    else:
-        raise ValueError(f"Invalid model provider {args.model_provider}")
+    model = get_model_for_inference()
 
-    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
-    tokenizer = get_tokenizer()
-    load_checkpoint(model, None, None)
-    model = model[0]
-    model.eval()
+    tokenizer = build_tokenizer(args)
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None
