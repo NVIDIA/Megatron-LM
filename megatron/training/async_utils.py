@@ -40,7 +40,7 @@ def _get_async_calls_queue(async_strategy: str = None):
             _, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
         AsyncCallsQueue = async_modules["AsyncCallsQueue"]
         _async_calls_queue = AsyncCallsQueue(
-            persistent=getattr(args, "use_persistent_ckpt_worker", False)
+            persistent=False #getattr(args, "use_persistent_ckpt_worker", False)
         )
 
     return _async_calls_queue

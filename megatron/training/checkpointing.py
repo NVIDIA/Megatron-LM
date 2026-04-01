@@ -67,7 +67,7 @@ except Exception:
 
 
 try:
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue, AsyncRequest
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         init_checkpoint_metadata_cache,
@@ -76,6 +76,7 @@ try:
     )
     HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
+    NVRxAsyncRequest = None
     HAVE_NVRX = False
 
 _async_queue = _get_async_calls_queue("nvrx")
@@ -702,8 +703,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=True
                 )
-                save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
-                _async_queue.schedule_async_request(save_request)
+                async_save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                _async_queue.schedule_async_request(async_save_request)
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -2108,7 +2109,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     return model
 
 
-def _get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
+def _get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> NVRxAsyncRequest:
     """Creates an async save request with a finalize function."""
     save_fn, preload_fn, save_args = writer.get_save_function_and_args()
 
@@ -2117,6 +2118,6 @@ def _get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncReques
         save_state_dict_async_finalize(*save_state_dict_ret)
         torch.distributed.barrier()
 
-    return AsyncRequest(
+    return NVRxAsyncRequest(
         save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
     )
