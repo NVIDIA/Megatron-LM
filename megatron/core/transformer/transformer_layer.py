@@ -1307,8 +1307,19 @@ class MoETransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
 
-        for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            attr = getattr(self.mlp.token_dispatcher, attr_name)
+        # Captures cudagraph_attrs (e.g. tokens_per_expert, routing_map, ...) using
+        # dotted-path traversal. During router CUDA graph replay, Python code does not
+        # re-run, so these attributes keep their capture-time values. We save them here
+        # (during recording) so _forward_mlp_expert_compute can restore them before each
+        # eager expert_compute pass. For tensors, copy_ keeps the same storage so that CUDA
+        # copy ops inside the graph update the buffer in place.
+        for attr_name in getattr(self.mlp.token_dispatcher, 'cudagraph_attrs', []):
+            obj = self.mlp.token_dispatcher
+            for part in attr_name.split('.'):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            attr = obj
             if torch.is_tensor(attr):
                 if attr_name in self.token_dispatcher_attrs:
                     self.token_dispatcher_attrs[attr_name].copy_(attr)
@@ -1326,8 +1337,24 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        for name, attr in self.token_dispatcher_attrs.items():
-            setattr(self.mlp.token_dispatcher, name, attr)
+        # Restore token dispatcher attributes that were captured during CUDA graph recording.
+        # After router graph replay, Python code does not re-run, so any attribute that was
+        # mutated by eager expert_compute (e.g. tokens_per_expert set to None by
+        # dispatch_postprocess) is NOT automatically restored.  We restore them here before
+        # each eager expert_compute call.
+        for attr_name, stored_attr in self.token_dispatcher_attrs.items():
+            parts = attr_name.split('.')
+            obj = self.mlp.token_dispatcher
+            for part in parts[:-1]:
+                obj = getattr(obj, part)
+            setattr(obj, parts[-1], stored_attr)
+
+        # For flex dispatchers (HybridEP/DeepEP), update _comm_manager.token_probs to the
+        # replay-wrapped 'probs' (which carries _CudagraphReplayNodeBackward as grad_fn) so
+        # that backward flows through the CUDA bwd graph replay rather than hitting the dead
+        # N_cap_router autograd node left over from graph capture.
+        if hasattr(self.mlp.token_dispatcher, '_comm_manager'):
+            self.mlp.token_dispatcher._comm_manager.token_probs = probs
 
         self.mlp.fwd_execution_map = "expert_compute"
         return self.mlp(None, intermediate_tensors=(hidden_states, probs))

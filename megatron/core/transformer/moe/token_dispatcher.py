@@ -1365,7 +1365,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+            self.cudagraph_attrs = ['_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
@@ -1373,7 +1373,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
+            self.cudagraph_attrs = ['_comm_manager.routing_map']
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
