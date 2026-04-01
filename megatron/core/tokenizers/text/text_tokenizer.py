@@ -76,7 +76,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         return self._tokenizer.text_to_ids(text)
 
-    def detokenize(self, ids: List[int], skip_special_tokens: bool = True) -> str:
+    def detokenize(self, ids: List[int], skip_special_tokens: Optional[bool] = None) -> str:
         """
         Text detokenization.
 
@@ -89,7 +89,9 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             text: detokenized text.
         """
 
-        if accepts_parameter(self._tokenizer.ids_to_text, "remove_special_tokens"):
+        if skip_special_tokens is not None and accepts_parameter(
+            self._tokenizer.ids_to_text, "remove_special_tokens"
+        ):
             return self._tokenizer.ids_to_text(ids, remove_special_tokens=skip_special_tokens)
         return self._tokenizer.ids_to_text(ids)
 
