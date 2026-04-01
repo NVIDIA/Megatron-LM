@@ -88,7 +88,9 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             text: detokenized text.
         """
 
-        return self._tokenizer.ids_to_text(ids, remove_special_tokens=skip_special_tokens)
+        if not skip_special_tokens:
+            return self._tokenizer.ids_to_text(ids, remove_special_tokens=False)
+        return self._tokenizer.ids_to_text(ids)
 
     def apply_chat_template(
         self, conversation: List[Dict[str, str]], chat_template: Optional[str] = None, **kwargs

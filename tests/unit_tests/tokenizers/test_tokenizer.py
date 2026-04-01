@@ -161,6 +161,30 @@ def test_hf_ids_to_text_eos_with_include_and_remove_special_tokens(
         )
 
 
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+@pytest.mark.parametrize("skip_special_tokens", [True, False])
+def test_hf_detokenize_skip_special_tokens(skip_special_tokens):
+    """Test that MegatronTokenizerText.detokenize forwards skip_special_tokens correctly."""
+    try:
+        tokenizer = MegatronTokenizer.from_pretrained(
+            LOCAL_HF_TOKENIZER_PATH, metadata_path={"library": "huggingface"}
+        )
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tokenizer.eos_id
+    ids = tokenizer.tokenize("hello") + [eos_id]
+    text = tokenizer.detokenize(ids, skip_special_tokens=skip_special_tokens)
+    eos_token = tokenizer._tokenizer.tokenizer.eos_token
+    if skip_special_tokens:
+        assert eos_token not in text, (
+            f"Expected EOS stripped when skip_special_tokens=True. Got: {text!r}"
+        )
+    else:
+        assert _eos_in_text(text, eos_token), (
+            f"Expected EOS preserved when skip_special_tokens=False. Got: {text!r}"
+        )
+
+
 def test_megatron_tokenizer():
     # Load tokenizer with additional special tokens
     special_tokens = {}
