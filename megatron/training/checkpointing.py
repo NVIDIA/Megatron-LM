@@ -696,7 +696,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 )
 
                 save_state_dict_ret = save_state_dict_async_plan(
-                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner,
+                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
                 )
                 async_save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
             else:
