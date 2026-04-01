@@ -252,10 +252,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
-        # Engine step counter (used for logging, metrics, and event tracking)
-        self.step_count = 0
 
-        # Separate monotonic clock for prefix caching LRU eviction ordering.
+        # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
+        self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+
+        # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step
         # counter is not overloaded with cache-eviction semantics.
         self.prefix_cache_lru_clock = 0
@@ -263,6 +264,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
+
+        # Engine step counter (used for logging, metrics, and event tracking)
+        self.step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -1839,6 +1843,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefix_skip_tokens = 0
         elif self.is_hybrid_model and finished == 0:
             prefix_skip_tokens = 0
+
+        # Clamp so that effective_prefill_chunk_length >= 2 when possible.
+        # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
+        # which routes the batch into the flash-attention decode kernel and crashes.
+        # Round down to a block boundary to keep block-table indexing consistent.
+        if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
+            max_skip = prefill_chunk_length - 2
+            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(

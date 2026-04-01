@@ -904,7 +904,7 @@ def validate_args(args, defaults={}):
 
     # Map string data-type to torch.dtype.
     dtype_map = {
-        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None,
+        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None, None: None,
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
@@ -1434,7 +1434,7 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
-        
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1881,6 +1881,13 @@ def _add_inference_args(parser):
                        'block hash only. "longest_prefix" routes to the rank with '
                        'the longest matching prefix. "round_robin" ignores prefix '
                        'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
+                       type=float, default=0.5,
+                       dest='inference_dynamic_batching_prefix_caching_routing_alpha',
+                       help='Weight for prefix-aware routing score: '
+                       'score = alpha * match + (1 - alpha) * normalized_load. '
+                       'Higher alpha favors prefix cache hits; lower alpha '
+                       'favors load balance. Default: 0.5.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
@@ -2231,6 +2238,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-coefficient-type', type=str, default='quintic',
+                       help='Newton-Schulz coefficient type for the Muon optimizer. '
+                       'Valid types are discovered from the installed emerging_optimizers '
+                       'package (e.g. simple, quintic, polar_express, aol). '
+                       'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
@@ -2660,6 +2672,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
+                       help='List of param_name patterns (in Python\'s fnmatch format) to match against '
+                       'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
+                       'every parameter.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
