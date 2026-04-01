@@ -691,9 +691,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
-                use_msc = True if MultiStorageClientFeature.is_enabled() else False
                 fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=use_msc
+                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=args.enable_msc
                 )
 
                 save_state_dict_ret = save_state_dict_async_plan(
