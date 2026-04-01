@@ -485,3 +485,47 @@ class TestBridgeCommunicator:
         assert (
             dest_leaders == expected_dest_leaders
         ), f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+
+    def test_2d_fan_in_fwd_bwd(self):
+        """Fan-in with 2D tensors: 4 src DP ranks → 1 dest DP group, forward + backward."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
+        bridge = BridgeCommunicator(
+            src_grid,
+            dest_grid,
+            dim_mapping={'s': 0, 'h': 2, 'b': 1},
+            comm_dtype=torch.float32,
+            tensor_ndim=2,
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.full((577, 128), float(rank + 1), device='cuda')
+            grad = bridge.send_forward_recv_backward(tensor)
+            assert grad.shape == (577, 128)
+        else:
+            grad = torch.randn(577 * 4, 128, device='cuda')
+            activation = bridge.send_backward_recv_forward(grad)
+            assert activation.shape == (577 * 4, 128)
+
+    def test_2d_fan_out_fwd_bwd(self):
+        """Fan-out with 2D tensors: 1 src DP group → 4 dest DP ranks, forward + backward."""
+        src_grid = create_hypercomm_grid(offset=0, tp=4, cp=1, pp=1, dp=1)
+        dest_grid = create_hypercomm_grid(offset=4, tp=1, cp=1, pp=1, dp=4)
+        bridge = BridgeCommunicator(
+            src_grid,
+            dest_grid,
+            dim_mapping={'s': 0, 'h': 2, 'b': 1},
+            comm_dtype=torch.float32,
+            tensor_ndim=2,
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.randn(577 * 4, 128, device='cuda')
+            grad = bridge.send_forward_recv_backward(tensor)
+            assert grad.shape == (577 * 4, 128)
+        else:
+            grad = torch.full((577, 128), float(rank), device='cuda')
+            activation = bridge.send_backward_recv_forward(grad)
+            assert activation.shape == (577, 128)

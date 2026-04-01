@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
 
 
 @dataclass
@@ -56,6 +58,11 @@ class DistributedDataParallelConfig:
     """If true, use a reduce-scatter implementation which sends lower-precision values
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
+
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
+    """List of param_name patterns (in Python's fnmatch format) to match against to do
+       local gradient accumulation in FP32. The special pattern 'all' matches every
+       parameter. Do not specify when grad_reduce_in_fp32 is already True."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
@@ -162,6 +169,33 @@ class DistributedDataParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
     def __post_init__(self):
         import os
 
@@ -175,3 +209,9 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "Only need to explicitly specify param_name patterns for FP32 local accumulation "
+                "if .main_grads aren't already in FP32"
+            )
