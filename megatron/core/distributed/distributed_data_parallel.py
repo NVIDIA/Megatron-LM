@@ -12,6 +12,8 @@ from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
+from nemo.lens.helpers import trace_fn as _otel_trace_fn
+
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
@@ -510,6 +512,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     if len(fp8_params) > 0:
                         post_all_gather_processing(fp8_params)
 
+    @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
@@ -522,6 +525,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
+    @_otel_trace_fn('communication', 'megatron.grad_sync.finish')
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
