@@ -2632,6 +2632,13 @@ class ParamAndGradBuffer:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
+            # For FSDP with delayed_wgrad_compute, `skip_backward_post_hook` needs
+            # to be reset on new param for correct grad accumulation of wgrad computation.
+            setattr(
+                new_param,
+                'skip_backward_post_hook',
+                getattr(old_param, 'skip_backward_post_hook', False),
+            )
         for item_id, p in enumerate(self.params):
             if p in param_map:
                 new_p = param_map[p]
