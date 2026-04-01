@@ -60,11 +60,6 @@ class TESpecProvider(BackendSpecProvider):
         return TERowParallelLinear
 
     @override
-    def fuse_layernorm_and_linear(self) -> bool:
-        """TE backend chooses a single module for layernorm and linear"""
-        return True
-
-    @override
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear

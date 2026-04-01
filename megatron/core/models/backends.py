@@ -76,11 +76,6 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend support a single module for layernorm and linear"""
-        ...
-
-    @abstractmethod
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""
         ...
@@ -126,11 +121,6 @@ class LocalSpecProvider(BackendSpecProvider):
     def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
-
-    @override
-    def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend choose a single module for layernorm and linear"""
-        return False
 
     @override
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
@@ -190,11 +180,6 @@ class InferenceSpecProvider(BackendSpecProvider):
     def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
-
-    @override
-    def fuse_layernorm_and_linear(self) -> bool:
-        """TE backend chooses a single module for layernorm and linear"""
-        return True
 
     @override
     def column_parallel_layer_norm_linear(self) -> type[InferenceLayerNormColumnParallelLinear]:

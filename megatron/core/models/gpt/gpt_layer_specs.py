@@ -525,11 +525,7 @@ def get_mlp_module_spec_for_backend(
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         module = TEFusedMLP if use_te_op_fuser else MLP
-        if backend.fuse_layernorm_and_linear():
-            linear_fc1 = backend.column_parallel_layer_norm_linear()
-            assert linear_fc1 is not None
-        else:
-            linear_fc1 = backend.column_parallel_linear()
+        linear_fc1 = backend.column_parallel_layer_norm_linear() or backend.column_parallel_linear()
         return ModuleSpec(
             module=module,
             submodules=MLPSubmodules(
