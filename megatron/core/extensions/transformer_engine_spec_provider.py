@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import warnings
 from functools import partial
-from typing import Optional, cast
+from typing import cast
 
 from typing_extensions import final, override
 
@@ -20,11 +20,6 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.models.protocols import (
-    ColumnParallelLinearBuilder,
-    LinearBuilder,
-    RowParallelLinearBuilder,
-)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
@@ -45,22 +40,22 @@ class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
     @override
-    def linear(self) -> LinearBuilder:
+    def linear(self) -> type[TELinear]:
         """Which linear module TE backend uses"""
         return TELinear
 
     @override
-    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
+    def column_parallel_linear(self) -> type[TEColumnParallelLinear]:
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
     @override
-    def row_parallel_linear(self) -> RowParallelLinearBuilder:
+    def row_parallel_linear(self) -> type[TERowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 
     @override
-    def column_parallel_layer_norm_linear(self) -> Optional[ColumnParallelLinearBuilder]:
+    def column_parallel_layer_norm_linear(self) -> type[TELayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
@@ -78,7 +73,7 @@ class TESpecProvider(BackendSpecProvider):
         return _TENormWithResidual if has_residual else TENorm
 
     @override
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 

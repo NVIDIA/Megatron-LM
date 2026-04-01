@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     import torch
 
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.enums import AttnMaskType
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -82,3 +85,38 @@ class RowParallelLinearBuilder(Protocol):
         tp_comm_buffer_name: str | None,
         tp_group: torch.distributed.ProcessGroup | None,
     ) -> LinearInterface: ...
+
+
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention layers."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: torch.Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
+    ) -> torch.Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Interface for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: str | None,
+        softmax_scale: float | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...

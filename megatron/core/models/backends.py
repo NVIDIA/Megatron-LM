@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.models.protocols import (
     ColumnParallelLinearBuilder,
+    CoreAttentionBuilder,
     LinearBuilder,
     RowParallelLinearBuilder,
 )
@@ -88,7 +89,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def core_attention(self) -> type:
+    def core_attention(self) -> CoreAttentionBuilder:
         """Which module to use for attention"""
         ...
 
@@ -113,17 +114,17 @@ class LocalSpecProvider(BackendSpecProvider):
         raise NotImplementedError("LocalSpecProvider does not have a linear module")
 
     @override
-    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
+    def column_parallel_linear(self) -> type[ColumnParallelLinear]:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
     @override
-    def row_parallel_linear(self) -> RowParallelLinearBuilder:
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
     @override
-    def column_parallel_layer_norm_linear(self) -> Optional[ColumnParallelLinearBuilder]:
+    def column_parallel_layer_norm_linear(self) -> None:
         """Which module for sequential layernorm and linear"""
         return None
 
@@ -140,7 +141,7 @@ class LocalSpecProvider(BackendSpecProvider):
         return LNImpl
 
     @override
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[DotProductAttention]:
         """Which module to use for attention"""
         return DotProductAttention
 
@@ -167,17 +168,17 @@ class InferenceSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
     @override
-    def linear(self) -> LinearBuilder:
+    def linear(self) -> type[TELinear]:
         """Which linear module TE backend uses"""
         return TELinear
 
     @override
-    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
+    def column_parallel_linear(self) -> type[InferenceColumnParallelLinear]:
         """Which column parallel linear module TE backend uses"""
         return InferenceColumnParallelLinear
 
     @override
-    def row_parallel_linear(self) -> RowParallelLinearBuilder:
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 
