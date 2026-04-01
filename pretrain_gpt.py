@@ -31,11 +31,10 @@ from megatron.core.parallel_state import get_context_parallel_group, get_hybrid_
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, StragglerDetector, preprocess_sft_batch, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.core.utils import get_attr_wrapped_model, StragglerDetector, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -43,7 +42,7 @@ from megatron.training import (
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.datasets.sft_dataset import SFTDataset, IGNORE_INDEX
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
@@ -71,10 +70,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
-    tp_size = args.tensor_model_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    sp = args.sequence_parallel
-    max_seq_len = args.seq_length
     is_sft = args.sft
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
@@ -86,8 +82,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
-        if is_sft:
-            batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len)
         for key in BATCH_KEYS:
             batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 
