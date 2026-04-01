@@ -2206,7 +2206,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_group=p2p_communicator.pp_group,
+        pp_group=getattr(p2p_communicator, 'pp_group', None),
         is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
@@ -2216,7 +2216,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_group=p2p_communicator.pp_group,
+        pp_group=getattr(p2p_communicator, 'pp_group', None),
         is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
