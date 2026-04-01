@@ -50,4 +50,6 @@ MODEL_ARGS:
   --ckpt-format: fsdp_dtensor
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
