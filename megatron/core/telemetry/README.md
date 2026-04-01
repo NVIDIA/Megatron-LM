@@ -62,8 +62,8 @@ keywords, individual group names, or a mix.
 | Keyword | Groups included | Overhead |
 |---|---|---|
 | `default` | `job`, `checkpoint`, `evaluate`, `inference` | < 0.1 % — safe for production |
-| `per_step` | all of `default` + `model_init`, `load_checkpoint`, `step`, `forward_backward`, `optimizer` | < 1 % — use with sampling |
-| `all` | everything including `microbatch` | > 1 % — dev/debug only |
+| `per_step` | all of `default` + `model_init`, `load_checkpoint`, `step`, `forward_backward`, `optimizer`, `communication`, `data_loading` | < 1 % — use with sampling |
+| `all` | everything including `microbatch`, `activation_offload` | > 1 % — dev/debug only |
 
 ### Individual group names
 
@@ -78,6 +78,9 @@ keywords, individual group names, or a mix.
 | `forward_backward` | `megatron.forward_backward` | every iteration |
 | `optimizer` | `megatron.optimizer_step` | every iteration |
 | `microbatch` | `megatron.microbatch.forward`, `megatron.microbatch.backward` | every microbatch |
+| `communication` | `megatron.p2p.{recv,send}_{forward,backward}`, `megatron.grad_sync.{start,finish}` | every iteration |
+| `activation_offload` | `megatron.activation.offload`, `megatron.activation.reload` | every microbatch |
+| `data_loading` | (reserved for future use) | every iteration |
 | `inference` | `text_completion {model}` | every inference request |
 
 ### Examples
@@ -99,19 +102,31 @@ MEGATRON_OTEL_SPAN_GROUPS=all
 ### Span hierarchy
 
 ```
-megatron.pretrain                              # job
-  ├── megatron.model_init                      # model_init
-  ├── megatron.load_checkpoint                 # load_checkpoint
-  └── megatron.train                           # job
-        ├── megatron.train_step                # step
-        │     ├── megatron.forward_backward    # forward_backward
-        │     │     ├── megatron.microbatch.forward   # microbatch (×N per step)
-        │     │     └── megatron.microbatch.backward  # microbatch (×N per step)
-        │     └── megatron.optimizer_step      # optimizer
-        ├── megatron.save_checkpoint           # checkpoint
-        └── megatron.evaluate                  # evaluate
+megatron.pretrain                                    # job
+  ├── megatron.model_init                            # model_init
+  ├── megatron.load_checkpoint                       # load_checkpoint
+  │     └── megatron.load_checkpoint.io_read         # load_checkpoint
+  └── megatron.train                                 # job
+        ├── megatron.train_step                      # step
+        │     ├── megatron.forward_backward          # forward_backward
+        │     │     ├── megatron.microbatch.forward   # microbatch (×N)
+        │     │     ├── megatron.microbatch.backward  # microbatch (×N)
+        │     │     ├── megatron.p2p.recv_forward     # communication
+        │     │     ├── megatron.p2p.send_forward     # communication
+        │     │     ├── megatron.p2p.recv_backward    # communication
+        │     │     ├── megatron.p2p.send_backward    # communication
+        │     │     ├── megatron.activation.offload   # activation_offload
+        │     │     └── megatron.activation.reload    # activation_offload
+        │     ├── megatron.grad_sync.start           # communication
+        │     ├── megatron.grad_sync.finish           # communication
+        │     └── megatron.optimizer_step             # optimizer
+        ├── megatron.save_checkpoint                 # checkpoint
+        │     ├── megatron.save_checkpoint.state_dict # checkpoint
+        │     └── megatron.save_checkpoint.io_write   # checkpoint
+        └── megatron.evaluate                        # evaluate
+              └── megatron.evaluate.step              # evaluate (×N)
 
-text_completion {model}                        # inference server (GenAI semconv)
+text_completion {model}                              # inference (GenAI semconv)
 ```
 
 ### Training span attributes
