@@ -1,14 +1,19 @@
 import functools
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+from torch.distributed.utils import (
+    _apply_to_tensors,
+    _cast_forward_inputs,
+    _p_assert,
+    _to_kwargs,
+)
 
 from .param_group import ParameterGroup
-from .mixed_precision import MixedPrecisionPolicy
 
 
 def fully_shard(
@@ -17,8 +22,8 @@ def fully_shard(
     mesh: DeviceMesh | None = None,
     reshard_after_forward: bool | int | None = None,
     shard_placement_fn: Callable[[nn.Parameter], Shard | None] | None = None,
-    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
-    offload_policy: "OffloadPolicy" = None,
+    mp_policy: Optional["MixedPrecisionPolicy"] = None,
+    offload_policy: Optional["OffloadPolicy"] = None,
     ignored_params: set[nn.Parameter] | None = None,
 ):
     if isinstance(module, FSDPModule):
@@ -38,55 +43,78 @@ def fully_shard(
             ignored_params.update(fsdp_sub_module.parameters())
 
     fsdp_param_groups = _get_module_fsdp_param_groups(
-        module, mesh=mesh, ignored_params=ignored_params
+        module, mesh, ignored_params=ignored_params
     )
 
-    # Replace the module class with FSDPModule and register the FSDP forward/backward hooks
+    # Make the module class as FSDPModule and register the FSDP forward/backward hooks
+    cls = module.__class__
+    new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    module.__class__ = new_cls
 
-    module.__class__ = FSDPModule
     setattr(module, "_fsdp_param_groups", fsdp_param_groups)
     _register_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
+
+    module.reshard()
     # _register_post_accumulate_grad_hooks(module)
 
     return module
 
-
 class FSDPModule(nn.Module):
-    pass
+
+    # def _init_each_param_name_of_param_groups(self):
+    #     self.param_name = []
+
+    #     for fsdp_param_group in self._fsdp_param_groups:
+    #         fsdp_param_group._init_dist_params()
+
+    #     self._named_params
+
+    def unshard(self):
+        self.param_to_name = {p: n for n, p in self.named_parameters()}
+        for fsdp_param_group in self._fsdp_param_groups:
+            fsdp_param_group.unshard()
+
+            for param, dist_param in zip(fsdp_param_group.params, fsdp_param_group.dist_params):
+                param_name = self.param_to_name[dist_param]
+                _replace_module_parameter(self, param_name, param)
+
+    def reshard(self):
+        self.param_to_name = {p: n for n, p in self.named_parameters()}
+        for fsdp_param_group in self._fsdp_param_groups:
+            fsdp_param_group.reshard()
+
+            for param, dist_param in zip(fsdp_param_group.params, fsdp_param_group.dist_params):
+                param_name = self.param_to_name[param]
+                _replace_module_parameter(self, param_name, dist_param)
 
 
 def _get_module_fsdp_param_groups(
     module, mesh: DeviceMesh | None = None, ignored_params: set[nn.Parameter] | None = None
 ):
-    dtype_to_param_groups = {
-        torch.bfloat16: [],
-        torch.float16: [],
-        torch.float32: [],
-        torch.float64: [],
-    }
+    param_groups = {}
 
     for param in module.parameters():
         if ignored_params is not None and param in ignored_params:
             continue
-        assert (
-            param.dtype in dtype_to_param_groups
-        ), f"Unsupported dtype {param.dtype} for FSDP parameters."
-        dtype_to_param_groups[param.dtype].append(param)
 
-    param_groups = []
-    for dtype, params in dtype_to_param_groups.items():
-        param_groups.append(ParameterGroup(params, dtype, mesh=mesh))
+        param_attrs = (param.device, param.dtype, param.requires_grad)
+        if param_attrs not in param_groups:
+            param_groups[param_attrs] = []
+        param_groups[param_attrs].append(param)
 
-    return param_groups
+    fsdp_param_groups = []
+    for params in param_groups.values():
+        fsdp_param_groups.append(ParameterGroup(params, params[0].dtype, mesh=mesh))
+
+    return fsdp_param_groups
 
 
 def _register_forward_pre_hook(module: FSDPModule):
     def unshard_param_groups(module, *unused):
-        for fsdp_param_group in module._fsdp_param_groups:
-            fsdp_param_group.unshard()
+        module.unshard()
 
     module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
         unshard_param_groups, prepend=True
@@ -95,8 +123,7 @@ def _register_forward_pre_hook(module: FSDPModule):
 
 def _register_forward_hook(module: FSDPModule):
     def reshard_param_groups(module, *unused):
-        for fsdp_param_group in module._fsdp_param_groups:
-            fsdp_param_group.reshard()
+        module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
 
@@ -137,8 +164,7 @@ def _register_backward_pre_hook(module: FSDPModule):
         return module.register_forward_hook(forward_hook)
 
     def param_groups_unshard(module, grads):
-        for fsdp_param_group in module._fsdp_param_groups:
-            fsdp_param_group.unshard()
+        module.unshard()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=param_groups_unshard
@@ -146,10 +172,10 @@ def _register_backward_pre_hook(module: FSDPModule):
 
 
 def _register_backward_hook(module: FSDPModule):
-    def post_backward(module, grads):
+    def post_backward(module):
+        module.reshard()
         for fsdp_param_group in module._fsdp_param_groups:
-            fsdp_param_group.reshard()
-            fsdp_param_group.grad_reduce()
+            fsdp_param_group.reduce_grad()
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -244,3 +270,16 @@ class RegisterFSDPBackwardFunction(torch.autograd.Function):
         """
         ctx.post_backward()
         return (None,) + grads
+
+
+def _replace_module_parameter(module, name, new_param):
+    """
+    Replace a module's parameter with a new parameter, preserving the hierarchy.
+    """
+    parts = name.split(".")
+    parent = module
+    for part in parts[:-1]:  # Navigate to parent module
+        parent = getattr(parent, part)
+
+    # Replace the parameter
+    setattr(parent, parts[-1], new_param)

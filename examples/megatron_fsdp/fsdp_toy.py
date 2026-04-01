@@ -62,7 +62,7 @@ def build_fsdp_model(
     use_megatron_fsdp: bool,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
-        from megatron.core.distributed.fsdp import fully_shard_v2 as fully_shard, FSDPModule
+        from megatron.core.distributed.fsdp.src.megatron_fsdp import fully_shard_v2 as fully_shard, FSDPModule
     else:
         from torch.distributed.fsdp import fully_shard, FSDPModule
 

@@ -17,13 +17,14 @@ from typing import Iterable, List, Union
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
+from torch.distributed.tensor import DeviceMesh
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     MetadataIndex,
     TensorProperties,
 )
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
-from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard, Placement
 
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
@@ -481,3 +482,20 @@ def split_dtensor(
             update_uneven_dtensor_chunk_metadata(new_dtensor)
 
         yield new_dtensor
+
+
+def make_uneven_dtensor(
+    local_tensor: torch.Tensor,
+    shape: torch.Size,
+    dp_mesh: DeviceMesh,
+    placements: List[Placement],
+):
+    assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    return DTensor.from_local(
+        local_tensor=local_tensor.view(-1, *local_tensor.shape[1:]),
+        device_mesh=dp_mesh,
+        placements=placements,
+        run_check=False,
+        shape=shape,
+        stride=torch.empty(shape, device="meta").stride(),
+    )

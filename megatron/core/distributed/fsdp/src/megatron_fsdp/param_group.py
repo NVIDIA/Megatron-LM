@@ -1,9 +1,12 @@
 from typing import Dict, List, Optional
 
 import torch
+from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from .allocator import TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer
+from .uneven_dtensor import make_uneven_dtensor
 
 
 class ParameterGroup:
@@ -12,9 +15,9 @@ class ParameterGroup:
         self,
         params: List[torch.nn.Parameter],
         fsdp_unit_id: int,
-        dp_group: torch.distributed.ProcessGroup,
-        device: torch.device,
-        sharding_strategy: str = "no_shard",
+        *,
+        mesh: Optional[DeviceMesh] = None,
+        sharding_strategy: str = "optim_grads_params",
         param_group_id: int = 0,
         chunk_size_factor: int = 1,
         main_params_dtype: Optional[torch.dtype] = None,
@@ -25,12 +28,19 @@ class ParameterGroup:
         self.param_idx: Dict[torch.nn.Parameter, int] = {
             p: i for i, p in enumerate(params)
         }
+        # TODO: validate that all params have the same device/dtype/require_grad
+        self.device = params[0].device
         self.dtype = params[0].dtype
         self.requires_grad = params[0].requires_grad
         self.fsdp_unit_id = fsdp_unit_id
 
-        self.dp_group = dp_group
-        self.device = device
+        self.mesh = mesh
+        if mesh is not None:
+            assert mesh.ndim == 1, "Only 1D mesh is supported for now"
+            self.dp_group = mesh.get_group()
+        else:
+            self.dp_group = torch.distributed.group.WORLD
+
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
         self.chunk_size_factor = chunk_size_factor
@@ -87,3 +97,34 @@ class ParameterGroup:
             gbuf = self._create_buffer(self.dtype, shard_grads)
             gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
             self.main_grad_buffer = gbuf
+
+        self._init_dist_params()
+
+    def unshard(self):
+        self.model_weight_buffer.unshard()
+
+    def reshard(self):
+        self.model_weight_buffer.reshard()
+
+    def reduce_grad(self):
+        self.main_grad_buffer.reduce_grad()
+
+    def _init_dist_params(self):
+        self.dist_params = []
+        s = self.sharding_strategy
+        if s == "optim_grads_params":
+            placements = [Shard(dim=0)]
+        else:
+            placements = [Replicate()]
+        for p in self.params:
+            if s != "no_shard":
+                wbuf = self.model_weight_buffer
+                data = wbuf.get_item(self.param_idx[p])
+            else:
+                data = p.detach()
+
+            self.dist_params.append(
+                torch.nn.Parameter(
+                    make_uneven_dtensor(data, p.shape, self.mesh, placements)
+                )
+            )

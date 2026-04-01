@@ -29,6 +29,7 @@ class TemporaryBucketAllocator:
             self.buckets[param_group_id] = Bucket(
                 data=torch.empty(size, dtype=dtype, device=device)
             )
+        self.buckets[param_group_id].data._typed_storage()._resize_(size)
         return self.buckets[param_group_id]
 
     def free(self, param_group_id: int) -> None:
@@ -37,4 +38,4 @@ class TemporaryBucketAllocator:
                 storage = self.buckets[param_group_id].data._typed_storage()
                 if storage._size() != 0:
                     storage._resize_(0)
-            del self.buckets[param_group_id]
+            # del self.buckets[param_group_id]
