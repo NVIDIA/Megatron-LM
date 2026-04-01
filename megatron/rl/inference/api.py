@@ -23,6 +23,7 @@ class InferenceResponse(BaseModel):
     token_ids: list[int] | None = None
     prompt_length: int | None = None
     logprobs: list[float] | None = None
+    finish_reason: str | None = None
     policy_epoch: list[tuple[int, int]]
     kv_cache_epoch: list[tuple[int, int]]
     num_evictions: int

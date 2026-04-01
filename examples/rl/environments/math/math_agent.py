@@ -34,7 +34,8 @@ class MathAgent(RewardOnlyAgent):
             answer_format (str): Which answer format is expected: "tagged" for <answer> tags,
                 or "boxed" for \boxed{} LaTeX formatting.
             negative_reward (float): Reward assigned for a clearly incorrect or unparseable answer.
-            partial_end_reward (float): Reward when the answer is correct but an expected end token is not matched exactly.
+            partial_end_reward (float): Reward when the answer is correct and nothing follows it,
+                but generation did not intentionally stop via an end-of-text token/string.
             **kwargs: Additional arguments for the base RewardOnlyAgent.
         """
         super().__init__(**kwargs)
@@ -46,23 +47,28 @@ class MathAgent(RewardOnlyAgent):
         self.negative_reward = negative_reward
         self.partial_end_reward = partial_end_reward
 
-    def compute_score(self, response: str, golden: dict, golden_key: str = "answer") -> float:
+    def compute_score(
+        self,
+        response: str,
+        golden: dict,
+        golden_key: str = "answer",
+        finish_reason: str | None = None,
+    ) -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.
 
         Uses the final answer in the response string to compute the score.
         """
-        # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)
-        matched_format = None
-        end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>", "<|eot_id|>", "<|im_end|>"]
+        # Generation that stopped cleanly (EOD or stop word) rather than
+        # hitting the token limit is eligible for full reward.
+        stopped = finish_reason != "length"
 
-        # Only an answer immediately followed by a known end token yields 1.0 reward.
         answer_tag_pattern = r'<answer>(.*?)</answer>'
         answer_tag_match = list(re.finditer(answer_tag_pattern, response, re.DOTALL))
         if answer_tag_match:
             # Only consider the last occurrence
             last_match = answer_tag_match[-1]
             final_answer = last_match.group(1).strip()
-            after = response[last_match.end():].lstrip()  # strip whitespace between </answer> and token
+            after = response[last_match.end():].strip()
 
             try:
                 parsed_answer = parse(final_answer)
@@ -73,15 +79,10 @@ class MathAgent(RewardOnlyAgent):
 
             correct_answer = verify(str(golden[golden_key]), parsed_answer)
             if correct_answer:
-                # Accept either <|end_of_text|> or <|endoftext|> as valid terminators, for flexibility.
-                for token in end_tokens:
-                    if after.startswith(token):
-                        return 1.0
-                # If the end token is present later (extra text before it), give partial credit.
-                for token in end_tokens:
-                    if token in after:
-                        return self.partial_end_reward
-                # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
+                if stopped and not after:
+                    return 1.0
+                if not after:
+                    return self.partial_end_reward
                 return self.format_reward
             else:
                 # Incorrect answer, regardless of format/end-of-text
@@ -93,7 +94,7 @@ class MathAgent(RewardOnlyAgent):
             if boxed_match:
                 last_match = boxed_match[-1]
                 final_answer = last_match.group(1).strip()
-                after = response[last_match.end():].lstrip()
+                after = response[last_match.end():].strip()
                 try:
                     parsed_answer = parse(final_answer)
                 except ValueError as e:
@@ -103,12 +104,10 @@ class MathAgent(RewardOnlyAgent):
 
                 correct_answer = verify(str(golden[golden_key]), parsed_answer)
                 if correct_answer:
-                    for token in end_tokens:
-                        if after.startswith(token):
-                            return 1.0
-                    for token in end_tokens:
-                        if token in after:
-                            return self.partial_end_reward
+                    if stopped and not after:
+                        return 1.0
+                    if not after:
+                        return self.partial_end_reward
                     return self.format_reward
                 else:
                     # Formatting is correct but the answer is incorrect
