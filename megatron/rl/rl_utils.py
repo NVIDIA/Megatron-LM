@@ -341,6 +341,100 @@ def get_rl_runtime_state():
     return _rl_runtime_state
 
 
+def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
+    """Compute, log, and store RL token throughput metrics.
+
+    Returns a string fragment to append to the training log line.
+    Also logs metrics to wandb and stores them on RLRuntimeState for
+    downstream consumers (e.g. RLProfiler).
+    """
+    log_string = ''
+    tokens_per_sec = None
+    tokens_per_sec_per_gpu = None
+    compute_tokens_per_sec = None
+    compute_tokens_per_sec_per_gpu = None
+    actual_tokens_per_sec = None
+    actual_tokens_per_sec_per_gpu = None
+    packing_efficiency = None
+
+    if args.seq_length > 0:
+        tokens_per_iteration = batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+
+        # For sequence packing, break down into compute vs actual tokens
+        if args.rl_use_sequence_packing:
+            runtime_state = get_rl_runtime_state()
+            if runtime_state.packing_context is not None:
+                dp_world_size = mpu.get_data_parallel_world_size()
+
+                compute_tokens = get_packing_compute_tokens(runtime_state.packing_context)
+                all_ranks_compute_tokens = compute_tokens * dp_world_size
+                compute_tokens_per_sec = all_ranks_compute_tokens / elapsed_time_per_iteration
+                compute_tokens_per_sec_per_gpu = compute_tokens_per_sec / args.world_size
+
+                actual_tokens = get_packing_actual_tokens(runtime_state.packing_context)
+                all_ranks_actual_tokens = actual_tokens * dp_world_size
+                actual_tokens_per_sec = all_ranks_actual_tokens / elapsed_time_per_iteration
+                actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / args.world_size
+
+                packing_efficiency = get_packing_efficiency(runtime_state.packing_context)
+
+        # Add tokens/sec to log string
+        log_string += f' toks/s: {tokens_per_sec:.0f} |'
+        log_string += f' toks/s/gpu: {tokens_per_sec_per_gpu:.0f} |'
+        if compute_tokens_per_sec is not None:
+            log_string += f' compute_toks/s: {compute_tokens_per_sec:.0f} |'
+            log_string += f' compute_toks/s/gpu: {compute_tokens_per_sec_per_gpu:.0f} |'
+        if actual_tokens_per_sec is not None:
+            log_string += f' actual_toks/s: {actual_tokens_per_sec:.0f} |'
+            log_string += f' actual_toks/s/gpu: {actual_tokens_per_sec_per_gpu:.0f} |'
+            log_string += f' packing_eff: {packing_efficiency:.1%} |'
+
+    # Log throughput metrics to wandb
+    if wandb_writer is not None:
+        if tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/tokens_per_sec': tokens_per_sec,
+                'throughput/tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+            }, iteration)
+        if compute_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/compute_tokens_per_sec': compute_tokens_per_sec,
+                'throughput/compute_tokens_per_sec_per_gpu': compute_tokens_per_sec_per_gpu,
+            }, iteration)
+        if actual_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/actual_tokens_per_sec': actual_tokens_per_sec,
+                'throughput/actual_tokens_per_sec_per_gpu': actual_tokens_per_sec_per_gpu,
+                'throughput/packing_efficiency': packing_efficiency,
+            }, iteration)
+
+    # Store derived throughput metrics on RLRuntimeState so that
+    # downstream consumers (e.g. RLProfiler) can read them.
+    runtime_state = get_rl_runtime_state()
+    runtime_state.tokens_per_sec = tokens_per_sec
+    runtime_state.tokens_per_sec_per_gpu = tokens_per_sec_per_gpu
+    runtime_state.compute_tokens_per_sec = compute_tokens_per_sec
+    runtime_state.compute_tokens_per_sec_per_gpu = compute_tokens_per_sec_per_gpu
+    runtime_state.actual_tokens_per_sec = actual_tokens_per_sec
+    runtime_state.actual_tokens_per_sec_per_gpu = actual_tokens_per_sec_per_gpu
+    runtime_state.packing_efficiency = packing_efficiency
+
+    # Log average sequence length. With packing this shows real sequence
+    # lengths; without packing it equals seq_length as a baseline.
+    packing_ctx = runtime_state.packing_context
+    if args.rl_use_sequence_packing and packing_ctx is not None:
+        avg_seq_length = get_packing_avg_seq_length(packing_ctx)
+        log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+        if wandb_writer is not None:
+            wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
+    elif args.log_throughput:
+        log_string += f' avg_seq_len: {args.seq_length} |'
+
+    return log_string
+
+
 def update_inference_logprobs_group_stats(
     old_logprobs: torch.Tensor,
     inference_logprobs: torch.Tensor,
