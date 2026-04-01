@@ -38,7 +38,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
-from .async_utils import is_empty_async_queue, schedule_async_save
+from .async_utils import _get_async_calls_queue, is_empty_async_queue, schedule_async_save
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest, _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -75,11 +75,10 @@ try:
         save_state_dict_async_plan,
     )
     HAVE_NVRX = True
-    async_queue = AsyncCallsQueue()
 except (ImportError, ModuleNotFoundError):
     HAVE_NVRX = False
-    async_queue = None
 
+_async_queue = _get_async_calls_queue("nvrx")
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -685,6 +684,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
+            if args.async_save and not HAVE_NVRX:
+                print_rank_0(
+                    "nvidia-resiliency-ext package is not installed. Async strategy will be disabled. "
+                    "Please, install nvidia-resiliency-ext package to use async strategy."
+                )
+                args.async_save = False
+
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
@@ -696,8 +702,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=True
                 )
-                save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
-                async_queue.schedule_async_request(save_request)
+                save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                _async_queue.schedule_async_request(save_request)
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -2102,7 +2108,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     return model
 
 
-def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
+def _get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
     """Creates an async save request with a finalize function."""
     save_fn, preload_fn, save_args = writer.get_save_function_and_args()
 

@@ -28,13 +28,16 @@ logger = logging.getLogger(__name__)
 _async_calls_queue = None
 
 
-def _get_async_calls_queue():
+def _get_async_calls_queue(async_strategy: str = None):
     """Get or lazily initialize the async calls queue."""
     global _async_calls_queue
 
     if _async_calls_queue is None:
-        args = get_args()
-        _, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
+        if async_strategy is not None:
+            _, async_modules = get_async_strategy(async_strategy)
+        else:
+            args = get_args()
+            _, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
         AsyncCallsQueue = async_modules["AsyncCallsQueue"]
         _async_calls_queue = AsyncCallsQueue(
             persistent=getattr(args, "use_persistent_ckpt_worker", False)
