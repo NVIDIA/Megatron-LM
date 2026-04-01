@@ -278,6 +278,46 @@ def test_null_tokenizer():
     assert tokenizer.vocab_size == 131073
 
 
+@pytest.mark.parametrize("skip_special_tokens", [True, False])
+@pytest.mark.parametrize(
+    "library",
+    ["null-text", "byte-level", "sentencepiece", "sft"],
+)
+def test_detokenize_skip_special_tokens_unsupported_backend(library, skip_special_tokens):
+    """skip_special_tokens must not raise on backends whose ids_to_text lacks the parameter."""
+    try:
+        if library == "null-text":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                metadata_path={"library": library}, vocab_size=131072
+            )
+            ids = tokenizer.tokenize("11 325 97")
+            expected = "11 325 97"
+        elif library == "byte-level":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                metadata_path={"library": library}, vocab_size=1024, _bos_id=3, special_tokens=[]
+            )
+            ids = tokenizer.tokenize("Hello")
+            expected = "Hello"
+        elif library == "sentencepiece":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                "/opt/data/tokenizers/sentencepiece/tokenizer.model"
+            )
+            ids = tokenizer.tokenize("I'm fine thanks.")
+            expected = "I'm fine thanks."
+        elif library == "sft":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                tokenizer_path="/opt/data/tokenizers/multimodal",
+                metadata_path={"library": "sft"},
+                prompt_format="nemotron-nano-v2",
+            )
+            ids = tokenizer.tokenize("abc")
+            expected = "abc"
+    except Exception:
+        pytest.skip(f"Could not load {library} tokenizer (path not available)")
+
+    assert tokenizer.detokenize(ids, skip_special_tokens=skip_special_tokens) == expected
+
+
 def test_bytelevel_tokenizer():
     metadata = {"library": "byte-level"}
     vocab_size = 1024
