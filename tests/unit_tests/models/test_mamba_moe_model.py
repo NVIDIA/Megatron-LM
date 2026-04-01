@@ -75,6 +75,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
@@ -284,6 +285,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_triton_nvls_kernels": False,
+    "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "auto",
     "inference_moe_disable_fused_quant_kernels": False,
 }

@@ -3,7 +3,7 @@
 import weakref
 from contextlib import nullcontext
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
@@ -330,6 +330,8 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with torch.cuda.stream(self.stream):
             nvtx_msg = f"{self.name} wgrad"
             nvtx_range_push(nvtx_msg)
@@ -492,6 +494,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
                             hidden_states
                         )
+
+                # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
+                # the layernorm returns (normalized_output, residual). Unpack
+                # and use the fused residual for the downstream BDA connection.
+                if isinstance(pre_mlp_layernorm_output, tuple):
+                    if len(pre_mlp_layernorm_output) != 2:
+                        raise ValueError(
+                            f"When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(pre_mlp_layernorm_output)}"
+                        )
+                    pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
