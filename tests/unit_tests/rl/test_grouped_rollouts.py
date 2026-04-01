@@ -54,7 +54,8 @@ class TestGroupedRollouts:
         [
             pytest.param(0, False, 8, 8, None, id="non_batched"),
             pytest.param(0, False, 4, 4, None, id="non_streaming_fewer_than_parallel"),
-            pytest.param(4, True, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
+            pytest.param(4, True, 2, 8, None, id="streaming_batched"),
+            pytest.param(0, True, 2, 16, None, id="streaming_steady_state_order"),
             pytest.param(0, True, 1, 10, None, id="streaming"),
         ],
     )
@@ -78,6 +79,14 @@ class TestGroupedRollouts:
         assert len(groups) == expected_count
         if expected_batch_ids is not None:
             assert [g.batch_id for g in groups] == expected_batch_ids
+        if num_slow_calls > 0 and streaming:
+            # Warmup should not block on slow batches.
+            batch_ids = [g.batch_id for g in groups]
+            num_slow_batches = num_slow_calls // num_groups
+            slow_batches = set(range(num_slow_batches))
+            assert batch_ids[0] not in slow_batches, (
+                f"Expected first group from a fast batch, got batch_id={batch_ids[0]}"
+            )
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):
