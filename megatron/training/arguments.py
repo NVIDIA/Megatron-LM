@@ -963,8 +963,6 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
-        print(args.ckpt_format)
-        args.ckpt_format = "fsdp_dtensor"
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron FSDP only supports fsdp_dtensor checkpoint format"
         
