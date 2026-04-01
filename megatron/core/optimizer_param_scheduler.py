@@ -3,8 +3,9 @@
 """Learning rate decay and weight decay incr functions."""
 import logging
 import math
-import torch
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
+
+import torch
 
 from megatron.core.utils import log_single_rank
 
