@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol, Union
+from typing import Optional, Protocol
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -28,9 +28,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.typed_torch import apply_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
 
 try:
@@ -49,14 +48,61 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+else:
+    TELinear, te_checkpoint = None, None
 
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+
+class ExpertsInterface(Protocol):
+    """Interface for the experts used in an MoELayer."""
+
+    def forward(
+        self,
+        dispatched_input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        /,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward pass of the experts layer."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass to compute weight gradients for the experts."""
+        ...
+
+
+class ExpertsBuilder(Protocol):
+    """Protocol for building the experts used in an MoELayer."""
+
+    def __call__(
+        self,
+        num_local_experts: int,
+        config: TransformerConfig,
+        /,
+        *,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> ExpertsInterface: ...
+
+
+class SharedExpertsInterface(Protocol):
+    """Interface for the shared experts used in an MoELayer."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> torch.Tensor:
+        """Forward pass of the shared experts."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass to compute weight gradients for the shared experts."""
+        ...
+
+
+class SharedExpertsBuilder(Protocol):
+    """Protocol for building the shared experts used in an MoELayer."""
+
+    def __call__(
+        self, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None, gate: bool
+    ) -> SharedExpertsInterface: ...
 
 
 class RouterInterface(Protocol):
@@ -90,8 +136,8 @@ class RouterBuilder(Protocol):
 class MoESubmodules:
     """MoE Layer Submodule spec"""
 
-    experts: Union[ModuleSpec, type] = None
-    shared_experts: Union[ModuleSpec, type] = None
+    experts: ExpertsBuilder
+    shared_experts: SharedExpertsBuilder | None = None
     router: RouterBuilder = TopKRouter
 
 
@@ -164,7 +210,7 @@ class MoELayer(BaseMoELayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
     ):
-        self.submodules = submodules
+        self.submodules = not_none(submodules)
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
         if pg_collection is None:
@@ -189,7 +235,7 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(
+        self.router = self.submodules.router(
             config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
         )
         self.tp_group = pg_collection.tp
@@ -197,7 +243,13 @@ class MoELayer(BaseMoELayer):
         # Initialize latent projections.
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
-            self.fc1_latent_proj = TELinear(
+            if self.config.transformer_impl == "inference_optimized":
+                from megatron.core.tensor_parallel.inference_layers import InferenceLinear
+
+                linear_cls = InferenceLinear
+            else:
+                linear_cls = TELinear
+            self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
                 parallel_mode="duplicated",
@@ -208,7 +260,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
             )
-            self.fc2_latent_proj = TELinear(
+            self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
                 parallel_mode="duplicated",
@@ -248,17 +300,16 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = build_module(
-            self.submodules.experts,
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
+        self.experts = self.submodules.experts(
+            self.num_local_experts, self.config, pg_collection=pg_collection
         )
 
         # Initialize shared experts
         if self.use_shared_expert:
-            self.shared_experts = build_module(
-                self.submodules.shared_experts,
+            assert (
+                self.submodules.shared_experts is not None
+            ), "Shared experts builder is not provided in the module spec."
+            self.shared_experts = self.submodules.shared_experts(
                 config=self.config,
                 pg_collection=pg_collection,
                 gate=self.config.moe_shared_expert_gate,
@@ -275,12 +326,14 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'te'."
                 )
-                if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
-                    warnings.warn(
-                        "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                        "The FlashInfer cutlass kernel will be JIT compiled,"
-                        "which may take a long time."
-                    )
+
+                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                # when using the FlashInfer backend. The flashinfer-jit-cache package
+                # must be installed ahead of time to avoid a multi-minute JIT
+                # compilation step at runtime.
+                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+
+                check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
                 assert hasattr(torch.nn.functional, 'grouped_mm'), (
                     "inference_grouped_gemm_backend='torch' requires "
@@ -397,7 +450,7 @@ class MoELayer(BaseMoELayer):
             if self.shared_experts_recompute:
                 if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
-                        self.shared_experts,
+                        apply_module(self.shared_experts),
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
                         parallel_state.get_tensor_model_parallel_group(),
@@ -405,10 +458,10 @@ class MoELayer(BaseMoELayer):
                     )
                 else:
                     shared_expert_output = tensor_parallel.checkpoint(
-                        self.shared_experts, False, hidden_states
+                        apply_module(self.shared_experts), False, hidden_states
                     )
             else:
-                shared_expert_output = self.shared_experts(hidden_states)
+                shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
         return shared_expert_output
 
@@ -428,11 +481,11 @@ class MoELayer(BaseMoELayer):
             and self.is_inference_cuda_graphed_iteration
         ):
             routing_map = self.token_dispatcher.routing_map
-            expert_output, mlp_bias = self.experts(
+            expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
-            expert_output, mlp_bias = self.experts(
+            expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"

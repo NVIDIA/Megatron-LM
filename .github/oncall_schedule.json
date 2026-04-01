@@ -1,13 +1,5 @@
 [
     {
-        "user": "maanug-nv",
-        "date": "2026-03-11"
-    },
-    {
-        "user": "dimapihtar",
-        "date": "2026-03-18"
-    },
-    {
         "user": "janEbert",
         "date": "2026-03-25"
     },
@@ -46,5 +38,13 @@
     {
         "user": "ilml",
         "date": "2026-05-27"
+    },
+    {
+        "user": "janEbert",
+        "date": "2026-06-03"
+    },
+    {
+        "user": "maanug-nv",
+        "date": "2026-06-10"
     }
 ]

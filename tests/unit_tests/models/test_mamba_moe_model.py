@@ -62,6 +62,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading": False,
     "cpu_offloading_activations": True,
     "cpu_offloading_double_buffering": False,
+    "cpu_offloading_retain_pinned_cpu_buffers": False,
     "cpu_offloading_num_layers": 0,
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
@@ -283,6 +284,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_triton_nvls_kernels": False,
+    "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "auto",
     "inference_moe_disable_fused_quant_kernels": False,
 }

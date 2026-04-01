@@ -104,6 +104,9 @@ class TestFullyShardedDataParallel:
             bucket_size=10000,
             use_megatron_fsdp=True,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
+            megatron_fsdp_main_params_dtype=main_params_dtype,
+            megatron_fsdp_main_grads_dtype=main_grads_dtype,
+            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
         )
         model = TestModel(input_dim=13, output_dim=17).cuda()
         transformer_config = TransformerConfig(
@@ -114,9 +117,6 @@ class TestFullyShardedDataParallel:
             ddp_config=fsdp_config,
             module=model,
             fsdp_unit_modules=[torch.nn.Linear],
-            main_params_dtype=main_params_dtype,
-            main_grads_dtype=main_grads_dtype,
-            grad_comm_dtype=grad_comm_dtype,
         )
         return fsdp_model
 
