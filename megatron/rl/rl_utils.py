@@ -801,8 +801,8 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
-            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
+            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
@@ -870,8 +870,8 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-rollout min policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        policy_epoch: Grouped list of per-token policy epoch stamps.
+        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
@@ -884,8 +884,12 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
-    true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
+    # Per-rollout staleness
+    rollout_policy_staleness = [current_iteration - min(r) for g in policy_epoch for r in g]
+    rollout_kv_staleness = [current_iteration - min(r) for g in kv_cache_epoch for r in g]
+    # Per-token staleness
+    per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
+    per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -907,12 +911,20 @@ def prep_wandb_metrics(
                 'advantages', 'Advantages'
             ),
             'rollout_table': wandb_writer.Table(
-                columns=['reward', 'traj_length', 'num_evictions'],
+                columns=[
+                    'reward', 'traj_length', 'num_evictions', 'policy_staleness', 'kv_staleness'
+                ],
                 data=list(zip(
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
                     [e for g in num_evictions for e in g],
+                    rollout_policy_staleness,
+                    rollout_kv_staleness,
                 )),
+            ),
+            'per_token_table': wandb_writer.Table(
+                columns=['policy_staleness', 'kv_staleness'],
+                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
             ),
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
@@ -929,16 +941,24 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            'mean_policy_staleness': np.mean(true_policy_staleness),
-            'max_policy_staleness': max(true_policy_staleness),
-            'min_policy_staleness': min(true_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
-            'max_kv_cache_staleness': max(true_kv_staleness),
-            'min_kv_cache_staleness': min(true_kv_staleness),
+            'mean_policy_staleness': np.mean(rollout_policy_staleness),
+            'max_policy_staleness': max(rollout_policy_staleness),
+            'min_policy_staleness': min(rollout_policy_staleness),
+            'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
+            'max_kv_cache_staleness': max(rollout_kv_staleness),
+            'min_kv_cache_staleness': min(rollout_kv_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
     }
+    metrics['per_token_policy_staleness_hist'] = wandb_writer.plot.histogram(
+        wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
+        'staleness', 'Per-Token Policy Staleness'
+    )
+    metrics['per_token_kv_staleness_hist'] = wandb_writer.plot.histogram(
+        wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
+        'staleness', 'Per-Token KV Cache Staleness'
+    )
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
