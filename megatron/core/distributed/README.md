@@ -1,6 +1,23 @@
-## How to use pytorch FSDP2?
+# Distributed Data Parallelism
 
-Add these flag to enable Torch FSDP2.
+This module contains 
+
+## Distributed Data Parallelism
+
+This is the default data parallelism used with all parallelism topologies in Megatron-LM.
+
+## Megatron-FSDP
+
+To use Megatron-FSDP in Megatron-LM, enable the following arguments:
+
+```
+--use-megatron-fsdp
+--ckpt-format fsdp_dtensor
+```
+
+## FSDP2
+
+To use FSDP2 in Megatron-LM, enable the following arguments:
 
 ```
 --use-torch-fsdp2
@@ -8,4 +25,4 @@ Add these flag to enable Torch FSDP2.
 --ckpt-format torch_dist
 ```
 
-It is worth noting that CUDA_MAX_CONNECTIONS=1 should not be enabled to ensure that the communication of FSDP and the computation on the primary stream can be fully parallelized.
+_**Note: FSDP2 is currently on a deprecation path, there may be functionality issues!**_
