@@ -73,6 +73,34 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
+def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
+    """Configure delayed wgrad gradient processing for MoE expert parameters.
+
+    When ``overlap_dispatch_backward_with_experts_wgrad`` is enabled on a TransformerLayer,
+    this function:
+      1. Marks expert parameters so the normal post-accumulate-grad hook is skipped.
+      2. Registers a callback on the MoE layer that invokes FSDP's gradient
+         reduce-scatter after the delayed wgrad computation completes.
+
+    Args:
+        module: The module being processed in the forward pre-hook. Only
+            ``TransformerLayer`` instances with the delayed wgrad config flag
+            enabled are affected; all other modules are no-ops.
+        process_post_backward_gradients_fn: The FSDP gradient processing function
+            (``_process_post_backward_gradients``) to be called after the delayed
+            wgrad computation finishes.
+    """
+    from functools import partial
+
+    need_backward_dw = getattr(module, "need_backward_dw", lambda: False)
+    if not need_backward_dw():
+        return
+
+    for param in module.parameters():
+        if getattr(param, 'skip_backward_post_hook', False):
+            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
+
+
 class MegatronFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training.
 
@@ -662,6 +690,23 @@ class MegatronFSDP(torch.nn.Module):
             """
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
+
+            # Filter out parameters whose gradient processing is deferred to a delayed
+            # wgrad accumulation hook (post_wgrad_grad_acc_hook).  If skip_backward_post_hook
+            # is set but the delayed hook was never installed, process the parameter
+            # immediately as a safety fallback to avoid silently dropping gradients.
+            param_list = [
+                p
+                for p in param_list
+                if not (
+                    getattr(p, 'skip_backward_post_hook', False)
+                    and hasattr(p, 'post_wgrad_grad_acc_hook')
+                )
+            ]
+
+            if not param_list:
+                return
+
             for param in param_list:
                 _grad_acc(param)
 
@@ -691,8 +736,17 @@ class MegatronFSDP(torch.nn.Module):
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(
-            module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+            module: nn.Module,
+            args: Optional[Tuple[Any, ...]] = None,
+            kwargs: Optional[Dict[str, Any]] = None,
         ):
+            # If args or kwargs are not passed, default to () and {}.
+            # This matches PyTorch Module hook conventions:
+            # torch.nn.Module._call_impl.inner()
+            if args is None:
+                args = ()
+            if kwargs is None:
+                kwargs = {}
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -719,14 +773,15 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
+
             return args, kwargs
 
         @torch.compiler.disable
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
-            args: Tuple[Any, ...],
-            kwargs: Dict[str, Any],
+            args: Optional[Tuple[Any, ...]] = None,
+            kwargs: Optional[Dict[str, Any]] = None,
         ):
             """
             Register a post-backward hook for the given module by inserting an autograd
@@ -735,6 +790,13 @@ class MegatronFSDP(torch.nn.Module):
             since such operations can trigger an autograd error that
             "the output is a view and is being modified in-place".
             """
+            # If args or kwargs are not passed, default to () and {}.
+            # This matches PyTorch Module hook conventions:
+            # torch.nn.Module._call_impl.inner()
+            if args is None:
+                args = ()
+            if kwargs is None:
+                kwargs = {}
             if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
                 return args, kwargs
@@ -967,6 +1029,8 @@ class MegatronFSDP(torch.nn.Module):
 
         fsdp_modules = []
         for name, module in root_module.named_modules():
+            # Set post backward hook for TE grouped gemm if enabled comm overlap
+            setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
                 _register_pre_backward_param_unshard_hook(module)
