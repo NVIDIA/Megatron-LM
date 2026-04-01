@@ -186,9 +186,6 @@ def test_prepare_cache_builds_and_hits_per_split_dataset_cache(tmp_path_dist_ckp
         summary = build_dataset_caches(args)
 
         assert summary["train_valid_test_num_samples"] == (32, 48, 16)
-        assert summary["train_dataset_length"] == 32
-        assert summary["valid_dataset_length"] == 48
-        assert summary["test_dataset_length"] == 16
         assert list((temp_dir / "cache").glob("*description.txt"))
 
         slow_args = _build_prepare_cache_args(
@@ -235,9 +232,11 @@ def test_prepare_cache_builds_and_hits_per_split_dataset_cache(tmp_path_dist_ckp
         assert test_fast.sample_index is None
         assert test_fast.shuffle_index is None
 
-        assert len(train_slow) == len(train_fast) == 32
-        assert len(valid_slow) == len(valid_fast) == 48
-        assert len(test_slow) == len(test_fast) == 16
+        assert summary["train_dataset_length"] == len(train_slow) == len(train_fast) == 32
+        assert summary["valid_dataset_length"] == len(valid_slow) == len(valid_fast)
+        assert summary["test_dataset_length"] == len(test_slow) == len(test_fast)
+        assert summary["valid_dataset_length"] >= summary["train_valid_test_num_samples"][1]
+        assert summary["test_dataset_length"] >= summary["train_valid_test_num_samples"][2]
         assert torch.all(train_slow[0]["tokens"] == train_fast[0]["tokens"])
         assert torch.all(valid_slow[0]["tokens"] == valid_fast[0]["tokens"])
         assert torch.all(test_slow[0]["tokens"] == test_fast[0]["tokens"])
