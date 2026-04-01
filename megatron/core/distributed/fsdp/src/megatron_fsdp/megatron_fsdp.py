@@ -593,7 +593,7 @@ class MegatronFSDP(torch.nn.Module):
                 return
 
             # Sharded Gradient Buffer
-            gbuf = group.hsdp_gbuf if group.hsdp_gbuf else group.main_grad_buffer
+            gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
                 if not param.grad_added_to_main_grad:
                     # Get `main_grad` will allocate bucket, check that the currently
