@@ -3292,17 +3292,18 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
-            loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=True,
-                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            )
+            with _otel_managed_span('evaluate', 'megatron.evaluate.step', **{'megatron.eval_iteration': iteration}):
+                loss_dicts = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=eval_num_microbatches,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
