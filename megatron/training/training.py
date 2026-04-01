@@ -1127,8 +1127,6 @@ def pretrain(
         _pretrain_span = _otel_tracer.start_span("megatron.pretrain")
         _otel_set_attrs(_pretrain_span, {
             'megatron.model_type': str(model_type),
-            'megatron.train_iters': getattr(args, 'train_iters', 0),
-            'megatron.global_batch_size': getattr(args, 'global_batch_size', 0),
         })
         _pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_pretrain_span))
 
@@ -2574,7 +2572,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if _opt_span is not None:
             _otel_set_attrs(_opt_span, {
                 "megatron.update_successful": bool(update_successful),
-                "megatron.grad_norm": grad_norm,
             })
 
     # get max attention logit for logging and run clip_qk()
@@ -3496,15 +3493,6 @@ def train(
             fault_injector_kwargs[f.name] = getattr(args, f.name)
     fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
 
-    # OTel: set span attribute on the active span started by the @_otel_trace_fn decorator.
-    # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
-    # so this is safe whether or not the group is enabled or the decorator fell back to no-op.
-    try:
-        from opentelemetry import trace as _ot
-        _ot.get_current_span().set_attribute('megatron.train_iters', getattr(args, 'train_iters', 0))
-    except Exception:  # noqa: BLE001 -- OTel must never crash training
-        pass
-
     _maybe_raise_workload_exception = None
     if (
         fault_injector_config.fault_injector_ranks is not None
@@ -4012,12 +4000,9 @@ def train(
                 ):
                     setup_fault_injection(fault_injector_config)
                 if _step_span is not None:
-                    _loss_val = next(iter(loss_dict.values())).item() if loss_dict else None
-                    _otel_safe_set_attrs(_step_span, {
-                        'megatron.loss': _loss_val,
-                        'megatron.grad_norm': grad_norm,
-                        'megatron.skipped': bool(skipped_iter),
-                    })
+                    _otel_safe_set_attrs(
+                        _step_span, {'megatron.skipped': bool(skipped_iter)}
+                    )
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
