@@ -117,10 +117,6 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-            # Add EOD, unless it's already present
-            if tokens_list[-1] != eod:
-                tokens_list.append(eod)
-                targets_list.append(eod)
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
