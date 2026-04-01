@@ -22,7 +22,9 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = await request.get_json()
+        req = await request.get_json(force=True)
+        if req is None:
+            return "Invalid or missing JSON body", 400
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -85,6 +87,11 @@ try:
             # skip_prompt_log_probs=False ensures the engine computes logprobs for prompt tokens
             skip_prompt_log_probs = not (echo and return_log_probs)
 
+            # Parse stop sequences
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -93,6 +100,7 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                stop_words=stop,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -108,6 +116,7 @@ try:
                 top_n_logprobs=sampling_params.top_n_logprobs,
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                stop_words=sampling_params.stop_words,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
@@ -125,17 +134,36 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format Response (matching old_completions.py) ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return f"Inference request(s) failed: {error_detail}", status
+
+        # --- 5. Format Response (matching old_completions.py) ---
         choices = []
 
         request_idx = 0
         for completed_request in batch_results:
-            request_dict = (
-                completed_request
-                if isinstance(completed_request, dict)
-                else completed_request.serialize()
-            )
-            result = unwrap_serialized_tensors(request_dict)
+            result = unwrap_serialized_tensors(completed_request)
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 

@@ -33,18 +33,14 @@ from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, gather_uneven_dtensor_to_full_tensor
 
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.strategies.common import load_common
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
 )
-from megatron.core.dist_checkpointing.validation import (
-    verify_checkpoint_and_load_strategy,
-)
+from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 
@@ -96,11 +92,9 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
 
     try:
         # Strategies initialization
-        sharded_strategy = get_default_load_sharded_strategy(checkpoint_dir)
+        sharded_strategy = TorchDistLoadShardedStrategy()
         sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-        sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-            checkpoint_dir, sharded_strategy, common_strategy=None
-        )
+        verify_checkpoint(checkpoint_dir)
         assert isinstance(
             sharded_strategy.base_strategy, TorchDistLoadShardedStrategy
         ), click.style(
@@ -108,7 +102,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
         )
 
         # Common state section
-        common_state = common_strategy.load_common(checkpoint_dir)
+        common_state = load_common(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -509,8 +503,10 @@ def convert_checkpoint(
                 is_param = True
 
             # Handle dist-opt flatten tensors
+            _has_mcore = hasattr(metadata, "mcore_data")
             if (
-                key in metadata.mcore_data
+                _has_mcore
+                and key in metadata.mcore_data
                 and "nd_reformulated_orig_global_shape" in metadata.mcore_data[key]
             ):
                 mcore_data = metadata.mcore_data[key]
@@ -602,30 +598,29 @@ def convert_checkpoint(
         if isinstance(fsdp_dtensor_state_dict[key], torch.Tensor):
             fsdp_dtensor_state_dict[key] = fsdp_dtensor_state_dict[key].cuda()
 
-    # Check MCore data
-    for key, value in list(metadata.mcore_data.items()):
-        if len(value) == 0:
-            del metadata.mcore_data[key]
-    if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
-        click.echo(
-            click.style(
-                f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
-                fg="yellow",
+    # Check MCore data (may not exist for pretrained-only checkpoints)
+    if hasattr(metadata, "mcore_data"):
+        for key, value in list(metadata.mcore_data.items()):
+            if len(value) == 0:
+                del metadata.mcore_data[key]
+        if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
+            click.echo(
+                click.style(
+                    f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
+                    fg="yellow",
+                )
             )
-        )
 
     # Handle args, optimizer.param_groups and other shared objects.
-    sharded_strategy = get_default_load_sharded_strategy(input_dir)
+    sharded_strategy = TorchDistLoadShardedStrategy()
     sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-    sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-        input_dir, sharded_strategy, common_strategy=None
-    )
+    verify_checkpoint(str(input_dir))
     assert isinstance(sharded_strategy.base_strategy, TorchDistLoadShardedStrategy), (
         click.style(
             f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
         )
     )
-    common_state = common_strategy.load_common(input_dir)
+    common_state = load_common(input_dir)
     try:
         if "param_groups" in common_state["optimizer"]:
             ckpt_param_groups = common_state["optimizer"]["param_groups"]

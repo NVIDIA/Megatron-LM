@@ -144,11 +144,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
         attention_mask = None
+        # Always skip MTP during dummy forwards.  When num_speculative_tokens > 0
+        # the serial MTP path handles MTP separately (with its own dummy forward).
+        # When num_speculative_tokens == 0 MTP is not needed at all.  In both
+        # cases, running MTP here would issue MoE all-to-all collectives that the
+        # real EP ranks do not execute, causing a hang.
         is_spec_decode = (
-            self.inference_context.is_dynamic_batching()
-            and self.inference_context.num_speculative_tokens > 0
+            self.inference_context.is_dynamic_batching() and self.config.mtp_num_layers is not None
         )
-
         return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
 
     def _get_batch_size_and_seq_len(

@@ -358,8 +358,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
-    policy_staleness: Optional[torch.Tensor] = None
-    kv_cache_staleness: Optional[torch.Tensor] = None
+    policy_epoch: Optional[list[tuple[int, int]]] = None
+    kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
@@ -377,13 +377,14 @@ class DynamicInferenceRequest(InferenceRequest):
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
 
-        # Compute block hashes for prefix matching
+        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
         if (
             self.enable_prefix_caching
             and self.block_size_tokens is not None
             and self.prompt_tokens is not None
+            and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
 
@@ -514,6 +515,8 @@ class DynamicInferenceRequest(InferenceRequest):
         blocks_hashed_total: Optional[int] = None,
         blocks_hashed_active: Optional[int] = None,
         blocks_ref_count: Optional[int] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
     ):
         """Add 'generated_token' event - records each generated token.
 
@@ -523,6 +526,8 @@ class DynamicInferenceRequest(InferenceRequest):
             blocks_hashed_total (int): All allocated (hashed) blocks.
             blocks_hashed_active (int): Blocks with ref_count > 0.
             blocks_ref_count (int): Sum of block ref counts from allocator.
+            pre_fwd_active_token_count (int): Active token count before forward pass.
+            pre_fwd_step_count (int): Step count before forward pass.
         """
         payload = {"token_id": token}
         if blocks_total is not None:
@@ -533,6 +538,10 @@ class DynamicInferenceRequest(InferenceRequest):
             payload["blocks_hashed_active"] = blocks_hashed_active
         if blocks_ref_count is not None:
             payload["blocks_ref_count"] = blocks_ref_count
+        if pre_fwd_active_token_count is not None:
+            payload["pre_fwd_active_token_count"] = pre_fwd_active_token_count
+        if pre_fwd_step_count is not None:
+            payload["pre_fwd_step_count"] = pre_fwd_step_count
         return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
 
     def add_event_pause(self):
@@ -610,53 +619,6 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    @staticmethod
-    def _update_staleness_tensor(
-        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True
-    ) -> torch.Tensor:
-        """Update a per-token staleness tensor, extending with zeros if needed.
-
-        Args:
-            tensor: Existing staleness tensor, or None to create a new one.
-            total_tokens: Expected length of the tensor after update.
-            increment: If True, increment all values by 1 (including new positions).
-        """
-        if tensor is None:
-            tensor = torch.zeros(total_tokens, dtype=torch.int32, device='cpu')
-        elif len(tensor) < total_tokens:
-            tensor = torch.cat(
-                (
-                    tensor,
-                    torch.zeros(
-                        total_tokens - len(tensor), dtype=tensor.dtype, device=tensor.device
-                    ),
-                ),
-                dim=0,
-            )
-        if increment:
-            tensor = tensor + 1
-        return tensor
-
-    def increment_staleness(self, policy_only: bool = False):
-        """Increment per-token staleness counters in-place.
-
-        Each call indicates that a training step has occurred since these tokens
-        were generated. Tokens not yet tracked are initialized to 1.
-
-        Args:
-            policy_only: If True, only increment policy_staleness. Use this for
-                evicted requests that have no KV cache to age.
-        """
-        request = self[-1]
-        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        request.policy_staleness = self._update_staleness_tensor(
-            request.policy_staleness, total_tokens, increment=True
-        )
-        if not policy_only:
-            request.kv_cache_staleness = self._update_staleness_tensor(
-                request.kv_cache_staleness, total_tokens, increment=True
-            )
-
     def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
         """Maintain reference to previous request, and then append a new request
         that concatenates the previous prompt and generations.
@@ -667,23 +629,12 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        total_tokens = len(old_request.prompt_tokens) + len(old_request.generated_tokens)
+        # Carry forward policy_epoch as-is.
+        policy_epoch = old_request.policy_epoch
 
-        # Carry forward policy_staleness without incrementing.
-        policy_staleness = (
-            self._update_staleness_tensor(
-                old_request.policy_staleness, total_tokens, increment=False
-            )
-            if old_request.policy_staleness is not None
-            else None
-        )
-
-        # Reset kv_cache_staleness to 0.
-        kv_cache_staleness = (
-            self._update_staleness_tensor(None, total_tokens, increment=False)
-            if old_request.kv_cache_staleness is not None
-            else None
-        )
+        # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
+        # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
+        kv_cache_epoch = None
 
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
@@ -714,8 +665,8 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -752,14 +703,8 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        # Ensure staleness tensors are always materialized (zeros if never incremented).
-        total_tokens = len(prompt_tokens) + len(generated_tokens)
-        policy_staleness = self._update_staleness_tensor(
-            self.requests[-1].policy_staleness, total_tokens, increment=False
-        )
-        kv_cache_staleness = self._update_staleness_tensor(
-            self.requests[-1].kv_cache_staleness, total_tokens, increment=False
-        )
+        policy_epoch = self.requests[-1].policy_epoch
+        kv_cache_epoch = self.requests[-1].kv_cache_epoch
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -774,14 +719,17 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request
