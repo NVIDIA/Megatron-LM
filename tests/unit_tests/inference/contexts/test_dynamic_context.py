@@ -2189,7 +2189,11 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 3, device='cuda')
+        # Use bs * 3 + 5 tokens so the prompt extends past the last full block.
+        # This avoids the single-token-chunk clamp (effective_prefill >= 2) and
+        # verifies that the prefix skip actually works.
+        tail = 5
+        prompt = torch.arange(bs * 3 + tail, device='cuda')
 
         # First request registers blocks.
         req1 = DynamicInferenceRequest(
@@ -2200,10 +2204,11 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req1)
-        first_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
+        # 3 full blocks are prefix-cacheable; the 4th (partial) block is not.
+        first_full_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
         avail_after_first = ctx.kv_block_allocator.total_avail
 
-        # Second request with same prefix should share all blocks.
+        # Second request with same prefix should share the 3 full blocks.
         req2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
@@ -2212,18 +2217,21 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req2)
-        second_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
+        second_full_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
 
-        # Blocks should be shared (same IDs, no pool consumption).
-        assert first_blocks == second_blocks
-        assert ctx.kv_block_allocator.total_avail == avail_after_first
+        # The 3 full blocks should be shared (same IDs).
+        assert first_full_blocks == second_full_blocks
 
-        # Ref counts should be 2.
-        for bid in first_blocks:
+        # Only 1 new block allocated for the partial tail of the second request.
+        assert ctx.kv_block_allocator.total_avail == avail_after_first - 1
+
+        # Ref counts on the shared full blocks should be 2.
+        for bid in first_full_blocks:
             assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
-        # Second request should skip prefix tokens (query_length == 1 for full match).
-        assert ctx.request_query_lengths[1].item() == 1
+        # Second request should skip the 3 full cached blocks (96 tokens),
+        # leaving only the trailing tokens as the query.
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2244,7 +2252,10 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        # Use bs * 2 + 5 tokens so the prompt extends past the last full block,
+        # avoiding the single-token-chunk clamp while still testing the skip.
+        tail = 5
+        prompt = torch.arange(bs * 2 + tail, device='cuda')
 
         # First request.
         req1 = DynamicInferenceRequest(
@@ -2266,10 +2277,10 @@ class TestDynamicContext:
         )
         ctx.add_request(req2)
 
-        # Full match: prefix_skip = min(2 * bs, 2*bs - 1) = 2*bs - 1
-        expected_skip = 2 * bs - 1
+        # 2 full blocks match → prefix_skip = 2 * bs = 64, query_length = tail.
+        expected_skip = 2 * bs
         assert ctx.request_kv_length_offsets[1].item() == expected_skip
-        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
