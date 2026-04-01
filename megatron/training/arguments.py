@@ -1206,6 +1206,12 @@ def validate_args(args, defaults={}):
                 'sequence_packing_scheduler=default_dynamic_cp'
             )
 
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        assert args.min_dynamic_context_parallel_size <= dp_cp_size, (
+            f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
+            f'must be <= dp_size * cp_size ({dp_cp_size})'
+        )
+
         import warnings
         warnings.warn(
             f"Dynamic CP enabled: dp_size * context_parallel_size="
