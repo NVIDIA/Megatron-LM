@@ -2232,8 +2232,9 @@ def training_log(
                 meter=_otel_telemetry_log.meter,
                 step_duration_ms=elapsed_time_per_iteration * 1000.0,
                 loss=_avg_loss,
-                throughput_tps=throughput if args.log_throughput else None,
+                throughput_tflops=throughput if args.log_throughput else None,
                 grad_norm=grad_norm,
+                learning_rate=learning_rate,
                 skipped_iters=int(total_loss_dict.get(skipped_iters_key, 0)),
             )
 
