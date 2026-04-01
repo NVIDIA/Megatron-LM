@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from megatron.core.distributed.fsdp_refactor.src.allocator import TemporaryBucketAllocator
+from .allocator import TemporaryBucketAllocator
 
 
 class BufferIndex:

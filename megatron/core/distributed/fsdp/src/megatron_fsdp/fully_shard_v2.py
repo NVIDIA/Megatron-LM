@@ -7,7 +7,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
-from .fsdp_param_group import FSDPParamGroup
+from .param_group import ParameterGroup
 from .mixed_precision import MixedPrecisionPolicy
 
 
@@ -78,7 +78,7 @@ def _get_module_fsdp_param_groups(
 
     param_groups = []
     for dtype, params in dtype_to_param_groups.items():
-        param_groups.append(FSDPParamGroup(params, dtype, mesh=mesh))
+        param_groups.append(ParameterGroup(params, dtype, mesh=mesh))
 
     return param_groups
 

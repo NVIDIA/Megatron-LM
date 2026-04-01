@@ -2,8 +2,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from megatron.core.distributed.fsdp_refactor.src.allocator import TemporaryBucketAllocator
-from megatron.core.distributed.fsdp_refactor.src.dp_buffer import DataParallelBuffer
+from .allocator import TemporaryBucketAllocator
+from .dp_buffer import DataParallelBuffer
 
 
 class ParameterGroup:
@@ -46,6 +46,8 @@ class ParameterGroup:
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
+        self._init_buffers()
+
     def _create_buffer(self, dtype: torch.dtype, is_distributed: bool) -> DataParallelBuffer:
         return DataParallelBuffer(
             params=self.params,
@@ -61,7 +63,7 @@ class ParameterGroup:
             sharding_strategy=self.sharding_strategy,
         )
 
-    def init_buffers(self) -> None:
+    def _init_buffers(self) -> None:
         s = self.sharding_strategy
         shard_weights = s == "optim_grads_params"
         shard_main_weights = s != "no_shard"
