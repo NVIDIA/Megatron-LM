@@ -2225,6 +2225,11 @@ def training_log(
                 / float(max(1, total_loss_dict.get(advanced_iters_key, 1)))
                 if _loss_keys else None
             )
+            _tokens_per_sec = (
+                batch_size * args.seq_length / elapsed_time_per_iteration
+                if elapsed_time_per_iteration > 0 else None
+            )
+            _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
             record_training_metrics(
                 meter=_otel_telemetry_log.meter,
                 step_duration_ms=elapsed_time_per_iteration * 1000.0,
@@ -2233,6 +2238,8 @@ def training_log(
                 grad_norm=grad_norm,
                 learning_rate=learning_rate,
                 skipped_iters=int(total_loss_dict.get(skipped_iters_key, 0)),
+                tokens_per_sec=_tokens_per_sec,
+                memory_allocated_gb=_mem_gb,
             )
 
         reported_memory_in_this_iteration = False
