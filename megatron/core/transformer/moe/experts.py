@@ -15,6 +15,7 @@ from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -40,16 +41,10 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.typed_torch import apply_module, not_none
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
-
-    HAVE_TE = True
-
-except ImportError:
-
-    HAVE_TE = False
+else:
+    Fp8Padding, Fp8Unpadding = None, None
 
 try:
     import flashinfer.fused_moe as fused_moe
@@ -142,7 +137,7 @@ class GroupedLinearFc2Builder(Protocol):
 
 
 @dataclass
-class TEGroupedMLPSubmodules:
+class GroupedMLPSubmodules:
     """
     The dataclass for ModuleSpecs of TEGroupedMLP submodules
     including  linear fc1, activation function, linear fc2.
@@ -169,7 +164,7 @@ class TEGroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: TEGroupedMLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
@@ -476,7 +471,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: MLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
@@ -563,14 +558,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
-            setattr(
-                self,
-                buf_name,
-                MXFP8Tensor(
-                    data=torch.stack(q_list, dim=0).contiguous(),
-                    scale=torch.stack(s_list, dim=0).contiguous(),
-                ),
-            )
+            stacked_data = torch.stack(q_list, dim=0).contiguous()
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+
+            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+
+            # Redirect per-expert weight .data to views into the stacked buffer,
+            # mirroring _build_concatenated_weights. This frees the original
+            # allocations while keeping the Parameter objects intact.
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                if isinstance(w, MXFP8Tensor):
+                    w.data = stacked_data[i]
+                    w.scale = stacked_scale[i]
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    w.data.data = stacked_data[i]
+                    w.data.scale = stacked_scale[i]
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -686,7 +689,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            if self.config.fp8_recipe == "mxfp8":
+            w = self.linear_fc1.weight0
+            if isinstance(w, MXFP8Tensor) or (
+                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+            ):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()

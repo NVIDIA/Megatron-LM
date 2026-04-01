@@ -27,7 +27,10 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -157,58 +160,64 @@ class TextGenerationController:
                 * -1
             )
 
-    def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
+    @staticmethod
+    def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
 
         Args:
+            tokenizer: The tokenizer to use.
             prompt (str): The input prompt.
+            add_BOS (bool): Whether to add a BOS token.
 
         Returns:
             List[int]: Returns the tokenized prompt.
         """
 
-        prompt_tokens = self.tokenizer.tokenize(prompt)
+        prompt_tokens = tokenizer.tokenize(prompt)
 
         if add_BOS:
-            assert self.tokenizer.bos is not None
+            assert tokenizer.bos is not None
 
-        while prompt_tokens and prompt_tokens[0] == self.tokenizer.bos:
+        while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
             prompt_tokens.pop(0)
 
         if add_BOS:
-            prompt_tokens = [self.tokenizer.bos] + prompt_tokens
+            prompt_tokens = [tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
 
-    def _detokenize(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+    @staticmethod
+    def detokenize(
+        tokenizer, tokens: List[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+    ) -> str:
         """
-        Detokenize a sequence of token IDs, handling skip_special_tokens for
-        different tokenizer APIs.
-
-        On the first call, inspects `self.tokenizer.detokenize` to see if it accepts
-        a `skip_special_tokens` keyword argument, and caches that result on `self`.
-        Subsequent calls will use the cached flag to invoke `detokenize` with the
-        correct signature (with or without `skip_special_tokens`).
+        Detokenize a sequence of token IDs, optionally removing trailing EOD
+        tokens and handling skip_special_tokens for different tokenizer APIs.
 
         Args:
+            tokenizer: The tokenizer to use for detokenization.
             tokens (List[int]): The token IDs to convert back to text.
+            remove_EOD (bool): Whether to remove trailing EOD tokens before
+                detokenization. Defaults to True.
             skip_special_tokens (bool): Whether to remove special tokens (e.g. BOS/EOS)
                 during detokenization. Only passed through if the tokenizer supports it.
 
         Returns:
             str: The detokenized string.
         """
-        # cache the check on first call
-        if not hasattr(self, "_detok_accepts_skip"):
-            sig_params = inspect.signature(self.tokenizer.detokenize).parameters.values()
-            self._detok_accepts_skip = any(
-                p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig_params
-            )
-        if self._detok_accepts_skip:
-            return self.tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+            while tokens and tokens[-1] == tokenizer.eod:
+                tokens = tokens[:-1]
+
+        sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
+        detok_accepts_skip = any(
+            p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig_params
+        )
+        if detok_accepts_skip:
+            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
         else:
-            return self.tokenizer.detokenize(tokens)
+            return tokenizer.detokenize(tokens)
 
     def detokenize_generations(
         self,
@@ -237,7 +246,10 @@ class TextGenerationController:
 
         if not detokenize_segments:
             tokens = tokens_gpu_tensor.tolist()
-            return self._detokenize(tokens, skip_special_tokens=skip_special_tokens), None
+            return (
+                self.detokenize(self.tokenizer, tokens, skip_special_tokens=skip_special_tokens),
+                None,
+            )
 
         prompts_plus_generations: List[str] = []
         prompts_plus_generations_segments: List[List[str]] = []
@@ -247,7 +259,7 @@ class TextGenerationController:
 
         for sequence_tokens, length in zip(tokens, lengths):
             sequence_tokens = sequence_tokens[:length]
-            detok_str = self._detokenize(sequence_tokens)
+            detok_str = self.detokenize(self.tokenizer, sequence_tokens)
             prompts_plus_generations.append(detok_str)
             offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
             words = [
@@ -256,7 +268,7 @@ class TextGenerationController:
 
             prompts_plus_generations_segments.append(words)
 
-        text = self._detokenize(tokens[0], skip_special_tokens=skip_special_tokens)
+        text = self.detokenize(self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens)
 
         return text, prompts_plus_generations_segments
 
@@ -813,6 +825,10 @@ class TextGenerationController:
         Each MTP depth receives the correctly sampled token from the previous depth
         (or the base token for depth 0) rather than stale speculative tokens from
         the previous step.
+
+        When sequence parallelism is active, hidden states are kept in SP format
+        (scattered along the first dimension) between MTP depths to avoid a
+        redundant gather + scatter round-trip per depth.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -828,6 +844,14 @@ class TextGenerationController:
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
             hidden_states = unwrapped_model._decoder_hidden_states_cache
+
+            # When SP is active the decoder output is in scattered format
+            # [S/TP, B, H], but _last_accepted_seq_indices are indices into
+            # the full (gathered) sequence.
+            if self.model_config.sequence_parallel:
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.inference_wrapped_model.tp_group
+                )
             last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
             # Shape: [active_request_count, 1, hidden_size]
         else:
@@ -845,6 +869,24 @@ class TextGenerationController:
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
         current_hidden = last_accepted_hidden if has_mtp else None
 
+        # Compute padding needed to make batch a multiple of tp_size for SP compatibility.
+        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+        if sp_enabled:
+            pad_count = (tp_size - active_request_count % tp_size) % tp_size
+            padded_count = active_request_count + pad_count
+        else:
+            pad_count = 0
+
+        # Pad hidden states to align with the tensor parallel size.
+        if has_mtp and sp_enabled:
+            if pad_count > 0:
+                current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+
+            current_hidden = scatter_to_sequence_parallel_region(
+                current_hidden, group=self.inference_wrapped_model.tp_group
+            )
+
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
             position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
@@ -852,12 +894,23 @@ class TextGenerationController:
 
             mtp_logits_2d = None
             if has_mtp:
+                # Pad token_ids and position_ids each iteration (they change per depth).
+                if pad_count > 0:
+                    token_ids = F.pad(token_ids, (0, pad_count))
+                    position_ids = F.pad(position_ids, (0, pad_count))
+
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,
                     position_ids=position_ids,
                     depth=depth,
                 )
+
+                # Strip padding from logits only.  Hidden states stay padded+SP
+                # between depths to avoid redundant gather/scatter round-trips.
+                if pad_count > 0:
+                    mtp_logits = mtp_logits[:active_request_count]
+
                 # mtp_logits: [active_request_count, 1, vocab_size]
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
 
@@ -1629,13 +1682,20 @@ class TextGenerationController:
         hidden_size = self.model_config.hidden_size
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
+        # Pad token_ids/position_ids to nearest multiple of tp_size so that the
+        # embedding can reduce-scatter evenly across TP ranks.
+        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+        padded_count = tp_size if sp_enabled else 1
+
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
+            # Depth 0 uses full-format hidden; subsequent depths use SP format.
             dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
-            dummy_token_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+            dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
+            dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
         for depth in range(num_depths):
             mtp_logits_2d = None
@@ -1646,12 +1706,15 @@ class TextGenerationController:
                     position_ids=dummy_position_ids,
                     depth=depth,
                 )
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [1, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
             if self.model_is_pipeline_parallel:
                 broadcast_from_last_pipeline_stage(
-                    [1, self.vocab_size], dtype=dtype, tensor=mtp_logits_2d, pp_group=self.pp_group
+                    [padded_count, self.vocab_size],
+                    dtype=dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
                 )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
@@ -1754,7 +1817,7 @@ class TextGenerationController:
         input_ids, position_ids = self._dynamic_step_context_init()
 
         cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
 
         # Enable routing recording before forward pass if routing replay is enabled

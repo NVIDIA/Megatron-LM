@@ -29,7 +29,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -57,6 +60,10 @@ class TestTextGenerationController:
         block_size_tokens: int = 256,
         enable_prefix_caching: bool = False,
         max_requests: int = None,
+        mtp_num_layers: int = 0,
+        sequence_parallel: bool = False,
+        expert_model_parallel_size: int = 1,
+        num_moe_experts: int = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -86,18 +93,32 @@ class TestTextGenerationController:
             tensor_model_parallel_size=tensor_model_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             pipeline_dtype=dtype,
+            mtp_num_layers=mtp_num_layers if mtp_num_layers > 0 else None,
+            sequence_parallel=sequence_parallel,
+            expert_model_parallel_size=expert_model_parallel_size,
+            num_moe_experts=num_moe_experts,
+            add_bias_linear=num_moe_experts is None,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
 
+        layer_spec = get_gpt_layer_local_spec()
+
+        mtp_block_spec = None
+        if mtp_num_layers > 0:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config=transformer_config, spec=layer_spec, use_transformer_engine=False
+            )
+
         gpt_model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(),
+            transformer_layer_spec=layer_spec,
             vocab_size=self.vocab_size,
             max_sequence_length=self.sequence_length,
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            mtp_block_spec=mtp_block_spec,
         ).cuda()
         gpt_model.eval()
         if dtype == torch.bfloat16:
@@ -599,7 +620,7 @@ class TestTextGenerationController:
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(
             [
                 ''.join(random.choices(string.ascii_letters, k=random.randint(1, len(prompt))))
                 for _ in range(len(x))
@@ -612,35 +633,73 @@ class TestTextGenerationController:
             random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
         ]
 
+        tokenizer = self.mock_tokenizer
+
         # Test on a tokenizer that does not add BOS by default
-        no_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert no_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        no_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert no_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert no_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        no_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert no_bos_to_no_bos[0] != tokenizer.bos
+        no_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert no_bos_to_yes_bos[0] == tokenizer.bos
+        assert no_bos_to_yes_bos[1] != tokenizer.bos
 
         # Force the first token to be BOS to emulate a tokenizer that does add BOS by default
-        self.mock_tokenizer.tokenize.return_value[0] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[0] = tokenizer.bos
 
-        yes_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert yes_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        yes_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert yes_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert yes_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        yes_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert yes_bos_to_no_bos[0] != tokenizer.bos
+        yes_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert yes_bos_to_yes_bos[0] == tokenizer.bos
+        assert yes_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test on an input that has had multiple BOS added
-        self.mock_tokenizer.tokenize.return_value[1] = self.mock_tokenizer.bos
+        tokenizer.tokenize.return_value[1] = tokenizer.bos
 
-        many_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
-        assert many_bos_to_no_bos[0] != self.mock_tokenizer.bos
-        many_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
-        assert many_bos_to_yes_bos[0] == self.mock_tokenizer.bos
-        assert many_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+        many_bos_to_no_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=False
+        )
+        assert many_bos_to_no_bos[0] != tokenizer.bos
+        many_bos_to_yes_bos = TextGenerationController.tokenize_prompt(
+            tokenizer, prompt, add_BOS=True
+        )
+        assert many_bos_to_yes_bos[0] == tokenizer.bos
+        assert many_bos_to_yes_bos[1] != tokenizer.bos
 
         # Test the assert triggered when the tokenizer has no bos
-        self.mock_tokenizer.bos = None
+        tokenizer.bos = None
         with pytest.raises(AssertionError):
-            self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+            TextGenerationController.tokenize_prompt(tokenizer, prompt, add_BOS=True)
+
+    @pytest.mark.parametrize("remove_EOD", [True, False])
+    def test_remove_eod_token(self, remove_EOD):
+        self.setup_model(torch.float32)
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, **_: ' '.join(f"T{t}" for t in x)
+
+        tokenizer = self.mock_tokenizer
+        eod = tokenizer.eod
+        detok = TextGenerationController.detokenize
+
+        # No trailing EOD.
+        assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+
+        # Single trailing EOD.
+        result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)
+        assert result == ("T1 T2" if remove_EOD else f"T1 T2 T{eod}")
+
+        # Multiple trailing EOD.
+        result = detok(tokenizer, [1, eod, eod, eod], remove_EOD=remove_EOD)
+        assert result == ("T1" if remove_EOD else f"T1 T{eod} T{eod} T{eod}")
 
     def test_zero_tokens_generated_batch_vs_single(self):
         """
@@ -1370,3 +1429,172 @@ class TestTextGenerationController:
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    @pytest.mark.parametrize("active_request_count", [2, 3, 4, 5])
+    def test_mtp_sp_padding_real_ranks(self, active_request_count):
+        """Test _compute_serial_mtp_and_sample with real MTP layers and sequence parallelism.
+
+        Creates a GPTModel with actual MTP layers and SP enabled, sets up the
+        inference context, and runs the full MTP inference path end-to-end.
+        Verifies that padding, SP scatter/gather, MTP forward, and sampling all
+        work correctly without mocking.
+        """
+        tp_size = 2
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=tp_size,
+            num_speculative_tokens=num_spec,
+            max_requests=active_request_count // tp_size * (tp_size * 2),
+            mtp_num_layers=num_spec,
+            sequence_parallel=True,
+        )
+
+        ctrl = self.text_generation_controller
+        ctx = ctrl.inference_wrapped_model.inference_context
+        ctx.total_request_count = active_request_count
+        ctx.paused_request_count = 0
+
+        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+        ctx.request_query_lengths[:active_request_count] = torch.ones(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+
+        ctrl._init_mtp_sampling_tensor()
+        ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+            torch.arange(active_request_count, device='cuda'), self.vocab_size
+        )
+
+        # Build decoder hidden states cache in proper SP format.
+        # Each TP rank holds its slice of the sequence dimension.
+        unwrapped_model = ctrl.inference_wrapped_model.model
+        # Make S_total divisible by TP so the gather is valid.
+        pad = (tp_size - active_request_count % tp_size) % tp_size
+        s_total = active_request_count + pad
+
+        torch.manual_seed(42)
+        full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=torch.float32)
+        # Broadcast so every rank starts from the same full tensor.
+        torch.distributed.broadcast(full_hidden, src=0)
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
+        unwrapped_model._decoder_hidden_states_cache = local_hidden
+
+        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+
+        # Greedy sampling: top_k=1 selects the argmax token deterministically.
+        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+
+        # Run the MTP forward pass
+        ctrl._compute_serial_mtp_and_sample()
+
+        # Verify sampled MTP tokens have the right shape and are valid token IDs.
+        for depth in range(num_spec):
+            sampled = ctrl._sampled_mtp_tokens_cuda[depth, :active_request_count]
+            assert sampled.shape == (active_request_count,)
+            assert sampled.dtype == torch.int64
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.vocab_size)
+
+        # Verify decoder hidden states cache was cleaned up.
+        assert not hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+
+    def test_mtp_sp_padding_dummy_ranks(self):
+        """Test _dummy_serial_mtp_forward with real MTP layers and sequence parallelism.
+
+        Creates a GPTModel with real MTP layers and SP, then runs the dummy
+        forward path used by EP dummy ranks. Verifies the full MTP forward
+        executes without errors and produces valid logits.
+        """
+        tp_size = 2
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=tp_size,
+            num_speculative_tokens=num_spec,
+            max_requests=tp_size,
+            mtp_num_layers=num_spec,
+            sequence_parallel=True,
+            expert_model_parallel_size=2,
+            num_moe_experts=2,
+        )
+
+        ctrl = self.text_generation_controller
+        unwrapped_model = ctrl.inference_wrapped_model.model
+        # The attribute just needs to exist so the has_mtp check passes.
+        unwrapped_model._decoder_hidden_states_cache = True
+
+        # Run the dummy MTP forward path end-to-end.
+        ctrl._dummy_serial_mtp_forward()
+
+        # Verify compute_mtp_single_step produces correctly-shaped outputs
+        # with the same dummy tensor shapes that _dummy_serial_mtp_forward uses.
+        # padded_count == tp_size when SP is enabled.
+        dummy_hidden = torch.zeros((1, 1, self.hidden_size), device='cuda', dtype=torch.float32)
+        dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+        dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+
+        hidden_out, logits_out = unwrapped_model.compute_mtp_single_step(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=dummy_positions,
+            depth=0,
+        )
+
+        # Hidden output is in SP format: [padded_count/tp_size, 1, H] = [1, 1, H].
+        assert hidden_out.shape == (1, 1, self.hidden_size)
+        # Logits are gathered: [padded_count, 1, vocab_size] = [tp_size, 1, vocab_size].
+        assert logits_out.shape == (tp_size, 1, self.vocab_size)
+
+    def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
+        """Test that chaining MTP depths produces correct SP-format shapes throughout.
+
+        Calls compute_mtp_single_step for multiple depths, feeding each depth's
+        hidden output into the next, verifying that hidden states stay in SP
+        format [padded_count/tp_size, 1, H] and logits are always gathered to
+        [padded_count, 1, vocab_size].
+        """
+        tp_size = 2
+        num_spec = 2
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=tp_size,
+            num_speculative_tokens=num_spec,
+            max_requests=tp_size,
+            mtp_num_layers=num_spec,
+            sequence_parallel=True,
+            expert_model_parallel_size=2,
+            num_moe_experts=2,
+        )
+
+        ctrl = self.text_generation_controller
+        unwrapped_model = ctrl.inference_wrapped_model.model
+
+        # Simulate the dummy forward tensor shapes: padded_count == tp_size.
+        current_hidden = torch.zeros((1, 1, self.hidden_size), device='cuda', dtype=torch.float32)
+        dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+        dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
+
+        for depth in range(num_spec):
+            current_hidden, logits = unwrapped_model.compute_mtp_single_step(
+                hidden_states=current_hidden,
+                next_token_ids=dummy_tokens,
+                position_ids=dummy_positions,
+                depth=depth,
+            )
+
+            # Hidden stays in SP format across all depths.
+            assert current_hidden.shape == (1, 1, self.hidden_size), (
+                f"Depth {depth}: expected hidden shape (1, 1, {self.hidden_size}), "
+                f"got {current_hidden.shape}"
+            )
+            # Logits are always gathered to full padded_count.
+            assert logits.shape == (tp_size, 1, self.vocab_size), (
+                f"Depth {depth}: expected logits shape ({tp_size}, 1, {self.vocab_size}), "
+                f"got {logits.shape}"
+            )
