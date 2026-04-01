@@ -50,7 +50,6 @@ import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
-from .async_utils import _get_async_calls_queue
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
