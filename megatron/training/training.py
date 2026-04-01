@@ -1464,6 +1464,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
