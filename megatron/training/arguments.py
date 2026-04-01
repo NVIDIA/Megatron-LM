@@ -965,7 +965,13 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron FSDP only supports fsdp_dtensor checkpoint format"
-        
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
+
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP"
         assert args.nccl_ub, "FSDP manual registration is only supported with nccl-ub option"
