@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -22,7 +23,6 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,

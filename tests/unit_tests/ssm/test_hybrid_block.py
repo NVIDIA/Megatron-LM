@@ -3,10 +3,10 @@
 import pytest
 import torch
 
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
