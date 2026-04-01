@@ -126,6 +126,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
+    args.async_strategy = "nvrx"
     args.data_parallel_random_init = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
