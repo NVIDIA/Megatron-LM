@@ -56,6 +56,8 @@ if HAVE_TE:
 else:
     TESpecProvider = None
 
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+
 
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
@@ -468,13 +470,16 @@ def get_mtp_layer_spec_for_backend(
 
 
 def mtp_on_this_rank(
-    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+    layout: PipelineParallelLayerLayout = None,
+    mtp_num_layers: Optional[int] = None,
+    ignore_virtual: Optional[bool] = True,
+    vp_stage: Optional[int] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
 
     Behavior:
-        - If a custom pipeline model parallel layout is provided in the config:
+        - If a custom pipeline model parallel layout is provided:
             - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
               whether any MTP layers are present on this (pp_rank, vp_stage) pair.
             - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
@@ -484,25 +489,24 @@ def mtp_on_this_rank(
     """
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if config.pipeline_model_parallel_layout is not None:
+    if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        layout = config.pipeline_model_parallel_layout.layout
         if (
             not ignore_virtual
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
         ):
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
-            num_layers_to_build = layout[pp_rank][vp_stage].count(LayerType.mtp)
+            num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
             mtp_on_this_rank = num_layers_to_build > 0
         else:
-            for vpp_rank in range(len(layout[pp_rank])):
-                num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+            for vpp_rank in range(len(layout.layout[pp_rank])):
+                num_layers_to_build = layout.layout[pp_rank][vpp_rank].count(LayerType.mtp)
                 if num_layers_to_build > 0:
                     mtp_on_this_rank = True
                     break
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
-        if config.mtp_num_layers is not None:
+        if mtp_num_layers is not None:
             mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
                 ignore_virtual=ignore_virtual, vp_stage=vp_stage
             )
