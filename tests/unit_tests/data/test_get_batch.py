@@ -62,6 +62,7 @@ def initialize_test_environment(
     )
     return args
 
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):

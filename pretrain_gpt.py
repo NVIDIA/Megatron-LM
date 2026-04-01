@@ -27,7 +27,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -35,9 +38,7 @@ from megatron.core.utils import (
     StragglerDetector,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
-    get_batch_on_this_hybrid_cp_rank,
     get_batch_on_this_tp_rank,
-    get_thd_batch_on_this_cp_rank,
 )
 from megatron.training import (
     get_args,
@@ -97,7 +98,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and not mtp_on_this_rank:
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         return [None for _ in batch_keys]
 
     batch = {}
@@ -127,52 +128,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
-    if batch["cu_seqlens"] is not None and batch["cu_seqlens"].dim() == 2:
-        batch["cu_seqlens"] = batch["cu_seqlens"][0]
-    if batch["cu_seqlens_padded"] is not None and batch["cu_seqlens_padded"].dim() == 2:
-        batch["cu_seqlens_padded"] = batch["cu_seqlens_padded"][0]
-
-    if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence and not mtp_on_this_rank:
-        middle_stage_batch = {key: None for key in batch_keys}
-        middle_stage_batch["cu_seqlens"] = batch["cu_seqlens"]
-        middle_stage_batch["cu_seqlens_padded"] = batch["cu_seqlens_padded"]
-        middle_stage_batch["max_seqlen"] = batch["max_seqlen"]
-        return [middle_stage_batch[key] for key in sorted(middle_stage_batch.keys())]
-
-    if is_hybrid_cp:
-        local_cp_size = int(batch["local_cp_size"].item())
-        hybrid_batch = {
-            key: batch.get(key)
-            for key in ("tokens", "labels", "loss_mask", "attention_mask", "position_ids")
-        }
-        hybrid_batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(
-            hybrid_batch, local_cp_size
-        )
-        batch.update(hybrid_batch)
-        batch["cu_seqlens"] = packed_seq_params.cu_seqlens_q
-        batch["cu_seqlens_padded"] = packed_seq_params.cu_seqlens_q_padded
-        batch["max_seqlen"] = torch.tensor(
-            [packed_seq_params.max_seqlen_q],
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        )
-        batch["hybrid_cp_group"] = packed_seq_params.cp_group
-    elif batch["cu_seqlens"] is not None:
-        thd_batch = {
-            key: batch.get(key)
-            for key in ("tokens", "labels", "loss_mask", "attention_mask", "position_ids")
-        }
-        thd_batch, _ = get_thd_batch_on_this_cp_rank(
-            thd_batch,
-            batch["cu_seqlens"],
-            batch["cu_seqlens_padded"],
-            batch["max_seqlen"],
-        )
-        batch.update(thd_batch)
-    else:
-        batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
-        )
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=is_hybrid_cp,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+    )
 
     return [batch[key] for key in sorted(batch.keys())]
 
