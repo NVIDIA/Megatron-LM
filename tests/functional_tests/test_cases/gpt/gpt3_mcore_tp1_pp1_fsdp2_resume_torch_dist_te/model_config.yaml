@@ -42,7 +42,6 @@ MODEL_ARGS:
   --use-torch-fsdp2: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
-  --no-async-tensor-model-parallel-allreduce: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
   --ckpt-format: torch_dist

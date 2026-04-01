@@ -1844,6 +1844,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif self.is_hybrid_model and finished == 0:
             prefix_skip_tokens = 0
 
+        # Clamp so that effective_prefill_chunk_length >= 2 when possible.
+        # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
+        # which routes the batch into the flash-attention decode kernel and crashes.
+        # Round down to a block boundary to keep block-table indexing consistent.
+        if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
+            max_skip = prefill_chunk_length - 2
+            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
+
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
             0, overall_required_blocks - already_allocated_blocks - num_matched
