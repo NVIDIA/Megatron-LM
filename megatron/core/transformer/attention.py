@@ -184,7 +184,7 @@ class CoreAttentionInterface(Protocol):
         /,
         *,
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor | None = None,
+        attention_bias: Tensor | None,
         packed_seq_params: PackedSeqParams | None,
     ) -> Tensor:
         """Applies dot product attention."""
