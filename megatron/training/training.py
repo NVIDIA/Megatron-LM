@@ -3406,7 +3406,7 @@ def evaluate(
                 try:
                     (
                         packed_data_iterator,
-                        eval_num_microbatches,
+                        scheduled_eval_num_microbatches,
                         _,
                         _,
                     ) = wrap_data_iterator(data_iterator, config, eval_num_microbatches)
@@ -3415,11 +3415,12 @@ def evaluate(
                     break
             else:
                 packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,

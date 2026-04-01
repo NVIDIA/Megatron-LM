@@ -446,7 +446,7 @@ def reroute_samples_to_dcp_ranks(
         return (
             torch.cat(flattened_tensors, dim=0)
             if flattened_tensors
-            else torch.empty(1, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
+            else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
         )
 
     def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):

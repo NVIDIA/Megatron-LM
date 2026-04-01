@@ -292,6 +292,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
