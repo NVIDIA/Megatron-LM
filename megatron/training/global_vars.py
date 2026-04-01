@@ -302,7 +302,8 @@ def _set_telemetry(args):
         prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
         span_group_cls=MegatronSpanGroup,
     )
-    config.service_name = config.service_name or 'megatron-training'
+    if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
+        config.service_name = 'megatron-lm'
     if getattr(args, 'otel_enabled', False):
         config.enabled = True
     if getattr(args, 'otel_service_name', None):
