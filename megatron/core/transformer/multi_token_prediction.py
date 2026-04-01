@@ -12,6 +12,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -50,14 +51,10 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding_causal,
 ]
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TESpecProvider = None
 
 
 def tie_word_embeddings_state_dict(
@@ -612,44 +609,6 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
-def compute_mtp_inference_logits(
-    hidden_states: Tensor,
-    mtp_num_layers: int,
-    output_layer: Callable,
-    output_weight: Optional[Tensor],
-    runtime_gather_output: Optional[bool],
-) -> tuple:
-    """Compute MTP logits for inference mode.
-
-    Splits the concatenated hidden states and generates logits for each MTP layer.
-
-    Args:
-        hidden_states (Tensor): Concatenated hidden states from main + MTP layers.
-        mtp_num_layers (int): Number of MTP layers.
-        output_layer (Callable): Output layer method to compute logits.
-        output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
-        runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
-
-    Returns:
-        tuple: (hidden_states, mtp_logits_cache) where hidden_states is the main hidden
-            states and mtp_logits_cache is a tensor of shape
-            [mtp_num_layers, batch_size, vocab_size].
-    """
-    hidden_states_list = torch.chunk(hidden_states, 1 + mtp_num_layers, dim=0)
-    hidden_states = hidden_states_list[0]
-    mtp_inference_logits = []
-    for mtp_layer_number in range(mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        # mtp logits shape [b, 1, vocab size]
-        mtp_inference_logits.append(mtp_logits.squeeze(1).unsqueeze(0))
-    mtp_logits_cache = torch.cat(mtp_inference_logits, dim=0)
-    return hidden_states, mtp_logits_cache
-
-
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -787,6 +746,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
@@ -845,6 +805,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
+            tp_group=pg_collection.tp if pg_collection is not None else None,
         )
 
         # Build inner layers: two possible paths
@@ -876,6 +837,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
+                pg_collection=pg_collection,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -947,10 +909,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
         # the gradient in backward pass and was therefore incorrect in this context.
         # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -1333,7 +1295,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp'])
         else:
             # Ensure the provided process groups include CP
             assert hasattr(
