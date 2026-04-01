@@ -6,6 +6,8 @@ from abc import abstractmethod
 from functools import partial
 from typing import Optional, Protocol, cast
 
+from typing_extensions import final, override
+
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
@@ -55,6 +57,11 @@ class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
     @abstractmethod
+    def linear(self) -> type:
+        """Which linear module the backend uses"""
+        ...
+
+    @abstractmethod
     def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module the backend uses"""
         ...
@@ -97,25 +104,36 @@ class BackendSpecProvider(Protocol):
         ...
 
 
+@final
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
+    @override
+    def linear(self) -> type:
+        """Which linear module the backend uses"""
+        raise NotImplementedError("LocalSpecProvider does not have a linear module")
+
+    @override
     def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
+    @override
     def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
+    @override
     def fuse_layernorm_and_linear(self) -> bool:
         """Does the backend choose a single module for layernorm and linear"""
         return False
 
+    @override
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""
         return None
 
+    @override
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
@@ -127,10 +145,12 @@ class LocalSpecProvider(BackendSpecProvider):
             LNImpl = WrappedTorchNorm
         return LNImpl
 
+    @override
     def core_attention(self) -> type:
         """Which module to use for attention"""
         return DotProductAttention
 
+    @override
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         return partial(
@@ -142,34 +162,42 @@ class LocalSpecProvider(BackendSpecProvider):
             ),
         )
 
+    @override
     def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         return None
 
 
+@final
 class InferenceSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
+    @override
     def linear(self) -> type:
         """Which linear module TE backend uses"""
         return TELinear
 
+    @override
     def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module TE backend uses"""
         return InferenceColumnParallelLinear
 
+    @override
     def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 
+    @override
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
         return True
 
+    @override
     def column_parallel_layer_norm_linear(self) -> type[InferenceLayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
+    @override
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
@@ -181,16 +209,19 @@ class InferenceSpecProvider(BackendSpecProvider):
             return not_none(FusedLayerNorm)
         return TENorm
 
+    @override
     def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 
+    @override
     def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
+    @override
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         return partial(
