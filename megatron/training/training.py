@@ -50,6 +50,7 @@ import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+from .async_utils import _get_async_calls_queue
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -251,6 +252,8 @@ from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgr
 from . import ft_integration
 
 stimer = StragglerDetector()
+
+async_queue = None
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
@@ -986,6 +989,10 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
+    if args.async_save and args.ckpt_format in ["fsdp_dtensor", "torch_dcp"]:
+        global async_queue
+        async_queue = _get_async_calls_queue()
+
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
         try:
@@ -1202,6 +1209,7 @@ def pretrain(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
                 preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                async_queue=async_queue,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2396,6 +2404,7 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        async_queue=async_queue,
     )
     if should_report_memory:
         # Track memory after checkpoint save.
