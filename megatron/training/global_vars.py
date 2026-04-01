@@ -325,13 +325,19 @@ def _set_telemetry(args):
         ('megatron.num_attention_heads', 'num_attention_heads'),
         ('megatron.train_iters', 'train_iters'),
         ('megatron.micro_batch_size', 'micro_batch_size'),
-        ('megatron.fp16', 'fp16'),
-        ('megatron.bf16', 'bf16'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]:
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+
+    # Derive precision from flags
+    if getattr(args, 'fp16', False):
+        resource_attrs['megatron.precision'] = 'fp16'
+    elif getattr(args, 'bf16', False):
+        resource_attrs['megatron.precision'] = 'bf16'
+    else:
+        resource_attrs['megatron.precision'] = 'fp32'
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
         config, rank=args.rank, world_size=args.world_size,
