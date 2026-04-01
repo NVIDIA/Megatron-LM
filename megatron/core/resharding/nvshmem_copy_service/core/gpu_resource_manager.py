@@ -7,9 +7,9 @@ Handles NVSHMEM initialization, CUDA device setup, stream management,
 and event lifecycle.
 """
 
-import importlib.metadata as _meta
 import logging
-import os as _os
+import os
+from importlib import metadata
 from typing import Dict, Optional
 
 from ..compat import ensure_nvshmem_compat, get_cuda_core_device_class
@@ -82,10 +82,10 @@ class GPUResourceManager:
         # MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION=1.
         min_nvshmem_version = (3, 6, 5)
         allow_unsupported_nvshmem = (
-            _os.environ.get("MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION", "0") == "1"
+            os.environ.get("MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION", "0") == "1"
         )
         try:
-            nvshmem_pkg_version = _meta.version("nvidia-nvshmem-cu12")
+            nvshmem_pkg_version = metadata.version("nvidia-nvshmem-cu12")
             version_parts = tuple(int(part) for part in nvshmem_pkg_version.split(".")[:3])
             if version_parts < min_nvshmem_version:
                 version_msg = (
@@ -104,13 +104,13 @@ class GPUResourceManager:
                             "if you intentionally want to try an older version."
                         )
                     )
-        except _meta.PackageNotFoundError:
+        except metadata.PackageNotFoundError:
             logger.warning(
                 "Could not determine nvidia-nvshmem-cu12 package version for NVSHMEM safety check."
             )
 
         # Recommend a conservative CTA limit for stability when team counts grow.
-        max_ctas = _os.environ.get("NVSHMEM_MAX_CTAS")
+        max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")
         if max_ctas != "2":
             logger.warning(
                 "Recommended NVSHMEM_MAX_CTAS=2 for this path. Current value is %r.", max_ctas
