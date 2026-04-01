@@ -11,8 +11,40 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+class LinearInterface(Protocol):
+    """Interface for linear layers."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Applies the linear module to the input hidden states."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        ...
+
+
+class LinearBuilder(Protocol):
+    """Interface for building linear layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        parallel_mode: str | None,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        skip_weight_param_allocation: bool,
+    ) -> LinearInterface: ...
+
+
 class ColumnParallelLinearInterface(Protocol):
-    """Protocol for ColumnParallelLinear modules."""
+    """Interface for ColumnParallelLinear modules."""
 
     def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Applies the column parallel linear module to the input hidden states."""
@@ -24,7 +56,7 @@ class ColumnParallelLinearInterface(Protocol):
 
 
 class ColumnParallelLinearBuilder(Protocol):
-    """Protocol for building column_parallel_linear layers."""
+    """Interface for building column_parallel_linear layers."""
 
     def __call__(
         self,
@@ -45,7 +77,7 @@ class ColumnParallelLinearBuilder(Protocol):
 
 
 class RowParallelLinearInterface(Protocol):
-    """Protocol for RowParallelLinear modules."""
+    """Interface for RowParallelLinear modules."""
 
     def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Applies the row parallel linear module to the input hidden states."""
@@ -57,7 +89,7 @@ class RowParallelLinearInterface(Protocol):
 
 
 class RowParallelLinearBuilder(Protocol):
-    """Protocol for building row_parallel_linear layers."""
+    """Interface for building row_parallel_linear layers."""
 
     def __call__(
         self,

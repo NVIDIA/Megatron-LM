@@ -12,7 +12,11 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
-from megatron.core.models.protocols import ColumnParallelLinearBuilder, RowParallelLinearBuilder
+from megatron.core.models.protocols import (
+    ColumnParallelLinearBuilder,
+    LinearBuilder,
+    RowParallelLinearBuilder,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
@@ -57,7 +61,7 @@ class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
     @abstractmethod
-    def linear(self) -> type:
+    def linear(self) -> LinearBuilder:
         """Which linear module the backend uses"""
         ...
 
@@ -109,7 +113,7 @@ class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
     @override
-    def linear(self) -> type:
+    def linear(self) -> LinearBuilder:
         """Which linear module the backend uses"""
         raise NotImplementedError("LocalSpecProvider does not have a linear module")
 
@@ -173,7 +177,7 @@ class InferenceSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
     @override
-    def linear(self) -> type:
+    def linear(self) -> LinearBuilder:
         """Which linear module TE backend uses"""
         return TELinear
 
