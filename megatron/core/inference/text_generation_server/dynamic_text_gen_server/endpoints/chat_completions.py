@@ -679,10 +679,7 @@ try:
             else:
                 content = message_text if message_text is not None else ""
 
-            message = {
-                "role": "assistant",
-                "content": content,
-            }
+            message = {"role": "assistant", "content": content}
             if normalized_tool_calls:
                 message["tool_calls"] = normalized_tool_calls
             if "reasoning" in metadata:

@@ -90,9 +90,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         """
 
         if accepts_parameter(self._tokenizer.ids_to_text, "remove_special_tokens"):
-            return self._tokenizer.ids_to_text(
-                ids, remove_special_tokens=skip_special_tokens
-            )
+            return self._tokenizer.ids_to_text(ids, remove_special_tokens=skip_special_tokens)
         return self._tokenizer.ids_to_text(ids)
 
     def apply_chat_template(

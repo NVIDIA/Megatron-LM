@@ -1,11 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core import mpu
-from megatron.core.utils import accepts_parameter
 from megatron.core.inference.communication_utils import broadcast_float_list
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.tokenization import tokenize_prompts
+from megatron.core.utils import accepts_parameter
 
 
 def run_mcore_engine(

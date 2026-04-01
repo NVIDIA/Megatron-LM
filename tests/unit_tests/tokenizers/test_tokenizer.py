@@ -176,13 +176,13 @@ def test_hf_detokenize_skip_special_tokens(skip_special_tokens):
     text = tokenizer.detokenize(ids, skip_special_tokens=skip_special_tokens)
     eos_token = tokenizer._tokenizer.tokenizer.eos_token
     if skip_special_tokens:
-        assert eos_token not in text, (
-            f"Expected EOS stripped when skip_special_tokens=True. Got: {text!r}"
-        )
+        assert (
+            eos_token not in text
+        ), f"Expected EOS stripped when skip_special_tokens=True. Got: {text!r}"
     else:
-        assert _eos_in_text(text, eos_token), (
-            f"Expected EOS preserved when skip_special_tokens=False. Got: {text!r}"
-        )
+        assert _eos_in_text(
+            text, eos_token
+        ), f"Expected EOS preserved when skip_special_tokens=False. Got: {text!r}"
 
 
 def test_megatron_tokenizer():
@@ -279,10 +279,7 @@ def test_null_tokenizer():
 
 
 @pytest.mark.parametrize("skip_special_tokens", [True, False])
-@pytest.mark.parametrize(
-    "library",
-    ["null-text", "byte-level", "sentencepiece", "sft"],
-)
+@pytest.mark.parametrize("library", ["null-text", "byte-level", "sentencepiece", "sft"])
 def test_detokenize_skip_special_tokens_unsupported_backend(library, skip_special_tokens):
     """skip_special_tokens must not raise on backends whose ids_to_text lacks the parameter."""
     try:
