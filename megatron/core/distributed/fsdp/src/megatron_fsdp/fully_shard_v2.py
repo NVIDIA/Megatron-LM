@@ -51,7 +51,7 @@ def fully_shard(
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    setattr(module, "_fsdp_param_groups", fsdp_param_groups)
+    module._init_named_param_groups(fsdp_param_groups)
     _register_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
@@ -64,31 +64,32 @@ def fully_shard(
 
 class FSDPModule(nn.Module):
 
-    # def _init_each_param_name_of_param_groups(self):
-    #     self.param_name = []
-
-    #     for fsdp_param_group in self._fsdp_param_groups:
-    #         fsdp_param_group._init_dist_params()
-
-    #     self._named_params
+    def _init_named_param_groups(self, fsdp_param_groups):
+        setattr(self, "_fsdp_param_groups", fsdp_param_groups)
+        param_to_name = {p: n for n, p in self.named_parameters()}
+        self._named_param_groups = []
+        for fsdp_param_group in self._fsdp_param_groups:
+            param_names = []
+            for param in fsdp_param_group.params:
+                param_name = param_to_name[param]
+                param_names.append(param_name)
+            self._named_param_groups.append((param_names, fsdp_param_group))
 
     def unshard(self):
         self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for fsdp_param_group in self._fsdp_param_groups:
+        for param_names, fsdp_param_group in self._named_param_groups:
             fsdp_param_group.unshard()
 
-            for param, dist_param in zip(fsdp_param_group.params, fsdp_param_group.dist_params):
-                param_name = self.param_to_name[dist_param]
-                _replace_module_parameter(self, param_name, param)
+            for name, param in zip(param_names, fsdp_param_group.params):
+                _replace_module_parameter(self, name, param)
 
     def reshard(self):
         self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for fsdp_param_group in self._fsdp_param_groups:
+        for param_names, fsdp_param_group in self._named_param_groups:
             fsdp_param_group.reshard()
 
-            for param, dist_param in zip(fsdp_param_group.params, fsdp_param_group.dist_params):
-                param_name = self.param_to_name[param]
-                _replace_module_parameter(self, param_name, dist_param)
+            for name, param in zip(param_names, fsdp_param_group.dist_params):
+                _replace_module_parameter(self, name, param)
 
 
 def _get_module_fsdp_param_groups(
