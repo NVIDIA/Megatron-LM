@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -34,6 +35,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -96,17 +98,13 @@ except:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
         set_save_original_input,
     )
-except ImportError:
-    HAVE_TE = False
+else:
     SplitAlongDim, TELinear, set_save_original_input = None, None, None
 
 try:
@@ -219,8 +217,8 @@ class SelfAttentionSubmodules:
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
-    q_layernorm: Union[ModuleSpec, type] = None
-    k_layernorm: Union[ModuleSpec, type] = None
+    q_layernorm: LayerNormBuilder | None = None
+    k_layernorm: LayerNormBuilder | None = None
 
 
 @dataclass
@@ -251,11 +249,13 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -431,7 +431,16 @@ class Attention(MegatronModule, ABC):
         )
 
     def _get_pp_layer_offset_for_inference(self):
-        """Return the pipeline parallel layer offset for inference."""
+        """Return the pipeline parallel layer offset for inference.
+
+        When pp_layer_offset was explicitly provided (e.g. by MambaBlock for
+        hybrid models using --hybrid-layer-pattern with fVPP), use that value
+        directly.  Otherwise fall back to the standard computation which assumes
+        uniform layer distribution across pipeline stages.
+        """
+        if self._pp_layer_offset is not None:
+            return self._pp_layer_offset
+
         assert (
             self.config.virtual_pipeline_model_parallel_size is None
         ), "Virtual pipeline parallelism is not supported for inference"
@@ -787,7 +796,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if not is_decode_only:
+        if max_seqlen_q > 1:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -1250,6 +1259,7 @@ class SelfAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(
             config=config,
@@ -1259,6 +1269,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1278,8 +1289,7 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
+            self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1288,8 +1298,7 @@ class SelfAttention(Attention):
             self.q_layernorm = None
 
         if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
+            self.k_layernorm = submodules.k_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1408,8 +1417,10 @@ class SelfAttention(Attention):
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
                 self.world_size // self.config.num_query_groups
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
@@ -1466,7 +1477,7 @@ class SelfAttention(Attention):
             # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
             # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
             # This is step 4 in the list of steps above.
-            idx = get_tensor_model_parallel_rank() % (
+            idx = get_pg_rank(self.pg_collection.tp) % (
                 self.world_size // self.config.num_query_groups
             )
             size = self.num_attention_heads_per_partition // (
@@ -1475,10 +1486,10 @@ class SelfAttention(Attention):
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = apply_module(self.q_layernorm)(query)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
@@ -1486,6 +1497,14 @@ class SelfAttention(Attention):
         if output_gate:
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.config.num_query_groups < self.world_size:
+                idx = get_tensor_model_parallel_rank() % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
 
         return query, key, value

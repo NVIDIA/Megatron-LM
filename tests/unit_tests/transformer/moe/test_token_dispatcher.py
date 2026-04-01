@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -99,15 +99,11 @@ class MoEModelTestContainer:
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = (
-            MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules)
-            .cuda()
-            .to(dtype=self.test_dtype)
-        )
+        moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
 

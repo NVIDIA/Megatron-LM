@@ -69,6 +69,12 @@ def _compile_timeout(timeout_s: int):
             "Please clean up your stale cache and try again."
         )
 
+    # Signal-based timeout only works in the main thread.
+    # In non-main threads (e.g., Ray actors), skip the timeout mechanism.
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
     curr_handler = signal.signal(signal.SIGALRM, _handler)
     try:
         signal.alarm(timeout_s)

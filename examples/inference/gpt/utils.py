@@ -69,6 +69,7 @@ class Request:
         self.time_arrival = None
         self.time_start = None
         self.time_end = None
+        self.ttft = None  # Time-to-first-token in seconds
         self.state = "not-started"
         self.sampling_params: SamplingParams = (
             sampling_params
@@ -302,7 +303,7 @@ def build_dynamic_engine_setup_prefix(
     # Buffer limits config
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
-        f"{context.block_allocator.active_count} chunks "
+        f"{context.kv_block_allocator.active_count} chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )
 

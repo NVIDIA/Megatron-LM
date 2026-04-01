@@ -5,19 +5,8 @@
 
 ## Contribution process
 
-```mermaid
-flowchart LR
-    A[Pre-checks] --> B[PR Tests]
-    subgraph Code Review/Approval
-        C1[Expert Review] --> C2[Final Review]
-    end
-    B --> C1
-    C2 --> D[Merge]
-```
-
 ### Pre-checks
 
-- [ ] I want this PR in a versioned release and have added the appropriate Milestone (e.g., `Core 0.8`)
 - [ ] I have added relevant unit tests
 - [ ] I have added relevant functional tests
 - [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
@@ -26,33 +15,32 @@ flowchart LR
 
 ### Code review
 
-The following process is enforced via the CODEOWNERS file for changes into `megatron/core`. For changes outside of `megatron/core`, it is up to the PR author whether or not to tag the Final Reviewer team.
+Feel free to message or comment the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
-<details>
-<summary>For MRs into `main` branch</summary>
+All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
 
-Feel free to message or comment the @mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
+#### Step 1: Mark PR as "Ready for Review"
 
-#### (Step 1): Add PR label `Expert Review`
+1. When your PR is ready, click **Ready for Review**.
+2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.
+   - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.
 
-#### (Step 2): Collect the expert reviewers reviews
-
-1. Attach the `Expert Review` label when your PR is ready for review.
-2. GitHub auto-assigns expert reviewers based on your changes. They will get notified and pick up your PR soon.
-
-:warning: Only proceed to the next step once all reviewers have approved, merge-conflict are resolved and the CI is passing.  
+:warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.
 Final Review might get declined if these requirements are not fulfilled.
 
-#### (Step 3): Final Review
+#### Step 2: Final Review
 
-1. Add `Final Review` label
-2. GitHub auto-assigns final reviewers based on your changes. They will get notified and pick up your PR soon.
+For PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.
 
-#### (Optional Step 4): Cherry-pick into release branch
+For PRs outside `megatron/core`, this step is skipped.
 
-If this PR also needs to be merged into `core_r*` release branches, after this PR has been merged, select `Cherry-pick` to open a new PR into the release branch.
+#### Step 3: Approved
 
-</details>
+Once all required reviewers have approved, the `Approved` label is applied **automatically**.
+
+### Merge
+
+Any member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.
 
 <details>
 <summary>For MRs into `dev` branch</summary>
@@ -60,7 +48,3 @@ The proposed review process for `dev` branch is under active discussion.
 
 MRs are mergable after one approval by either `eharper@nvidia.com` or `zijiey@nvidia.com`.
 </details>
-
-### Merging your PR
-
-Any member of [core-adlr](https://github.com/orgs/teams/NVIDIA/core-adlr) and [`core-nemo`](https://github.com/orgs/teams/NVIDIA/core-nemo) will be able to merge your PR.

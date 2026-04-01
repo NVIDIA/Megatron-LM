@@ -85,6 +85,7 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Qwen2.5-32B \
+  --tokenizer-hf-include-special-tokens \
   --lr 1e-6 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 128 \
