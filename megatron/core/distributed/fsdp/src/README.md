@@ -326,6 +326,9 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`.
 - `keep_fp8_transpose_cache` will keep the fp8 transpose cache when using `MegatronFSDP`. This option will cause (number of parameter $\times$ 1 Byte) of memory overhead, but can skip the weight transpose operation in the backward propagation. This feature will not give any benefit from the Blackwell architecture.
     - Defaults to `False`.
+- `use_decoupled_grad` installs the reduced gradient into a separate buffer: `Parameter.decoupled_grad`. This buffer is utilized by specific optimizers, such as TransformerEngine's `FusedAdam`, and can be used to temporarily store your gradient for custom `torch.nn.Optimizer`(s).
+    - Defaults to `False`.
+    - Required for `transformer_engine.pytorch.optimizers.FusedAdam`.
 - `nccl_ub` will allocate and register the NCCL userbuffer for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
     - **Only effective when using with Megatron-Core.**
     - Defaults to `False`.
