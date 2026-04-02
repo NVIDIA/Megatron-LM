@@ -84,9 +84,9 @@ class TestGroupedRollouts:
             slow_batches = set(range(num_slow_batches))
             first_slow = next(i for i, b in enumerate(batch_ids) if b in slow_batches)
             last_fast = max(i for i, b in enumerate(batch_ids) if b not in slow_batches)
-            assert last_fast < first_slow, (
-                f"Expected fast batches before slow batches, got batch_ids={batch_ids}"
-            )
+            assert (
+                last_fast < first_slow
+            ), f"Expected fast batches before slow batches, got batch_ids={batch_ids}"
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):
