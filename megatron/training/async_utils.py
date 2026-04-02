@@ -21,6 +21,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
     from megatron.core.dist_checkpointing.strategies.state_dict_saver import save_state_dict_async_finalize
+
     NVRxAsyncRequest = ABC
 
 logger = logging.getLogger(__name__)
