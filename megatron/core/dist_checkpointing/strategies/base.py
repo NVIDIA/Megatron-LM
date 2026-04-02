@@ -3,7 +3,6 @@
 """ Strategies base interfaces. """
 
 import logging
-
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
