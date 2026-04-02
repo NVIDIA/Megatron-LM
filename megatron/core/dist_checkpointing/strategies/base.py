@@ -47,10 +47,9 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
 class LoadStrategyBase(ABC):
     """Base class for a load strategy. Requires implementing checks for compatibility with a
     given checkpoint version."""
+
     def __init__(self):
-        logger.warning(
-            "LoadStrategyBase is deprecated and will be removed in future releases."
-        )
+        logger.warning("LoadStrategyBase is deprecated and will be removed in future releases.")
 
     @abstractmethod
     def check_backend_compatibility(self, loaded_backend):
@@ -72,9 +71,8 @@ class SaveStrategyBase(ABC):
     """Base class for a save strategy. Requires defining a backend type and
     version of the saved format."""
     def __init__(self, backend: str, version: int):
-        logger.warning(
-            "SaveStrategyBase is deprecated and will be removed in future releases."
-        )
+
+        logger.warning("SaveStrategyBase is deprecated and will be removed in future releases.")
         self.backend = backend
         self.version = version
 
@@ -89,10 +87,9 @@ class SaveStrategyBase(ABC):
 
 class LoadShardedStrategy(LoadStrategyBase):
     """Base class for load strategies to be removed in future releases."""
+
     def __init__(self):
-        logger.warning(
-            "LoadShardedStrategy is deprecated and will be removed in future releases."
-        )
+        logger.warning("LoadShardedStrategy is deprecated and will be removed in future releases.")
     
     @abstractmethod
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -136,6 +133,7 @@ class LoadShardedStrategy(LoadStrategyBase):
 
 class SaveShardedStrategy(SaveStrategyBase):
     """Base class for save strategies to be removed in future releases."""
+
     def __init__(self):
         logger.warning(
             "SaveShardedStrategy is deprecated and will be removed in future releases."
@@ -149,6 +147,7 @@ class SaveShardedStrategy(SaveStrategyBase):
 
 class AsyncSaveShardedStrategy(SaveShardedStrategy):
     """Save strategy suitable for async save. To be removed in future releases."""
+
     def __init__(self):
         logger.warning(
             "AsyncSaveShardedStrategy is deprecated and will be removed in future releases."
