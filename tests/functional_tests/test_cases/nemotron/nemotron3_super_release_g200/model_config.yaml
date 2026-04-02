@@ -4,6 +4,8 @@ ENV_VARS:
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
+  USE_MNNVL: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Precision args
@@ -38,7 +40,9 @@ MODEL_ARGS:
   --cross-entropy-fusion-impl: native
   --use-fused-weighted-squared-relu: true
 
-  --moe-token-dispatcher-type: alltoall
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-hybridep-num-sms: 32
+  --moe-token-dispatcher-type: flex
   --moe-router-score-function: sigmoid
   --moe-grouped-gemm: true
   --num-experts: 512
