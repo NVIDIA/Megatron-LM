@@ -11,7 +11,12 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import (
+    HAVE_EMERGING_OPTIMIZERS,
+    TensorParallelMuon,
+    get_supported_coefficient_types,
+    validate_coefficient_type,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
