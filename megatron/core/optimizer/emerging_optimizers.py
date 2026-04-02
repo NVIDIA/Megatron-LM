@@ -300,20 +300,22 @@ def _default_adam_based_eopt_config_to_kwargs(
 # -----------------------------------------------------------------------
 # Register emerging optimizers
 # -----------------------------------------------------------------------
-_EMERGING_OPTIMIZERS = {
-    'muon': EmergingOptimizerEntry(
-        optimizer_cls=TensorParallelMuon,
-        init_state_fn=_eopt_init_state_fn,
-        config_to_kwargs=_muon_config_to_kwargs,
-        default_param_overrides={
-            ParamKey(
-                predicate=ParamPredicate(
-                    name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                )
-            ): {'optimizer': 'adam'}
-        },
-    )
-}
+_EMERGING_OPTIMIZERS.update(
+    {
+        'muon': EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelMuon,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
+            },
+        )
+    }
+)
 
 # Register soap with default config
 # TODO(skyw): register all emerging optimizers.
