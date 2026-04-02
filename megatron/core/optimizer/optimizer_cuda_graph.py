@@ -53,7 +53,7 @@ class OptimizerCudaGraphWrapper:
         OptimizerCudaGraphWrapper.curr_iteration += 1
 
     def __del__(self):
-        print(f"Destructor called for {type(self.optimizer_step_func).__name__} optimizer!!!")
+        logger.info(f"Destructor called for {type(self.optimizer_step_func).__name__} optimizer!!!")
         if OptimizerCudaGraphWrapper.cuda_graph is not None:
             del OptimizerCudaGraphWrapper.cuda_graph
             OptimizerCudaGraphWrapper.cuda_graph = None
