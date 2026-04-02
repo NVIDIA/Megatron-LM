@@ -43,7 +43,7 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.model_provider == "gpt":
         model_builder = gpt_builder
-    elif args.model_provider == "mamba":
+    elif args.model_provider in ("hybrid", "mamba"):
         model_builder = hybrid_builder
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
@@ -158,7 +158,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "total number of requests. Set to -1 to add all requests together.",
     )
     group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--model-provider", choices=["hybrid", "mamba", "gpt"], default="gpt", help="Model provider"
     )
     group.add_argument(
         "--skip-prompt-log-probs", action='store_true', default=False, help='Skip prompt log probs.'
