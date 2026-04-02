@@ -179,9 +179,6 @@ def save_distributed_checkpoint(
     Args:
         checkpoint_path (str): Directory path where the checkpoint will be saved.
         gpt_model (torch.nn.Module): The GPT model to checkpoint (may be wrapped with DDP).
-
-    Returns:
-        None
     """
     # Access underlying model if wrapped with DDP
     model: torch.nn.Module = (
