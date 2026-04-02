@@ -70,8 +70,8 @@ class LoadStrategyBase(ABC):
 class SaveStrategyBase(ABC):
     """Base class for a save strategy. Requires defining a backend type and
     version of the saved format."""
-    def __init__(self, backend: str, version: int):
 
+    def __init__(self, backend: str, version: int):
         logger.warning("SaveStrategyBase is deprecated and will be removed in future releases.")
         self.backend = backend
         self.version = version
@@ -90,7 +90,7 @@ class LoadShardedStrategy(LoadStrategyBase):
 
     def __init__(self):
         logger.warning("LoadShardedStrategy is deprecated and will be removed in future releases.")
-    
+
     @abstractmethod
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Load the sharded part of the checkpoint."""
@@ -135,10 +135,8 @@ class SaveShardedStrategy(SaveStrategyBase):
     """Base class for save strategies to be removed in future releases."""
 
     def __init__(self):
-        logger.warning(
-            "SaveShardedStrategy is deprecated and will be removed in future releases."
-        )
-    
+        logger.warning("SaveShardedStrategy is deprecated and will be removed in future releases.")
+
     @abstractmethod
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Save the sharded part of the state dict."""
