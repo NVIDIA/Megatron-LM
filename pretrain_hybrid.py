@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -357,7 +357,7 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     pretrain(train_valid_test_datasets_provider,
-             partial(model_provider, mamba_builder),
+             partial(model_provider, hybrid_builder),
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},

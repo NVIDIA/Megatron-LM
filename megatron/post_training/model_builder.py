@@ -158,7 +158,7 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
     return teacher
 
 
-def modelopt_gpt_mamba_builder(
+def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
     post_process,
@@ -260,7 +260,7 @@ def modelopt_gpt_mamba_builder(
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
-        from megatron.core.post_training.modelopt.mamba.model_specs import get_hybrid_stack_modelopt_spec
+        from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
             logging.getLogger(__name__).warning(

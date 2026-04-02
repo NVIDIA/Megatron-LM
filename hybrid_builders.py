@@ -9,21 +9,21 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 
 
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    print_rank_0('building MAMBA model ...')
+def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    print_rank_0('building Hybrid model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
-    assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
+    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec
         assert (
             not config.inference_fuse_tp_communication
-        ), "inference_fuse_tp_communication is not supported for Mamba"
+        ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
     else:
-        raise ValueError("You must provide a valid Mamba layer spec via --spec")
+        raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
     model = HybridModel(
         config=config,

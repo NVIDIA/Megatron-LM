@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -44,7 +44,7 @@ def get_model_for_inference() -> MegatronModule:
     if args.model_provider == "gpt":
         model_builder = gpt_builder
     elif args.model_provider == "mamba":
-        model_builder = mamba_builder
+        model_builder = hybrid_builder
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 

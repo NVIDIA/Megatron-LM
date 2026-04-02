@@ -397,7 +397,7 @@ class TestMambaMoEModel:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-        sys.argv = ['test_mamba_moe_model.py']
+        sys.argv = ['test_hybrid_moe_model.py']
         args = parse_args()
 
         # The following args would be set from the nano v3 checkpoint.

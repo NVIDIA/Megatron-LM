@@ -19,7 +19,7 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.core.post_training.modelopt.mamba.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig

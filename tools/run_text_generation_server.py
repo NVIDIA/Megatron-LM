@@ -15,7 +15,7 @@ from contextlib import nullcontext
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -139,7 +139,7 @@ def main(model_type: str = "gpt"):
         if model_type == "gpt":
             model_builder = gpt_builder
         elif model_type == "mamba":
-            model_builder = mamba_builder
+            model_builder = hybrid_builder
         else:
             raise ValueError(f"Invalid model provider {model_type}")
         model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)

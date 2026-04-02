@@ -735,7 +735,7 @@ class TestMultiTokenPredictionMamba:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-        sys.argv = ['test_multi_token_prediction_mamba.py']
+        sys.argv = ['test_multi_token_prediction_hybrid.py']
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
