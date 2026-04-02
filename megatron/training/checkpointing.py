@@ -678,13 +678,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
-            if args.async_save and not HAVE_NVRX:
-                print_rank_0(
-                    "nvidia-resiliency-ext package is not installed. Async strategy will be disabled. "
-                    "Please, install nvidia-resiliency-ext package to use async strategy."
-                )
-                args.async_save = False
-
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
