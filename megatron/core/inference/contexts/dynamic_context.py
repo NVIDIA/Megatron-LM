@@ -684,7 +684,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
-        if torch.distributed.get_rank() == 0:
+        if inference_config._verbose and torch.distributed.get_rank() == 0:
             logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
