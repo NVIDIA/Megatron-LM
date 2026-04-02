@@ -682,22 +682,6 @@ def test_validate_coefficient_type_rejects_invalid():
         validate_coefficient_type("nonexistent_type_xyz")
 
 
-def test_muon_optimizer_invalid_coefficient_type():
-    """Test that TensorParallelMuon raises ValueError for an invalid coefficient_type."""
-    model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
-    model.requires_grad_(True)
-
-    with pytest.raises(ValueError, match="Unsupported muon coefficient type"):
-        TensorParallelMuon(
-            params=[model.weight],
-            lr=0.01,
-            coefficient_type="nonexistent_type_xyz",
-            num_ns_steps=5,
-            pg_collection=None,
-            tp_mode="duplicated",
-        )
-
-
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
