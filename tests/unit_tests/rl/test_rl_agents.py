@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
 def _mock_math_verify():
     """Patch math_verify so MathAgent can be imported without the real package."""
     mock_module = MagicMock()
@@ -20,8 +21,9 @@ from examples.rl.environments.countdown.countdown import compute_score as countd
 from examples.rl.environments.math.math_agent import MathAgent
 
 
-def _make_math_agent(answer_format="tagged", format_reward=0.05, negative_reward=-0.5,
-                     partial_end_reward=0.1):
+def _make_math_agent(
+    answer_format="tagged", format_reward=0.05, negative_reward=-0.5, partial_end_reward=0.1
+):
     return MathAgent(
         answer_format=answer_format,
         format_reward=format_reward,
@@ -36,10 +38,14 @@ class TestRLAgentRewards:
     Covers MathAgent.compute_score (used by AIME, BigMath, DAPO, GSM8K, OpenMath)
     and CountdownAgent / countdown.compute_score.
     """
-    @pytest.mark.parametrize("answer_format, correct, wrong", [
-        pytest.param("tagged", "<answer>42</answer>", "<answer>99</answer>", id="tagged"),
-        pytest.param("boxed", r"\boxed{42}", r"\boxed{99}", id="boxed"),
-    ])
+
+    @pytest.mark.parametrize(
+        "answer_format, correct, wrong",
+        [
+            pytest.param("tagged", "<answer>42</answer>", "<answer>99</answer>", id="tagged"),
+            pytest.param("boxed", r"\boxed{42}", r"\boxed{99}", id="boxed"),
+        ],
+    )
     @pytest.mark.parametrize(
         "response_fn, finish_reason, expected_reward",
         [
@@ -55,8 +61,9 @@ class TestRLAgentRewards:
             pytest.param(lambda c, w: "I think 42", "stop", -0.5, id="no-tag"),
         ],
     )
-    def test_math_agent_compute_score(self, answer_format, correct, wrong,
-                                      response_fn, finish_reason, expected_reward):
+    def test_math_agent_compute_score(
+        self, answer_format, correct, wrong, response_fn, finish_reason, expected_reward
+    ):
         agent = _make_math_agent(answer_format=answer_format)
         response = response_fn(correct, wrong)
         score = agent.compute_score(response, {"answer": "42"}, finish_reason=finish_reason)
@@ -84,10 +91,7 @@ class TestRLAgentRewards:
             ),
             # No answer tag
             pytest.param(
-                "I have no idea",
-                {"target": 30, "nums": [10, 5, 2]},
-                0,
-                id="countdown-no-tag",
+                "I have no idea", {"target": 30, "nums": [10, 5, 2]}, 0, id="countdown-no-tag"
             ),
             # Uses a number not in the set
             pytest.param(
