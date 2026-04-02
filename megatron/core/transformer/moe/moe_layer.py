@@ -234,6 +234,8 @@ class MoELayer(BaseMoELayer):
         )
 
         self.tp_group = pg_collection.tp
+        self.tp_ep_group = pg_collection.tp_ep
+        self.dp_group = pg_collection.dp
 
         # Initialize router.
         self.router = self.submodules.router(
@@ -507,36 +509,36 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
-        routing_map_for_expected = None
+        routing_map_for_balanced_count = None
         if self.config.log_overload_factor:
-            routing_map_for_expected = self._routing_map_after_token_dispatch()
+            routing_map_for_balanced_count = self._routing_map_after_token_dispatch()
 
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if self.config.log_overload_factor and routing_map_for_expected is not None:
-            ws = float(self.router.tp_ep_group.size())
-            base = float(routing_map_for_expected.shape[0]) * float(
+        if self.config.log_overload_factor and routing_map_for_balanced_count is not None:
+            ws = float(self.tp_ep_group.size())
+            base = float(routing_map_for_balanced_count.shape[0]) * float(
                 self.config.moe_router_topk
             )
             # AllGather replicates the full concatenated map on every rank; contribute
-            # fair share so report()'s SUM over tp_ep matches one global expected count.
+            # fair share so report()'s SUM over tp_ep matches one global balanced count.
             td = self.token_dispatcher
             if isinstance(td, MoEAllGatherTokenDispatcher) and (
                 td.tp_size > 1 or td.ep_size > 1
             ):
                 base = base / ws
-            local_expected = torch.empty(
+            local_balanced = torch.empty(
                 (), device=dispatched_input.device, dtype=torch.float32
             )
-            local_expected.fill_(base)
+            local_balanced.fill_(base)
             dispatched_input = save_overload_factor_to_tracker(
                 tensor=dispatched_input,
                 tokens_per_expert=tokens_per_expert,
-                local_expected_routed_slots=local_expected,
+                local_balanced_token_count=local_balanced,
                 layer_number=self.layer_number,
-                tp_ep_group=self.router.tp_ep_group,
-                dp_group=self.router.dp_group,
+                tp_ep_group=self.tp_ep_group,
+                dp_group=self.dp_group,
             )
         if (
             hasattr(self, "_inference_token_dispatcher")

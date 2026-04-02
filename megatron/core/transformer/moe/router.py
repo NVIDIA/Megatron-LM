@@ -53,8 +53,6 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
-        self.tp_ep_group = pg_collection.tp_ep
-        self.dp_group = pg_collection.dp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
