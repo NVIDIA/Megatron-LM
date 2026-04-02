@@ -38,7 +38,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
-from .async_utils import is_empty_async_queue, schedule_async_save
+from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -67,15 +67,12 @@ except Exception:
 
 
 try:
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-        save_state_dict_async_finalize,
-        save_state_dict_async_plan,
-    )
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_plan
+
     HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
-    NVRxAsyncRequest = None
+
     HAVE_NVRX = False
 
 _CHECKPOINT_VERSION = None
@@ -698,7 +695,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
                 )
-                async_save_request = _get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                async_save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -2101,16 +2098,3 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
-
-
-def _get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> NVRxAsyncRequest:
-    """Creates an async save request for fsdp_dtensor & torch_dcp with a finalize function."""
-    save_fn, preload_fn, save_args = writer.get_save_function_and_args()
-
-    def finalize_fn():
-        """Finalizes async checkpointing and synchronizes processes."""
-        save_state_dict_async_finalize(*save_state_dict_ret)
-
-    return NVRxAsyncRequest(
-        save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
-    )
