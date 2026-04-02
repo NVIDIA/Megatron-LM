@@ -103,6 +103,10 @@ class MoEOverloadFactorTracker:
     over ``tp_ep_group``, divides by expected-per-rank (from summed local expected / size)
     to get **tp_ep overload** per microbatch entry, then ``all_reduce(AVG)`` and
     ``all_reduce(MAX)`` on that overload across ``dp_group`` before scalar summaries.
+    Over the **pipeline-parallel** group, ``max`` and ``max_cum`` scalars are
+    ``all_reduce(MAX)`` so every stage agrees on the worst overload; ranks without
+    MoE layers contribute ``0``. The **mean** overload scalar is **not** reduced
+    across PP (each rank logs its local mean, ``0`` if it recorded nothing).
     ``_fwd_bwd`` / ``_fwd_bwd_expected`` mirror interleaved fwd/bwd so cumulative
     peaks of actual vs ideal expected slots can be compared.
 
@@ -174,6 +178,12 @@ class MoEOverloadFactorTracker:
         self._fwd_bwd.append(-tokens_on_rank.detach())
         self._fwd_bwd_expected.append(-local_expected_routed_slots.detach())
 
+    def _pp_group_for_overload(self) -> Optional[torch.distributed.ProcessGroup]:
+        if not torch.distributed.is_initialized():
+            return None
+        g = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
+        return g
+
     def report(
         self,
         iteration: int,
@@ -182,20 +192,35 @@ class MoEOverloadFactorTracker:
         per_layer_logging: bool = False,
     ) -> str:
         """Reduce stored data, compute overload factors, log to TB/W&B, request deferred clear, return log string."""
-        if not self._fwd:
-            return ""
+        pp_group = self._pp_group_for_overload()
+        use_pp_reduce = (
+            pp_group is not None
+            and torch.distributed.get_world_size(group=pp_group) > 1
+        )
 
         tp_ep_group = self._tp_ep_group
         dp_group = self._dp_group
 
         fwd_tensors = []
         expected_tensors = []
-        for layer_idx in sorted(self._fwd.keys()):
-            for t, e in zip(self._fwd[layer_idx], self._fwd_expected[layer_idx]):
-                fwd_tensors.append(t)
-                expected_tensors.append(e)
+        if self._fwd:
+            for layer_idx in sorted(self._fwd.keys()):
+                for t, e in zip(self._fwd[layer_idx], self._fwd_expected[layer_idx]):
+                    fwd_tensors.append(t)
+                    expected_tensors.append(e)
 
-        if not fwd_tensors:
+        if not self._fwd or not fwd_tensors:
+            # Ranks without MoE still join PP collectives so peers do not hang.
+            if use_pp_reduce:
+                device = (
+                    torch.device('cuda', torch.cuda.current_device())
+                    if torch.cuda.is_available()
+                    else torch.device('cpu')
+                )
+                pp_buf = torch.zeros(2, device=device, dtype=torch.float32)
+                torch.distributed.all_reduce(
+                    pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX
+                )
             self.clear()
             return ""
 
@@ -291,6 +316,24 @@ class MoEOverloadFactorTracker:
 
         avg_overload_factor = avg_overload_factors.mean().item()
         max_overload_factor = max_overload_factors.max().item()
+
+        if use_pp_reduce:
+            cum_in = (
+                float(max_cum_overload_factor)
+                if max_cum_overload_factor is not None
+                else 0.0
+            )
+            pp_buf = torch.tensor(
+                [max_overload_factor, cum_in],
+                device=device,
+                dtype=torch.float32,
+            )
+            if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
+            torch.distributed.all_reduce(
+                pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX
+            )
+            max_overload_factor = pp_buf[0].item()
+            max_cum_overload_factor = pp_buf[1].item()
 
         if writer is not None:
             writer.add_scalar("moe/avg_overload_factor", avg_overload_factor, iteration)
