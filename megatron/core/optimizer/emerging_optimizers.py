@@ -254,7 +254,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def _eopt_init_state_fn(opt, config=None):
     """Initialize emerging optimizer state for torch_dist checkpoint format."""
     for group in opt.param_groups:
-        opt._init_group(group)
+        # Checkpoint init needs state for all parameters, including those without grads yet.
+        opt._init_group(group, skip_non_grad_params=False)
 
 
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
