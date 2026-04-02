@@ -64,6 +64,12 @@ def initialize_test_environment(
 
 
 def create_sft_data_iterator(max_seq_length: int = 1024):
+    """Create a mock SFT data iterator matching the old SFTDataset output after DataLoader collation.
+
+    The old SFTDataset (megatron/training/datasets/sft_dataset.py) returns per-sample dicts with
+    keys: tokens, labels, loss_mask, position_ids, cu_seqlens, max_seqlen — all padded to
+    seq_length.  After PyTorch DataLoader default_collate, tensors get a leading batch dim of 1.
+    """
     min_len = max(1, int(0.1 * max_seq_length))
     max_len = max(2, int(0.4 * max_seq_length))
     candidate_lengths = [torch.randint(min_len, max_len + 1, (1,)).item() for _ in range(10)]
@@ -80,19 +86,51 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     assert (
         num_real_tokens < max_seq_length
     ), f"Sum of lengths {num_real_tokens} is greater than max_seq_length {max_seq_length}"
-    text = torch.randint(0, 10000, (1, num_real_tokens + 1), dtype=torch.int64)
-    tokens = text[:, :-1].contiguous()
-    labels = text[:, 1:].contiguous()
 
+    # Generate packed token sequence (num_real_tokens + 1 for labels shift)
+    text = torch.randint(0, 10000, (num_real_tokens + 1,), dtype=torch.int64)
+
+    # Pad to max_seq_length (mimics old SFTDataset padding)
+    pad_len = max_seq_length - num_real_tokens
+    pad_token = 0
+
+    tokens = torch.cat([text[:-1], torch.full((pad_len,), pad_token, dtype=torch.int64)])
+    labels = torch.cat([text[1:], torch.full((pad_len,), pad_token, dtype=torch.int64)])
+
+    # Position IDs: per-segment positions, then padding positions
+    position_ids = torch.cat([torch.arange(l, dtype=torch.int64) for l in lengths])
+    position_ids = torch.cat(
+        [position_ids, torch.arange(position_ids[-1].item() + 1, position_ids[-1].item() + 1 + pad_len, dtype=torch.int64)]
+    )
+
+    # Loss mask: 1 for real tokens, 0 for padding
+    loss_mask = torch.cat(
+        [torch.ones(num_real_tokens, dtype=torch.float32), torch.zeros(pad_len, dtype=torch.float32)]
+    )
+
+    # cu_seqlens: cumulative lengths ending at max_seq_length (last entry = seq_length after padding)
     cu_seqlens = torch.cat(
         (
             torch.zeros(1, dtype=torch.int32),
             torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32),
         )
     )
+    cu_seqlens[-1] = max_seq_length  # last entry is padded to seq_length
 
-    loss_mask = torch.ones((1, num_real_tokens), dtype=torch.float)
-    batch = {"tokens": tokens, "labels": labels, "loss_mask": loss_mask, "cu_seqlens": cu_seqlens}
+    # max_seqlen: max segment length
+    seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = torch.tensor([seg_lengths.max().item()], dtype=torch.int32)
+
+    # Add batch dimension to sequence tensors (mimics DataLoader default_collate).
+    # cu_seqlens and max_seqlen stay 1D — get_batch_on_this_tp_rank expects them without batch dim.
+    batch = {
+        "tokens": tokens.unsqueeze(0),
+        "labels": labels.unsqueeze(0),
+        "loss_mask": loss_mask.unsqueeze(0),
+        "position_ids": position_ids.unsqueeze(0),
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }
     return iter([batch]), num_real_tokens
 
 
@@ -143,8 +181,10 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     assert attention_mask is None
     assert hybrid_cp_group is None
     assert local_cp_size is None
+    # cu_seqlens_padded is not produced by the old SFTDataset (no preprocess_sft_batch in this PR)
+    assert cu_seqlens_padded is None
 
-    # Shape: preprocess_sft_batch pads to seq_length; THD CP slicing gives seq_length // cp_size per rank
+    # Shape: old SFTDataset pads to seq_length; THD CP slicing gives seq_length // cp_size per rank
     seq_len_per_rank = seq_length // cp_size
     assert tokens.shape == (
         1,
@@ -169,7 +209,7 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     assert loss_mask.dtype == torch.float32
     assert position_ids.dtype == torch.int64
 
-    # cu_seqlens: 1D int32, starts at 0, ends at seq_length (padded by preprocess_sft_batch)
+    # cu_seqlens: 1D int32, starts at 0, ends at seq_length
     assert cu_seqlens.dim() == 1
     assert cu_seqlens.dtype == torch.int32
     assert cu_seqlens[0].item() == 0
@@ -181,119 +221,8 @@ def test_sft_batch(tp_size, cp_size, seq_length):
     assert max_seqlen.dtype == torch.int32
     assert 0 < max_seqlen.item() <= seq_length
 
-    if cp_size > 1:
-        assert cu_seqlens_padded is not None
-        assert cu_seqlens_padded.dim() == 1
-        assert cu_seqlens_padded.dtype == torch.int32
-        assert cu_seqlens_padded[0].item() == 0
-        assert cu_seqlens_padded[-1].item() == seq_length
-        assert cu_seqlens_padded.shape == cu_seqlens.shape
-
-        # Compute the divisibility factor (mirrors preprocess_sft_batch logic)
-        sp = tp_size > 1
-        divisibility_factor = cp_size * 2
-        if tp_size > 1 and sp:
-            divisibility_factor *= tp_size
-
-        # Compute the segment lengths from cu_seqlens and cu_seqlens_padded
-        orig_seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        padded_seg_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-        num_segments = len(orig_seg_lengths)
-
-        # cu_seqlens_padded: every segment must be divisible by divisibility_factor
-        for i, seg_len in enumerate(padded_seg_lengths):
-            assert (
-                seg_len.item() % divisibility_factor == 0
-            ), f"Padded segment {i} length {seg_len.item()} not divisible by {divisibility_factor}"
-
-        # cu_seqlens_padded segments >= cu_seqlens segments (padding only adds tokens).
-        # The last segment is excluded because pad_or_truncate_thd_tensors replaces
-        # the final entry of both cu_seqlens and cu_seqlens_padded with seq_length.
-        # Since cu_seqlens_padded[-2] >= cu_seqlens[-2] (from CP padding), the last
-        # padded segment (seq_length - cu_seqlens_padded[-2]) can be smaller than the
-        # last original segment (seq_length - cu_seqlens[-2]).
-        for i in range(num_segments - 1):
-            assert (
-                padded_seg_lengths[i].item() >= orig_seg_lengths[i].item()
-            ), f"Segment {i}: padded length {padded_seg_lengths[i].item()} < original length {orig_seg_lengths[i].item()}"
-
-        # loss_mask: must be binary (0.0 or 1.0)
-        assert ((loss_mask == 0.0) | (loss_mask == 1.0)).all(), "loss_mask must be binary"
-
-        # Intra-sample CP padding validation: for each padded segment on this
-        # CP rank, verify that position_ids and loss_mask are consistent with
-        # the padding introduced by pad_thd_sequences_for_cp.
-        cp_rank = mpu.get_context_parallel_rank()
-        per_rank_seg_lens = (padded_seg_lengths // cp_size).tolist()
-
-        offset = 0
-        for i in range(num_segments):
-            seg_len = per_rank_seg_lens[i]
-            if seg_len == 0:
-                continue
-            seg_pos = position_ids[0, offset : offset + seg_len]
-            seg_loss = loss_mask[0, offset : offset + seg_len]
-
-            # thd_get_partitioned_indices uses zigzag load-balanced partitioning:
-            # each padded segment is split into 2*cp_size chunks, and rank k
-            # gets chunk k and chunk (2*cp_size - 1 - k).
-            padded_seg_len = padded_seg_lengths[i].item()
-            num_chunks = 2 * cp_size
-            chunk_size = padded_seg_len // num_chunks
-            chunk0_start = cp_rank * chunk_size
-            chunk1_start = (num_chunks - 1 - cp_rank) * chunk_size
-            expected_pos = torch.cat(
-                [
-                    torch.arange(
-                        chunk0_start,
-                        chunk0_start + chunk_size,
-                        dtype=torch.int64,
-                        device=seg_pos.device,
-                    ),
-                    torch.arange(
-                        chunk1_start,
-                        chunk1_start + chunk_size,
-                        dtype=torch.int64,
-                        device=seg_pos.device,
-                    ),
-                ]
-            )
-            assert torch.equal(seg_pos, expected_pos), (
-                f"Segment {i}: expected zigzag position_ids "
-                f"[{chunk0_start}..{chunk0_start + chunk_size - 1}, "
-                f"{chunk1_start}..{chunk1_start + chunk_size - 1}] but got "
-                f"[{seg_pos[0].item()}, ..., {seg_pos[-1].item()}] on CP rank {cp_rank}"
-            )
-
-            # For non-last segments, cu_seqlens entries are unchanged by
-            # pad_or_truncate_thd_tensors, so orig_seg_lengths[i] is the true
-            # sub-sequence length.  This lets us make precise assertions:
-            #   position_id >= orig_len  =>  intra-sample CP padding  =>  loss_mask == 0
-            #   position_id <  orig_len  =>  real token               =>  loss_mask == 1
-            # (The last segment absorbs end-of-sequence padding so its
-            # orig_seg_lengths entry is inflated -- skip the precise check.)
-            if i < num_segments - 1:
-                orig_len = orig_seg_lengths[i].item()
-                padding_mask = seg_pos >= orig_len
-                if padding_mask.any():
-                    assert (seg_loss[padding_mask] == 0.0).all(), (
-                        f"Segment {i}: intra-sample padding tokens (pos >= {orig_len}) "
-                        f"must have loss_mask=0, CP rank {cp_rank}"
-                    )
-                real_mask = seg_pos < orig_len
-                if real_mask.any():
-                    assert (seg_loss[real_mask] == 1.0).all(), (
-                        f"Segment {i}: real tokens (pos < {orig_len}) "
-                        f"must have loss_mask=1, CP rank {cp_rank}"
-                    )
-
-            offset += seg_len
-
-        assert (
-            offset == seq_len_per_rank
-        ), f"Total per-rank offset {offset} != expected {seq_len_per_rank}"
-    else:
-        assert cu_seqlens_padded is None
+    # loss_mask: must be binary (0.0 or 1.0)
+    assert ((loss_mask == 0.0) | (loss_mask == 1.0)).all(), "loss_mask must be binary"
 
     Utils.destroy_model_parallel()
 
