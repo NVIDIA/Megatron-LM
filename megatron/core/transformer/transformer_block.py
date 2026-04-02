@@ -453,6 +453,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
+        condition_embeddings: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         layer_offset: int = 0,
     ):
@@ -482,6 +483,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 context_mask,
                 rotary_pos_emb,
                 padding_mask=None,
+                condition_embeddings=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -513,6 +515,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            condition_embeddings=condition_embeddings,
                         )
                 return hidden_states, context
 
@@ -533,6 +536,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    condition_embeddings,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -544,6 +548,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    condition_embeddings,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -700,6 +705,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        condition_embeddings: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -737,6 +743,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 which to extract intermediate hidden states. If
                 non-empty, the forward pass will collect hidden_states
                 after each specified layer.
+            condition_embeddings (Tensor, optional): Condition embeddings for diffusion models
+                (e.g. timestep or text embeddings). Shape [batch_size, embeddings_dim].
+                Passed through to each transformer layer's forward().
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -853,6 +862,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
+                    condition_embeddings=condition_embeddings,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
                 )
@@ -901,6 +911,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            condition_embeddings=condition_embeddings,
                             mhc_recompute_manager=mhc_manager,
                         )
                     self._finalize_mhc_recompute_layer(

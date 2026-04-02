@@ -706,6 +706,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
+        # Condition embeddings for diffusion models (e.g. timestep or text embeddings),
+        # shape [batch_size, embeddings_dim]. Consumed here so it is not forwarded to
+        # _forward_attention. Subclasses that override forward() can use this directly.
+        condition_embeddings = kwargs.pop("condition_embeddings", None)
         assert (
             not self.config.enable_hyper_connections
         ), "Please use HyperConnectionTransformerLayer instead"
