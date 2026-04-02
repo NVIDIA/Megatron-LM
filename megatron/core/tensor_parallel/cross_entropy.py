@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Tuple
 
 import torch
@@ -11,6 +12,8 @@ from megatron.core.parallel_state import (
 )
 
 from .utils import VocabUtility
+
+_TP_INVARIANT_MODE = os.environ.get("NVTE_TP_INVARIANT_MODE", "0") == "1"
 
 
 class VocabParallelCrossEntropy:
@@ -151,11 +154,21 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             group=get_tensor_model_parallel_group(),
         )
 
-        torch.distributed.all_reduce(
-            sum_exp_logits,
-            op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
-        )
+        if _TP_INVARIANT_MODE and world_size > 1:
+            # All-gather exp_logits and recompute sum locally so the
+            # reduction order matches TP=1 (single contiguous sum).
+            gathered = [torch.empty_like(exp_logits) for _ in range(world_size)]
+            torch.distributed.all_gather(
+                gathered, exp_logits.contiguous(), group=get_tensor_model_parallel_group()
+            )
+            sum_exp_logits = torch.cat(gathered, dim=-1).sum(dim=-1)
+            del gathered
+        else:
+            torch.distributed.all_reduce(
+                sum_exp_logits,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_tensor_model_parallel_group(),
+            )
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
             exp_logits, predicted_logits, sum_exp_logits

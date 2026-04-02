@@ -1,0 +1,12 @@
+# Result logs (kept local, not in upstream PR)
+results/
+output/
+*.log
+
+# Bridge-based legacy scripts (replaced by submit_qwen3_*_tp_invariant.sh)
+validate_e2e_*.py
+submit_e2e_*.sh
+test_tp_numerics.py
+
+# Local-only notes (never push)
+*.local.md

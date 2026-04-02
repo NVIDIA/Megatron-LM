@@ -1065,7 +1065,11 @@ def pretrain(
 
         set_ideal_affinity_for_current_gpu()
     if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally", flush=True)
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            enable_batch_invariant_mode,
+        )
+
+        print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
 
     if args.log_progress:

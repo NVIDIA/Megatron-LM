@@ -735,3 +735,158 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
         C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
+
+
+# ============================================================================
+# Batch-Invariant bmm and softmax tests
+# ============================================================================
+
+try:
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        bmm_batch_invariant,
+        _softmax_batch_invariant,
+    )
+    HAVE_BMM_SOFTMAX_BIK = True
+except ImportError:
+    # Older BIK versions don't ship bmm/softmax helpers; skip dependent tests.
+    bmm_batch_invariant = None
+    _softmax_batch_invariant = None
+    HAVE_BMM_SOFTMAX_BIK = False
+
+_skip_no_bmm_softmax = pytest.mark.skipif(
+    not HAVE_BMM_SOFTMAX_BIK,
+    reason="bmm_batch_invariant / _softmax_batch_invariant not in this BIK build",
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_bmm_batch_invariant_chunking(dtype):
+    """Verify bmm gives identical per-element results regardless of batch size.
+
+    Simulates attention Q@K^T where batch=nheads varies with TP degree.
+    """
+    torch.manual_seed(42)
+    B1, B2, M, K, N = 5, 11, 64, 64, 64
+    a_full = torch.randn(B1 + B2, M, K, **_device(dtype))
+    b_full = torch.randn(B1 + B2, K, N, **_device(dtype))
+
+    c_full = bmm_batch_invariant(a_full, b_full)
+    c1 = bmm_batch_invariant(a_full[:B1].contiguous(), b_full[:B1].contiguous())
+    c2 = bmm_batch_invariant(a_full[B1:].contiguous(), b_full[B1:].contiguous())
+    c_cat = torch.cat([c1, c2], dim=0)
+
+    assert c_full.shape == c_cat.shape
+    assert torch.equal(c_full, c_cat), (
+        f"bmm results differ: max_diff={(c_full.float()-c_cat.float()).abs().max().item():.6e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_bmm_batch_invariant_attention_dims(dtype):
+    """Test with realistic attention dimensions (Qwen3-0.6B: seq=2048, d=128)."""
+    torch.manual_seed(42)
+    max_heads = 16
+    seq, head_dim = 2048, 128
+
+    # Q@K^T: [nheads, seq, head_dim] @ [nheads, head_dim, seq]
+    a_full = torch.randn(max_heads, seq, head_dim, **_device(dtype))
+    b_full = torch.randn(max_heads, head_dim, seq, **_device(dtype))
+
+    for nheads in [16, 8, 4]:
+        c = bmm_batch_invariant(a_full[:nheads].contiguous(), b_full[:nheads].contiguous())
+        c_ref = bmm_batch_invariant(a_full[:1].contiguous(), b_full[:1].contiguous())
+        assert torch.equal(c[0], c_ref[0]), (
+            f"nheads={nheads}: head 0 differs from nheads=1 by "
+            f"{(c[0].float()-c_ref[0].float()).abs().max().item():.6e}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_bmm_batch_invariant_numerical_parity(dtype):
+    """Verify bmm_batch_invariant is numerically close to torch.bmm."""
+    torch.manual_seed(42)
+    B, M, K, N = 8, 64, 64, 64
+    a = torch.randn(B, M, K, **_device(dtype))
+    b = torch.randn(B, K, N, **_device(dtype))
+
+    c_bik = bmm_batch_invariant(a, b)
+    c_ref = torch.bmm(a.float(), b.float()).to(dtype)
+    torch.testing.assert_close(c_bik, c_ref, **_tols(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_softmax_batch_invariant_chunking(dtype):
+    """Verify softmax gives identical per-element results regardless of batch size."""
+    torch.manual_seed(42)
+    B1, B2, M, N = 5, 11, 64, 64
+    x_full = torch.randn(B1 + B2, M, N, **_device(dtype))
+
+    y_full = _softmax_batch_invariant(x_full, dim=-1, half_to_float=False)
+    y1 = _softmax_batch_invariant(x_full[:B1].contiguous(), dim=-1, half_to_float=False)
+    y2 = _softmax_batch_invariant(x_full[B1:].contiguous(), dim=-1, half_to_float=False)
+    y_cat = torch.cat([y1, y2], dim=0)
+
+    assert y_full.shape == y_cat.shape
+    assert torch.equal(y_full, y_cat), (
+        f"softmax results differ: max_diff={(y_full.float()-y_cat.float()).abs().max().item():.6e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_softmax_batch_invariant_attention_dims(dtype):
+    """Test softmax with realistic attention score dimensions."""
+    torch.manual_seed(42)
+    max_heads = 16
+    seq = 2048
+
+    scores = torch.randn(max_heads, seq, seq, **_device(dtype))
+
+    for nheads in [16, 8, 4]:
+        y = _softmax_batch_invariant(scores[:nheads].contiguous(), dim=-1, half_to_float=False)
+        y_ref = _softmax_batch_invariant(scores[:1].contiguous(), dim=-1, half_to_float=False)
+        assert torch.equal(y[0], y_ref[0]), (
+            f"nheads={nheads}: head 0 differs from nheads=1 by "
+            f"{(y[0].float()-y_ref[0].float()).abs().max().item():.6e}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_softmax_batch_invariant_half_to_float(dtype):
+    """Verify half_to_float mode returns fp32 output."""
+    torch.manual_seed(42)
+    x = torch.randn(4, 32, 32, **_device(dtype))
+
+    y = _softmax_batch_invariant(x, dim=-1, half_to_float=True)
+    assert y.dtype == torch.float32
+
+    # Row sums should be ~1.0
+    row_sums = y.sum(dim=-1)
+    assert (row_sums - 1.0).abs().max().item() < 1e-5
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_softmax_batch_invariant_numerical_parity(dtype):
+    """Verify softmax_batch_invariant is numerically close to torch.softmax."""
+    torch.manual_seed(42)
+    x = torch.randn(8, 64, 64, **_device(dtype))
+
+    y_bik = _softmax_batch_invariant(x, dim=-1, half_to_float=False)
+    y_ref = torch.softmax(x.float(), dim=-1).to(dtype)
+    torch.testing.assert_close(y_bik, y_ref, **_tols(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_mean_batch_invariant_full_reduction_chunking_invariant(dtype):
+    """Full-reduction mean must be invariant to how the input is chunked.
+
+    Mean of equal-size halves' means should equal mean of the whole. Exercises
+    the two-stage Triton reduction path.
+    """
+    torch.manual_seed(42)
+    x = torch.randn(4096, 2, 4096, **_device(dtype))
+    flat = x.reshape(-1)
+    half = flat.numel() // 2
+    with set_batch_invariant_mode(True):
+        m_full = x.mean()
+        m_halves = (flat[:half].mean() + flat[half:].mean()) / 2
+    torch.testing.assert_close(m_full, m_halves, **_tols(dtype))
