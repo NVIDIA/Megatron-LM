@@ -985,73 +985,80 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
     """Autograd function to save overload factor data for forward and backward passes."""
 
     @staticmethod
-    def forward(ctx, tensor, routing_map, layer_number, num_local_experts):
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        local_expected_routed_slots: torch.Tensor,
+        layer_number: Optional[int],
+    ):
         """Forward pass: save overload factor data.
 
         Args:
-            tensor: A tensor in the autograd graph (e.g., probs) to pass through.
-            routing_map: The routing map tensor [num_tokens, num_experts].
+            tensor: Tensor in the autograd graph (e.g. ``dispatched_input``) — pass-through.
+            tokens_per_expert: Per-local-expert counts from ``dispatch_postprocess`` (any device).
+            local_expected_routed_slots: Scalar float, ``routing_map.shape[0] * topk`` pre-dispatch.
             layer_number: Layer index (1-based).
-            num_local_experts: Number of experts per EP rank.
 
         Returns:
-            tensor unchanged (pass-through).
+            ``tensor`` unchanged.
         """
         if layer_number is None:
             return tensor
 
-        local_tokens_per_expert = routing_map.sum(dim=0).detach().float()
-        num_experts = local_tokens_per_expert.shape[0]
-        ep_size = num_experts // num_local_experts
-        local_tokens_per_ep_rank = local_tokens_per_expert.view(
-            ep_size, num_local_experts
-        ).sum(dim=1)
+        tokens_on_rank = tokens_per_expert.detach().sum()
+        if not tokens_on_rank.is_floating_point():
+            tokens_on_rank = tokens_on_rank.float()
+        tokens_on_rank = tokens_on_rank.to(device=tensor.device, dtype=torch.float32).reshape(())
+
+        expected = local_expected_routed_slots.detach().to(
+            device=tensor.device, dtype=torch.float32
+        ).reshape(())
 
         tracker = get_moe_overload_factor_tracker()
-        tracker.record_fwd(layer_number, local_tokens_per_ep_rank)
+        tracker.record_fwd(layer_number, tokens_on_rank, expected)
 
-        ctx.save_for_backward(local_tokens_per_ep_rank)
+        ctx.save_for_backward(tokens_on_rank, expected)
         return tensor
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward pass: append negated tokens to fwd_bwd tracker."""
+        """Backward pass: append negated actual and expected for paired cumsums."""
         if ctx.saved_tensors:
-            (local_tokens_per_ep_rank,) = ctx.saved_tensors
-            get_moe_overload_factor_tracker().record_bwd(local_tokens_per_ep_rank)
+            tokens_on_rank, expected = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, expected)
         return grad_output, None, None, None
 
 
 def save_overload_factor_to_tracker(
     tensor: torch.Tensor,
-    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    local_expected_routed_slots: torch.Tensor,
     layer_number: Optional[int],
-    num_local_experts: int,
     tp_ep_group: torch.distributed.ProcessGroup,
     dp_group: torch.distributed.ProcessGroup,
 ) -> torch.Tensor:
-    """Save local tokens per EP rank for overload factor computation at report time.
+    """Wrap ``tensor`` to record post-dispatch token totals for overload factor reporting.
 
-    Sets process groups on the overload tracker and wraps the tensor in
-    SaveOverloadFactorFunction so forward/backward record data for
-    get_moe_overload_factor_tracker().report().
+    Records ``tokens_per_expert.sum()`` on this rank and the pre-dispatch expected slot
+    count scalar. See ``MoEOverloadFactorTracker.report()``.
 
     Args:
-        tensor: A tensor in the autograd graph (e.g., probs) - passed through unchanged.
-        routing_map: The routing map tensor [num_tokens, num_experts].
+        tensor: Tensor in the autograd graph (typically ``dispatched_input``).
+        tokens_per_expert: Output of ``dispatch_postprocess`` (per-expert counts).
+        local_expected_routed_slots: Scalar float tensor, ``shape[0] * moe_router_topk``.
         layer_number: Layer index (1-based).
-        num_local_experts: Number of experts per EP rank.
-        tp_ep_group: The TP x EP group for all-reducing.
-        dp_group: The DP group for max/avg reduction.
+        tp_ep_group: TP × EP process group.
+        dp_group: Data-parallel group for cross-replica stats.
 
     Returns:
-        tensor unchanged.
+        ``tensor`` unchanged.
     """
     get_moe_overload_factor_tracker().set_process_groups(
         tp_ep_group=tp_ep_group, dp_group=dp_group
     )
     return SaveOverloadFactorFunction.apply(
-        tensor, routing_map, layer_number, num_local_experts
+        tensor, tokens_per_expert, local_expected_routed_slots, layer_number
     )
 
 
