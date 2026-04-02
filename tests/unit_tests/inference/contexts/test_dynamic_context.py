@@ -1489,7 +1489,9 @@ class TestDynamicContext:
                     unified_memory_level=0,
                 ),
             )
-            assert context.kv_block_allocator.total_count > context_many.kv_block_allocator.total_count
+            assert (
+                context.kv_block_allocator.total_count > context_many.kv_block_allocator.total_count
+            )
 
     @pytest.mark.internal
     @rounder_override(64)
