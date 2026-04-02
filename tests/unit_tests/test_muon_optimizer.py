@@ -10,10 +10,13 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, OptimizerConfig
-from megatron.core.optimizer.muon import (
+from megatron.core.optimizer import (
+    HAVE_EMERGING_OPTIMIZERS,
+    OptimizerConfig,
+    get_megatron_optimizer,
+)
+from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelMuon,
-    get_megatron_muon_optimizer,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -139,8 +142,8 @@ class TestMuonOptimizerMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
-    def test_get_megatron_muon_optimizer_smoke(self):
-        """Smoke test for get_megatron_muon_optimizer function."""
+    def test_get_megatron_optimizer_smoke(self):
+        """Smoke test for get_megatron_optimizer function."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -165,11 +168,8 @@ class TestMuonOptimizerMultiRank:
         )
 
         # Test creating the optimizer
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Test basic properties
@@ -214,24 +214,13 @@ class TestMuonOptimizerMultiRank:
         # Load state dict should not raise error
         optimizer.load_state_dict(state_dict)
 
-    def test_get_megatron_muon_optimizer_validation(self):
-        """Test validation logic for get_megatron_muon_optimizer."""
+    def test_get_megatron_optimizer_validation(self):
+        """Test validation logic for get_megatron_optimizer."""
         model = torch.nn.Linear(100, 50, bias=False, dtype=torch.bfloat16, device='cuda')
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
 
-        # Test 1: Distributed optimizer should raise exception
-        optimizer_config_dist = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            bf16=True,
-            use_distributed_optimizer=True,  # This should cause an exception
-        )
-
-        with pytest.raises(Exception, match='muon with dist optimizer is not supported'):
-            get_megatron_muon_optimizer(config=optimizer_config_dist, model_chunks=[model])
-
-        # Test 2: FP16 should raise exception
+        # Test 1: FP16 should raise exception
         optimizer_config_fp16 = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -239,8 +228,8 @@ class TestMuonOptimizerMultiRank:
             use_distributed_optimizer=False,
         )
 
-        with pytest.raises(Exception, match='muon with fp16 is not supported'):
-            get_megatron_muon_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+        with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
+            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
 
         # Test 3: Invalid num_ns_steps should raise exception
         optimizer_config_invalid_ns = OptimizerConfig(
@@ -252,10 +241,10 @@ class TestMuonOptimizerMultiRank:
         )
 
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
-            get_megatron_muon_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
+            get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
 
-    def test_get_megatron_muon_optimizer_layer_wise(self):
-        """Test get_megatron_muon_optimizer with layer-wise distributed optimizer."""
+    def test_get_megatron_optimizer_layer_wise(self):
+        """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -265,7 +254,7 @@ class TestMuonOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
             muon_momentum=0.95,
             muon_use_nesterov=True,
             muon_fp32_matmul_prec="medium",
@@ -274,12 +263,9 @@ class TestMuonOptimizerMultiRank:
             muon_tp_mode="duplicated",
         )
 
-        # Test with layer_wise_distributed_optimizer=True
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=True,
+        # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Verify it's a LayerWiseDistributedOptimizer
@@ -709,7 +695,7 @@ def test_muon_optimizer_invalid_coefficient_type():
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
 class TestMuonCoefficientTypeMultiRank:
-    """Test coefficient_type integration through get_megatron_muon_optimizer."""
+    """Test coefficient_type integration through get_megatron_optimizer."""
 
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
@@ -724,8 +710,8 @@ class TestMuonCoefficientTypeMultiRank:
         )
 
     @pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
-    def test_get_megatron_muon_optimizer_coefficient_type(self, coefficient_type):
-        """Test that coefficient_type flows through get_megatron_muon_optimizer."""
+    def test_get_megatron_optimizer_coefficient_type(self, coefficient_type):
+        """Test that coefficient_type flows through get_megatron_optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -741,11 +727,8 @@ class TestMuonCoefficientTypeMultiRank:
             muon_tp_mode="duplicated",
         )
 
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         assert optimizer is not None
