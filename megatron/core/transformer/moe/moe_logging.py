@@ -96,19 +96,19 @@ class MoEOverloadFactorTracker:
     """Tracker for MoE overload factor metrics.
 
     Records per-layer **tokens on this rank** after dispatch
-    (``tokens_per_expert.sum()``) and a pre-dispatch expected slot scalar
+    (``tokens_per_expert.sum()``) and a pre-dispatch **balanced token count** scalar
     (from ``routing_map.shape[0] * moe_router_topk`` read after ``token_dispatch``),
     via an autograd hook on
     ``dispatched_input``. ``report()`` does ``all_reduce(MAX)`` on per-rank actual totals
-    over ``tp_ep_group``, divides by expected-per-rank (from summed local expected / size)
+    over ``tp_ep_group``, divides by balanced count per rank (from summed local counts / size)
     to get **tp_ep overload** per microbatch entry, then ``all_reduce(AVG)`` and
     ``all_reduce(MAX)`` on that overload across ``dp_group`` before scalar summaries.
     Over the **pipeline-parallel** group, ``max`` and ``max_cum`` scalars are
     ``all_reduce(MAX)`` so every stage agrees on the worst overload; ranks without
     MoE layers contribute ``0``. The **mean** overload scalar is **not** reduced
     across PP (each rank logs its local mean, ``0`` if it recorded nothing).
-    ``_fwd_bwd`` / ``_fwd_bwd_expected`` mirror interleaved fwd/bwd so cumulative
-    peaks of actual vs ideal expected slots can be compared.
+    ``_fwd_bwd`` / ``_fwd_bwd_balanced`` mirror interleaved fwd/bwd so cumulative
+    peaks of actual vs balanced token counts can be compared.
 
     Lifecycle: set_process_groups() and record_fwd/record_bwd during forward
     (SaveOverloadFactorFunction in MoELayer) → report() at step end
@@ -121,10 +121,10 @@ class MoEOverloadFactorTracker:
 
     def __init__(self) -> None:
         self._fwd: Dict[int, List[torch.Tensor]] = {}  # layer_idx -> list of 0-dim float (tokens on rank)
-        self._fwd_expected: Dict[int, List[torch.Tensor]] = {}  # same keys as _fwd, scalar tensors
+        self._fwd_balanced: Dict[int, List[torch.Tensor]] = {}  # same keys as _fwd, balanced token count
         self._fwd_bwd: List[torch.Tensor] = []
-        # Mirrors _fwd_bwd: +expected on forward, -expected on backward (pre-dispatch slots).
-        self._fwd_bwd_expected: List[torch.Tensor] = []
+        # Mirrors _fwd_bwd: +balanced count on forward, - on backward.
+        self._fwd_bwd_balanced: List[torch.Tensor] = []
         self._tp_ep_group: Optional[torch.distributed.ProcessGroup] = None
         self._dp_group: Optional[torch.distributed.ProcessGroup] = None
         self._pending_clear: bool = False
@@ -142,9 +142,9 @@ class MoEOverloadFactorTracker:
 
     def _clear_storage(self) -> None:
         self._fwd.clear()
-        self._fwd_expected.clear()
+        self._fwd_balanced.clear()
         self._fwd_bwd.clear()
-        self._fwd_bwd_expected.clear()
+        self._fwd_bwd_balanced.clear()
 
     def _flush_pending_clear(self) -> None:
         if self._pending_clear:
@@ -155,28 +155,28 @@ class MoEOverloadFactorTracker:
         self,
         layer_number: Optional[int],
         tokens_on_rank: torch.Tensor,
-        local_expected_routed_slots: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
     ) -> None:
-        """Record forward-pass token total on this rank (0-dim float) and expected slots scalar."""
+        """Record forward-pass token total on this rank (0-dim float) and balanced token count scalar."""
         self._flush_pending_clear()
         if layer_number is None:
             return
         layer_idx = layer_number - 1
         if layer_idx not in self._fwd:
             self._fwd[layer_idx] = []
-            self._fwd_expected[layer_idx] = []
+            self._fwd_balanced[layer_idx] = []
         self._fwd[layer_idx].append(tokens_on_rank.detach())
-        self._fwd_expected[layer_idx].append(local_expected_routed_slots.detach())
+        self._fwd_balanced[layer_idx].append(local_balanced_token_count.detach())
         self._fwd_bwd.append(tokens_on_rank.detach())
-        self._fwd_bwd_expected.append(local_expected_routed_slots.detach())
+        self._fwd_bwd_balanced.append(local_balanced_token_count.detach())
 
     def record_bwd(
-        self, tokens_on_rank: torch.Tensor, local_expected_routed_slots: torch.Tensor
+        self, tokens_on_rank: torch.Tensor, local_balanced_token_count: torch.Tensor
     ) -> None:
-        """Record backward-pass (negated actual and expected) for paired cumsums."""
+        """Record backward-pass (negated actual and balanced count) for paired cumsums."""
         self._flush_pending_clear()
         self._fwd_bwd.append(-tokens_on_rank.detach())
-        self._fwd_bwd_expected.append(-local_expected_routed_slots.detach())
+        self._fwd_bwd_balanced.append(-local_balanced_token_count.detach())
 
     def _pp_group_for_overload(self) -> Optional[torch.distributed.ProcessGroup]:
         if not torch.distributed.is_initialized():
@@ -202,12 +202,12 @@ class MoEOverloadFactorTracker:
         dp_group = self._dp_group
 
         fwd_tensors = []
-        expected_tensors = []
+        balanced_tensors = []
         if self._fwd:
             for layer_idx in sorted(self._fwd.keys()):
-                for t, e in zip(self._fwd[layer_idx], self._fwd_expected[layer_idx]):
+                for t, b in zip(self._fwd[layer_idx], self._fwd_balanced[layer_idx]):
                     fwd_tensors.append(t)
-                    expected_tensors.append(e)
+                    balanced_tensors.append(b)
 
         if not self._fwd or not fwd_tensors:
             # Ranks without MoE still join PP collectives so peers do not hang.
@@ -231,34 +231,34 @@ class MoEOverloadFactorTracker:
                 f"Overload factor tracker: num_entries ({num_entries}) must be "
                 f"divisible by num_layers ({num_layers})."
             )
-        if len(expected_tensors) != num_entries:
+        if len(balanced_tensors) != num_entries:
             raise ValueError(
-                f"Overload factor tracker: expected_tensors length ({len(expected_tensors)}) "
+                f"Overload factor tracker: balanced_tensors length ({len(balanced_tensors)}) "
                 f"must match fwd_tensors ({num_entries})."
             )
 
-        # Cumulative actual vs ideal (expected slots) balance; ratio of peaks across ranks.
+        # Cumulative actual vs balanced token count; ratio of peaks across ranks.
         max_cum_overload_factor = None
         if self._fwd_bwd:
-            if len(self._fwd_bwd_expected) != len(self._fwd_bwd):
+            if len(self._fwd_bwd_balanced) != len(self._fwd_bwd):
                 raise ValueError(
                     f"Overload tracker: _fwd_bwd ({len(self._fwd_bwd)}) and "
-                    f"_fwd_bwd_expected ({len(self._fwd_bwd_expected)}) length mismatch."
+                    f"_fwd_bwd_balanced ({len(self._fwd_bwd_balanced)}) length mismatch."
                 )
             fwd_bwd_stacked = torch.stack(
                 [t.float() for t in self._fwd_bwd], dim=0
             )  # [num_events]
-            exp_bwd_stacked = torch.stack(
-                [t.float() for t in self._fwd_bwd_expected], dim=0
+            balanced_bwd_stacked = torch.stack(
+                [t.float() for t in self._fwd_bwd_balanced], dim=0
             )
             cum_actual = fwd_bwd_stacked.cumsum(dim=0)
-            cum_ideal = exp_bwd_stacked.cumsum(dim=0)
+            cum_balanced = balanced_bwd_stacked.cumsum(dim=0)
             local_actual_peak = cum_actual.max()
-            local_ideal_peak = cum_ideal.max()
+            local_balanced_peak = cum_balanced.max()
             ratio_t = torch.tensor(
                 [
-                    (local_actual_peak / (local_ideal_peak + 1e-8)).item()
-                    if local_ideal_peak.item() > 0
+                    (local_actual_peak / (local_balanced_peak + 1e-8)).item()
+                    if local_balanced_peak.item() > 0
                     else 0.0
                 ],
                 device=fwd_bwd_stacked.device,
@@ -274,7 +274,7 @@ class MoEOverloadFactorTracker:
                 )
             max_cum_overload_factor = ratio_t.item()
 
-        # tp_ep: max token count per entry across the group, then overload = max / expected_per_rank.
+        # tp_ep: max token count per entry across the group, then overload = max / balanced_per_rank.
         stacked = torch.stack([t.float() for t in fwd_tensors], dim=0)
         device = stacked.device
         if tp_ep_group is not None:
@@ -287,15 +287,15 @@ class MoEOverloadFactorTracker:
             tp_ep_world = 1.0
             max_actual = stacked
 
-        # Expected routed slots per rank if balanced: sum_local(shape[0]*topk) over tp_ep / size.
-        expected_stacked = torch.stack(
-            [e.to(device=device, dtype=torch.float32) for e in expected_tensors], dim=0
+        # Balanced token count per rank: sum_local(shape[0]*topk) over tp_ep / size.
+        balanced_stacked = torch.stack(
+            [b.to(device=device, dtype=torch.float32) for b in balanced_tensors], dim=0
         )
         if tp_ep_group is not None:
-            torch.distributed.all_reduce(expected_stacked, group=tp_ep_group)
-        expected_per_rank = expected_stacked / tp_ep_world
+            torch.distributed.all_reduce(balanced_stacked, group=tp_ep_group)
+        balanced_per_rank = balanced_stacked / tp_ep_world
 
-        tp_ep_overload = max_actual / (expected_per_rank + 1e-8)
+        tp_ep_overload = max_actual / (balanced_per_rank + 1e-8)
 
         # DP: average and worst-case overload across data-parallel replicas (per entry).
         if dp_group is not None:
@@ -328,7 +328,6 @@ class MoEOverloadFactorTracker:
                 device=device,
                 dtype=torch.float32,
             )
-            if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
             torch.distributed.all_reduce(
                 pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX
             )

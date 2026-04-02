@@ -739,9 +739,10 @@ class TransformerConfig(ModelParallelConfig):
     This is an experimental feature for benchmarking purposes."""
 
     log_overload_factor: bool = False
-    """When True, log MoE overload metrics (avg/max vs expected per step; max cum overload =
-    peak cumulative actual / peak cumulative expected over interleaved fwd/bwd) to TensorBoard/W&B
-    and console. Records ``tokens_per_expert.sum()`` after dispatch; use for debugging."""
+    """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
+    overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
+    fwd/bwd) to TensorBoard/W&B and console. Records ``tokens_per_expert.sum()`` after dispatch;
+    use for debugging."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms

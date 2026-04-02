@@ -989,7 +989,7 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
         ctx,
         tensor: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        local_expected_routed_slots: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
         layer_number: Optional[int],
     ):
         """Forward pass: save overload factor data.
@@ -997,7 +997,7 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
         Args:
             tensor: Tensor in the autograd graph (e.g. ``dispatched_input``) — pass-through.
             tokens_per_expert: Per-local-expert counts from ``dispatch_postprocess`` (any device).
-            local_expected_routed_slots: Scalar float, ``routing_map.shape[0] * topk`` pre-dispatch.
+            local_balanced_token_count: Scalar float, ``routing_map.shape[0] * topk`` pre-dispatch.
             layer_number: Layer index (1-based).
 
         Returns:
@@ -1011,42 +1011,42 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
             tokens_on_rank = tokens_on_rank.float()
         tokens_on_rank = tokens_on_rank.to(device=tensor.device, dtype=torch.float32).reshape(())
 
-        expected = local_expected_routed_slots.detach().to(
+        balanced = local_balanced_token_count.detach().to(
             device=tensor.device, dtype=torch.float32
         ).reshape(())
 
         tracker = get_moe_overload_factor_tracker()
-        tracker.record_fwd(layer_number, tokens_on_rank, expected)
+        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
 
-        ctx.save_for_backward(tokens_on_rank, expected)
+        ctx.save_for_backward(tokens_on_rank, balanced)
         return tensor
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward pass: append negated actual and expected for paired cumsums."""
+        """Backward pass: append negated actual and balanced count for paired cumsums."""
         if ctx.saved_tensors:
-            tokens_on_rank, expected = ctx.saved_tensors
-            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, expected)
+            tokens_on_rank, balanced = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
         return grad_output, None, None, None
 
 
 def save_overload_factor_to_tracker(
     tensor: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    local_expected_routed_slots: torch.Tensor,
+    local_balanced_token_count: torch.Tensor,
     layer_number: Optional[int],
     tp_ep_group: torch.distributed.ProcessGroup,
     dp_group: torch.distributed.ProcessGroup,
 ) -> torch.Tensor:
     """Wrap ``tensor`` to record post-dispatch token totals for overload factor reporting.
 
-    Records ``tokens_per_expert.sum()`` on this rank and the pre-dispatch expected slot
-    count scalar. See ``MoEOverloadFactorTracker.report()``.
+    Records ``tokens_per_expert.sum()`` on this rank and the pre-dispatch **balanced token
+    count** scalar. See ``MoEOverloadFactorTracker.report()``.
 
     Args:
         tensor: Tensor in the autograd graph (typically ``dispatched_input``).
         tokens_per_expert: Output of ``dispatch_postprocess`` (per-expert counts).
-        local_expected_routed_slots: Scalar float tensor, ``shape[0] * moe_router_topk``.
+        local_balanced_token_count: Scalar float tensor, ``shape[0] * moe_router_topk``.
         layer_number: Layer index (1-based).
         tp_ep_group: TP × EP process group.
         dp_group: Data-parallel group for cross-replica stats.
@@ -1058,7 +1058,7 @@ def save_overload_factor_to_tracker(
         tp_ep_group=tp_ep_group, dp_group=dp_group
     )
     return SaveOverloadFactorFunction.apply(
-        tensor, tokens_per_expert, local_expected_routed_slots, layer_number
+        tensor, tokens_per_expert, local_balanced_token_count, layer_number
     )
 
 
