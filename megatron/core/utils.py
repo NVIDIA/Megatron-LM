@@ -2050,17 +2050,14 @@ def get_batch_on_this_tp_rank(
             n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
 
-            if n == 0:
-                buf = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
+            if n > 0:
                 assert isinstance(
                     cu_seqlens, torch.Tensor
                 ), f"Expected cu_seqlens to be a torch.Tensor, got {type(cu_seqlens)}"
                 assert (
                     cu_seqlens.dtype == torch.int32
                 ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
-                buf = cu_seqlens
-            _broadcast(buf)
+                _broadcast(cu_seqlens)
 
         if is_hybrid_cp:
             hybrid_cp_seq_length = torch.tensor(
@@ -2146,15 +2143,10 @@ def get_batch_on_this_tp_rank(
             n = int(n.item())
 
             if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
+                return None
+
+            cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
             _broadcast(cu_seqlens)
-
-            assert (
-                cu_seqlens.numel() > 0
-            ), f"Expected cu_seqlens to have more than 0 elements, got {cu_seqlens.numel()}"
-
             return cu_seqlens
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
