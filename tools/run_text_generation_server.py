@@ -138,7 +138,7 @@ def main(model_type: str = "gpt"):
         # Set up model and load checkpoint
         if model_type == "gpt":
             model_builder = gpt_builder
-        elif model_type == "mamba":
+        elif model_type == "hybrid":
             model_builder = hybrid_builder
         else:
             raise ValueError(f"Invalid model provider {model_type}")
