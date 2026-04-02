@@ -490,6 +490,12 @@ def is_flashinfer_min_version(version, check_equality=True):
     return flashinver_version > PkgVersion(version)
 
 
+def accepts_parameter(func: Callable, name: str) -> bool:
+    """Check if a callable accepts a parameter with the given name or **kwargs."""
+    params = inspect.signature(func).parameters.values()
+    return any(p.name == name or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)

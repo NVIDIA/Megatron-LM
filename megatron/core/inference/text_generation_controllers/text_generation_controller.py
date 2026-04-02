@@ -4,7 +4,6 @@ import asyncio
 import concurrent
 import copy
 import functools
-import inspect
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -35,7 +34,13 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core.utils import get_asyncio_loop, get_model_config, get_pg_size, unwrap_model
+from megatron.core.utils import (
+    accepts_parameter,
+    get_asyncio_loop,
+    get_model_config,
+    get_pg_size,
+    unwrap_model,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -209,12 +214,7 @@ class TextGenerationController:
             while tokens and tokens[-1] == tokenizer.eod:
                 tokens = tokens[:-1]
 
-        sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
-        detok_accepts_skip = any(
-            p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in sig_params
-        )
-        if detok_accepts_skip:
+        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
             return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
         else:
             return tokenizer.detokenize(tokens)
