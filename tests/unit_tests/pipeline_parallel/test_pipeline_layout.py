@@ -134,7 +134,7 @@ def create_args():
     args.consumed_valid_samples = 0
     args.vocab_file = None
     args.add_position_embedding = False
-    args.ckpt_assume_constant_structure = True
+    args.ckpt_assume_constant_structure = False
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
     args.bf16 = True
@@ -147,6 +147,7 @@ def create_args():
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    args.async_strategy = "nvrx"
 
     yield args
 
