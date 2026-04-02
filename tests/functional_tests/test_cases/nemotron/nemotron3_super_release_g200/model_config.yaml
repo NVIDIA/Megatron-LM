@@ -1,0 +1,147 @@
+ENV_VARS:
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  TORCHINDUCTOR_WORKER_START: fork
+  QUANTIZATION_TYPE_DEBUG: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+TEST_TYPE: "release"
+MODEL_ARGS:
+  # Precision args
+  --keep-mtp-spec-in-bf16: true
+  --keep-mamba-stack-attention-linear-in-bf16: true
+  --keep-mamba-out-proj-in-mxfp8: true
+  --keep-moe-latent-projections-in-bf16: true
+  --first-last-layers-bf16: true
+  --num-layers-at-start-in-bf16: 0
+  --num-layers-at-end-in-bf16: 14
+  --fp4-format: e2m1
+  --fp4-recipe: nvfp4
+  # MTP args
+  --mtp-spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --mtp-num-layers: 2
+  --mtp-hybrid-override-pattern: \"*E\"
+  --calculate-per-token-loss: true
+  --mtp-loss-scaling-factor: 0.3
+
+  --enable-cuda-graph: true
+  --cuda-graph-scope: mamba attn moe_router
+  --te-rng-tracker: true
+  --ddp-num-buckets: 10
+  --high-priority-stream-groups: ep
+  --manual-gc: true
+  --manual-gc-interval: 10
+  --moe-shared-expert-compute-before-router: true
+
+  --moe-latent-size: 1024
+  --moe-permute-fusion: true
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: native
+  --use-fused-weighted-squared-relu: true
+
+  --moe-token-dispatcher-type: alltoall
+  --moe-router-score-function: sigmoid
+  --moe-grouped-gemm: true
+  --num-experts: 512
+  --moe-router-topk: 22
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-topk-scaling-factor: 5.0
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-shared-expert-intermediate-size: 5376
+
+  --attention-backend: flash
+  --num-workers: 1
+  --disable-gloo-process-groups: true
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
+
+  --squared-relu: true
+  --no-mmap-bin-files: true
+  --distributed-timeout-minutes: 10
+  # --exit-duration-in-mins: 5750
+  --no-create-attention-mask-in-dataloader: true
+
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --sequence-parallel: true
+  --tensor-model-parallel-size: 2
+  --expert-model-parallel-size: 64
+  --expert-tensor-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --use-distributed-optimizer: true
+  --override-opt_param-scheduler
+
+
+  --mamba-num-heads: 128
+  --is-hybrid-model: true
+  --untie-embeddings-and-output-weights: true
+  --init-method-std: 0.014
+  --position-embedding-type: none
+  --num-layers: 88
+  --hidden-size: 4096
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 2
+  --hybrid-override-pattern: MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME
+  --ffn-hidden-size: 2688
+  --kv-channels: 128
+
+
+  --seq-length: 8192
+  --max-position-embeddings: 8192
+  --train-samples: 12207031
+  --lr-decay-style: WSD
+  --lr-warmup-samples: 24414063
+  --lr-decay-samples: 3048706055
+  --lr-wsd-decay-style: minus_sqrt
+  --lr-wsd-decay-samples: 610351563
+
+
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --per-split-data-args-path: ${BLEND_PATH}
+  --data-cache-path: ${DATACACHE_DIR}
+  --tiktoken-pattern: v2
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${TOKENIZER_MODEL_PATH}
+
+  --micro-batch-size: 1
+  --global-batch-size: 3072
+  --lr: 4.5e-4
+  --min-lr: 4.5e-6
+  --weight-decay: 0.1
+  --clip-grad: 1.0
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --disable-bias-linear: true
+  --normalization: RMSNorm
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --log-interval: 100
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-throughput: true
+  --log-progress: true
+  --log-energy: true
+  --log-memory-interval: 500
+  --logging-level: 20
+
+  --check-weight-hash-across-dp-replicas-interval: 20000
+  --ddp-pad-buckets-for-high-nccl-busbw: true
+  --timing-log-option: minmax
+
+
+  --save-interval: 1000
+  --save-retain-interval: 5000
+
+  --eval-interval: 1000
+  --eval-iters: 14
+  --bf16: true
+  --use-mcore-models: true
+  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --tensorboard-dir: ${TENSORBOARD_PATH}
