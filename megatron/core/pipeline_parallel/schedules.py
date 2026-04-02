@@ -638,7 +638,8 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
+    if config.moe_paged_stash:
+        paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -1066,7 +1067,8 @@ def forward_backward_pipelining_with_interleaving(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
-    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
+    if config.moe_paged_stash:
+        paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -2270,7 +2272,8 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
+    if config.moe_paged_stash:
+        paged_stash_reset(enabled=config.moe_paged_stash and not forward_only, config=config)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

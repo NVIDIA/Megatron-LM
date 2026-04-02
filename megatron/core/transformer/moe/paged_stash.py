@@ -488,7 +488,7 @@ class PagedTensor:
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
 
 
-class PP_PreScheduleFunction(torch.autograd.Function):
+class PipelinePreScheduleFunction(torch.autograd.Function):
     """
     This function is used to update the pp schedule.
     """
@@ -518,7 +518,7 @@ class PP_PreScheduleFunction(torch.autograd.Function):
         return grad_output + (None, None)
 
 
-class PP_PostScheduleFunction(torch.autograd.Function):
+class PipelinePostScheduleFunction(torch.autograd.Function):
     """
     This function is used to update the pp schedule.
     """
@@ -648,6 +648,7 @@ class PagedStashManager:
 
     def get_schedule_layer(self, vp_stage, layer_no, microbatch_no):
         """Get the schedule layer."""
+        assert layer_no < 1000 and microbatch_no < 1000, "Schedule encoding overflow"
         return vp_stage * 1000000 + layer_no * 1000 + microbatch_no
 
     def add_paged_tensor_to_stash(self, paged_tensor):
@@ -660,11 +661,7 @@ class PagedStashManager:
     def remove_paged_tensor_from_stash(self):
         """Remove all paged tensors from the stash list."""
         if self.status == 'captured':
-            while len(self.paged_tensors_to_stash) > 0:
-                paged_tensor = self.paged_tensors_to_stash.pop(0)
-            assert (
-                len(self.paged_tensors_to_stash) == 0
-            ), f"paged_tensors_to_stash is not empty {self.paged_tensors_to_stash}"
+            self.paged_tensors_to_stash.clear()
         else:
             pass
 
@@ -992,7 +989,7 @@ def paged_stash_group_start(tensor):
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return tensor
-    return PP_PreScheduleFunction.apply(tensor, stash_manager)
+    return PipelinePreScheduleFunction.apply(tensor, stash_manager)
 
 
 def get_paged_stash_context(
@@ -1020,7 +1017,7 @@ def paged_stash_group_commit(tensor, name=None):
     stash_manager.device = tensor.device
     if not stash_manager.enabled:
         return tensor
-    return PP_PostScheduleFunction.apply(tensor, stash_manager)
+    return PipelinePostScheduleFunction.apply(tensor, stash_manager)
 
 
 def paged_stash_init_chunk_handler(vp_size, vp_stage):
