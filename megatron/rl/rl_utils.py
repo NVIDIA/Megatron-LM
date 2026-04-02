@@ -884,9 +884,12 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    # Per-rollout staleness
+    # Per-rollout staleness (oldest token)
     rollout_policy_staleness = [current_iteration - min(r) for g in policy_epoch for r in g]
     rollout_kv_staleness = [current_iteration - min(r) for g in kv_cache_epoch for r in g]
+    # Per-rollout staleness (newest token)
+    rollout_policy_last_token_staleness = [current_iteration - max(r) for g in policy_epoch for r in g]
+    rollout_kv_last_token_staleness = [current_iteration - max(r) for g in kv_cache_epoch for r in g]
     # Per-token staleness
     per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
     per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
@@ -912,7 +915,9 @@ def prep_wandb_metrics(
             ),
             'rollout_table': wandb_writer.Table(
                 columns=[
-                    'reward', 'traj_length', 'num_evictions', 'policy_staleness', 'kv_staleness'
+                    'reward', 'traj_length', 'num_evictions',
+                    'policy_staleness', 'kv_staleness',
+                    'policy_last_token_staleness', 'kv_last_token_staleness',
                 ],
                 data=list(zip(
                     [r for g in rewards for r in g],
@@ -920,6 +925,8 @@ def prep_wandb_metrics(
                     [e for g in num_evictions for e in g],
                     rollout_policy_staleness,
                     rollout_kv_staleness,
+                    rollout_policy_last_token_staleness,
+                    rollout_kv_last_token_staleness,
                 )),
             ),
             'per_token_table': wandb_writer.Table(
@@ -947,6 +954,12 @@ def prep_wandb_metrics(
             'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
             'max_kv_cache_staleness': max(rollout_kv_staleness),
             'min_kv_cache_staleness': min(rollout_kv_staleness),
+            'mean_policy_last_token_staleness': np.mean(rollout_policy_last_token_staleness),
+            'max_policy_last_token_staleness': max(rollout_policy_last_token_staleness),
+            'min_policy_last_token_staleness': min(rollout_policy_last_token_staleness),
+            'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
+            'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
+            'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
