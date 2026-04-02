@@ -145,7 +145,9 @@ class TestIsSWiGLUKey:
         assert not _is_swiglu_key("model.module.language_model.layers.0.mlp.linear_fc2.weight")
 
     def test_attention_not_matched(self):
-        assert not _is_swiglu_key("model.module.language_model.layers.0.self_attention.linear_qkv.weight")
+        assert not _is_swiglu_key(
+            "model.module.language_model.layers.0.self_attention.linear_qkv.weight"
+        )
 
     # --- Per-module prefix filtering (--swiglu-modules) ---
 
@@ -210,9 +212,7 @@ class TestSWiGLURegexSplit:
         assert v == "model.module.language_model.layers.3.mlp.experts.linear_fc1.weight5_v"
 
     def test_grouped_expert_bias_with_index(self):
-        w, v = self._split_key(
-            "model.module.language_model.layers.3.mlp.experts.linear_fc1.bias0"
-        )
+        w, v = self._split_key("model.module.language_model.layers.3.mlp.experts.linear_fc1.bias0")
         assert w == "model.module.language_model.layers.3.mlp.experts.linear_fc1.bias0_w"
         assert v == "model.module.language_model.layers.3.mlp.experts.linear_fc1.bias0_v"
 
@@ -256,26 +256,34 @@ class TestMTPKeyRenaming:
 
     def test_mtp_key_renamed(self):
         sd = {
-            "model.module.language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": torch.tensor(1.0),
+            "model.module.language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": torch.tensor(
+                1.0
+            )
         }
         result, count = self._rename_mtp_keys(sd)
         assert count == 1
-        expected_key = "model.module.language_model.mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight"
+        expected_key = (
+            "model.module.language_model.mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight"
+        )
         assert expected_key in result
 
     def test_non_mtp_key_unchanged(self):
-        sd = {
-            "model.module.language_model.layers.0.mlp.linear_fc1.weight": torch.tensor(1.0),
-        }
+        sd = {"model.module.language_model.layers.0.mlp.linear_fc1.weight": torch.tensor(1.0)}
         result, count = self._rename_mtp_keys(sd)
         assert count == 0
         assert "model.module.language_model.layers.0.mlp.linear_fc1.weight" in result
 
     def test_multiple_mtp_keys(self):
         sd = {
-            "model.module.language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": torch.tensor(1.0),
-            "model.module.language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight": torch.tensor(2.0),
-            "model.module.language_model.mtp.layers.1.transformer_layer.mlp.linear_fc1.weight": torch.tensor(3.0),
+            "model.module.language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": torch.tensor(
+                1.0
+            ),
+            "model.module.language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight": torch.tensor(
+                2.0
+            ),
+            "model.module.language_model.mtp.layers.1.transformer_layer.mlp.linear_fc1.weight": torch.tensor(
+                3.0
+            ),
             "model.module.language_model.layers.0.mlp.linear_fc1.weight": torch.tensor(4.0),
         }
         result, count = self._rename_mtp_keys(sd)
@@ -302,15 +310,11 @@ class TestMTPKeyRenaming:
         assert self._should_auto_detect_mtp(keys)
 
     def test_auto_detect_does_not_trigger_without_mtp(self):
-        keys = [
-            "model.module.language_model.layers.0.transformer_layer.mlp.weight",
-        ]
+        keys = ["model.module.language_model.layers.0.transformer_layer.mlp.weight"]
         assert not self._should_auto_detect_mtp(keys)
 
     def test_auto_detect_does_not_trigger_without_transformer_layer(self):
-        keys = [
-            "model.module.language_model.mtp.layers.0.mtp_model_layer.mlp.weight",
-        ]
+        keys = ["model.module.language_model.mtp.layers.0.mtp_model_layer.mlp.weight"]
         assert not self._should_auto_detect_mtp(keys)
 
 
@@ -374,9 +378,7 @@ class TestKeyInGluLayer:
 
     def test_unknown_key_defaults_to_true(self):
         """Keys not matching any TransformerLayer default to GLU=True for backward compat."""
-        layer_glu = {
-            "language_model.decoder.layers.0": True,
-        }
+        layer_glu = {"language_model.decoder.layers.0": True}
         key = "module.embedding.word_embeddings.weight"
         assert self._key_in_glu_layer(key, layer_glu) is True
 
@@ -385,15 +387,15 @@ class TestKeyInGluLayer:
 
     def test_longest_prefix_match(self):
         """When multiple layers match, the longest prefix should win."""
-        layer_glu = {
-            "language_model": True,
-            "language_model.decoder.layers.0": False,
-        }
+        layer_glu = {"language_model": True, "language_model.decoder.layers.0": False}
         key = "module.language_model.decoder.layers.0.mlp.linear_fc1.weight"
         assert self._key_in_glu_layer(key, layer_glu) is False
 
     def test_strip_wrappers(self):
-        assert self._strip_wrappers("module.model.language_model.layers.0") == "language_model.layers.0"
+        assert (
+            self._strip_wrappers("module.model.language_model.layers.0")
+            == "language_model.layers.0"
+        )
         assert self._strip_wrappers("language_model.layers.0") == "language_model.layers.0"
         assert self._strip_wrappers("module.module.model.x") == "x"
 
@@ -427,7 +429,7 @@ class TestGDNKeyMatching:
         for gdn_path, info in gdn_info.items():
             if not norm.startswith(gdn_path + '.'):
                 continue
-            rel = norm[len(gdn_path) + 1:]
+            rel = norm[len(gdn_path) + 1 :]
             if rel == 'in_proj.weight':
                 return info['in_proj_sizes'], cls.GDN_IN_PROJ_NAMES, 0
             if rel in ('conv1d.weight', 'conv1d.bias'):
@@ -436,15 +438,19 @@ class TestGDNKeyMatching:
 
     def _make_gdn_info(self, qk_dim=64, v_dim=128, num_value_heads=4, tp=1):
         return {
-            'in_proj_sizes': [qk_dim // tp, qk_dim // tp, v_dim // tp,
-                              v_dim // tp, num_value_heads // tp, num_value_heads // tp],
+            'in_proj_sizes': [
+                qk_dim // tp,
+                qk_dim // tp,
+                v_dim // tp,
+                v_dim // tp,
+                num_value_heads // tp,
+                num_value_heads // tp,
+            ],
             'conv1d_sizes': [qk_dim // tp, qk_dim // tp, v_dim // tp],
         }
 
     def test_in_proj_weight_matched(self):
-        gdn_info = {
-            "language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()
-        }
+        gdn_info = {"language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()}
         key = "module.language_model.decoder.layers.0.self_attention.gdn.in_proj.weight"
         result = self._match_gdn_key(key, gdn_info)
         assert result is not None
@@ -454,9 +460,7 @@ class TestGDNKeyMatching:
         assert dim == 0
 
     def test_conv1d_weight_matched(self):
-        gdn_info = {
-            "language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()
-        }
+        gdn_info = {"language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()}
         key = "module.language_model.decoder.layers.0.self_attention.gdn.conv1d.weight"
         result = self._match_gdn_key(key, gdn_info)
         assert result is not None
@@ -465,9 +469,7 @@ class TestGDNKeyMatching:
         assert len(sizes) == 3
 
     def test_conv1d_bias_matched(self):
-        gdn_info = {
-            "language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()
-        }
+        gdn_info = {"language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()}
         key = "module.language_model.decoder.layers.0.self_attention.gdn.conv1d.bias"
         result = self._match_gdn_key(key, gdn_info)
         assert result is not None
@@ -475,17 +477,13 @@ class TestGDNKeyMatching:
         assert names == self.GDN_CONV1D_NAMES
 
     def test_non_gdn_key_not_matched(self):
-        gdn_info = {
-            "language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()
-        }
+        gdn_info = {"language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()}
         key = "module.language_model.decoder.layers.0.mlp.linear_fc1.weight"
         assert self._match_gdn_key(key, gdn_info) is None
 
     def test_other_gdn_subkey_not_matched(self):
         """Only in_proj.weight and conv1d.weight/bias should be matched, not e.g. gate.weight."""
-        gdn_info = {
-            "language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()
-        }
+        gdn_info = {"language_model.decoder.layers.0.self_attention.gdn": self._make_gdn_info()}
         key = "module.language_model.decoder.layers.0.self_attention.gdn.gate.weight"
         assert self._match_gdn_key(key, gdn_info) is None
 
@@ -507,12 +505,8 @@ class TestGDNKeyMatching:
         assert r1[0][0] == 128  # layer 1 qk_dim
 
     def test_tp_affects_split_sizes(self):
-        gdn_info_tp1 = {
-            "gdn": self._make_gdn_info(qk_dim=64, v_dim=128, num_value_heads=4, tp=1)
-        }
-        gdn_info_tp2 = {
-            "gdn": self._make_gdn_info(qk_dim=64, v_dim=128, num_value_heads=4, tp=2)
-        }
+        gdn_info_tp1 = {"gdn": self._make_gdn_info(qk_dim=64, v_dim=128, num_value_heads=4, tp=1)}
+        gdn_info_tp2 = {"gdn": self._make_gdn_info(qk_dim=64, v_dim=128, num_value_heads=4, tp=2)}
         key = "module.gdn.in_proj.weight"
         r1 = self._match_gdn_key(key, gdn_info_tp1)
         r2 = self._match_gdn_key(key, gdn_info_tp2)
@@ -637,12 +631,14 @@ class TestMCoreDataGuard:
     def test_metadata_without_mcore_data(self):
         class FakeMetadata:
             pass
+
         m = FakeMetadata()
         assert not hasattr(m, "mcore_data")
 
     def test_metadata_with_mcore_data(self):
         class FakeMetadata:
             mcore_data = {"key": {"nd_reformulated_orig_global_shape": (10, 20)}}
+
         m = FakeMetadata()
         assert hasattr(m, "mcore_data")
         assert "key" in m.mcore_data

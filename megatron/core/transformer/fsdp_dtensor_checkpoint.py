@@ -224,9 +224,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     _layer_glu = {}
     for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrappers(name)] = getattr(
-                module.config, 'gated_linear_unit', False
-            )
+            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
 
     def _key_in_glu_layer(key):
         """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
@@ -236,7 +234,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if norm_key.startswith(layer_path + '.') and len(layer_path) > best_len:
                 best_glu, best_len = uses_glu, len(layer_path)
         if best_glu is None:
-            return True   # no TransformerLayer found — assume GLU for backward compat
+            return True  # no TransformerLayer found — assume GLU for backward compat
         return best_glu
 
     def intersection(s1, s2):
@@ -427,8 +425,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # ------------------------------------------------------------------
     _gdn_info = {}  # normalized_path → {in_proj_sizes, conv1d_sizes}
     for name, mod in model.named_modules():
-        if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim')
-                and hasattr(mod, 'in_proj_dim')):
+        if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim') and hasattr(mod, 'in_proj_dim')):
             continue
         tp = getattr(mod, 'tp_size', 1)
         qk = mod.qk_dim // tp
@@ -449,7 +446,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         for gdn_path, info in _gdn_info.items():
             if not norm.startswith(gdn_path + '.'):
                 continue
-            rel = norm[len(gdn_path) + 1:]
+            rel = norm[len(gdn_path) + 1 :]
             if rel == 'in_proj.weight':
                 return info['in_proj_sizes'], GDN_IN_PROJ_NAMES, 0
             if rel in ('conv1d.weight', 'conv1d.bias'):
@@ -468,9 +465,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """Split a fused GDN projection DTensor into per-component DTensors."""
         fsdp_slice = dist_param.megatron_fsdp_slice
         dist_index = dist_param.megatron_fsdp_dist_index
-        tp_mesh = dist_index.get_submesh(
-            [dist_index.tp_dim], is_expert_parallel=False
-        )
+        tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
 
         data_size = data.numel() // tp_mesh.mesh.numel()
         total_split = sum(split_sizes)
@@ -492,9 +487,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             comp_slice = slice(flat_offset, flat_offset + comp_flat)
 
             shard = intersection(fsdp_slice, comp_slice)
-            comp_data = local_tensor.view(-1)[
-                offset_slice(shard, -fsdp_slice.start)
-            ]
+            comp_data = local_tensor.view(-1)[offset_slice(shard, -fsdp_slice.start)]
 
             comp_view = list(view_shape)
             comp_view[split_dim] = -1
@@ -527,9 +520,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             continue
         sizes, names, dim = match
         dist_param = model.get_parameter(f"module.{key}")
-        sub_tensors = split_gdn_fused(
-            model_state_dict[key], dist_param, sizes, dim
-        )
+        sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
         del model_state_dict[key]
@@ -556,10 +547,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module."):])
-                    sub_tensors = split_gdn_fused(
-                        opt_state[key][subkey], dist_param, sizes, dim
-                    )
+                    dist_param = model.get_parameter(key[len("module.") :])
+                    sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
             optimizer_state_dict["state"] = new_opt_state
