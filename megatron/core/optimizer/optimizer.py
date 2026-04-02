@@ -146,10 +146,16 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if getattr(param, "__fsdp_param__", False):
-                grad = param.grad._local_tensor if param.grad is not None else None
-            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                if (
+                    getattr(param, "__fsdp_param__", False)
+                    and grad is not None
+                    and hasattr(grad, "_local_tensor")
+                ):
+                    grad = grad._local_tensor
+            elif getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
             else:
                 grad = param.grad
             grad_not_none = grad is not None

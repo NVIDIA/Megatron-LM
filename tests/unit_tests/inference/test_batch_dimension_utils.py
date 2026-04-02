@@ -40,15 +40,12 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
     return graph_list
 
 
-def _match(
-    real, graph_list, ep_group, strict=False, decode_only=False, explicit_chunked_prefill=False
-):
+def _match(real, graph_list, ep_group, strict=False, decode_only=False):
     return CUDAGraphBatchDimensionBuilder.match_graph_config(
         real_batch_dim=real,
         cuda_graph_batch_dimensions_list=graph_list,
         strict=strict,
         decode_only_cuda_graphs=decode_only,
-        explicit_chunked_prefill=explicit_chunked_prefill,
         ep_group=ep_group,
         smallest_non_decode_cuda_graph_size=min(MIXED_PREFILL_COUNT, MAX_REQUESTS),
     )
@@ -199,28 +196,7 @@ class TestMatchGraphConfigWithEP:
         ), "All ranks should run eager when decode_only=True and some rank has prefill"
 
     # ------------------------------------------------------------------ #
-    # 4. explicit_chunked_prefill=True, some ranks prefill → all None
-    # ------------------------------------------------------------------ #
-    @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
-    def test_explicit_chunked_prefill_with_mixed_ranks(self, num_cuda_graphs):
-        """When explicit_chunked_prefill=True and some EP rank has prefill,
-        ALL ranks should get None (eager mode)."""
-        ep_group = self._get_ep_group()
-        graph_list = _generate_graphs(num_cuda_graphs)
-        rank = dist.get_rank()
-
-        if rank == 0:
-            real = BD(token_count=64, prefill_req_count=2, decode_req_count=10)
-        else:
-            real = BD(token_count=32, prefill_req_count=0, decode_req_count=32)
-
-        result = _match(real, graph_list, ep_group=ep_group, explicit_chunked_prefill=True)
-        _assert_consistent_across_ranks(result, ep_group)
-        assert result is None, "All ranks should run eager with explicit_chunked_prefill"
-
-    # ------------------------------------------------------------------ #
-    # 5. Mixed prefill graphs with strict matching
+    # 4. Mixed prefill graphs with strict matching
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
