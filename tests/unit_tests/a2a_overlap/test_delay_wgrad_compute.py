@@ -166,7 +166,9 @@ class TestDelayWgradCompute:
         # the same mesh dimension names (but different mesh shape, DP=WORLD_SIZE).
         expt_dp_group = parallel_state.get_expert_data_parallel_group()
         expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
-        expt_tp_group = torch.distributed.new_group(ranks=[torch.distributed.get_rank()]) # Dummy TP=1 group.
+        expt_tp_group = torch.distributed.new_group(
+            ranks=[torch.distributed.get_rank()]
+        )  # Dummy TP=1 group.
         expt_device_mesh = DeviceMesh.from_group(
             [expt_dp_group, expt_tp_group],
             device_type="cuda",
