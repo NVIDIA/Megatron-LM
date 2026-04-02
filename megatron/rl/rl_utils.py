@@ -639,13 +639,13 @@ def cp_split_rl_batch(
     tokens,
     position_ids,
     pad_token,
+    cp_size,
     old_logprobs=None,
     ref_logprobs=None,
     loss_mask=None,
     inference_logprobs=None,
 ):
     """Prepare and context-parallel split a non-packed RL batch."""
-    cp_size = mpu.get_context_parallel_world_size()
     if cp_size <= 1:
         return None
 
@@ -674,15 +674,15 @@ def cp_split_rl_batch(
     return get_batch_on_this_cp_rank(batch)
 
 
-def cp_gather_logprobs(local_logprobs):
+def cp_gather_logprobs(local_logprobs, cp_group):
     """All-gather and un-zigzag CP-local logprobs back to [B, S-1]."""
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = get_pg_size(cp_group)
     if cp_size <= 1:
         return local_logprobs
 
     gathered = [torch.empty_like(local_logprobs) for _ in range(cp_size)]
     torch.distributed.all_gather(
-        gathered, local_logprobs.contiguous(), group=mpu.get_context_parallel_group()
+        gathered, local_logprobs.contiguous(), group=cp_group
     )
 
     chunk_size = local_logprobs.shape[1] // 2
@@ -726,10 +726,11 @@ def get_logprobs(
     args = get_args()
     # For non-packed RL with CP>1, keep packed_seq_params=None to stay on the SBHD path so
     # RoPE and attention use the same zigzag CP partitioning as the split batch.
+    cp_group = get_attr_wrapped_model(model, "pg_collection").cp
     use_cp_nonpacked_path = (
         labels is not None
         and not sequence_packing
-        and mpu.get_context_parallel_world_size() > 1
+        and get_pg_size(cp_group) > 1
     )
 
     # Otherwise keep the existing THD defaults for CUDA-graph signature consistency.
@@ -1285,7 +1286,10 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         position_ids = b_posids.cuda()
         labels = None
         b_packed_seq_params = None
-        cp_batch = cp_split_rl_batch(tokens, position_ids, get_tokenizer().pad)
+        cp_group = get_attr_wrapped_model(model, "pg_collection").cp
+        cp_batch = cp_split_rl_batch(
+            tokens, position_ids, get_tokenizer().pad, get_pg_size(cp_group)
+        )
         if cp_batch is not None:
             tokens = cp_batch["tokens"]
             position_ids = cp_batch["position_ids"]
@@ -1301,7 +1305,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         labels=labels,
     )
     if labels is not None and is_pp_last_stage(get_attr_wrapped_model(model, "pg_collection").pp):
-        logprobs_result = cp_gather_logprobs(logprobs_result)
+        logprobs_result = cp_gather_logprobs(logprobs_result, cp_group)
 
     logprobs = (logprobs_result, None)
     model.train()

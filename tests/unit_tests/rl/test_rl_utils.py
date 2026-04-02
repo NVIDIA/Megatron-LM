@@ -173,13 +173,13 @@ class TestRLUtils:
         position_ids = torch.arange(tokens.shape[1]).unsqueeze(0)
         short = torch.tensor([[1.0] * 7])
 
-        monkeypatch.setattr(rl_utils.mpu, "get_context_parallel_world_size", lambda: 2)
         monkeypatch.setattr(rl_utils, "get_batch_on_this_cp_rank", lambda batch: batch)
 
         result = rl_utils.cp_split_rl_batch(
             tokens,
             position_ids,
             pad_token=42,
+            cp_size=2,
             old_logprobs=short,
             ref_logprobs=short,
             loss_mask=short,
@@ -204,7 +204,7 @@ class TestRLUtils:
                 recorded["packed_seq_params"] = kwargs.get("packed_seq_params")
                 return super().__call__(x, position_ids, attention_mask, **kwargs)
 
-        monkeypatch.setattr(rl_utils.mpu, "get_context_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(rl_utils, "get_pg_size", lambda _: 2)
 
         model = RecordingMockModel(batch=1, seq=SEQ, vocab=VOCAB)
         tokens = torch.ones((1, SEQ), dtype=torch.long)

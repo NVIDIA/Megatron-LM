@@ -9,12 +9,11 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, get_pg_size
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     cp_split_rl_batch,
@@ -262,10 +261,13 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
+        model_to_use = model[0] if isinstance(model, list) else model
+        cp_size = get_pg_size(get_attr_wrapped_model(model_to_use, "pg_collection").cp)
         cp_batch = cp_split_rl_batch(
             tokens,
             position_ids,
             get_tokenizer().pad,
+            cp_size,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
             loss_mask=loss_mask,
@@ -284,7 +286,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = get_pg_size(get_attr_wrapped_model(model_to_use, "pg_collection").cp)
 
     if packed_seq_params is None:
         if args.rl_use_sequence_packing:
