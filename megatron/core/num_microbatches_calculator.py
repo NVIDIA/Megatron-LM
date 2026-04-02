@@ -640,9 +640,8 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         if rank == 0:
             logger.info(f'> initializing step batch size schedule')
             logger.info(f'  raw schedule string: "{schedule}"')
-            logger.info(
-                f'  seq_length: {seq_length} (thresholds interpreted as {"tokens" if seq_length else "samples"})'
-            )
+            unit = "tokens" if seq_length else "samples"
+            logger.info(f'  seq_length: {seq_length}' f' (thresholds interpreted as {unit})')
             logger.info(f'  micro_batch_size: {micro_batch_size}')
             logger.info(f'  data_parallel_size: {data_parallel_size}')
             logger.info(f'step batch size schedule ({len(self.schedule)} steps):')
@@ -651,11 +650,15 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 if seq_length:
                     tokens = threshold * seq_length
                     logger.info(
-                        f'  >= {tokens:,} tokens ({threshold:,} samples) -> batch_size={batch_size}, num_microbatches={num_microbatches}'
+                        f'  >= {tokens:,} tokens ({threshold:,} samples)'
+                        f' -> batch_size={batch_size},'
+                        f' num_microbatches={num_microbatches}'
                     )
                 else:
                     logger.info(
-                        f'  >= {threshold:,} samples -> batch_size={batch_size}, num_microbatches={num_microbatches}'
+                        f'  >= {threshold:,} samples'
+                        f' -> batch_size={batch_size},'
+                        f' num_microbatches={num_microbatches}'
                     )
         # Initialize
         self.update(0, consistency_check=False, verbose=True)
