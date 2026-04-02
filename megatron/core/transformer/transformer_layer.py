@@ -709,7 +709,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Condition embeddings for diffusion models (e.g. timestep or text embeddings),
         # shape [batch_size, embeddings_dim]. Consumed here so it is not forwarded to
         # _forward_attention. Subclasses that override forward() can use this directly.
-        condition_embeddings = kwargs.pop("condition_embeddings", None)
+        conditions_embeddings = kwargs.pop("conditions_embeddings", None)
         assert (
             not self.config.enable_hyper_connections
         ), "Please use HyperConnectionTransformerLayer instead"
@@ -1531,6 +1531,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
+        condition_embeddings = kwargs.pop("condition_embeddings", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
