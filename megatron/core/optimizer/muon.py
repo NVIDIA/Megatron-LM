@@ -13,7 +13,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
 
-from . import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
+from . import HAVE_EMERGING_OPTIMIZERS, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
     ChainedOptimizer,
@@ -32,7 +32,7 @@ if HAVE_EMERGING_OPTIMIZERS:
 else:
     OrthogonalizedOptimizer = object
 
-if HAVE_EO_V02:
+if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT
 
 
@@ -46,14 +46,14 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
     added upstream are automatically available without code changes here.
     """
     assert (
-        HAVE_EO_V02
+        HAVE_EMERGING_OPTIMIZERS
     ), "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
     return get_args(NSCoeffT)  # pylint: disable=possibly-used-before-assignment
 
 
 def validate_coefficient_type(coefficient_type: str) -> None:
     """Raise ``ValueError`` if *coefficient_type* is not supported."""
-    supported = get_supported_coefficient_types() if HAVE_EO_V02 else ("quintic",)
+    supported = get_supported_coefficient_types()
     if coefficient_type not in supported:
         raise ValueError(
             f"Unsupported muon coefficient type '{coefficient_type}'. "
@@ -102,7 +102,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
             mode_value = "duplicated" if mode == "blockwise" else mode
-            mode_kwarg = {"tp_mode": mode_value} if HAVE_EO_V02 else {"mode": mode_value}
+            mode_kwarg = {"tp_mode": mode_value}
             ns_kwargs = dict(
                 steps=num_ns_steps, tp_group=tp_group, partition_dim=partition_dim, **mode_kwarg
             )
@@ -120,9 +120,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
-        nesterov_kwarg = (
-            {"nesterov": use_nesterov} if HAVE_EO_V02 else {"use_nesterov": use_nesterov}
-        )
+        nesterov_kwarg = {"nesterov": use_nesterov}
         super().__init__(
             params,
             lr,
@@ -213,13 +211,7 @@ def get_megatron_muon_optimizer(
     # Set the nonlinear optimizer for muon (used for embeddings, biases, norms).
     config.optimizer = config.muon_scalar_optimizer
 
-    if config.muon_scalar_optimizer == 'lion':
-        assert HAVE_EO_V02, (
-            "Lion optimizer requires emerging_optimizers >= 0.2. "
-            "Please upgrade to use --muon-scalar-optimizer lion."
-        )
-    else:
-        assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
+    assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers >= 0.2 is not installed."
 
     # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
     # In theory we can change DDP to enable use muon and dist-opt-adam together
