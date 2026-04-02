@@ -357,7 +357,7 @@ class HybridModel(LanguageModule):
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
 
-        # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
+        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
         # for inference.
         if in_inference_mode:

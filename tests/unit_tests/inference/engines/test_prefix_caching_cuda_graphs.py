@@ -1,4 +1,4 @@
-# Copyright (c) 2026-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Parameterized test for prefix caching with CUDA graphs.
 

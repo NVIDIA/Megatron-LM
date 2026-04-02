@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
-"""Pretrain and SFT Mamba."""
+"""Pretrain and SFT Hybrid."""
 
 # Capture the true program start time BEFORE any heavy imports.
 import time

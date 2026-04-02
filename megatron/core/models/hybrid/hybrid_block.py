@@ -390,7 +390,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = (
-                f'{layer_prefix}{local_layer_idx}.'  # module list index in MambaBlock
+                f'{layer_prefix}{local_layer_idx}.'  # module list index in HybridStack
             )
 
             sharded_prefix = f'{layer_prefix}{global_layer_offset}.'

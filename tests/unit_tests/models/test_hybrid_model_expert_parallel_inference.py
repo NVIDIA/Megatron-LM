@@ -1,4 +1,4 @@
-# Copyright (c) 2026-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for full HybridModel inference with expert-parallel batch dimension sync.
 

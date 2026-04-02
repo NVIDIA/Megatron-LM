@@ -1,4 +1,4 @@
-# Copyright (c) 2026-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """End-to-end test for Mamba prefix caching with a real hybrid model.
 
