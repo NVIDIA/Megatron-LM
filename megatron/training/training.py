@@ -159,6 +159,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
@@ -2867,6 +2868,16 @@ def train(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
         )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            args,
+            copy_main_params,
+            model,
+            optimizer,
+            forward_backward_func,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3372,6 +3383,16 @@ def evaluate(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            args,
+            copy_main_params,
+            model,
+            None,
+            forward_backward_func,
         )
 
     if has_nvidia_modelopt:
