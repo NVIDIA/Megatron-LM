@@ -185,6 +185,7 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             overlap_param_gather=async_allgather,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -192,7 +193,10 @@ class TestLayerWiseOptimizer:
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
 
