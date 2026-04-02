@@ -851,6 +851,26 @@ class _CudaGraphRunner(torch.nn.Module):
         # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
+    def _drain_etp_async_comms_before_capture(self):
+        """Drain all in-flight ETP async comms (all-gathers / reduce-scatters) and
+        synchronize the device BEFORE entering a torch.cuda.graph() capture context.
+
+        wait_async_comms() is also called INSIDE the capture context so that any
+        prefetch-comms launched by the captured module itself are waited before the
+        graph ends.  However, if comms belonging to *other* (non-captured) parameters
+        are in flight at capture time, their ag_event.record() CUDA ops get embedded
+        into this graph.  On subsequent replays the event fires at the wrong moment,
+        letting the forward GEMM race ahead of the actual in-flight all-gather and
+        corrupting partially-written quantized buffers (e.g. mxfp8 scale_inv → NaN).
+
+        Calling this method outside the capture context settles Python-side state
+        (_prefetch_handle, _inflight_comm_params) so the inner wait_async_comms()
+        becomes a no-op and captures no external ag_event.record() ops.
+        """
+        if self.parameter_sharding:
+            wait_async_comms()
+        torch.cuda.synchronize()
+
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -1002,7 +1022,7 @@ class _CudaGraphRunner(torch.nn.Module):
             # _set_warmup_end()
 
             with self.get_quantization_context():
-                torch.cuda.synchronize()
+                self._drain_etp_async_comms_before_capture()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
                 # before capture begins, to avoid inference-tensor state issues during capture.
                 with torch.inference_mode(mode=False):
@@ -1026,15 +1046,22 @@ class _CudaGraphRunner(torch.nn.Module):
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
 
-                    # Record completion event inside the graph so the current stream can
-                    # proceed as soon as module compute finishes, before async comms are joined.
-                    if self.use_stream:
-                        self.fwd_completion_event.record()
-
+                    # wait_async_comms() records ag_event on the AG side-stream (not the
+                    # graph's main stream).  _wait_side_streams() then makes the main stream
+                    # wait for the AG stream, establishing a happens-before edge that ensures
+                    # ag_event is fully set before fwd_completion_event fires.
+                    # Recording fwd_completion_event AFTER _wait_side_streams() guarantees that
+                    # when the main stream unblocks from wait_event(fwd_completion_event), the
+                    # next module's ag_event.wait() sees the correct, freshly-recorded ag_event
+                    # rather than a stale one from a prior iteration.
                     if self.parameter_sharding:
                         wait_async_comms()
+
                     if self.fwd_side_streams:
                         self._wait_side_streams(self.fwd_side_streams)
+
+                    if self.use_stream:
+                        self.fwd_completion_event.record()
                 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1141,6 +1168,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
 
+        self._drain_etp_async_comms_before_capture()
+
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
@@ -1158,12 +1187,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
-            if self.use_stream:
-                self.bwd_completion_event.record()
             if self.parameter_sharding:
                 wait_async_comms()
+
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
+
+            if self.use_stream:
+                self.bwd_completion_event.record()
 
         # Unfreeze GC.
         if FREEZE_GC:
