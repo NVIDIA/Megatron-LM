@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import asyncio
 import json
 import logging
 import time
@@ -9,8 +8,14 @@ import uuid
 import warnings
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
+
+from .common import (
+    add_moe_routing_to_choice,
+    check_failed_requests,
+    parse_sampling_params,
+    run_inference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +365,321 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def parse_chat_messages(req, tokenizer):
+    """Parse and tokenize chat messages from request via the chat template.
+
+    Reads ``messages``, ``tools``, and ``chat_template_kwargs`` from *req*,
+    sanitizes them for the HF/Jinja template, applies the chat template
+    (or falls back to plain tokenization), and optionally avoids prefix
+    retokenization for cache-friendly continuations.
+
+    Args:
+        req: The request JSON dict.
+        tokenizer: Tokenizer with ``apply_chat_template`` or ``tokenize``.
+
+    Returns:
+        ``prompt_tokens`` (``list[int]``).
+
+    Raises:
+        ValueError: If the ``messages`` field is missing or invalid.
+        Other exceptions from the tokenizer propagate unchanged.
+    """
+    messages = req.get("messages")
+    if not messages:
+        raise ValueError("Missing 'messages' field")
+    if not isinstance(messages, list):
+        raise ValueError("'messages' must be a list")
+
+    tools = req.get("tools", None)
+    chat_template_kwargs = req.get("chat_template_kwargs", {})
+    if not isinstance(chat_template_kwargs, dict):
+        logger.warning(
+            "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
+        )
+        chat_template_kwargs = {}
+
+    template_messages = _sanitize_messages_for_template(messages)
+    template_messages = _reconstruct_reasoning_content(template_messages)
+    template_tools = _sanitize_tools_for_template(tools)
+
+    if (
+        hasattr(tokenizer, 'apply_chat_template')
+        and getattr(tokenizer, "chat_template", None) is not None
+    ):
+        prompt_tokens = tokenizer.apply_chat_template(
+            template_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            tools=template_tools,
+            **chat_template_kwargs,
+        )
+
+        if req.get("prevent_retokenization", True):
+            # If we are avoiding retokenization, we need to replace some prompt
+            # tokens with the prompt/generation tokens from the previous generation.
+            # This improves prefix cache hits and reduces logprob variation between
+            # training and inference.
+
+            # Find the last assistant message
+            last_assistant_message_idx = None
+            for i in reversed(range(len(template_messages))):
+                if template_messages[i]["role"] == "assistant":
+                    last_assistant_message_idx = i
+                    break
+
+            last_assistant_message = (
+                template_messages[last_assistant_message_idx]
+                if last_assistant_message_idx is not None
+                else None
+            )
+
+            # Only proceed if the last assistant message has the token IDs from a
+            # previous generation.  Dataset-provided conversation history won't
+            # have these fields.
+            if (
+                last_assistant_message is not None
+                and "prompt_token_ids" in last_assistant_message
+                and "generation_token_ids" in last_assistant_message
+            ):
+                eos_token_id = tokenizer.eos_id
+                assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+
+                warnings.warn(
+                    "Avoiding prefix retokenization."
+                    " This is a patch that ensures subsequent generations are not"
+                    " retokenized differently than the previous generation."
+                    " This may cause unexpected behavior if messages (including"
+                    " system messages) are altered between generations."
+                )
+
+                messages_to_last_assistant_message = template_messages[
+                    : last_assistant_message_idx + 1
+                ]
+
+                # Get the templated tokenization of just the previous generation
+                retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
+                    messages_to_last_assistant_message,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    tools=template_tools,
+                    **chat_template_kwargs,
+                )
+
+                # Replace the prefix tokens with the tokens from the previous
+                # generation.  If prior token IDs are unavailable, fall back to
+                # the normal retokenized prompt instead of failing the request.
+                prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+                generation_token_ids = last_assistant_message.get("generation_token_ids")
+
+                if isinstance(prompt_token_ids, list) and isinstance(generation_token_ids, list):
+                    previous_turn_token_ids = prompt_token_ids + generation_token_ids
+                    prompt_tokens = _replace_prefix_tokens(
+                        eos_token_id,
+                        previous_turn_token_ids,
+                        retokenized_previous_turn_token_ids,
+                        prompt_tokens,
+                    )
+                else:
+                    logger.warning(
+                        "Last assistant message missing prompt_token_ids/"
+                        "generation_token_ids; skipping prefix replacement."
+                    )
+    else:
+        warnings.warn("Tokenizer does not support 'apply_chat_template'. Using tokenize instead.")
+        prompt_tokens = tokenizer.tokenize("\n".join([message["content"] for message in messages]))
+
+    return prompt_tokens
+
+
+def apply_parsers(message_text, tools, parsers_list, tools_requested):
+    """Runs CPU-intensive text parsing."""
+    meta = {}
+    for parser in parsers_list:
+        if parser not in PARSER_MAPPING:
+            raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+
+        prev_text = message_text
+        parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
+        if "tool_calls" in new_info:
+            new_info["tool_calls"] = _normalize_tool_calls(
+                new_info.get("tool_calls", []), tools=tools
+            )
+            if not tools_requested:
+                # Ignore incidental tool-call syntax in plain chat mode.
+                parsed_text = prev_text
+                new_info.pop("tool_calls", None)
+        message_text = parsed_text
+
+        assert not (meta.keys() & new_info.keys()), "Multiple parsers found the same information."
+        meta.update(new_info)
+
+    return message_text, meta
+
+
+def format_chat_response(
+    batch_results, sampling_params, tokenizer, parsers, tools,
+    tools_requested, tool_choice, parallel_tool_calls, verbose,
+):
+    """Format inference results into an OpenAI chat completions response body.
+
+    Args:
+        batch_results: Raw result dicts from the inference engine.
+        sampling_params: The :class:`SamplingParams` used for inference.
+        tokenizer: Tokenizer with a ``detokenize`` method.
+        parsers: List of parser names to apply (may be ``None``).
+        tools: Tools specification from the request (for parser integration).
+        tools_requested: Whether tools were requested in the request.
+        tool_choice: The ``tool_choice`` value from the request.
+        parallel_tool_calls: Whether parallel tool calls are allowed.
+        verbose: Whether to emit detailed (redacted) result logs.
+
+    Returns:
+        ``dict``: Full OpenAI chat completion response with ``choices``
+        and ``usage``.
+    """
+    choices = []
+    total_completion_tokens = 0
+    prompt_tokens_counts = []
+
+    request_idx = 0
+    for result_item in batch_results:
+        result = unwrap_serialized_tensors(result_item)
+
+        prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
+        text_output = result["generated_text"]
+        prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+        prompt_tokens_counts.append(prompt_tokens_count)
+
+        logprobs_content = None
+        if sampling_params.return_log_probs:
+            token_logprobs = result.get('log_probs', [])
+
+            tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
+            tokens = list(map(tokenizer.detokenize, tokens_to_decode))
+
+            # Get top_n_logprobs if available
+            generated_top_n_logprobs = result.get('generated_top_n_logprobs')
+
+            logprobs_content = []
+            for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
+                # Build top_logprobs list for this token position
+                top_logprobs_list = []
+                if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
+                    top_n_dict = generated_top_n_logprobs[i]
+                    for token_str, logprob in top_n_dict.items():
+                        top_logprobs_list.append(
+                            {
+                                "token": token_str,
+                                "logprob": logprob,
+                                "bytes": list(token_str.encode("utf-8")),
+                            }
+                        )
+
+                logprobs_content.append(
+                    {
+                        "token": tok,
+                        "logprob": lp,
+                        "bytes": list(tok.encode("utf-8")),
+                        "top_logprobs": top_logprobs_list,
+                    }
+                )
+
+        metadata = {}
+        message_text = text_output
+
+        if parsers:
+            message_text, metadata = apply_parsers(
+                message_text, tools, parsers, tools_requested
+            )
+
+        normalized_tool_calls = metadata.get("tool_calls", [])
+
+        # Apply parallel_tool_calls filtering (matches vLLM behavior)
+        normalized_tool_calls = _maybe_filter_parallel_tool_calls(
+            normalized_tool_calls, parallel_tool_calls
+        )
+
+        # Determine content based on tool_choice (matches vLLM behavior):
+        # - Named tool choice or "required": content is empty string
+        # - Otherwise: content is the parsed message text
+        is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+        if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
+            content = ""
+        else:
+            content = message_text if message_text is not None else ""
+
+        message = {"role": "assistant", "content": content}
+        if normalized_tool_calls:
+            message["tool_calls"] = normalized_tool_calls
+        if "reasoning" in metadata:
+            message["reasoning_content"] = metadata["reasoning"]
+
+        # Replicate data in the message field for compatibility.
+        message["prompt_token_ids"] = result["prompt_tokens"]
+        message["generation_token_ids"] = result["generated_tokens"]
+        message["generation_log_probs"] = result.get("generated_log_probs", [])
+        return_log_probs = sampling_params.return_log_probs
+
+        # Determine finish_reason following vLLM conventions:
+        # - "tool_calls" for auto or required tool choice when tools are called
+        # - "stop" for named tool choice (even when tools are called)
+        # - "length" when max tokens is reached
+        if (
+            len(result["generated_tokens"])
+            >= result["sampling_params"]["num_tokens_to_generate"]
+        ):
+            finish_reason = "length"
+        elif normalized_tool_calls and not is_named_tool_choice:
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop"
+
+        choice_data = {
+            "index": request_idx,
+            "message": message,
+            "prompt_token_ids": result["prompt_tokens"],
+            "generation_token_ids": result["generated_tokens"],
+            "generation_log_probs": result.get("generated_log_probs", []),
+            "raw_text": result["prompt"] + result["generated_text"],
+            # 'logprobs' in chat API is an object containing 'content'
+            # "logprobs": {"content": logprobs_content} if logprobs_content else None,
+            "logprobs": {"content": logprobs_content} if return_log_probs else None,
+            "finish_reason": finish_reason,
+        }
+        choice_data["policy_epoch"] = result["policy_epoch"]
+        choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
+        choice_data["num_evictions"] = sum(
+            1 for e in result["events"] if e.get("type") == "EVICT"
+        )
+        if verbose:
+            logging.info(_redact_token_id_lists_for_logging(result))
+
+        add_moe_routing_to_choice(choice_data, result)
+
+        choices.append(choice_data)
+        if choice_data["generation_log_probs"] is None:
+            logger.warning(
+                "Generation log probs is None for request:\n%s",
+                json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
+            )
+        total_completion_tokens += len(result["generated_tokens"])
+        request_idx += 1
+
+    prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "created": int(time.time()),
+        "model": "EMPTY",
+        "object": "chat.completion",
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": prompt_token_count,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": prompt_token_count + total_completion_tokens,
+        },
+    }
+
+
 try:
     import orjson
 
@@ -372,32 +692,6 @@ try:
     from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
-
-    def apply_parsers(message_text, tools, parsers_list, tools_requested):
-        """Runs CPU-intensive text parsing."""
-        meta = {}
-        for parser in parsers_list:
-            if parser not in PARSER_MAPPING:
-                raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
-
-            prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
-            if "tool_calls" in new_info:
-                new_info["tool_calls"] = _normalize_tool_calls(
-                    new_info.get("tool_calls", []), tools=tools
-                )
-                if not tools_requested:
-                    # Ignore incidental tool-call syntax in plain chat mode.
-                    parsed_text = prev_text
-                    new_info.pop("tool_calls", None)
-            message_text = parsed_text
-
-            assert not (
-                meta.keys() & new_info.keys()
-            ), "Multiple parsers found the same information."
-            meta.update(new_info)
-
-        return message_text, meta
 
     @bp.route('/chat/completions', methods=['POST'])
     @bp.route('/v1/chat/completions', methods=['POST'])
@@ -412,130 +706,20 @@ try:
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
         tools_requested = bool(tools) and tool_choice != "none"
-        messages = req.get("messages")
-        chat_template_kwargs = req.get("chat_template_kwargs", {})
-        if not isinstance(chat_template_kwargs, dict):
-            logger.warning(
-                "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
-            )
-            chat_template_kwargs = {}
+
         # --- 1. Parse Messages ---
-        if not messages:
-            return Response("Missing 'messages' field", status=400)
-        if not isinstance(messages, list):
-            return Response("'messages' must be a list", status=400)
-        template_messages = _sanitize_messages_for_template(messages)
-        template_messages = _reconstruct_reasoning_content(template_messages)
-        template_tools = _sanitize_tools_for_template(tools)
-
         try:
-            if (
-                hasattr(tokenizer, 'apply_chat_template')
-                and getattr(tokenizer, "chat_template", None) is not None
-            ):
-                prompt_tokens = tokenizer.apply_chat_template(
-                    template_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=template_tools,
-                    **chat_template_kwargs,
-                )
-
-                if req.get("prevent_retokenization", True):
-                    # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
-                    # This improves prefix cache hits and reduces logprob variation between training and inference.
-
-                    # Find the last assistant message
-                    last_assistant_message_idx = None
-                    for i in reversed(range(len(template_messages))):
-                        if template_messages[i]["role"] == "assistant":
-                            last_assistant_message_idx = i
-                            break
-
-                    last_assistant_message = (
-                        template_messages[last_assistant_message_idx]
-                        if last_assistant_message_idx is not None
-                        else None
-                    )
-
-                    # Only proceed if the last assistant message has the token IDs from a previous generation.
-                    # Dataset-provided conversation history won't have these fields.
-                    if (
-                        last_assistant_message is not None
-                        and "prompt_token_ids" in last_assistant_message
-                        and "generation_token_ids" in last_assistant_message
-                    ):
-                        eos_token_id = tokenizer.eos_id
-                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
-
-                        warnings.warn(
-                            "Avoiding prefix retokenization."
-                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
-                        )
-
-                        messages_to_last_assistant_message = template_messages[
-                            : last_assistant_message_idx + 1
-                        ]
-
-                        # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
-                            messages_to_last_assistant_message,
-                            tokenize=True,
-                            add_generation_prompt=False,
-                            tools=template_tools,
-                            **chat_template_kwargs,
-                        )
-
-                        # Replace the prefix tokens with the tokens from the previous generation.
-                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
-                        # instead of failing the request.
-                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
-                        generation_token_ids = last_assistant_message.get("generation_token_ids")
-
-                        if isinstance(prompt_token_ids, list) and isinstance(
-                            generation_token_ids, list
-                        ):
-                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
-                            prompt_tokens = _replace_prefix_tokens(
-                                eos_token_id,
-                                previous_turn_token_ids,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
-                            )
-                        else:
-                            logger.warning(
-                                "Last assistant message missing prompt_token_ids/"
-                                "generation_token_ids; skipping prefix replacement."
-                            )
-
-            else:
-                warnings.warn(
-                    "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
-                )
-                prompt_tokens = tokenizer.tokenize(
-                    "\n".join([message["content"] for message in messages])
-                )
+            prompt_tokens = parse_chat_messages(req, tokenizer)
+        except ValueError as e:
+            return Response(str(e), status=400)
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return Response(f"Error processing 'messages': {e}", status=500)
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
-
-            if temperature == 0.0:
-                top_k = 1
-                top_p = 0.0
-
-            # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            sampling_params, extras = parse_sampling_params(req)
+            n = extras["n"]
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
@@ -547,213 +731,32 @@ try:
                 if start_idx > 0:
                     prompt_tokens = prompt_tokens[start_idx:]
 
-                if add_BOS:
+                if sampling_params.add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
-
-            max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
-
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                return_log_probs=return_log_probs,
-                top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
-                skip_prompt_log_probs=skip_prompt_log_probs,
-                add_BOS=add_BOS,
-            )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 
-        if current_app.config['verbose']:
-            start_time = time.perf_counter()
-
         try:
-            batch_results = await asyncio.gather(*tasks)
+            batch_results = await run_inference(tasks, current_app.config['verbose'])
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
 
-        if current_app.config['verbose']:
-            logging.info(
-                f"Batch of {len(tasks)} requests (n={n}) processed in "
-                f"{time.perf_counter() - start_time:.2f}s"
-            )
-
         # --- 4. Check for failed requests ---
-        failed_errors = []
-        has_nontransient_error = False
-        for i, record in enumerate(batch_results):
-            if record.get("status") == "FAILED":
-                events = record.get("events", [])
-                error_events = [
-                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
-                ]
-                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
-                    has_nontransient_error = True
-                error_msg = (
-                    str(error_events[-1].get("payload", "Unknown error"))
-                    if error_events
-                    else "Unknown error"
-                )
-                failed_errors.append(f"Request {i}: {error_msg}")
-
-        if failed_errors:
-            error_detail = "; ".join(failed_errors)
-            status = 400 if has_nontransient_error else 500
-            logger.error(f"Inference request(s) failed: {error_detail}")
+        failure = check_failed_requests(batch_results)
+        if failure:
+            error_detail, status = failure
             return Response(f"Inference request(s) failed: {error_detail}", status=status)
 
         # --- 5. Format OpenAI Response ---
-        choices = []
-        total_completion_tokens = 0
-        prompt_tokens_counts = []
-
-        request_idx = 0
-        for result_item in batch_results:
-            result = unwrap_serialized_tensors(result_item)
-
-            prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
-            text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
-            prompt_tokens_counts.append(prompt_tokens_count)
-
-            logprobs_content = None
-            if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
-
-                tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
-                tokens = list(map(tokenizer.detokenize, tokens_to_decode))
-
-                # Get top_n_logprobs if available
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs')
-
-                logprobs_content = []
-                for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
-                    # Build top_logprobs list for this token position
-                    top_logprobs_list = []
-                    if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
-                        top_n_dict = generated_top_n_logprobs[i]
-                        for token_str, logprob in top_n_dict.items():
-                            top_logprobs_list.append(
-                                {
-                                    "token": token_str,
-                                    "logprob": logprob,
-                                    "bytes": list(token_str.encode("utf-8")),
-                                }
-                            )
-
-                    logprobs_content.append(
-                        {
-                            "token": tok,
-                            "logprob": lp,
-                            "bytes": list(tok.encode("utf-8")),
-                            "top_logprobs": top_logprobs_list,
-                        }
-                    )
-
-            metadata = {}
-            message_text = text_output
-
-            if parsers:
-                message_text, metadata = apply_parsers(
-                    message_text, tools, parsers, tools_requested
-                )
-
-            normalized_tool_calls = metadata.get("tool_calls", [])
-
-            # Apply parallel_tool_calls filtering (matches vLLM behavior)
-            normalized_tool_calls = _maybe_filter_parallel_tool_calls(
-                normalized_tool_calls, parallel_tool_calls
-            )
-
-            # Determine content based on tool_choice (matches vLLM behavior):
-            # - Named tool choice or "required": content is empty string
-            # - Otherwise: content is the parsed message text
-            is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
-            if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
-                content = ""
-            else:
-                content = message_text if message_text is not None else ""
-
-            message = {"role": "assistant", "content": content}
-            if normalized_tool_calls:
-                message["tool_calls"] = normalized_tool_calls
-            if "reasoning" in metadata:
-                message["reasoning_content"] = metadata["reasoning"]
-
-            # Replicate data in the message field for compatibility.
-            message["prompt_token_ids"] = result["prompt_tokens"]
-            message["generation_token_ids"] = result["generated_tokens"]
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
-            return_log_probs = sampling_params.return_log_probs
-
-            # Determine finish_reason following vLLM conventions:
-            # - "tool_calls" for auto or required tool choice when tools are called
-            # - "stop" for named tool choice (even when tools are called)
-            # - "length" when max tokens is reached
-            if (
-                len(result["generated_tokens"])
-                >= result["sampling_params"]["num_tokens_to_generate"]
-            ):
-                finish_reason = "length"
-            elif normalized_tool_calls and not is_named_tool_choice:
-                finish_reason = "tool_calls"
-            else:
-                finish_reason = "stop"
-
-            choice_data = {
-                "index": request_idx,
-                "message": message,
-                "prompt_token_ids": result["prompt_tokens"],
-                "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
-                # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
-                "finish_reason": finish_reason,
-            }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
-            if current_app.config['verbose']:
-                logging.info(_redact_token_id_lists_for_logging(result))
-
-            if result["routing_indices"] is not None:
-                choice_data["moe_topk_indices"] = result["routing_indices"]
-                if prompt_tokens_count:
-                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
-                        :prompt_tokens_count
-                    ]
-
-            choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
-                logger.warning(
-                    "Generation log probs is None for request:\n%s",
-                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
-                )
-            total_completion_tokens += len(result["generated_tokens"])
-            request_idx += 1
-
-        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "created": int(time.time()),
-            "model": "EMPTY",
-            "object": "chat.completion",
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_token_count,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": prompt_token_count + total_completion_tokens,
-            },
-        }
+        response = format_chat_response(
+            batch_results, sampling_params, tokenizer, parsers, tools,
+            tools_requested, tool_choice, parallel_tool_calls,
+            current_app.config['verbose'],
+        )
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization
