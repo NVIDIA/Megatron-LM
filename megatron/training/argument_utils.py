@@ -1,16 +1,30 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from _typeshed import DataclassInstance
 import dataclasses
 import typing
 import types
-from typing import Any, Optional
-from argparse import ArgumentParser, _ArgumentGroup
+from typing import Any, Callable, Optional
+from argparse import ArgumentParser, _ArgumentGroup, Namespace
 import inspect
 import itertools
 import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+
+from megatron.training.config import (
+    DistributedInitConfig, 
+    PretrainConfigContainer, 
+    SchedulerConfig, 
+    TrainingConfig, 
+    ValidationConfig, 
+    RNGConfig, 
+    LoggerConfig,
+    StragglerDetectionConfig,
+    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+)
+from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
 # TODO: support arg renames
 
@@ -248,3 +262,59 @@ class ArgumentGroupFactory:
                 field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
+
+
+def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> DataclassInstance | dict[str, Any]:
+    """Create a config dataclass from the appropriate values in the `args` Namespace.
+
+    This is generic, i.e. it will work if dataclass attribute names map 1-to-1 with
+    names in `args`. Some classes might require additional logic.
+    """
+    kwargs = {}
+    for f in fields(cls):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+
+    if return_instance:
+        return cls(**kwargs)
+    else:
+        return kwargs
+
+def pretrain_container_from_args(args: Namespace, dataset_cfg_provider: Callable) -> PretrainConfigContainer:
+    """Build a PretrainConfigContainer from the argparse arguments."""
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
+    rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+
+    optim_cfg, _ = get_megatron_optimizer_config(args)
+    ddp_config = get_megatron_ddp_config(args)
+
+    cfg = PretrainConfigContainer(
+        train=_default_config_from_args(TrainingConfig, args),
+        validation=_default_config_from_args(ValidationConfig, args),
+        optimizer=optim_cfg,
+        scheduler=_default_config_from_args(SchedulerConfig, args),
+        dataset=dataset_cfg_provider(args),
+        ddp=ddp_config,
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        profiling=ProfilingConfig(**prof_kwargs),
+
+        rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
+        straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
+
+    return cfg
