@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.transformer.cuda_graphs import drain_etp_rs_stream
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -439,6 +440,14 @@ def finalize_model_grads(
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Ensure all in-flight ETP reduce-scatter ops complete before DDP reads the sharded
+    # gradients.  With CUDA graphs + parameter_sharding, the per-graph backward replay
+    # intentionally leaves the last graph's RS running on the RS side-stream to overlap
+    # with subsequent graph backward computation.  That RS must be complete here before
+    # finish_grad_sync checks and allreduces the ETP gradient buckets.
+    if config.parameter_sharding_size > 1 or config.expert_parameter_sharding_size > 1:
+        drain_etp_rs_stream()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
