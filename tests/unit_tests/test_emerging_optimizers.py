@@ -694,7 +694,7 @@ def test_muon_optimizer_invalid_coefficient_type():
             coefficient_type="nonexistent_type_xyz",
             num_ns_steps=5,
             pg_collection=None,
-            mode="duplicated",
+            tp_mode="duplicated",
         )
 
 
