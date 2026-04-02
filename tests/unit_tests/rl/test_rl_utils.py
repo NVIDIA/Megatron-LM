@@ -902,9 +902,9 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        # Per-rollout min iteration stamps (2 rollouts in group 1, 2 in group 2)
-        policy_epoch = [[4, 2], [5, 0]]
-        kv_cache_epoch = [[4, 3], [5, 1]]
+        # Per-token epoch stamps, grouped by group then rollout
+        policy_epoch = [[[4], [2]], [[5], [0]]]
+        kv_cache_epoch = [[[4], [3]], [[5], [1]]]
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
