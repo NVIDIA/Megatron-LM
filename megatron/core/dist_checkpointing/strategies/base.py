@@ -88,6 +88,7 @@ class LoadShardedStrategy(LoadStrategyBase):
     """Base class for load strategies to be removed in future releases."""
 
     def __init__(self):
+        super.__init__()
         logger.warning("LoadShardedStrategy is deprecated and will be removed in future releases.")
 
     @abstractmethod
@@ -133,7 +134,8 @@ class LoadShardedStrategy(LoadStrategyBase):
 class SaveShardedStrategy(SaveStrategyBase):
     """Base class for save strategies to be removed in future releases."""
 
-    def __init__(self):
+    def __init__(self, backend: str, version: int):
+        super.__init__(backend, version)
         logger.warning("SaveShardedStrategy is deprecated and will be removed in future releases.")
 
     @abstractmethod
@@ -145,7 +147,8 @@ class SaveShardedStrategy(SaveStrategyBase):
 class AsyncSaveShardedStrategy(SaveShardedStrategy):
     """Save strategy suitable for async save. To be removed in future releases."""
 
-    def __init__(self):
+    def __init__(self, backend: str, version: int):
+        super.__init__(backend, version)
         logger.warning(
             "AsyncSaveShardedStrategy is deprecated and will be removed in future releases."
         )
