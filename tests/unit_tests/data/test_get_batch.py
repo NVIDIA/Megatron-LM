@@ -100,12 +100,22 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     # Position IDs: per-segment positions, then padding positions
     position_ids = torch.cat([torch.arange(l, dtype=torch.int64) for l in lengths])
     position_ids = torch.cat(
-        [position_ids, torch.arange(position_ids[-1].item() + 1, position_ids[-1].item() + 1 + pad_len, dtype=torch.int64)]
+        [
+            position_ids,
+            torch.arange(
+                position_ids[-1].item() + 1,
+                position_ids[-1].item() + 1 + pad_len,
+                dtype=torch.int64,
+            ),
+        ]
     )
 
     # Loss mask: 1 for real tokens, 0 for padding
     loss_mask = torch.cat(
-        [torch.ones(num_real_tokens, dtype=torch.float32), torch.zeros(pad_len, dtype=torch.float32)]
+        [
+            torch.ones(num_real_tokens, dtype=torch.float32),
+            torch.zeros(pad_len, dtype=torch.float32),
+        ]
     )
 
     # cu_seqlens: cumulative lengths ending at max_seq_length (last entry = seq_length after padding)
