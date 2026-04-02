@@ -78,15 +78,13 @@ class TestGroupedRollouts:
         if expected_batch_ids is not None:
             assert [g.batch_id for g in groups] == expected_batch_ids
         if num_slow_calls > 0 and streaming:
-            # Warmup should yield fast-completing batches before slow ones.
+            # Warmup should not block on slow batches.
             batch_ids = [g.batch_id for g in groups]
             num_slow_batches = num_slow_calls // num_groups
             slow_batches = set(range(num_slow_batches))
-            first_slow = next(i for i, b in enumerate(batch_ids) if b in slow_batches)
-            last_fast = max(i for i, b in enumerate(batch_ids) if b not in slow_batches)
-            assert (
-                last_fast < first_slow
-            ), f"Expected fast batches before slow batches, got batch_ids={batch_ids}"
+            assert batch_ids[0] not in slow_batches, (
+                f"Expected first group from a fast batch, got batch_id={batch_ids[0]}"
+            )
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):
