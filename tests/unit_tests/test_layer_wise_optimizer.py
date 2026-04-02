@@ -117,20 +117,14 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=use_layer_wise,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_optimizer(optimizer_config, [model])
-        if use_layer_wise:
-            # Extract base torch optimizers from the FP32Optimizer wrappers.
-            base_optimizers = [opt.optimizer for opt in optimizer.chained_optimizers]
-            optimizer_config.bf16 = True
-            optimizer = LayerWiseDistributedOptimizer(
-                base_optimizers, optimizer_config, pg_collection
-            )
+        optimizer = get_megatron_optimizer(optimizer_config, [model], pg_collection=pg_collection)
         return model, optimizer, pg_collection
 
     def create_model_and_optimizer_with_overlap_param_gather(
