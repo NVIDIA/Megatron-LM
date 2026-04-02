@@ -3563,7 +3563,8 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
-                get_moe_overload_factor_tracker().clear()
+                if getattr(args, 'log_overload_factor', False):
+                    get_moe_overload_factor_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator

@@ -744,8 +744,9 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
     log_overload_factor: bool = False
-    """When True, log MoE overload factor metrics (avg/max/cum) to TensorBoard/W&B and console.
-    Requires recording routing data during forward/backward; use for debugging or monitoring."""
+    """When True, log MoE overload metrics (avg/max vs expected per step; max cum overload =
+    peak cumulative actual / peak cumulative expected over interleaved fwd/bwd) to TensorBoard/W&B
+    and console. Records ``tokens_per_expert.sum()`` after dispatch; use for debugging."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
