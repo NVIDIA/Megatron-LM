@@ -1,5 +1,5 @@
 ---
-name: developer-guide
+name: build-and-test
 description: Developer environment setup, CI/CD workflows, and CI failure debugging for Megatron-LM. Covers container-based development, uv package management, linting, running tests, CI failure investigation, and common pitfalls. Use when onboarding, setting up a dev environment, troubleshooting build issues, or investigating CI failures.
 ---
 
