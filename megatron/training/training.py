@@ -2702,7 +2702,7 @@ def train(
     train_data_iterator,
     valid_data_iterator,
     process_non_loss_data_func,
-    config,
+    model_cfg,
     checkpointing_context,
     non_loss_data_func,
     inference_model=None,
@@ -2782,7 +2782,7 @@ def train(
     one_logger = get_one_logger()
 
     if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, model_cfg))
 
     if args.run_workload_inspector_server:
         try:
@@ -2832,25 +2832,25 @@ def train(
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
     # Setup some training config params.
-    config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
-    config.timers = timers
+    model_cfg.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
+    model_cfg.timers = timers
     if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
+        assert model_cfg.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
         )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        model_cfg.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0]
+            model_cfg.no_sync_func = model_cfg.no_sync_func[0]
         if args.align_grad_reduce:
-            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            model_cfg.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
-                config.grad_sync_func = config.grad_sync_func[0]
+                model_cfg.grad_sync_func = model_cfg.grad_sync_func[0]
     if args.overlap_param_gather and args.align_param_gather:
-        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+        model_cfg.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
-            config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+            model_cfg.param_sync_func = model_cfg.param_sync_func[0]
+    model_cfg.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -2960,8 +2960,8 @@ def train(
         disable_forward_pre_hook(model, param_sync=False)
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
-        param_sync_func = config.param_sync_func
-        config.param_sync_func = None
+        param_sync_func = model_cfg.param_sync_func
+        model_cfg.param_sync_func = None
         pre_hook_enabled = False
     # Also, check weight hash across DP replicas to be very pedantic.
     if args.check_weight_hash_across_dp_replicas_interval is not None:
@@ -2975,7 +2975,7 @@ def train(
     if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
-            config=config,
+            config=model_cfg,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
@@ -3115,7 +3115,7 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, model_cfg, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -3146,7 +3146,7 @@ def train(
                 # `forward_backward_func`.
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(model)
-                    config.param_sync_func = param_sync_func
+                    model_cfg.param_sync_func = param_sync_func
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
@@ -3275,7 +3275,7 @@ def train(
                 evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
-                                       config, verbose=False, write_to_tensorboard=True,
+                                       model_cfg, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func)
 
             eval_duration += timers('eval-time').elapsed()
