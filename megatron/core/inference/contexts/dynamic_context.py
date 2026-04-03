@@ -2,6 +2,7 @@
 
 import logging
 import math
+import operator
 import warnings
 from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
@@ -29,7 +30,10 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
+from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    Symbols,
+    get_layer_maps_from_layer_type_list,
+)
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
@@ -332,16 +336,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            mamba_layer_map, gdn_layer_map, attention_layer_map, _, _ = (
-                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
+            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
+                operator.itemgetter(
+                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
+                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
             )
 
             if len(gdn_layer_map) > 0:
                 raise NotImplementedError("GDN layers are not supported for inference.")
 
-            self.num_attention_layers = len(attention_layer_map)
+            self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | mamba_layer_map
+            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
