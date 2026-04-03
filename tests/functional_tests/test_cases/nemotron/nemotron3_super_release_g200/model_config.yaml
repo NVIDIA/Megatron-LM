@@ -11,7 +11,7 @@ MODEL_ARGS:
   # Distributed args
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 1
-  --expert-model-parallel-size: 32
+  --expert-model-parallel-size: 64
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
