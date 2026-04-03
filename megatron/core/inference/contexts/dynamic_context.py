@@ -239,6 +239,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
+    TMS_KV_TAG = "autotune_kv_cache"
+    TMS_MAMBA_TAG = "autotune_mamba_states"
 
     # Per-request metadata: 8 int32 tensors (request_ids, query_lengths, etc.)
     PER_REQUEST_SCALAR_BYTES = 8 * 4
@@ -768,15 +770,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             from megatron.core.inference.contexts.mamba_chunk_manager import ChunkTracker
 
             num_kv_chunks = 8
-            kv_tms_tag = "kv_cache"
+            needs_cpu_backup = (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            )
             self.kv_chunk_tracker = ChunkTracker(
                 total_slots=total_blocks,
                 num_chunks=num_kv_chunks,
-                tms_tag=kv_tms_tag,
+                tms_tag=self.TMS_KV_TAG,
             )
             kv_ctx = torch_memory_saver.region(
-                tag=kv_tms_tag,
-                enable_cpu_backup=False,
+                tag=self.TMS_KV_TAG,
+                enable_cpu_backup=needs_cpu_backup,
                 num_chunks=num_kv_chunks,
             )
         else:
@@ -835,15 +839,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
                 num_mamba_chunks = 8
-                mamba_tms_tag = "mamba_states"
+                needs_cpu_backup = (
+                    self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                )
                 self.mamba_chunk_tracker = ChunkTracker(
                     total_slots=self.max_requests,
                     num_chunks=num_mamba_chunks,
-                    tms_tag=mamba_tms_tag,
+                    tms_tag=self.TMS_MAMBA_TAG,
                 )
                 ctx = torch_memory_saver.region(
-                    tag=mamba_tms_tag,
-                    enable_cpu_backup=False,
+                    tag=self.TMS_MAMBA_TAG,
+                    enable_cpu_backup=needs_cpu_backup,
                     num_chunks=num_mamba_chunks,
                 )
             else:
@@ -981,6 +987,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Allocate large non-graphed buffers.
+        # The outer context manager handles UVM or static-address TMS.
+        # When autotune is enabled, _allocate_memory_buffer() and
+        # _allocate_mamba_states() create inner per-chunk TMS regions that
+        # nest cleanly inside the outer context (each tag has its own pool).
+        self._tms_tags = []  # active TMS tags for suspend/resume
         need_static_addr = (
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -995,9 +1006,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
             )
             self._uses_torch_memory_saver = True
+            self._tms_tags.append(self.TMS_TAG)
+
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
+
+        # When autotune creates per-chunk TMS regions (nested inside the
+        # outer context), add their tags for suspend/resume.
+        if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+            self._uses_torch_memory_saver = True
+            self._tms_tags.append(self.TMS_KV_TAG)
+            if self.mamba_chunk_tracker is not None:
+                self._tms_tags.append(self.TMS_MAMBA_TAG)
 
         # Wire KV chunk tracker to the block allocator.
         if self.kv_chunk_tracker is not None:
@@ -1031,16 +1052,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
             # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
-                tag = self.TMS_TAG
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
-                    )
-                torch_memory_saver.resume(tag)
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
-                    )
+                for tag in self._tms_tags:
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
+                        )
+                    torch_memory_saver.resume(tag)
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
+                        )
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                 self.reset_metadata()
             return
@@ -1069,16 +1090,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            tag = self.TMS_TAG
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
-                )
-            torch_memory_saver.pause(tag)
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
-                )
+            for tag in self._tms_tags:
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
+                    )
+                torch_memory_saver.pause(tag)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
+                    )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:

@@ -1467,6 +1467,24 @@ def validate_args(args, defaults={}):
                 'Enabling --enable-chunked-prefill (required by --inference-dynamic-batching-autotune).'
             )
             args.enable_chunked_prefill = True
+        if args.decode_only_cuda_graphs:
+            warn_rank_0(
+                'Disabling --decode-only-cuda-graphs (incompatible with '
+                '--inference-dynamic-batching-autotune, which requires prefill CUDA graphs '
+                'for profiling and for graphed prefill steps at max_tokens > max_requests).'
+            )
+            args.decode_only_cuda_graphs = False
+        if args.inference_dynamic_batching_unified_memory_level != 0:
+            warn_rank_0(
+                'Setting --inference-dynamic-batching-unified-memory-level=0 (autotune uses '
+                'TMS per-chunk memory management which is incompatible with UVM).'
+            )
+            args.inference_dynamic_batching_unified_memory_level = 0
+        if args.inference_dynamic_batching_paused_buffer_size_gb is not None:
+            warn_rank_0(
+                '--inference-dynamic-batching-paused-buffer-size-gb is set but will be '
+                'overridden by --inference-dynamic-batching-autotune.'
+            )
 
         # Warn about arguments that will be overridden by the auto-tuner.
         overridden_args = {
