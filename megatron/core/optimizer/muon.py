@@ -109,7 +109,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             params,
             lr,
             momentum_beta,
-            use_nesterov=use_nesterov,
+            nesterov=use_nesterov,
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
