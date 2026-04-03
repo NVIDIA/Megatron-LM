@@ -1,19 +1,40 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-from unittest.mock import MagicMock
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from megatron.rl import rl_utils
 from megatron.rl.agent.api import (
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
     Rollout,
     RolloutGenerator,
     RolloutGroup,
+    RolloutStream,
 )
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
+
+
+def _make_group(i, rollouts_per_group=1):
+    return RolloutGroup(
+        rollouts=[
+            Rollout(
+                trajectory=[f"t{i}"],
+                reward=float(i),
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
+            )
+            for _ in range(rollouts_per_group)
+        ],
+        batch_id=i,
+        index_in_batch=0,
+    )
 
 
 class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
@@ -117,3 +138,50 @@ class TestGroupedRollouts:
             assert sub_req.num_groups in (1, 3)  # distributed proportionally by weight
             assert sub_req.enforce_order == request.enforce_order
             assert sub_req.streaming == request.streaming
+
+
+    @pytest.mark.parametrize("buffered_groups, expect_colocated_call", [
+        pytest.param(6, False, id="drain_sufficient_skips_inference"),
+        pytest.param(1, True, id="drain_insufficient_calls_inference"),
+    ])
+    def test_get_environment_rollouts(self, buffered_groups, expect_colocated_call):
+        n_prompts = 4
+
+        async def gen():
+            for i in range(buffered_groups):
+                yield _make_group(i)
+            # Block forever so drain sees "nothing available" after the buffered items.
+            await asyncio.sleep(1000)
+
+        def mock_nvtx(*args, **kwargs):
+            return nullcontext()
+
+        mock_args = MagicMock()
+        mock_args.rl_partial_rollouts = True
+        mock_args.curr_iteration = 1
+        mock_args.langrl_env_config = "test.yaml"
+
+        loop = asyncio.new_event_loop()
+        mock_colocated = MagicMock(return_value=[_make_group(i) for i in range(n_prompts)])
+        try:
+            with patch.multiple('megatron.rl.rl_utils',
+                colocated_inference=mock_colocated,
+                get_args=MagicMock(return_value=mock_args),
+                get_nvtx_range=MagicMock(return_value=mock_nvtx),
+                get_asyncio_loop=MagicMock(return_value=loop),
+                get_attr_wrapped_model=MagicMock(return_value=MagicMock()),
+                get_pg_size=MagicMock(return_value=1),
+                get_pg_rank=MagicMock(return_value=0),
+                lang_rl_log_dir=None,
+                _ROLLOUT_GENERATOR=RolloutStream(gen()),
+            ), patch('torch.distributed.get_rank', return_value=0), \
+               patch('torch.distributed.broadcast'), \
+               patch('torch.distributed.broadcast_object_list'):
+                rollouts = rl_utils.get_environment_rollouts(
+                    model=[MagicMock()], inference_model=None,
+                    optimizer=MagicMock(), n_prompts=n_prompts, samples_per_group=1,
+                )
+                assert mock_colocated.called == expect_colocated_call
+                assert len(rollouts) == n_prompts
+        finally:
+            loop.close()

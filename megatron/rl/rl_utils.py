@@ -67,6 +67,7 @@ from megatron.rl.agent.api import (
     RewardEvaluationResult,
     Rollout,
     RolloutGroup,
+    RolloutStream,
     Rollouts,
     TokenRollout,
 )
@@ -473,23 +474,15 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             enforce_order=args.rl_enforce_generation_order,
         )
-        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        _ROLLOUT_GENERATOR = RolloutStream(agent.get_grouped_rollouts(request))
     return _ROLLOUT_GENERATOR
 
 
-def get_environment_rollouts(
-    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
-):
-    """Sample environment rollouts from an LLM.
+def colocated_inference(model, inference_model, optimizer, n_prompts, samples_per_group, rank):
+    """Enter inference mode and collect rollouts via the colocated inference engine.
 
-    Args:
-        model: Model to sample from.
-        inference_model: Inference model to use for inference.
-        n_prompts: Number of prompts to sample for across *all* data parallel workers.
-        samples_per_group: Amount of trajectories per prompt.
-
-    Returns:
-        GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+    Handles optimizer offload/restore, model weight swap, and CUDA graph management.
+    Returns the collected rollouts on rank 0, None on other ranks.
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -524,10 +517,7 @@ def get_environment_rollouts(
     else:
         inference_model = model
 
-    inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
-    pg_size = get_pg_size(inference_pg_collection.ep)
-    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
-
+    rollouts = None
     with nvtx_range("rl/rollout-collection", time=True):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
@@ -544,8 +534,6 @@ def get_environment_rollouts(
                     args, inference_interface, n_prompts, samples_per_group
                 )
 
-            # NOTE(jbarker): we need to double check this when using PP>1
-            rank = torch.distributed.get_rank()
             with nvtx_range("rl/collect-rollouts", time=True):
                 if rank == 0:
                     log_single_rank(
@@ -567,15 +555,6 @@ def get_environment_rollouts(
                                 assert False, "Unexpected group left in generator."
                             except StopAsyncIteration:
                                 break
-                else:
-                    # Just set up space to collect the rollouts
-                    rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
-
-        with nvtx_range("rl/sync-rollouts", time=True):
-            # Wait for Rollouts to be collected
-            # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
-            torch.distributed.broadcast_object_list(rollouts, src=0)
-        logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/restore-optimizer-after-inference", time=True):
@@ -583,6 +562,67 @@ def get_environment_rollouts(
                 model[0].restore_grad_buffers()
             with nvtx_range("rl/restore/optimizer-state", time=True):
                 optimizer.restore_from_cpu()
+
+    return rollouts
+
+
+def get_environment_rollouts(
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int,
+):
+    """Sample environment rollouts from an LLM.
+
+    Args:
+        model: Model to sample from.
+        inference_model: Inference model to use for inference.
+        n_prompts: Number of prompts to sample for across *all* data parallel workers.
+        samples_per_group: Amount of trajectories per prompt.
+
+    Returns:
+        GroupedRollouts object which is a nested list
+        where each element being a list of rollouts of a group.
+    """
+    args = get_args()
+    nvtx_range = get_nvtx_range()
+    # NOTE(jbarker): we need to double check this when using PP>1
+    rank = torch.distributed.get_rank()
+
+    inference_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    pg_size = get_pg_size(inference_pg_collection.ep)
+    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
+
+    fast_drained = False
+
+    # Fast path: when partial rollouts are enabled and the generator already has
+    # pre-generated groups buffered, drain them without entering inference mode
+    # (skips optimizer offload, weight swap, CUDA graph toggle, etc.).
+    if args.rl_partial_rollouts and _ROLLOUT_GENERATOR is not None:
+        loop = get_asyncio_loop()
+        if rank == 0:
+            drained = _ROLLOUT_GENERATOR.drain(n_prompts, loop)
+            fast_drained = len(drained) >= n_prompts
+        # All ranks must agree on the path (full inference has collective ops)
+        flag = torch.tensor([fast_drained], device='cuda', dtype=torch.bool)
+        torch.distributed.broadcast(flag, src=0)
+        fast_drained = flag.item()
+
+        if fast_drained and rank == 0:
+            rollouts = drained[:n_prompts]
+
+    if not fast_drained:
+        rollouts = colocated_inference(
+            model, inference_model, optimizer, n_prompts, samples_per_group, rank
+        )
+
+    # Shared broadcast + return path (used by both fast drain and full inference)
+    if rank != 0:
+        rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+    with nvtx_range("rl/sync-rollouts", time=True):
+        torch.distributed.broadcast_object_list(rollouts, src=0)
+    logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1515,14 +1555,6 @@ def prepare_data_for_update(
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
-
-        with nvtx_range("rl/log-wandb-tb", time=True):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 

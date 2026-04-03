@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -297,6 +297,48 @@ class GroupedRolloutGenerator(Agent, ABC):
             shutdown_task.cancel()
             for task in tasks:
                 task.cancel()
+
+
+class RolloutStream(AsyncIterator):
+    """Wrapper around an async generator that supports non-blocking drain."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._pending_task = None
+
+    async def __anext__(self):
+        if self._pending_task is not None:
+            task = self._pending_task
+            self._pending_task = None
+            return await task
+        return await self._inner.__anext__()
+
+    async def aclose(self):
+        if self._pending_task is not None:
+            self._pending_task.cancel()
+            self._pending_task = None
+        await self._inner.aclose()
+
+    async def try_next(self):
+        """Attempt to get next item without blocking."""
+        inner_task = asyncio.ensure_future(self._inner.__anext__())
+        try:
+            return await asyncio.wait_for(asyncio.shield(inner_task), timeout=0.01)
+        except asyncio.TimeoutError:
+            self._pending_task = inner_task
+            return None
+        except StopAsyncIteration:
+            return None
+
+    def drain(self, n, loop):
+        """Synchronously drain up to n items."""
+        items = []
+        for _ in range(n):
+            item = loop.run_until_complete(self.try_next())
+            if item is None:
+                break
+            items.append(item)
+        return items
 
 
 class EvaluationAgent(Agent, ABC):
