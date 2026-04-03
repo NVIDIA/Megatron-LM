@@ -5,6 +5,7 @@ import logging
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from contextlib import nullcontext
 from functools import partial
 from itertools import chain
 from math import ceil
@@ -41,6 +42,12 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+    skip_routed_expert_padding,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -51,6 +58,7 @@ from megatron.core.typed_torch import apply_module, not_none
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+    import transformer_engine as te
 else:
     Fp8Padding, Fp8Unpadding = None, None
 
@@ -915,8 +923,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        if self.config.moe_router_padding_for_quantization:
-            # Padding has already been applied in router
+        if skip_routed_expert_padding(self.config):
             pass
         elif self.config.fp8 or self.config.fp4:
             tokens_per_expert = tokens_per_expert.tolist()
@@ -931,19 +938,38 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
+        # if the number of tokens is 0, pad the hidden states to 256
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
-        )
-
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
+        with stash_context:
+            # Call fused impl
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU
+                tokens_per_expert,  # FC2
+            )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
@@ -1033,8 +1059,7 @@ class TEGroupedMLP(MegatronModule):
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         permuted_probs = permuted_probs.unsqueeze(-1)
-        if self.config.moe_router_padding_for_quantization:
-            # Padding has already been applied in router
+        if skip_routed_expert_padding(self.config):
             pass
         elif self.config.fp8 or self.config.fp4:
             unpadded_tokens_per_expert = tokens_per_expert
