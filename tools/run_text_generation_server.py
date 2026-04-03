@@ -138,7 +138,15 @@ def main(model_type: str = "gpt"):
         # Set up model and load checkpoint
         if model_type == "gpt":
             model_builder = gpt_builder
-        elif model_type == "hybrid":
+        elif model_type in ("hybrid", "mamba"):
+            if model_type == "mamba":
+                import warnings
+
+                warnings.warn(
+                    'model_type="mamba" is deprecated. Use model_type="hybrid" instead.',
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
             model_builder = hybrid_builder
         else:
             raise ValueError(f"Invalid model provider {model_type}")
