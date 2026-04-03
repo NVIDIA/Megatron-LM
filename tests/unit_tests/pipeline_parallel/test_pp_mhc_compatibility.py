@@ -244,7 +244,7 @@ class TestGetTensorShapesWithMHC:
 # ===========================================================================
 
 
-class TestGetNumLayersToBuilWithMHC:
+class TestGetNumLayersToBuildWithMHC:
     """
     Verify layer counts are correct when mHC is combined with standalone
     embedding / loss stages (account_for_embedding/loss_in_pipeline_split).

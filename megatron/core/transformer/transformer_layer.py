@@ -1459,11 +1459,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
+        """Forward attention with hyper connection pre/post processing on self-attention."""
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
@@ -1556,11 +1556,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
+        """Forward MLP with hyper connection pre/post processing."""
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
             and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
@@ -1656,7 +1656,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
 
         Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, h].
+            output (Tensor): Transformed hidden states of shape [s, b, n*C].
         """
         if self.recompute_pre_mlp_layernorm or (
             mhc_mlp_bda_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
