@@ -2239,6 +2239,13 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+
+        # RL token throughput metrics.
+        if args.perform_rl_step:
+            log_string += rl_utils.log_rl_throughput_metrics(
+                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
