@@ -48,8 +48,8 @@ MODEL_ARGS:
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 32
-  --global-batch-size: 128
+  --micro-batch-size: 8
+  --global-batch-size: 32
   --train-iters: 20
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
@@ -73,7 +73,7 @@ MODEL_ARGS:
 
 
   # Data args
-  --seq-length: 4096
+  --seq-length: 1024
   --data-cache-path: ${DATA_CACHE_PATH}
   --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
@@ -83,14 +83,14 @@ MODEL_ARGS:
 
   # Network
   --num-layers: 2
-  --hidden-size: 7168
-  --ffn-hidden-size: 18432
-  --num-attention-heads: 128
+  --hidden-size: 512
+  --ffn-hidden-size: 2048
+  --num-attention-heads: 8
   --kv-channels: 128
-  --max-position-embeddings: 4096
+  --max-position-embeddings: 1024
   --position-embedding-type: rope
   --rotary-base: 10000
-  --make-vocab-size-divisible-by: 128
+  --make-vocab-size-divisible-by: 64
   --normalization: RMSNorm
   --norm-epsilon: 1e-6
   --swiglu: true
@@ -117,14 +117,14 @@ MODEL_ARGS:
   # MoE args (DeepSeek-style)
   --num-experts: 8
   --moe-layer-freq: ([0]*1+[1]*1)
-  --moe-ffn-hidden-size: 2048
-  --moe-shared-expert-intermediate-size: 2048
+  --moe-ffn-hidden-size: 1024
+  --moe-shared-expert-intermediate-size: 1024
   --moe-router-load-balancing-type: seq_aux_loss
-  --moe-router-topk: 8
+  --moe-router-topk: 2
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
   --moe-router-group-topk: 4
-  --moe-router-num-groups: 8
+  --moe-router-num-groups: 4
   --moe-router-topk-scaling-factor: 2.5
   --moe-router-score-function: sigmoid
   --moe-router-enable-expert-bias: true
@@ -139,12 +139,12 @@ MODEL_ARGS:
   --moe-flex-dispatcher-backend: hybridep
   
   # MLA args (DeepSeek-style)
-  --q-lora-rank: 1536
-  --kv-lora-rank: 512
+  --q-lora-rank: 256
+  --kv-lora-rank: 128
   --qk-head-dim: 128
   --qk-pos-emb-head-dim: 64
   --v-head-dim: 128
-  --rotary-scaling-factor: 40
+  --rotary-scaling-factor: 1.0
   --mscale: 1.0
   --mscale-all-dim: 1.0
 
