@@ -49,7 +49,8 @@ class LoadStrategyBase(ABC):
 
     def __init__(self):
         logger.warning(
-            "LoadStrategyBase & LoadShardedStrategy are deprecated and will be removed in future releases."
+            "LoadStrategyBase & LoadShardedStrategy are deprecated "
+            "and will be removed in future releases."
         )
 
     @abstractmethod
@@ -74,7 +75,8 @@ class SaveStrategyBase(ABC):
 
     def __init__(self, backend: str, version: int):
         logger.warning(
-            "SaveStrategyBase & SaveShardedStrategy are deprecated and will be removed in future releases."
+            "SaveStrategyBase & SaveShardedStrategy are deprecated "
+            "and will be removed in future releases."
         )
         self.backend = backend
         self.version = version
