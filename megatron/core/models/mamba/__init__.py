@@ -2,4 +2,4 @@
 
 # Backward-compatible re-exports. The canonical location is now
 # megatron.core.models.hybrid.
-from megatron.core.models.hybrid import HybridModel, MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel, MambaModel

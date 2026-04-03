@@ -30,7 +30,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.models.hybrid import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector

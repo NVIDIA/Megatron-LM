@@ -1,7 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
 from model_provider import count_parameters_in_layer
-from megatron.core.models.hybrid import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0

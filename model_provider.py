@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import torch
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.hybrid import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.training import get_args, print_rank_0
 
 try:
