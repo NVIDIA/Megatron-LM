@@ -732,8 +732,14 @@ class PagedStashManager:
     ):
         """Allocate stash buffers organized by [dtype][hidden_size]."""
         self.stash_buffers = {}
-        self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
-        self.host_spill = torch.zeros(1, dtype=torch.int64, device=self.device)
+        if self.overflow is None:
+            self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
+        else:
+            self.overflow.zero_()
+        if self.host_spill is None:
+            self.host_spill = torch.zeros(1, dtype=torch.int64, device=self.device)
+        else:
+            self.host_spill.zero_()
 
         cuda_factor = stash_buffer_size_factor_cuda
         cpu_factor = stash_buffer_size_factor_cpu
@@ -797,6 +803,21 @@ class PagedStashManager:
                 msg += f' host: {sb.host_buffer.shape}'
             msg += f' dtype={sb.dtype} ({dtype})'
             log_single_rank(logger, logging.INFO, msg)
+
+    def release_stash_buffers(self):
+        """Drop large stash CUDA/host page buffers after full-iteration CUDA graph teardown (fallback).
+
+        Shared ``overflow`` / ``host_spill`` scalars are retained (small). Reallocation of page
+        buffers happens on the next ``paged_stash_reset`` while status remains ``captured``.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.stash_buffers = None
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Paged stash: released stash page buffers after fallback (reallocated on next stash reset).",
+        )
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -1055,9 +1076,20 @@ def paged_stash_reset(enabled=True, config=None):
             stash_buffer_size_factor_cpu=cpu_factor,
         )
     elif stash_manager.status == 'captured':
-        pass
+        # Buffers may have been released after a PagedStashRunner fallback; reallocate using
+        # the same capture-derived maxima and current config factors.
+        if stash_manager.stash_buffers is None:
+            cuda_factor = config.stash_buffer_size_factor_cuda if config is not None else 1.10
+            cpu_factor = config.stash_buffer_size_factor_cpu if config is not None else 0.0
+            stash_manager.allocate_stash_buffers(
+                stash_buffer_size_factor_cuda=cuda_factor,
+                stash_buffer_size_factor_cpu=cpu_factor,
+            )
 
     if stash_manager.status == 'captured':
+        assert stash_manager.stash_buffers is not None, (
+            "Paged stash: captured state but stash_buffers is None after reset/allocation."
+        )
         for dtype in stash_manager.stash_buffers.keys():
             for hidden_size in stash_manager.stash_buffers[dtype].keys():
                 stash_manager.stash_buffers[dtype][hidden_size].reset()
@@ -1172,7 +1204,7 @@ class PagedStashRunner:
         """Prepare for rerun"""
         log_single_rank(
             logger,
-            logging.WARNING,
+            logging.INFO,
             "Paged stash: rerunning forward-backward without moe_expert_rank_capacity_factor padding "
             "and with moe_paged_stash disabled.",
         )
@@ -1183,7 +1215,8 @@ class PagedStashRunner:
             ):
                 mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
                 mlp.token_dispatcher.reset_over_budget()
-        self.stash_manager.overflow.zero_()
+        if self.stash_manager.overflow is not None:
+            self.stash_manager.overflow.zero_()
         if self.stash_manager.host_spill is not None:
             self.stash_manager.host_spill.zero_()
         self.config.moe_paged_stash = False
@@ -1209,9 +1242,19 @@ class PagedStashRunner:
                 else:
                     _try_copy_main_params(self.optimizer)
 
-        # Delete the CUDA graph
+        # Delete the CUDA graph before releasing stash tensors the captured graph may reference.
         if isinstance(self.forward_backward_func, FullCudaGraphWrapper):
             self.forward_backward_func.reset_cuda_graph(stage='training' if is_training else 'validation')
+
+        # Only drop page buffers on training fallback. Validation uses forward_only=True, so
+        # paged_stash_reset disables the stash manager and eval forward never reads/writes the
+        # large page buffers—freeing them here saves almost nothing. If we released on eval,
+        # the next training step would realloc new buffer addresses while the training
+        # FullCudaGraphWrapper could still replay a graph recorded against the old pointers.
+        # Training fallback resets the training graph before this path, so release + realloc
+        # remains consistent with capture.
+        if is_training:
+            self.stash_manager.release_stash_buffers()
 
     def __call__(self, *args, **kwargs):
         """Run the paged stash"""
