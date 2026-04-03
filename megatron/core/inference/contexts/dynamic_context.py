@@ -205,6 +205,8 @@ class ContextErrorFactory:
 
 def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
+    if n_bytes == 0:
+        return "0 bytes"
     for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
         nquery = int(1024**exp)
         if round(n_bytes / nquery) >= 1:
@@ -452,6 +454,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = buffer_size_bytes // self.block_size_bytes
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
+        elif self.is_hybrid_model and inference_config.max_requests is not None:
+            # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
+            # mamba memory for max_requests, and give the rest to KV cache blocks.
+            total_memory = buffer_size_bytes + paused_buffer_size_bytes
+            mamba_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            assert mamba_memory_needed < total_memory, (
+                f"Not enough memory for {inference_config.max_requests} mamba requests. "
+                f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "
+                f"but total buffer is {total_memory / 1024**3:.2f} GB."
+            )
+            mamba_max_requests = inference_config.max_requests
+
+            # Subtract mamba memory proportionally from active and paused buffers.
+            mamba_memory_ratio = mamba_memory_needed / total_memory
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+
+            block_count = buffer_size_bytes // self.block_size_bytes
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
                 self.block_size_bytes + mamba_states_memory_per_request
@@ -594,13 +616,76 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.initialize_all_tensors()
 
         # Print info.
-        logging.info(
-            "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (
-                get_mem_size_str(self.kv_block_allocator.active_count * self.block_size_bytes),
-                self.kv_block_allocator.active_count,
+        active_blocks = self.kv_block_allocator.active_count
+        total_blocks = self.kv_block_allocator.total_count
+        paused_blocks = self.kv_block_allocator.paused_count
+        active_kv_bytes = active_blocks * self.block_size_bytes
+        total_kv_bytes = total_blocks * self.block_size_bytes
+        paused_kv_bytes = paused_blocks * self.block_size_bytes
+
+        log_lines = [
+            "DynamicInferenceContext: configuration summary",
+            f"  max_requests:            {self.max_requests}",
+            f"  max_tokens:              {self.max_tokens}",
+            f"  max_sequence_length:     {self.max_sequence_length}",
+            f"  block_size_tokens:       {self.block_size_tokens}",
+            f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
+            f"  KV cache:",
+            f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
+            f"    active_blocks:         {active_blocks} ({get_mem_size_str(active_kv_bytes)})",
+            f"    paused_blocks:         {paused_blocks} ({get_mem_size_str(paused_kv_bytes)})",
+            f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
+        ]
+
+        if self.is_hybrid_model:
+            mamba_conv_bytes = (
+                math.prod(self.mamba_conv_states_shape)
+                * self.mamba_conv_states_dtype.itemsize
+                * self.num_mamba_layers
             )
-        )
+            mamba_ssm_bytes = (
+                math.prod(self.mamba_ssm_states_shape)
+                * self.mamba_ssm_states_dtype.itemsize
+                * self.num_mamba_layers
+            )
+            mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
+            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
+            log_lines += [
+                f"  Mamba states:",
+                f"    num_mamba_layers:      {self.num_mamba_layers}",
+                f"    conv_state_shape:      {self.mamba_conv_states_shape}",
+                f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
+                f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
+                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+            ]
+
+            if self.num_speculative_tokens > 0:
+                spec_multiplier = self.num_speculative_tokens + 1
+                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                spec_total_bytes = spec_bytes_per_req * self.max_requests
+                log_lines += [
+                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
+                    f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
+                ]
+
+            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            if (
+                inference_config.enable_prefix_caching
+                and prefix_caching_mamba_gb is not None
+                and prefix_caching_mamba_gb > 0
+            ):
+                prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
+                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                log_lines += [
+                    f"  Mamba prefix cache:",
+                    f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
+                    f"    slots:                 {prefix_cache_slots}",
+                    f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
+                ]
+
+        if inference_config._verbose and torch.distributed.get_rank() == 0:
+            logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
