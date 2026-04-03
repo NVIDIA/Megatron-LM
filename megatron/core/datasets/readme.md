@@ -192,9 +192,19 @@ To query the `BlendedDataset` for the _k_-th sample we do the following
 
 To save time during initialization, each index is built/cached sequentially on one process rank and subsequently loaded in parallel on other process ranks. The cached indices are unique to a hash generated in the `BlendedDataset.__init__` function.
 
+## Offline cache preparation
+
+For GPT-style training, the dataset caches described above can be prepared ahead of time with `tools/prepare_cache.py` instead of waiting for rank 0 to build them during training startup.
+
+The script reuses the normal dataset construction path used by `pretrain_gpt.py` and `pretrain_mamba.py`, including `GPTDataset`, `BlendedDataset`, and `BlendedMegatronDatasetBuilder`. It accepts the usual dataset arguments, supports blends and per-split dataset definitions, and requires `--data-cache-path` so the generated cache can later be reused by training.
+
+This is especially useful for large blends or many file prefixes, where building the document, sample, and shuffle indices can take several minutes and leave all GPUs idle while rank 0 performs CPU-only work.
+
+If the later training job does not specify `--global-batch-size` (which is needed to determine the dataset size and splits), you should specify `--prepare-cache-world-size` to explicitly set the world size used during cache preparation.
+
 ## Fast DataLoader initialization
 
-Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags":
+Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:
 
   - `--dataloader-fast-cache-load`: This option assumes that the dataset cache already exists in the specified `--data-cache-path`. When enabled, it speeds up the creation process by removing synchronization points and file check assertions.
 
