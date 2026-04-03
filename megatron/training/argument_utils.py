@@ -280,7 +280,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     else:
         return kwargs
 
-def pretrain_container_from_args(args: Namespace, dataset_cfg_provider: Callable) -> PretrainConfigContainer:
+def pretrain_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
@@ -305,7 +305,6 @@ def pretrain_container_from_args(args: Namespace, dataset_cfg_provider: Callable
         validation=_default_config_from_args(ValidationConfig, args),
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
-        dataset=dataset_cfg_provider(args),
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),

@@ -16,7 +16,7 @@ class PretrainConfigContainer:
     # model: GPTModelConfig | MambaModelConfig  # TODO (@maanug): add support
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    dataset: GPTDatasetConfig
+    # dataset: GPTDatasetConfig # TODO (@maanug): add support
     # tokenizer: TokenizerConfig # TODO (@maanug): add support
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
