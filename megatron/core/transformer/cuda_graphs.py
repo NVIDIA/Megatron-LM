@@ -814,6 +814,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
         self.cudagraph_created = False
+        self._eager_warmup_pass_count = 0
         self.status = _GraphStatus.FWD_READY
 
         self.fuse_wgrad_accumulation = False
@@ -1090,33 +1091,30 @@ class _CudaGraphRunner(torch.nn.Module):
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
 
-            # if self.parameter_sharding:
-            #     ETP_CONFIG.weight_prefetch = False
+            for _ in range(self.num_warmup_steps):
+                with self.get_quantization_context():
 
-            # for _ in range(self.num_warmup_steps):
-            #     with self.get_quantization_context():
+                    def clone_ten(ten):
+                        if not torch.is_tensor(ten):
+                            return ten
+                        return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
 
-            #         def clone_ten(ten):
-            #             if not torch.is_tensor(ten):
-            #                 return ten
-            #             return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
+                    warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
+                    warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
+                    warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
-            #         warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
-            #         warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
-            #         warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
-
-            #     if self.grad_enabled:
-            #         warmup_outputs = self.get_tensors(warmup_outputs)
-            #         warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-            #         input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
-            #         torch.autograd.grad(
-            #             outputs=warmup_outputs,
-            #             inputs=tuple(i for i in input_tensors if i.requires_grad),
-            #             grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
-            #             only_inputs=True,
-            #             allow_unused=True,
-            #         )
-            # _set_warmup_end()
+                if self.grad_enabled:
+                    warmup_outputs = self.get_tensors(warmup_outputs)
+                    warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
+                    input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
+                    torch.autograd.grad(
+                        outputs=warmup_outputs,
+                        inputs=tuple(i for i in input_tensors if i.requires_grad),
+                        grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
+                        only_inputs=True,
+                        allow_unused=True,
+                    )
+            _set_warmup_end()
 
             with self.get_quantization_context():
                 self._drain_etp_async_comms_before_capture()
@@ -1413,6 +1411,18 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if type(out) != tuple:
             out = (out,)
+
+        if not self.fwd_graph_recorded:
+            # For ETP (parameter_sharding), the ETP prefetch link table is built on the 1st
+            # eager pass but async AG tickets (_ag_ticket_fwd) are only set on the 2nd pass.
+            # Delay recording until num_warmup_steps eager passes have run so that tickets
+            # are always initialized before graph capture.
+            # Must check BEFORE applying _CudagraphRecordNode to avoid premature bwd recording.
+            if self._eager_warmup_pass_count < self.num_warmup_steps:
+                self._eager_warmup_pass_count += 1
+                if len(out) == 1:
+                    return out[0]
+                return tuple(out)
 
         # Register a noop autograd node that toggles `self.graph_status` in the bwd pass, which
         # tracks when the runner completes its bwd pass.
