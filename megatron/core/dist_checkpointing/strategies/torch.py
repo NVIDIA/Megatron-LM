@@ -941,7 +941,8 @@ class TorchDistLoadShardedStrategy:
         if not files_to_remove:
             warnings.warn(
                 f'There are no files in {checkpoint_dir} that begin with "{key_prefix}".'
-                f' Skipping removal.'
+                f' Skipping removal.',
+                stacklevel=2,
             )
             return
 

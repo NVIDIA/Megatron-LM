@@ -471,7 +471,8 @@ try:
                         warnings.warn(
                             "Avoiding prefix retokenization."
                             " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                            " This may cause unexpected behavior if messages (including system messages) are altered between generations.",
+                            stacklevel=2,
                         )
 
                         messages_to_last_assistant_message = template_messages[
@@ -511,7 +512,8 @@ try:
 
             else:
                 warnings.warn(
-                    "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
+                    "Tokenizer does not support 'apply_chat_template'. Using tokenize instead.",
+                    stacklevel=2,
                 )
                 prompt_tokens = tokenizer.tokenize(
                     "\n".join([message["content"] for message in messages])

@@ -12,6 +12,7 @@ warnings.warn(
     "a cyclic import issue that causes rotary embeddings to import "
     "from Apex rather than Transformer Engine.",
     DeprecationWarning,
+    stacklevel=2,
 )
 from .dynamic_context import (
     ActiveRequestCountOverflowError,

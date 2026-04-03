@@ -1670,6 +1670,7 @@ def set_virtual_pipeline_model_parallel_rank(rank):
         "set_virtual_pipeline_model_parallel_rank in global scope is deprecated. "
         "Pass vp_stage explicitly to is_pipeline_first_stage, is_pipeline_last_stage, etc.",
         DeprecationWarning,
+        stacklevel=2,
     )
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank

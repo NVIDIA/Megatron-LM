@@ -447,7 +447,8 @@ class ModelParallelConfig:
             if self.sequence_parallel is False:
                 warnings.warn(
                     "When using expert parallelism and tensor parallelism for training, "
-                    "sequence parallelism must be used"
+                    "sequence parallelism must be used",
+                    stacklevel=2,
                 )
 
         if self.microbatch_group_size_per_vp_stage is None:

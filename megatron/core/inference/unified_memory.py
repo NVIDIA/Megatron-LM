@@ -237,7 +237,7 @@ def compile_allocator():
                 _compilation_error = None
         except (RuntimeError, ImportError, OSError, UnifiedMemoryCompileTimeoutError) as e:
             _compilation_error = str(e)
-            warnings.warn(f"Failed to create unified memory mempool: '{e}'.")
+            warnings.warn(f"Failed to create unified memory mempool: '{e}'.", stacklevel=3)
             _compilation_state = CompilationState.FAILURE
             _so_path = None
             _ctypes_lib = None

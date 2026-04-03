@@ -407,7 +407,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             except UnifiedMemoryUnsupportedError:
                 if torch.distributed.get_rank() == 0:
                     warnings.warn(
-                        "Unified memory requested but not available; defaulting to GPU memory."
+                        "Unified memory requested but not available; defaulting to GPU memory.",
+                        stacklevel=2,
                     )
                 self.unified_memory_level = 0
         # If we are in a mode that requires static KV memory pointers,

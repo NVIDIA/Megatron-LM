@@ -121,7 +121,8 @@ class MegatronOptimizer(ABC):
         if self.optimizer is None:
             warnings.warn(
                 f"WARNING: there is no optimizer on RANK {torch.distributed.get_rank()}. "
-                "This may be expected if you have frozen sub-models."
+                "This may be expected if you have frozen sub-models.",
+                stacklevel=2,
             )
         self.config = config
         self.init_state_fn = init_state_fn
@@ -184,7 +185,9 @@ class MegatronOptimizer(ABC):
             warnings.warn(
                 "WARNING: `optimizer.model_parallel_group` deprecated and renamed to "
                 "`optimizer.grad_stats_parallel_group`. The previous name will be "
-                "removed in a future release."
+                "removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
             )
             self.grad_stats_parallel_group = self.model_parallel_group
             delattr(self, "model_parallel_group")

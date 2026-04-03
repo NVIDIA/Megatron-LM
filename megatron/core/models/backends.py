@@ -31,7 +31,7 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
+    warnings.warn("Apex is not installed. Falling back to Torch Norm", stacklevel=2)
     FusedLayerNorm = None
     HAVE_APEX = False
     LNImpl = WrappedTorchNorm

@@ -115,7 +115,8 @@ except:
             warnings.warn(
                 "Transformer Engine and Apex are not installed. "
                 "Falling back to local implementations of "
-                "multi_tensor_applier and multi_tensor_scale"
+                "multi_tensor_applier and multi_tensor_scale",
+                stacklevel=2,
             )
 
             def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):

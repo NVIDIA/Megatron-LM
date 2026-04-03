@@ -58,7 +58,9 @@ class StaticInferenceEngine(AbstractEngine):
         self.legacy = legacy
         if legacy:
             warnings.warn(
-                "The static engine will be deprecated and removed in the future version of megatron-core. Switch to DynamicInferenceEngine."
+                "The static engine will be deprecated and removed in the future version of megatron-core. Switch to DynamicInferenceEngine.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         else:
             warnings.warn(
@@ -66,6 +68,7 @@ class StaticInferenceEngine(AbstractEngine):
                 "Please directly use `DynamicInferenceEngine` instead. "
                 "`StaticInferenceEngine` currently uses `DynamicInferenceEngine` under the hood.",
                 DeprecationWarning,
+                stacklevel=2,
             )
 
         self.controller = text_generation_controller
@@ -87,6 +90,7 @@ class StaticInferenceEngine(AbstractEngine):
                 f"({original_context.max_batch_size}); setting `max_batch_size` to "
                 f"{original_context.max_batch_size}",
                 UserWarning,
+                stacklevel=2,
             )
             max_batch_size = original_context.max_batch_size
 
@@ -124,6 +128,7 @@ class StaticInferenceEngine(AbstractEngine):
             warnings.warn(
                 f"Error initializing dynamic engine: {exception_msg} , using legacy static engine",
                 UserWarning,
+                stacklevel=2,
             )
             # Restore original context when falling back to legacy static engine
             self.controller.inference_wrapped_model.inference_context = original_context
@@ -168,7 +173,9 @@ class StaticInferenceEngine(AbstractEngine):
         if sampling_params is None and inference_parameters is not None:
             warnings.warn(
                 "`inference_parameters` has been renamed to `sampling_params`, "
-                "and the previous name will be removed in Mcore v0.14."
+                "and the previous name will be removed in Mcore v0.14.",
+                DeprecationWarning,
+                stacklevel=2,
             )
             sampling_params = inference_parameters
 

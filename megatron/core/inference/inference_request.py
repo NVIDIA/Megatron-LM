@@ -159,7 +159,9 @@ class InferenceRequest:
         if self.sampling_params is None and self.inference_parameters is not None:
             warnings.warn(
                 "`inference_parameters` renamed to `sampling_params`, and the "
-                "previous name will be removed in Mcore 0.14."
+                "previous name will be removed in Mcore 0.14.",
+                DeprecationWarning,
+                stacklevel=2,
             )
             self.sampling_params = self.inference_parameters
 
@@ -466,7 +468,8 @@ class DynamicInferenceRequest(InferenceRequest):
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 warnings.warn(
                     f"DynamicInferenceRequest {self.request_id} has no termination_id set "
-                    "in its sampling_params. Defaulting to -1."
+                    "in its sampling_params. Defaulting to -1.",
+                    stacklevel=2,
                 )
             sp.termination_id = -1
         return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
