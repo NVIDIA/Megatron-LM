@@ -161,6 +161,9 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Each async strategy can be trivially used as a sync strategy."""
+        logger.warning(
+            "AsyncSaveShardedStrategy is deprecated and will be removed in future releases."
+        )
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
         async_request.execute_sync()
         del async_request
