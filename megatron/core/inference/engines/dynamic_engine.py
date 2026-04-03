@@ -358,7 +358,21 @@ class DynamicInferenceEngine(AbstractEngine):
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
-        logging.info("> dynamic_engine.py: building cuda graphs for ")
+        logging.info(
+            "> dynamic_engine.py: building cuda graphs for %d batch dimensions. "
+            "Context: max_requests=%d, max_tokens=%d, max_seq_len=%d, "
+            "block_size_tokens=%d, total_blocks=%d, active_blocks=%d, "
+            "block_size_bytes=%d, is_hybrid=%s",
+            len(context.cuda_graph_batch_dimensions_list),
+            context.max_requests,
+            context.max_tokens,
+            context.max_sequence_length,
+            context.block_size_tokens,
+            context.kv_block_allocator.total_count,
+            context.kv_block_allocator.active_count,
+            context.block_size_bytes,
+            context.is_hybrid_model,
+        )
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
