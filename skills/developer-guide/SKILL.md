@@ -1,58 +1,35 @@
-# AGENT.md
+---
+name: developer-guide
+description: Developer environment setup, CI/CD workflows, and CI failure debugging for Megatron-LM. Covers container-based development, uv package management, linting, running tests, CI failure investigation, and common pitfalls. Use when onboarding, setting up a dev environment, troubleshooting build issues, or investigating CI failures.
+---
 
-Guidance for AI agents operating in this repository.
+# Developer Guide
+
+This guide covers the recommended development workflow for Megatron-LM.
+The core principle: **build and develop inside containers** — the CI container
+ships the correct CUDA toolkit, PyTorch build, and pre-compiled native extensions
+(TransformerEngine, DeepEP, …) that cannot be reproduced on a bare host.
 
 ---
 
-## 1. CI/CD Overview
+## Why Containers
 
-### Pipeline entry point
+Megatron-LM depends on CUDA, NCCL, PyTorch with GPU support, TransformerEngine,
+and optional components like ModelOpt and DeepEP. Installing these on a bare host
+is fragile and hard to reproduce. The project ships Dockerfiles that pin every
+dependency.
 
-The main workflow is `.github/workflows/cicd-main.yml`. It triggers on pushes
-to branches matching `pull-request/[0-9]+` and `deploy-release/*`, on merge
-groups, on a daily schedule, and on manual dispatch.
+**Use the container as your development environment.** This guarantees:
 
-High-level stage order:
+- Identical CUDA / NCCL / cuDNN versions across all developers and CI.
+- `uv.lock` resolves the same way locally and in CI.
+- GPU-dependent operations (training, testing) work out of the box.
 
-```
-is-not-external-contributor
-  └─ pre-flight
-       └─ configure          # determines scope, container tag, n_repeat
-            ├─ linting
-            ├─ cicd-container-build
-            │    ├─ cicd-parse-unit-tests → cicd-unit-tests-latest
-            │    ├─ cicd-parse-integration-tests-h100 → cicd-integration-tests-latest-h100
-            │    └─ cicd-parse-integration-tests-gb200 → cicd-integration-tests-latest-gb200 (maintainers only)
-            └─ Nemo_CICD_Test  # final pass/fail gate
-```
+### Option A — Use a Pre-built Image (fastest)
 
-### Container build
-
-Dockerfiles live in `docker/`. The default CI image is built from
-`docker/Dockerfile.ci.dev`; the LTS variant uses `docker/Dockerfile.ci.lts`.
-
-Which image is used is controlled by the PR label `container::lts`; absent that
-label, `dev` is used. Images are pushed to:
-
-- AWS ECR: `766267172432.dkr.ecr.us-east-1.amazonaws.com/…`
-- GCP Artifact Registry: `us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm/…`
-
-The container is tagged by PR number and commit SHA for full traceability.
-Build caching is enabled via the registry.
-
-### Dependency management
-
-> **All `uv` operations must be run inside the `megatron-core` CI container.**
-> Never run `uv sync` / `uv pip install` on the host — the container provides
-> the correct CUDA toolkit, PyTorch build, and pre-compiled native extensions
-> (TransformerEngine, DeepEP, …) that cannot be reproduced outside of it.
-
-#### Getting the container
-
-**Option A — use a pre-built image** (fastest):
+Images are tagged by PR number and commit SHA:
 
 ```bash
-# Images are tagged by PR number and commit SHA.
 # Pull the latest image built for the current PR branch:
 PR_NUMBER=$(git rev-parse --abbrev-ref HEAD | grep -oP '(?<=pull-request/)\d+')
 docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${PR_NUMBER}
@@ -61,7 +38,7 @@ docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${PR_NUMBER
 docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
 ```
 
-**Option B — build from scratch**:
+### Option B — Build from Scratch
 
 ```bash
 # dev image (default)
@@ -79,7 +56,10 @@ docker build \
   -t megatron-lm:local-lts .
 ```
 
-#### Running work inside the container
+Which image variant is used is controlled by the PR label `container::lts`;
+absent that label, `dev` is used.
+
+### Running Work Inside the Container
 
 ```bash
 docker run --rm --gpus all \
@@ -89,10 +69,17 @@ docker run --rm --gpus all \
   bash -c "<your command>"
 ```
 
-#### uv dependency groups
+---
+
+## Dependency Management
 
 Dependencies are declared in `pyproject.toml`. The venv lives at `/opt/venv`
 inside the container (already on `PATH`).
+
+> **All `uv` operations must be run inside the container.**
+> Never run `uv sync` / `uv pip install` on the host.
+
+### uv Dependency Groups
 
 | Group | Purpose |
 |-------|---------|
@@ -120,7 +107,9 @@ Several dependencies are sourced directly from git (TransformerEngine, nemo-run,
 FlashMLA, Emerging-Optimizers, nvidia-resiliency-ext). The locked `uv.lock` file
 pins exact revisions; update it with `uv lock` when changing `pyproject.toml`.
 
-### Linting
+---
+
+## Linting
 
 Run before opening a PR:
 
@@ -133,11 +122,11 @@ Tools invoked: `black`, `isort`, `pylint`, `ruff`, `mypy`.
 
 ---
 
-## 2. Test onboarding
+## Running Tests
 
-### Test layout
+### Test Layout
 
-```
+```text
 tests/
 ├── unit_tests/          # pytest, 1 node × 8 GPUs, torch.distributed runner
 ├── functional_tests/    # end-to-end shell + training scripts
@@ -148,36 +137,28 @@ tests/
     └── python_scripts/  # helpers (recipe_parser, golden-value download, …)
 ```
 
-### How tests execute
+### How Tests Execute
 
 All tests run on a **single DGX H100 node (8 GPUs)**. The GitHub Actions runner
 invokes `launch_nemo_run_workload.py`, which uses **nemo-run** to launch a
-`DockerExecutor` container. The repo is bind-mounted into the container at
-`/opt/megatron-lm`; training data is mounted at `/mnt/artifacts`.
+`DockerExecutor` container. The repo is bind-mounted at `/opt/megatron-lm`;
+training data is mounted at `/mnt/artifacts`.
 
 **Unit tests** are dispatched through `torch.distributed.run`:
 
-```
---tee 3 --redirects 3 --log-dir {assets_dir}/logs/1/
-```
-
-- Ranks 0 and 3 (first and last) are tee-d to stdout; all other ranks write
-  only to log files.
+- Ranks 0 and 3 are tee-d to stdout; all other ranks write only to log files.
 - Per-rank log files land at `{assets_dir}/logs/1/` and are uploaded as a
   GitHub artifact after the run.
 
 **Functional tests** are driven by
-`tests/functional_tests/shell_test_utils/run_ci_test.sh`. Only the node with
-`SLURM_NODEID=0` runs the pytest validation step; training output from all ranks
-is written to `{assets_dir}/` and uploaded as an artifact.
+`tests/functional_tests/shell_test_utils/run_ci_test.sh`. Only rank 0 runs the
+pytest validation step; training output from all ranks is uploaded as an artifact.
 
-**Flaky-failure auto-retry**: `launch_nemo_run_workload.py` reads
-`assets_dir/logs/*/*/attempt_0/*/std*.log` across all ranks after a failure.
-If it matches a known transient pattern (NCCL timeout, ECC error, segfault,
-HuggingFace connectivity, …) the job is retried up to **3 times** before being
-declared a genuine failure.
+**Flaky-failure auto-retry**: `launch_nemo_run_workload.py` retries up to
+**3 times** for known transient patterns (NCCL timeout, ECC error, segfault,
+HuggingFace connectivity, …) before declaring a genuine failure.
 
-### Recipe YAML structure
+### Recipe YAML Structure
 
 Recipes live in `tests/test_utils/recipes/` and are parsed by
 `tests/test_utils/python_scripts/recipe_parser.py`. Each file expands a
@@ -192,10 +173,10 @@ spec:
   nodes: 1
   gpus: 8
   platforms: dgx_h100
-  time_limit: 1800          # seconds
-  script_setup: |           # runs before the test (git ops, env setup)
+  time_limit: 1800
+  script_setup: |
     ...
-  script: |-                # the actual test command; use {assets_dir} for output paths
+  script: |-
     bash tests/unit_tests/run_ci_test.sh \
       --tag {tag} \
       --environment {environment} \
@@ -213,7 +194,7 @@ products:
 Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
 `{environment}`, `{platforms}`, `{tag}`, `{n_repeat}`.
 
-### Adding a unit test
+### Adding a Unit Test
 
 1. Create `tests/unit_tests/<category>/test_<name>.py`.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
@@ -222,13 +203,15 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
    - `@pytest.mark.flaky` — skipped in `lts` environment
    - `@pytest.mark.experimental` — `latest` tag only
 4. Verify the test runs locally inside the container:
+
    ```bash
    pytest -xvs tests/unit_tests/<category>/test_<name>.py
    ```
+
 5. If the test needs a dedicated CI bucket, add an entry to
    `tests/test_utils/recipes/h100/unit-tests.yaml`.
 
-### Adding a functional / integration test
+### Adding a Functional / Integration Test
 
 1. Create `tests/functional_tests/test_cases/<model>/<test_name>/`.
 2. Write the shell test script; use `{assets_dir}` for all output paths.
@@ -237,13 +220,15 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
    `time_limit`.
 4. Push the PR, add the label **"Run functional tests"** to trigger a full run.
 5. After a successful run, download golden values:
+
    ```bash
    python tests/test_utils/python_scripts/download_golden_values.py \
      --source github --pipeline-id <run-id>
    ```
+
 6. Commit the downloaded golden values.
 
-### CI test scope labels
+### CI Test Scope Labels
 
 | PR label | Scope | Behaviour |
 |----------|-------|-----------|
@@ -254,12 +239,38 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
 
 ---
 
-## 3. CI-failure assistance
+## CI Pipeline
 
-### Locating the PR from a CI branch
+The main workflow is `.github/workflows/cicd-main.yml`. It triggers on pushes
+to branches matching `pull-request/[0-9]+` and `deploy-release/*`, on merge
+groups, on a daily schedule, and on manual dispatch.
 
-CI branches always follow the pattern `pull-request/<number>`. To find the
-associated PR:
+### Pipeline Structure
+
+```text
+is-not-external-contributor
+  └─ pre-flight
+       └─ configure          # determines scope, container tag, n_repeat
+            ├─ linting
+            ├─ cicd-container-build
+            │    ├─ cicd-parse-unit-tests → cicd-unit-tests-latest
+            │    ├─ cicd-parse-integration-tests-h100 → cicd-integration-tests-latest-h100
+            │    └─ cicd-parse-integration-tests-gb200 → cicd-integration-tests-latest-gb200 (maintainers only)
+            └─ Nemo_CICD_Test  # final pass/fail gate
+```
+
+Images are pushed to:
+
+- AWS ECR: `766267172432.dkr.ecr.us-east-1.amazonaws.com/…`
+- GCP Artifact Registry: `us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm/…`
+
+---
+
+## CI Failure Investigation
+
+CI branches always follow the pattern `pull-request/<number>`.
+
+### Locating the PR from a CI Branch
 
 ```bash
 # Extract PR number from the current branch
@@ -282,7 +293,7 @@ search by branch name instead:
 gh pr list --repo NVIDIA/Megatron-LM --head "pull-request/my-branch"
 ```
 
-### Reading CI job logs
+### Reading CI Job Logs
 
 ```bash
 # List recent workflow runs for the PR
@@ -314,12 +325,8 @@ gh run download <run-id> --repo NVIDIA/Megatron-LM \
 grep -r -l "ERROR\|Traceback\|FAILED\|fatal" ./ci-logs/
 
 # 4. Log files can exceed 10 000 lines — never read a full log at once.
-#    Chunk each file and read one chunk at a time to stay within context limits.
-#    First, check how large a file is:
+#    Check size first, then read in chunks of ~200 lines:
 wc -l ./ci-logs/<test>/<attempt>/attempt_0/<rank>/stderr.log
-
-#    Then read in chunks of ~200 lines, advancing the offset until the error is found:
-#    (using the Read tool with offset/limit, or via sed for shell use)
 sed -n '1,200p'   ./ci-logs/.../stderr.log   # chunk 1
 sed -n '201,400p' ./ci-logs/.../stderr.log   # chunk 2
 # … continue until the traceback / error is found, then stop.
@@ -327,7 +334,7 @@ sed -n '201,400p' ./ci-logs/.../stderr.log   # chunk 2
 
 Inside the artifact the log tree mirrors the container's `assets_dir`:
 
-```
+```text
 ci-logs/
 └── <test-name>/
     └── <attempt>/
@@ -337,11 +344,7 @@ ci-logs/
                 └── stderr.log
 ```
 
-The glob `assets_dir/logs/*/*/attempt_0/*/std*.log` captures all ranks across
-all attempts — this is also what the flaky-failure detector reads before
-deciding whether to retry.
-
-### Identifying failure root cause
+### Identifying Failure Root Cause
 
 1. **Linting failure** — re-run `tools/autoformat.sh` locally; the diff shows
    exactly what needs to change.
@@ -352,31 +355,28 @@ deciding whether to retry.
    `cicd-unit-tests-latest` job matrix. Ranks 0 and 3 appear in runner stdout;
    for failures on other ranks download the artifact and check per-rank logs.
    Re-run the specific bucket locally inside the container:
+
    ```bash
    bash tests/unit_tests/run_ci_test.sh \
      --tag latest --environment dev \
      --bucket "<glob from recipe>" \
      --log-dir ./logs
    ```
+
 4. **Functional test failure** — look at the `cicd-integration-tests-*` job.
    Failures in lightweight mode indicate a crash; failures with golden-value
    mismatch indicate a numerical regression. Only rank 0 runs pytest validation,
    so start with `stdout.log` for rank 0 in the artifact.
 5. **Flaky test** — the runner retries automatically up to 3 times for known
-   transient patterns (NCCL timeout, ECC error, segfault, HuggingFace
-   connectivity, …). If the job exhausted all retries and the failure matches
+   transient patterns. If the job exhausted all retries and the failure matches
    one of those patterns it is infrastructure noise, not a code regression.
-   For genuinely non-deterministic test logic, mark with `@pytest.mark.flaky`
-   (or `@pytest.mark.flaky_in_dev`) and open a follow-up issue.
+   Mark genuinely non-deterministic tests with `@pytest.mark.flaky` and open a
+   follow-up issue.
 
-### Correlating a failure with the PR changeset
-
-After extracting the PR number and fetching the diff (see above), map changed
-files to test ownership:
+### Correlating a Failure with the PR Changeset
 
 ```bash
 # Find unit tests that cover a changed source file
-# e.g. megatron/core/transformer/attention.py → tests/unit_tests/models/
 grep -r "from megatron.core.transformer.attention" tests/unit_tests/ -l
 
 # Check CODEOWNERS for reviewer assignment
@@ -385,3 +385,16 @@ cat .github/CODEOWNERS | grep "<changed-path>"
 
 Use this mapping to determine whether the failure is directly caused by the
 PR's changes or is a pre-existing issue on `main`.
+
+---
+
+## Common Pitfalls
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `uv sync --locked` fails | Dependency conflict or stale `uv.lock` | Re-run `uv lock` inside the container and commit updated lock |
+| `ModuleNotFoundError` after pip install | pip installed outside the uv-managed venv | Use `uv add` and `uv sync`, never bare `pip install` |
+| `uv: command not found` inside container | Wrong container image | Use the `megatron-lm` image built from `Dockerfile.ci.dev` |
+| `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
+| Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
+| Port collision on multi-GPU runs | torchrun binding conflicts | Use `torch.distributed.run` via the container entry point |
