@@ -29,7 +29,7 @@ class PSEmbeddingWeightGathering(torch.autograd.Function):
         (sharded_weight,) = ctx.saved_tensors
 
         nvtx_range_push(msg="PSEmbeddingWeightGathering_bwd")
-        wgrad = sharded_weight.wgrad_reduce_scatter(wgrad, fuse_wgrad_accumulation=False)
+        wgrad = sharded_weight.wgrad_reduce_scatter(wgrad)
         nvtx_range_pop(msg="PSEmbeddingWeightGathering_bwd")
 
         return wgrad

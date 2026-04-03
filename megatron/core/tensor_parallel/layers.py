@@ -512,10 +512,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.ps_size > 1:
             sharded_weight = weight
             weight = sharded_weight.all_gather_and_prefetch_bwd()
-            etp_fuse_wgrad = ctx.gradient_accumulation_fusion
             ctx.gradient_accumulation_fusion = False
-        else:
-            etp_fuse_wgrad = False
 
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
@@ -636,9 +633,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         # ETP: reduce-scatter wgrad
         if ctx.ps_size > 1 and grad_weight is not None:
-            grad_weight = sharded_weight.wgrad_reduce_scatter(
-                grad_weight, etp_fuse_wgrad
-            )
+            grad_weight = sharded_weight.wgrad_reduce_scatter(grad_weight)
 
         if ctx.sequence_parallel:
             handle.wait()

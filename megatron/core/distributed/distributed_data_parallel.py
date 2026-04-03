@@ -375,16 +375,16 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
+                elif ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+                    # ETP handles grad accumulation internally in _finalize_wgrad
+                    # (captured by CUDA graph); no DDP hook needed.
+                    pass
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-
-                    if ETPShardedParam is not None and isinstance(param, ETPShardedParam):
-                        param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
-                    else:
-                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                    grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
         self.use_forward_hook = (

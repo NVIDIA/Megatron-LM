@@ -28,4 +28,4 @@ class ETPEmbeddingWeight(torch.autograd.Function):
         """Backward: reduce-scatter grad to match the sharded weight shape."""
         (weight,) = ctx.saved_tensors
         # grad_output: [full_vocab/tp, hidden] → sharded: [full_vocab/tp/ps, hidden]
-        return weight.wgrad_reduce_scatter(grad_output, fuse_wgrad_accumulation=False)
+        return weight.wgrad_reduce_scatter(grad_output)
