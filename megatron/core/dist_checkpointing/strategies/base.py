@@ -48,7 +48,9 @@ class LoadStrategyBase(ABC):
     given checkpoint version."""
 
     def __init__(self):
-        logger.warning("LoadStrategyBase is deprecated and will be removed in future releases.")
+        logger.warning(
+            "LoadStrategyBase & LoadShardedStrategy are deprecated and will be removed in future releases."
+        )
 
     @abstractmethod
     def check_backend_compatibility(self, loaded_backend):
@@ -71,7 +73,9 @@ class SaveStrategyBase(ABC):
     version of the saved format."""
 
     def __init__(self, backend: str, version: int):
-        logger.warning("SaveStrategyBase is deprecated and will be removed in future releases.")
+        logger.warning(
+            "SaveStrategyBase & SaveShardedStrategy are deprecated and will be removed in future releases."
+        )
         self.backend = backend
         self.version = version
 
@@ -86,10 +90,6 @@ class SaveStrategyBase(ABC):
 
 class LoadShardedStrategy(LoadStrategyBase):
     """Base class for load strategies to be removed in future releases."""
-
-    def __init__(self):
-        super.__init__()
-        logger.warning("LoadShardedStrategy is deprecated and will be removed in future releases.")
 
     @abstractmethod
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -134,10 +134,6 @@ class LoadShardedStrategy(LoadStrategyBase):
 class SaveShardedStrategy(SaveStrategyBase):
     """Base class for save strategies to be removed in future releases."""
 
-    def __init__(self, backend: str, version: int):
-        super.__init__(backend, version)
-        logger.warning("SaveShardedStrategy is deprecated and will be removed in future releases.")
-
     @abstractmethod
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Save the sharded part of the state dict."""
@@ -146,12 +142,6 @@ class SaveShardedStrategy(SaveStrategyBase):
 
 class AsyncSaveShardedStrategy(SaveShardedStrategy):
     """Save strategy suitable for async save. To be removed in future releases."""
-
-    def __init__(self, backend: str, version: int):
-        super.__init__(backend, version)
-        logger.warning(
-            "AsyncSaveShardedStrategy is deprecated and will be removed in future releases."
-        )
 
     @abstractmethod
     def async_save(
