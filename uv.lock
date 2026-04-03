@@ -2019,6 +2019,19 @@ http2 = [
 ]
 
 [[package]]
+name = "httpx-aiohttp"
+version = "0.1.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/2c/b894861cecf030fb45675ea24aa55b5722e97c602a163d872fca66c5a6d8/httpx_aiohttp-0.1.12.tar.gz", hash = "sha256:81feec51fd82c0ecfa0e9aaf1b1a6c2591260d5e2bcbeb7eb0277a78e610df2c", size = 275945, upload-time = "2025-12-12T10:12:15.283Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/8d/85c9701e9af72ca132a1783e2a54364a90c6da832304416a30fc11196ab2/httpx_aiohttp-0.1.12-py3-none-any.whl", hash = "sha256:5b0eac39a7f360fa7867a60bcb46bb1024eada9c01cbfecdb54dc1edb3fb7141", size = 6367, upload-time = "2025-12-12T10:12:14.018Z" },
+]
+
+[[package]]
 name = "huggingface-hub"
 version = "0.36.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2634,7 +2647,6 @@ dev = [
     { name = "fastapi" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-python" },
-    { name = "flask", extra = ["async"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "hypercorn" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
@@ -2644,7 +2656,8 @@ dev = [
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
     { name = "onnxscript" },
-    { name = "openai" },
+    { name = "openai", extra = ["aiohttp"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "quart", marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "opentelemetry-api", version = "1.33.1", source = { registry = "https://pypi.org/simple" } },
     { name = "tensorstore", version = "0.1.78", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tensorstore", version = "0.1.81", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -3834,6 +3847,12 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/61/4b/dc1d84b8237205ebe48a1b1c9c3a8e1ab9fd08b30811b6d787196df58fd6/openai-2.23.0.tar.gz", hash = "sha256:7d24cc8087d5e8eed58e98aaa823391d39d12f9a9a2755770f67c7bb2004d94c", size = 657323, upload-time = "2026-02-24T03:20:20.323Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1d/5f/bcdf0fb510c24f021e485f920677da363cd59d6e0310171bf2cad6e052b5/openai-2.23.0-py3-none-any.whl", hash = "sha256:1041d40bebf845053fda1946104f8bf9c3e2df957a41c3878c55c72c352630e9", size = 1118971, upload-time = "2026-02-24T03:20:18.708Z" },
+]
+
+[package.optional-dependencies]
+aiohttp = [
+    { name = "aiohttp" },
+    { name = "httpx-aiohttp" },
 ]
 
 [[package]]
@@ -5292,6 +5311,26 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/05/10/f42c48fa5153204f42eaa945e8d1fd7c10d6296841dcb2447bf7da1be5c4/pyyaml_ft-8.0.0-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:052561b89d5b2a8e1289f326d060e794c21fa068aa11255fe71d65baf18a632e", size = 810403, upload-time = "2025-06-10T15:32:11.051Z" },
     { url = "https://files.pythonhosted.org/packages/d5/d2/e369064aa51009eb9245399fd8ad2c562bd0bcd392a00be44b2a824ded7c/pyyaml_ft-8.0.0-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:3bb4b927929b0cb162fb1605392a321e3333e48ce616cdcfa04a839271373255", size = 835581, upload-time = "2025-06-10T15:32:12.897Z" },
     { url = "https://files.pythonhosted.org/packages/c0/28/26534bed77109632a956977f60d8519049f545abc39215d086e33a61f1f2/pyyaml_ft-8.0.0-cp313-cp313t-win_amd64.whl", hash = "sha256:de04cfe9439565e32f178106c51dd6ca61afaa2907d143835d501d84703d3793", size = 171579, upload-time = "2025-06-10T15:32:14.34Z" },
+]
+
+[[package]]
+name = "quart"
+version = "0.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiofiles" },
+    { name = "blinker" },
+    { name = "click" },
+    { name = "flask" },
+    { name = "hypercorn" },
+    { name = "itsdangerous" },
+    { name = "jinja2" },
+    { name = "markupsafe" },
+    { name = "werkzeug" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1d/9d/12e1143a5bd2ccc05c293a6f5ae1df8fd94a8fc1440ecc6c344b2b30ce13/quart-0.20.0.tar.gz", hash = "sha256:08793c206ff832483586f5ae47018c7e40bdd75d886fee3fabbdaa70c2cf505d", size = 63874, upload-time = "2024-12-23T13:53:05.664Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/e9/cc28f21f52913adf333f653b9e0a3bf9cb223f5083a26422968ba73edd8d/quart-0.20.0-py3-none-any.whl", hash = "sha256:003c08f551746710acb757de49d9b768986fd431517d0eb127380b656b98b8f1", size = 77960, upload-time = "2024-12-23T13:53:02.642Z" },
 ]
 
 [[package]]
