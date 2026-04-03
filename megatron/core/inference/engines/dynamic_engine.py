@@ -469,19 +469,58 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     def _autotune_and_rebuild(self):
-        """Two-pass initialization: profile, compute optimal params, rebuild.
+        """Three-step initialization: safe profiling context, profile, rebuild.
 
-        Pass 1: Run create_cuda_graphs() with profiling to collect activation
+        Step 1: Deallocate the initial context (which may have an unsafe
+        buffer_size_gb) and rebuild with a conservative buffer that fits in
+        available GPU memory.
+
+        Step 2: Run create_cuda_graphs() with profiling to collect activation
         memory and compute throughput per batch dimension.
 
-        Pass 2: Compute optimal (max_requests, max_tokens), rebuild the context
-        and CUDA graphs with tuned parameters.
+        Step 3: Compute optimal (max_requests, max_tokens, buffer_size_gb),
+        rebuild the context and CUDA graphs with tuned parameters.
         """
         from dataclasses import replace
 
         from megatron.core.inference.autotune import compute_optimal_params
 
-        logging.info("Autotune: Pass 1 — profiling during CUDA graph warmup")
+        model_config = self.controller.inference_wrapped_model.model.config
+        old_config = self.context.config
+
+        # Step 1: Rebuild context with a safe buffer for profiling.
+        # The initial context may have buffer_size_gb larger than available
+        # GPU memory (e.g., default 40GB on a 24GB GPU). Deallocate it and
+        # create a small profiling context that won't OOM.
+        self.context.deallocate_inference_state_buffers()
+        torch.cuda.empty_cache()
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        # Use 50% of free memory for the profiling buffer. The rest is
+        # headroom for activations during CUDA graph warmup.
+        profiling_buffer_gb = (free_bytes * 0.5) / (1024 ** 3)
+        profiling_buffer_gb = max(profiling_buffer_gb, 0.1)  # floor at 100MB
+
+        logging.info(
+            "Autotune: Step 1 — creating profiling context with buffer_size_gb=%.2f "
+            "(%.1f GB free of %.1f GB total)",
+            profiling_buffer_gb,
+            free_bytes / (1024 ** 3),
+            total_bytes / (1024 ** 3),
+        )
+
+        profiling_config = replace(
+            old_config,
+            buffer_size_gb=profiling_buffer_gb,
+            max_requests=None,  # auto-derive from buffer
+            max_tokens=None,  # use default
+        )
+        self.context = DynamicInferenceContext(model_config, profiling_config)
+        self.controller.inference_wrapped_model.inference_context = self.context
+        self.reset()
+
+        # Step 2: Profile during CUDA graph warmup.
+        logging.info("Autotune: Step 2 — profiling during CUDA graph warmup")
         self.create_cuda_graphs()
 
         profile = self.autotune_profile
@@ -492,44 +531,35 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             return
 
-        model_config = self.controller.inference_wrapped_model.model.config
         tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
 
         new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
             profile, tp_size=tp_size, request_rounder=self.context.REQUEST_ROUNDER,
         )
 
-        # Rebuild context with tuned parameters.
-        old_config = self.context.config
-        new_config = replace(
+        # Step 3: Rebuild with tuned parameters.
+        logging.info(
+            "Autotune: Step 3 — rebuilding context with max_requests=%d, max_tokens=%d, "
+            "buffer_size_gb=%.2f",
+            new_max_requests,
+            new_max_tokens,
+            new_buffer_size_gb,
+        )
+
+        self.context.deallocate_inference_state_buffers()
+        torch.cuda.empty_cache()
+
+        tuned_config = replace(
             old_config,
             max_requests=new_max_requests,
             max_tokens=new_max_tokens,
             buffer_size_gb=new_buffer_size_gb,
-            autotune=False,  # don't profile again on second pass
+            autotune=False,  # don't profile again
         )
-
-        logging.info(
-            "Autotune: Pass 2 — rebuilding context with max_requests=%d, max_tokens=%d, "
-            "buffer_size_gb=%.2f (was max_requests=%s, max_tokens=%s, buffer_size_gb=%s)",
-            new_max_requests,
-            new_max_tokens,
-            new_buffer_size_gb,
-            old_config.max_requests,
-            old_config.max_tokens,
-            old_config.buffer_size_gb,
-        )
-
-        # Deallocate old context state.
-        self.context.deallocate_inference_state_buffers()
-
-        # Create new context and rewire.
-        self.context = DynamicInferenceContext(model_config, new_config)
+        self.context = DynamicInferenceContext(model_config, tuned_config)
         self.controller.inference_wrapped_model.inference_context = self.context
-        self.autotune = False  # prevent re-profiling
+        self.autotune = False
         self.autotune_profile = None
-
-        # Reset engine state for the new context.
         self.reset()
 
         # Build real CUDA graphs.
