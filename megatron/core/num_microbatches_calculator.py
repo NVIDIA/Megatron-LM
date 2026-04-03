@@ -9,13 +9,11 @@ from typing import List, Optional, Tuple, Union
 logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
-_GLOBAL_NUM_MICROBATCHES_CALCULATOR: Optional[
-    Union[
-        'ConstantNumMicroBatchesCalculator',
-        'RampupBatchsizeNumMicroBatchesCalculator',
-        'StepBatchsizeNumMicroBatchesCalculator',
-    ]
-] = None
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
+    'ConstantNumMicroBatchesCalculator',
+    'RampupBatchsizeNumMicroBatchesCalculator',
+    'StepBatchsizeNumMicroBatchesCalculator',
+] = None  # type: ignore[assignment]
 
 
 def get_num_microbatches() -> int:
@@ -352,26 +350,30 @@ class NumMicroBatchesCalculator(ABC):
     """Base class for number of microbatches calculator."""
 
     def __init__(self) -> None:
-        self.num_micro_batches = None
-        self.current_global_batch_size = None
-        self.micro_batch_size = None
-        self.current_running_global_batch_size = None
+        self.num_micro_batches: Optional[int] = None
+        self.current_global_batch_size: Optional[int] = None
+        self.micro_batch_size: Optional[int] = None
+        self.current_running_global_batch_size: Optional[int] = None
 
     def get(self) -> int:
         """Get number of microbatches."""
+        assert self.num_micro_batches is not None
         return self.num_micro_batches
 
     def get_current_global_batch_size(self) -> int:
         """Get current global batch size."""
+        assert self.current_global_batch_size is not None
         return self.current_global_batch_size
 
     def get_micro_batch_size(self) -> int:
         """Get current global batch size."""
+        assert self.micro_batch_size is not None
         return self.micro_batch_size
 
     def get_current_running_global_batch_size(self) -> int:
         """Get current running global batch size. If decrease_batch_size_if_needed is False,
         this just equals global batch size."""
+        assert self.current_running_global_batch_size is not None
         return self.current_running_global_batch_size
 
     @abstractmethod
@@ -405,6 +407,7 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         decrease_batch_size_if_needed: bool,
         rank: int,
     ) -> None:
+        super().__init__()
 
         micro_batch_times_data_parallel_size = micro_batch_size * data_parallel_size
         if decrease_batch_size_if_needed:
@@ -418,9 +421,7 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                     f'to keep divisiblity by micro_batch_size={micro_batch_size} * '
                     f'data_parallel_size={data_parallel_size}'
                 )
-            self.num_micro_batches = (
-                running_global_batch_size // micro_batch_times_data_parallel_size
-            )
+            num_micro_batches = running_global_batch_size // micro_batch_times_data_parallel_size
         else:
             assert global_batch_size % micro_batch_times_data_parallel_size == 0, (
                 'global batch size ({}) is not divisible by micro batch size ({})'
@@ -429,11 +430,12 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 )
             )
             running_global_batch_size = global_batch_size
-            self.num_micro_batches = global_batch_size // micro_batch_times_data_parallel_size
+            num_micro_batches = global_batch_size // micro_batch_times_data_parallel_size
         assert (
-            self.num_micro_batches >= 1
-        ), 'number of microbatches should be at least 1, got {}.'.format(self.num_micro_batches)
+            num_micro_batches >= 1
+        ), 'number of microbatches should be at least 1, got {}.'.format(num_micro_batches)
 
+        self.num_micro_batches = num_micro_batches
         self.current_global_batch_size = global_batch_size
         self.current_running_global_batch_size = running_global_batch_size
         self.micro_batch_size = micro_batch_size
@@ -480,6 +482,7 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         batch_size_increment: int,
         ramup_samples: int,
     ) -> None:
+        super().__init__()
         assert global_batch_size > 0, 'global batch size should be positive, got {}.'.format(
             global_batch_size
         )
@@ -493,16 +496,18 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             ramup_samples
         )
 
-        self.global_batch_size = global_batch_size
+        self.global_batch_size: int = global_batch_size
         self.micro_batch_size = micro_batch_size
-        self.data_parallel_size = data_parallel_size
-        self.decrease_batch_size_if_needed = decrease_batch_size_if_needed
-        self.rank = rank
-        self.start_global_batch_size = start_global_batch_size
-        self.batch_size_increment = batch_size_increment
-        self.ramup_samples = ramup_samples
+        self.data_parallel_size: int = data_parallel_size
+        self.decrease_batch_size_if_needed: bool = decrease_batch_size_if_needed
+        self.rank: int = rank
+        self.start_global_batch_size: int = start_global_batch_size
+        self.batch_size_increment: int = batch_size_increment
+        self.ramup_samples: int = ramup_samples
 
-        self.micro_batch_times_data_parallel_size = self.micro_batch_size * self.data_parallel_size
+        self.micro_batch_times_data_parallel_size: int = (
+            self.micro_batch_size * self.data_parallel_size
+        )
         assert self.micro_batch_times_data_parallel_size > 0
         self.current_global_batch_size = None
 
@@ -542,7 +547,8 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             self.current_global_batch_size = (
                 self.start_global_batch_size + steps * self.batch_size_increment
             )
-            assert self.current_global_batch_size <= self.global_batch_size
+        assert self.current_global_batch_size is not None
+        assert self.current_global_batch_size <= self.global_batch_size
 
         if old_current_global_batch_size != self.current_global_batch_size:
             global_batch_size_changed = True
@@ -588,6 +594,7 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         else:
             self.current_running_global_batch_size = self.current_global_batch_size
 
+        assert self.current_running_global_batch_size is not None
         self.num_micro_batches = (
             self.current_running_global_batch_size // self.micro_batch_times_data_parallel_size
         )
@@ -629,11 +636,11 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             )
 
         self.micro_batch_size = micro_batch_size
-        self.data_parallel_size = data_parallel_size
-        self.rank = rank
-        self.seq_length = seq_length
+        self.data_parallel_size: int = data_parallel_size
+        self.rank: int = rank
+        self.seq_length: Optional[int] = seq_length
 
-        self.micro_batch_times_data_parallel_size = micro_batch_size * data_parallel_size
+        self.micro_batch_times_data_parallel_size: int = micro_batch_size * data_parallel_size
         assert self.micro_batch_times_data_parallel_size > 0
 
         # Parse schedule string
@@ -642,7 +649,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         # Validate schedule
         self._validate_schedule()
 
-        self.global_batch_size = self.schedule[-1][1]
+        self.global_batch_size: int = self.schedule[-1][1]
         self.current_global_batch_size = None
 
         if rank == 0:
@@ -768,6 +775,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             verbose (bool): Enable logging.
         """
         self.current_global_batch_size = self._get_batch_size_for_samples(consumed_samples)
+        assert self.current_global_batch_size is not None
 
         # Consistency check
         if consistency_check:
@@ -780,6 +788,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             )
 
         self.current_running_global_batch_size = self.current_global_batch_size
+        assert self.current_running_global_batch_size is not None
         self.num_micro_batches = (
             self.current_running_global_batch_size // self.micro_batch_times_data_parallel_size
         )
