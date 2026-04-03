@@ -229,6 +229,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
+        self.autotune = inference_config.autotune
+        self.autotune_profile = None
         # Initialize engine.
         self.reset()
 
@@ -262,8 +264,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Create cuda graphs.
-        self.create_cuda_graphs()
+        # Create cuda graphs (with optional auto-tuning).
+        if self.autotune:
+            self._autotune_and_rebuild()
+        else:
+            self.create_cuda_graphs()
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -367,6 +372,28 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+        profiling = self.autotune
+        if profiling:
+            from megatron.core.inference.autotune import AutotuneProfile
+            from megatron.core.inference.contexts.dynamic_context import (
+                DynamicInferenceContext,
+            )
+
+            mem_params = DynamicInferenceContext.compute_context_memory_params(
+                controller.inference_wrapped_model.model.config, context.config
+            )
+            profile = AutotuneProfile(
+                block_size_bytes=mem_params['block_size_bytes'],
+                mamba_memory_per_request=mem_params['mamba_memory_per_request'],
+                max_kv_block_count=mem_params['max_kv_block_count'],
+                per_request_bytes=mem_params['per_request_bytes'],
+                per_token_bytes=mem_params['per_token_bytes'],
+                gpu_total_bytes=torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).total_mem,
+                memory_after_model_load_bytes=torch.cuda.memory_allocated(),
+            )
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -389,10 +416,29 @@ class DynamicInferenceEngine(AbstractEngine):
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
+            # Per-iteration profiling for autotune.
+            if profiling:
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+            if profiling:
+                end_event.record()
+                torch.cuda.synchronize()
+                peak_bytes = torch.cuda.max_memory_allocated()
+                elapsed_ms = start_event.elapsed_time(end_event)
+                profile.add_sample(
+                    cuda_graph_batch_dimension.token_count, peak_bytes, elapsed_ms
+                )
+
             context.reset()
+
+        if profiling:
+            self.autotune_profile = profile
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
@@ -421,6 +467,70 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+
+    def _autotune_and_rebuild(self):
+        """Two-pass initialization: profile, compute optimal params, rebuild.
+
+        Pass 1: Run create_cuda_graphs() with profiling to collect activation
+        memory and compute throughput per batch dimension.
+
+        Pass 2: Compute optimal (max_requests, max_tokens), rebuild the context
+        and CUDA graphs with tuned parameters.
+        """
+        from dataclasses import replace
+
+        from megatron.core.inference.autotune import compute_optimal_params
+
+        logging.info("Autotune: Pass 1 — profiling during CUDA graph warmup")
+        self.create_cuda_graphs()
+
+        profile = self.autotune_profile
+        if profile is None:
+            logging.warning(
+                "Autotune: no profiling data collected (CUDA graphs may be disabled). "
+                "Skipping auto-tuning."
+            )
+            return
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
+
+        new_max_requests, new_max_tokens = compute_optimal_params(
+            profile, tp_size=tp_size, request_rounder=self.context.REQUEST_ROUNDER,
+        )
+
+        # Rebuild context with tuned parameters.
+        old_config = self.context.config
+        new_config = replace(
+            old_config,
+            max_requests=new_max_requests,
+            max_tokens=new_max_tokens,
+            autotune=False,  # don't profile again on second pass
+        )
+
+        logging.info(
+            "Autotune: Pass 2 — rebuilding context with max_requests=%d, max_tokens=%d "
+            "(was max_requests=%s, max_tokens=%s)",
+            new_max_requests,
+            new_max_tokens,
+            old_config.max_requests,
+            old_config.max_tokens,
+        )
+
+        # Deallocate old context state.
+        self.context.deallocate_inference_state_buffers()
+
+        # Create new context and rewire.
+        self.context = DynamicInferenceContext(model_config, new_config)
+        self.controller.inference_wrapped_model.inference_context = self.context
+        self.autotune = False  # prevent re-profiling
+        self.autotune_profile = None
+
+        # Reset engine state for the new context.
+        self.reset()
+
+        # Build real CUDA graphs.
+        self.create_cuda_graphs()
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(

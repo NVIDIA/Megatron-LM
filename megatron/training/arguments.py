@@ -1447,6 +1447,21 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
+    if getattr(args, 'inference_dynamic_batching_autotune', False):
+        assert args.inference_dynamic_batching, \
+            "--inference-dynamic-batching-autotune requires --inference-dynamic-batching"
+        try:
+            import torch_memory_saver  # noqa: F401
+        except ImportError:
+            raise AssertionError(
+                "--inference-dynamic-batching-autotune requires torch_memory_saver to be "
+                "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+            )
+        assert args.cuda_graph_impl != "none", \
+            "--inference-dynamic-batching-autotune requires CUDA graphs to be enabled"
+        assert args.enable_chunked_prefill, \
+            "--inference-dynamic-batching-autotune requires --enable-chunked-prefill"
+
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
@@ -1795,6 +1810,11 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-autotune',
+                       action='store_true', default=False,
+                       help='Automatically tune inference memory parameters '
+                       '(buffer_size_gb, mamba_memory_ratio, max_requests, '
+                       'max_tokens) based on available GPU memory.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
                        help='Amount of on-GPU memory allocated for the KV cache. '
