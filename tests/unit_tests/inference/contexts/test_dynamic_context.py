@@ -1400,6 +1400,100 @@ class TestDynamicContext:
         assert context.is_hybrid_model is True
 
     @pytest.mark.internal
+    @rounder_override(1)
+    @pytest.mark.parametrize("max_requests", [1, 4, 64])
+    def test_hybrid_max_requests_auto_derives_mamba_split(self, max_requests):
+        """
+        When max_requests is set on a hybrid model without mamba_memory_ratio,
+        mamba memory should be allocated for exactly max_requests slots, with
+        the remaining memory going to KV cache blocks.
+        """
+
+        buffer_gb = 0.05
+        paused_gb = 0.01
+        block_size = 256
+        num_attention_heads = 8
+        kv_channels = 64
+        params_dtype = torch.float32
+
+        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list,
+            mamba_conv_states_shape,
+            mamba_ssm_states_shape,
+            params_dtype,
+            params_dtype,
+        )
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=2,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=buffer_gb,
+                paused_buffer_size_gb=paused_gb,
+                block_size_tokens=block_size,
+                max_tokens=2048,
+                mamba_inference_state_config=mamba_config,
+                max_requests=max_requests,
+                unified_memory_level=0,
+            ),
+        )
+
+        dtype_size = torch.tensor([], dtype=params_dtype).element_size()
+
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
+        mamba_mem_per_req *= dtype_size
+
+        kv_buffer_bytes = int(buffer_gb * 1024**3)
+        kv_paused_bytes = int(paused_gb * 1024**3)
+        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+
+        # Auto-derived ratio from max_requests.
+        mamba_memory_needed = max_requests * mamba_mem_per_req
+        ratio = mamba_memory_needed / total_mem_bytes
+
+        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
+        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
+        expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+
+        assert context.kv_block_allocator.total_count == expected_active_blocks
+        assert context.max_requests == max_requests
+
+        # With max_requests=1, more memory goes to KV blocks than with max_requests=64.
+        # Verify we get more blocks with fewer requests.
+        if max_requests == 1:
+            context_many = DynamicInferenceContext(
+                model_config=TransformerConfig(
+                    params_dtype=params_dtype,
+                    num_layers=2,
+                    kv_channels=kv_channels,
+                    num_attention_heads=num_attention_heads,
+                ),
+                inference_config=InferenceConfig(
+                    max_sequence_length=512,
+                    buffer_size_gb=buffer_gb,
+                    paused_buffer_size_gb=paused_gb,
+                    block_size_tokens=block_size,
+                    max_tokens=2048,
+                    mamba_inference_state_config=mamba_config,
+                    max_requests=64,
+                    unified_memory_level=0,
+                ),
+            )
+            assert (
+                context.kv_block_allocator.total_count > context_many.kv_block_allocator.total_count
+            )
+
+    @pytest.mark.internal
     @rounder_override(64)
     def test_max_requests_less_than_tp_size(self):
         tp_size = 2
