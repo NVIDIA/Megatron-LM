@@ -321,6 +321,7 @@ class RolloutStream(AsyncIterator):
 
     async def try_next(self):
         """Attempt to get next item without blocking."""
+        assert self._pending_task is None, "previous pending task not consumed"
         inner_task = asyncio.ensure_future(self._inner.__anext__())
         try:
             return await asyncio.wait_for(asyncio.shield(inner_task), timeout=0.01)

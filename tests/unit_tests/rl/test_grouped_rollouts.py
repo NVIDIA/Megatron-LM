@@ -163,6 +163,7 @@ class TestGroupedRollouts:
 
         loop = asyncio.new_event_loop()
         mock_colocated = MagicMock(return_value=[_make_group(i) for i in range(n_prompts)])
+        stream = RolloutStream(gen())
         try:
             with patch.multiple('megatron.rl.rl_utils',
                 colocated_inference=mock_colocated,
@@ -173,7 +174,7 @@ class TestGroupedRollouts:
                 get_pg_size=MagicMock(return_value=1),
                 get_pg_rank=MagicMock(return_value=0),
                 lang_rl_log_dir=None,
-                _ROLLOUT_GENERATOR=RolloutStream(gen()),
+                _ROLLOUT_GENERATOR=stream,
             ), patch('torch.distributed.get_rank', return_value=0), \
                patch('torch.distributed.broadcast'), \
                patch('torch.distributed.broadcast_object_list'):
@@ -184,4 +185,5 @@ class TestGroupedRollouts:
                 assert mock_colocated.called == expect_colocated_call
                 assert len(rollouts) == n_prompts
         finally:
+            loop.run_until_complete(stream.aclose())
             loop.close()

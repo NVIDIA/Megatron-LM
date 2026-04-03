@@ -1556,6 +1556,14 @@ def prepare_data_for_update(
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
+        with nvtx_range("rl/log-wandb-tb", time=True):
+            maybe_log_training_metrics(
+                group_stats=group_stats,
+                current_iteration=args.curr_iteration,
+                tokenizer=tokenizer,
+                example_groups=example_groups,
+            )
+
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
 
