@@ -471,7 +471,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            enforce_order=args.rl_use_strict_lag,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
