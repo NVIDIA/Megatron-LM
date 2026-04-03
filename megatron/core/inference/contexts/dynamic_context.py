@@ -761,30 +761,53 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
-        if self.cache_mla_latent:
-            self.memory_buffer = torch.empty(
-                (
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.kv_reduced_dim,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
+        self.kv_chunk_tracker = None
+        total_blocks = self.kv_block_allocator.total_count
+
+        if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+            from megatron.core.inference.contexts.mamba_chunk_manager import ChunkTracker
+
+            num_kv_chunks = 8
+            kv_tms_tag = "kv_cache"
+            self.kv_chunk_tracker = ChunkTracker(
+                total_slots=total_blocks,
+                num_chunks=num_kv_chunks,
+                tms_tag=kv_tms_tag,
+            )
+            kv_ctx = torch_memory_saver.region(
+                tag=kv_tms_tag,
+                enable_cpu_backup=True,
+                num_chunks=num_kv_chunks,
             )
         else:
-            self.memory_buffer = torch.empty(
-                (
-                    2,  # key and value
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+            kv_ctx = nullcontext()
+
+        with kv_ctx:
+            if self.cache_mla_latent:
+                self.memory_buffer = torch.empty(
+                    (
+                        self.num_attention_layers,
+                        total_blocks,
+                        self.block_size_tokens,
+                        self.kv_reduced_dim,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.empty(
+                    (
+                        2,  # key and value
+                        self.num_attention_layers,
+                        total_blocks,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -975,6 +998,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
+
+        # Wire KV chunk tracker to the block allocator.
+        if self.kv_chunk_tracker is not None:
+            self.kv_block_allocator.chunk_tracker = self.kv_chunk_tracker
 
         # Allocate Mamba prefix cache if configured
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None

@@ -39,6 +39,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self.chunk_tracker = None  # Set by DynamicInferenceContext when autotune is enabled
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -183,6 +184,10 @@ class KVBlockAllocator:
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
+        if self.chunk_tracker is not None:
+            for bid in block_ids.tolist():
+                self.chunk_tracker.activate_slot(bid)
+
         return block_ids
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
@@ -219,10 +224,16 @@ class KVBlockAllocator:
                     num_unreg = unreg_blocks.numel()
                     self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
                     self.total_avail += num_unreg
+                    if self.chunk_tracker is not None:
+                        for bid in unreg_blocks.tolist():
+                            self.chunk_tracker.deactivate_slot(bid)
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
             self.total_avail += num_blocks
+            if self.chunk_tracker is not None:
+                for bid in blocks.tolist():
+                    self.chunk_tracker.deactivate_slot(bid)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -309,6 +320,9 @@ class KVBlockAllocator:
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
+        if self.chunk_tracker is not None:
+            for bid in block_ids.tolist():
+                self.chunk_tracker.deactivate_slot(bid)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
