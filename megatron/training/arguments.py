@@ -1376,6 +1376,25 @@ def validate_args(args, defaults={}):
         )
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
+    # emerging optimizer check
+    if args.optimizer not in ('sgd', 'adam'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
+
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
+
+        assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
@@ -1471,24 +1490,6 @@ def validate_args(args, defaults={}):
         assert False, \
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
-
-    # emerging optimizer check
-    if args.optimizer not in ('sgd', 'adam'):
-        if args.optimizer == 'dist_muon':
-            warn_rank_0(
-                "optimizer='dist_muon' is deprecated. "
-                "Use --optimizer muon --use-distributed-optimizer instead."
-            )
-            args.optimizer = 'muon'
-            args.use_layer_wise_distributed_optimizer = True
-
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
-
-        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
