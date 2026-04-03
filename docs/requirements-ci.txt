@@ -1,8 +1,0 @@
-setuptools<80.0.0,>=77.0.0
-wheel
-sphinx
-sphinx-autobuild
-sphinx-autodoc2
-sphinx-copybutton
-myst_parser
-nvidia-sphinx-theme

@@ -266,9 +266,6 @@ jobs:
 
       - name: Install linting tools
         run: |
-          uv venv
-          uv pip install --python .venv/bin/python \
-            wheel packaging "setuptools<80.0.0,>=77.0.0"
           uv sync --locked --only-group linting
 
       - name: Get PR info
