@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
@@ -92,6 +93,8 @@ try:
             if isinstance(stop, str):
                 stop = [stop]
 
+            ignore_eos = bool(req.get("ignore_eos", False))
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -101,6 +104,7 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
+                termination_id=-1 if ignore_eos else None,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -160,12 +164,25 @@ try:
 
         # --- 5. Format Response (matching old_completions.py) ---
         choices = []
+        total_completion_tokens = 0
+        prompt_tokens_counts = []
 
         request_idx = 0
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
+
+            generated_tokens = result.get("generated_tokens") or []
+            prompt_tokens_list = result.get("prompt_tokens") or []
+            total_completion_tokens += len(generated_tokens)
+            prompt_tokens_counts.append(len(prompt_tokens_list))
+
+            finish_reason = "length"
+            sampling_params_result = result.get("sampling_params") or {}
+            num_tokens_requested = sampling_params_result.get("num_tokens_to_generate")
+            if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
+                finish_reason = "stop"
 
             logprobs_data = None
             if sampling_params.return_log_probs:
@@ -230,7 +247,12 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
+            choices.append({
+                "index": request_idx,
+                "text": text_output,
+                "logprobs": logprobs_data,
+                "finish_reason": finish_reason,
+            })
             if result["routing_indices"] is not None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
@@ -243,7 +265,19 @@ try:
 
             request_idx += 1
 
-        return jsonify({"choices": choices})
+        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        return jsonify({
+            "id": str(uuid.uuid4()),
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": prompt_token_count,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": prompt_token_count + total_completion_tokens,
+            },
+        })
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")
