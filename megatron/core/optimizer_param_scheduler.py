@@ -293,7 +293,7 @@ class OptimizerParamScheduler:
         # This is important for logging under model parallelism that may leave
         # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
-            if isinstance(param_group['lr'], torch.Tensor):
+            if isinstance(param_group.get('lr'), torch.Tensor):
                 param_group['lr'].fill_(self.get_lr(param_group))
             else:
                 param_group['lr'] = self.get_lr(param_group)
