@@ -1468,7 +1468,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
-            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
+            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer and (
+                # NOTE(@cspades): Follow the same __post_init__ as in OptimizerConfig:
+                #   OptimizerConfig.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                # Megatron-FSDP only needs to be consistent with FusedAdam(use_decoupled_grad=?),
+                # and because the OR logic of use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                # isn't particularly restrictive, Megatron-FSDP uses decoupled gradients under
+                # the same conditions that the distributed optimizer uses decoupled gradients.
+                args.main_params_dtype != torch.float32
+                or (args.fp8_recipe is None or args.fp8_recipe == "delayed")
+                or args.optimizer_cpu_offload
+            )
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
