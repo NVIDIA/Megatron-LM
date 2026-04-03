@@ -565,6 +565,28 @@ class DynamicInferenceEngine(AbstractEngine):
         # Build real CUDA graphs.
         self.create_cuda_graphs()
 
+        logging.info(
+            "\n"
+            "========== Autotune Complete ==========\n"
+            "  max_requests:    %d\n"
+            "  max_tokens:      %d\n"
+            "  buffer_size_gb:  %.2f\n"
+            "\n"
+            "To reproduce without autotune, replace\n"
+            "  --inference-dynamic-batching-autotune\n"
+            "with:\n"
+            "  --inference-dynamic-batching-max-requests %d \\\n"
+            "  --inference-dynamic-batching-max-tokens %d \\\n"
+            "  --inference-dynamic-batching-buffer-size-gb %.2f\n"
+            "=======================================",
+            new_max_requests,
+            new_max_tokens,
+            new_buffer_size_gb,
+            new_max_requests,
+            new_max_tokens,
+            new_buffer_size_gb,
+        )
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
