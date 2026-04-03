@@ -153,3 +153,8 @@ MODEL_ARGS:
   --timing-log-option: minmax
   --check-weight-hash-across-dp-replicas-interval: 20000
   --tensorboard-dir: ${TENSORBOARD_PATH}
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
