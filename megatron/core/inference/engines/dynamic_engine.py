@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -22,6 +23,7 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
@@ -45,7 +47,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
-    prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -366,32 +367,6 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-            # Pre-compile FlashInfer CUTLASS kernels before the warmup loop.
-            # JIT compilation can take several minutes on first run; doing it here
-            # prevents the warmup progress bar from appearing stuck at 0%.
-            # Only rank 0 compiles to avoid filelock contention across ranks;
-            # other ranks wait for the result via broadcast.
-            error_msg = None
-            if torch.distributed.get_rank() == 0:
-                try:
-                    prewarm_flashinfer_jit()
-                except Exception as e:
-                    error_msg = str(e)
-
-            # Broadcast success/failure to all ranks so they can fail together
-            # instead of hanging at a barrier.
-            result = torch.tensor(
-                [0 if error_msg is None else 1],
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-            torch.distributed.broadcast(result, src=0)
-            if result.item() == 1:
-                raise RuntimeError(
-                    f"FlashInfer CUTLASS kernel pre-compilation failed on rank 0"
-                    + (f": {error_msg}" if error_msg else "")
-                )
-
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -453,6 +428,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -490,6 +466,9 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to `socket.gethostname()`. Should be set to a routable
+                address in multi-node settings where gethostname() may return 127.0.0.1.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -522,7 +501,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
@@ -532,18 +511,21 @@ class DynamicInferenceEngine(AbstractEngine):
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
-                args=(
-                    dp_process_pipe,
-                    coordinator_ready_event,
-                    get_pg_size(self.pg_collection.dp),
-                    self.controller.tokenizer,
-                    inference_coordinator_port,
-                    deterministic_mode,
-                    self.context.block_size_tokens,
-                    self.context.enable_prefix_caching,
-                    self.context.prefix_caching_coordinator_policy,
-                    coordinator_schedule_output_path,
-                ),
+                kwargs={
+                    "pipe_connection": dp_process_pipe,
+                    "ready_event": coordinator_ready_event,
+                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "tokenizer": self.controller.tokenizer,
+                    "max_requests": self.context.max_requests,
+                    "inference_coordinator_port": inference_coordinator_port,
+                    "deterministic_mode": deterministic_mode,
+                    "block_size_tokens": self.context.block_size_tokens,
+                    "enable_prefix_caching": self.context.enable_prefix_caching,
+                    "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
+                    "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "schedule_output_path": coordinator_schedule_output_path,
+                    "hostname": hostname,
+                },
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
@@ -628,13 +610,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep
+                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=None, hostname=hostname
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
@@ -958,6 +942,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
+
+        # Check that the KV cache has enough blocks for this request's max sequence length.
+        max_request_tokens = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
+        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        if request_block_count > total_blocks:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(BlockOverflowError(request_id))
 
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:

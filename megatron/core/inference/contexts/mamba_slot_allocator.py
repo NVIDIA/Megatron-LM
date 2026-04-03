@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict
 
 import torch
 from torch import Tensor
@@ -9,6 +9,11 @@ from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
+
+# Maximum intermediate state extraction offsets per request. The 3 candidates
+# are: KV divergence boundary, last block-aligned boundary, and penultimate
+# block boundary (see compute_and_store_offsets for details).
+MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
 
 
 class MambaSlotAllocator:
@@ -66,46 +71,114 @@ class MambaSlotAllocator:
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
 
-        # Per-request intermediate state storage
-        self._intermediate_offsets: list = [None] * context.max_requests
-        self._intermediate_block_ids: list = [None] * context.max_requests
-        self._eos_cache_block_id: list = [None] * context.max_requests
-        self._intermediate_buffer: dict = {}
+        # Per-request intermediate state storage (GPU tensors, fixed-size per request)
+        # 0 = no offset, -1 = no block
+        k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        self._intermediate_offsets_gpu = torch.zeros(
+            (context.max_requests, k), dtype=torch.int32, device=device
+        )
+        self._intermediate_block_ids_gpu = torch.full(
+            (context.max_requests, k), -1, dtype=torch.int32, device=device
+        )
+        self._intermediate_counts_gpu = torch.zeros(
+            context.max_requests, dtype=torch.int32, device=device
+        )
+        self._eos_cache_block_id_gpu = torch.full(
+            (context.max_requests,), -1, dtype=torch.int32, device=device
+        )
+        # CPU flag to skip GPU sync when no intermediates exist
+        self._has_intermediates = False
+
+        # Pre-allocated output buffers for CUDA graph compatible extraction
+        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        self.intermediate_ssm_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
+            dtype=ssm_states_dtype,
+            device=device,
+        )
+        self.intermediate_conv_out = torch.zeros(
+            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
+            dtype=conv_states_dtype,
+            device=device,
+        )
 
     # =========================================================================
-    # Slot management
+    # Slot allocation
     # =========================================================================
 
-    def allocate_slot(self, block_id: int) -> int:
-        """Get a free Mamba cache slot for a block, evicting if necessary.
+    def allocate_slots_batch(self, block_ids: list) -> list:
+        """Get free Mamba cache slots for multiple blocks, evicting if necessary.
+
+        Handles deduplication: if the same block_id appears multiple times,
+        only one slot is allocated and all occurrences get the same slot.
 
         Args:
-            block_id: The KV block ID to associate with this slot.
+            block_ids: List of KV block IDs to associate with slots.
 
         Returns:
-            The allocated slot index.
+            List of allocated slot indices (same length as block_ids).
         """
-        # Check if block already has a slot
-        existing = self.block_to_slot[block_id].item()
-        if existing >= 0:
-            return existing
+        if not block_ids:
+            return []
 
-        # Try free pool
-        if self.free_count > 0:
-            self.free_count -= 1
-            slot = self.free_slots[self.free_count].item()
-        else:
-            slot = self._evict_lru_slot()
+        device = self.block_to_slot.device
+        bid_tensor = torch.tensor(block_ids, dtype=torch.int64, device=device)
 
-        self.block_to_slot[block_id] = slot
-        self.slot_to_block[slot] = block_id
-        return slot
+        # Phase 1: Batch lookup existing slots (1 GPU sync)
+        existing_slots = self.block_to_slot[bid_tensor].tolist()
 
-    def _evict_lru_slot(self) -> int:
-        """Evict the least recently used Mamba cache slot.
+        # Phase 2: Identify new blocks needing allocation (deduplicated)
+        # seen_new maps block_id -> index in new_bids list
+        seen_new = {}
+        new_bids = []
+        for i, (bid, slot) in enumerate(zip(block_ids, existing_slots)):
+            if slot < 0 and bid not in seen_new:
+                seen_new[bid] = len(new_bids)
+                new_bids.append(bid)
+
+        num_new = len(new_bids)
+        if num_new == 0:
+            return existing_slots
+
+        # Phase 3: Get slots from free pool, evicting if necessary
+        from_free = min(num_new, self.free_count)
+        new_slots = []
+        if from_free > 0:
+            start = self.free_count - from_free
+            new_slots = self.free_slots[start : self.free_count].tolist()  # 1 GPU sync
+            self.free_count = start
+
+        need_evict = num_new - from_free
+        if need_evict > 0:
+            new_slots.extend(self._evict_lru_slots_batch(need_evict))
+
+        # Phase 4: Batch GPU writes for new mappings
+        new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
+        new_slot_tensor = torch.tensor(new_slots, dtype=torch.int64, device=device)
+        self.block_to_slot[new_bid_tensor] = new_slot_tensor.to(torch.int32)
+        self.slot_to_block[new_slot_tensor] = new_bid_tensor.to(torch.int32)
+
+        # Phase 5: Build result mapping
+        # Map new block_ids to their allocated slots
+        alloc_bid_to_slot = {bid: slot for bid, slot in zip(new_bids, new_slots)}
+        result = []
+        for bid, existing in zip(block_ids, existing_slots):
+            if existing >= 0:
+                result.append(existing)
+            else:
+                result.append(alloc_bid_to_slot[bid])
+        return result
+
+    def _evict_lru_slots_batch(self, num_needed: int) -> list:
+        """Evict the least recently used Mamba cache slots.
+
+        Does NOT return slots to the free pool — caller takes ownership.
+
+        Args:
+            num_needed: Number of slots to evict.
 
         Returns:
-            The freed slot index.
+            List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
         # Find blocks that have mamba slots and ref_count == 0
@@ -114,26 +187,32 @@ class MambaSlotAllocator:
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
-        if candidate_ids.numel() == 0:
+        if candidate_ids.numel() < num_needed:
             raise RuntimeError("No evictable Mamba cache slots available")
 
-        # Pick block with oldest timestamp if LRU, otherwise just pick first
+        # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             timestamps = kv_alloc.block_timestamps[candidate_ids]
-            evict_idx = candidate_ids[torch.argmin(timestamps)].item()
+            sorted_indices = torch.argsort(timestamps)[:num_needed]
+            evict_ids = candidate_ids[sorted_indices]
         else:
-            evict_idx = candidate_ids[0].item()
+            evict_ids = candidate_ids[:num_needed]
 
-        slot = self.block_to_slot[evict_idx].item()
-        block_hash = kv_alloc.block_hashes[evict_idx].item()
+        # Batch gather slots + hashes (2 GPU syncs)
+        slots = self.block_to_slot[evict_ids].tolist()
+        hashes = kv_alloc.block_hashes[evict_ids].tolist()
 
-        # Clean up mappings
-        self.block_to_slot[evict_idx] = -1
-        self.slot_to_block[slot] = -1
-        if block_hash > 0 and block_hash in self.hash_to_block_id:
-            del self.hash_to_block_id[block_hash]
+        # Batch cleanup GPU mappings
+        self.block_to_slot[evict_ids] = -1
+        slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.block_to_slot.device)
+        self.slot_to_block[slot_tensor] = -1
 
-        return slot
+        # Clean up hash dict (CPU loop)
+        for h in hashes:
+            if h > 0 and h in self.hash_to_block_id:
+                del self.hash_to_block_id[h]
+
+        return slots
 
     def get_slot(self, block_id: int) -> int:
         """Return the cache slot for a block, or -1 if none.
@@ -150,10 +229,12 @@ class MambaSlotAllocator:
         """Check if a block has cached Mamba state."""
         return self.block_to_slot[block_id].item() >= 0
 
+    # =========================================================================
+    # Slot invalidation and deregistration
+    # =========================================================================
+
     def invalidate_block(self, block_id: int) -> None:
         """Free cache slot and clear mappings for a block.
-
-        Called when KV blocks are evicted/deregistered.
 
         Args:
             block_id: The KV block ID.
@@ -166,6 +247,47 @@ class MambaSlotAllocator:
         # Return slot to free pool
         self.free_slots[self.free_count] = slot
         self.free_count += 1
+
+    def _invalidate_blocks_batch(self, block_ids_list: list) -> None:
+        """Free cache slots and clear mappings for multiple blocks at once.
+
+        Vectorized version of invalidate_block that avoids per-block .item()
+        GPU syncs. Used by on_kv_blocks_deregistered for bulk eviction.
+
+        Args:
+            block_ids_list: List of block IDs to invalidate.
+        """
+        if not block_ids_list:
+            return
+        bid_t = torch.tensor(block_ids_list, dtype=torch.int64, device=self.block_to_slot.device)
+        slots = self.block_to_slot[bid_t].to(torch.int64)
+        valid_mask = slots >= 0
+        if not valid_mask.any():
+            return
+        valid_slots = slots[valid_mask]
+        valid_bids = bid_t[valid_mask]
+        self.block_to_slot[valid_bids] = -1
+        self.slot_to_block[valid_slots] = -1
+        n = valid_slots.numel()
+        self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
+        self.free_count += n
+
+    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
+        """Handle KV block deregistration by cleaning up Mamba state.
+
+        Called by KVBlockAllocator._deregister_blocks via callback.
+
+        Args:
+            block_ids_list: List of deregistered block IDs.
+            hashes_to_delete: Set of hashes being deregistered (excludes -1).
+        """
+        if self.hash_to_block_id:
+            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
+            if mamba_keys:
+                from collections import deque
+
+                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
+                self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
     # State store/restore
@@ -187,21 +309,24 @@ class MambaSlotAllocator:
         self.ssm_states[layer_idx, slot].copy_(ssm_state)
         self.conv_states[layer_idx, slot].copy_(conv_state)
 
-    def store_from_live(self, block_id: int, request_idx: int) -> None:
-        """Copy all layers from live per-request buffer to cache slot.
-
-        Used for block-aligned EOS case where the final kernel state
-        is in the live buffer.
+    def store_from_live_batch(self, slots: list, request_indices: list) -> None:
+        """Copy all layers from live per-request buffers to cache slots.
 
         Args:
-            block_id: The KV block ID.
-            request_idx: The context request index.
+            slots: List of cache slot indices.
+            request_indices: List of context request indices.
         """
-        slot = self.block_to_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no Mamba cache slot"
-        mamba_idx = self.context.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
-        self.conv_states[:, slot].copy_(self.context.mamba_conv_states[:, mamba_idx])
-        self.ssm_states[:, slot].copy_(self.context.mamba_ssm_states[:, mamba_idx])
+        if not slots:
+            return
+        device = self.conv_states.device
+        slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
+        req_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
+        # Batch lookup mamba state indices (1 GPU sync)
+        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[req_tensor].tolist()
+        mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
+        # Fancy-indexed copy (2 kernel launches instead of 2E)
+        self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
+        self.ssm_states[:, slot_tensor] = self.context.mamba_ssm_states[:, mamba_idx_tensor]
 
     def restore_to_live(self, request_idx: int, block_id: int) -> bool:
         """Copy all layers from cache slot to live request state.
@@ -225,39 +350,21 @@ class MambaSlotAllocator:
     # Hash registration
     # =========================================================================
 
-    def register_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block as having cached Mamba state.
+    def register_block_hashes_batch(self, block_ids: list, hashes: list) -> None:
+        """Register multiple blocks as having cached Mamba state.
+
+        Only registers entries where hash > 0.
 
         Args:
-            block_id: The block ID.
-            block_hash: The block's hash value.
+            block_ids: List of block IDs.
+            hashes: List of hash values (same length as block_ids).
         """
-        self.hash_to_block_id[block_hash] = block_id
+        updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
+        if updates:
+            self.hash_to_block_id.update(updates)
 
     # =========================================================================
-    # Deregistration callback
-    # =========================================================================
-
-    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
-        """Handle KV block deregistration by cleaning up Mamba state.
-
-        Called by KVBlockAllocator._deregister_blocks via callback.
-
-        Args:
-            block_ids_list: List of deregistered block IDs.
-            hashes_to_delete: Set of hashes being deregistered (excludes -1).
-        """
-        if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
-                from collections import deque
-
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                for bid in block_ids_list:
-                    self.invalidate_block(bid)
-
-    # =========================================================================
-    # Intermediate offset tracking
+    # Intermediate state tracking
     # =========================================================================
 
     def compute_and_store_offsets(
@@ -304,138 +411,186 @@ class MambaSlotAllocator:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)
+        count = len(offsets)
 
-        # Map each offset back to block index and block ID
-        block_ids_for_offsets = []
-        for offset in offsets:
-            abs_token = skip_tokens + offset
-            block_idx = abs_token // ctx.block_size_tokens - 1
-            bid = ctx.request_to_kv_block_ids[current_id][block_idx].item()
-            block_ids_for_offsets.append(bid)
+        # Vectorized block ID lookup: GPU gather avoids per-block .item() syncs
+        if count > 0:
+            device = self._intermediate_offsets_gpu.device
+            abs_tokens = torch.tensor(
+                [skip_tokens + o for o in offsets], dtype=torch.int64, device=device
+            )
+            block_indices = abs_tokens // ctx.block_size_tokens - 1
+            bids = ctx.request_to_kv_block_ids[current_id][block_indices]
 
-        self._intermediate_offsets[current_id] = offsets if offsets else None
-        self._intermediate_block_ids[current_id] = (
-            block_ids_for_offsets if block_ids_for_offsets else None
-        )
+            self._intermediate_offsets_gpu[current_id, :count] = torch.tensor(
+                offsets, dtype=torch.int32, device=device
+            )
+            self._intermediate_block_ids_gpu[current_id, :count] = bids.to(torch.int32)
+            self._has_intermediates = True
+        self._intermediate_counts_gpu[current_id] = count
 
         # Block-aligned EOS: prompt_len is exactly block-aligned
         if last_aligned_abs == prompt_len and prompt_len > 0:
             last_block_idx = prompt_len // ctx.block_size_tokens - 1
             if last_block_idx >= 0:
-                eos_bid = ctx.request_to_kv_block_ids[current_id][last_block_idx].item()
-                self._eos_cache_block_id[current_id] = eos_bid
+                self._eos_cache_block_id_gpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                    last_block_idx
+                ]
+                self._has_intermediates = True
             else:
-                self._eos_cache_block_id[current_id] = None
+                self._eos_cache_block_id_gpu[current_id] = -1
         else:
-            self._eos_cache_block_id[current_id] = None
+            self._eos_cache_block_id_gpu[current_id] = -1
 
-    def get_intermediate_offsets(self) -> Optional[List[List[int]]]:
-        """Get intermediate token offsets for all prefill requests in the current batch.
+    def get_intermediate_gpu_data(self):
+        """Get intermediate offsets and counts as GPU tensor slices for current prefill batch.
 
         Returns:
-            List of offset lists (one per prefill request), or None if no
-            request has intermediate offsets.
+            Tuple of (offsets_gpu, counts_gpu) where:
+                offsets_gpu: [prefill_count, 3] int32 GPU tensor
+                counts_gpu: [prefill_count] int32 GPU tensor
+            Returns (None, None) if no prefill requests or no intermediates.
         """
+        if not self._has_intermediates:
+            return None, None
+
         ctx = self.context
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count == 0:
-            return None
+            return None, None
 
-        # Prefill requests are the last `prefill_count` active requests
         active_start = ctx.paused_request_count
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
 
-        result = []
-        has_any = False
-        for i in range(prefill_start, prefill_start + prefill_count):
-            offsets = self._intermediate_offsets[i]
-            if offsets is not None:
-                has_any = True
-                result.append(offsets)
-            else:
-                result.append([])
+        offsets = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
+        counts = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
+        return offsets, counts
 
-        return result if has_any else None
-
-    def buffer_intermediate_states(
-        self, mamba_layer_idx: int, intermediate_states_per_request: list
-    ) -> None:
-        """Buffer intermediate states from a single Mamba layer's forward pass.
-
-        Args:
-            mamba_layer_idx: The Mamba layer index.
-            intermediate_states_per_request: Per-request list of
-                (ssm_states, conv_states) tuples or None.
-        """
-        self._intermediate_buffer[mamba_layer_idx] = intermediate_states_per_request
+    # =========================================================================
+    # Intermediate state commit
+    # =========================================================================
 
     def commit_intermediate_states(self) -> None:
-        """Commit buffered intermediate states to the Mamba cache.
+        """Commit intermediate states from pre-allocated output buffers to cache.
 
-        Called after the forward pass completes. For each prefill request:
-        - Intermediate states at kv_divergence/last_aligned: allocate cache slot,
-          write state, register hash in hash_to_block_id.
-        - Block-aligned EOS: copy final state from live buffer to cache slot.
+        Called after the forward pass (including CUDA graph replay) completes.
+        Batched pipeline: collect data, allocate slots, copy states, register hashes.
         """
-        ctx = self.context
-        prefill_count = ctx.batch_dimensions.prefill_req_count
-        if prefill_count == 0:
-            self._clear_intermediate_state()
+        collected = self._collect_commit_data()
+        if collected is None:
             return
+        intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        active_start = ctx.paused_request_count
-        decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
-        has_buffer = bool(self._intermediate_buffer)
+        # Allocate all slots in one batch (intermediates + EOS)
+        all_bids = intermediate_bids + eos_bids
+        all_slots = self.allocate_slots_batch(all_bids)
 
-        for req_batch_idx in range(prefill_count):
-            ctx_idx = prefill_start + req_batch_idx
-            offsets = self._intermediate_offsets[ctx_idx]
-            block_ids = self._intermediate_block_ids[ctx_idx]
+        # Copy intermediate states from output buffers to cache
+        n_intermediate = len(intermediate_bids)
+        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
 
-            # Commit intermediate states from forward pass
-            if offsets is not None and block_ids is not None and has_buffer:
-                for offset_idx in range(len(offsets)):
-                    bid = block_ids[offset_idx]
-                    slot = self.allocate_slot(bid)
+        # Copy EOS states from live buffers to cache
+        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
 
-                    # Write states from each mamba layer
-                    for layer_idx, states_list in self._intermediate_buffer.items():
-                        if states_list[req_batch_idx] is not None:
-                            ssm_states, conv_states = states_list[req_batch_idx]
-                            self.ssm_states[layer_idx, slot].copy_(ssm_states[offset_idx])
-                            self.conv_states[layer_idx, slot].copy_(conv_states[offset_idx])
-
-                    # Register in mamba hash map
-                    block_hash = ctx.kv_block_allocator.block_hashes[bid].item()
-                    if block_hash > 0:
-                        self.register_block_hash(bid, block_hash)
-
-            # Handle block-aligned EOS: copy final state from live buffer
-            eos_bid = self._eos_cache_block_id[ctx_idx]
-            if eos_bid is not None:
-                slot = self.allocate_slot(eos_bid)
-                self.store_from_live(eos_bid, ctx_idx)
-                block_hash = ctx.kv_block_allocator.block_hashes[eos_bid].item()
-                if block_hash > 0:
-                    self.register_block_hash(eos_bid, block_hash)
+        # Register hashes for all committed blocks
+        self.register_block_hashes_batch(all_bids, all_hashes)
 
         self._clear_intermediate_state()
 
+    def _collect_commit_data(self):
+        """Extract commit data from GPU intermediate state tracking.
+
+        Returns:
+            Tuple of (intermediate_bids, src_offsets, eos_bids, eos_ctx_indices,
+            all_hashes) or None if nothing to commit. all_hashes covers
+            intermediate_bids + eos_bids in that order.
+        """
+        ctx = self.context
+        metadata = ctx.mamba_metadata
+        prefill_count = ctx.batch_dimensions.prefill_req_count
+        if prefill_count == 0:
+            self._clear_intermediate_state()
+            return None
+
+        active_start = ctx.paused_request_count
+        decode_count = ctx.batch_dimensions.decode_req_count
+        prefill_start = active_start + decode_count
+
+        # Batch-transfer block IDs and EOS block IDs from GPU (2 GPU syncs)
+        intermediate_count = metadata.intermediate_count
+        per_request_counts = metadata.per_request_intermediate_counts
+
+        all_block_ids_cpu = self._intermediate_block_ids_gpu[
+            prefill_start : prefill_start + prefill_count
+        ].tolist()
+        eos_bids_cpu = self._eos_cache_block_id_gpu[
+            prefill_start : prefill_start + prefill_count
+        ].tolist()
+
+        # Flatten intermediate block IDs and source offsets
+        intermediate_bids = []
+        src_offsets = []
+        if intermediate_count > 0:
+            ssm_offset = 0
+            for req_idx, count in enumerate(per_request_counts):
+                for j in range(count):
+                    intermediate_bids.append(all_block_ids_cpu[req_idx][j])
+                    src_offsets.append(ssm_offset + j)
+                ssm_offset += count
+
+        # Collect EOS block IDs and their context indices
+        eos_bids = []
+        eos_ctx_indices = []
+        for req_batch_idx in range(prefill_count):
+            eos_bid = eos_bids_cpu[req_batch_idx]
+            if eos_bid >= 0:
+                eos_bids.append(eos_bid)
+                eos_ctx_indices.append(prefill_start + req_batch_idx)
+
+        if not intermediate_bids and not eos_bids:
+            self._clear_intermediate_state()
+            return None
+
+        # Single batch hash fetch for all block IDs (1 GPU sync)
+        all_bids_for_hash = intermediate_bids + eos_bids
+        device = ctx.kv_block_allocator.block_hashes.device
+        bid_tensor = torch.tensor(all_bids_for_hash, dtype=torch.int64, device=device)
+        all_hashes = ctx.kv_block_allocator.block_hashes[bid_tensor].tolist()
+
+        return intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes
+
+    def _copy_intermediate_to_cache(self, src_offsets: list, slots: list) -> None:
+        """Copy intermediate states from output buffers to cache slots.
+
+        Uses fancy-indexed GPU D2D copy (2 kernel launches instead of 2N).
+
+        Args:
+            src_offsets: Source indices into intermediate_ssm_out/intermediate_conv_out.
+            slots: Destination cache slot indices.
+        """
+        if not src_offsets:
+            return
+        device = self.ssm_states.device
+        src_idx = torch.tensor(src_offsets, dtype=torch.int64, device=device)
+        dst_idx = torch.tensor(slots, dtype=torch.int64, device=device)
+        self.ssm_states[:, dst_idx] = self.intermediate_ssm_out[:, src_idx]
+        self.conv_states[:, dst_idx] = self.intermediate_conv_out[:, src_idx]
+
     def _clear_intermediate_state(self) -> None:
         """Clear all per-request intermediate state tracking."""
-        self._intermediate_buffer.clear()
         ctx = self.context
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count > 0:
             active_start = ctx.paused_request_count
             decode_count = ctx.batch_dimensions.decode_req_count
             prefill_start = active_start + decode_count
-            for i in range(prefill_start, prefill_start + prefill_count):
-                self._intermediate_offsets[i] = None
-                self._intermediate_block_ids[i] = None
-                self._eos_cache_block_id[i] = None
+            end = prefill_start + prefill_count
+            self._intermediate_counts_gpu[prefill_start:end].fill_(0)
+            self._intermediate_offsets_gpu[prefill_start:end].fill_(0)
+            self._intermediate_block_ids_gpu[prefill_start:end].fill_(-1)
+            self._eos_cache_block_id_gpu[prefill_start:end].fill_(-1)
+        self._has_intermediates = False
 
     # =========================================================================
     # Reset
@@ -450,8 +605,10 @@ class MambaSlotAllocator:
         )
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self._intermediate_buffer.clear()
-        for i in range(self.context.max_requests):
-            self._intermediate_offsets[i] = None
-            self._intermediate_block_ids[i] = None
-            self._eos_cache_block_id[i] = None
+        self.intermediate_ssm_out.zero_()
+        self.intermediate_conv_out.zero_()
+        self._intermediate_offsets_gpu.fill_(0)
+        self._intermediate_block_ids_gpu.fill_(-1)
+        self._intermediate_counts_gpu.fill_(0)
+        self._eos_cache_block_id_gpu.fill_(-1)
+        self._has_intermediates = False

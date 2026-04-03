@@ -192,6 +192,8 @@ class RerunStateMachine:
     ) -> None:
         self.mode: RerunMode = mode
         self.state: RerunState = RerunState.NOT_RUNNING_YET
+        # Note: current_iteration is 0-indexed internally; all messages to
+        # stdout / stderr and the tracker file add 1 to display 1-indexed iterations.
         self.current_iteration: int = -1
         self.first_iteration_complete = False
         # The flags below are per-rank flags that get all-reduced across all ranks
@@ -526,7 +528,7 @@ class RerunStateMachine:
                 device: int = torch.cuda.current_device()
                 full_message: str = (
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration {self.current_iteration}: "
+                    f"iteration {self.current_iteration + 1}: "
                     f"Unexpected result {result} (message='{message}')"
                 )
                 if fatal:
@@ -569,12 +571,12 @@ class RerunStateMachine:
             if fatal:
                 logger.error(
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration #{self.current_iteration}: {message}!"
+                    f"iteration #{self.current_iteration + 1}: {message}!"
                 )
             else:
                 logger.warning(
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration #{self.current_iteration}: {message}!"
+                    f"iteration #{self.current_iteration + 1}: {message}!"
                 )
 
         # Emit message in log so that we can identify which jobs have this instrumentation
@@ -604,7 +606,7 @@ class RerunStateMachine:
                 logger.error(
                     f"Unexpected result {result} "
                     f"on rank {safe_get_rank()} "
-                    f"at iteration #{self.current_iteration} "
+                    f"at iteration #{self.current_iteration + 1} "
                     f"invocation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
@@ -1012,7 +1014,7 @@ class RerunStateMachine:
                     f.write(
                         f"ts={datetime.datetime.now()} node={node} device={device} "
                         f"jobID={os.getenv('SLURM_JOBID', 'N/A')} rank={rank} "
-                        f"iteration={self.current_iteration} status={status} result={result} "
+                        f"iteration={self.current_iteration + 1} status={status} result={result} "
                         f"message='{message}'\n"
                     )
             except Exception as e:
