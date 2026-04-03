@@ -52,9 +52,9 @@ class TestRLAgentRewards:
             # Correct answer, stopped cleanly, nothing trailing.
             pytest.param(lambda c, w: c, "stop", 1.0, id="correct-stop-clean"),
             # Correct answer, hit token limit, nothing trailing.
-            pytest.param(lambda c, w: c, "length", 0.1, id="correct-length-clean"),
+            pytest.param(lambda c, w: c, "length", 0.05, id="correct-length-clean"),
             # Correct answer, stopped cleanly, but trailing text.
-            pytest.param(lambda c, w: c + " extra", "stop", 0.05, id="correct-stop-trailing"),
+            pytest.param(lambda c, w: c + " extra", "stop", 0.1, id="correct-stop-trailing"),
             # Wrong answer, correct format.
             pytest.param(lambda c, w: w, "stop", 0.05, id="wrong-answer"),
             # No answer tag at all.

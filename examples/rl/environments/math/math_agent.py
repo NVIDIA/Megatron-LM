@@ -60,6 +60,8 @@ class MathAgent(RewardOnlyAgent):
         """
         # Generation that stopped cleanly (EOD or stop word) rather than
         # hitting the token limit is eligible for full reward.
+
+        # NOTE: finish_reason=None is treated as "stopped" here for backwards compatibility.
         stopped = finish_reason != "length"
 
         answer_tag_pattern = r'<answer>(.*?)</answer>'
@@ -68,7 +70,7 @@ class MathAgent(RewardOnlyAgent):
             # Only consider the last occurrence
             last_match = answer_tag_match[-1]
             final_answer = last_match.group(1).strip()
-            after = response[last_match.end():].strip()
+            after = response[last_match.end():].lstrip()
 
             try:
                 parsed_answer = parse(final_answer)
@@ -81,7 +83,7 @@ class MathAgent(RewardOnlyAgent):
             if correct_answer:
                 if stopped and not after:
                     return 1.0
-                if not after:
+                if stopped:
                     return self.partial_end_reward
                 return self.format_reward
             else:
@@ -94,7 +96,7 @@ class MathAgent(RewardOnlyAgent):
             if boxed_match:
                 last_match = boxed_match[-1]
                 final_answer = last_match.group(1).strip()
-                after = response[last_match.end():].strip()
+                after = response[last_match.end():].lstrip()
                 try:
                     parsed_answer = parse(final_answer)
                 except ValueError as e:
@@ -106,7 +108,7 @@ class MathAgent(RewardOnlyAgent):
                 if correct_answer:
                     if stopped and not after:
                         return 1.0
-                    if not after:
+                    if stopped:
                         return self.partial_end_reward
                     return self.format_reward
                 else:
