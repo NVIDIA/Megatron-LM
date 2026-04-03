@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -22,6 +23,7 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
@@ -940,6 +942,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
+
+        # Check that the KV cache has enough blocks for this request's max sequence length.
+        max_request_tokens = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
+        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        if request_block_count > total_blocks:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(BlockOverflowError(request_id))
 
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
