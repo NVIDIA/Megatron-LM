@@ -285,7 +285,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_config = inference_config.mamba_inference_state_config
         if mamba_config is not None:
             layer_type_list = mamba_config.layer_type_list or []
-            from megatron.core.transformer.enums import Symbols
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
             num_mamba_layers = sum(
                 1 for lt in layer_type_list if lt == Symbols.MAMBA
             )
