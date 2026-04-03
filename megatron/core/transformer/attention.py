@@ -1290,21 +1290,21 @@ class SelfAttention(Attention):
         )
 
         # Resolve which norm class to use for Q and K.
-        # Spec-driven: q/k_layernorm explicitly set in the spec (GPTModel).
-        # Config-driven: config.qk_layernorm / qk_l2_norm selects the norm
-        # class automatically (MambaModel / HybridModel).
-        if self.config.qk_layernorm:
-            if TENorm is not None:
-                default_norm_cls = TENorm
-            else:
-                raise RuntimeError("Transformer Engine is not installed. It is required for qk_layernorm.")
+        # Config selects the default norm class; spec overrides if set.
+        default_norm_cls = None
+        if self.config.qk_layernorm and TENorm is not None:
+            default_norm_cls = TENorm
         elif self.config.qk_l2_norm:
             default_norm_cls = L2Norm
-        else:
-            default_norm_cls = None
 
         q_norm_cls = submodules.q_layernorm or default_norm_cls
         k_norm_cls = submodules.k_layernorm or default_norm_cls
+
+        if self.config.qk_layernorm and (q_norm_cls is None or k_norm_cls is None):
+            raise RuntimeError(
+                "qk_layernorm requires Transformer Engine (for TENorm) or "
+                "q_layernorm/k_layernorm set in the spec."
+            )
 
         self.q_layernorm = (
             q_norm_cls(
