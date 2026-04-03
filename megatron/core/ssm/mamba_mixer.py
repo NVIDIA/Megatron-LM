@@ -443,6 +443,11 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        # Dynamic CP group support
+        _orig_cp_group = self.cp.cp_group
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            self.cp.set_context_parallel_group(packed_seq_params.cp_group)
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -460,6 +465,7 @@ class MambaMixer(MegatronModule):
 
         out, out_bias = self.out_proj(y)
 
+        self.cp.set_context_parallel_group(_orig_cp_group)
         return out, out_bias
 
     def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):

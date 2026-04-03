@@ -1194,15 +1194,41 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.dynamic_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Dynamic context parallelism not supported with pipeline parallelism'
         assert not args.enable_cuda_graph, 'Dynamic context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
+        if args.sequence_packing_scheduler is None:
+            args.sequence_packing_scheduler = 'default_dynamic_cp'
+        if args.sequence_packing_scheduler != 'default_dynamic_cp':
+            raise ValueError(
+                'Dynamic context parallelism requires '
+                'sequence_packing_scheduler=default_dynamic_cp'
+            )
+
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        assert args.min_dynamic_context_parallel_size <= dp_cp_size, (
+            f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
+            f'must be <= dp_size * cp_size ({dp_cp_size})'
+        )
+
+        import warnings
+        warnings.warn(
+            f"Dynamic CP enabled: dp_size * context_parallel_size="
+            f"{args.data_parallel_size * args.context_parallel_size} "
+            f"will be used as the maximum dynamic CP group size. "
+            f"Dynamic CP groups will range from "
+            f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
+            f"to {args.data_parallel_size * args.context_parallel_size}."
+        )
 
     if args.sequence_packing_scheduler is not None:
-        assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
-            f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) ' \
             f'must be >= single sequence max length ({args.seq_length})'
 
     # disable async_tensor_model_parallel_allreduce when
