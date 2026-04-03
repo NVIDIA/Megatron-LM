@@ -207,7 +207,8 @@ class OptimizerConfig:
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'
-    """Optimizer name. NOTE: Deprecated, use individual optimizer classes instead."""
+    """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
+    via config_overrides to use different optimizers for different parameters."""
 
     ###############
     # Loss scaling
@@ -230,7 +231,7 @@ class OptimizerConfig:
     """Hysteresis for dynamic loss scaling."""
 
     ###################################################################################
-    # Optimizer (NOTE: Deprecated, use individual optimizer classes instead.).
+    # Optimizer-specific parameters.
     ###################################################################################
     # Adam.
     adam_beta1: float = 0.9
@@ -255,15 +256,14 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon.
-    # TODO: move muon configs to it's own `MuonConfig`.
+    # emerging optimizers.
     muon_momentum: float = 0.95
-    """The momentum used by the internal SGD."""
+    """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
-    muon_use_nesterov: bool = False
+    muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
@@ -271,6 +271,10 @@ class OptimizerConfig:
 
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
 
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
@@ -281,11 +285,38 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
+    One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    # Lion.
+    lion_beta1: float = 0.95
+    """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
+
+    lion_beta2: float = 0.98
+    """Second beta coefficient for Lion optimizer (used in momentum EMA update).
+    Defaults to 0.98."""
+
+    soap_shampoo_beta: float = 0.95
+    """The beta parameter for the Shampoo preconditioner."""
+
+    soap_precondition_frequency: int = 1
+    """The frequency of the Shampoo preconditioner."""
+
+    soap_use_kl_shampoo: bool = True
+    """Whether to use the KL-Shampoo preconditioner."""
+
     #######################
     # Distributed optimizer
     #######################
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
+
+    use_layer_wise_distributed_optimizer: bool = False
+    """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
+    When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
+    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
+    that the standard distributed-optimizer path is not triggered."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -426,33 +457,6 @@ class OptimizerConfig:
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
 
 
-@dataclass
-class AdamOptimizerConfig(OptimizerConfig):
-    """Adam optimizer configuration object."""
-
-    optimizer: str = 'adam'
-    """Optimizer name."""
-
-    adam_beta1: float = 0.9
-    """First coefficient for computing running averages of gradient and its square in Adam
-    optimizer.
-    """
-
-    adam_beta2: float = 0.999
-    """Second coefficient for computing running averages of gradient and its square in Adam
-    optimizer.
-    """
-
-    adam_eps: float = 1e-08
-    """Term added to the denominator to improve numerical stability in Adam optimizer."""
-
-
-@dataclass
-class SGDOptimizerConfig(OptimizerConfig):
-    """SGD optimizer configuration object."""
-
-    optimizer: str = 'sgd'
-    """Optimizer name."""
-
-    sgd_momentum: float = 0.9
-    """Momentum factor for SGD optimizer."""
+# Backward-compatible aliases (deprecated; use OptimizerConfig directly).
+AdamOptimizerConfig = OptimizerConfig
+SGDOptimizerConfig = OptimizerConfig

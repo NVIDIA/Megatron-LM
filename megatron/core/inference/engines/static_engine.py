@@ -174,7 +174,9 @@ class StaticInferenceEngine(AbstractEngine):
 
         if inference_request is None:
             # Support legacy single-arg tokenize_prompt mocks in tests.
-            prompt_tokens = self.controller.tokenize_prompt(prompt, add_BOS)
+            prompt_tokens = self.controller.tokenize_prompt(
+                self.controller.tokenizer, prompt, add_BOS
+            )
         else:
             prompt_tokens = inference_request.prompt_tokens
 
