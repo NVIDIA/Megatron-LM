@@ -48,3 +48,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         print_rank_0(f" == params layer {l}: {layer_params}")
 
     return model
+
+
+# Backward-compatible alias
+mamba_builder = hybrid_builder

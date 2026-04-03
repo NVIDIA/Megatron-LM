@@ -361,3 +361,7 @@ def modelopt_gpt_hybrid_builder(
     
     print_distributed_quant_summary(model)
     return model
+
+
+# Backward-compatible alias
+modelopt_gpt_mamba_builder = modelopt_gpt_hybrid_builder
