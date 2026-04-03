@@ -4,14 +4,11 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.router import Router
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -53,16 +50,16 @@ class TestLatentMoELayer:
             moe_latent_size=moe_latent_size,
         )
         if use_te:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
                 num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
             )
         else:
-            transformer_layer_spec = get_gpt_layer_local_spec(
+            transformer_layer_submodules = get_gpt_layer_local_submodules(
                 num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
             )
-        moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
+        submodules = get_submodules(transformer_layer_submodules.mlp)
+        assert isinstance(submodules, MoESubmodules)
+        moe_layer = MoELayer(self.transformer_config, submodules)
         moe_layer.cuda()
         config = moe_layer.config
 

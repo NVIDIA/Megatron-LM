@@ -12,7 +12,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -42,15 +43,15 @@ class TestMoEModel(torch.nn.Module):
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
         super().__init__()
         self.layers = torch.nn.ModuleList(
-            [
-                MoELayer(transformer_config, submodules.mlp.submodules).cuda()
-                for _ in range(num_layers)
-            ]
+            [MoELayer(transformer_config, submodules).cuda() for _ in range(num_layers)]
         )
 
 

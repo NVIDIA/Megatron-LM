@@ -10,7 +10,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args
@@ -58,8 +59,11 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        submodules = get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(tf_config, submodules.mlp.submodules)
+        sequential_submodules = get_submodules(
+            get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(sequential_submodules, MoESubmodules)
+        self.sequential_mlp = MoELayer(tf_config, sequential_submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
@@ -71,12 +75,13 @@ class TestTEGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(
-            tf_config,
+        grouped_submodules = get_submodules(
             get_gpt_layer_with_transformer_engine_submodules(
                 self.num_experts, moe_grouped_gemm=True
-            ).mlp.submodules,
+            ).mlp
         )
+        assert isinstance(grouped_submodules, MoESubmodules)
+        self.grouped_mlp = MoELayer(tf_config, grouped_submodules)
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
         self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
 
