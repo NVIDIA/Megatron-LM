@@ -144,8 +144,8 @@ def compute_optimal_params(
     tp_size: int = 1,
     request_rounder: int = 4,
     avg_sequence_length: Optional[int] = None,
-) -> Tuple[int, int]:
-    """Solve for optimal (max_requests, max_tokens) from profiling data.
+) -> Tuple[int, int, float]:
+    """Solve for optimal (max_requests, max_tokens, buffer_size_gb) from profiling data.
 
     Args:
         profile: Profiling data from CUDA graph warmup.
@@ -155,7 +155,7 @@ def compute_optimal_params(
             estimate. If None, defaults to max_sequence_length // 2.
 
     Returns:
-        (max_requests, max_tokens) tuple.
+        (max_requests, max_tokens, buffer_size_gb) tuple.
     """
     # Build interpolation table from profiling data.
     activation_table = _build_activation_interpolator(
@@ -243,14 +243,19 @@ def compute_optimal_params(
     max_tokens = (max_tokens // tp_size) * tp_size
     max_tokens = max(max_tokens, max_requests)  # re-enforce after alignment
 
+    # Derive buffer_size_gb from the block count that fits.
+    buffer_size_bytes = best_block_count * profile.block_size_bytes
+    buffer_size_gb = buffer_size_bytes / (1024 ** 3)
+
     logging.info(
-        "Autotune result: max_requests=%d, max_tokens=%d, block_count=%d, "
-        "case=%s (elbow=%d)",
+        "Autotune result: max_requests=%d, max_tokens=%d, buffer_size_gb=%.2f "
+        "(%d blocks), case=%s (elbow=%d)",
         max_requests,
         max_tokens,
+        buffer_size_gb,
         best_block_count,
         "saturated" if max_requests >= elbow else "undersaturated",
         elbow,
     )
 
-    return max_requests, max_tokens
+    return max_requests, max_tokens, buffer_size_gb

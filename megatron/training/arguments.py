@@ -1461,6 +1461,23 @@ def validate_args(args, defaults={}):
             "--inference-dynamic-batching-autotune requires CUDA graphs to be enabled"
         assert args.enable_chunked_prefill, \
             "--inference-dynamic-batching-autotune requires --enable-chunked-prefill"
+        overridden_args = {
+            'inference_dynamic_batching_max_requests': '--inference-dynamic-batching-max-requests',
+            'inference_dynamic_batching_max_tokens': '--inference-dynamic-batching-max-tokens',
+            'inference_dynamic_batching_mamba_memory_ratio': '--inference-dynamic-batching-mamba-memory-ratio',
+        }
+        for attr, flag in overridden_args.items():
+            if getattr(args, attr, None) is not None:
+                logging.warning(
+                    "%s is set but will be overridden by --inference-dynamic-batching-autotune",
+                    flag,
+                )
+        if args.inference_dynamic_batching_buffer_size_gb != 40.:
+            logging.warning(
+                "--inference-dynamic-batching-buffer-size-gb is set but will be overridden "
+                "by --inference-dynamic-batching-autotune (buffer size is auto-determined "
+                "from available GPU memory)"
+            )
 
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \

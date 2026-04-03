@@ -495,7 +495,7 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = self.controller.inference_wrapped_model.model.config
         tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
 
-        new_max_requests, new_max_tokens = compute_optimal_params(
+        new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
             profile, tp_size=tp_size, request_rounder=self.context.REQUEST_ROUNDER,
         )
 
@@ -505,16 +505,19 @@ class DynamicInferenceEngine(AbstractEngine):
             old_config,
             max_requests=new_max_requests,
             max_tokens=new_max_tokens,
+            buffer_size_gb=new_buffer_size_gb,
             autotune=False,  # don't profile again on second pass
         )
 
         logging.info(
-            "Autotune: Pass 2 — rebuilding context with max_requests=%d, max_tokens=%d "
-            "(was max_requests=%s, max_tokens=%s)",
+            "Autotune: Pass 2 — rebuilding context with max_requests=%d, max_tokens=%d, "
+            "buffer_size_gb=%.2f (was max_requests=%s, max_tokens=%s, buffer_size_gb=%s)",
             new_max_requests,
             new_max_tokens,
+            new_buffer_size_gb,
             old_config.max_requests,
             old_config.max_tokens,
+            old_config.buffer_size_gb,
         )
 
         # Deallocate old context state.
