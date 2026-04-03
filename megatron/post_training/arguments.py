@@ -11,7 +11,8 @@ def add_modelopt_args(parser):
         type=str,
         default="GPTModel",
         choices=["GPTModel", "HybridModel", "MambaModel"],
-        help="Model type to use in model_provider.",
+        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
+        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--export-legacy-megatron",

@@ -260,6 +260,15 @@ def modelopt_gpt_hybrid_builder(
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+        if args.export_model_type == "MambaModel":
+            import warnings
+
+            warnings.warn(
+                '--export-model-type "MambaModel" is deprecated. '
+                'Use --export-model-type "HybridModel" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
         from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
