@@ -33,6 +33,8 @@ jobs:
     needs: [pre-flight]
     if: needs.pre-flight.outputs.is_deployment_workflow != 'true'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.80.2
+    with:
+      requirements-file: docs/requirements-ci.txt
 
   build-docs-summary:
     needs: [pre-flight, build-docs]
