@@ -852,8 +852,8 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_epoch: List[List[int]],
-        kv_cache_epoch: List[List[int]],
+        policy_epoch: List[List[List[int]]],
+        kv_cache_epoch: List[List[List[int]]],
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
@@ -929,6 +929,7 @@ def prep_wandb_metrics(
                     rollout_kv_last_token_staleness,
                 )),
             ),
+            # NOTE: This table can get very large (one row per token across all rollouts).
             'per_token_table': wandb_writer.Table(
                 columns=['policy_staleness', 'kv_staleness'],
                 data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
@@ -963,15 +964,15 @@ def prep_wandb_metrics(
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
+            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
+                'staleness', 'Per-Token Policy Staleness'
+            ),
+            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
+                'staleness', 'Per-Token KV Cache Staleness'
+            ),
     }
-    metrics['per_token_policy_staleness_hist'] = wandb_writer.plot.histogram(
-        wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
-        'staleness', 'Per-Token Policy Staleness'
-    )
-    metrics['per_token_kv_staleness_hist'] = wandb_writer.plot.histogram(
-        wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
-        'staleness', 'Per-Token KV Cache Staleness'
-    )
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -1548,14 +1549,6 @@ def prepare_data_for_update(
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
-
-        with nvtx_range("rl/log-wandb-tb", time=True):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
