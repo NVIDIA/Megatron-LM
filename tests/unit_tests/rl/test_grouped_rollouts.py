@@ -84,9 +84,9 @@ class TestGroupedRollouts:
             batch_ids = [g.batch_id for g in groups]
             num_slow_batches = num_slow_calls // num_groups
             slow_batches = set(range(num_slow_batches))
-            assert batch_ids[0] not in slow_batches, (
-                f"Expected first group from a fast batch, got batch_id={batch_ids[0]}"
-            )
+            assert (
+                batch_ids[0] not in slow_batches
+            ), f"Expected first group from a fast batch, got batch_id={batch_ids[0]}"
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):
