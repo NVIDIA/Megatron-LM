@@ -1531,7 +1531,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
-        condition_embeddings = kwargs.pop("condition_embeddings", None)
+        conditions_embeddings = kwargs.pop("conditions_embeddings", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
