@@ -47,8 +47,8 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
-from megatron.core.utils import is_te_min_version
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
