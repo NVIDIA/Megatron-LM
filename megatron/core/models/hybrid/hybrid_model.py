@@ -480,9 +480,7 @@ class MambaModel(HybridModel):
 
     def __init__(self, *args, mamba_stack_spec: ModuleSpec = None, **kwargs):
         log_single_rank(
-            logger,
-            logging.WARNING,
-            "MambaModel has been deprecated. Use HybridModel instead.",
+            logger, logging.WARNING, "MambaModel has been deprecated. Use HybridModel instead."
         )
         if mamba_stack_spec is not None:
             if 'hybrid_stack_spec' in kwargs or (args and len(args) >= 2):

@@ -579,7 +579,9 @@ class TestSelectPipelineSegmentLegacyFallback:
             patch('torch.distributed.get_rank', return_value=0),
             patch('torch.distributed.get_world_size', return_value=2),
             patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage'),
-            patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_single_rank') as mock_warn,
+            patch(
+                'megatron.core.models.hybrid.hybrid_layer_allocation.log_single_rank'
+            ) as mock_warn,
         ):
             select_pipeline_segment("M*M*", pp_group=mock_group, vp_stage=None)
             mock_warn.assert_called_once()
