@@ -230,7 +230,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         self.autotune = inference_config.autotune
-        self.autotune_profile = None
         # Initialize engine.
         self.reset()
 
@@ -264,11 +263,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Create cuda graphs (with optional auto-tuning).
+        # Auto-tune parameters before building CUDA graphs.
         if self.autotune:
             self._autotune_and_rebuild()
-        else:
-            self.create_cuda_graphs()
+
+        # Create cuda graphs.
+        self.create_cuda_graphs()
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -372,28 +372,6 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        profiling = self.autotune
-        if profiling:
-            from megatron.core.inference.autotune import AutotuneProfile
-            from megatron.core.inference.contexts.dynamic_context import (
-                DynamicInferenceContext,
-            )
-
-            mem_params = DynamicInferenceContext.compute_context_memory_params(
-                controller.inference_wrapped_model.model.config, context.config
-            )
-            profile = AutotuneProfile(
-                block_size_bytes=mem_params['block_size_bytes'],
-                mamba_memory_per_request=mem_params['mamba_memory_per_request'],
-                max_kv_block_count=mem_params['max_kv_block_count'],
-                per_request_bytes=mem_params['per_request_bytes'],
-                per_token_bytes=mem_params['per_token_bytes'],
-                gpu_total_bytes=torch.cuda.get_device_properties(
-                    torch.cuda.current_device()
-                ).total_memory,
-                memory_after_model_load_bytes=torch.cuda.memory_allocated(),
-            )
-
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -416,29 +394,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Per-iteration profiling for autotune.
-            if profiling:
-                torch.cuda.reset_peak_memory_stats()
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-            if profiling:
-                end_event.record()
-                torch.cuda.synchronize()
-                peak_bytes = torch.cuda.max_memory_allocated()
-                elapsed_ms = start_event.elapsed_time(end_event)
-                profile.add_sample(
-                    cuda_graph_batch_dimension.token_count, peak_bytes, elapsed_ms
-                )
-
             context.reset()
-
-        if profiling:
-            self.autotune_profile = profile
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
@@ -469,84 +428,120 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     def _autotune_and_rebuild(self):
-        """Three-step initialization: safe profiling context, profile, rebuild.
+        """Profile activation memory and compute throughput, then rebuild the
+        context with optimal parameters before CUDA graphs are created.
 
-        Step 1: Deallocate the initial context (which may have an unsafe
-        buffer_size_gb) and rebuild with a conservative buffer that fits in
-        available GPU memory.
-
-        Step 2: Run create_cuda_graphs() with profiling to collect activation
-        memory and compute throughput per batch dimension.
-
-        Step 3: Compute optimal (max_requests, max_tokens, buffer_size_gb),
-        rebuild the context and CUDA graphs with tuned parameters.
+        Runs standalone forward passes at various token counts (outside the
+        CUDA graph path) to build activation memory and throughput curves.
+        Then computes optimal (max_requests, max_tokens, buffer_size_gb) and
+        replaces the context so that the subsequent create_cuda_graphs() call
+        uses the tuned parameters directly.
         """
         from dataclasses import replace
 
-        from megatron.core.inference.autotune import compute_optimal_params
+        from megatron.core.inference.autotune import AutotuneProfile, compute_optimal_params
+        from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
         model_config = self.controller.inference_wrapped_model.model.config
         old_config = self.context.config
+        controller = self.controller
+        context = self.context
 
-        # Step 1: Rebuild context with a safe buffer for profiling.
-        # The initial context may have buffer_size_gb larger than available
-        # GPU memory (e.g., default 40GB on a 24GB GPU). Deallocate it and
-        # create a small profiling context that won't OOM.
-        self.context.deallocate_inference_state_buffers()
-        torch.cuda.empty_cache()
+        # --- Collect memory accounting constants ---
+        mem_params = DynamicInferenceContext.compute_context_memory_params(
+            model_config, old_config
+        )
+        gpu_total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
+        mem_before_profiling = torch.cuda.memory_allocated()
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        # Use 50% of free memory for the profiling buffer. The rest is
-        # headroom for activations during CUDA graph warmup.
-        profiling_buffer_gb = (free_bytes * 0.5) / (1024 ** 3)
-        profiling_buffer_gb = max(profiling_buffer_gb, 0.1)  # floor at 100MB
+        profile = AutotuneProfile(
+            block_size_bytes=mem_params['block_size_bytes'],
+            mamba_memory_per_request=mem_params['mamba_memory_per_request'],
+            max_kv_block_count=mem_params['max_kv_block_count'],
+            per_request_bytes=mem_params['per_request_bytes'],
+            per_token_bytes=mem_params['per_token_bytes'],
+            gpu_total_bytes=gpu_total,
+            memory_after_model_load_bytes=mem_before_profiling,
+        )
+
+        # --- Generate token counts to profile ---
+        # Use a geometric-ish spread from small to large.
+        max_profile_tokens = context.max_tokens
+        token_counts = [1, 2, 4]
+        t = 8
+        while t <= max_profile_tokens:
+            token_counts.append(t)
+            t = max(t + 8, int(t * 1.5)) if t < 256 else t + max(16, t // 4)
+        if not token_counts or token_counts[-1] != max_profile_tokens:
+            token_counts.append(max_profile_tokens)
+        # Clamp to what the context can handle and deduplicate.
+        token_counts = sorted(set(
+            min(tc, max_profile_tokens) for tc in token_counts
+        ))
 
         logging.info(
-            "Autotune: Step 1 — creating profiling context with buffer_size_gb=%.2f "
-            "(%.1f GB free of %.1f GB total)",
-            profiling_buffer_gb,
-            free_bytes / (1024 ** 3),
-            total_bytes / (1024 ** 3),
+            "Autotune: profiling %d token counts (max=%d), "
+            "GPU total %.1f GB, after model load %.1f GB",
+            len(token_counts),
+            max_profile_tokens,
+            gpu_total / (1024 ** 3),
+            mem_before_profiling / (1024 ** 3),
         )
 
-        profiling_config = replace(
-            old_config,
-            buffer_size_gb=profiling_buffer_gb,
-            max_requests=None,  # auto-derive from buffer
-            max_tokens=None,  # use default
-        )
-        self.context = DynamicInferenceContext(model_config, profiling_config)
-        self.controller.inference_wrapped_model.inference_context = self.context
-        self.reset()
-
-        # Step 2: Profile during CUDA graph warmup.
-        logging.info("Autotune: Step 2 — profiling during CUDA graph warmup")
-        self.create_cuda_graphs()
-
-        profile = self.autotune_profile
-        if profile is None:
-            logging.warning(
-                "Autotune: no profiling data collected (CUDA graphs may be disabled). "
-                "Skipping auto-tuning."
+        # --- Run standalone forward passes ---
+        for tc in token_counts:
+            # Build a decode-only batch dimension for this token count.
+            decode_count = min(tc, context.max_requests)
+            batch_dim = InferenceBatchDimensions(
+                token_count=decode_count,
+                prefill_req_count=0,
+                decode_req_count=decode_count,
             )
-            return
 
+            try:
+                input_ids, position_ids = controller._dynamic_step_context_init(
+                    construct_graph_dimensions=batch_dim
+                )
+            except Exception:
+                context.reset()
+                continue
+
+            torch.cuda.reset_peak_memory_stats()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+            end_event.record()
+            torch.cuda.synchronize()
+
+            peak_bytes = torch.cuda.max_memory_allocated()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            profile.add_sample(decode_count, peak_bytes, elapsed_ms)
+
+            context.reset()
+
+        logging.info("Autotune: collected %d profiling samples", len(profile.token_counts))
+
+        # --- Compute optimal parameters ---
         tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
-
         new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
-            profile, tp_size=tp_size, request_rounder=self.context.REQUEST_ROUNDER,
+            profile, tp_size=tp_size, request_rounder=context.REQUEST_ROUNDER,
         )
 
-        # Step 3: Rebuild with tuned parameters.
+        # --- Rebuild context with tuned parameters ---
         logging.info(
-            "Autotune: Step 3 — rebuilding context with max_requests=%d, max_tokens=%d, "
+            "Autotune: rebuilding context with max_requests=%d, max_tokens=%d, "
             "buffer_size_gb=%.2f",
             new_max_requests,
             new_max_tokens,
             new_buffer_size_gb,
         )
 
-        self.context.deallocate_inference_state_buffers()
+        context.deallocate_inference_state_buffers()
         torch.cuda.empty_cache()
 
         tuned_config = replace(
@@ -554,16 +549,15 @@ class DynamicInferenceEngine(AbstractEngine):
             max_requests=new_max_requests,
             max_tokens=new_max_tokens,
             buffer_size_gb=new_buffer_size_gb,
-            autotune=False,  # don't profile again
+            autotune=False,
         )
         self.context = DynamicInferenceContext(model_config, tuned_config)
-        self.controller.inference_wrapped_model.inference_context = self.context
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
         self.autotune = False
-        self.autotune_profile = None
         self.reset()
 
-        # Build real CUDA graphs.
-        self.create_cuda_graphs()
+        # CUDA graphs are built by the caller (create_cuda_graphs) after we return.
 
         logging.info(
             "\n"
