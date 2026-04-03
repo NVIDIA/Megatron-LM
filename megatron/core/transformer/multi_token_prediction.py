@@ -452,7 +452,7 @@ def get_mtp_layer_spec_for_backend(
     Returns:
         ModuleSpec: Module specification with modules from the backend.
     """
-    column_parallel_linear_impl: type = backend.column_parallel_linear()
+    column_parallel_linear_impl = backend.column_parallel_linear()
     layer_norm_impl = backend.layer_norm()
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,

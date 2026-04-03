@@ -6,9 +6,17 @@ from abc import abstractmethod
 from functools import partial
 from typing import Optional, Protocol, cast
 
+from typing_extensions import final, override
+
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
+)
+from megatron.core.models.protocols import (
+    ColumnParallelLinearBuilder,
+    CoreAttentionBuilder,
+    LinearBuilder,
+    RowParallelLinearBuilder,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -54,22 +62,22 @@ class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
     @abstractmethod
-    def column_parallel_linear(self) -> type:
+    def linear(self) -> LinearBuilder:
+        """Which linear module the backend uses"""
+        ...
+
+    @abstractmethod
+    def column_parallel_linear(self) -> ColumnParallelLinearBuilder:
         """Which column parallel linear module the backend uses"""
         ...
 
     @abstractmethod
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> RowParallelLinearBuilder:
         """Which row parallel linear module the backend uses"""
         ...
 
     @abstractmethod
-    def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend support a single module for layernorm and linear"""
-        ...
-
-    @abstractmethod
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> Optional[ColumnParallelLinearBuilder]:
         """Which module for sequential layernorm and linear"""
         ...
 
@@ -81,7 +89,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def core_attention(self) -> type:
+    def core_attention(self) -> CoreAttentionBuilder:
         """Which module to use for attention"""
         ...
 
@@ -96,25 +104,31 @@ class BackendSpecProvider(Protocol):
         ...
 
 
+@final
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
-    def column_parallel_linear(self) -> type:
+    @override
+    def linear(self) -> LinearBuilder:
+        """Which linear module the backend uses"""
+        raise NotImplementedError("LocalSpecProvider does not have a linear module")
+
+    @override
+    def column_parallel_linear(self) -> type[ColumnParallelLinear]:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    @override
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
-    def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend choose a single module for layernorm and linear"""
-        return False
-
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    @override
+    def column_parallel_layer_norm_linear(self) -> None:
         """Which module for sequential layernorm and linear"""
         return None
 
+    @override
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
@@ -126,10 +140,12 @@ class LocalSpecProvider(BackendSpecProvider):
             LNImpl = WrappedTorchNorm
         return LNImpl
 
-    def core_attention(self) -> type:
+    @override
+    def core_attention(self) -> type[DotProductAttention]:
         """Which module to use for attention"""
         return DotProductAttention
 
+    @override
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         return partial(
@@ -141,34 +157,37 @@ class LocalSpecProvider(BackendSpecProvider):
             ),
         )
 
+    @override
     def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         return None
 
 
+@final
 class InferenceSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def linear(self) -> type:
+    @override
+    def linear(self) -> type[TELinear]:
         """Which linear module TE backend uses"""
         return TELinear
 
-    def column_parallel_linear(self) -> type:
+    @override
+    def column_parallel_linear(self) -> type[InferenceColumnParallelLinear]:
         """Which column parallel linear module TE backend uses"""
         return InferenceColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    @override
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 
-    def fuse_layernorm_and_linear(self) -> bool:
-        """TE backend chooses a single module for layernorm and linear"""
-        return True
-
+    @override
     def column_parallel_layer_norm_linear(self) -> type[InferenceLayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
+    @override
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
@@ -180,16 +199,19 @@ class InferenceSpecProvider(BackendSpecProvider):
             return not_none(FusedLayerNorm)
         return TENorm
 
+    @override
     def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 
+    @override
     def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
+    @override
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         return partial(

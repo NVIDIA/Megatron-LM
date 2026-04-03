@@ -403,7 +403,9 @@ def _get_self_attention_module_spec(
     if config.multi_latent_attention:
         attn_spec.metainfo["fuse_input_layernorm"] = False
     else:
-        attn_spec.metainfo["fuse_input_layernorm"] = backend.fuse_layernorm_and_linear()
+        attn_spec.metainfo["fuse_input_layernorm"] = (
+            backend.column_parallel_layer_norm_linear() is None
+        )
 
     return attn_spec
 
@@ -422,7 +424,9 @@ def _get_dense_mlp_module_spec(
     from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 
     mlp_spec = get_mlp_module_spec_for_backend(backend=backend, num_experts=None)
-    mlp_spec.metainfo["fuse_pre_mlp_layernorm"] = backend.fuse_layernorm_and_linear()
+    mlp_spec.metainfo["fuse_pre_mlp_layernorm"] = (
+        backend.column_parallel_layer_norm_linear() is None
+    )
 
     return mlp_spec
 
