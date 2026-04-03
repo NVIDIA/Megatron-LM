@@ -35,7 +35,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -102,10 +102,11 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
+        TENorm,
         set_save_original_input,
     )
 else:
-    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -1288,23 +1289,41 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
-        else:
-            self.q_layernorm = None
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        default_norm_cls = None
+        if self.config.qk_layernorm and TENorm is not None:
+            default_norm_cls = TENorm
+        elif self.config.qk_l2_norm:
+            default_norm_cls = L2Norm
 
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = submodules.k_layernorm(
+        q_norm_cls = submodules.q_layernorm or default_norm_cls
+        k_norm_cls = submodules.k_layernorm or default_norm_cls
+
+        if self.config.qk_layernorm and (q_norm_cls is None or k_norm_cls is None):
+            raise RuntimeError(
+                "qk_layernorm requires Transformer Engine (for TENorm) or "
+                "q_layernorm/k_layernorm set in the spec."
+            )
+
+        self.q_layernorm = (
+            q_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-        else:
-            self.k_layernorm = None
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
