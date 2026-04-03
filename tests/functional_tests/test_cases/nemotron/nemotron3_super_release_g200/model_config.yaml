@@ -64,8 +64,8 @@ MODEL_ARGS:
   # Data args
   --seq-length: 8192
   --max-position-embeddings: 8192
-  --per-split-data-args-path: ${BLEND_PATH}
-  --data-cache-path: ${DATACACHE_DIR}
+  --data-path: ${DATA_BLEND}
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tiktoken-pattern: v2
   --tokenizer-type: TikTokenizer
   --tokenizer-model: ${TOKENIZER_MODEL_PATH}
@@ -153,6 +153,10 @@ MODEL_ARGS:
   --timing-log-option: minmax
   --check-weight-hash-across-dp-replicas-interval: 20000
   --tensorboard-dir: ${TENSORBOARD_PATH}
+  --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
