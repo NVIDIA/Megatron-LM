@@ -39,6 +39,8 @@ Update the paths to point to the mcore converted CLIP and Mistral models and run
 examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /path/to/clip/model /output/dir
 ```
 
+> **Note:** If you encounter a loading error, try setting `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`.
+
 ## Training
 
 ### Pretraining
