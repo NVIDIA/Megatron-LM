@@ -445,16 +445,43 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = self.controller.inference_wrapped_model.model.config
         old_config = self.context.config
         controller = self.controller
-        context = self.context
+
+        # --- Create a small profiling context ---
+        # The initial context may be too large (e.g., 17 GB of Mamba state).
+        # Delete it entirely and create a minimal context for profiling — we
+        # only need a small max_requests to run forward passes at various
+        # token counts.  Note: deallocate_inference_state_buffers() is a no-op
+        # in PERSIST mode, so we must drop all tensor references explicitly.
+        del self.context
+        controller.inference_wrapped_model.inference_context = None
+        torch.cuda.empty_cache()
+
+        gpu_total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
+        mem_after_model = torch.cuda.memory_allocated()
+        free_bytes = gpu_total - mem_after_model
+
+        # Small profiling context: enough requests/blocks to exercise the model
+        # but not so large that it starves activation memory.
+        profiling_buffer_gb = max(0.1, (free_bytes * 0.3) / (1024 ** 3))
+        profiling_config = replace(
+            old_config,
+            buffer_size_gb=profiling_buffer_gb,
+            max_requests=None,  # auto-derive from small buffer
+            max_tokens=None,    # use default
+            autotune=False,     # no TMS chunks for profiling context
+        )
+        context = DynamicInferenceContext(model_config, profiling_config)
+        self.context = context
+        controller.inference_wrapped_model.inference_context = context
+        controller._reinit_for_context()
+        self.reset()
 
         # --- Collect memory accounting constants ---
         mem_params = DynamicInferenceContext.compute_context_memory_params(
             model_config, old_config
         )
-        gpu_total = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).total_memory
-        mem_before_profiling = torch.cuda.memory_allocated()
 
         profile = AutotuneProfile(
             block_size_bytes=mem_params['block_size_bytes'],
@@ -463,7 +490,7 @@ class DynamicInferenceEngine(AbstractEngine):
             per_request_bytes=mem_params['per_request_bytes'],
             per_token_bytes=mem_params['per_token_bytes'],
             gpu_total_bytes=gpu_total,
-            memory_after_model_load_bytes=mem_before_profiling,
+            memory_after_model_load_bytes=mem_after_model,
         )
 
         # --- Generate token counts to profile ---
@@ -483,14 +510,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         logging.info(
             "Autotune: profiling %d token counts (max=%d), "
-            "GPU total %.1f GB, after model load %.1f GB",
+            "GPU total %.1f GB, model %.1f GB, free %.1f GB, "
+            "profiling buffer %.2f GB, profiling max_requests %d",
             len(token_counts),
             max_profile_tokens,
             gpu_total / (1024 ** 3),
-            mem_before_profiling / (1024 ** 3),
+            mem_after_model / (1024 ** 3),
+            free_bytes / (1024 ** 3),
+            profiling_buffer_gb,
+            context.max_requests,
         )
 
         # --- Run standalone forward passes ---
+        # Measure NET activation memory = peak - baseline per iteration.
         for tc in token_counts:
             # Build a decode-only batch dimension for this token count.
             decode_count = min(tc, context.max_requests)
@@ -508,6 +540,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 context.reset()
                 continue
 
+            baseline_bytes = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -519,8 +552,9 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
 
             peak_bytes = torch.cuda.max_memory_allocated()
+            activation_bytes = peak_bytes - baseline_bytes
             elapsed_ms = start_event.elapsed_time(end_event)
-            profile.add_sample(decode_count, peak_bytes, elapsed_ms)
+            profile.add_sample(decode_count, activation_bytes, elapsed_ms)
 
             context.reset()
 
@@ -541,7 +575,9 @@ class DynamicInferenceEngine(AbstractEngine):
             new_buffer_size_gb,
         )
 
-        context.deallocate_inference_state_buffers()
+        del context
+        del self.context
+        controller.inference_wrapped_model.inference_context = None
         torch.cuda.empty_cache()
 
         tuned_config = replace(
