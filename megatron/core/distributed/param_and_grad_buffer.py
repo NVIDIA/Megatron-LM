@@ -758,6 +758,121 @@ class _ParamAndGradBucketGroup:
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
+from ..optimizer.param_layout import BufferKey, PerBufferParamLayout
+
+
+def _compute_default_per_buffer_param_layout(
+    params: List[torch.nn.Parameter], bucket_size: Optional[int]
+) -> PerBufferParamLayout:
+    """Compute parameter layout for the non-distributed-optimizer case.
+
+    No padding is applied. Parameters are iterated in reverse order (backprop order)
+    and grouped into buckets of approximately `bucket_size` elements.
+
+    Args:
+        params: List of parameters to lay out.
+        bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+
+    Returns:
+        PerBufferParamLayout with the computed mapping.
+    """
+    param_index_map = {}
+    bucket_indices = []
+    per_bucket_numel_unpadded = []
+
+    param_start_index = 0
+    bucket_start_index = 0
+    bucket_params = set()
+    bucket_id = 0
+
+    # Iterate through parameters in reverse order to roughly match backprop order: the last
+    # layer's parameters (whose gradients are ready first) end up in the first bucket.
+    # Communication of the first bucket can be overlapped with backward pass computation
+    # of the second bucket, and so on.
+    for param in params[::-1]:
+        this_numel = param.data.nelement()
+        param_end_index = param_start_index + this_numel
+        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+        bucket_params.add(param)
+
+        # If we have enough elements already, form a new bucket.
+        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_indices.append((bucket_start_index, param_end_index))
+            bucket_start_index = param_end_index
+            bucket_params = set()
+            bucket_id += 1
+            param_start_index = param_end_index
+        else:
+            param_start_index = param_end_index
+
+    # Add remaining params to a new bucket.
+    if len(bucket_params) > 0:
+        per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+        bucket_indices.append((bucket_start_index, param_end_index))
+
+    return PerBufferParamLayout(
+        param_index_map=param_index_map,
+        bucket_indices=bucket_indices,
+        per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+    )
+
+
+def group_params_for_buffers(
+    params: List[torch.nn.Parameter], grad_reduce_in_fp32: bool
+) -> Dict[BufferKey, Tuple[List[torch.nn.Parameter], List[int]]]:
+    """Group parameters by buffer identity for buffer allocation.
+
+    Each distinct buffer is identified by a BufferKey with three dimensions:
+    - param_dtype: storage dtype (torch.uint8 for FP8 parameters, else param.dtype).
+    - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
+    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
+      which requires a separate buffer with a different data-parallel group.
+
+    The param_indices track each parameter's position among same-dtype params (using
+    the "fake" high-precision dtype for FP8 params), needed for loading non-native-fp8
+    checkpoints in native-fp8 mode.
+
+    Args:
+        params: List of parameters to group.
+        grad_reduce_in_fp32: Whether gradients are reduced in FP32.
+
+    Returns:
+        Dict mapping BufferKey to (params_list, param_indices).
+    """
+    key_to_params = {}
+    dtype_to_offsets = {}
+    key_to_indices = {}
+
+    for param in params:
+        assert param.requires_grad
+
+        param_dtype = param.dtype
+        if is_float8tensor(param):
+            param_dtype = torch.uint8
+        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
+        is_expert_parallel = not getattr(param, 'allreduce', True)
+
+        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        param_list = key_to_params.get(key, [])
+        param_list.append(param)
+        key_to_params[key] = param_list
+
+        # Use param.dtype (not param_dtype) so FP8 params share offsets with their
+        # logical high-precision dtype, needed for checkpoint compatibility.
+        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset = dtype_to_offsets.get(offset_key, 0)
+        dtype_to_offsets[offset_key] = offset + 1
+        indices = key_to_indices.get(key, [])
+        indices.append(offset)
+        key_to_indices[key] = indices
+
+    result = {}
+    for key, param_list in key_to_params.items():
+        result[key] = (param_list, key_to_indices[key])
+    return result
+
+
 class _ParamAndGradBuffer:
     """
     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
@@ -793,6 +908,7 @@ class _ParamAndGradBuffer:
         param_indices: List[int],
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        param_layout: Optional[PerBufferParamLayout] = None,
     ):
 
         if pg_collection is None:
@@ -827,113 +943,16 @@ class _ParamAndGradBuffer:
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
-        self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
-        def _pad(number_to_be_padded: int, divisor: int) -> int:
-            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+        # Use the provided layout if given, otherwise compute the default (no-padding) layout.
+        if param_layout is None:
+            param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
+        self.param_index_map = param_layout.param_index_map
+        self.bucket_indices = param_layout.bucket_indices
+        per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
-        def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
-            """
-            Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
-            """
-            if self.ddp_config.use_distributed_optimizer:
-                # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
-                # This also helps cuBLAS pick more efficient algorithms for GEMMs.
-                # We now ensure that all buckets start at a memory address that is 256-byte
-                # aligned (128 values since params and grads use >= 16-bit precision).
-                if self.ddp_config.pad_buckets_for_high_nccl_busbw:
-                    # Make sure the bucket size is divisible by a large power of 2 (2^16) to
-                    # ensure NCCL collectives have high bus bandwidth at large DP counts,
-                    # since NCCL message size (which for ring algorithms is bucket_size /
-                    # dp_size) apparently needs to be divisible by a power of 2 for high busbw.
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128, 2**16)
-                else:
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128)
-                return _pad(bucket_end_index, bucket_size_divisor)
-            return bucket_end_index
-
-        def _pad_start_of_param_if_needed(param_start_index: int) -> int:
-            """
-            Pads start index of param if using distributed optimizer (to ensure "good" alignment).
-            """
-            if self.ddp_config.use_distributed_optimizer:
-                # Ensure that params start at 128-byte aligned addresses (64 values
-                # since params are >= 16-bit precision).
-                return _pad(param_start_index, 64)
-            return param_start_index
-
-        # First, figure out how many elements should be in the underlying buffer storage.
-        # Note that if we need to split the buffer into smaller buckets, each of these
-        # might need to be padded as well (if using the distributed optimizer).
-        param_start_index = 0
-        bucket_start_index = param_start_index
-        bucket_params = set()
-        self.bucket_indices = []
-        per_bucket_numel_unpadded = []
-        bucket_id = 0
-
-        def _update_bucket_metadata(param_end_index: int) -> int:
-            """
-            Record metadata for the bucket starting at bucket_start_index and ending with the
-            passed-in param_end_index. Returns the bucket's end_index.
-            """
-            nonlocal bucket_start_index, bucket_params, bucket_id
-            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
-
-            # Record metadata of new bucket.
-            self.bucket_indices.append((bucket_start_index, bucket_end_index))
-            bucket_start_index = bucket_end_index
-
-            # Prepare for next bucket.
-            bucket_params = set()
-            bucket_id += 1
-
-            # Return the potentially padded bucket_end_index.
-            return bucket_end_index
-
-        def _does_param_require_new_bucket(param):
-            """
-            Split shared embedding parameters into separate bucket if using distributed
-            optimizer that makes use of reduce-scatters instead of all-reduces.
-            This ensures that the first and last pipeline stage partition optimizer state
-            for the shared embedding parameters the same way across DP replicas, allowing
-            the DP reduce-scatter to be before the embedding all-reduce.
-            """
-            return (
-                getattr(param, "shared_embedding", False)
-                and self.ddp_config.use_distributed_optimizer
-            )
-
-        for param, _ in params_with_names[::-1]:
-            # Iterate through parameters in reverse order to roughly follow backprop order.
-
-            this_numel = param.data.nelement()
-            param_start_index = _pad_start_of_param_if_needed(param_start_index)
-
-            # Create bucket with collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
-                # Ensure this param accounts for the new padding introduced at end of
-                # previous bucket.
-                param_start_index = _update_bucket_metadata(param_start_index)
-
-            param_end_index = param_start_index + this_numel
-            self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
-            bucket_params.add(param)
-
-            # If we have enough elements already or the current param is part of the shared
-            # embedding layer and needs a separate bucket, form a new bucket.
-            if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
-                bucket_end_index = _update_bucket_metadata(param_end_index)
-                param_start_index = bucket_end_index
-            else:
-                param_start_index = param_end_index
-
-        # Add remaining params to a new bucket.
-        if len(bucket_params) > 0:
-            bucket_end_index = _update_bucket_metadata(param_end_index)
+        # Determine total buffer size from the last bucket's end index.
+        bucket_end_index = self.bucket_indices[-1][1]
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
@@ -1064,7 +1083,7 @@ class _ParamAndGradBuffer:
                 self.extra_main_grads.append(param.main_grad)
 
             if bucket_id != cur_bucket_id:
-                bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
+                bucket_end_index = self.bucket_indices[cur_bucket_id][1]
                 self.buckets.append(
                     self._new_bucket(
                         bucket_params=bucket_params,
@@ -1088,7 +1107,7 @@ class _ParamAndGradBuffer:
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            bucket_end_index = self.bucket_indices[cur_bucket_id][1]
             self.buckets.append(
                 self._new_bucket(
                     bucket_params=bucket_params,

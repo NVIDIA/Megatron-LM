@@ -6,6 +6,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -48,13 +49,18 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    group_params_for_buffers,
+    partition_buckets,
+)
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
+from .param_layout import FullParamLayout, PerBufferParamLayout
 
 logger = getLogger(__name__)
 
@@ -97,7 +103,7 @@ class Range:
 class DistributedOptimizer(MixedPrecisionOptimizer):
     """Optimizer that shards state across data-parallel ranks.
 
-    This class reduces memory usage by distributing optimizer states (like 
+    This class reduces memory usage by distributing optimizer states (like
     momentum and variance buffers) across GPUs in the data-parallel group.
 
     Attributes:
@@ -113,6 +119,171 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fully_sharded_model_space',
         'fsdp_dtensor',
     }
+
+    @staticmethod
+    def _compute_per_buffer_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+    ) -> PerBufferParamLayout:
+        """Compute how parameters should be laid out in the contiguous buffer.
+
+        Iterates params in reverse order (backprop order), applies 64-byte param
+        alignment, bucket-end padding for DP divisibility, and shared-embedding
+        bucket splitting.
+
+        Args:
+            params: List of parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: DistributedDataParallel config object.
+
+        Returns:
+            PerBufferParamLayout with the computed mapping.
+        """
+
+        def _pad(number_to_be_padded: int, divisor: int) -> int:
+            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
+        def _pad_end_of_bucket(bucket_end_index: int) -> int:
+            """
+            Pads end index of bucket to ensure uniform sharding across DP ranks.
+            Also ensures that all buckets start at a memory address that is 256-byte
+            aligned (128 values since params and grads use >= 16-bit precision).
+            This works around a TE bug causing cuBLAS to pick an incompatible algorithm,
+            and also helps cuBLAS pick more efficient algorithms for GEMMs.
+            """
+            if ddp_config.pad_buckets_for_high_nccl_busbw:
+                # Make sure the bucket size is divisible by a large power of 2 (2^16) to
+                # ensure NCCL collectives have high bus bandwidth at large DP counts,
+                # since NCCL message size (which for ring algorithms is bucket_size /
+                # dp_size) apparently needs to be divisible by a power of 2 for high busbw.
+                bucket_size_divisor = math.lcm(data_parallel_world_size, 128, 2**16)
+            else:
+                bucket_size_divisor = math.lcm(data_parallel_world_size, 128)
+            return _pad(bucket_end_index, bucket_size_divisor)
+
+        def _pad_start_of_param(param_start_index: int) -> int:
+            """
+            Pads start index of param to ensure params start at 128-byte aligned
+            addresses (64 values since params are >= 16-bit precision).
+            """
+            return _pad(param_start_index, 64)
+
+        def _does_param_require_new_bucket(param):
+            """
+            Split shared embedding parameters into a separate bucket so that the
+            first and last pipeline stages partition optimizer state for shared
+            embedding parameters the same way across DP replicas, allowing the
+            DP reduce-scatter to be before the embedding all-reduce.
+            """
+            return getattr(param, "shared_embedding", False)
+
+        param_index_map = {}
+        bucket_indices = []
+        per_bucket_numel_unpadded = []
+
+        param_start_index = 0
+        bucket_start_index = 0
+        bucket_params = set()
+        bucket_id = 0
+
+        def _update_bucket_metadata(param_end_index: int) -> int:
+            """
+            Record metadata for the bucket starting at bucket_start_index and ending with the
+            passed-in param_end_index. Returns the bucket's (potentially padded) end_index.
+            """
+            nonlocal bucket_start_index, bucket_params, bucket_id
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = _pad_end_of_bucket(param_end_index)
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            bucket_start_index = bucket_end_index
+            bucket_params = set()
+            bucket_id += 1
+            return bucket_end_index
+
+        # Iterate through parameters in reverse order to roughly match backprop order: the last
+        # layer's parameters (whose gradients are ready first) end up in the first bucket.
+        # Communication of the first bucket can be overlapped with backward pass computation
+        # of the second bucket, and so on.
+        for param in params[::-1]:
+            this_numel = param.data.nelement()
+            param_start_index = _pad_start_of_param(param_start_index)
+
+            # Create bucket with collected parameters if current param needs its own bucket.
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # Ensure this param accounts for the new padding introduced at end of
+                # previous bucket.
+                param_start_index = _update_bucket_metadata(param_start_index)
+
+            param_end_index = param_start_index + this_numel
+            param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            bucket_params.add(param)
+
+            # If we have enough elements already or the current param is part of the shared
+            # embedding layer and needs a separate bucket, form a new bucket.
+            if (
+                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                bucket_end_index = _update_bucket_metadata(param_end_index)
+                param_start_index = bucket_end_index
+            else:
+                param_start_index = param_end_index
+
+        # Add remaining params to a new bucket.
+        if len(bucket_params) > 0:
+            _update_bucket_metadata(param_end_index)
+
+        return PerBufferParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+        )
+
+    @staticmethod
+    def compute_full_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        expert_data_parallel_world_size: Optional[int] = None,
+    ) -> FullParamLayout:
+        """Compute parameter layouts for all buffer groups.
+
+        Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
+        computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
+        expert_data_parallel_world_size for padding alignment.
+
+        Args:
+            params: List of all parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group for dense params.
+            ddp_config: DistributedDataParallel config object.
+            expert_data_parallel_world_size: Size of the expert data-parallel group.
+                Required if any expert-parallel params are present. Defaults to
+                data_parallel_world_size if not provided.
+
+        Returns:
+            FullParamLayout with a PerBufferParamLayout per buffer group.
+        """
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        layouts = {}
+        for buffer_key, (group_params, param_indices) in buffer_groups.items():
+            if buffer_key.is_expert_parallel:
+                dp_world_size = (
+                    expert_data_parallel_world_size
+                    if expert_data_parallel_world_size is not None
+                    else data_parallel_world_size
+                )
+            else:
+                dp_world_size = data_parallel_world_size
+            layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                group_params, bucket_size, dp_world_size, ddp_config
+            )
+            layout.param_indices = param_indices
+            layouts[buffer_key] = layout
+        return FullParamLayout(layouts=layouts)
 
     @classmethod
     def _build_model_gbuf_param_range_map(
@@ -231,9 +402,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        These mappings are partitioned according to data type. This method 
-        iterates through all buckets of a grad buffer to construct param 
-        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        These mappings are partitioned according to data type. This method
+        iterates through all buckets of a grad buffer to construct param
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket,
         where each shard is 1/dp_world_size of the bucket).
 
         Args:
@@ -483,33 +654,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad 
-        buffers, parameters, and parameter shard ranges, that is needed for 
-        converting between model param indexes and main parameter shard indexes. 
-        This method also updates the optimizer parameter groups with the 
+        The steps in this method create the core mapping between param and grad
+        buffers, parameters, and parameter shard ranges, that is needed for
+        converting between model param indexes and main parameter shard indexes.
+        This method also updates the optimizer parameter groups with the
         newly created shards.
 
         Args:
             optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
-                this can be None for BF16 training if no loss scale is used. 
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that
+                this can be None for BF16 training if no loss scale is used.
                 For FP16, a grad scaler is always required.
-            init_state_fn (Callable, optional): Function to initialize state in 
+            init_state_fn (Callable, optional): Function to initialize state in
                 the optimizer.
             model_chunks (List[MegatronModule]): List of model chunks to optimize.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
-                implementation of the distributed optimizer is centered on using 
-                a contiguous buffer for communicating grads & params between 
-                the model state and the optimizer state. For a detailed 
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The
+                implementation of the distributed optimizer is centered on using
+                a contiguous buffer for communicating grads & params between
+                the model state and the optimizer state. For a detailed
                 description, see `docs/source/distrib_optimizer.md`.
-            data_parallel_group (ProcessGroup): Data-parallel group used to 
+            data_parallel_group (ProcessGroup): Data-parallel group used to
                 all-gather params after optimizer.step().
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel
                 group used specifically for checkpoint loading and saving.
-            data_parallel_group_idx (int): Index in the data-parallel group 
+            data_parallel_group_idx (int): Index in the data-parallel group
                 used by distributed checkpointing logic.
-            distributed_optimizer_instance_id (int): Unique identifier for the 
+            distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
         """
 
@@ -2645,4 +2816,3 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
-    
