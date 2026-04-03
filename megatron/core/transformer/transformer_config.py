@@ -262,8 +262,19 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dca']] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dca."""
+
+    ####################
+    # DCA (Dual Chunk Attention)
+    ####################
+    dca_chunk_size: int = 8192
+    """Chunk size for Dual Chunk Attention. Sequences longer than chunk_len
+    (= dca_chunk_size - dca_local_size) are split into chunks."""
+
+    dca_local_size: int = 1024
+    """Local window size for successive-chunk attention in DCA.
+    chunk_len = dca_chunk_size - dca_local_size."""
 
     ####################
     # DSA
@@ -2231,6 +2242,19 @@ class TransformerConfig(ModelParallelConfig):
                 self.context_parallel_size == 1
             ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
+        if self.experimental_attention_variant == "dca":
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DualChunkAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DualChunkAttention"
+            assert self.dca_chunk_size > self.dca_local_size, (
+                f"dca_chunk_size ({self.dca_chunk_size}) must be greater than "
+                f"dca_local_size ({self.dca_local_size})"
+            )
+            assert (
+                self.dca_chunk_size > 0 and self.dca_local_size >= 0
+            ), "dca_chunk_size must be positive and dca_local_size must be non-negative"
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

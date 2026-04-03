@@ -1099,7 +1099,9 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
-            if split_qkv:
+            if self.config.experimental_attention_variant == "dca":
+                pass
+            elif split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():
@@ -1153,6 +1155,9 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
+                dca_kwargs = {}
+                if self.config.experimental_attention_variant == "dca":
+                    dca_kwargs["rotary_pos_emb"] = rotary_pos_emb
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
@@ -1164,6 +1169,7 @@ class Attention(MegatronModule, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **dca_kwargs,
                     )
 
             else:

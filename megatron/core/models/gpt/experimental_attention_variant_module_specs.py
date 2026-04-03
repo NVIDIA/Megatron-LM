@@ -6,6 +6,10 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.dca import (
+    DCASubmodules,
+    DualChunkAttention,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -128,6 +132,35 @@ def get_dsa_module_spec_for_backend(
     return attention
 
 
+def get_dca_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for Dual Chunk Attention (DCA).
+
+    DCA replaces core_attention in standard SelfAttention with chunked attention
+    that uses modified rotary position embeddings for efficient long-context handling.
+    """
+    from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    core_attention = ModuleSpec(module=DualChunkAttention, submodules=DCASubmodules())
+
+    attention = ModuleSpec(
+        module=SelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=SelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+
+    return attention
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -138,6 +171,8 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dca":
+        return get_dca_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
