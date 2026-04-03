@@ -368,13 +368,18 @@ def selective_state_update(
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
     )
 
+    dim_block = triton.next_power_of_2(dim)
     BLOCK_SIZE_M, num_warps = (
-        (32, 4)
+        (min(32, dim_block), 4)
         if dstate <= 16
         else (
-            (16, 4)
+            (min(16, dim_block), 4)
             if dstate <= 32
-            else ((8, 4) if dstate <= 64 else ((4, 4) if dstate <= 128 else ((4, 8))))
+            else (
+                (min(16, dim_block), 4)
+                if dstate <= 64
+                else ((min(16, dim_block), 4) if dstate <= 128 else ((min(8, dim_block), 8)))
+            )
         )
     )
 
