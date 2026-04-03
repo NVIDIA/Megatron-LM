@@ -49,12 +49,6 @@ from ..mapping import (
     is_main_replica,
 )
 from .async_utils import AsyncRequest
-from .base import (
-    AsyncSaveShardedStrategy,
-    LoadShardedStrategy,
-    StrategyAction,
-    register_default_strategy,
-)
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
 try:
@@ -62,9 +56,13 @@ try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
+
+    HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC
     NVRxAsyncRequest = ABC
+
+    HAVE_NVRX = False
 
 try:
     if not torch.cuda.is_available():
@@ -101,16 +99,6 @@ class MCoreSavePlan:
     """ """
 
     pass
-
-
-def register_default_torch_strategies():
-    """Register default strategies related to PyT Distributed backend."""
-    register_default_strategy(
-        StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
-    )
-    register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy()
-    )
 
 
 logger = getLogger(__name__)
@@ -596,7 +584,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         return super().commit_tensor(read_item, tensor)
 
 
-class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+class TorchDistSaveShardedStrategy:
     """Async save strategy for the PyT Distributed format.
 
     The idea is to translate MCore ShardedTensors into PyT ShardedTensors
@@ -627,7 +615,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint(str, optional): If provided, all tensors whose keys have this
                 prefix will be saved to a separate file.
         """
-        super().__init__(backend, version)
+        self.backend = backend
+        self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
@@ -653,6 +642,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
+
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """Each async strategy can be trivially used as a sync strategy."""
+        strategy = "nvrx" if HAVE_NVRX else "mcore"
+        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
+        async_request.execute_sync()
+        del async_request
 
     def async_save(
         self,
@@ -805,9 +801,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         return async_request(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 
-    def can_handle_sharded_objects(self):
-        return True
-
 
 def _get_filesystem_reader(
     checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "nvrx"
@@ -823,13 +816,12 @@ def _get_filesystem_reader(
     return FileSystemReader(checkpoint_dir)
 
 
-class TorchDistLoadShardedStrategy(LoadShardedStrategy):
+class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
     def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        super().__init__()
 
     def load(
         self,
@@ -1011,15 +1003,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             raise e
         else:
             fs_writer.fs.rm_file(old_path)
-
-    def can_handle_sharded_objects(self):
-        return True
-
-    def check_backend_compatibility(self, loaded_version):
-        pass  # TODO
-
-    def check_version_compatibility(self, loaded_version):
-        pass  # TODO
 
 
 def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tuple:
