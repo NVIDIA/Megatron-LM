@@ -22,7 +22,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   --sft: true
   --mock-data: true
-  --sft-mock-dataset-config-json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":128,"max_seq_len":2048,"mean_seq_len":512,"lognormal_sigma":1.2}'
+  --sft-mock-dataset-config-json: '\'{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":128,"max_seq_len":2048,"mean_seq_len":512,"lognormal_sigma":1.2}\''
   --tokenizer-type: GPTSentencePieceTokenizer
   --tokenizer-model: ${DATA_PATH}/text/slimpajama/preprocessed/mixtral_benchmarking/tokenizer.model
   --distributed-backend: nccl
