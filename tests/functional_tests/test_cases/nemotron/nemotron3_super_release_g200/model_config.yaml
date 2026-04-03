@@ -145,6 +145,8 @@ MODEL_ARGS:
   --log-interval: 100
   --log-params-norm: true
   --log-num-zeros-in-grad: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
   --log-throughput: true
   --log-progress: true
   --log-energy: true
