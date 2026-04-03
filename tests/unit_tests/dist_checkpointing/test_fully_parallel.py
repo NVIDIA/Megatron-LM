@@ -84,6 +84,12 @@ class MockLoadStrategy(LoadShardedStrategy):
     def load_tensors_metadata(self, checkpoint_dir: Path):
         pass
 
+    def check_backend_compatibility(self, loaded_version):
+        pass
+
+    def check_version_compatibility(self, loaded_version):
+        pass
+
 
 class TestFullyParallelSaveAndLoad:
     def setup_method(self, method):
