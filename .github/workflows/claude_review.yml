@@ -33,6 +33,12 @@ jobs:
           fetch-depth: 1
           ref: ${{ steps.get-pr-head-commit.outputs.sha }}
 
+      - name: React to trigger comment
+        run: |
+          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
+            --method POST \
+            -f content='+1'
+
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
         with:
