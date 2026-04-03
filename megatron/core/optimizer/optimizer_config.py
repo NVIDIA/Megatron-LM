@@ -137,7 +137,7 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers."""
 
     ##############
     # General
