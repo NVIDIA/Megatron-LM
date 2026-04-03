@@ -911,7 +911,7 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
-    config = pretrain_container_from_args(args)
+    full_config = pretrain_container_from_args(args)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (
@@ -920,7 +920,7 @@ def pretrain(
         set_ideal_affinity_for_current_gpu()
 
 
-    if args.log_progress:
+    if full_config.logger.log_progress:
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
@@ -1000,7 +1000,7 @@ def pretrain(
     one_logger_utils.on_pretrain_start()
 
     # Context used for persisting some state between checkpoint saves.
-    if args.non_persistent_ckpt_type == 'local':
+    if full_config.checkpoint.non_persistent_ckpt_type == 'local':
         try:
             from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
                 LocalCheckpointManager,
@@ -1018,16 +1018,16 @@ def pretrain(
                 "checkpointing but was not found. Please ensure it is installed."
             )
 
-        if args.replication:
+        if full_config.checkpoint.replication:
             repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                args.replication_jump, args.replication_factor
+                full_config.checkpoint.replication_jump, full_config.checkpoint.replication_factor
             )
         else:
             repl_strategy = None
 
         checkpointing_context = {
             'local_checkpoint_manager': LocalCheckpointManager(
-                args.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
+                full_config.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
             )
         }
     else:
@@ -1041,7 +1041,7 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    config = get_model_config(model[0])
+    model_cfg = get_model_config(model[0])
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1071,7 +1071,7 @@ def pretrain(
             )
 
             # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(config)
+            inference_config = copy.deepcopy(model_cfg)
             if args.rl_inference_tensor_model_parallel_size is not None:
                 inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
             if args.rl_inference_pipeline_model_parallel_size is not None:
@@ -1160,8 +1160,8 @@ def pretrain(
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        args.train_iters,
-        args.skip_train,
+        full_config.train.train_iters,
+        full_config.validation.skip_train,
         args.do_train,
         args.do_valid,
         args.do_test,
@@ -1180,15 +1180,15 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not args.skip_train or args.perform_rl_step:
-        if args.skip_train:
+    if not full_config.validation.skip_train or args.perform_rl_step:
+        if full_config.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
             print_rank_0('training ...')
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
+        if args.do_train and (full_config.train.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
@@ -1197,7 +1197,7 @@ def pretrain(
                 train_data_iterator,
                 valid_data_iterator,
                 process_non_loss_data_func,
-                config,
+                model_cfg,
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
@@ -1205,7 +1205,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
+        if not full_config.validation.skip_train and full_config.checkpoint.save and iteration != 0 and iteration % full_config.checkpoint.save_interval != 0:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -1243,15 +1243,15 @@ def pretrain(
                 rl_eval_model,
                 optimizer,
                 iteration,
-                write_to_tensorboard=not args.skip_train,
+                write_to_tensorboard=not full_config.validation.skip_train,
                 training_model=rl_training_model,
             )
         else:
             evaluate_and_print_results(
                 prefix, forward_step_func,
                 valid_data_iterator, model,
-                iteration, process_non_loss_data_func, config,
-                verbose=True, write_to_tensorboard=not args.skip_train,
+                iteration, process_non_loss_data_func, model_cfg,
+                verbose=True, write_to_tensorboard=not full_config.validation.skip_train,
                 non_loss_data_func=non_loss_data_func
             )
 
@@ -1264,9 +1264,9 @@ def pretrain(
             model,
             iteration,
             process_non_loss_data_func,
-            config,
+            model_cfg,
             verbose=True,
-            write_to_tensorboard=not args.skip_train,
+            write_to_tensorboard=not full_config.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
         )
 
