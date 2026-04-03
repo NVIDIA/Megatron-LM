@@ -277,7 +277,35 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
-    """Tensor Parallel Adaptive Muon optimizer."""
+    """Tensor Parallel Adaptive Muon optimizer.
+
+    This class extends Muon by adding AdamW-style or NorMuon-style second moment
+    accumulation after orthogonalization. This idea was first explored in D.E. Carlson,
+    E. Collins, Ya-Ping Hsieh, L. Carin, and V. Cevher. *Preconditioned spectral
+    descent for deep learning.* In Advances in neural information processing systems 28 (2015).
+    The step() method is overridden to include second moment normalization logic.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        lr: Learning rate.
+        momentum: The exponential decay rate for momentum.
+        nesterov: Whether to use Nesterov momentum.
+        weight_decay: Weight decay coefficient.
+        use_decoupled_weight_decay: Whether to use decoupled weight decay.
+        split_qkv: Whether to split QKV weights for orthogonalization.
+        is_qkv_fn: Function to determine if a tensor is a QKV weight.
+        qkv_split_shapes: Shapes for splitting QKV weights.
+        fp32_matmul_prec: Precision for FP32 matrix multiplication.
+        coefficient_type: The type of coefficient set to use for the Newton-Schulz iteration.
+        num_ns_steps: The number of iteration steps to use in the Newton-Schulz iteration.
+        scale_mode: The type of scale factor to use for the update.
+        extra_scale_factor: The additional scale factor to use for the update.
+        pg_collection: Process group collection for distributed training.
+        tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
+        beta2: The exponential decay rate for second moment.
+        eps: Small constant for numerical stability.
+    """
 
     def __init__(
         self,
