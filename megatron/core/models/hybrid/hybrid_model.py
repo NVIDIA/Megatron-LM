@@ -475,5 +475,15 @@ class HybridModel(LanguageModule):
         return loss
 
 
-# Backward-compatible alias
-MambaModel = HybridModel
+class MambaModel(HybridModel):
+    """Backward-compatible wrapper that accepts the deprecated mamba_stack_spec kwarg."""
+
+    def __init__(self, *args, mamba_stack_spec: ModuleSpec = None, **kwargs):
+        if mamba_stack_spec is not None:
+            if 'hybrid_stack_spec' in kwargs or (args and len(args) >= 2):
+                raise ValueError(
+                    "Cannot specify both hybrid_stack_spec and mamba_stack_spec. "
+                    "mamba_stack_spec has been deprecated; use hybrid_stack_spec instead."
+                )
+            kwargs['hybrid_stack_spec'] = mamba_stack_spec
+        super().__init__(*args, **kwargs)
