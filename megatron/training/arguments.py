@@ -5,6 +5,7 @@
 import argparse
 import dataclasses
 import json
+from math import gcd
 import os
 from pathlib import Path
 import re
@@ -406,48 +407,75 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
-        assert args.rl_num_parallel_generations is None \
-            or args.rl_parallel_generation_tasks is None, \
-            "Cannot specify both --rl-num-parallel-generations and " \
-            "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
-            "(--rl-parallel-generation-tasks is deprecated)."
-        if args.rl_parallel_generation_tasks is not None:
-            print_rank_0(
-                "WARNING: --rl-parallel-generation-tasks is deprecated, "
-                "use --rl-num-parallel-generations instead.")
-            args.rl_num_parallel_generations = (
-                args.rl_parallel_generation_tasks * args.grpo_group_size)
+        # Resolve --rl-desired-lag / --rl-use-strict-lag into internal parameters,
+        # or fall back to the legacy --rl-num-parallel-generations etc. flags.
+        _has_legacy_params = any(x is not None for x in [
+            args.rl_num_parallel_generations,
+            args.rl_num_parallel_generation_batches,
+            args.rl_parallel_generation_tasks,
+            args.rl_generation_batch_size,
+        ])
+        assert not (args.rl_desired_lag is not None and _has_legacy_params), \
+            "--rl-desired-lag is mutually exclusive with --rl-num-parallel-generations, " \
+            "--rl-num-parallel-generation-batches, --rl-parallel-generation-tasks, " \
+            "and --rl-generation-batch-size."
+        if args.rl_use_strict_lag:
+            assert args.rl_desired_lag is not None, \
+                "--rl-use-strict-lag requires --rl-desired-lag."
 
-        # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
-        assert args.rl_num_parallel_generations is None \
-            or args.rl_num_parallel_generation_batches is None, \
-            "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
-            "are mutually exclusive."
-        if args.rl_num_parallel_generations is not None:
+        if args.rl_desired_lag is not None:
+            P = args.grpo_prompts_per_step
             assert args.rl_partial_rollouts, \
-                "--rl-num-parallel-generations requires --rl-partial-rollouts."
-            assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
-                f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
-                f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
-            args.rl_parallel_generation_tasks = (
-                args.rl_num_parallel_generations // args.grpo_group_size)
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
-        elif args.rl_num_parallel_generation_batches is not None:
-            assert args.rl_partial_rollouts, \
-                "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = args.grpo_prompts_per_step
-            args.rl_parallel_generation_tasks = (
-                args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
+                "--rl-desired-lag requires --rl-partial-rollouts."
+            assert args.rl_desired_lag >= -1, \
+                f"--rl-desired-lag ({args.rl_desired_lag}) must be >= -1."
+            tasks = max(1, round((args.rl_desired_lag + 1) * P))
+            args.rl_parallel_generation_tasks = tasks
+            args.rl_generation_batch_size = gcd(tasks, P) if args.rl_use_strict_lag else 1
+            args.rl_enforce_generation_order = args.rl_use_strict_lag
         else:
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
-            args.rl_parallel_generation_tasks = 512
+            # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
+            assert args.rl_num_parallel_generations is None \
+                or args.rl_parallel_generation_tasks is None, \
+                "Cannot specify both --rl-num-parallel-generations and " \
+                "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
+                "(--rl-parallel-generation-tasks is deprecated)."
+            if args.rl_parallel_generation_tasks is not None:
+                print_rank_0(
+                    "WARNING: --rl-parallel-generation-tasks is deprecated, "
+                    "use --rl-num-parallel-generations instead.")
+                args.rl_num_parallel_generations = (
+                    args.rl_parallel_generation_tasks * args.grpo_group_size)
 
-        # Derive enforce_order after all resolution is complete.
-        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+            # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
+            assert args.rl_num_parallel_generations is None \
+                or args.rl_num_parallel_generation_batches is None, \
+                "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
+                "are mutually exclusive."
+            if args.rl_num_parallel_generations is not None:
+                assert args.rl_partial_rollouts, \
+                    "--rl-num-parallel-generations requires --rl-partial-rollouts."
+                assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
+                    f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
+                    f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
+                args.rl_parallel_generation_tasks = (
+                    args.rl_num_parallel_generations // args.grpo_group_size)
+                if args.rl_generation_batch_size is None:
+                    args.rl_generation_batch_size = 1
+            elif args.rl_num_parallel_generation_batches is not None:
+                assert args.rl_partial_rollouts, \
+                    "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
+                if args.rl_generation_batch_size is None:
+                    args.rl_generation_batch_size = args.grpo_prompts_per_step
+                args.rl_parallel_generation_tasks = (
+                    args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
+            else:
+                if args.rl_generation_batch_size is None:
+                    args.rl_generation_batch_size = 1
+                args.rl_parallel_generation_tasks = 512
+
+            # Derive enforce_order after all resolution is complete.
+            args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -2289,6 +2317,17 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
+    group.add_argument('--rl-desired-lag', type=float, default=None,
+                       help='Desired collection lag: the number of training steps worth of rollouts '
+                            'generated ahead of the current training step. A lag of L means L+1 '
+                            'steps worth of prompt groups are in flight simultaneously. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generations, '
+                            '--rl-num-parallel-generation-batches, and --rl-parallel-generation-tasks.')
+    group.add_argument('--rl-use-strict-lag', action='store_true', default=False,
+                       help='Enforce strict ordering of generation batches so that the lag is '
+                            'deterministic rather than non-strict. When set, rollouts are yielded '
+                            'in batch order. Requires --rl-desired-lag.')
     group.add_argument('--rl-num-parallel-generations', type=int, default=None,
                        help='Number of rollouts being generated by the inference engine simultaneously. '
                             'Internally divided by grpo_group_size. '
@@ -2341,7 +2380,8 @@ def _add_rl_args(parser):
                        help='Allow inference to continue generating rollouts while training updates '
                             'the policy weights. This enables off-policy training where rollouts may '
                             'be generated with a stale version of the policy. Use '
-                            '--rl-num-parallel-generations or --rl-num-parallel-generation-batches '
+                            '--rl-desired-lag, --rl-num-parallel-generations, or '
+                            '--rl-num-parallel-generation-batches '
                             'to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
