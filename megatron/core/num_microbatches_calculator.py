@@ -9,10 +9,12 @@ from typing import List, Optional, Tuple, Union
 logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
-_GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
-    'ConstantNumMicroBatchesCalculator',
-    'RampupBatchsizeNumMicroBatchesCalculator',
-    'StepBatchsizeNumMicroBatchesCalculator',
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR: Optional[
+    Union[
+        'ConstantNumMicroBatchesCalculator',
+        'RampupBatchsizeNumMicroBatchesCalculator',
+        'StepBatchsizeNumMicroBatchesCalculator',
+    ]
 ] = None
 
 
@@ -69,9 +71,9 @@ def init_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
-    step_batch_size_schedule: Optional[str],
-    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
+    step_batch_size_schedule: Optional[str] = None,
+    seq_length: Optional[int] = None,
 ) -> None:
     """Initialize number of microbatches calculator. Supporting backward compatibility.
 
@@ -87,6 +89,9 @@ def init_num_microbatches_calculator(
             Micro batch size at initialization.
         data_parallel_size (int):
             Data parallel size.
+        decrease_batch_size_if_needed (bool, optional):
+            If true, scale down batch size to ensure divisibility by DP size * microbatch size.
+            Defaults to False.
         step_batch_size_schedule (Optional[str]):
             Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
             Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
@@ -94,9 +99,6 @@ def init_num_microbatches_calculator(
         seq_length (Optional[int]):
             Sequence length for token-to-sample conversion when using step_batch_size_schedule.
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
-        decrease_batch_size_if_needed (bool, optional):
-            If true, scale down batch size to ensure divisibility by DP size * microbatch size.
-            Defaults to False.
     """
     _configure_global_num_microbatches_calculator(
         rank,
@@ -104,9 +106,9 @@ def init_num_microbatches_calculator(
         global_batch_size,
         micro_batch_size,
         data_parallel_size,
+        decrease_batch_size_if_needed,
         step_batch_size_schedule,
         seq_length,
-        decrease_batch_size_if_needed,
         init=True,
     )
 
@@ -123,9 +125,9 @@ def reconfigure_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
-    step_batch_size_schedule: Optional[str],
-    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
+    step_batch_size_schedule: Optional[str] = None,
+    seq_length: Optional[int] = None,
 ) -> None:
     """Reconfigure number of microbatches calculator. Supporting backward compatibility.
 
@@ -158,9 +160,9 @@ def reconfigure_num_microbatches_calculator(
         global_batch_size,
         micro_batch_size,
         data_parallel_size,
+        decrease_batch_size_if_needed,
         step_batch_size_schedule,
         seq_length,
-        decrease_batch_size_if_needed,
         init=False,
     )
 
@@ -171,9 +173,9 @@ def _configure_global_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
-    step_batch_size_schedule: Optional[str],
-    seq_length: Optional[int],
     decrease_batch_size_if_needed: bool = False,
+    step_batch_size_schedule: Optional[str] = None,
+    seq_length: Optional[int] = None,
     init: bool = False,
 ) -> None:
     """Configure number of microbatches calculator. Can be used for initialization and
@@ -194,8 +196,6 @@ def _configure_global_num_microbatches_calculator(
         decrease_batch_size_if_needed (bool, optional):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
             Defaults to False.
-        init (bool, optional):
-            If true, initialize the calculator. Defaults to False.
         step_batch_size_schedule (Optional[str]):
             Step batch size schedule string in format "THRESHOLD:BS THRESHOLD:BS ...".
             Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
@@ -203,6 +203,8 @@ def _configure_global_num_microbatches_calculator(
         seq_length (Optional[int]):
             Sequence length for token-to-sample conversion when using step_batch_size_schedule.
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
+        init (bool, optional):
+            If true, initialize the calculator. Defaults to False.
     """
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
@@ -262,6 +264,12 @@ def _build_num_microbatches_calculator(
             Sequence length for token-to-sample conversion when using step_batch_size_schedule.
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
+
+    num_microbatches_calculator: Union[
+        'ConstantNumMicroBatchesCalculator',
+        'RampupBatchsizeNumMicroBatchesCalculator',
+        'StepBatchsizeNumMicroBatchesCalculator',
+    ]
 
     # Validate mutually exclusive options
     if step_batch_size_schedule is not None and rampup_batch_size is not None:

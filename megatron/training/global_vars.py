@@ -99,9 +99,9 @@ def set_global_variables(args, build_tokenizer=True):
         args.global_batch_size,
         args.micro_batch_size,
         args.data_parallel_size,
-        args.step_batch_size_schedule,
-        args.seq_length,
         args.decrease_batch_size_if_needed,
+        step_batch_size_schedule=args.step_batch_size_schedule,
+        seq_length=args.seq_length,
     )
     if build_tokenizer:
         _ = _build_tokenizer(args)
