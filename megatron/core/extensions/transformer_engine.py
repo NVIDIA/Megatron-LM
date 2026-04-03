@@ -1809,9 +1809,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
                 if self.use_bias:
-                    maybe_remap_param(
-                        "bias", getattr(self, "single_grouped_bias", False)
-                    )
+                    maybe_remap_param("bias", getattr(self, "single_grouped_bias", False))
 
             self._register_load_state_dict_pre_hook(
                 normalize_grouped_parameter_keys, with_module=True
