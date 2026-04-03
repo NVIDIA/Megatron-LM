@@ -390,7 +390,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 per_token_bytes=mem_params['per_token_bytes'],
                 gpu_total_bytes=torch.cuda.get_device_properties(
                     torch.cuda.current_device()
-                ).total_mem,
+                ).total_memory,
                 memory_after_model_load_bytes=torch.cuda.memory_allocated(),
             )
 
