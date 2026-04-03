@@ -906,24 +906,39 @@ class _ParamAndGradBuffer:
                 and self.ddp_config.use_distributed_optimizer
             )
 
-        # Check if this buffer contains NVFP4 params
+        # Check if this buffer contains NVFP4 params.
+        #
+        # NVFP4 uses a dual-buffer layout: the param buffer stores packed bytes (half the
+        # logical numel) while the grad buffer uses the full numel. This is because NVFP4
+        # packs two FP4 values into a single uint8 byte for storage/communication, but
+        # gradients are computed and reduced in BF16 at full element count.
+        #
+        #   Logical param (BF16 view):  [v0, v1, v2, v3, ...]   numel = N
+        #
+        #   Param buffer  (uint8):      [byte0, byte1, ...]      numel = N // 2
+        #                                 ^^^^^ packs v0+v1
+        #
+        #   Grad buffer   (BF16):       [g0, g1, g2, g3, ...]   numel = N
+        #
+        # We therefore maintain two index maps:
+        #   - param_index_map:        offsets into the packed param buffer  (numel // 2)
+        #   - nvfp4_grad_index_map:   offsets into the full-size grad buffer (numel)
+        #
         self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
-        # For NVFP4, we need separate tracking for param buffer (packed) and grad buffer (full)
-        self.nvfp4_grad_index_map = {}  # Maps param -> (start, end, bucket_id) for grad buffer
+        self.nvfp4_grad_index_map = {}
         grad_start_index = 0 if self.has_nvfp4_params else None
         grad_bucket_start_index = 0 if self.has_nvfp4_params else None
 
         for param, _ in params_with_names[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
-            # Use full numel for grad buffer allocation
             full_numel = param.data.nelement()
-            # For NVFP4 params, use packed numel for param buffer to avoid zeros.
+            # NVFP4 params are packed (2 values per byte), so the param buffer uses
+            # half the logical numel. Non-NVFP4 params use the full numel for both.
             if self.has_nvfp4_params and is_nvfp4tensor(param):
-                # NVFP4: use packed numel (half of logical numel) for param buffer
-                this_numel = full_numel // 2
+                param_numel = full_numel // 2
             else:
-                this_numel = full_numel
+                param_numel = full_numel
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
             # Create bucket with collected parameters if current param needs its own bucket.
@@ -932,11 +947,12 @@ class _ParamAndGradBuffer:
                 # previous bucket.
                 param_start_index = _update_bucket_metadata(param_start_index)
 
-            param_end_index = param_start_index + this_numel
+            param_end_index = param_start_index + param_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
             bucket_params.add(param)
 
-            # For NVFP4, track separate grad buffer offsets (using full numel)
+            # For NVFP4, the grad buffer is sized at full numel (not packed), so we
+            # maintain a parallel index map using full_numel for every param.
             if self.has_nvfp4_params:
                 grad_start_index = _pad_start_of_param_if_needed(grad_start_index)
                 grad_end_index = grad_start_index + full_numel
@@ -962,14 +978,11 @@ class _ParamAndGradBuffer:
         self.numel = bucket_end_index
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
 
-        # For NVFP4, grad buffer needs full size (2x packed size)
+        # For NVFP4, grad buffer needs full size (roughly 2x the packed param buffer).
         if self.has_nvfp4_params:
-            # Pad grad_numel to be divisible by dp_size
             self.grad_numel = grad_start_index
             if self.ddp_config.use_distributed_optimizer:
-                remainder = self.grad_numel % self.data_parallel_world_size
-                if remainder > 0:
-                    self.grad_numel += self.data_parallel_world_size - remainder
+                self.grad_numel = _pad(self.grad_numel, self.data_parallel_world_size)
         else:
             self.grad_numel = self.numel
 
@@ -1060,7 +1073,9 @@ class _ParamAndGradBuffer:
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
                 if self.param_data is not None:
                     if is_nvfp4tensor(param):
-                        # NVFP4 params: map rowwise packed bytes (uint8) into the param buffer.
+                        # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
+                        # points into the contiguous DDP param buffer. This enables the
+                        # all-gather to communicate packed NVFP4 bytes directly.
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
 
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
@@ -1431,10 +1446,12 @@ def partition_buckets(
         fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
-                # When using reduce-scatter with FP32 accumulation,
-                # we can only have one bucket per group.
+                # reduce_scatter_with_fp32_accumulation requires exactly one bucket
+                # per group (see assert in _ParamAndGradBucketGroup.reduce_scatter).
+                # Without this flag the non-FP8 buckets would be merged into the last
+                # FP8 group, violating that constraint. So we split them out into
+                # their own individual groups instead.
                 if reduce_scatter_with_fp32_accumulation:
-                    # Create separate groups for FP8 bucket and non-FP8 buckets
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
