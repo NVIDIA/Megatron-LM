@@ -149,6 +149,11 @@ def add_text_generate_ptq_args(parser):
         help="Number of last layers to skip quantization.",
     )
     group.add_argument(
+        "--sync-expert-weight-amax",
+        action="store_true",
+        help="Synchronize expert weight amax across experts.",
+    )
+    group.add_argument(
         "--lora-config",
         type=str,
         default=None,
@@ -283,6 +288,9 @@ def get_modelopt_torch_quantization_config():
             num_layers=args.num_layers,
             num_layers_to_disable=args.num_last_layers_to_skip_quant,
         )
+
+    if args.sync_expert_weight_amax:
+        mtq_config["sync_expert_weight_amax"] = True
 
     return mtq_config
 

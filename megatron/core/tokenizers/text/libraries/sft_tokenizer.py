@@ -109,6 +109,20 @@ class SFTTokenizer:
 
         self._prompt_format = prompt_format
 
+    @staticmethod
+    def _extract_token_ids(result):
+        """Extract token IDs as a numpy array from apply_chat_template output."""
+        if hasattr(result, 'input_ids'):
+            ids = result['input_ids']
+            if hasattr(ids, 'shape'):
+                return ids[0]
+            return np.array(ids[0] if isinstance(ids[0], list) else ids)
+        if hasattr(result, 'ids'):
+            return np.array(result.ids)
+        if isinstance(result, list):
+            return np.array(result)
+        return result[0]
+
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
@@ -129,22 +143,14 @@ class SFTTokenizer:
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
-        tokens = self._tokenizer.apply_chat_template(
+        tokens = self._extract_token_ids(self._tokenizer.apply_chat_template(
             conversation,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
             return_tensors="np",
             chat_template=self._prompt_config.custom_chat_template,
-        )[0]
-        # Some tokenizer versions return a tokenizers.Encoding or BatchEncoding instead of a numpy array.
-        # BatchEncoding is a UserDict subclass (not dict), but has .input_ids property.
-        if hasattr(tokens, 'input_ids'):
-            tokens = np.array(tokens.input_ids, dtype=np.int64)
-        elif isinstance(tokens, dict):
-            tokens = np.array(tokens['input_ids'], dtype=np.int64)
-        elif hasattr(tokens, 'ids'):
-            tokens = np.array(tokens.ids, dtype=np.int64)
+        ))
 
         if not return_target:
             return tokens
@@ -153,7 +159,7 @@ class SFTTokenizer:
 
         # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.
-        if self._prompt_format == "default":
+        if self._prompt_format in ("default", "identity"):
             return tokens, target
 
         # Mask system and user tokens in the target.
@@ -165,16 +171,9 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant":
                 assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
-            turn_tokens = self._tokenizer.apply_chat_template(
+            turn_tokens = self._extract_token_ids(self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
-            )
-            # BatchEncoding is a UserDict subclass (not dict), but has .input_ids property.
-            if hasattr(turn_tokens, 'input_ids'):
-                turn_tokens = turn_tokens.input_ids
-            elif isinstance(turn_tokens, dict):
-                turn_tokens = turn_tokens['input_ids']
-            elif hasattr(turn_tokens, 'ids'):
-                turn_tokens = turn_tokens.ids
+            ))
 
             # There should be only one BOS at the very beginning.
             # After the first turn, skip BOS token.
