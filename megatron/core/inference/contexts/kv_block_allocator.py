@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+import time
 from collections import deque
 from typing import Callable, Dict, Optional
 
@@ -162,6 +164,8 @@ class KVBlockAllocator:
         Return:
             (Optional[Tensor]) Allocated block IDs.
         """
+        t0 = time.perf_counter() if self.chunk_tracker is not None else None
+
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
             if (
@@ -187,6 +191,15 @@ class KVBlockAllocator:
         if self.chunk_tracker is not None:
             for bid in block_ids.tolist():
                 self.chunk_tracker.activate_slot(bid)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logging.debug(
+                "KVBlockAllocator.allocate: %d blocks in %.3f ms "
+                "(paused chunks: %d/%d)",
+                num_blocks,
+                elapsed_ms,
+                self.chunk_tracker.num_paused,
+                self.chunk_tracker.num_chunks,
+            )
 
         return block_ids
 
@@ -204,6 +217,8 @@ class KVBlockAllocator:
         """
         if blocks.numel() == 0:
             return
+
+        t0 = time.perf_counter() if self.chunk_tracker is not None else None
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
@@ -234,6 +249,17 @@ class KVBlockAllocator:
             if self.chunk_tracker is not None:
                 for bid in blocks.tolist():
                     self.chunk_tracker.deactivate_slot(bid)
+
+        if self.chunk_tracker is not None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logging.debug(
+                "KVBlockAllocator.release: %d blocks in %.3f ms "
+                "(paused chunks: %d/%d)",
+                blocks.numel(),
+                elapsed_ms,
+                self.chunk_tracker.num_paused,
+                self.chunk_tracker.num_chunks,
+            )
 
     def reset(self) -> None:
         """Reset the allocator to initial state.

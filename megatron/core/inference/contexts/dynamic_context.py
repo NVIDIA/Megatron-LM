@@ -776,7 +776,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             kv_ctx = torch_memory_saver.region(
                 tag=kv_tms_tag,
-                enable_cpu_backup=True,
+                enable_cpu_backup=False,
                 num_chunks=num_kv_chunks,
             )
         else:
@@ -843,7 +843,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 ctx = torch_memory_saver.region(
                     tag=mamba_tms_tag,
-                    enable_cpu_backup=True,
+                    enable_cpu_backup=False,
                     num_chunks=num_mamba_chunks,
                 )
             else:
