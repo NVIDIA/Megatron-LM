@@ -797,22 +797,48 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
+        self.mamba_chunk_tracker = None
+
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
-                device=torch.cuda.current_device(),
-            )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
-                device=torch.cuda.current_device(),
-            )
+
+            if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+                from megatron.core.inference.contexts.mamba_chunk_manager import (
+                    ChunkTracker,
+                )
+
+                num_mamba_chunks = 8
+                mamba_tms_tag = "mamba_states"
+                self.mamba_chunk_tracker = ChunkTracker(
+                    total_slots=self.max_requests,
+                    num_chunks=num_mamba_chunks,
+                    tms_tag=mamba_tms_tag,
+                )
+                ctx = torch_memory_saver.region(
+                    tag=mamba_tms_tag,
+                    enable_cpu_backup=True,
+                    num_chunks=num_mamba_chunks,
+                )
+            else:
+                from contextlib import nullcontext
+                ctx = nullcontext()
+
+            with ctx:
+                self.mamba_conv_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                    dtype=self.mamba_ssm_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
@@ -1507,6 +1533,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
+                if self.mamba_chunk_tracker is not None:
+                    self.mamba_chunk_tracker.activate_slot(mamba_idx)
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
@@ -2277,6 +2305,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 restored = self.mamba_slot_allocator.restore_to_live(
                     self.total_request_count, restore_block_id
                 )
+            if self.mamba_chunk_tracker is not None:
+                self.mamba_chunk_tracker.activate_slot(mamba_idx)
             if not restored:
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
@@ -2403,6 +2433,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Free Mamba slots.
         if self.is_hybrid_model:
+            if self.mamba_chunk_tracker is not None:
+                mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[request_indexes]
+                for idx in mamba_indices.tolist():
+                    if idx >= 0:
+                        self.mamba_chunk_tracker.deactivate_slot(idx)
             self.mamba_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests
