@@ -29,7 +29,7 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
+from megatron.core.models.hybrid.hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide

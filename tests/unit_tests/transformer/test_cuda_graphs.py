@@ -23,7 +23,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,

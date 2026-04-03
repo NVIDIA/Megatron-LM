@@ -7,7 +7,7 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -87,7 +87,7 @@ class TestMambaBlock:
         invalid_symbol = '+'
         assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
-        # validate_segment_layers() in mamba_hybrid_layer_allocation.py throws a ValueError.
+        # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
             block = self.get_mamba_block(layer_pattern)
 

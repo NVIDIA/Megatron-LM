@@ -161,7 +161,7 @@ class HybridModel(LanguageModule):
                 "Use hybrid_layer_pattern instead.",
             )
             if self.hybrid_layer_pattern is None:
-                from megatron.core.ssm.mamba_hybrid_layer_allocation import pattern_from_ratios
+                from megatron.core.models.hybrid.hybrid_layer_allocation import pattern_from_ratios
 
                 attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
                 mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
@@ -171,7 +171,7 @@ class HybridModel(LanguageModule):
 
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
         )

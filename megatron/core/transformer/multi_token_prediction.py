@@ -813,7 +813,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = HybridStack(
                 config=self.config,
