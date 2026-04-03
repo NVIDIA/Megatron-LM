@@ -94,9 +94,9 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers; python_version >= '3.12'",
-    "flask[async]",
+    "quart",
     "hypercorn",
-    "openai",
+    "openai[aiohttp]",
 ]
 
 lts = [
