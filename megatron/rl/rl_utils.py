@@ -458,6 +458,29 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
+        # Autotune parallel generation tasks based on engine capacity.
+        engine = inference_interface._inference_engine
+        max_requests = engine.context.max_requests
+        dp_size = len(dist.get_process_group_ranks(engine.pg_collection.dp))
+        G = args.grpo_group_size
+        P = args.grpo_prompts_per_step
+        max_effective_tasks = max(1, dp_size * max_requests // G)
+        max_effective_lag = max_effective_tasks / P - 1
+        if args.rl_desired_lag is not None:
+            if args.rl_parallel_generation_tasks > max_effective_tasks:
+                print_rank_0(
+                    f"WARNING: --rl-desired-lag {args.rl_desired_lag} results in "
+                    f"{args.rl_parallel_generation_tasks} parallel tasks, which exceeds "
+                    f"the maximum effective {max_effective_tasks} "
+                    f"(DP={dp_size}, max_requests={max_requests}, G={G}). "
+                    f"Maximum effective lag is {max_effective_lag:.2f}.")
+        else:
+            args.rl_parallel_generation_tasks = max_effective_tasks
+            print_rank_0(
+                f"Autotuned rl_parallel_generation_tasks={max_effective_tasks} "
+                f"(effective lag={max_effective_lag:.2f}, "
+                f"DP={dp_size}, max_requests={max_requests}, G={G}).")
+
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
             num_groups=args.rl_generation_batch_size,
