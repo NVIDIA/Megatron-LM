@@ -37,7 +37,7 @@ jobs:
         run: |
           gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
             --method POST \
-            -f content='+1'
+            -f content='eyes'
 
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
