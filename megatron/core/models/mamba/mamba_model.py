@@ -21,6 +21,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
     process_mtp_loss,
+    roll_tensor,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -418,10 +419,29 @@ class MambaModel(LanguageModule):
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For RL: create labels and loss_mask by shifting to match SFT format.
+                mtp_labels = labels
+                mtp_loss_mask = loss_mask
+                if mtp_labels is None and input_ids is not None:
+                    mtp_labels, _ = roll_tensor(
+                        input_ids,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.pg_collection.cp,
+                        packed_seq_params=packed_seq_params,
+                    )
+                    if loss_mask is not None:
+                        mtp_loss_mask, _ = roll_tensor(
+                            loss_mask,
+                            shifts=-1,
+                            dims=-1,
+                            cp_group=self.pg_collection.cp,
+                            packed_seq_params=packed_seq_params,
+                        )
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
-                    labels=labels,
-                    loss_mask=loss_mask,
+                    labels=mtp_labels,
+                    loss_mask=mtp_loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
