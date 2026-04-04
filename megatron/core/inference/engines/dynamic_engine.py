@@ -1109,6 +1109,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            is_prefill = len(request.generated_tokens) == 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1172,7 +1173,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
                 # Track acceptance statistics for logging.
-                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                # Skip prefill requests: MTP heads only propose speculative tokens
+                # for decode requests, so counting prefill requests would inflate
+                # the denominator and artificially deflate the acceptance rate.
+                if not is_prefill and len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
                     actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
 
@@ -1883,31 +1887,20 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
                 spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
-                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
+                output_str += " ... spec (cumul): accept %.1f%% (%d/%d in %d steps)" % (
                     spec_rate,
                     self._spec_tokens_accepted,
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
+                output_str += " ... prefix cache (cumul): %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
-
-            # Reset speculative decoding accumulators after both wandb and console logging.
-            if self.num_speculative_tokens > 0:
-                self._spec_tokens_proposed = 0
-                self._spec_tokens_accepted = 0
-                self._spec_steps = 0
-
-            # Reset prefix caching accumulators after both wandb and console logging.
-            if self.context.enable_prefix_caching:
-                self._prefix_cache_hits = 0
-                self._prefix_cache_blocks_matched = 0
 
         return {
             "active_request_ids": active_request_ids,

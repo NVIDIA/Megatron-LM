@@ -1785,9 +1785,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter and LRU clock
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
+        # Note: step_count and prefix_cache_lru_clock are lifetime counters
+        # and are only reset in reset(), not here, so they persist across
+        # suspend/resume cycles.
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -1812,6 +1812,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self.reset_tensors()
         self.reset_metadata()
+
+        # Reset lifetime counters (not reset in reset_metadata, which is also
+        # called during suspend/resume where these must persist).
+        self.step_count = 0
+        self.prefix_cache_lru_clock = 0
 
         # Reset Mamba cache state
         if self.mamba_slot_allocator is not None:
