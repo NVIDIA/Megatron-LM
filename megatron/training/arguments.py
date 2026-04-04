@@ -1377,6 +1377,7 @@ def validate_args(args, defaults={}):
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # emerging optimizer check
+    args.use_layer_wise_distributed_optimizer = False
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
