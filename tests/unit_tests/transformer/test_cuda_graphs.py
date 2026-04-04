@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -15,15 +15,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_block import MambaStack
-from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -486,8 +486,8 @@ class TestParallelMambaBlockCudagraphs:
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
             )
-            modules = mamba_stack_spec.submodules
-            return MambaStack(
+            modules = hybrid_stack_spec.submodules
+            return HybridStack(
                 transformer_config,
                 modules,
                 layer_type_list=layer_type_list,

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for full MambaModel inference with expert-parallel batch dimension sync.
+"""Tests for full HybridModel inference with expert-parallel batch dimension sync.
 
 When expert parallelism > 1 with strict matching (hybrid models), batch
 dimensions are MAX-reduced across EP ranks.  Different EP ranks can be in
@@ -11,7 +11,7 @@ one of four request states:
   - PREFILL: 0 decode requests, >0 prefill requests
   - MIXED:   >0 decode requests, >0 prefill requests
 
-These tests verify that the full MambaModel produces correct output shapes
+These tests verify that the full HybridModel produces correct output shapes
 for every combination of these states across EP ranks, using the real EP
 synchronization path (strict matching + MAX-reduce on batch dimensions).
 """
@@ -24,8 +24,8 @@ from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -56,7 +56,7 @@ _STATE_DIMS = {
 
 @pytest.mark.internal
 class TestDynamicInference:
-    """Verify full MambaModel output shapes under EP strict matching scenarios."""
+    """Verify full HybridModel output shapes under EP strict matching scenarios."""
 
     HIDDEN_SIZE = 256
     NUM_ATTN_HEADS = 4
@@ -95,9 +95,9 @@ class TestDynamicInference:
             num_moe_experts=2,
             moe_token_dispatcher_type="alltoall",
         )
-        model = MambaModel(
+        model = HybridModel(
             config=config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
             hybrid_layer_pattern="M*",

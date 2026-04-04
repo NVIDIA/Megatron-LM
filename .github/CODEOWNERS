@@ -4,7 +4,10 @@ megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
 
-megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
+megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+
+megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
 
 megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets

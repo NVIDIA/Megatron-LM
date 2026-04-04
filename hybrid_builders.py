@@ -1,33 +1,33 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
 from model_provider import count_parameters_in_layer
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.mamba.mamba_layer_specs import mamba_inference_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 
 
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    print_rank_0('building MAMBA model ...')
+def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    print_rank_0('building Hybrid model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
-    assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
+    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
 
     if config.transformer_impl == "inference_optimized":
-        mamba_stack_spec = mamba_inference_stack_spec
+        hybrid_stack_spec = hybrid_inference_stack_spec
         assert (
             not config.inference_fuse_tp_communication
-        ), "inference_fuse_tp_communication is not supported for Mamba"
+        ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        mamba_stack_spec = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
     else:
-        raise ValueError("You must provide a valid Mamba layer spec via --spec")
+        raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
-    model = MambaModel(
+    model = HybridModel(
         config=config,
-        mamba_stack_spec=mamba_stack_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
@@ -48,3 +48,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         print_rank_0(f" == params layer {l}: {layer_params}")
 
     return model
+
+
+# Backward-compatible alias
+mamba_builder = hybrid_builder

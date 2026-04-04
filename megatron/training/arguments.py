@@ -612,7 +612,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
         Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
     )

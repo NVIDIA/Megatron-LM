@@ -16,7 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
