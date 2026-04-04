@@ -639,6 +639,13 @@ def checkpoint(
 ) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+    # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
+    # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot
+    # run inside a captured graph.
+    if is_graph_warmup() or is_graph_capturing():
+        return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
