@@ -275,7 +275,9 @@ def test_null_tokenizer():
     ids = tokenizer.tokenize("11 325 97")
 
     assert ids == [11, 325, 97]
-    assert tokenizer.vocab_size == 131073
+    assert tokenizer.vocab_size == 131072
+    assert tokenizer.eod == 131071
+    assert tokenizer.pad == 0
 
 
 @pytest.mark.parametrize("skip_special_tokens", [True, False])
