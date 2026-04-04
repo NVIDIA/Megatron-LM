@@ -2480,6 +2480,8 @@ def _add_training_args(parser):
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
+    group.add_argument('--optimizer-cuda-graph', action='store_true',
+                       help='Enable CUDA graph for optimizer step')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
