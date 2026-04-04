@@ -335,6 +335,15 @@ class CheckpointConfig:
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
 
+    save_params_interval: int | None = None
+    """Number of iterations between param.name->param.data mapping saves."""
+
+    save_activations_interval: int | None = None
+    """Number of iterations between act.name->act.data mapping saves."""
+
+    save_tokens_per_experts_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
