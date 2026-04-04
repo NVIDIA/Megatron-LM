@@ -13,7 +13,7 @@ If there is a conflict between this file and the Google style guides, prioritize
 
 ### Python Standard
 
-1. The code developed for Megatron-LM should conform to Python 3.10+.
+1. The code developed for Megatron-LM should conform to Python 3.12+.
 
 ### Line Length
 
@@ -38,7 +38,6 @@ If there is a conflict between this file and the Google style guides, prioritize
 
 4. Local Variables
    - snake_case: `my_variable = ...`
-   - prefix `k` for variable names that start with a number: `k_99th_percentile = ...`
 
 5. Global Variables
    - upper snake_case: `MY_GLOBAL = ...`
@@ -77,7 +76,7 @@ from megatron.core import parallel_state as mpu
 
 ### String Quotes
 
-1. Use **double quotes** for strings (matching ruff formatter configuration).
+1. Use **double quotes** for strings.
 
 ### Comments
 
@@ -162,29 +161,29 @@ else:
 ### Type Hints
 
 1. Use type hints for function arguments and return types.
-2. Use `T | None` for nullable types (not `Optional[T]`).
-3. Use `X | Y` for union types (not `Union[X, Y]`).
+2. Use `Optional[T]` for nullable types.
+3. Use `Union[X, Y]` for union types.
 4. Use `TypeVar` for generic type parameters.
-5. Use built-in generics (`list`, `dict`, `tuple`) instead of `typing` equivalents.
+5. Use `typing` generics (`List`, `Dict`, `Tuple`) for type annotations. Built-in generics (`list`, `dict`) are also acceptable.
 
 Example:
 
 ```python
-from typing import TypeVar
+from typing import Dict, List, Optional, TypeVar, Union
 
 T = TypeVar("T", bound=torch.nn.Module)
 
 def get_module_by_name(
     model: T,
     name: str,
-    default: torch.nn.Module | None = None,
-) -> torch.nn.Module | None:
+    default: Optional[torch.nn.Module] = None,
+) -> Optional[torch.nn.Module]:
     """Get a module from a model by its name."""
     ...
 
 def convert_weights(
-    weights: torch.Tensor | dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
+    weights: Union[torch.Tensor, Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
     """Convert weights, accepting either a single tensor or a dict."""
     ...
 ```
@@ -198,40 +197,31 @@ def convert_weights(
 Example:
 
 ```python
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 @dataclass
-class GPTModel(LanguageModule):
-"""GPT Transformer language model.
+class TransformerConfig(ModelParallelConfig):
+    """Configuration object for megatron-core transformers.
 
-Args:
-    config (TransformerConfig):
-        Transformer config
-    transformer_layer_spec (ModuleSpec):
-        Specifies module to use for transformer layers
-    vocab_size (int):
-        Vocabulary size
-    max_sequence_length (int):
-        maximum size of sequence. This is used for positional embedding
-    pre_process (bool, optional):
-        Include embedding layer (used with pipeline parallelism). Defaults to True.
-    post_process (bool, optional):
-        Include an output layer (used with pipeline parallelism). Defaults to True.
-    fp16_lm_cross_entropy (bool, optional):
-        Defaults to False.
-"""
+    The initialization function has an argument for each parameter,
+    including those in ModelParallelConfig.
+    """
 
-def __init__(
-    self,
-    config: TransformerConfig,
-    transformer_layer_spec: ModuleSpec,
-    vocab_size: int,
-    max_sequence_length: int,
-    pre_process: bool = True,
-    post_process: bool = True,
-    fp16_lm_cross_entropy: bool = False
-) -> None:
-    ...
+    num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
+    """Number of transformer layers in a transformer block."""
+
+    mtp_num_layers: Optional[int] = None
+    """Number of Multi-Token Prediction (MTP) Layers."""
+
+    mtp_loss_scaling_factor: Optional[float] = 0.1
+    """Weighting factor of Multi-Token Prediction (MTP) loss."""
+
+    hidden_size: int = field(default=0, metadata={"argparse_meta": {"default": None}})
+    """Transformer hidden size."""
+
+    num_attention_heads: int = field(default=0, metadata={"argparse_meta": {"default": None}})
+    """Number of transformer attention heads."""
 ```
 
 ### Avoid Reflection
@@ -275,7 +265,7 @@ When a new markdown doc is added under `docs/**/*.md` or a markdown file is rena
 - Place unit tests in `tests/unit_tests/`
 - Name test files with `test_` prefix: `test_gpt_model.py`
 - Use pytest fixtures for common setup
-- Use `pytest.mark` to categorize tests (unit, integration, system)
+- Use `pytest.mark` to categorize tests (`internal`, `flaky`, `flaky_in_dev`)
 
 ### Functional Tests
 
@@ -290,14 +280,15 @@ Use appropriate pytest markers:
 ```python
 import pytest
 
-@pytest.mark.unit
-def test_parameter_mapping():
-    """Test that parameter mapping is correct."""
+@pytest.mark.internal
+def test_private_helper():
+    """Test a private/internal function."""
     ...
 
-@pytest.mark.integration
-def test_model_loading():
-    """Test end-to-end model loading."""
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_distributed_grad_sync():
+    """Test that may be flaky in both LTS and DEV environments."""
     ...
 ```
 
@@ -306,5 +297,5 @@ def test_model_loading():
 Add the following NVIDIA copyright header to all Python files and shell scripts. The header should appear at the top of the file:
 
 ```python
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
 ```
