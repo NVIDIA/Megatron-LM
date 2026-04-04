@@ -1547,6 +1547,11 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 if "recv_prev" in fwd_wait_handles:
                     recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
+            # isend() copies asynchronously; wait until the copy is done before
+            # freeing the source buffer, otherwise the next PP stage gets corrupted data.
+            if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                send_next_wait_handle.wait()
+                send_next_wait_handle = None
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
             if recv_prev:
@@ -1669,6 +1674,11 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     if "recv_prev" in fwd_wait_handles:
                         recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
+                # isend() copies asynchronously; wait until the copy is done before
+                # freeing the source buffer, otherwise the next PP stage gets corrupted data.
+                if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                    send_next_wait_handle.wait()
+                    send_next_wait_handle = None
                 # assert fwd_wait_handles is not None
 
                 # Put input_tensor and output_tensor_grad in data structures in the
