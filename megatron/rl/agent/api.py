@@ -271,7 +271,10 @@ class GroupedRolloutGenerator(Agent, ABC):
         shutdown_task = asyncio.create_task(shutdown_queue_when_done())
 
         try:
-            next_batch_id = 0
+            # Forced lag involves strict ordering at steady-state.
+            # However, the initial conditions do not require (and are harmed by) strict ordering.
+            warmup_groups_until_release = groups_per_worker
+            next_batch_id = num_workers
             pending: dict[int, GroupedRollouts] = {}
             while True:
                 try:
@@ -279,16 +282,25 @@ class GroupedRolloutGenerator(Agent, ABC):
                 except asyncio_QueueShutDown:
                     break
                 if request.enforce_order:
-                    # Accumulate groups and enforce submission order across batches.
-                    pending.setdefault(group.batch_id, []).append(group)
-                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
-                        assert l == groups_per_worker
-                        batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g.index_in_batch)
-                        next_batch_id += 1
-                        for g in batch:
-                            yield g
-                        submission_gate.release()
+                    if group.batch_id < num_workers:
+                        # Warmup: initial batches all have equal staleness;
+                        # yield immediately without waiting for batch completion.
+                        yield group
+                        warmup_groups_until_release -= 1
+                        if warmup_groups_until_release == 0:
+                            submission_gate.release()
+                            warmup_groups_until_release = groups_per_worker
+                    else:
+                        # Steady state: accumulate and enforce strict batch order.
+                        pending.setdefault(group.batch_id, []).append(group)
+                        while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
+                            assert l == groups_per_worker
+                            batch = pending.pop(next_batch_id)
+                            batch.sort(key=lambda g: g.index_in_batch)
+                            next_batch_id += 1
+                            for g in batch:
+                                yield g
+                            submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
                     yield group
