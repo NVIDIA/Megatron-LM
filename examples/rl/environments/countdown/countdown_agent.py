@@ -40,5 +40,6 @@ class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
         golden = dataset[random.randrange(len(dataset))]
         return self.make_prefix(**golden), golden
 
-    async def get_reward(self, response, golden: dict) -> float:
+    async def get_reward(self, response, golden: dict, finish_reason: str | None = None) -> float:
+        # NOTE: finish_reason is intentionally unused.
         return compute_score(response, golden)
