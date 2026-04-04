@@ -71,7 +71,12 @@ def initialize_gpt_model(
         else:
             layer_spec = layer_spec_fn()
 
-        if with_mtp and mtp_on_this_rank(transformer_config, ignore_virtual=False, vp_stage=i):
+        if with_mtp and mtp_on_this_rank(
+            layout=transformer_config.pipeline_model_parallel_layout,
+            mtp_num_layers=transformer_config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=i,
+        ):
             if is_moe:
                 transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
             else:
@@ -121,6 +126,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
+    args.async_strategy = "nvrx"
     args.data_parallel_random_init = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
@@ -134,7 +140,7 @@ def create_args():
     args.consumed_valid_samples = 0
     args.vocab_file = None
     args.add_position_embedding = False
-    args.ckpt_assume_constant_structure = False
+    args.ckpt_assume_constant_structure = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
     args.bf16 = True
@@ -147,7 +153,6 @@ def create_args():
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
-    args.async_strategy = "nvrx"
 
     yield args
 

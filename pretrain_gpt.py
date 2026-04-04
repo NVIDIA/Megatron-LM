@@ -22,15 +22,24 @@ from typing import List, Optional, Tuple
 import torch
 
 from gpt_builders import gpt_builder
-from megatron.core import parallel_state
+from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import (
+    StragglerDetector,
+    get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+)
 from megatron.training import (
     get_args,
     get_timers,
@@ -39,13 +48,11 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
@@ -63,104 +70,72 @@ stimer = StragglerDetector()
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
-    """Generate a batch.
+    """Generate a batch."""
 
-    Packed sequence support (SFT / ``--sft`` flag):
-        When ``args.sft`` is True, the dataset emits THD-format batches where
-        multiple sequences are concatenated into a single flat token tensor.
-        The batch includes ``cu_seqlens`` (cumulative sequence lengths, shape
-        ``[1, S+1]``) and ``max_seqlen`` (shape ``[1]``) that describe the
-        individual sequence boundaries.
+    batch_keys = [
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "attention_mask",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "max_seqlen",
+        "local_cp_size",
+        "hybrid_cp_group",
+    ]
 
-        This function validates and squeezes those fields:
-          - ``cu_seqlens``:  asserted to have shape ``[1, S+1]`` (micro-batch
-            size must be 1 for packing), then squeezed to ``[S+1]``.
-          - ``max_seqlen``:  asserted to be 1-D; kept as a tensor and passed
-            to ``get_thd_batch_on_this_cp_rank`` which performs the final
-            scalar conversion internally.
-
-        Pipeline stage handling:
-          - First/last PP stages: fetch the full batch (tokens + labels) and
-            route through ``get_thd_batch_on_this_cp_rank`` to produce a
-            ``PackedSeqParams`` object that carries ``cu_seqlens`` and
-            ``max_seqlen`` to the attention kernel.
-          - Middle PP stages: only ``cu_seqlens`` and ``max_seqlen`` are
-            needed for attention masking; all other fields are returned as
-            ``None`` with a ``PackedSeqParams`` built directly here.
-          - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
-            regardless of pipeline stage.
-
-        Difference from ``pretrain_mamba.py``:
-          - Return format: GPT returns a 6-tuple
-            ``(tokens, labels, loss_mask, attention_mask, position_ids,
-            packed_seq_params)`` where ``packed_seq_params`` is a
-            ``PackedSeqParams`` dataclass.  Mamba returns 7 values via
-            ``batch.values()`` with ``cu_seqlens`` and ``max_seqlen`` as
-            separate dict entries (no ``PackedSeqParams`` wrapper).
-          - Middle-stage return: GPT returns ``(None×5, PackedSeqParams)``;
-            Mamba returns an ``empty_batch`` dict with ``cu_seqlens`` and
-            ``max_seqlen`` set.
-          - CP with packed sequences: GPT delegates to
-            ``get_thd_batch_on_this_cp_rank`` (MCore utility); Mamba
-            implements the ``tex.thd_get_partitioned_indices`` CP slicing
-            inline and does not call that helper.
-          - MTP: GPT passes ``mtp_on_this_rank`` to ``get_batch_on_this_tp_rank``
-            and uses it to gate the early-return; Mamba has no MTP support.
-          - ``max_seqlen`` conversion: Mamba converts to a Python int scalar
-            before returning (``int(max_seqlen[0].item())``); GPT keeps it as
-            a tensor and lets ``get_thd_batch_on_this_cp_rank`` convert it,
-            except for the middle-stage ``PackedSeqParams`` where conversion
-            is done inline.
-    """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
-    if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
 
-    # get batches based on the TP rank you are on
+    is_packed_sequence = args.sft
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    mtp_on_this_rank = mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
+    is_hybrid_cp = args.hybrid_context_parallel
+
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+        return [None for _ in batch_keys]
+
+    batch = {}
+    if tp_rank == 0:
+        data = next(data_iterator)
+        for key in batch_keys:
+            batch[key] = (
+                data[key].cuda(non_blocking=True)
+                if key in data and data[key] is not None
+                else None
+            )
+
     batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-        )
+        batch,
+        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        is_sft=is_packed_sequence,
+        is_hybrid_cp=is_hybrid_cp,
+        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+        cp_size=args.context_parallel_size,
+        tp_rank=tp_rank,
+        micro_batch_size=args.micro_batch_size,
+        seq_length=args.seq_length,
+        mtp_on_this_rank=mtp_on_this_rank,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+    )
 
-    cu_seqlens = batch.pop('cu_seqlens', None)
-    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
-    local_cp_size = batch.pop('local_cp_size', None)
-    if local_cp_size is not None:
-        local_cp_size = int(local_cp_size.item())
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=is_hybrid_cp,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+    )
 
-    if cu_seqlens is not None:
-        assert (
-            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        ), "micro-batch-size must be 1 for packing"
-        cu_seqlens = cu_seqlens[0]
-        assert max_seqlen.dim() == 1
-
-    # For middle pipeline stages with packed sequences, only cu_seqlens and
-    # max_seqlen are needed (for attention masking); skip the full batch.
-    if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
-        return None, None, None, None, None, PackedSeqParams(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=int(max_seqlen[0].item()),
-            max_seqlen_kv=int(max_seqlen[0].item()),
-            qkv_format='thd',
-        )
-
-    if cu_seqlens is None and local_cp_size is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-        packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-
-    return (*batch.values(), packed_seq_params)
+    return [batch[key] for key in sorted(batch.keys())]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -245,7 +220,45 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        (
+            attention_mask,
+            cu_seqlens,
+            cu_seqlens_padded,
+            hybrid_cp_group,
+            labels,
+            local_cp_size,
+            loss_mask,
+            max_seqlen,
+            position_ids,
+            tokens,
+        ) = get_batch(data_iterator, vp_stage)
+
+    packed_seq_params = None
+    if cu_seqlens is not None:
+        max_seqlen_value = int(max_seqlen[0].item())
+        if local_cp_size is not None:
+            packed_seq_params = PackedSeqParams(
+                qkv_format="sbhd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=max_seqlen_value,
+                max_seqlen_kv=max_seqlen_value,
+                local_cp_size=int(local_cp_size[0].item()),
+                cp_group=hybrid_cp_group,
+            )
+        else:
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=max_seqlen_value,
+                max_seqlen_kv=max_seqlen_value,
+            )
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -271,13 +284,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if parallel_state.get_tensor_model_parallel_rank() != 0:
+    if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
         return True
     return (
         is_first_or_last_pipeline_stage(vp_stage)
-        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        or mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
     )
 
 
