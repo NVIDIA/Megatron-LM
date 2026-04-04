@@ -270,12 +270,14 @@ def test_tiktoken_tokenizer():
 
 def test_null_tokenizer():
     metadata = {"library": "null-text"}
-    tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=131072)
+    vocab_size = 131072
+    tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=vocab_size)
 
-    ids = tokenizer.tokenize("11 325 97")
+    text = "11 325 97"
+    ids = tokenizer.tokenize(text)
 
-    assert ids == [11, 325, 97]
-    assert tokenizer.vocab_size == 131073
+    assert ids == [ord(c) % vocab_size for c in text]
+    assert tokenizer.vocab_size == vocab_size + 1
 
 
 @pytest.mark.parametrize("skip_special_tokens", [True, False])

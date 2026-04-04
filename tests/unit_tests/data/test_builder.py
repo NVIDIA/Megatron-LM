@@ -53,7 +53,7 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
             file_prefix_path + ".bin", dtype=DType.optimal_dtype(tokenizer.vocab_size)
         )
         number_of_documents = random.randint(10, maximum_number_of_documents)
-        for j in range(number_of_documents):
+        for _ in range(number_of_documents):
             number_of_tokens = random.randint(50, 100)
             tokenized_doc = [
                 str(random.randint(0, tokenizer.vocab_size - 1)) for _ in range(number_of_tokens)

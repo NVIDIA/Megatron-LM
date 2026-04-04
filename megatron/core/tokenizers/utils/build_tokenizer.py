@@ -11,6 +11,8 @@ SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2T
 
 logger = logging.getLogger(__name__)
 
+NULL_TOKENIZERS = {'NullTokenizer': 'null-text', 'NullMultimodalTokenizer': 'null-multimodal'}
+
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
@@ -67,10 +69,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sft'
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
-    elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
-        tokenizer_library = (
-            'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
-        )
+    elif args.tokenizer_type in NULL_TOKENIZERS.keys():
+        tokenizer_library = NULL_TOKENIZERS[args.tokenizer_type]
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size

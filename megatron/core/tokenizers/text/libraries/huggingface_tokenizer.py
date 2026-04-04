@@ -241,7 +241,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         tokens = self.tokenizer.convert_ids_to_tokens(ids)
         return tokens
 
-    def text_to_ids(self, text: str) -> List[int]:
+    def text_to_ids(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """Converts text to tokens ids."""
         if self.include_special_tokens:
             return self.tokenizer(text).input_ids

@@ -15,10 +15,11 @@ class NullTokenizer:
         """ """
         self._vocab_size_without_eod = int(vocab_size)
         self._eod_id = self._vocab_size_without_eod
+        self.pad_id = self._vocab_size_without_eod - 1
 
-    def text_to_ids(self, text):
+    def text_to_ids(self, text, add_special_tokens=True):
         """Converts text to ids."""
-        return [int(x) for x in text.split(' ')]
+        return [ord(x) % self._vocab_size_without_eod for x in text]
 
     def ids_to_text(self, ids):
         """Converts ids to text."""

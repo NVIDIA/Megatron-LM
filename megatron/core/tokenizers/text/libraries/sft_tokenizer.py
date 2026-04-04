@@ -154,7 +154,10 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
+                assert conversation[turn_idx - 1]["role"].lower() in (
+                    "user",
+                    "tool",
+                ), "Assistant turn must be preceded by a user or tool turn"
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
@@ -185,7 +188,7 @@ class SFTTokenizer:
 
         return tokens, target
 
-    def text_to_ids(self, text: Union[str, List[Dict]]):
+    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
@@ -193,7 +196,7 @@ class SFTTokenizer:
                 text, return_target=False, add_generation_prompt=True
             ).tolist()
 
-        return self._tokenizer.encode(text)
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
