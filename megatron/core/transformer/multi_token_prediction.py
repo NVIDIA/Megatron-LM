@@ -30,6 +30,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    compute_output_logits_fp32,
     get_pg_rank,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -662,11 +663,19 @@ def process_mtp_loss(
     original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
+        if config.fp32_residual_connection:
+            mtp_logits = compute_output_logits_fp32(
+                hidden_states=hidden_states_list[mtp_layer_number + 1],
+                output_layer=output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
