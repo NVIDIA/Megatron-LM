@@ -98,7 +98,23 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 vp_stage=vp_stage,
             )
 
-        model = GPTModel(
+        model_cls = GPTModel
+        model_kwargs = {}
+        if getattr(args, "use_engram", False):
+            from megatron.core.models.engram.engram_model import EngramGPTModel
+            from megatron.core.models.engram.plugin import (
+                apply_engram_to_transformer_layer_spec,
+                build_engram_config_from_args,
+            )
+
+            engram_config = build_engram_config_from_args(args)
+            transformer_layer_spec = apply_engram_to_transformer_layer_spec(
+                transformer_layer_spec, engram_config
+            )
+            model_cls = EngramGPTModel
+            model_kwargs["engram_config"] = engram_config
+
+        model = model_cls(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
@@ -115,6 +131,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
+            **model_kwargs,
         )
 
     return model

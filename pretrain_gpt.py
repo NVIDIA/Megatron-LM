@@ -29,6 +29,7 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.engram.plugin import add_engram_args
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_dynamic_cp_rank, StragglerDetector
@@ -63,6 +64,13 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def add_gpt_extra_args(parser):
+    parser = add_engram_args(parser)
+    if has_nvidia_modelopt:
+        parser = add_modelopt_args(parser)
+    return parser
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -431,7 +439,7 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=add_gpt_extra_args,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
