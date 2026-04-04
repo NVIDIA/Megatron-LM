@@ -141,6 +141,82 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_jit_compiled_helpers(self):
+        import torch._dynamo
+
+        gdn = self.gdn
+        batch = 2
+        seq_len = 16
+
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
+        qkv = torch.randn(
+            batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        gate = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            gdn.value_head_dim,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        beta = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        alpha = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        # Disable dynamo so coverage.py can trace through the method bodies,
+        # which are normally wrapped by @jit_fuser (torch.compile).
+        with torch._dynamo.config.patch(disable=True):
+            query, key, value, gate_out, beta_out, alpha_out = (
+                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+            )
+
+        # Run again with JIT enabled and compare numerics.
+        torch._dynamo.reset()
+        query_jit, key_jit, value_jit, gate_out_jit, beta_out_jit, alpha_out_jit = (
+            gdn._prepare_qkv_for_gated_delta_rule(
+                qkv.clone(), gate.clone(), beta.clone(), alpha.clone(), batch, seq_len
+            )
+        )
+
+        torch.testing.assert_close(query, query_jit)
+        torch.testing.assert_close(key, key_jit)
+        torch.testing.assert_close(value, value_jit)
+        torch.testing.assert_close(gate_out, gate_out_jit)
+        torch.testing.assert_close(beta_out, beta_out_jit)
+        torch.testing.assert_close(alpha_out, alpha_out_jit)
+
+        A_log = torch.randn(
+            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        dt_bias = torch.randn(
+            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+
+        with torch._dynamo.config.patch(disable=True):
+            g, beta_out = gdn._compute_g_and_beta(A_log, dt_bias, alpha, beta)
+
+        torch._dynamo.reset()
+        g_jit, beta_out_jit = gdn._compute_g_and_beta(
+            A_log.clone(), dt_bias.clone(), alpha.clone(), beta.clone()
+        )
+
+        torch.testing.assert_close(g, g_jit)
+        torch.testing.assert_close(beta_out, beta_out_jit)
+
 
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
