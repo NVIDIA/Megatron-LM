@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import FMLA_REQUIRED_BLOCK_SIZE, Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -167,6 +167,11 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        kv_channel_kwargs = (
+            dict(k_channels=self.q_head_dim, v_channels=self.config.v_head_dim)
+            if self.q_head_dim != self.config.v_head_dim
+            else {}
+        )
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -174,10 +179,9 @@ class MultiLatentAttention(Attention):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
+            **kv_channel_kwargs,
         )
 
         # Output.
@@ -331,9 +335,13 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
+                if (
+                    not inference_context.is_decode_only()
+                    or inference_context.block_size_tokens != FMLA_REQUIRED_BLOCK_SIZE
+                ):
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
@@ -341,7 +349,11 @@ class MultiLatentAttention(Attention):
                 )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context.is_decode_only()
+            and inference_context.block_size_tokens == FMLA_REQUIRED_BLOCK_SIZE
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -636,7 +648,10 @@ class MLASelfAttention(MultiLatentAttention):
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
             if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
-                # k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                # kv_compressed: [s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                kv_compressed = gather_from_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
         if packed_seq_params is not None:
@@ -703,6 +718,10 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
+            if self.config.sequence_parallel and kv_compressed.size(0) != k_pos_emb_squeezed.size(
+                0
+            ):
+                kv_compressed = gather_from_sequence_parallel_region(kv_compressed)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
 
             # Flag for whether to use absorption. We only use absorption
@@ -711,6 +730,7 @@ class MLASelfAttention(MultiLatentAttention):
                 self.config.cache_mla_latents
                 and inference_context
                 and inference_context.is_decode_only()
+                and inference_context.block_size_tokens == FMLA_REQUIRED_BLOCK_SIZE
             )
             # Compute query components. Multiply by up k if absorbing
             q_content = (
@@ -883,7 +903,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         # Seperated out the norm and linear
-        kv, _ = self.linear_kv_up_proj_linear(kv_compressed)
+        kv, _ = self.linear_kv_up_proj_linear(kv_compressed.contiguous())
 
         kv = kv.view(
             *kv.size()[:-1],
@@ -895,6 +915,8 @@ class MLASelfAttention(MultiLatentAttention):
 
         # Add head dimension
         k_pos_emb = k_pos_emb.unsqueeze(-2)
+        if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
         k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
 
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
@@ -926,16 +948,22 @@ class MLASelfAttention(MultiLatentAttention):
         # We should only have to call to set once at start
         if not hasattr(self, "up_k_weight"):
             with torch.no_grad():
-                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
-                    split_te_layernorm_column_parallel_linear(
-                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
+                if isinstance(self.linear_kv_up_proj, TELayerNormColumnParallelLinear):
+                    linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                        split_te_layernorm_column_parallel_linear(
+                            self.linear_kv_up_proj,
+                            self.config,
+                            None,
+                            self.linear_kv_up_proj.tp_group,
+                        )
                     )
-                )
 
-                # Note: When caching latents we overide the kv_layernorm
-                # which was an identity before because in the is path
-                # we unfused the linear_kv_up_proj
-                self.kv_layernorm = linear_kv_up_proj_norm
+                    # Note: When caching latents we overide the kv_layernorm
+                    # which was an identity before because in the is path
+                    # we unfused the linear_kv_up_proj
+                    self.kv_layernorm = linear_kv_up_proj_norm
+                else:
+                    linear_kv_up_proj_linear = self.linear_kv_up_proj
 
                 # This is used in absorption when we are
                 # uncompressing the KV cache in prefill/mixed stages
