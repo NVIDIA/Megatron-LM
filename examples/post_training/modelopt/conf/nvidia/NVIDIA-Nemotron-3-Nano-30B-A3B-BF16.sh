@@ -11,7 +11,7 @@ MODEL_ARGS=" \
     --trust-remote-code \
     --save-interval 100000 \
     --micro-batch-size 1 \
-    --moe-token-dispatcher-type allgather \
+    --moe-token-dispatcher-type alltoall \
     --enable-experimental \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \

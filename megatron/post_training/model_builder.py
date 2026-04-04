@@ -28,6 +28,40 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.post_training.utils import print_distributed_quant_summary
 
 
+def _sync_lora_weights_across_dp(model):
+    """Broadcast LoRA weights from DP rank 0 so all replicas start identical.
+
+    Uses the ``allreduce`` attribute on each parameter (set by modelopt during adapter
+    creation) to choose the correct process group — regular DP for non-expert params,
+    expert-DP for expert params — matching the groups used by DDP and hash checks.
+    """
+    try:
+        import torch.distributed as dist
+        from modelopt.torch.peft.lora.layer import LoRAModule
+        from megatron.core import parallel_state
+
+        dp_group = parallel_state.get_data_parallel_group()
+        expert_dp_group = parallel_state.get_expert_data_parallel_group()
+
+        synced = False
+        for _, module in model.named_modules():
+            if not isinstance(module, LoRAModule) or not module._lora_adapters:
+                continue
+            for adapter in module._lora_adapters.values():
+                for submodule in ("lora_a", "lora_b"):
+                    for param in adapter[submodule].parameters():
+                        is_expert_param = not getattr(param, "allreduce", True)
+                        group = expert_dp_group if is_expert_param else dp_group
+                        src = dist.get_global_rank(group, 0)
+                        dist.broadcast(param.data, src=src, group=group)
+                        synced = True
+
+        if synced:
+            print_rank_0("Synchronized LoRA weights across data-parallel replicas.")
+    except (ImportError, AttributeError, AssertionError):
+        pass  # No LoRA adapters or parallel state not initialized
+
+
 def count_parameters_in_layer(model, layer_name):
     num_params = 0
     for name, param in model.named_parameters():
@@ -207,8 +241,8 @@ def modelopt_gpt_mamba_builder(
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
-    if args.spec is not None:
-        raise ValueError("ModelOpt integration does not support custom args.spec.")
+    if args.spec is not None and not args.export_default_te_spec:
+        raise ValueError("ModelOpt integration does not support custom args.spec when --export-default-te-spec is not enabled.")
 
     # Llama-4 Scout/Maverick support
     config.qk_l2_norm = args.export_qk_l2_norm
@@ -307,6 +341,7 @@ def modelopt_gpt_mamba_builder(
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
         load_modelopt_state(model=model)
+        _sync_lora_weights_across_dp(model)
 
     _add_load_convert_hooks(model)
 

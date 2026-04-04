@@ -22,6 +22,9 @@ import modelopt.torch.quantization as mtq
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 
+import modelopt.torch.peft as mtp
+from modelopt.torch.peft.lora.config import LORA_CFG_CHOICES
+
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
 except ImportError:
@@ -144,6 +147,21 @@ def add_text_generate_ptq_args(parser):
         type=int,
         default=None,
         help="Number of last layers to skip quantization.",
+    )
+    group.add_argument(
+        "--sync-expert-weight-amax",
+        action="store_true",
+        help="Synchronize expert weight amax across experts.",
+    )
+    group.add_argument(
+        "--lora-config",
+        type=str,
+        default=None,
+        choices=list(LORA_CFG_CHOICES.keys()),
+        help=(
+            "Name of a predefined LoRA config to apply after quantization. "
+            f"Available configs: {list(LORA_CFG_CHOICES.keys())}."
+        ),
     )
     add_modelopt_args(parser)
     return parser
@@ -271,6 +289,9 @@ def get_modelopt_torch_quantization_config():
             num_layers_to_disable=args.num_last_layers_to_skip_quant,
         )
 
+    if args.sync_expert_weight_amax:
+        mtq_config["sync_expert_weight_amax"] = True
+
     return mtq_config
 
 
@@ -294,6 +315,8 @@ def get_calib_dataloader(
             for i, line in enumerate(f):
                 if len(all_texts) == calib_size:
                     break
+                if not line.strip():
+                    continue
                 sample = json.loads(line)
 
                 # Extract text field from various possible keys
@@ -441,7 +464,14 @@ if __name__ == "__main__":
             mtq.compress(unwrapped_model)
             print_rank_0("Weights are now compressed to low-bit!")
 
-        print_distributed_quant_summary(model, "Quantized Model:")
+        #print_distributed_quant_summary(model, "Quantized Model:")
+    if args.lora_config is not None:
+        print_rank_0(f"Applying LoRA adapters with config '{args.lora_config}'...")
+        lora_cfg = LORA_CFG_CHOICES[args.lora_config]
+        mtp.update_model(unwrapped_model, lora_cfg)
+        print_rank_0("Done adding LoRA adapters.")
+
+    print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
 
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
