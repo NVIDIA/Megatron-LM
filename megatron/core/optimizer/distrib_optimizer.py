@@ -1009,8 +1009,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    if self.config.store_param_remainders and self.config.bf16:
+                        v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
+                    if v.dtype != torch.float32:
+                        v = v.to(torch.float32)
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -1058,6 +1062,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 dtype_state[dtype] = buckets_state
             state[gbuf_idx] = dtype_state
         return state
+
+    def _get_dtype_by_key(self, key):
+        if key == "param":
+            return torch.float32
+        elif key == "exp_avg":
+            return self.config.exp_avg_dtype
+        elif key == "exp_avg_sq":
+            return self.config.exp_avg_sq_dtype
+        else:
+            raise ValueError(f"Invalid key: {key}")
 
     def get_parameter_state_dp_zero(
         self,
@@ -1115,7 +1129,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
                         key: torch.zeros(
-                            (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
+                            (buffer_numel_unpadded,), dtype=self._get_dtype_by_key(key), device="cpu"
                         )
                         for key in ("param", "exp_avg", "exp_avg_sq")
                     }
@@ -1138,7 +1152,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
                         local_shards = {
-                            key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
+                            key: torch.zeros((gbuf_local_numel,), dtype=self._get_dtype_by_key(key), device="cpu")
                             for key in ("param", "exp_avg", "exp_avg_sq")
                         }
 
@@ -1162,7 +1176,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 device = "cpu" if use_gloo_comm else torch.cuda.current_device()
                                 recv_tensors = [
                                     torch.zeros(
-                                        (gbuf_local_numel,), dtype=torch.float32, device=device
+                                        (gbuf_local_numel,), dtype=self._get_dtype_by_key(key), device=device
                                     )
                                     for _ in range(data_parallel_world_size)
                                 ]
@@ -1990,7 +2004,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Contiguous local shards (received from DP rank 0).
                         recv_tensor = torch.zeros(
-                            (gbuf_local_numel,), dtype=torch.float32, device="cpu"
+                            (gbuf_local_numel,), dtype=self._get_dtype_by_key(key), device="cpu"
                         )
 
                         # Scatter tensor list.
@@ -2104,7 +2118,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Contiguous local shards (received from DP rank 0).
                         recv_tensor = torch.zeros(
-                            (gbuf_local_numel,), dtype=torch.float32, device="cpu"
+                            (gbuf_local_numel,), dtype=self._get_dtype_by_key(key), device="cpu"
                         )
 
                         # Scatter tensor list.
