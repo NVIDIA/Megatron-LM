@@ -19,7 +19,10 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -976,6 +979,87 @@ def save_to_aux_losses_tracker(
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     get_moe_metrics_tracker().clear()
+
+
+class SaveOverloadFactorFunction(torch.autograd.Function):
+    """Autograd function to save overload factor data for forward and backward passes."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
+        layer_number: Optional[int],
+    ):
+        """Forward pass: save overload factor data.
+
+        Args:
+            tensor: Tensor in the autograd graph (e.g. ``dispatched_input``) — pass-through.
+            tokens_per_expert: Per-local-expert counts from ``dispatch_postprocess`` (any device).
+            local_balanced_token_count: Scalar float, ``routing_map.shape[0] * topk`` pre-dispatch.
+            layer_number: Layer index (1-based).
+
+        Returns:
+            ``tensor`` unchanged.
+        """
+        if layer_number is None:
+            return tensor
+
+        tokens_on_rank = tokens_per_expert.detach().sum()
+        if not tokens_on_rank.is_floating_point():
+            tokens_on_rank = tokens_on_rank.float()
+        tokens_on_rank = tokens_on_rank.to(device=tensor.device, dtype=torch.float32).reshape(())
+
+        balanced = local_balanced_token_count.detach().to(
+            device=tensor.device, dtype=torch.float32
+        ).reshape(())
+
+        tracker = get_moe_overload_factor_tracker()
+        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
+
+        ctx.save_for_backward(tokens_on_rank, balanced)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: append negated actual and balanced count for paired cumsums."""
+        if ctx.saved_tensors:
+            tokens_on_rank, balanced = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
+        return grad_output, None, None, None
+
+
+def save_overload_factor_to_tracker(
+    tensor: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    local_balanced_token_count: torch.Tensor,
+    layer_number: Optional[int],
+    tp_ep_group: torch.distributed.ProcessGroup,
+    dp_group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Wrap ``tensor`` to record post-dispatch token totals for overload factor reporting.
+
+    Records ``tokens_per_expert.sum()`` on this rank and the pre-dispatch **balanced token
+    count** scalar. See ``MoEOverloadFactorTracker.report()``.
+
+    Args:
+        tensor: Tensor in the autograd graph (typically ``dispatched_input``).
+        tokens_per_expert: Output of ``dispatch_postprocess`` (per-expert counts).
+        local_balanced_token_count: Scalar float tensor, ``shape[0] * moe_router_topk``.
+        layer_number: Layer index (1-based).
+        tp_ep_group: TP × EP process group.
+        dp_group: Data-parallel group for cross-replica stats.
+
+    Returns:
+        ``tensor`` unchanged.
+    """
+    get_moe_overload_factor_tracker().set_process_groups(
+        tp_ep_group=tp_ep_group, dp_group=dp_group
+    )
+    return SaveOverloadFactorFunction.apply(
+        tensor, tokens_per_expert, local_balanced_token_count, layer_number
+    )
 
 
 @deprecated(

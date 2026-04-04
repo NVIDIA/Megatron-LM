@@ -17,6 +17,7 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    save_overload_factor_to_tracker,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -233,6 +234,8 @@ class MoELayer(BaseMoELayer):
         )
 
         self.tp_group = pg_collection.tp
+        self.tp_ep_group = pg_collection.tp_ep
+        self.dp_group = pg_collection.dp
 
         # Initialize router.
         self.router = self.submodules.router(
@@ -431,6 +434,20 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
+    def _routing_map_after_token_dispatch(self) -> Optional[torch.Tensor]:
+        """Routing map still held after ``token_dispatch`` (cleared in AllGather ``dispatch_postprocess``).
+
+        Flex/HybridEP keep the map on ``_comm_manager``.
+        """
+        td = self.token_dispatcher
+        rm = getattr(td, "routing_map", None)
+        if rm is not None:
+            return rm
+        cm = getattr(td, "_comm_manager", None)
+        if cm is not None:
+            return getattr(cm, "routing_map", None)
+        return None
+
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
@@ -467,9 +484,37 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
+        routing_map_for_balanced_count = None
+        if self.config.log_overload_factor:
+            routing_map_for_balanced_count = self._routing_map_after_token_dispatch()
+
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        if self.config.log_overload_factor and routing_map_for_balanced_count is not None:
+            ws = float(self.tp_ep_group.size())
+            base = float(routing_map_for_balanced_count.shape[0]) * float(
+                self.config.moe_router_topk
+            )
+            # AllGather replicates the full concatenated map on every rank; contribute
+            # fair share so report()'s SUM over tp_ep matches one global balanced count.
+            td = self.token_dispatcher
+            if isinstance(td, MoEAllGatherTokenDispatcher) and (
+                td.tp_size > 1 or td.ep_size > 1
+            ):
+                base = base / ws
+            local_balanced = torch.empty(
+                (), device=dispatched_input.device, dtype=torch.float32
+            )
+            local_balanced.fill_(base)
+            dispatched_input = save_overload_factor_to_tracker(
+                tensor=dispatched_input,
+                tokens_per_expert=tokens_per_expert,
+                local_balanced_token_count=local_balanced,
+                layer_number=self.layer_number,
+                tp_ep_group=self.tp_ep_group,
+                dp_group=self.dp_group,
+            )
         if (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
