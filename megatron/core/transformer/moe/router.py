@@ -698,10 +698,10 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        if self.config.moe_router_force_biased is not None:
+        if self.config.moe_router_force_biased_std != 0.0:
             # Apply biased logits with shared random bias across all ranks
             logits = apply_biased_logits(
-                logits, self.config.moe_router_force_biased, self.layer_number
+                logits, self.config.moe_router_force_biased_std, self.layer_number
             )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
