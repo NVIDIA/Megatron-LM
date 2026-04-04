@@ -76,11 +76,11 @@ class TestParallelTransformerLayer:
             ):
 
                 transformer_config = TransformerConfig(
-                    num_layers=2,
-                    hidden_size=12,
-                    num_attention_heads=4,
-                    mlp_chunks_for_prefill=4,
-                    mlp_chunks_for_training=4,
+                    num_layers=num_layers,
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_attention_heads,
+                    mlp_chunks_for_prefill=mlp_chunks_for_prefill,
+                    mlp_chunks_for_training=mlp_chunks_for_training,
                     add_bias_linear=True,
                     use_cpu_initialization=True,
                 )
