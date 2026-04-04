@@ -1023,6 +1023,15 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
+            # Set max tokens per rank based on strict capacity.
+            self.max_tokens_per_rank = self.capacity * self.num_local_experts
+        else:
+            # Calculate expected average tokens per EP rank + padding factor.
+            avg_tokens_per_rank = (num_tokens * slef.config.moe_router_topk) // self.group.size()
+            safe_limit = int(avg_tokens_per_rank * (self.capacity_factor or 2.0))
+            # Hardware limit guard : DeepEP QP depth - 3*N + 1 < 65536.
+            # N <= 21845.
+            self.max_tokens_per_rank = min(safe_limit, 21845)
 
     def dispatch(
         self,
@@ -1046,6 +1055,7 @@ class _HybridEPManager(_DispatchManager):
                 probs=self.token_probs,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
+                max_tokens_per_rank=self.max_tokens_per_rank,
                 num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
                 num_permuted_tokens=self.num_permuted_tokens,

@@ -342,6 +342,7 @@ class HybridEPDispatch(torch.autograd.Function):
         probs,
         group,
         num_local_experts,
+        max_tokens_per_rank,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
         num_permuted_tokens=None,
@@ -351,11 +352,12 @@ class HybridEPDispatch(torch.autograd.Function):
         Forward pass of fused dispatch of the HybridEP backend
         '''
         if _hybrid_ep_buffer is None:
-            seq_len, hidden_dim = x.shape[-2:]
+            seq_len, hidden_dim = x.shape[-1]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
+                max_tokens_per_rank,
                 seq_len,
                 num_local_experts,
                 num_sms_dispatch_api,
@@ -449,6 +451,7 @@ if HAVE_HYBRIDEP:
         probs,
         group,
         num_local_experts,
+        max_tokens_per_rank,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
         num_permuted_tokens=None,
@@ -487,6 +490,7 @@ if HAVE_HYBRIDEP:
             probs,
             group,
             num_local_experts,
+            max_tokens_per_rank,
             num_sms_dispatch_api,
             num_sms_combine_api,
             num_permuted_tokens,
