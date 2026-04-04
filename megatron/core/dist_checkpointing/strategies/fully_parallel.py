@@ -85,22 +85,15 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
-    def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
-    ):
-        """ """
+    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(
                 f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
             )
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
@@ -142,7 +135,6 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
     @property
     def can_handle_sharded_objects(self):
-        """ """
         return self.base_strategy.can_handle_sharded_objects
 
 
@@ -193,12 +185,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.cached_global_metadata: Optional[Metadata] = None
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
-    def load(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
-    ) -> StateDict:
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
         Steps:
@@ -231,7 +218,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+            return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -258,13 +245,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         ), "sharded_state_dict is not empty after deferring tensors and objects"
         with debug_time("base_load_ShardedObjects", logger):
             # Load sharded objects first
-            loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
-            )
+            loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
 
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
         with debug_time("self.exchange_loaded_tensors", logger):
 
@@ -405,23 +390,18 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     @property
     def can_handle_sharded_objects(self):
-        """ """
         return self.base_strategy.can_handle_sharded_objects
 
     def load_tensors_metadata(self, checkpoint_dir: Path):
-        """ """
         return self.base_strategy.load_tensors_metadata(checkpoint_dir)
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
-        """ """
         return self.base_strategy.load_sharded_metadata(checkpoint_dir)
 
     def check_backend_compatibility(self, loaded_version):
-        """ """
         return self.base_strategy.check_backend_compatibility(loaded_version)
 
     def check_version_compatibility(self, loaded_version):
-        """ """
         return self.base_strategy.check_version_compatibility(loaded_version)
 
 

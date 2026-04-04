@@ -73,7 +73,7 @@ def test_all_gather_batch(tp, pp):
 
 # TODO: Use mock local checkpointing?
 @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
-@pytest.mark.parametrize(('async_save'), [False])
+@pytest.mark.parametrize(('async_save'), [True, False])
 @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
 @pytest.mark.parametrize(
     ("repl_groups"), [[[0, 1], [2, 3], [4, 5], [6, 7]], [[2, 6, 7], [3, 1], [5], [0, 4]]]
