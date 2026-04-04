@@ -2,6 +2,7 @@
 TP=${TP:-2}
 PP=${PP:-1}
 EP=${EP:-32}
+ETP=${ETP:-1}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
 LLM="nemotron6_3b_moe"
 
@@ -98,7 +99,7 @@ MODEL_OPTIONS="\
   --tensor-model-parallel-size $TP  \
   --pipeline-model-parallel-size $PP  \
   --expert-model-parallel-size $EP \
-  --expert-tensor-parallel-size 1 \
+  --expert-tensor-parallel-size $ETP \
   --weight-decay 0.01 \
   --clip-grad 1.0 \
   --tiktoken-pattern v2 \
