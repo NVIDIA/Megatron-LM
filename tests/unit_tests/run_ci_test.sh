@@ -117,7 +117,7 @@ export BUCKET
 IGNORE_ARGS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-done < <(python tests/unit_tests/find_test_cases.py "$BUCKET")
+done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "h100")
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}

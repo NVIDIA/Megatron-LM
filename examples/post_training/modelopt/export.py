@@ -2,6 +2,7 @@
 
 """Export a GPTModel."""
 import functools
+import inspect
 import os
 import sys
 import warnings
@@ -15,7 +16,6 @@ import torch
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import modelopt_version_at_least
 from megatron.training import get_args, get_model
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import unwrap_model
@@ -36,6 +36,12 @@ def add_modelopt_export_args(parser):
         "--pretrained-model-name",
         type=str,
         help="A pretrained model hosted inside a model repo on huggingface.co.",
+    )
+    group.add_argument(
+        "--export-vllm-fq",
+        action="store_true",
+        default=False,
+        help="Export the model for vLLM fakequant reload.",
     )
     group.add_argument("--export-dir", type=str, help="The target export path.")
     add_modelopt_args(parser)
@@ -96,6 +102,8 @@ if __name__ == "__main__":
         "export_dir": args.export_dir,
         "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
     }
-    if modelopt_version_at_least("0.41.0"):
+    if "trust_remote_code" in inspect.signature(mtex.export_mcore_gpt_to_hf).parameters:
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
-    mtex.export_mcore_gpt_to_hf(unwrapped_model, args.pretrained_model_name, **export_kwargs)
+    
+    export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+    export_fn(unwrapped_model, args.pretrained_model_name, **export_kwargs)

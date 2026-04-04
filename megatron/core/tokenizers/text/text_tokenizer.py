@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 from megatron.core.tokenizers.text.libraries.abstract_tokenizer import MegatronTokenizerTextAbstract
+from megatron.core.utils import accepts_parameter
 
 TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
     [
@@ -13,7 +14,8 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("megatron", "MegatronHFTokenizer"),
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
-        ("null", "NullTokenizer"),
+        ("null-text", "NullTokenizer"),
+        ("sft", "SFTTokenizer"),
     ]
 )
 
@@ -56,7 +58,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        if self.library in ['byte-level', 'null']:
+        if self.library in ['byte-level', 'null-text']:
             return library_class(**kwargs)
         else:
             return library_class(self.path, **kwargs)
@@ -74,17 +76,23 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         return self._tokenizer.text_to_ids(text)
 
-    def detokenize(self, ids: List[int]) -> str:
+    def detokenize(self, ids: List[int], skip_special_tokens: Optional[bool] = None) -> str:
         """
         Text detokenization.
 
         Args:
-            ids (list): text to be tokenized.
+            ids (list): token IDs to be detokenized.
+            skip_special_tokens (bool): Whether to strip special tokens
+                (e.g. <|im_end|>) from the output. Defaults to True.
 
         Returns:
-            text: dettokenized text.
+            text: detokenized text.
         """
 
+        if skip_special_tokens is not None and accepts_parameter(
+            self._tokenizer.ids_to_text, "remove_special_tokens"
+        ):
+            return self._tokenizer.ids_to_text(ids, remove_special_tokens=skip_special_tokens)
         return self._tokenizer.ids_to_text(ids)
 
     def apply_chat_template(
@@ -111,6 +119,32 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         return self._tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
         )
+
+    def tokenize_conversation(
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+    ):
+        """Convert a conversation to tokens. Needed for SFTTokenizer.
+
+        Args:
+            conversation (List[Dict]): Sequence of system/user/assistant messages.
+                Must be in the following format:
+                [
+                    {"role": "system", "content": "something"},
+                    {"role": "user", "content": "something1"},
+                    {"role": "assistant", "content": "something2"},
+                ]
+            return_target (bool): Return target tokens with system and assistant masked.
+            add_generation_prompt (bool): Add assistant prefix to the end.
+        """
+
+        if self.library == 'sft':
+            return self._tokenizer.tokenize_conversation(
+                conversation=conversation,
+                return_target=return_target,
+                add_generation_prompt=add_generation_prompt,
+            )
+        else:
+            raise NotImplementedError("This method is supported only for SFTTokenizer.")
 
     def save_pretrained(self, path: str) -> None:
         """
@@ -140,6 +174,20 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         """
 
         self._tokenizer.add_special_tokens(special_tokens)
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        return self._tokenizer.offsets(ids=ids, text=text)
+
+    @property
+    def space_sensitive(self):
+        """Check if tokenizer is space sensetive."""
+        if self.library in ['sentencepiece', 'huggingface']:
+            return self._tokenizer.space_sensitive
+        else:
+            raise NotImplementedError(
+                f"This method is not supported for {self.library} tokenizers."
+            )
 
     @property
     def additional_special_tokens_ids(self) -> list:

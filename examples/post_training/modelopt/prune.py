@@ -6,6 +6,7 @@ Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tr
 """
 
 import functools
+import inspect
 import os
 import sys
 import warnings
@@ -29,10 +30,10 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import (
-    modelopt_version_at_least,
     report_current_memory_info,
 )
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -160,7 +161,7 @@ if __name__ == "__main__":
     args = get_args()
     check_arguments(args)
 
-    tokenizer = get_tokenizer()._tokenizer
+    tokenizer = get_hf_tokenizer()
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -176,7 +177,7 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_kwargs = {"dtype": import_dtype}
-        if modelopt_version_at_least("0.41.0"):
+        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs

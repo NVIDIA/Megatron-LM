@@ -7,14 +7,14 @@ from megatron.core import parallel_state
 
 def clip_qk(model, log_max_only=False) -> float:
     """
-    Clip the QK attention logits to the threshold, recommended for Muon optimizer.
+    Clips QK attention logits to prevent numerical instability.
 
     Args:
-        model: The model to clip the QK attention logits, a list of model chunks.
-        log_only: Whether to only log the max attention logit, without updating the weights.
+        model (List[MegatronModule]): Model chunks containing attention layers.
+        log_max_only (bool): If True, only computes max logit without clipping.
 
     Returns:
-        The maximum attention logit, a float.
+        float: The maximum QK logit value across all chunks.
     """
 
     with torch.no_grad():
@@ -22,6 +22,11 @@ def clip_qk(model, log_max_only=False) -> float:
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'clip_qk'):
+                    if (
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits
+                        is None
+                    ):
+                        continue
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
                         op=torch.distributed.ReduceOp.MAX,
