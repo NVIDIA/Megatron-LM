@@ -926,10 +926,12 @@ class ChunkOffloadHandler:
         debug_rank("tensor_need_offloading_checker")
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
-        # Respect tensor's offload preference if specified
-        if getattr(tensor, "_TE_do_not_offload", False) or getattr(
-            tensor, "_do_not_offload", False
-        ):
+        # Offload activations by default, unless explicitly marked as not offloadable.
+        # TE CPU offload API: mark_activation_offload(tensor, offload=False)
+        if not getattr(tensor, "activation_offloading", True):
+            return False
+        # Megatron CPU offload API: mark_not_offload(tensor)
+        if getattr(tensor, "_do_not_offload", False):
             return False
         return True
 
