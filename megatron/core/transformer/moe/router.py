@@ -51,6 +51,7 @@ class Router(ABC, MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
+        self.dp_group = pg_collection.dp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
@@ -412,9 +413,16 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+
+        # Global aux loss uses local-rank probs but global tokens_per_expert. To make
+        # the gradient scale consistent with aux_loss, scale by dp_size.
+        # See: https://github.com/NVIDIA/Megatron-LM/issues/3672
+        dp_size = self.dp_group.size()
+        global_aux_loss = global_aux_loss * dp_size
+
         probs = self.attach_and_log_load_balancing_loss(
             probs,
-            global_aux_loss_coeff,
+            global_aux_loss_coeff * dp_size,
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
@@ -426,7 +434,7 @@ class TopKRouter(Router):
     def attach_and_log_load_balancing_loss(
         self,
         activation: torch.Tensor,
-        aux_loss_coeff: float,
+        normalize_scale: float,
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
@@ -437,7 +445,8 @@ class TopKRouter(Router):
 
         Args:
             activation (torch.Tensor): Activation tensor to attach the aux loss to.
-            aux_loss_coeff (float): Coefficient for the aux loss.
+            normalize_scale (float): Scale factor to normalize aux_loss for logging.
+                The logged value is `aux_loss / normalize_scale`.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
@@ -473,7 +482,7 @@ class TopKRouter(Router):
 
         save_to_aux_losses_tracker(
             aux_loss_name,
-            aux_loss / aux_loss_coeff,
+            aux_loss / normalize_scale,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
