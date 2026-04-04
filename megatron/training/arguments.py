@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
+    parser = _add_tensor_inspect_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -2197,6 +2198,14 @@ def _add_ft_package_args(parser):
                        'out-of-section timeouts. The first N iterations are excluded from '
                        'timeout monitoring as they can be significantly slower than steady-state. '
                        'Default: 5. Note: This feature is for Nvidia internal use only.')
+    return parser
+
+
+def _add_tensor_inspect_args(parser):
+    from megatron.training.config import TensorInspectConfig
+
+    tensor_inspect_factory = ArgumentGroupFactory(TensorInspectConfig)
+    tensor_inspect_factory.build_group(parser, title="tensor_inspect")
     return parser
 
 
