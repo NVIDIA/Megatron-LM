@@ -471,9 +471,7 @@ class TestDistributedOptimizer:
         )
 
         metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
-        sharded_sd = optimizer.sharded_state_dict(
-            model[0].sharded_state_dict(), metadata=metadata
-        )
+        sharded_sd = optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=metadata)
 
         if isinstance(optimizer, ChainedOptimizer):
             optim_sds = [sharded_sd[idx] for idx in sharded_sd if isinstance(idx, int)]
@@ -482,9 +480,9 @@ class TestDistributedOptimizer:
 
         for optim_sd in optim_sds:
             for param_idx, tensors in optim_sd['param_state'].items():
-                assert 'step' not in tensors, (
-                    f"'step' should be excluded from param_state (param_idx={param_idx})"
-                )
+                assert (
+                    'step' not in tensors
+                ), f"'step' should be excluded from param_state (param_idx={param_idx})"
 
         Utils.destroy_model_parallel()
 
