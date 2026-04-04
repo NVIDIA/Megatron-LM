@@ -188,6 +188,7 @@ def main():
 
         with open(args.output_path, 'w') as f:
             json.dump(results_output, f)
+            f.write('\n')  # End file in newline
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:

@@ -796,6 +796,7 @@ def main():
 
     with open(output_path, 'w') as f:
         json.dump(output, f, indent=2)
+        f.write('\n')  # End file in newline
 
     logger.info(f"Statistics written to {args.output}")
 
