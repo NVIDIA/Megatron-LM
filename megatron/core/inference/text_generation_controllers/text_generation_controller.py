@@ -149,6 +149,24 @@ class TextGenerationController:
 
         self._init_mtp_sampling_tensor()
 
+    def _reinit_for_context(self):
+        """Reinitialize per-request tensors after the context is replaced.
+
+        Called by the autotune rebuild when max_requests changes.
+        """
+        context = self.inference_wrapped_model.inference_context
+        max_requests = context.max_requests
+        device = torch.cuda.current_device()
+
+        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._request_metadata = {}
+        for label, dtype, on_gpu in context.request_metadata_types:
+            tensor = context.request_metadata[label]
+            if not on_gpu:
+                tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            self._request_metadata[label] = tensor
+        self._init_mtp_sampling_tensor()
+
     def _init_mtp_sampling_tensor(self):
         """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
         if self.num_speculative_tokens is not None and self.num_speculative_tokens > 0:

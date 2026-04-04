@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+import time
 from collections import deque
 from typing import Callable, Dict, Optional
 
@@ -39,6 +41,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self.chunk_tracker = None  # Set by DynamicInferenceContext when autotune is enabled
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -161,6 +164,8 @@ class KVBlockAllocator:
         Return:
             (Optional[Tensor]) Allocated block IDs.
         """
+        t0 = time.perf_counter() if self.chunk_tracker is not None else None
+
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
             if (
@@ -183,6 +188,19 @@ class KVBlockAllocator:
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
+        if self.chunk_tracker is not None:
+            for bid in block_ids.tolist():
+                self.chunk_tracker.activate_slot(bid)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logging.debug(
+                "KVBlockAllocator.allocate: %d blocks in %.3f ms "
+                "(paused chunks: %d/%d)",
+                num_blocks,
+                elapsed_ms,
+                self.chunk_tracker.num_paused,
+                self.chunk_tracker.num_chunks,
+            )
+
         return block_ids
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
@@ -199,6 +217,8 @@ class KVBlockAllocator:
         """
         if blocks.numel() == 0:
             return
+
+        t0 = time.perf_counter() if self.chunk_tracker is not None else None
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
@@ -219,10 +239,27 @@ class KVBlockAllocator:
                     num_unreg = unreg_blocks.numel()
                     self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
                     self.total_avail += num_unreg
+                    if self.chunk_tracker is not None:
+                        for bid in unreg_blocks.tolist():
+                            self.chunk_tracker.deactivate_slot(bid)
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
             self.total_avail += num_blocks
+            if self.chunk_tracker is not None:
+                for bid in blocks.tolist():
+                    self.chunk_tracker.deactivate_slot(bid)
+
+        if self.chunk_tracker is not None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logging.debug(
+                "KVBlockAllocator.release: %d blocks in %.3f ms "
+                "(paused chunks: %d/%d)",
+                blocks.numel(),
+                elapsed_ms,
+                self.chunk_tracker.num_paused,
+                self.chunk_tracker.num_chunks,
+            )
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -309,6 +346,9 @@ class KVBlockAllocator:
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
+        if self.chunk_tracker is not None:
+            for bid in block_ids.tolist():
+                self.chunk_tracker.deactivate_slot(bid)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

@@ -156,6 +156,9 @@ class InferenceConfig:
     state tensors for each KV cache block. Only used for hybrid models.
     """
 
+    autotune: bool = False
+    """Automatically tune inference memory parameters based on available GPU memory."""
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.

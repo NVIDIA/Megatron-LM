@@ -282,6 +282,8 @@ class CUDAGraphBatchDimensionBuilder:
         )
         # Make sure divisible by TP size
         cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+        # Ensure non-zero step size (can happen when max_tokens < num_cuda_graphs).
+        cuda_graph_step_size = max(cuda_graph_step_size, tp_size)
 
         # round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
@@ -378,11 +380,9 @@ class CUDAGraphBatchDimensionBuilder:
             ):
                 cuda_graph_max_tokens = max_tokens
 
-            assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
-                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests *"
-                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)}). "
-                "This is required for correctly syncing EP ranks: "
-                f"prefill and decode graph pools must have the same token count granularity."
+            assert cuda_graph_max_tokens >= max_requests * (num_speculative_tokens + 1), (
+                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must be >= max_requests * "
+                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)})."
             )
 
             if num_cuda_graphs != -1:
