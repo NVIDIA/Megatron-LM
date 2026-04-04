@@ -283,12 +283,15 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
+        # Calculate the loss scale based on moe_grad_scale_func (preferred),
+        # grad_scale_func (fallback), or default to 1.
+        moe_grad_scale_func = getattr(config, 'moe_grad_scale_func', None)
+        if moe_grad_scale_func is not None:
+            loss_scale = moe_grad_scale_func()
+        elif config.grad_scale_func is not None:
+            loss_scale = config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+        else:
+            loss_scale = torch.ones(1, device=output_tensor.device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
