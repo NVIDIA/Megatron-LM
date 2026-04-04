@@ -568,7 +568,8 @@ if HAVE_TE:
                 )
             elif config.fp8_recipe == Fp8Recipe.mxfp8:
                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
-                    fp8_format=fp8_format
+                    fp8_format=fp8_format,
+                    fp8_dpa=config.fp8_dot_product_attention
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
                 assert config.fp8_quantizer_factory is not None
