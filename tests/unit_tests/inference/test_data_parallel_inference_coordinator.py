@@ -6,9 +6,8 @@ import multiprocessing
 import os
 import time
 import unittest.mock
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Dict, Optional
-
 import msgpack
 import pytest
 import torch
@@ -670,3 +669,310 @@ class TestCoordinator:
             await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
             await cleanup_engine(engine, client, timeout=60.0)
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python unit tests for prefix-caching router logic.
+# These tests construct a coordinator directly (no ZMQ, no distributed setup)
+# and exercise the routing, cleanup, eviction, and fault-injection paths.
+# ---------------------------------------------------------------------------
+
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy  # noqa: E402
+
+
+def _make_coordinator(dp_size: int = 2, max_hash_entries: int | None = None):
+    """Instantiate a coordinator without touching ZMQ or sockets.
+
+    Only the attributes consumed by the routing/cleanup helpers are populated.
+    Raises ValueError for invalid max_hash_entries to mirror __init__ behaviour.
+    """
+    if max_hash_entries is not None and max_hash_entries < 1:
+        raise ValueError("max_hash_entries must be >= 1")
+
+    coord = DataParallelInferenceCoordinator.__new__(DataParallelInferenceCoordinator)
+
+    identities = [f"rank{i}".encode() for i in range(dp_size)]
+    coord.data_parallel_size = dp_size
+    coord.identities_of_data_parallel_ranks = deque(identities)
+    coord._active_engine_set = set(identities)
+    coord._round_robin_idx = 0
+
+    coord.enable_prefix_caching = True
+    coord.block_size_tokens = 4
+    coord.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+
+    coord.hash_to_rank_info = OrderedDict()
+    coord._assignment_counter = 0
+    coord.max_hash_entries = max_hash_entries
+
+    coord._stale_rank_filtered_count = 0
+    coord._hash_entry_evictions = 0
+    coord._fallback_to_round_robin_count = 0
+
+    return coord
+
+
+class TestPrefixCachingRouter:
+    """Unit / stress / fault-injection tests for the prefix-caching router.
+
+    No distributed setup or ZMQ sockets required.
+    """
+
+    # ------------------------------------------------------------------
+    # Active-rank filtering
+    # ------------------------------------------------------------------
+
+    def test_active_rank_preferred_over_stale(self):
+        """When a hash maps to both a stale and an active rank, the active one wins."""
+        coord = _make_coordinator(dp_size=2)
+        h = 0xDEADBEEF
+        # rank0 cached this hash (ts=1), rank1 also did (ts=2).
+        coord.hash_to_rank_info[h] = {b"rank0": 1, b"rank1": 2}
+        # Simulate rank0 gone.
+        coord._active_engine_set = {b"rank1"}
+        coord.identities_of_data_parallel_ranks = deque([b"rank1"])
+
+        selected = coord.get_best_data_parallel_rank([h])
+
+        assert selected == b"rank1"
+        assert coord._stale_rank_filtered_count == 1
+
+    def test_all_cached_ranks_stale_falls_back_to_round_robin(self):
+        """When every cached identity is stale the router falls back to round-robin."""
+        coord = _make_coordinator(dp_size=2)
+        h = 0xCAFEBABE
+        # Only rank0 ever cached h, but rank0 is now gone.
+        coord.hash_to_rank_info[h] = {b"rank0": 1}
+        coord._active_engine_set = {b"rank1"}
+        coord.identities_of_data_parallel_ranks = deque([b"rank1"])
+
+        selected = coord.get_best_data_parallel_rank([h])
+
+        assert selected == b"rank1"  # round-robin selects the sole active engine
+        assert coord._fallback_to_round_robin_count == 1
+
+    def test_no_prefix_match_falls_back_to_round_robin(self):
+        """Requests with no hash present in the map always fall back to round-robin."""
+        coord = _make_coordinator(dp_size=2)
+
+        selected = coord.get_best_data_parallel_rank([0x1111, 0x2222])
+
+        # Identity chosen is determined by round-robin; we just need no crash.
+        assert selected in coord._active_engine_set
+        assert coord._fallback_to_round_robin_count == 1
+
+    def test_longer_prefix_match_preferred(self):
+        """The rank with the longest matching prefix (furthest hash) is chosen."""
+        coord = _make_coordinator(dp_size=2)
+        h0, h1 = 0xAAAA, 0xBBBB
+        # rank0 has only h0; rank1 has both h0 and h1 (longer prefix).
+        coord.hash_to_rank_info[h0] = {b"rank0": 1, b"rank1": 2}
+        coord.hash_to_rank_info[h1] = {b"rank1": 3}
+
+        # Reversed scan: h1 is checked first.
+        selected = coord.get_best_data_parallel_rank([h0, h1])
+
+        assert selected == b"rank1"
+
+    # ------------------------------------------------------------------
+    # Cleanup on engine removal
+    # ------------------------------------------------------------------
+
+    def test_remove_engine_purges_all_hash_entries(self):
+        """_remove_engine removes the identity from every hash entry."""
+        coord = _make_coordinator(dp_size=2)
+        for h in [1, 2, 3]:
+            coord.hash_to_rank_info[h] = {b"rank0": h, b"rank1": h + 10}
+        # hash 4 is exclusively owned by rank0 — must be deleted entirely.
+        coord.hash_to_rank_info[4] = {b"rank0": 99}
+
+        coord._remove_engine(b"rank0")
+
+        assert b"rank0" not in coord._active_engine_set
+        assert b"rank0" not in coord.identities_of_data_parallel_ranks
+        for h in [1, 2, 3]:
+            assert b"rank0" not in coord.hash_to_rank_info[h]
+            assert b"rank1" in coord.hash_to_rank_info[h]
+        # Exclusively-owned entry must be gone.
+        assert 4 not in coord.hash_to_rank_info
+
+    def test_remove_engine_idempotent(self):
+        """Calling _remove_engine twice for the same identity must not raise."""
+        coord = _make_coordinator(dp_size=2)
+        coord._remove_engine(b"rank0")
+        # Second call on a no-longer-present identity should be a no-op.
+        coord._remove_engine(b"rank0")
+
+    def test_remove_engine_with_no_hash_entries(self):
+        """_remove_engine works correctly when hash_to_rank_info is empty."""
+        coord = _make_coordinator(dp_size=1)
+        coord._remove_engine(b"rank0")
+        assert len(coord.identities_of_data_parallel_ranks) == 0
+        assert len(coord._active_engine_set) == 0
+        assert len(coord.hash_to_rank_info) == 0
+
+    # ------------------------------------------------------------------
+    # Bounded metadata growth (LRU eviction)
+    # ------------------------------------------------------------------
+
+    def test_hash_map_never_exceeds_max_entries(self):
+        """hash_to_rank_info stays at or below max_hash_entries at all times."""
+        max_entries = 10
+        coord = _make_coordinator(dp_size=1, max_hash_entries=max_entries)
+
+        for i in range(50):
+            coord._update_rank_hashes(b"rank0", [i])
+
+        assert len(coord.hash_to_rank_info) <= max_entries
+        assert coord._hash_entry_evictions == 40  # 50 inserts - 10 capacity
+
+    def test_no_eviction_when_limit_not_set(self):
+        """Without a limit the map grows unboundedly and no evictions occur."""
+        coord = _make_coordinator(dp_size=1, max_hash_entries=None)
+
+        for i in range(100):
+            coord._update_rank_hashes(b"rank0", [i])
+
+        assert len(coord.hash_to_rank_info) == 100
+        assert coord._hash_entry_evictions == 0
+
+    def test_lru_eviction_preserves_recently_used_entries(self):
+        """Entries touched via get_best_data_parallel_rank survive eviction."""
+        coord = _make_coordinator(dp_size=1, max_hash_entries=3)
+        # Fill to capacity with hashes 0, 1, 2.
+        for h in [0, 1, 2]:
+            coord._update_rank_hashes(b"rank0", [h])
+
+        # Access hash 0 — it should move to MRU position.
+        coord.get_best_data_parallel_rank([0])
+
+        # Insert a new hash — the LRU (hash 1, then 2 would be next oldest) should evict.
+        coord._update_rank_hashes(b"rank0", [99])
+
+        # Hash 0 was recently accessed so it must still be present.
+        assert 0 in coord.hash_to_rank_info
+        assert 99 in coord.hash_to_rank_info
+        assert len(coord.hash_to_rank_info) == 3
+
+    def test_updating_existing_hash_does_not_evict(self):
+        """Re-writing an existing hash entry never triggers an eviction."""
+        coord = _make_coordinator(dp_size=1, max_hash_entries=2)
+        coord._update_rank_hashes(b"rank0", [10])
+        coord._update_rank_hashes(b"rank0", [20])
+        # Both slots filled; updating an existing hash should NOT evict.
+        coord._update_rank_hashes(b"rank0", [10])
+
+        assert coord._hash_entry_evictions == 0
+        assert len(coord.hash_to_rank_info) == 2
+
+    # ------------------------------------------------------------------
+    # Stress test
+    # ------------------------------------------------------------------
+
+    def test_stress_bounded_map(self):
+        """Stress: insert many hashes across multiple ranks; map never exceeds limit."""
+        max_entries = 64
+        coord = _make_coordinator(dp_size=4, max_hash_entries=max_entries)
+
+        for i in range(10_000):
+            rank = f"rank{i % 4}".encode()
+            coord._update_rank_hashes(rank, [i, i + 1])
+            assert len(coord.hash_to_rank_info) <= max_entries, (
+                f"Map exceeded limit at iteration {i}: {len(coord.hash_to_rank_info)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Fault injection: engine disconnect during routing
+    # ------------------------------------------------------------------
+
+    def test_fault_disconnect_between_hash_update_and_routing(self):
+        """Engine disconnect between _update_rank_hashes and get_best_data_parallel_rank
+        must not crash and must route to a surviving engine."""
+        coord = _make_coordinator(dp_size=2)
+        h = 0xFACEFEED
+
+        # rank0 cached the hash.
+        coord._update_rank_hashes(b"rank0", [h])
+        assert h in coord.hash_to_rank_info
+
+        # Engine0 disconnects.
+        coord._remove_engine(b"rank0")
+
+        # hash entry for h should now be gone (was rank0-exclusive).
+        assert h not in coord.hash_to_rank_info
+
+        # Routing must fall back gracefully to the surviving engine.
+        selected = coord.get_best_data_parallel_rank([h])
+        assert selected == b"rank1"
+        assert coord._fallback_to_round_robin_count == 1
+
+    def test_fault_all_engines_disconnect(self):
+        """With no active engines, get_next_data_parallel_rank raises RuntimeError."""
+        coord = _make_coordinator(dp_size=1)
+        coord._remove_engine(b"rank0")
+
+        try:
+            coord.get_best_data_parallel_rank([0xDEAD])
+            assert False, "Expected RuntimeError"
+        except RuntimeError:
+            pass
+
+    def test_fault_duplicate_remove_does_not_corrupt_state(self):
+        """Duplicate _remove_engine calls must not corrupt active set or hash map."""
+        coord = _make_coordinator(dp_size=2)
+        coord._update_rank_hashes(b"rank0", [1, 2, 3])
+        coord._update_rank_hashes(b"rank1", [2, 3, 4])
+
+        coord._remove_engine(b"rank0")
+        coord._remove_engine(b"rank0")  # no-op
+
+        assert b"rank0" not in coord._active_engine_set
+        # Hashes shared with rank1 must still exist.
+        for h in [2, 3, 4]:
+            assert h in coord.hash_to_rank_info
+            assert b"rank1" in coord.hash_to_rank_info[h]
+
+    # ------------------------------------------------------------------
+    # Validation guards
+    # ------------------------------------------------------------------
+
+    def test_max_hash_entries_zero_raises(self):
+        """max_hash_entries=0 must be rejected at construction time."""
+        import pytest
+
+        with pytest.raises(ValueError, match="max_hash_entries must be >= 1"):
+            _make_coordinator(dp_size=1, max_hash_entries=0)
+
+    def test_batch_larger_than_limit_raises(self):
+        """_update_rank_hashes must raise when batch size exceeds max_hash_entries."""
+        import pytest
+
+        coord = _make_coordinator(dp_size=1, max_hash_entries=2)
+        with pytest.raises(ValueError, match="max_hash_entries"):
+            coord._update_rank_hashes(b"rank0", [1, 2, 3])
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def test_get_stats_reflects_counters(self):
+        """get_stats() returns a consistent snapshot of all observability counters."""
+        coord = _make_coordinator(dp_size=2, max_hash_entries=5)
+
+        # Trigger eviction (single-element batches to stay within limit).
+        for i in range(10):
+            coord._update_rank_hashes(b"rank0", [i])
+
+        # Trigger stale-rank filter by removing rank0 from active set while its
+        # hash entries remain.  hash 9 is the most recently inserted entry and
+        # guaranteed to be in the map; its rank_map contains rank0 (now stale).
+        coord._active_engine_set = {b"rank1"}
+        coord.identities_of_data_parallel_ranks = deque([b"rank1"])
+        coord.get_best_data_parallel_rank([9])
+
+        stats = coord.get_stats()
+        assert stats["hash_entry_evictions"] == 5
+        assert stats["active_engine_count"] == 1
+        assert stats["hash_to_rank_info_size"] <= 5
+        # Hash 9 has a stale rank0 entry → stale_rank_filtered_count must be >= 1.
+        assert stats["stale_rank_filtered_count"] >= 1

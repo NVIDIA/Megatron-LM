@@ -6,13 +6,11 @@ import json
 import logging
 import signal
 import socket
-from collections import deque
+from collections import OrderedDict, deque
 from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
-
 import torch
-
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
@@ -36,8 +34,12 @@ except:
 
 # Register faulthandler to emit stack traces upon process kill.
 faulthandler.enable()
-faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
-faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
+# faulthandler.register is only available on Unix platforms.
+try:
+    faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
+    faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
+except AttributeError:
+    pass
 
 
 class DataParallelInferenceCoordinator:
@@ -95,6 +97,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        max_hash_entries: int | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -187,8 +190,24 @@ class DataParallelInferenceCoordinator:
         self.block_size_tokens = block_size_tokens
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
-        self.hash_to_rank_info = {}  # Dict[int, Dict[bytes, int]]: hash → {rank → timestamp}
+        # OrderedDict allows O(1) LRU eviction via popitem(last=False) / move_to_end().
+        self.hash_to_rank_info: OrderedDict[int, dict[bytes, int]] = OrderedDict()
         self._assignment_counter = 0
+        if max_hash_entries is not None and max_hash_entries < 1:
+            raise ValueError("max_hash_entries must be >= 1")
+        self.max_hash_entries = max_hash_entries
+
+        # O(1) active-membership check (mirrors identities_of_data_parallel_ranks).
+        self._active_engine_set: set[bytes] = set(self.identities_of_data_parallel_ranks)
+
+        # Lightweight observability counters (never reset; read with get_stats()).
+        # _stale_rank_filtered_count: hash buckets scanned that contained at least one
+        # stale (removed) engine entry.  Routing still succeeds when active entries
+        # exist in the same bucket; only _fallback_to_round_robin_count indicates an
+        # actual routing degradation.
+        self._stale_rank_filtered_count = 0
+        self._hash_entry_evictions = 0
+        self._fallback_to_round_robin_count = 0
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
@@ -215,11 +234,34 @@ class DataParallelInferenceCoordinator:
         return identities[idx]
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from the routing pool."""
-        self.identities_of_data_parallel_ranks.remove(identity)
+        """Remove a disconnected engine from the routing pool.
+
+        Idempotent: safe to call for an already-removed engine.  Purges every
+        hash_to_rank_info entry that referenced *identity* and deletes entries
+        that become empty, preventing unbounded stale metadata growth.
+        """
+        try:
+            self.identities_of_data_parallel_ranks.remove(identity)
+        except ValueError:
+            # Already removed; nothing left to clean up.
+            return
+        self._active_engine_set.discard(identity)
+
+        # Remove the engine from every hash entry.  Collect keys first to
+        # avoid mutating the dict while iterating over it.
+        stale_hashes = [
+            h for h, rank_map in self.hash_to_rank_info.items() if identity in rank_map
+        ]
+        for h in stale_hashes:
+            rank_map = self.hash_to_rank_info[h]
+            del rank_map[identity]
+            if not rank_map:
+                del self.hash_to_rank_info[h]
+
         logging.warning(
-            "Coordinator: removed engine %s (now %d engines)",
+            "Coordinator: removed engine %s, cleaned %d hash entries (now %d engines)",
             identity,
+            len(stale_hashes),
             len(self.identities_of_data_parallel_ranks),
         )
 
@@ -263,8 +305,9 @@ class DataParallelInferenceCoordinator:
         the longest matching prefix (the furthest hash found). Since hashes are
         parent-chained, finding hash[i] in a rank guarantees hash[0..i-1] are
         also present. Among ranks that share the longest match, the most recently
-        assigned rank (highest timestamp) is preferred. Falls back to round-robin
-        when no rank matches.
+        assigned rank (highest timestamp) is preferred. Only *active* engine
+        identities are considered; stale entries are skipped in-line without
+        allocation. Falls back to round-robin when no active rank matches.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -279,18 +322,44 @@ class DataParallelInferenceCoordinator:
         ):
             return self.get_next_data_parallel_rank()
 
+        active = self._active_engine_set  # local ref avoids repeated attribute lookup
+
         # Reverse scan: first match is the longest prefix (parent-chained hashes).
         for h in reversed(request_hashes):
             rank_info = self.hash_to_rank_info.get(h)
-            if rank_info:
-                # Pick the most recently assigned rank.
-                best_rank = max(rank_info, key=rank_info.get)
+            if not rank_info:
+                continue
+
+            # Filter to active ranks; find the one with the highest timestamp.
+            best_rank = None
+            best_ts = -1
+            saw_stale = False
+            for rank, ts in rank_info.items():
+                if rank in active:
+                    if ts > best_ts:
+                        best_ts = ts
+                        best_rank = rank
+                else:
+                    saw_stale = True
+
+            if saw_stale:
+                self._stale_rank_filtered_count += 1
+
+            if best_rank is not None:
+                # Promote to MRU position for LRU eviction accounting.
+                self.hash_to_rank_info.move_to_end(h)
                 return best_rank
 
+        self._fallback_to_round_robin_count += 1
         return self.get_next_data_parallel_rank()
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
+
+        When *max_hash_entries* is set, the oldest (LRU) entry is evicted before
+        inserting a new one so the map stays bounded.  Updating an existing
+        entry only touches its rank map and moves it to the MRU end — no
+        eviction occurs.
 
         Args:
             rank_identity: ZMQ identity of the target rank.
@@ -298,8 +367,39 @@ class DataParallelInferenceCoordinator:
         """
         self._assignment_counter += 1
         ts = self._assignment_counter
+        limit = self.max_hash_entries  # local ref; None means unbounded
+        if limit is not None and limit < len(request_hashes):
+            raise ValueError(
+                f"max_hash_entries ({limit}) must be >= len(request_hashes) "
+                f"({len(request_hashes)}); otherwise earlier inserts in the batch "
+                "are immediately evicted by later ones."
+            )
         for h in request_hashes:
-            self.hash_to_rank_info.setdefault(h, {})[rank_identity] = ts
+            if h in self.hash_to_rank_info:
+                # Update existing entry and mark recently used.
+                self.hash_to_rank_info[h][rank_identity] = ts
+                self.hash_to_rank_info.move_to_end(h)
+            else:
+                # Evict LRU entry if we are at capacity.
+                if limit is not None and len(self.hash_to_rank_info) >= limit:
+                    self.hash_to_rank_info.popitem(last=False)
+                    self._hash_entry_evictions += 1
+                self.hash_to_rank_info[h] = {rank_identity: ts}
+
+    def get_stats(self) -> dict:
+        """Return a snapshot of lightweight observability counters.
+
+        Counters are cumulative since coordinator start and are never reset.
+        Intended for health-check endpoints or periodic logging; not for the
+        hot path.
+        """
+        return {
+            "stale_rank_filtered_count": self._stale_rank_filtered_count,
+            "hash_entry_evictions": self._hash_entry_evictions,
+            "fallback_to_round_robin_count": self._fallback_to_round_robin_count,
+            "hash_to_rank_info_size": len(self.hash_to_rank_info),
+            "active_engine_count": len(self._active_engine_set),
+        }
 
     def start(self):
         """
@@ -320,6 +420,7 @@ class DataParallelInferenceCoordinator:
             if serialized_payload == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
+                    self._active_engine_set.add(sender_identity)
                 continue
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
@@ -460,12 +561,25 @@ class DataParallelInferenceCoordinator:
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
+                # Use a warning rather than an assert so that in-flight replies arriving
+                # just after an engine disconnect are still processed instead of crashing.
+                if sender_identity not in self._active_engine_set:
+                    logging.debug(
+                        "Coordinator: ENGINE_REPLY from engine %s not in active set "
+                        "(processing in-flight reply post-disconnect)",
+                        sender_identity,
+                    )
                 finished_requests = deserialized_payload[1]
 
                 for finished_request in finished_requests:
                     self.detokenize(finished_request)
                     fid = finished_request["request_id"]
+                    if fid not in self.request_id_to_client_id:
+                        logging.warning(
+                            "Coordinator: ENGINE_REPLY for unknown request_id %d, dropping",
+                            fid,
+                        )
+                        continue
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -488,8 +602,8 @@ class DataParallelInferenceCoordinator:
                 break
 
             elif header == Headers.DISCONNECT:
-                if sender_identity in self.identities_of_data_parallel_ranks:
-                    self._remove_engine(sender_identity)
+                # _remove_engine is idempotent; no pre-check needed.
+                self._remove_engine(sender_identity)
 
             else:
                 raise UnknownHeaderError(header)
@@ -533,6 +647,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        max_hash_entries: int | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -551,6 +666,9 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching (bool): Whether prefix caching is enabled.
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
             schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
+            max_hash_entries (Optional[int]): Cap on hash_to_rank_info size.  When set,
+                the least-recently-used entry is evicted on overflow.  ``None`` (default)
+                leaves the map unbounded.
         """
         coordinator = cls(
             pipe_connection,
@@ -562,6 +680,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             schedule_output_path=schedule_output_path,
+            max_hash_entries=max_hash_entries,
         )
         ready_event.set()
         try:
