@@ -1,0 +1,34 @@
+# Models module (gpt, bert, t5, mamba, mimo, vision, multimodal).
+#
+# Test imports traced:
+#   fp8_param           → models.gpt.gpt_layer_specs, models.gpt.gpt_model
+#   pipeline_parallel   → models.gpt.*, models.common.model_chunk_schedule_plan
+#   models              → models.* (heavily)
+#   ckpt*               → models.gpt, models.bert, models.T5
+#   transformer*        → models.common.embeddings, models.gpt.*, models.mamba.*
+#   distributed_fsdp    → models.gpt.gpt_layer_specs, models.gpt.gpt_model
+#   export              → models.gpt.gpt_layer_specs, models.gpt.gpt_model
+#   fusions             → models.common.embeddings
+#   inference           → models.common.embeddings
+#   post_training       → models.gpt, models.mamba
+#   rl                  → models.gpt.gpt_model
+#   ssm                 → models.mamba.*
+#   core_unit           → test_utils.py (models.gpt.gpt_layer_specs)
+test_buckets:
+  - fp8_param
+  - pipeline_parallel
+  - models
+  - ckpt
+  - ckpt_optimizer
+  - ckpt_models
+  - ckpt_moe_experts
+  - transformer
+  - transformer_moe
+  - distributed_fsdp
+  - export
+  - fusions
+  - inference
+  - post_training
+  - rl
+  - ssm
+  - core_unit

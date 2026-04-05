@@ -1,0 +1,7 @@
+# megatron/inference/ (top-level, not core).
+# No tests directly import from this package.
+#
+# Test imports traced:
+#   core_unit → test_basic.py (import megatron) catches import-time failures
+test_buckets:
+  - core_unit
