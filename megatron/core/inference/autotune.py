@@ -144,6 +144,7 @@ def compute_optimal_params(
     tp_size: int = 1,
     request_rounder: int = 4,
     avg_sequence_length: Optional[int] = None,
+    safety_margin_fraction: float = 0.10,
 ) -> Tuple[int, int, float]:
     """Solve for optimal (max_requests, max_tokens, buffer_size_gb) from profiling data.
 
@@ -153,6 +154,9 @@ def compute_optimal_params(
         request_rounder: Request count alignment (typically 4).
         avg_sequence_length: Expected average sequence length for freed-cache
             estimate. If None, defaults to max_sequence_length // 2.
+        safety_margin_fraction: Fraction of free GPU memory to reserve for
+            CUDA graph workspace, TMS VMM overhead, and allocator
+            fragmentation. Defaults to 0.10 (10%).
 
     Returns:
         (max_requests, max_tokens, buffer_size_gb) tuple.
@@ -170,12 +174,17 @@ def compute_optimal_params(
 
     # Available GPU memory = total - model weights (approximated by memory
     # used after model load, before context allocation).
-    gpu_free = profile.gpu_total_bytes - profile.memory_after_model_load_bytes
+    gpu_free_raw = profile.gpu_total_bytes - profile.memory_after_model_load_bytes
+    safety_margin = int(gpu_free_raw * safety_margin_fraction)
+    gpu_free = gpu_free_raw - safety_margin
 
     logging.info(
-        "Autotune: GPU total %d MB, after model load %d MB, free for context+activations %d MB",
+        "Autotune: GPU total %d MB, after model load %d MB, "
+        "free %d MB (reserving %d MB safety margin = %d MB usable)",
         profile.gpu_total_bytes // (1024 ** 2),
         profile.memory_after_model_load_bytes // (1024 ** 2),
+        gpu_free_raw // (1024 ** 2),
+        safety_margin // (1024 ** 2),
         gpu_free // (1024 ** 2),
     )
     logging.info("Autotune: compute elbow at %d tokens", elbow)

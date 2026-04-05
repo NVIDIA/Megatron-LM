@@ -460,6 +460,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """Create a temporary context and run forward passes to collect
         activation memory and timing samples.
 
+        On the first call, also populates the profile's memory accounting
+        constants from the actual context (avoiding recomputation errors).
         The temporary context is freed after profiling.
         """
         from dataclasses import replace
@@ -478,6 +480,33 @@ class DynamicInferenceEngine(AbstractEngine):
         controller.inference_wrapped_model.inference_context = context
         controller._reinit_for_context()
         self.reset()
+
+        # Read actual memory accounting from the context (not recomputed).
+        if profile.block_size_bytes == 0:
+            profile.block_size_bytes = context.block_size_bytes
+            profile.max_kv_block_count = context.max_kv_block_count
+            # Include block table in per-request overhead.
+            profile.per_request_bytes += context.max_kv_block_count * 4
+            if context.is_hybrid_model:
+                # Compute actual mamba bytes per request from context shapes.
+                conv_bytes = (
+                    math.prod(context.mamba_conv_states_shape)
+                    * context.mamba_conv_states_dtype.itemsize
+                    * context.num_mamba_layers
+                )
+                ssm_bytes = (
+                    math.prod(context.mamba_ssm_states_shape)
+                    * context.mamba_ssm_states_dtype.itemsize
+                    * context.num_mamba_layers
+                )
+                profile.mamba_memory_per_request = conv_bytes + ssm_bytes
+            logging.info(
+                "Autotune: actual context params — block_size=%.2f MB, "
+                "mamba/request=%.2f MB, max_kv_blocks=%d",
+                profile.block_size_bytes / (1024 ** 2),
+                profile.mamba_memory_per_request / (1024 ** 2),
+                profile.max_kv_block_count,
+            )
 
         for tc in token_counts:
             decode_count = min(tc, context.max_requests)
@@ -554,10 +583,6 @@ class DynamicInferenceEngine(AbstractEngine):
         mem_after_model = torch.cuda.memory_allocated()
         free_bytes = gpu_total - mem_after_model
 
-        mem_params = DynamicInferenceContext.compute_context_memory_params(
-            model_config, old_config
-        )
-
         logging.info(
             "Autotune: GPU total %.1f GB, model %.1f GB, free %.1f GB",
             gpu_total / (1024 ** 3),
@@ -568,14 +593,17 @@ class DynamicInferenceEngine(AbstractEngine):
         # --- Two-phase profiling ---
         # Phase A: tiny context (few requests) to get activation-per-token slope.
         # Phase B: larger context (sized from Phase A estimate) for full range.
+        # Memory accounting constants (block_size_bytes, mamba_memory_per_request)
+        # are populated from the actual Phase A context, not recomputed.
         profile = AutotuneProfile(
-            block_size_bytes=mem_params['block_size_bytes'],
-            mamba_memory_per_request=mem_params['mamba_memory_per_request'],
-            max_kv_block_count=mem_params['max_kv_block_count'],
-            per_request_bytes=mem_params['per_request_bytes'],
-            per_token_bytes=mem_params['per_token_bytes'],
             gpu_total_bytes=gpu_total,
             memory_after_model_load_bytes=mem_after_model,
+            # per_request_bytes and per_token_bytes are conservative estimates.
+            # block_size_bytes, mamba_memory_per_request, max_kv_block_count are
+            # populated from the actual Phase A context in _run_profiling_pass.
+            per_request_bytes=DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
+            + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES,
+            per_token_bytes=DynamicInferenceContext.PER_TOKEN_METADATA_BYTES,
         )
 
         # Phase A: tiny context, small token counts.
@@ -622,29 +650,20 @@ class DynamicInferenceEngine(AbstractEngine):
         # Estimate how many tokens we can safely fit.
         safe_activation_budget = free_bytes * 0.8  # leave 20% margin
         max_safe_tokens = max(16, int(safe_activation_budget / max(bytes_per_token, 1)))
-        phase_b_max_requests = min(max_safe_tokens, 4096)
-        # Buffer just big enough for phase_b_max_requests blocks (1 block/request min).
+        phase_b_max_requests = min(max_safe_tokens, 8192)
+
+        # Size Phase B so context overhead (mamba + KV + metadata) stays
+        # under 50% of free memory, leaving room for activations.
+        block_bytes = max(profile.block_size_bytes, 1)
+        mamba_bytes = profile.mamba_memory_per_request
+        per_req_total = block_bytes + mamba_bytes + profile.per_request_bytes
+        # Max requests that fit in 50% of free memory (1 block per request).
+        max_from_memory = int((free_bytes * 0.5) / max(per_req_total, 1))
+        phase_b_max_requests = max(16, min(phase_b_max_requests, max_from_memory))
         phase_b_buffer_gb = max(
             0.01,
-            (phase_b_max_requests * mem_params['block_size_bytes']) / (1024 ** 3),
+            (phase_b_max_requests * block_bytes) / (1024 ** 3),
         )
-        # Don't exceed what's available.
-        phase_b_context_overhead = (
-            phase_b_max_requests * mem_params['mamba_memory_per_request']
-            + phase_b_max_requests * mem_params['per_request_bytes']
-            + phase_b_buffer_gb * (1024 ** 3)
-        )
-        while phase_b_context_overhead > free_bytes * 0.5 and phase_b_max_requests > 16:
-            phase_b_max_requests //= 2
-            phase_b_buffer_gb = max(
-                0.01,
-                (phase_b_max_requests * mem_params['block_size_bytes']) / (1024 ** 3),
-            )
-            phase_b_context_overhead = (
-                phase_b_max_requests * mem_params['mamba_memory_per_request']
-                + phase_b_max_requests * mem_params['per_request_bytes']
-                + phase_b_buffer_gb * (1024 ** 3)
-            )
 
         # Generate token counts for Phase B — geometric spread up to max_safe_tokens.
         phase_b_tokens = []
