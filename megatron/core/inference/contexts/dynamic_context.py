@@ -205,6 +205,8 @@ class ContextErrorFactory:
 
 def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
+    if n_bytes == 0:
+        return "0 bytes"
     for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
         nquery = int(1024**exp)
         if round(n_bytes / nquery) >= 1:
@@ -252,13 +254,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_coordinator_policy = inference_config.prefix_caching_coordinator_policy
-        self.use_triton_conv1d = inference_config.use_triton_conv1d
-        self._use_triton_conv1d_this_step = inference_config.use_triton_conv1d
 
-        # Engine step counter (used for logging, metrics, and event tracking)
-        self.step_count = 0
+        # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
+        self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
 
-        # Separate monotonic clock for prefix caching LRU eviction ordering.
+        # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step
         # counter is not overloaded with cache-eviction semantics.
         self.prefix_cache_lru_clock = 0
@@ -266,6 +266,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
+
+        # Engine step counter (used for logging, metrics, and event tracking)
+        self.step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -451,6 +454,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = buffer_size_bytes // self.block_size_bytes
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
+        elif self.is_hybrid_model and inference_config.max_requests is not None:
+            # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
+            # mamba memory for max_requests, and give the rest to KV cache blocks.
+            total_memory = buffer_size_bytes + paused_buffer_size_bytes
+            mamba_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            assert mamba_memory_needed < total_memory, (
+                f"Not enough memory for {inference_config.max_requests} mamba requests. "
+                f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "
+                f"but total buffer is {total_memory / 1024**3:.2f} GB."
+            )
+            mamba_max_requests = inference_config.max_requests
+
+            # Subtract mamba memory proportionally from active and paused buffers.
+            mamba_memory_ratio = mamba_memory_needed / total_memory
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+
+            block_count = buffer_size_bytes // self.block_size_bytes
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
                 self.block_size_bytes + mamba_states_memory_per_request
@@ -593,13 +616,76 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.initialize_all_tensors()
 
         # Print info.
-        logging.info(
-            "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (
-                get_mem_size_str(self.kv_block_allocator.active_count * self.block_size_bytes),
-                self.kv_block_allocator.active_count,
+        active_blocks = self.kv_block_allocator.active_count
+        total_blocks = self.kv_block_allocator.total_count
+        paused_blocks = self.kv_block_allocator.paused_count
+        active_kv_bytes = active_blocks * self.block_size_bytes
+        total_kv_bytes = total_blocks * self.block_size_bytes
+        paused_kv_bytes = paused_blocks * self.block_size_bytes
+
+        log_lines = [
+            "DynamicInferenceContext: configuration summary",
+            f"  max_requests:            {self.max_requests}",
+            f"  max_tokens:              {self.max_tokens}",
+            f"  max_sequence_length:     {self.max_sequence_length}",
+            f"  block_size_tokens:       {self.block_size_tokens}",
+            f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
+            f"  KV cache:",
+            f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
+            f"    active_blocks:         {active_blocks} ({get_mem_size_str(active_kv_bytes)})",
+            f"    paused_blocks:         {paused_blocks} ({get_mem_size_str(paused_kv_bytes)})",
+            f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
+        ]
+
+        if self.is_hybrid_model:
+            mamba_conv_bytes = (
+                math.prod(self.mamba_conv_states_shape)
+                * self.mamba_conv_states_dtype.itemsize
+                * self.num_mamba_layers
             )
-        )
+            mamba_ssm_bytes = (
+                math.prod(self.mamba_ssm_states_shape)
+                * self.mamba_ssm_states_dtype.itemsize
+                * self.num_mamba_layers
+            )
+            mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
+            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
+            log_lines += [
+                f"  Mamba states:",
+                f"    num_mamba_layers:      {self.num_mamba_layers}",
+                f"    conv_state_shape:      {self.mamba_conv_states_shape}",
+                f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
+                f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
+                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+            ]
+
+            if self.num_speculative_tokens > 0:
+                spec_multiplier = self.num_speculative_tokens + 1
+                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                spec_total_bytes = spec_bytes_per_req * self.max_requests
+                log_lines += [
+                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
+                    f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
+                ]
+
+            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            if (
+                inference_config.enable_prefix_caching
+                and prefix_caching_mamba_gb is not None
+                and prefix_caching_mamba_gb > 0
+            ):
+                prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
+                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                log_lines += [
+                    f"  Mamba prefix cache:",
+                    f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
+                    f"    slots:                 {prefix_cache_slots}",
+                    f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
+                ]
+
+        if inference_config._verbose and torch.distributed.get_rank() == 0:
+            logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
@@ -641,7 +727,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -768,6 +856,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
+                d_conv=self.mamba_conv_states_shape[-1],
             )
 
         # Allocate large non-graphed buffers.
@@ -1512,20 +1601,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        requires_mamba_state_extraction = False
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
-            requires_mamba_state_extraction = (
-                self.mamba_slot_allocator.get_intermediate_offsets() is not None
-            )
-
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
-            explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
-            requires_mamba_state_extraction=requires_mamba_state_extraction,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1626,6 +1707,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
+            intermediate_offsets_gpu = None
+            intermediate_counts_gpu = None
+            if self.mamba_slot_allocator is not None:
+                intermediate_offsets_gpu, intermediate_counts_gpu = (
+                    self.mamba_slot_allocator.get_intermediate_gpu_data()
+                )
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
@@ -1633,15 +1720,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
             )
-
-            # Auto-enable Triton conv1d for CUDA graph steps. The per-request
-            # conv loop launches a variable number of kernels with .item()
-            # calls, which is incompatible with CUDA graph capture/replay.
-            if self._using_cuda_graph_this_step:
-                self._use_triton_conv1d_this_step = True
-            else:
-                self._use_triton_conv1d_this_step = self.use_triton_conv1d
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
@@ -1712,7 +1793,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self._use_triton_conv1d_this_step = self.use_triton_conv1d
         self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -1823,8 +1903,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
-        # Hybrid models with Mamba caching: skip based on Mamba match count
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+        # Hybrid models with Mamba caching: skip based on Mamba match count.
+        # Only applies to the first chunk (finished == 0); continuation chunks
+        # already had Mamba state restored during the first chunk.
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             assert (
                 num_mamba_matched <= num_matched
@@ -1844,8 +1926,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model:
+        elif self.is_hybrid_model and finished == 0:
             prefix_skip_tokens = 0
+
+        # Clamp so that effective_prefill_chunk_length >= 2 when possible.
+        # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
+        # which routes the batch into the flash-attention decode kernel and crashes.
+        # Round down to a block boundary to keep block-table indexing consistent.
+        if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
+            max_skip = prefill_chunk_length - 2
+            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -2219,8 +2309,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
-        if self.is_hybrid_model:
-            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
         return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
@@ -2247,13 +2335,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Clear intermediate offset entries for released requests
         if self.mamba_slot_allocator is not None:
-            idx_list = (
-                request_indexes.tolist() if hasattr(request_indexes, 'tolist') else request_indexes
-            )
-            for idx in idx_list:
-                self.mamba_slot_allocator._intermediate_offsets[idx] = None
-                self.mamba_slot_allocator._intermediate_block_ids[idx] = None
-                self.mamba_slot_allocator._eos_cache_block_id[idx] = None
+            sa = self.mamba_slot_allocator
+            sa._intermediate_counts_gpu[request_indexes] = 0
+            sa._intermediate_offsets_gpu[request_indexes] = 0
+            sa._intermediate_block_ids_gpu[request_indexes] = -1
+            sa._eos_cache_block_id_gpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor

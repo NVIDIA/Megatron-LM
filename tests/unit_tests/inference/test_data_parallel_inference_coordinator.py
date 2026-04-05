@@ -9,9 +9,11 @@ import unittest.mock
 from collections import OrderedDict, deque
 from typing import Dict, Optional
 import msgpack
+import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -303,7 +305,15 @@ def coordinator():
         ready_event = spawn_context.Event()
         proc = spawn_context.Process(
             target=DataParallelInferenceCoordinator.entrypoint,
-            args=(pipe_child, ready_event, 0, DummyTokenizer(), DEFAULT_PORT, False),
+            kwargs={
+                "pipe_connection": pipe_child,
+                "ready_event": ready_event,
+                "data_parallel_size": 0,
+                "tokenizer": DummyTokenizer(),
+                "max_requests": 16,
+                "inference_coordinator_port": DEFAULT_PORT,
+                "deterministic_mode": False,
+            },
         )
         proc.start()
 
@@ -976,3 +986,117 @@ class TestPrefixCachingRouter:
         assert stats["hash_to_rank_info_size"] <= 5
         # Hash 9 has a stale rank0 entry → stale_rank_filtered_count must be >= 1.
         assert stats["stale_rank_filtered_count"] >= 1
+def _set_hash_rank(coord, h, rank_identity, timestamp):
+    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
+    rank_idx = coord.identity_to_rank_index[rank_identity]
+    coord._hash_table.setdefault(h, {})[rank_idx] = timestamp
+
+
+def _make_routing_coordinator(
+    num_ranks=4, enable_prefix_caching=False, policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+):
+    """Create a coordinator with fake rank identities for routing-only tests.
+
+    Thin wrapper around the shared helper in coordinator_test_utils.py.
+    """
+    from tests.unit_tests.inference.coordinator_test_utils import (
+        make_coordinator_direct as _make_coordinator,
+    )
+
+    return _make_coordinator(
+        data_parallel_size=num_ranks,
+        block_size_tokens=64,
+        enable_prefix_caching=enable_prefix_caching,
+        policy=policy,
+        rank_name_template="rank-{}",
+    )
+
+
+class TestRoutingPolicies:
+    """Unit tests for routing behavior under different policies and load conditions."""
+
+    def test_no_prefix_caching_uses_round_robin(self):
+        """When prefix caching is off, round-robin is used regardless of load."""
+        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        results = [coord.get_best_data_parallel_rank([]) for _ in range(6)]
+        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-0", b"rank-1", b"rank-2"]
+
+    def test_empty_hashes_uses_round_robin(self):
+        """Empty hash list falls back to round-robin."""
+        coord = _make_routing_coordinator(num_ranks=4)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 5
+
+        results = [coord.get_best_data_parallel_rank([]) for _ in range(4)]
+        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-3"]
+
+    def test_prefix_affinity_routing(self):
+        """When prefix caching is on with hashes, scoring picks the best rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        for ident in coord.identities_of_data_parallel_ranks:
+            coord._pending_counts[coord.identity_to_rank_index[ident]] = 1
+
+        # Seed a hash on rank-2 so prefix routing prefers it.
+        fake_hash = 12345
+        _set_hash_rank(coord, fake_hash, b"rank-2", 1)
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-2"
+
+    def test_prefix_affinity_beats_free_capacity(self):
+        """A rank with a prefix match and capacity is preferred over a free rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        fake_hash = 99999
+        _set_hash_rank(coord, fake_hash, b"rank-1", 1)
+
+        # Scoring: rank-1 gets prefix match bonus, which outweighs rank-2's
+        # free capacity advantage.
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_free_capacity_wins_when_prefix_rank_is_full(self):
+        """A free rank wins when the prefix-matched rank is full and alpha is low."""
+        coord = _make_routing_coordinator(
+            num_ranks=2,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        )
+        coord.prefix_caching_routing_alpha = 0.1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
+
+        fake_hash = 42
+        _set_hash_rank(coord, fake_hash, b"rank-0", 1)
+
+        # score(rank-0) = 0.1*1 + 0.9*(0/10) = 0.1
+        # score(rank-1) = 0.1*0 + 0.9*(10/10) = 0.9
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_round_robin_policy_ignores_load(self):
+        """ROUND_ROBIN policy does naive round-robin regardless of load."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        coord._round_robin_idx = 0
+        identities = list(coord.identities_of_data_parallel_ranks)
+        for i in range(len(identities)):
+            chosen = coord.get_best_data_parallel_rank([99])
+            assert chosen == identities[i]
