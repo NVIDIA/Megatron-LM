@@ -62,9 +62,9 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   # data settings
   --data-cache-path: ${DATA_CACHE_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   # logging settings
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --timing-log-level: 0
@@ -78,6 +78,8 @@ MODEL_ARGS:
   --rerun-mode: validate_results
   --error-injection-rate: 100
   --error-injection-type: persistent_error
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 AFTER_SCRIPT: |
   check_log() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then exit 1; else echo OK; fi }
   check_log -F "Result validation enabled"
