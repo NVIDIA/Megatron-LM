@@ -48,17 +48,16 @@ MODEL_ARGS:
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 8
-  --global-batch-size: 32
-  --train-iters: 20
+  --micro-batch-size: 128
+  --global-batch-size: 1024
+  --train-iters: 1000
   --exit-duration-in-mins: 60
-  --no-check-for-nan-in-loss-and-grad: true
   # --cross-entropy-loss-fusion: true  # Not deterministic yet.
   --cross-entropy-fusion-impl: te
   --manual-gc: true
   --manual-gc-interval: 10
   --deterministic-mode: true
-  --exit-interval: 20000
+  --seed: 42 
 
   # Transformer Engine args
   --transformer-impl: transformer_engine
@@ -131,12 +130,13 @@ MODEL_ARGS:
   --moe-router-bias-update-rate: 1e-3
   --moe-router-dtype: fp32
   --moe-permute-fusion: true
-  --moe-router-fusion: true
+  # Running into issues with router fusion, skipping for now
+  #--moe-router-fusion: true 
   --moe-router-pre-softmax: true
   
   # MoE Dispatcher
-  --moe-token-dispatcher-type: flex
-  --moe-flex-dispatcher-backend: hybridep
+  --moe-token-dispatcher-type: alltoall
+  #--moe-flex-dispatcher-backend: hybridep
   
   # MLA args (DeepSeek-style)
   --q-lora-rank: 256
@@ -151,7 +151,7 @@ MODEL_ARGS:
 
   # Validation
   --eval-iters: 10
-  --eval-interval: 200
+  --eval-interval: 100
 
   # Checkpointing
   # --save: ${CHECKPOINT_SAVE_PATH}
@@ -167,7 +167,7 @@ MODEL_ARGS:
   --log-params-norm: true
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
-  --log-interval: 100
+  --log-interval: 1
   #--logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
 
