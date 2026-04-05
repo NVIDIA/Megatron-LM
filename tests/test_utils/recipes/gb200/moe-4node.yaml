@@ -1,3 +1,5 @@
+# 4 Nodes Tests to get EP2, TP2, FSPD2, DP2
+# Using MoE has as they have Dense modules as well. All the actual tests are still in the moe/ folder.
 type: basic
 format_version: 1
 maintainers: [mcore]
@@ -6,9 +8,9 @@ spec:
   name: "{test_case}_{environment}_{platforms}"
   model: moe
   build: mcore-pyt-{environment}
-  nodes: 1
+  nodes: 4
   gpus: 4
-  n_repeat: 5
+  n_repeat: 3
   platforms: dgx_gb200
   script_setup: |
     unset https_proxy
@@ -45,7 +47,6 @@ spec:
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
-        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
@@ -58,13 +59,11 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node]
+  #######################################################################
+  # Nightly tests: Run both DEV and LTS                                 #
+  #######################################################################
+  - test_case: [deepseek_fsdp_4node]
     products:
       - environment: [dev]
-        scope: [mr-github, mr-github-slim]
-        platforms: [dgx_gb200]
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node_conv]
-    products:
-      - environment: [dev]
-        scope: [mr-github]
+        scope: [nightly]
         platforms: [dgx_gb200]
