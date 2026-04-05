@@ -2,7 +2,6 @@
 # Functional test for dense+MoE hybrid, EP, and HSDP.
 ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   NCCL_DEBUG: VERSION
   NCCL_ALGO: Ring
@@ -53,7 +52,7 @@ MODEL_ARGS:
 
   # Recompute args
   --recompute-granularity: selective
-  --recompute-modules: "layernorm,mla_up_proj,moe_act"
+  --recompute-modules: "[layernorm mla_up_proj moe_act]"
 
   # Data args
   --seq-length: 1024
