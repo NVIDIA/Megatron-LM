@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import gc
 import os
@@ -37,8 +37,8 @@ except Exception:
 try:
     import mamba_ssm  # noqa: F401
 
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+    from megatron.core.models.mamba.mamba_model import MambaModel
 
     has_mamba_deps = True
 except Exception:
@@ -203,9 +203,9 @@ def _build_mamba(
     parallel_output: bool = True,
 ):
     pre_process, post_process = _pp_flags(pg_collection)
-    model = HybridModel(
+    model = MambaModel(
         config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
+        mamba_stack_spec=mamba_stack_spec,
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
         hybrid_layer_pattern=hybrid_layer_pattern,
