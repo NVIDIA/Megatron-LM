@@ -612,7 +612,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
         Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
     )
@@ -2482,14 +2482,12 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
-    group.add_argument('--optimizer-cuda-graph', action='store_true',
-                       help='Enable CUDA graph for optimizer step')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
@@ -2696,6 +2694,9 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_param_gather')
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',

@@ -156,7 +156,6 @@ from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -667,7 +666,7 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -2122,7 +2121,7 @@ def training_log(
         if is_hybrid_model(args):
             from operator import itemgetter
 
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols, get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
@@ -2785,8 +2784,6 @@ def train(
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
-    if args.optimizer_cuda_graph:
-        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3208,10 +3205,6 @@ def train(
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
-
-    # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
-    if args.optimizer_cuda_graph:
-        del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
 

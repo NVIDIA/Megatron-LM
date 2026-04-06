@@ -9,7 +9,7 @@ MODEL_ARGS:
   --group-query-attention: true
   --num-query-groups: 8
   --hybrid-layer-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-
-  --spec: "[megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec]"
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -55,4 +55,6 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
