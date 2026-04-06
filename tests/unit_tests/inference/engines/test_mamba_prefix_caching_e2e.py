@@ -54,8 +54,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -131,9 +131,9 @@ class TestMambaPrefixCachingE2E:
             add_bias_linear=True,
             is_hybrid_model=True,
         )
-        model = HybridModel(
+        model = MambaModel(
             config=transformer_config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            mamba_stack_spec=mamba_stack_spec,
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
