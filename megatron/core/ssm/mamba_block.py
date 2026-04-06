@@ -2,10 +2,4 @@
 
 # Backward-compatible re-export. The canonical location is now
 # megatron.core.models.hybrid.hybrid_block.
-from megatron.core.models.hybrid.hybrid_block import *  # noqa: F401,F403
-from megatron.core.models.hybrid.hybrid_block import (  # noqa: F401
-    HybridStack,
-    HybridStackSubmodules,
-    MambaStack,
-    MambaStackSubmodules,
-)
+from megatron.core.models.hybrid.hybrid_block import *  # noqa: F401,F403 # pylint: disable=unused-import
