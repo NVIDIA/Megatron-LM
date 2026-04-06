@@ -21,7 +21,7 @@ MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2
   --expert-model-parallel-size: 2
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
@@ -29,20 +29,20 @@ MODEL_ARGS:
   --overlap-grad-reduce: true
   --overlap-param-gather: true
 
-  --num-distributed-optimizer-instances: 1
+  #--num-distributed-optimizer-instances: 1
 
   # FSDP args
-  --use-megatron-fsdp: true
-  --data-parallel-sharding-strategy: "optim_grads_params"
-  --outer-dp-sharding-strategy: "no_shard"
+  #--use-megatron-fsdp: true
+  #--data-parallel-sharding-strategy: "optim_grads_params"
+  #--outer-dp-sharding-strategy: "no_shard"
 
-  --ckpt-format: "fsdp_dtensor"
+  #--ckpt-format: "fsdp_dtensor"
   #--no-gradient-accumulation-fusion: true
 
   # Precision
-  --fp8-format: "e4m3"
+  --fp8-format: "hybrid"
   --fp8-recipe: "tensorwise"
-  --fp8-param-gather: true
+  #--fp8-param-gather: true
 
   # Training args
   --use-mcore-models: true
@@ -156,7 +156,6 @@ MODEL_ARGS:
   # Checkpointing
   # --save: ${CHECKPOINT_SAVE_PATH}
   # --load: ${CHECKPOINT_LOAD_PATH}
-  --ckpt-format: fsdp_dtensor
 
   # Logging
   #--save-interval: 25
