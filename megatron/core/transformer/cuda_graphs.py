@@ -1148,8 +1148,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     ref.can_skip_replay_copy = arg.can_skip_replay_copy
                 return ref
 
-                return ref
-
             # NOTE: Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
             # reference. This is safe for surfaces whose memory is managed by the CUDA graph pool
             # (driver-pinned, stable addresses) but not safe for tensors allocated by the caching
