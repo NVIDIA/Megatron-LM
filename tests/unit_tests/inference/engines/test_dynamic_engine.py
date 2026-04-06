@@ -3011,7 +3011,6 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 
-
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -3095,14 +3094,14 @@ class TestDynamicInferenceEngine:
 
         for record in finished_records:
             req = record.merge()
-            assert req.status == Status.COMPLETED, (
-                f"Request {req.request_id} not completed: {req.status}"
-            )
+            assert (
+                req.status == Status.COMPLETED
+            ), f"Request {req.request_id} not completed: {req.status}"
 
             # Generated log probs should match generated token count.
-            assert req.generated_log_probs is not None, (
-                f"Request {req.request_id}: generated_log_probs is None"
-            )
+            assert (
+                req.generated_log_probs is not None
+            ), f"Request {req.request_id}: generated_log_probs is None"
             assert len(req.generated_log_probs) == len(req.generated_tokens), (
                 f"Request {req.request_id}: log probs count {len(req.generated_log_probs)} "
                 f"!= token count {len(req.generated_tokens)}"
@@ -3110,12 +3109,10 @@ class TestDynamicInferenceEngine:
 
             # All log probs should be valid floats (negative, since they're log probabilities).
             for j, lp in enumerate(req.generated_log_probs):
-                assert isinstance(lp, float), (
-                    f"Request {req.request_id}, token {j}: log prob is not float"
-                )
-                assert lp <= 0.0, (
-                    f"Request {req.request_id}, token {j}: log prob {lp} > 0"
-                )
+                assert isinstance(
+                    lp, float
+                ), f"Request {req.request_id}, token {j}: log prob is not float"
+                assert lp <= 0.0, f"Request {req.request_id}, token {j}: log prob {lp} > 0"
 
             # Prompt log probs check.
             if skip_prompt_log_probs:
@@ -3212,18 +3209,18 @@ class TestDynamicInferenceEngine:
             assert req.status == Status.COMPLETED
 
             # Validate generated top-n logprobs.
-            assert req.generated_top_n_logprobs is not None, (
-                f"Request {req.request_id}: generated_top_n_logprobs is None"
-            )
+            assert (
+                req.generated_top_n_logprobs is not None
+            ), f"Request {req.request_id}: generated_top_n_logprobs is None"
             assert len(req.generated_top_n_logprobs) == len(req.generated_tokens), (
                 f"Request {req.request_id}: top-n count {len(req.generated_top_n_logprobs)} "
                 f"!= token count {len(req.generated_tokens)}"
             )
 
             for j, top_n_dict in enumerate(req.generated_top_n_logprobs):
-                assert isinstance(top_n_dict, dict), (
-                    f"Request {req.request_id}, token {j}: top_n_dict is not a dict"
-                )
+                assert isinstance(
+                    top_n_dict, dict
+                ), f"Request {req.request_id}, token {j}: top_n_dict is not a dict"
                 assert 0 < len(top_n_dict) <= top_n, (
                     f"Request {req.request_id}, token {j}: "
                     f"top-n has {len(top_n_dict)} entries, expected 1..{top_n}"
@@ -3232,11 +3229,7 @@ class TestDynamicInferenceEngine:
             # Validate consistency: selected token's log prob should appear in top-n.
             if req.generated_log_probs is not None:
                 for j, (lp, top_n_dict, token_id) in enumerate(
-                    zip(
-                        req.generated_log_probs,
-                        req.generated_top_n_logprobs,
-                        req.generated_tokens,
-                    )
+                    zip(req.generated_log_probs, req.generated_top_n_logprobs, req.generated_tokens)
                 ):
                     token_str = env.engine.controller.tokenizer.detokenize([token_id])
                     assert token_str in top_n_dict, (
@@ -3250,9 +3243,9 @@ class TestDynamicInferenceEngine:
 
             # Validate prompt top-n logprobs.
             if not skip_prompt_log_probs:
-                assert req.prompt_top_n_logprobs is not None, (
-                    f"Request {req.request_id}: prompt_top_n_logprobs is None"
-                )
+                assert (
+                    req.prompt_top_n_logprobs is not None
+                ), f"Request {req.request_id}: prompt_top_n_logprobs is None"
                 assert len(req.prompt_top_n_logprobs) > 0
                 for j, top_n_dict in enumerate(req.prompt_top_n_logprobs):
                     assert isinstance(top_n_dict, dict)
@@ -3354,7 +3347,6 @@ class TestDynamicInferenceEngine:
                         f"expected <= {req_top_n} entries, got {len(top_n_dict)}"
                     )
 
-
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -3412,9 +3404,9 @@ class TestDynamicInferenceEngine:
 
         for record in finished_records:
             req = record.merge()
-            assert req.status == Status.COMPLETED, (
-                f"Request {req.request_id} not completed: {req.status}"
-            )
+            assert (
+                req.status == Status.COMPLETED
+            ), f"Request {req.request_id} not completed: {req.status}"
 
             # Generated tokens should be within valid vocab range.
             for j, tok in enumerate(req.generated_tokens):
@@ -3432,9 +3424,7 @@ class TestDynamicInferenceEngine:
 
             # All log probs should be valid (non-positive).
             for j, lp in enumerate(req.generated_log_probs):
-                assert lp <= 0.0, (
-                    f"Request {req.request_id}, token {j}: log prob {lp} > 0"
-                )
+                assert lp <= 0.0, f"Request {req.request_id}, token {j}: log prob {lp} > 0"
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -3502,11 +3492,7 @@ class TestDynamicInferenceEngine:
             # Consistency: selected token's log prob should appear in top-n.
             if req.generated_log_probs is not None:
                 for j, (lp, top_n_dict, token_id) in enumerate(
-                    zip(
-                        req.generated_log_probs,
-                        req.generated_top_n_logprobs,
-                        req.generated_tokens,
-                    )
+                    zip(req.generated_log_probs, req.generated_top_n_logprobs, req.generated_tokens)
                 ):
                     token_str = env.engine.controller.tokenizer.detokenize([token_id])
                     assert token_str in top_n_dict, (
