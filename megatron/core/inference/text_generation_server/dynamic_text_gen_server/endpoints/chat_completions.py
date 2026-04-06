@@ -605,7 +605,7 @@ try:
             error_detail = "; ".join(failed_errors)
             status = 400 if has_nontransient_error else 500
             logger.error(f"Inference request(s) failed: {error_detail}")
-            
+
             # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
             if "MaxSequenceLengthOverflowError" in error_detail:
                 error_msg = (

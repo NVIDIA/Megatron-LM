@@ -1328,9 +1328,7 @@ class TextGenerationController:
         if only_last:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
-            log_probs_tensor = F.log_softmax(
-                logits_squeezed[: context.active_token_count], dim=-1
-            )
+            log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
 
         log_probs_list_decode = []
 
@@ -1377,17 +1375,14 @@ class TextGenerationController:
                     num_decode_requests:active_request_count
                 ]
                 selected_log_probs = prefill_log_probs[
-                    torch.arange(num_prefill_requests, device=logits.device),
-                    prefill_new_tokens,
+                    torch.arange(num_prefill_requests, device=logits.device), prefill_new_tokens
                 ]
                 log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
             else:
                 prefill_token_ids = context.token_to_input_ids[
                     decode_len : context.active_token_count
                 ].roll(-1, 0)
-                prefill_query_lengths = request_query_lengths[
-                    request_in_prefill_status_tensor == 1
-                ]
+                prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
                 new_token_idx = prefill_query_lengths.cumsum(0) - 1
                 prefill_new_tokens = self._sampled_tokens_cuda[
                     num_decode_requests:active_request_count
@@ -1475,12 +1470,9 @@ class TextGenerationController:
             prefill_log_probs = log_probs_tensor[decode_len:]
 
             # Batch metadata reads: single CPU transfer for all prefill requests.
-            prefill_top_n = (
-                self._request_metadata["top_n_logprobs"][active_request_slice][
-                    num_decode_requests:
-                ]
-                .tolist()
-            )
+            prefill_top_n = self._request_metadata["top_n_logprobs"][active_request_slice][
+                num_decode_requests:
+            ].tolist()
             max_top_n_prefill = int(max(prefill_top_n)) if prefill_top_n else 0
 
             if max_top_n_prefill > 0:
@@ -1506,12 +1498,9 @@ class TextGenerationController:
                     prefill_log_probs_per_request = prefill_log_probs.split(
                         prefill_query_lengths.tolist(), dim=0
                     )
-                    prefill_skip_prompt = (
-                        self._request_metadata["skip_prompt_log_probs"][
-                            num_decode_requests:active_request_count
-                        ]
-                        .tolist()
-                    )
+                    prefill_skip_prompt = self._request_metadata["skip_prompt_log_probs"][
+                        num_decode_requests:active_request_count
+                    ].tolist()
 
                     for i in range(num_prefill_requests):
                         top_n = int(prefill_top_n[i])
@@ -1897,10 +1886,8 @@ class TextGenerationController:
                         self._dynamic_step_calculate_log_probs_speculative(logits)
                     )
                     if return_top_n_logprobs:
-                        top_n_logprobs = (
-                            self._dynamic_step_calculate_top_n_logprobs_speculative(
-                                log_probs_tensor
-                            )
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                            log_probs_tensor
                         )
                 else:
                     log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
