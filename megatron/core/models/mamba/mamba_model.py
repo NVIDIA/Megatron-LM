@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -25,6 +26,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
+    compute_output_logits_fp32,
     deprecate_inference_params,
     is_using_quantization_scales,
     log_single_rank,
@@ -452,9 +454,19 @@ class MambaModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        # If fp32 residual connection is enabled, run output projection in FP32 and
+        # keep output logits as FP32.
+        if self.config.fp32_residual_connection:
+            logits = compute_output_logits_fp32(
+                hidden_states=hidden_states,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
         logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
