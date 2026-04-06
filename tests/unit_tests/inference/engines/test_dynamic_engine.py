@@ -1935,6 +1935,10 @@ class TestDynamicInferenceEngine:
         )
         env = self._build_test_env(test_config)
 
+        # Override detokenize to produce unique strings per token ID so the
+        # top-n dict doesn't collapse all entries to a single key.
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
+
         # Create requests with top_n_logprobs enabled
         top_n = 5
         requests_to_add = []
@@ -3146,6 +3150,10 @@ class TestDynamicInferenceEngine:
         )
         env = self._build_test_env(test_config)
 
+        # Override detokenize to produce unique strings per token ID so the
+        # top-n dict doesn't collapse all entries to a single key.
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
+
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
         hidden_size = unwrapped_model.config.hidden_size
 
@@ -3275,6 +3283,8 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
         )
         env = self._build_test_env(test_config)
+
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
         hidden_size = unwrapped_model.config.hidden_size
@@ -3448,6 +3458,8 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
         )
         env = self._build_test_env(test_config)
+
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
         top_n = 5
         num_requests = 3
