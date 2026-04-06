@@ -64,91 +64,70 @@ class TestParallelTransformerLayer:
 
     def test_chunked_mlp(self):
         with torch.no_grad():
-
-            def test(
-                num_layers,
-                hidden_size,
-                num_attention_heads,
-                mlp_chunks_for_prefill,
-                mlp_chunks_for_training,
-                hidden_states,
-                inference_context,
-            ):
-
-                transformer_config = TransformerConfig(
-                    num_layers=num_layers,
-                    hidden_size=hidden_size,
-                    num_attention_heads=num_attention_heads,
-                    mlp_chunks_for_prefill=mlp_chunks_for_prefill,
-                    mlp_chunks_for_training=mlp_chunks_for_training,
-                    add_bias_linear=True,
-                    use_cpu_initialization=True,
-                )
-                parallel_transformer_layer = TransformerLayer(
-                    transformer_config, get_gpt_layer_with_transformer_engine_submodules()
-                )
-
-                parallel_transformer_layer.cuda()
-
-                hidden_states, context = parallel_transformer_layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                )
-
-                return hidden_states, context
-
             num_layers = 2
             hidden_size = 12
             num_attention_heads = 4
-
             sequence_length = 32
             micro_batch_size = 2
 
+            transformer_config = TransformerConfig(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                mlp_chunks_for_prefill=1,
+                mlp_chunks_for_training=1,
+                add_bias_linear=True,
+                use_cpu_initialization=True,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+            )
+            parallel_transformer_layer = TransformerLayer(
+                transformer_config, get_gpt_layer_with_transformer_engine_submodules()
+            )
+            parallel_transformer_layer.cuda()
+
             # [sequence length, batch size, hidden size]
-            input_hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size))
+            torch.manual_seed(42)
+            input_hidden_states = torch.randn((sequence_length, micro_batch_size, hidden_size))
             input_hidden_states = input_hidden_states.cuda()
 
-            attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+            attention_mask = torch.ones(
+                (1, 1, sequence_length, sequence_length), dtype=bool
+            ).cuda()
 
+            # Test chunked prefill: chunks=1 vs chunks=4 should be identical
+            parallel_transformer_layer.eval()
             inference_context = StaticInferenceContext(
                 max_batch_size=micro_batch_size, max_sequence_length=sequence_length
             )
-
             outputs = {}
-
             for mlp_chunks_for_prefill in [1, 4]:
-                hidden_states, context = test(
-                    num_layers,
-                    hidden_size,
-                    num_attention_heads,
-                    mlp_chunks_for_prefill,
-                    1,
-                    input_hidden_states,
-                    inference_context,
+                transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
+                hidden_states, context = parallel_transformer_layer(
+                    hidden_states=input_hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
                 )
                 assert hidden_states.shape[0] == sequence_length
                 assert hidden_states.shape[1] == micro_batch_size
                 assert hidden_states.shape[2] == hidden_size
-
                 outputs[mlp_chunks_for_prefill] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
-            inference_context = None
+
+            # Test chunked training: chunks=1 vs chunks=4 should be identical
+            parallel_transformer_layer.train()
+            outputs = {}
             for mlp_chunks_for_training in [1, 4]:
-                hidden_states, context = test(
-                    num_layers,
-                    hidden_size,
-                    num_attention_heads,
-                    1,
-                    mlp_chunks_for_training,
-                    input_hidden_states,
-                    inference_context,
+                transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
+                hidden_states, context = parallel_transformer_layer(
+                    hidden_states=input_hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=None,
                 )
                 assert hidden_states.shape[0] == sequence_length
                 assert hidden_states.shape[1] == micro_batch_size
                 assert hidden_states.shape[2] == hidden_size
-
                 outputs[mlp_chunks_for_training] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
