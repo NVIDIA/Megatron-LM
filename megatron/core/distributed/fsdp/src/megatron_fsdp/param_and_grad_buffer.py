@@ -104,6 +104,19 @@ except ImportError:
 NCCL_MEMORY_POOL = None
 
 
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device) -> None:
+    """
+    Materialize only meta tensors in a module, preserving non-meta tensors that are already initialized on device.
+    """
+    for name, param in module.named_parameters(recurse=False):
+        if param.is_meta:
+            new = torch.empty_like(param, device=device)
+            setattr(module, name, torch.nn.Parameter(new, requires_grad=param.requires_grad))
+    for name, buf in module.named_buffers(recurse=False):
+        if buf.is_meta:
+            module.register_buffer(name, torch.empty_like(buf, device=device))
+
+
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     """Alternate to ``assert`` when in the backward context to print the error
     message ``s`` since otherwise, it is swallowed.
@@ -2489,7 +2502,7 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            _materialize_meta_tensors(m, self.device)
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
