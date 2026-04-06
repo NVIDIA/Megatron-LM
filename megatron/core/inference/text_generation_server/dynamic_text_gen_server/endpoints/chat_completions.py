@@ -76,16 +76,6 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-_TRANSFER_TOOL_NAME = "transfer_to_human_agents"
-_TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
-_RESERVATION_UPDATE_TOOLS = {
-    "update_reservation_flights",
-    "update_reservation_passengers",
-    "update_reservation_baggages",
-}
-_RESERVATION_DESTRUCTIVE_TOOLS = {"cancel_reservation", "book_reservation"}
-
-
 def _try_parse_jsonish(value):
     if not isinstance(value, str):
         return value
@@ -199,46 +189,19 @@ def _normalize_tool_calls(tool_calls, tools=None):
                 "function": {"name": str(fn_name), "arguments": fn_args},
             }
         )
-    return _apply_tool_call_guardrails(normalized)
+    return normalized
 
 
-def _apply_tool_call_guardrails(tool_calls):
-    """Apply conservative post-parse guardrails to tool call lists.
+def _maybe_filter_parallel_tool_calls(tool_calls, parallel_tool_calls):
+    """Filter to first tool call only when parallel_tool_calls is False.
 
-    If update-style reservation tools are already present in the same response,
-    suppress cancel+book style calls to avoid destructive replanning patterns.
+    Matches vLLM's maybe_filter_parallel_tool_calls behavior.
     """
-    if not isinstance(tool_calls, list):
+    if parallel_tool_calls:
         return tool_calls
-
-    call_names = {
-        _get_field(_get_field(call, "function", {}), "name")
-        for call in tool_calls
-        if isinstance(call, dict)
-    }
-    if call_names & _RESERVATION_UPDATE_TOOLS:
-        return [
-            call
-            for call in tool_calls
-            if _get_field(_get_field(call, "function", {}), "name")
-            not in _RESERVATION_DESTRUCTIVE_TOOLS
-        ]
+    if tool_calls:
+        return tool_calls[:1]
     return tool_calls
-
-
-def _normalize_assistant_content(message_text, tool_calls):
-    """Normalize assistant content for policy-sensitive tool transitions."""
-    if not isinstance(message_text, str):
-        message_text = "" if message_text is None else str(message_text)
-
-    tool_names = {
-        _get_field(_get_field(call, "function", {}), "name")
-        for call in (tool_calls or [])
-        if isinstance(call, dict)
-    }
-    if _TRANSFER_TOOL_NAME in tool_names:
-        return _TRANSFER_HOLD_MESSAGE
-    return message_text
 
 
 def _coerce_arguments_mapping(arguments):
@@ -446,7 +409,9 @@ try:
 
         req = await request.get_json()
         tools = req.get("tools", None)
-        tools_requested = bool(tools)
+        tool_choice = req.get("tool_choice", None)
+        parallel_tool_calls = req.get("parallel_tool_calls", True)
+        tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
         chat_template_kwargs = req.get("chat_template_kwargs", {})
         if not isinstance(chat_template_kwargs, dict):
@@ -699,10 +664,22 @@ try:
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
-            message = {
-                "role": "assistant",
-                "content": _normalize_assistant_content(message_text, normalized_tool_calls),
-            }
+
+            # Apply parallel_tool_calls filtering (matches vLLM behavior)
+            normalized_tool_calls = _maybe_filter_parallel_tool_calls(
+                normalized_tool_calls, parallel_tool_calls
+            )
+
+            # Determine content based on tool_choice (matches vLLM behavior):
+            # - Named tool choice or "required": content is empty string
+            # - Otherwise: content is the parsed message text
+            is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+            if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
+                content = ""
+            else:
+                content = message_text if message_text is not None else ""
+
+            message = {"role": "assistant", "content": content}
             if normalized_tool_calls:
                 message["tool_calls"] = normalized_tool_calls
             if "reasoning" in metadata:
@@ -714,12 +691,19 @@ try:
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
-            finish_reason = "tool_calls" if metadata.get("tool_calls", []) else "stop"
+            # Determine finish_reason following vLLM conventions:
+            # - "tool_calls" for auto or required tool choice when tools are called
+            # - "stop" for named tool choice (even when tools are called)
+            # - "length" when max tokens is reached
             if (
                 len(result["generated_tokens"])
                 >= result["sampling_params"]["num_tokens_to_generate"]
             ):
                 finish_reason = "length"
+            elif normalized_tool_calls and not is_named_tool_choice:
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = "stop"
 
             choice_data = {
                 "index": request_idx,
@@ -759,7 +743,7 @@ try:
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         response = {
-            "id": str(uuid.uuid4()),
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",
