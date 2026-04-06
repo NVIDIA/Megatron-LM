@@ -3008,6 +3008,505 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.total_request_count == 0
 
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @torch.inference_mode()
+    def test_speculative_decoding_logprobs(self, skip_prompt_log_probs: bool):
+        """Test that log probabilities are correctly computed with speculative decoding.
+
+        Verifies:
+        1. generated_log_probs are returned for all generated tokens (including accepted
+           speculative tokens and newly sampled tokens).
+        2. prompt_log_probs respect the skip_prompt_log_probs flag.
+        3. The number of log probs matches the number of generated tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        # Mock forward to return deterministic logits so speculative tokens are accepted.
+        def mock_deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            b, s = tokens.shape
+            base_logits = torch.randn(
+                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            # Make token 0 very likely so speculative tokens get accepted.
+            base_logits[:, :, 0] = 100.0
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return base_logits
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            n = hidden_states.size(0)
+            logits = torch.randn(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
+
+        # Add requests with log probs enabled and varying prompt lengths.
+        num_requests = 3
+        prompt_lengths = [4, 6, 8]
+        for i in range(num_requests):
+            prompt = torch.randint(
+                0, test_config.vocab_size - 1, (prompt_lengths[i],), device='cuda'
+            )
+            env.engine.add_request(
+                request_id=i,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8,
+                    termination_id=test_config.vocab_size - 1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=skip_prompt_log_probs,
+                    top_k=1,
+                ),
+            )
+
+        # Run to completion.
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        assert len(finished_records) == num_requests
+
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED, (
+                f"Request {req.request_id} not completed: {req.status}"
+            )
+
+            # Generated log probs should match generated token count.
+            assert req.generated_log_probs is not None, (
+                f"Request {req.request_id}: generated_log_probs is None"
+            )
+            assert len(req.generated_log_probs) == len(req.generated_tokens), (
+                f"Request {req.request_id}: log probs count {len(req.generated_log_probs)} "
+                f"!= token count {len(req.generated_tokens)}"
+            )
+
+            # All log probs should be valid floats (negative, since they're log probabilities).
+            for j, lp in enumerate(req.generated_log_probs):
+                assert isinstance(lp, float), (
+                    f"Request {req.request_id}, token {j}: log prob is not float"
+                )
+                assert lp <= 0.0, (
+                    f"Request {req.request_id}, token {j}: log prob {lp} > 0"
+                )
+
+            # Prompt log probs check.
+            if skip_prompt_log_probs:
+                assert req.prompt_log_probs is None or len(req.prompt_log_probs) == 0
+            else:
+                assert req.prompt_log_probs is not None
+                assert len(req.prompt_log_probs) > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @torch.inference_mode()
+    def test_speculative_decoding_top_n_logprobs(self, skip_prompt_log_probs: bool):
+        """Test that top-N log probabilities are correctly computed with speculative decoding.
+
+        Verifies:
+        1. generated_top_n_logprobs are returned for all generated tokens.
+        2. Each top-n dict has the expected number of entries (<= top_n).
+        3. The selected token appears in the top-n with a matching log prob value.
+        4. prompt_top_n_logprobs respect the skip_prompt_log_probs flag.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=8,
+            num_tokens_to_generate=6,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        def mock_deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            b, s = tokens.shape
+            base_logits = torch.randn(
+                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            base_logits[:, :, 0] = 100.0
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return base_logits
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            n = hidden_states.size(0)
+            logits = torch.randn(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
+
+        top_n = 5
+        num_requests = 3
+        prompt_lengths = [4, 6, 8]
+        for i in range(num_requests):
+            prompt = torch.randint(
+                0, test_config.vocab_size - 1, (prompt_lengths[i],), device='cuda'
+            )
+            env.engine.add_request(
+                request_id=i,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=6,
+                    termination_id=test_config.vocab_size - 1,
+                    return_log_probs=True,
+                    top_n_logprobs=top_n,
+                    skip_prompt_log_probs=skip_prompt_log_probs,
+                    top_k=1,
+                ),
+            )
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        assert len(finished_records) == num_requests
+
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED
+
+            # Validate generated top-n logprobs.
+            assert req.generated_top_n_logprobs is not None, (
+                f"Request {req.request_id}: generated_top_n_logprobs is None"
+            )
+            assert len(req.generated_top_n_logprobs) == len(req.generated_tokens), (
+                f"Request {req.request_id}: top-n count {len(req.generated_top_n_logprobs)} "
+                f"!= token count {len(req.generated_tokens)}"
+            )
+
+            for j, top_n_dict in enumerate(req.generated_top_n_logprobs):
+                assert isinstance(top_n_dict, dict), (
+                    f"Request {req.request_id}, token {j}: top_n_dict is not a dict"
+                )
+                assert 0 < len(top_n_dict) <= top_n, (
+                    f"Request {req.request_id}, token {j}: "
+                    f"top-n has {len(top_n_dict)} entries, expected 1..{top_n}"
+                )
+
+            # Validate consistency: selected token's log prob should appear in top-n.
+            if req.generated_log_probs is not None:
+                for j, (lp, top_n_dict, token_id) in enumerate(
+                    zip(
+                        req.generated_log_probs,
+                        req.generated_top_n_logprobs,
+                        req.generated_tokens,
+                    )
+                ):
+                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
+                    assert token_str in top_n_dict, (
+                        f"Request {req.request_id}, token {j}: "
+                        f"selected token '{token_str}' not in top-n keys {list(top_n_dict.keys())}"
+                    )
+                    assert abs(lp - top_n_dict[token_str]) < 0.1, (
+                        f"Request {req.request_id}, token {j}: "
+                        f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
+                    )
+
+            # Validate prompt top-n logprobs.
+            if not skip_prompt_log_probs:
+                assert req.prompt_top_n_logprobs is not None, (
+                    f"Request {req.request_id}: prompt_top_n_logprobs is None"
+                )
+                assert len(req.prompt_top_n_logprobs) > 0
+                for j, top_n_dict in enumerate(req.prompt_top_n_logprobs):
+                    assert isinstance(top_n_dict, dict)
+                    assert 0 < len(top_n_dict) <= top_n
+            else:
+                assert req.prompt_top_n_logprobs is None or len(req.prompt_top_n_logprobs) == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_top_n_logprobs_mixed_top_n(self):
+        """Test speculative decoding with different top_n_logprobs values per request.
+
+        Verifies:
+        1. Requests with top_n=0 do not receive top-n logprobs.
+        2. Requests with different top_n values get the correct number of entries.
+        3. Mixed top_n values in the same batch work correctly.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        def mock_deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            b, s = tokens.shape
+            base_logits = torch.randn(
+                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            base_logits[:, :, 0] = 100.0
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return base_logits
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            n = hidden_states.size(0)
+            logits = torch.randn(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = mock_deterministic_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
+
+        # Request 0: top_n=3, Request 1: top_n=0 (no top-n), Request 2: top_n=10.
+        top_n_values = [3, 0, 10]
+        for i in range(3):
+            prompt = torch.randint(0, test_config.vocab_size - 1, (4,), device='cuda')
+            env.engine.add_request(
+                request_id=i,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=4,
+                    termination_id=test_config.vocab_size - 1,
+                    return_log_probs=True,
+                    top_n_logprobs=top_n_values[i],
+                    top_k=1,
+                ),
+            )
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        assert len(finished_records) == 3
+
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED
+            req_top_n = top_n_values[req.request_id]
+
+            if req_top_n == 0:
+                assert req.generated_top_n_logprobs is None or all(
+                    d is None or len(d) == 0 for d in (req.generated_top_n_logprobs or [])
+                ), f"Request {req.request_id}: should have no top-n logprobs"
+            else:
+                assert req.generated_top_n_logprobs is not None
+                assert len(req.generated_top_n_logprobs) == len(req.generated_tokens)
+                for j, top_n_dict in enumerate(req.generated_top_n_logprobs):
+                    assert isinstance(top_n_dict, dict)
+                    assert 0 < len(top_n_dict) <= req_top_n, (
+                        f"Request {req.request_id}, token {j}: "
+                        f"expected <= {req_top_n} entries, got {len(top_n_dict)}"
+                    )
+
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "sampling_params_kwargs",
+        [
+            pytest.param({"top_k": 10}, id="top_k_10"),
+            pytest.param({"top_p": 0.9, "top_k": 0}, id="top_p_0.9"),
+            pytest.param({"temperature": 0.8, "top_k": 10}, id="temp_0.8_top_k_10"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_non_greedy_sampling(self, sampling_params_kwargs: dict):
+        """Test that speculative decoding works correctly with non-greedy sampling.
+
+        Exercises top-k, top-p, and temperature sampling through the full engine
+        pipeline with speculative tokens. Verifies:
+        1. All requests complete without errors.
+        2. Generated tokens are within the valid vocab range.
+        3. The generated token count is correct.
+        4. Log probs are consistent with the generated tokens.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=8,
+            num_tokens_to_generate=10,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        num_requests = 4
+        prompt_lengths = [4, 5, 6, 8]
+        for i in range(num_requests):
+            prompt = torch.randint(
+                0, test_config.vocab_size - 1, (prompt_lengths[i],), device='cuda'
+            )
+            params = SamplingParams(
+                num_tokens_to_generate=10,
+                termination_id=test_config.vocab_size - 1,
+                return_log_probs=True,
+                **sampling_params_kwargs,
+            )
+            env.engine.add_request(request_id=i, prompt=prompt, sampling_params=params)
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        assert len(finished_records) == num_requests
+
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED, (
+                f"Request {req.request_id} not completed: {req.status}"
+            )
+
+            # Generated tokens should be within valid vocab range.
+            for j, tok in enumerate(req.generated_tokens):
+                assert 0 <= tok < test_config.vocab_size, (
+                    f"Request {req.request_id}, token {j}: "
+                    f"token {tok} out of vocab range [0, {test_config.vocab_size})"
+                )
+
+            # Log probs count must match token count.
+            assert req.generated_log_probs is not None
+            assert len(req.generated_log_probs) == len(req.generated_tokens), (
+                f"Request {req.request_id}: log probs count {len(req.generated_log_probs)} "
+                f"!= token count {len(req.generated_tokens)}"
+            )
+
+            # All log probs should be valid (non-positive).
+            for j, lp in enumerate(req.generated_log_probs):
+                assert lp <= 0.0, (
+                    f"Request {req.request_id}, token {j}: log prob {lp} > 0"
+                )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_non_greedy_with_top_n_logprobs(self):
+        """Test speculative decoding with non-greedy sampling and top-n logprobs.
+
+        Combines non-greedy sampling (top_k=10) with top_n_logprobs to verify that
+        the logprobs pipeline works end-to-end when speculative tokens may be
+        partially rejected due to sampling randomness.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        top_n = 5
+        num_requests = 3
+        prompt_lengths = [4, 6, 8]
+        for i in range(num_requests):
+            prompt = torch.randint(
+                0, test_config.vocab_size - 1, (prompt_lengths[i],), device='cuda'
+            )
+            env.engine.add_request(
+                request_id=i,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8,
+                    termination_id=test_config.vocab_size - 1,
+                    return_log_probs=True,
+                    top_n_logprobs=top_n,
+                    top_k=10,
+                ),
+            )
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            res = env.engine.step_modern()
+            finished_records.extend(res["finished_request_records"])
+
+        assert len(finished_records) == num_requests
+
+        for record in finished_records:
+            req = record.merge()
+            assert req.status == Status.COMPLETED
+
+            # Top-n logprobs must be present and match token count.
+            assert req.generated_top_n_logprobs is not None
+            assert len(req.generated_top_n_logprobs) == len(req.generated_tokens)
+
+            for j, top_n_dict in enumerate(req.generated_top_n_logprobs):
+                assert isinstance(top_n_dict, dict)
+                assert 0 < len(top_n_dict) <= top_n
+
+            # Consistency: selected token's log prob should appear in top-n.
+            if req.generated_log_probs is not None:
+                for j, (lp, top_n_dict, token_id) in enumerate(
+                    zip(
+                        req.generated_log_probs,
+                        req.generated_top_n_logprobs,
+                        req.generated_tokens,
+                    )
+                ):
+                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
+                    assert token_str in top_n_dict, (
+                        f"Request {req.request_id}, token {j}: "
+                        f"selected token '{token_str}' not in top-n"
+                    )
+                    assert abs(lp - top_n_dict[token_str]) < 0.1, (
+                        f"Request {req.request_id}, token {j}: "
+                        f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
+                    )
+
+
 CHUNKED_CG_BLOCK_SIZE = 256
 CHUNKED_CG_VOCAB_SIZE = 10000
 CHUNKED_CG_MAX_SEQ_LEN = 2048
