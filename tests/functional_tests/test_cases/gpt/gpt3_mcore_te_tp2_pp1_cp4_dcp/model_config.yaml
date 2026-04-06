@@ -6,6 +6,7 @@ MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
   --num-attention-heads: 8
+  --moe-token-dispatcher-type: alltoall
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -57,4 +58,4 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: flash
   --log-memory-to-tensorboard: true
-TEST_TYPE: release
+TEST_TYPE: ckpt-resume
