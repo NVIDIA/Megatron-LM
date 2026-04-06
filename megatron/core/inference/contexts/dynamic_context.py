@@ -1839,19 +1839,49 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
 
-    def last_token_logits(self, logits: Tensor) -> Tensor:
-        """Last tokens of logits.
+    def speculative_required_logit_indices(self, device: torch.device) -> Tensor:
+        """Token-level indices needed for speculative decode verification.
+
+        Returns all decode token positions (base + speculative) concatenated
+        with the last token position of each prefill request.  Uses only Python
+        int properties (``num_decode_requests``, ``num_speculative_tokens``) so
+        no host-device synchronisation is required.
 
         Args:
-            logits (Tensor): Output logits of forward pass.
+            device (torch.device): Device on which to create the index tensor.
 
         Return:
-            (Tensor) Last token logits.
+            (Tensor) 1-D indices into the packed token sequence, length
+            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``.
         """
         paused = self.paused_request_count
         total = self.total_request_count
         query_lengths = self.request_query_lengths[paused:total]
+        num_decode = self.num_decode_requests
 
+        decode_token_count = num_decode * (self.num_speculative_tokens + 1)
+        decode_indices = torch.arange(decode_token_count, device=device)
+
+        cumsum = torch.cumsum(query_lengths, dim=0)
+        prefill_last_indices = cumsum[num_decode:] - 1
+
+        return torch.cat([decode_indices, prefill_last_indices])
+
+    def last_token_logits(self, logits: Tensor) -> Tensor:
+        """Select the logit positions needed for token generation.
+
+        When speculative decoding is active, decode requests need logits for all
+        their tokens (base + speculative) for verification, while prefill requests
+        only need the last token logit.  This avoids materializing the full
+        vocab-sized logits for every prefill token, which causes large memory
+        spikes during prefill-heavy batches.
+
+        Args:
+            logits (Tensor): Output logits of forward pass, shape [1, S, H].
+
+        Return:
+            (Tensor) Selected logits, shape [N, H].
+        """
         # todo: @lmcafee, remove these asserts?
         assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
         assert logits.size(1) == self.padded_active_token_count, (
@@ -1859,6 +1889,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
         logits_2d = logits.squeeze(0)
+
+        if self.num_speculative_tokens > 0:
+            selected = self.speculative_required_logit_indices(logits.device)
+            return logits_2d[selected, :]
+
+        paused = self.paused_request_count
+        total = self.total_request_count
+        query_lengths = self.request_query_lengths[paused:total]
         last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
         return logits_2d[last_token_idxs, :]
 

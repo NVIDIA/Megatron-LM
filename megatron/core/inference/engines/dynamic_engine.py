@@ -216,10 +216,6 @@ class DynamicInferenceEngine(AbstractEngine):
             assert (
                 self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
-
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
