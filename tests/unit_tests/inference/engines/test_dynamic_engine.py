@@ -3112,9 +3112,9 @@ class TestDynamicInferenceEngine:
             # All log probs should be valid floats (negative, since they're log probabilities).
             # With logit=100 for the chosen token, log_softmax is very close to 0.
             for j, lp in enumerate(req.generated_log_probs):
-                assert isinstance(lp, float), (
-                    f"Request {req.request_id}, token {j}: log prob is not float"
-                )
+                assert isinstance(
+                    lp, float
+                ), f"Request {req.request_id}, token {j}: log prob is not float"
                 assert -0.1 < lp <= 0.0, (
                     f"Request {req.request_id}, token {j}: "
                     f"expected log prob near 0.0 (high confidence), got {lp}"
@@ -3592,9 +3592,9 @@ class TestDynamicInferenceEngine:
         assert len(finished_records) == 1
         req = finished_records[0].merge()
         assert req.status == Status.COMPLETED
-        assert len(req.generated_tokens) == 6, (
-            f"Expected 6 generated tokens, got {len(req.generated_tokens)}"
-        )
+        assert (
+            len(req.generated_tokens) == 6
+        ), f"Expected 6 generated tokens, got {len(req.generated_tokens)}"
 
         assert req.generated_log_probs is not None
         assert len(req.generated_log_probs) == len(req.generated_tokens), (
@@ -3604,14 +3604,13 @@ class TestDynamicInferenceEngine:
 
         for j, lp in enumerate(req.generated_log_probs):
             assert isinstance(lp, float)
-            assert -0.1 < lp <= 0.0, (
-                f"Token {j}: expected log prob near 0.0 (high confidence), got {lp}"
-            )
+            assert (
+                -0.1 < lp <= 0.0
+            ), f"Token {j}: expected log prob near 0.0 (high confidence), got {lp}"
 
         assert req.prompt_log_probs is not None
         assert len(req.prompt_log_probs) == prompt_length - 1, (
-            f"Expected {prompt_length - 1} prompt log probs, "
-            f"got {len(req.prompt_log_probs)}"
+            f"Expected {prompt_length - 1} prompt log probs, " f"got {len(req.prompt_log_probs)}"
         )
 
     @pytest.mark.internal
@@ -3697,9 +3696,9 @@ class TestDynamicInferenceEngine:
             f"Full output: {finished_req.generated_tokens}"
         )
 
-        assert finished_req.generated_log_probs is not None, (
-            "generated_log_probs is None despite return_log_probs=True"
-        )
+        assert (
+            finished_req.generated_log_probs is not None
+        ), "generated_log_probs is None despite return_log_probs=True"
         assert len(finished_req.generated_log_probs) == len(finished_req.generated_tokens), (
             f"Log probs count {len(finished_req.generated_log_probs)} != "
             f"token count {len(finished_req.generated_tokens)}. "
