@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Literal
+from typing import Literal, Optional
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -67,6 +67,9 @@ class TrainingConfig:
     exit_signal_handler_for_dataloader: bool = False
     """Use signal handler for dataloader workers"""
 
+    exit_signal_handler_for_training: bool = False
+    """Shutdown the training when SIGINT or SIGTERM received to avoid unclear traceback"""
+
     manual_gc: bool = False
     """Disable the threshold-based default garbage collector and trigger the garbage collection
     manually. Manual garbage collection helps to align the timing of the collection across ranks
@@ -84,7 +87,7 @@ class TrainingConfig:
     """
 
     iterations_to_skip: list[int] = field(default_factory=list)
-    """List of iterations to skip during training, empty by default."""
+    """List of 1-indexed iterations to skip during training, empty by default."""
 
 
 @dataclass(kw_only=True)
@@ -433,7 +436,7 @@ class CheckpointConfig:
     The legacy format was deprecated on Feb 13, 2024.
     """
 
-    ckpt_fully_parallel_save: bool = True
+    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
@@ -441,12 +444,23 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
+    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
+    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
     created and destroyed for each save operation."""
 
-    ckpt_fully_parallel_load: bool = False
+    async_ckpt_cpu_priority: int = 10
+    """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
+    If it exceeds 19, it will be set to 19. If the current nice value is greater than the target, it will be left unchanged.
+    Only applies when using persistent ckpt worker."""
+
+    async_ckpt_io_priority: Optional[int] = 3
+    """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
+    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
     ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
@@ -515,3 +529,15 @@ class CheckpointConfig:
 
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
+
+    def __post_init__(self):
+        from megatron.training.utils import has_nvrx_installed
+
+        assert self.async_strategy in ["nvrx", "mcore"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+            assert has_nvrx_installed(), (
+                "nvidia-resiliency-ext is not installed. "
+                "Please, install nvidia-resiliency-ext to enable async save."
+            )
