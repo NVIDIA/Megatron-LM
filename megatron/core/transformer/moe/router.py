@@ -133,6 +133,114 @@ class Router(ABC, MegatronModule):
         """Set the layer number for the router."""
         self.layer_number = layer_number
 
+    def update_prices(self, expert_usage_counts: torch.Tensor):
+        """Optional hook for routers that maintain expert prices."""
+        return
+
+
+class CapacityPricedRouter(Router):
+    """Top-1 capacity-priced router with tatonnement price updates."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        self.price_learning_rate = self.config.moe_cp_price_learning_rate
+        self.slack_capacity = self.config.moe_cp_slack_capacity
+        self.price_update_frequency = self.config.moe_cp_price_update_frequency
+        self.register_buffer(
+            'expert_prices',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+        )
+        self.register_buffer(
+            'cp_steps',
+            torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
+
+    def _maintain_float32_expert_prices(self):
+        if self.expert_prices.dtype != torch.float32:
+            self.expert_prices.data = self.expert_prices.data.to(torch.float32)
+
+    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """Route with argmax(logits - expert_prices) using top-1 dispatch."""
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        if padding_mask is not None:
+            padding_mask = padding_mask.reshape(-1)
+
+        effective_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+        top1_indices = torch.argmax(effective_logits, dim=-1, keepdim=True)
+
+        if self.config.moe_router_score_function == "sigmoid":
+            scores = torch.sigmoid(logits)
+        else:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        top1_scores = torch.gather(scores, dim=1, index=top1_indices)
+
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top1_indices, True)
+        probs = torch.zeros_like(scores).scatter(1, top1_indices, top1_scores)
+
+        # Keep padded tokens from contributing to dispatch or price updates.
+        if padding_mask is not None:
+            valid_mask = (~padding_mask).unsqueeze(-1)
+            routing_map = routing_map & valid_mask
+            probs = probs * valid_mask.to(dtype=probs.dtype)
+
+        return probs, routing_map
+
+    def update_prices(self, expert_usage_counts: torch.Tensor):
+        """Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)."""
+        if expert_usage_counts is None:
+            return
+
+        self._maintain_float32_expert_prices()
+        self.cp_steps += 1
+        if int(self.cp_steps.item()) % self.price_update_frequency != 0:
+            return
+
+        usage = expert_usage_counts.to(device=self.expert_prices.device, dtype=torch.float32)
+        if self.config.moe_cp_expert_capacity is None:
+            expert_capacity = usage.sum() / max(self.config.num_moe_experts, 1)
+        else:
+            expert_capacity = torch.tensor(
+                float(self.config.moe_cp_expert_capacity),
+                device=usage.device,
+                dtype=torch.float32,
+            )
+        target_capacity = self.slack_capacity * expert_capacity
+
+        self.expert_prices.add_(self.price_learning_rate * (usage - target_capacity))
+        self.expert_prices.clamp_(min=0.0)
+
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        self._maintain_float32_expert_prices()
+        logits = self.gating(input)
+
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_biased is not None:
+            logits = apply_biased_logits(logits, self.config.moe_router_force_biased, self.layer_number)
+
+        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        return probs, routing_map
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._maintain_float32_expert_prices()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _save_to_state_dict(self, *args, **kwargs):
+        self._maintain_float32_expert_prices()
+        return super()._save_to_state_dict(*args, **kwargs)
+
+
+# Backward-compatible alias while transitioning to the new class name.
+CapacityPriceRouter = CapacityPricedRouter
+
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.

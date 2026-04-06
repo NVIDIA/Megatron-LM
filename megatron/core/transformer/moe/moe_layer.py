@@ -11,6 +11,7 @@ import torch
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -18,7 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import CapacityPricedRouter, TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -121,6 +122,10 @@ class RouterInterface(Protocol):
 
         Called from transformer_layer during initialization.
         """
+        ...
+
+    def update_prices(self, expert_usage_counts: torch.Tensor) -> None:
+        """Optional hook for price-based routers."""
         ...
 
 
@@ -235,7 +240,10 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = self.submodules.router(
+        router_builder = self.submodules.router
+        if self.config.moe_capacity_priced_routing and router_builder == TopKRouter:
+            router_builder = CapacityPricedRouter
+        self.router = router_builder(
             config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
         )
         self.tp_group = pg_collection.tp
@@ -554,10 +562,22 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            expert_usage_counts = None
+            update_cp_prices = (
+                self.config.moe_capacity_priced_routing
+                and self.training
+                and torch.is_grad_enabled()
+                and hasattr(self.router, "update_prices")
+            )
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
+                    if update_cp_prices:
+                        expert_usage_counts = routing_map.sum(dim=0).to(dtype=torch.float32)
+                        expert_usage_counts = reduce_from_tensor_model_parallel_region(
+                            expert_usage_counts, group=self.router.tp_cp_group
+                        )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -581,6 +601,10 @@ class MoELayer(BaseMoELayer):
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+
+                if update_cp_prices and expert_usage_counts is not None:
+                    with torch.no_grad():
+                        self.router.update_prices(expert_usage_counts)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
