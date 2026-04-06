@@ -363,6 +363,88 @@ def test_chained_optimizer_get_parameters():
     assert result == opt1.params + opt2.params + opt3.params
 
 
+def test_mtp_grad_separation():
+    """Test that get_main_grads_for_grad_norm and get_mtp_grads_for_grad_norm
+    correctly separate gradients based on is_mtp_param attribute."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    Utils.initialize_model_parallel()
+
+    class MockOptimizer:
+        """Minimal mock of MegatronOptimizer for testing grad filtering."""
+
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
+        get_mtp_grads_for_grad_norm = MegatronOptimizer.get_mtp_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    # Create params: 2 main + 2 MTP
+    main_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+    mtp_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+    for p in mtp_params:
+        p.is_mtp_param = True
+
+    # Assign gradients
+    all_params = main_params + mtp_params
+    for p in all_params:
+        p.grad = torch.randn_like(p)
+
+    mock_opt = MockOptimizer(all_params)
+
+    main_grads = mock_opt.get_main_grads_for_grad_norm()
+    mtp_grads = mock_opt.get_mtp_grads_for_grad_norm()
+
+    assert len(main_grads) == 2
+    assert len(mtp_grads) == 2
+
+    # Verify the grads match the expected params
+    for grad, param in zip(main_grads, main_params):
+        assert torch.equal(grad, param.grad)
+    for grad, param in zip(mtp_grads, mtp_params):
+        assert torch.equal(grad, param.grad)
+
+    Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_separation_no_mtp_params():
+    """Test that without is_mtp_param, all grads go to main."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    Utils.initialize_model_parallel()
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
+        get_mtp_grads_for_grad_norm = MegatronOptimizer.get_mtp_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(3)]
+    for p in params:
+        p.grad = torch.randn_like(p)
+
+    mock_opt = MockOptimizer(params)
+
+    main_grads = mock_opt.get_main_grads_for_grad_norm()
+    mtp_grads = mock_opt.get_mtp_grads_for_grad_norm()
+
+    assert len(main_grads) == 3
+    assert len(mtp_grads) == 0
+
+    Utils.destroy_model_parallel()
+
+
 def test_precision_aware_fused_adam():
     try:
         from transformer_engine.pytorch.optimizers import FusedAdam
