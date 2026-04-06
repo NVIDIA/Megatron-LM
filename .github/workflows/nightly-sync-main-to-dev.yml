@@ -1,0 +1,160 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nightly Sync Main to Dev
+
+on:
+  schedule:
+    # 4:00 AM China time (UTC+8) on weekdays = 20:00 UTC Sun-Thu
+    - cron: "0 20 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-main-to-dev:
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      SYNC_LABEL: "nightly-sync"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Configure Git
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+
+      - name: Ensure sync label exists
+        run: |
+          gh label create "$SYNC_LABEL" \
+            --repo "${{ github.repository }}" \
+            --description "Automated nightly sync from main to dev" \
+            --color "1d76db" 2>/dev/null || true
+
+      - name: Close previous unmerged sync PRs
+        run: |
+          echo "Searching for open sync PRs..."
+          OPEN_PRS=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base dev \
+            --label "$SYNC_LABEL" \
+            --state open \
+            --json number \
+            --jq '.[].number')
+
+          for PR_NUM in $OPEN_PRS; do
+            echo "Closing stale sync PR #${PR_NUM}"
+            gh pr close "$PR_NUM" \
+              --repo "${{ github.repository }}" \
+              --comment "Superseded by today's nightly sync."
+          done
+
+      - name: Check if sync is needed
+        id: check-sync
+        run: |
+          git fetch origin main dev
+          AHEAD_COUNT=$(git rev-list --count origin/dev..origin/main)
+          echo "main is $AHEAD_COUNT commit(s) ahead of dev"
+          if [ "$AHEAD_COUNT" -eq 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No changes to sync."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create sync branch and merge
+        if: steps.check-sync.outputs.skip != 'true'
+        id: merge
+        run: |
+          DATE=$(date -u -d '+8 hours' +%Y-%m-%d)
+          BRANCH="sync/main-to-dev-${DATE}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+          # Start from dev
+          git checkout -b "$BRANCH" origin/dev
+
+          # Merge main, preferring main on all conflicts
+          if git merge origin/main -X theirs --no-edit; then
+            echo "Merge completed cleanly (or with auto-resolved conflicts)."
+          else
+            echo "Merge had conflicts that -X theirs could not resolve."
+            echo "Taking main's version for all remaining conflicted files."
+            CONFLICTED=$(git diff --name-only --diff-filter=U)
+            if [ -n "$CONFLICTED" ]; then
+              echo "$CONFLICTED" | xargs git checkout --theirs --
+              echo "$CONFLICTED" | xargs git add
+              git commit --no-edit
+            else
+              echo "::error::Merge failed with no identifiable conflicts."
+              exit 1
+            fi
+          fi
+
+          # Always take main's pyproject.toml and uv.lock for lock consistency
+          git checkout origin/main -- pyproject.toml uv.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: use main's pyproject.toml and uv.lock for consistency"
+          fi
+
+      - name: Push sync branch
+        if: steps.check-sync.outputs.skip != 'true'
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}" --force
+
+      - name: Create Pull Request
+        if: steps.check-sync.outputs.skip != 'true'
+        env:
+          SYNC_DATE: ${{ steps.merge.outputs.date }}
+          SYNC_BRANCH: ${{ steps.merge.outputs.branch }}
+        run: |
+          AHEAD_COUNT=$(git rev-list --count origin/dev..HEAD)
+
+          BODY=$(cat <<BODY_EOF
+          ## Nightly Sync: main → dev (${SYNC_DATE})
+
+          Automated nightly sync bringing **${AHEAD_COUNT} commit(s)** from \`main\` into \`dev\`.
+
+          ### Conflict resolution strategy
+          - All merge conflicts resolved by preferring \`main\`
+          - \`pyproject.toml\` and \`uv.lock\` taken from \`main\` for lock-file consistency
+
+          ### Action required
+          - Review the changes and approve if CI passes
+          - If CI fails, investigate and fix manually
+
+          ---
+          *This PR was created automatically by the nightly-sync-main-to-dev workflow.*
+          *Previous unmerged sync PRs are closed automatically.*
+          BODY_EOF
+          )
+
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base dev \
+            --head "$SYNC_BRANCH" \
+            --draft \
+            --title "chore: nightly sync main into dev (${SYNC_DATE})" \
+            --label "$SYNC_LABEL" \
+            --body "$BODY"
+
+          echo "Sync PR created successfully."
