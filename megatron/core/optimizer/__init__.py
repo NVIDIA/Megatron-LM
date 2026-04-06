@@ -635,7 +635,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # - Note: both the Float16Optimizer and the ElementWiseDistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if config.fp16 or config.bf16 or config.use_distributed_optimizer:
+    if config.fp16 or config.bf16 or config.use_element_wise_distributed_optimizer:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -662,7 +662,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 )
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
-        if config.use_distributed_optimizer:
+        if config.use_element_wise_distributed_optimizer:
             optimizer = ElementWiseDistributedOptimizer(
                 *optimizer_args,
                 model_chunks=model_chunks,
@@ -821,7 +821,7 @@ def _get_megatron_emerging_optimizer(
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
-            fallback_config.use_distributed_optimizer = False
+            fallback_config.use_element_wise_distributed_optimizer = False
             result = _get_megatron_optimizer_based_on_param_groups(
                 config=fallback_config,
                 model_chunks=model_chunks,

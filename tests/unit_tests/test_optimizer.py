@@ -454,7 +454,7 @@ def test_precision_aware_optimizer(
     baseline_model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
     baseline_model.requires_grad_(True)
     baseline_model.weight.data.fill_(1.0)
-    baseline_ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    baseline_ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     baseline_model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), baseline_ddp_config, baseline_model
     )
@@ -462,7 +462,7 @@ def test_precision_aware_optimizer(
         optimizer='adam',
         lr=0.01,
         bf16=True,
-        use_distributed_optimizer=True,
+        use_element_wise_distributed_optimizer=True,
         use_precision_aware_optimizer=False,
         main_params_dtype=torch.float32,
         main_grads_dtype=torch.float32,
@@ -475,7 +475,7 @@ def test_precision_aware_optimizer(
     test_model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
     test_model.requires_grad_(True)
     test_model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     test_model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, test_model
     )
@@ -484,7 +484,7 @@ def test_precision_aware_optimizer(
         lr=0.01,
         bf16=True,
         fp8_recipe=fp8_recipe,
-        use_distributed_optimizer=True,
+        use_element_wise_distributed_optimizer=True,
         use_precision_aware_optimizer=True,
         main_params_dtype=main_params_dtype,
         main_grads_dtype=main_grads_dtype,
@@ -569,7 +569,7 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
@@ -578,7 +578,7 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
         optimizer='adam',
         lr=0.01,
         bf16=True,
-        use_distributed_optimizer=True,
+        use_element_wise_distributed_optimizer=True,
         use_precision_aware_optimizer=use_precision_aware,
         main_params_dtype=torch.float32,
         main_grads_dtype=torch.float32,
@@ -659,9 +659,9 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
 
-@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("use_element_wise_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
-def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
+def test_optim_sharded_state_dict(use_element_wise_distributed_optimizer: bool, precision: str):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
 
@@ -671,7 +671,9 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
     model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    ddp_config = DistributedDataParallelConfig(
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer
+    )
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
@@ -680,20 +682,22 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
 
     if precision == 'bf16':
         optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=use_distributed_optimizer
+            optimizer='adam',
+            bf16=True,
+            use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer,
         )
     elif precision == 'fp32':
         optimizer_config = OptimizerConfig(
             optimizer='adam',
             bf16=False,
             fp16=False,
-            use_distributed_optimizer=use_distributed_optimizer,
+            use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer,
         )
     optim = get_megatron_optimizer(optimizer_config, [model])
 
     model_sharded_state_dict = model.sharded_state_dict()
     metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
-    if precision == 'bf16' or use_distributed_optimizer:
+    if precision == 'bf16' or use_element_wise_distributed_optimizer:
         sharded_state_dict = optim.sharded_state_dict(
             model_sharded_state_dict, metadata=metadata, is_loading=True
         )
@@ -717,11 +721,13 @@ def test_optimizer_reload_model_params():
     # Initial values of model params are 1.
     for param in model.parameters():
         param.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
-    optimizer_config = OptimizerConfig(optimizer='adam', bf16=True, use_distributed_optimizer=True)
+    optimizer_config = OptimizerConfig(
+        optimizer='adam', bf16=True, use_element_wise_distributed_optimizer=True
+    )
     optim = get_megatron_optimizer(optimizer_config, [model])
 
     # Set all model params to 2.
@@ -839,7 +845,7 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     model = torch.nn.Linear(100, 100, bias=False, device='cuda')
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
@@ -921,7 +927,7 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
     model = torch.nn.Linear(100, 100, bias=False, device='cuda')
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=True)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )

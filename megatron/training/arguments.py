@@ -853,10 +853,31 @@ def validate_args(args, defaults={}):
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
     )
 
+    # emerging optimizer check
+    if args.optimizer not in ('sgd', 'adam'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_element_wise_distributed_optimizer = False
+
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_element_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = None  # deprecated internally
+
+        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+
+
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer or args.use_megatron_fsdp \
-            or args.optimizer == 'dist_muon', \
-            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+        assert args.use_element_wise_distributed_optimizer or args.use_megatron_fsdp \
+            or args.use_layer_wise_distributed_optimizer, \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or layer-wise distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -869,7 +890,7 @@ def validate_args(args, defaults={}):
             '--use-torch-fsdp2 is not supported with pipeline parallelism'
         assert args.expert_model_parallel_size == 1, \
             '--use-torch-fsdp2 is not supported with expert parallelism'
-        assert not args.use_distributed_optimizer, \
+        assert not args.use_element_wise_distributed_optimizer, \
             "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
         assert not args.gradient_accumulation_fusion, \
             '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
@@ -893,7 +914,7 @@ def validate_args(args, defaults={}):
             raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")
 
     if args.overlap_param_gather_with_optimizer_step:
-        assert args.use_distributed_optimizer, \
+        assert args.use_element_wise_distributed_optimizer, \
             '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
         assert args.overlap_param_gather, \
             'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
@@ -922,7 +943,7 @@ def validate_args(args, defaults={}):
         args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
+        assert args.use_element_wise_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
     # FP4 and FP8 are mutually exclusive
@@ -1378,7 +1399,7 @@ def validate_args(args, defaults={}):
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
-        if args.use_distributed_optimizer:
+        if args.use_element_wise_distributed_optimizer:
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.
@@ -1404,7 +1425,7 @@ def validate_args(args, defaults={}):
     if (
         args.use_dist_ckpt
         and not args.ckpt_fully_parallel_save
-        and args.use_distributed_optimizer
+        and args.use_element_wise_distributed_optimizer
         and args.rank == 0
     ):
         print('Warning: With non-parallel ckpt save and ElementWiseDistributedOptimizer,'
@@ -1472,23 +1493,6 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
-    # emerging optimizer check
-    if args.optimizer not in ('sgd', 'adam'):
-        if args.optimizer == 'dist_muon':
-            warn_rank_0(
-                "optimizer='dist_muon' is deprecated. "
-                "Use --optimizer muon --use-distributed-optimizer instead."
-            )
-            args.optimizer = 'muon'
-            args.use_layer_wise_distributed_optimizer = True
-
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
-
-        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:

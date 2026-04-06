@@ -225,7 +225,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
-                    self.ddp_config.use_distributed_optimizer
+                    self.ddp_config.use_element_wise_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
@@ -238,7 +238,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
             # Note: overlap_param_gather covers both the distributed optimizer and the
             # layer-wise optimizer cases; the latter sets overlap_param_gather=True
-            # without use_distributed_optimizer.
+            # without use_element_wise_distributed_optimizer.
             if self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
@@ -308,7 +308,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with
         # https://github.com/NVIDIA/TransformerEngine/pull/719.
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_element_wise_distributed_optimizer:
 
             @torch.no_grad()
             def unmap_weight_tensor(m):
@@ -349,7 +349,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
-        # without use_distributed_optimizer.
+        # without use_element_wise_distributed_optimizer.
         self.use_forward_hook = self.ddp_config.overlap_param_gather
         self.remove_forward_pre_hook_handles = {}
         if self.use_forward_hook:

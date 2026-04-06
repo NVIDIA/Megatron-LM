@@ -148,7 +148,7 @@ class TestMuonOptimizerMultiRank:
         Returns:
             DDP-wrapped model
         """
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -169,7 +169,7 @@ class TestMuonOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,  # Muon doesn't support distributed optimizer
+            use_element_wise_distributed_optimizer=False,  # Muon doesn't support distributed optimizer
             muon_momentum=0.95,
             muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
@@ -236,7 +236,7 @@ class TestMuonOptimizerMultiRank:
             optimizer='muon',
             lr=0.01,
             fp16=True,  # This should cause an exception
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
@@ -247,7 +247,7 @@ class TestMuonOptimizerMultiRank:
             optimizer='muon',
             lr=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             muon_num_ns_steps=0,  # This should cause an exception
         )
 
@@ -748,7 +748,7 @@ class TestMuonCoefficientTypeMultiRank:
         Utils.destroy_model_parallel()
 
     def create_ddp_model(self, model):
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -765,7 +765,7 @@ class TestMuonCoefficientTypeMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             muon_coefficient_type=coefficient_type,
             muon_num_ns_steps=_DEFAULT_NS_STEPS,
             muon_tp_mode="duplicated",
@@ -1104,7 +1104,7 @@ class TestAdaptiveMuonOptimizerMultiRank:
 
     def create_ddp_model(self, model):
         """Wrap model in DDP."""
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -1123,7 +1123,7 @@ class TestAdaptiveMuonOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             muon_momentum=0.95,
             muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
@@ -1179,7 +1179,10 @@ class TestAdaptiveMuonOptimizerMultiRank:
         model = self.create_ddp_model(model)
 
         optimizer_config_fp16 = OptimizerConfig(
-            optimizer='adaptive_muon', lr=0.01, fp16=True, use_distributed_optimizer=False
+            optimizer='adaptive_muon',
+            lr=0.01,
+            fp16=True,
+            use_element_wise_distributed_optimizer=False,
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
@@ -1465,7 +1468,7 @@ class TestSoapOptimizerMultiRank:
 
     def create_ddp_model(self, model):
         """Wrap model in DDP."""
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -1484,7 +1487,7 @@ class TestSoapOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             soap_shampoo_beta=0.95,
             soap_precondition_frequency=1,
             soap_use_kl_shampoo=True,
@@ -1541,7 +1544,7 @@ class TestSoapOptimizerMultiRank:
 
         # FP16 should raise exception
         optimizer_config_fp16 = OptimizerConfig(
-            optimizer='soap', lr=0.01, fp16=True, use_distributed_optimizer=False
+            optimizer='soap', lr=0.01, fp16=True, use_element_wise_distributed_optimizer=False
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):

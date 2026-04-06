@@ -145,7 +145,7 @@ class TestPartialCudaGraphedA2AOverlap:
         args.bf16 = True
         args.add_bias_linear = False
         args.swiglu = True
-        args.use_distributed_optimizer = True
+        args.use_element_wise_distributed_optimizer = True
         args.position_embedding_type = "rope"
         args.rotary_percent = 1.0
         args.hidden_dropout = 0.0

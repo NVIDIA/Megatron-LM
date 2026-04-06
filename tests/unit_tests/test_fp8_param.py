@@ -59,7 +59,9 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
     return (
-        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+        not args.use_megatron_fsdp
+        and args.use_element_wise_distributed_optimizer
+        and args.overlap_param_gather
     )
 
 
@@ -138,7 +140,7 @@ class TestFP8Param:
         args.bf16 = True
         args.add_bias_linear = False
         args.swiglu = True
-        args.use_distributed_optimizer = not inference
+        args.use_element_wise_distributed_optimizer = not inference
         args.fp8 = "e4m3"
         args.fp8_recipe = recipe
         args.fp8_param_gather = fp8_param_gather

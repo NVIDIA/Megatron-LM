@@ -100,7 +100,7 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -114,7 +114,7 @@ class TestLayerWiseOptimizer:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
@@ -162,7 +162,7 @@ class TestLayerWiseOptimizer:
         model.requires_grad_(True)
 
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             overlap_param_gather=True,
             overlap_grad_reduce=True,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
@@ -181,7 +181,7 @@ class TestLayerWiseOptimizer:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             clip_grad=clip_grad,
             overlap_param_gather=async_allgather,
             muon_tp_mode="duplicated",
@@ -344,13 +344,13 @@ class TestLayerWiseOptimizer:
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
         optimizer_config = OptimizerConfig(
-            optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=False
+            optimizer='adam', lr=0.01, bf16=True, use_element_wise_distributed_optimizer=False
         )
 
         # Split parameters into two groups for testing multiple optimizers
@@ -402,7 +402,7 @@ class TestLayerWiseOptimizer:
         model = SimpleModel().bfloat16().cuda()
         model.requires_grad_(True)
 
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        ddp_config = DistributedDataParallelConfig(use_element_wise_distributed_optimizer=False)
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
@@ -416,7 +416,7 @@ class TestLayerWiseOptimizer:
             optimizer='muon',
             lr=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             muon_tp_mode="duplicated",
         )
         muon_optimizer = get_megatron_optimizer(
@@ -429,7 +429,7 @@ class TestLayerWiseOptimizer:
 
         # Should raise TypeError when receiving already-wrapped Float16 optimizer
         lw_config = OptimizerConfig(
-            optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=False
+            optimizer='muon', lr=0.01, bf16=True, use_element_wise_distributed_optimizer=False
         )
         with pytest.raises(
             TypeError, match='LayerWiseDistributedOptimizer expects base torch optimizers'

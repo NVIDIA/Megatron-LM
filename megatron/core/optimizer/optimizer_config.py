@@ -318,13 +318,13 @@ class OptimizerConfig:
     #######################
     # Distributed optimizer
     #######################
-    use_distributed_optimizer: bool = False
+    use_element_wise_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
-    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
+    arguments layer sets this flag and resets ``use_element_wise_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
     overlap_param_gather: bool = False

@@ -433,10 +433,10 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     """
     metadata = {}
 
-    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+    if args.use_element_wise_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+    if args.use_element_wise_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
         if args.dist_ckpt_optim_fully_reshardable:
             metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
             metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
@@ -569,7 +569,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save distributed optimizer's custom parameter state.
     if (
-        args.use_distributed_optimizer
+        args.use_element_wise_distributed_optimizer
         and not args.no_save_optim
         and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
@@ -603,7 +603,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
-            if args.use_distributed_optimizer:
+            if args.use_element_wise_distributed_optimizer:
                 print_rank_0(f'Storing distributed optimizer sharded state of type'
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
         else:
@@ -1688,7 +1688,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
-            if args.use_distributed_optimizer:
+            if args.use_element_wise_distributed_optimizer:
                 if sharded_sd_metadata is None:
                     # Backward-compatibility with old checkpoints which don't have content versioning
                     # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
@@ -1903,7 +1903,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
-            if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
+            if args.use_element_wise_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
@@ -2068,7 +2068,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,
-                                          args.use_distributed_optimizer,
+                                          args.use_element_wise_distributed_optimizer,
                                           release=False)
 
     if mpu.get_data_parallel_rank() == 0:

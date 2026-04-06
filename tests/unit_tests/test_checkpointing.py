@@ -208,7 +208,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
 
-    args.use_distributed_optimizer = ckpt_format != "torch_dcp"
+    args.use_element_wise_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
 
     iteration = 123
@@ -219,7 +219,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
-                use_distributed_optimizer=True, use_megatron_fsdp=True
+                use_element_wise_distributed_optimizer=True, use_megatron_fsdp=True
             ),
             module=model,
         )
@@ -256,7 +256,7 @@ def test_load_checkpoint(
     """Test load_checkpoint."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
-    args.use_distributed_optimizer = ckpt_format != "torch_dcp"
+    args.use_element_wise_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
@@ -304,7 +304,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
     """Test distributed checkpoint versioning."""
     args = create_ckpt_load_args
     args.ckpt_format = 'torch_dist'
-    args.use_distributed_optimizer = True
+    args.use_element_wise_distributed_optimizer = True
     args.use_dist_ckpt = True
 
     with TempNamedDir(

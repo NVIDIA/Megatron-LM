@@ -330,7 +330,7 @@ def get_mimo_model(
 
     # Wrap with DDP
     ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+        overlap_grad_reduce=True, bucket_size=10000, use_element_wise_distributed_optimizer=True
     )
 
     if mimo_model.language_model is not None:
@@ -520,7 +520,7 @@ def run_mimo_1f1b_test(
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=True,
+        use_element_wise_distributed_optimizer=True,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 

@@ -83,7 +83,7 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=False,
+        use_element_wise_distributed_optimizer=False,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 

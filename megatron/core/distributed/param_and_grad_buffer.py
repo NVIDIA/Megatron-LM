@@ -181,12 +181,15 @@ class _ParamAndGradBucketGroup:
         self.ddp_config = ddp_config
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
+        # overlap_param_gather=True without use_element_wise_distributed_optimizer.
+        if (
+            self.ddp_config.use_element_wise_distributed_optimizer
+            or self.ddp_config.overlap_param_gather
+        ):
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        if not self.ddp_config.use_distributed_optimizer:
+        if not self.ddp_config.use_element_wise_distributed_optimizer:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -307,8 +310,11 @@ class _ParamAndGradBucketGroup:
                 other settings if true.
         """
         # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
+        # overlap_param_gather=True without use_element_wise_distributed_optimizer.
+        assert (
+            self.ddp_config.use_element_wise_distributed_optimizer
+            or self.ddp_config.overlap_param_gather
+        )
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -320,7 +326,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-        if not self.ddp_config.use_distributed_optimizer:
+        if not self.ddp_config.use_element_wise_distributed_optimizer:
             # Layer-wise optimizer path: use all_gather for variable-size
             # param gather.
             #
@@ -489,7 +495,7 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
+            elif not self.ddp_config.use_element_wise_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -587,7 +593,7 @@ class _ParamAndGradBucketGroup:
         else:
             stream_context = nullcontext()
 
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_element_wise_distributed_optimizer:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
@@ -596,7 +602,7 @@ class _ParamAndGradBucketGroup:
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
-                if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
+                if self.ddp_config.use_element_wise_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
@@ -622,7 +628,7 @@ class _ParamAndGradBucketGroup:
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
-            self.ddp_config.use_distributed_optimizer
+            self.ddp_config.use_element_wise_distributed_optimizer
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
             assert self.inter_distributed_optimizer_instance_group is not None
@@ -836,7 +842,7 @@ class _ParamAndGradBuffer:
             """
             Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
             """
-            if self.ddp_config.use_distributed_optimizer:
+            if self.ddp_config.use_element_wise_distributed_optimizer:
                 # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
                 # This also helps cuBLAS pick more efficient algorithms for GEMMs.
                 # We now ensure that all buckets start at a memory address that is 256-byte
@@ -856,7 +862,7 @@ class _ParamAndGradBuffer:
             """
             Pads start index of param if using distributed optimizer (to ensure "good" alignment).
             """
-            if self.ddp_config.use_distributed_optimizer:
+            if self.ddp_config.use_element_wise_distributed_optimizer:
                 # Ensure that params start at 128-byte aligned addresses (64 values
                 # since params are >= 16-bit precision).
                 return _pad(param_start_index, 64)
@@ -902,7 +908,7 @@ class _ParamAndGradBuffer:
             """
             return (
                 getattr(param, "shared_embedding", False)
-                and self.ddp_config.use_distributed_optimizer
+                and self.ddp_config.use_element_wise_distributed_optimizer
             )
 
         for param, _ in params_with_names[::-1]:
@@ -940,7 +946,7 @@ class _ParamAndGradBuffer:
         self.numel = bucket_end_index
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
         assert self.numel_unpadded <= self.numel
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_element_wise_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
         else:
             assert self.numel == self.numel_unpadded
@@ -975,7 +981,7 @@ class _ParamAndGradBuffer:
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
+            if self.ddp_config.use_element_wise_distributed_optimizer and any(
                 is_mxfp8tensor(p) for p in self.params
             ):
                 self.shared_buffer = torch.zeros(
@@ -994,7 +1000,7 @@ class _ParamAndGradBuffer:
                 self.grad_data = self.shared_buffer
             else:
                 # Only re-map param tensors if using distributed optimizer.
-                if self.ddp_config.use_distributed_optimizer:
+                if self.ddp_config.use_element_wise_distributed_optimizer:
                     self.param_data = torch.zeros(
                         self.numel,
                         dtype=self.param_dtype,
@@ -1162,7 +1168,7 @@ class _ParamAndGradBuffer:
 
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_element_wise_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]

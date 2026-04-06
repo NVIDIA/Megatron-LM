@@ -147,7 +147,7 @@ def create_args():
     args.no_save_rng = True
     args.no_load_optim = True
     args.no_load_rng = True
-    args.use_distributed_optimizer = True
+    args.use_element_wise_distributed_optimizer = True
     args.use_megatron_fsdp = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
