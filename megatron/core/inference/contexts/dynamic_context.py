@@ -1843,9 +1843,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Token-level indices needed for speculative decode verification.
 
         Returns all decode token positions (base + speculative) concatenated
-        with the last token position of each prefill request.  Uses only Python
-        int properties (``num_decode_requests``, ``num_speculative_tokens``) so
-        no host-device synchronisation is required.
+        with the last token position of each prefill request.
 
         Args:
             device (torch.device): Device on which to create the index tensor.
@@ -1872,7 +1870,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         When speculative decoding is active, decode requests need logits for all
         their tokens (base + speculative) for verification, while prefill requests
-        only need the last token logit.  This avoids materializing the full
+        only need the last token logit. This avoids materializing the full
         vocab-sized logits for every prefill token, which causes large memory
         spikes during prefill-heavy batches.
 
