@@ -339,7 +339,7 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
-class TestDistributedOptimizer:
+class TestElementWiseDistributedOptimizer:
     def setup_method(self, method):
         pass
 

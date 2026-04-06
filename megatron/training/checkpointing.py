@@ -32,7 +32,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
-from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer import ElementWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -1701,9 +1701,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if (
                     ckpt_tp_pp != run_tp_pp
                     and sharded_sd_metadata['distrib_optim_sharding_type']
-                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                    not in ElementWiseDistributedOptimizer.checkpoint_fully_reshardable_formats
                 ):
-                    raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
+                    raise RuntimeError(f"{mismatch_msg}: not supported for ElementWiseDistributedOptimizer with sharding type"
                                        f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                                        f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
 

@@ -60,7 +60,7 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
-from .distrib_optimizer import DistributedOptimizer
+from .distrib_optimizer import DistributedOptimizer, ElementWiseDistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
@@ -632,7 +632,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         return optimizer, init_state_fn
 
     # Mixed precision optimizer.
-    # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
+    # - Note: both the Float16Optimizer and the ElementWiseDistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
     if config.fp16 or config.bf16 or config.use_distributed_optimizer:
@@ -663,7 +663,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
+            optimizer = ElementWiseDistributedOptimizer(
                 *optimizer_args,
                 model_chunks=model_chunks,
                 per_model_buffers=per_model_buffers,

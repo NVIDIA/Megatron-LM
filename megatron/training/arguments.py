@@ -1407,7 +1407,7 @@ def validate_args(args, defaults={}):
         and args.use_distributed_optimizer
         and args.rank == 0
     ):
-        print('Warning: With non-parallel ckpt save and DistributedOptimizer,'
+        print('Warning: With non-parallel ckpt save and ElementWiseDistributedOptimizer,'
               ' it will be impossible to resume training with different parallelism.'
               ' Consider removing flag --no-ckpt-fully-parallel-save.')
     if args.use_dist_ckpt_deprecated and args.rank == 0:

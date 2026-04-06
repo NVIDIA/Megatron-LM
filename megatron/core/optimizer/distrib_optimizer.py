@@ -94,10 +94,10 @@ class Range:
         return self.end - self.start
 
 
-class DistributedOptimizer(MixedPrecisionOptimizer):
+class ElementWiseDistributedOptimizer(MixedPrecisionOptimizer):
     """Optimizer that shards state across data-parallel ranks.
 
-    This class reduces memory usage by distributing optimizer states (like 
+    This class reduces memory usage by distributing optimizer states (like
     momentum and variance buffers) across GPUs in the data-parallel group.
 
     Attributes:
@@ -231,9 +231,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        These mappings are partitioned according to data type. This method 
-        iterates through all buckets of a grad buffer to construct param 
-        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        These mappings are partitioned according to data type. This method
+        iterates through all buckets of a grad buffer to construct param
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket,
         where each shard is 1/dp_world_size of the bucket).
 
         Args:
@@ -483,33 +483,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad 
-        buffers, parameters, and parameter shard ranges, that is needed for 
-        converting between model param indexes and main parameter shard indexes. 
-        This method also updates the optimizer parameter groups with the 
+        The steps in this method create the core mapping between param and grad
+        buffers, parameters, and parameter shard ranges, that is needed for
+        converting between model param indexes and main parameter shard indexes.
+        This method also updates the optimizer parameter groups with the
         newly created shards.
 
         Args:
             optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
-                this can be None for BF16 training if no loss scale is used. 
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that
+                this can be None for BF16 training if no loss scale is used.
                 For FP16, a grad scaler is always required.
-            init_state_fn (Callable, optional): Function to initialize state in 
+            init_state_fn (Callable, optional): Function to initialize state in
                 the optimizer.
             model_chunks (List[MegatronModule]): List of model chunks to optimize.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
-                implementation of the distributed optimizer is centered on using 
-                a contiguous buffer for communicating grads & params between 
-                the model state and the optimizer state. For a detailed 
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The
+                implementation of the distributed optimizer is centered on using
+                a contiguous buffer for communicating grads & params between
+                the model state and the optimizer state. For a detailed
                 description, see `docs/source/distrib_optimizer.md`.
-            data_parallel_group (ProcessGroup): Data-parallel group used to 
+            data_parallel_group (ProcessGroup): Data-parallel group used to
                 all-gather params after optimizer.step().
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel
                 group used specifically for checkpoint loading and saving.
-            data_parallel_group_idx (int): Index in the data-parallel group 
+            data_parallel_group_idx (int): Index in the data-parallel group
                 used by distributed checkpointing logic.
-            distributed_optimizer_instance_id (int): Unique identifier for the 
+            distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
         """
 
@@ -532,7 +532,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # when freezing sub-models we have no real optimizer
-        # but still need a stub DistributedOptimizer class
+        # but still need a stub ElementWiseDistributedOptimizer class
         if optimizer is None:
             self.is_stub_optimizer = True
             return
@@ -709,7 +709,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the optimizers state (and the ordering it expects for parameter state)
         and this DP rank's shards. The optimizer at this point does not contain
         any tensor dimension information, so we must get these dimensions from
-        the DP shards mapped during DistributedOptimizer.__init__().
+        the DP shards mapped during ElementWiseDistributedOptimizer.__init__().
 
         The tensor parameter state is loaded via load_parameter_state(), and
         so this method also must populate the loaded state dict with dummy
@@ -1211,14 +1211,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - 'dp_reshardable': Sharded state dict where each noncontiguous buffer is a
             separate ShardedTensor. Results in fully parallel save and load without any
             inter-process communication or intermediate buffers/copies. Since the format relies
-            on the internal DistributedOptimizer structure, it allows checkpoint resharding
-            only in DP dimension.
+            on the internal ElementWiseDistributedOptimizer structure, it allows checkpoint
+            resharding only in DP dimension.
         - 'fully_reshardable': During checkpoint save (`is_loading=False`) gathers all
-            DistributedOptimizer buffers on DP rank 0 and transforms them into a canonical state
-            representation similar to a regular optimizer where each model param corresponds to
-            one or more optimizer state tensors of the same shape (possibly different precision).
-            During checkpoint load each rank loads a superset of the required state and does
-            rank specific flattening and slicing.
+            ElementWiseDistributedOptimizer buffers on DP rank 0 and transforms them into a
+            canonical state representation similar to a regular optimizer where each model param
+            corresponds to one or more optimizer state tensors of the same shape (possibly
+            different precision). During checkpoint load each rank loads a superset of the
+            required state and does rank specific flattening and slicing.
         - 'fsdp_dtensor': Sharded state dict where each parameter is a separate
             PyTorch DTensor. This is the default and recommended implementation for the distributed
             optimizer when using the megatron fsdp training.
@@ -1240,7 +1240,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             log_single_rank(
                 logger,
                 logging.WARNING,
-                'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
+                'ElementWiseDistributedOptimizer.sharded_state_dict parameter `sharding_type`'
                 ' is deprecated and will be removed.'
                 ' Use `metadata["distrib_optim_sharding_type"] instead`.',
             )
@@ -1249,7 +1249,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
             )
 
-        # Handle FSDP DistributedOptimizer States
+        # Handle FSDP ElementWiseDistributedOptimizer States
         if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
@@ -1262,7 +1262,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             log_single_rank(
                 logger,
                 logging.WARNING,
-                '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
+                '`fully_sharded_bucket_space` sharding for ElementWiseDistributedOptimizer'
                 ' checkpoint is deprecated and will be removed in the future.'
                 ' Please switch to `full_sharded_model_space`.',
             )
@@ -2645,4 +2645,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
-    
+
+
+# Backward compatibility alias.
+DistributedOptimizer = ElementWiseDistributedOptimizer

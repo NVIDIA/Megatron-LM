@@ -48,7 +48,7 @@ from typing import Any, Optional, Dict
 
 import torch.distributed
 
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import ElementWiseDistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
 
@@ -1803,7 +1803,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             if forward_pre_hook_enabled:
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    if isinstance(optim_instance, ElementWiseDistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
