@@ -159,6 +159,13 @@ class InferenceConfig:
     autotune: bool = False
     """Automatically tune inference memory parameters based on available GPU memory."""
 
+    autotune_dynamic: bool = False
+    """Enable runtime dynamic memory management via per-chunk TMS.
+    When True, KV cache and Mamba state chunks are independently pauseable
+    at runtime, allowing freed cache from completed requests to be converted
+    into activation headroom for larger prefill chunks. Requires autotune=True.
+    When False (default), only static parameter tuning is performed."""
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.

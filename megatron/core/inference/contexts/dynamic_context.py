@@ -238,9 +238,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
-    TMS_TAG = "inference_context"
-    TMS_KV_TAG = "autotune_kv_cache"
-    TMS_MAMBA_TAG = "autotune_mamba_states"
+    _tms_counter = 0  # unique suffix for TMS tags across context lifetimes
 
     # Per-request metadata: 8 int32 tensors (request_ids, query_lengths, etc.)
     PER_REQUEST_SCALAR_BYTES = 8 * 4
@@ -323,6 +321,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Unique TMS tag names per context instance to avoid conflicts
+        # when TMS's C++ side retains old (paused) allocations under a tag.
+        DynamicInferenceContext._tms_counter += 1
+        suffix = DynamicInferenceContext._tms_counter
+        self.TMS_TAG = f"inference_context_{suffix}"
+        self.TMS_KV_TAG = f"autotune_kv_cache_{suffix}"
+        self.TMS_MAMBA_TAG = f"autotune_mamba_states_{suffix}"
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -766,7 +772,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_chunk_tracker = None
         total_blocks = self.kv_block_allocator.total_count
 
-        if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+        if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
             from megatron.core.inference.contexts.mamba_chunk_manager import ChunkTracker
 
             num_kv_chunks = 8
@@ -833,7 +839,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 d_conv=self.mamba_conv_states_shape[-1],
             )
 
-            if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+            if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
                 from megatron.core.inference.contexts.mamba_chunk_manager import (
                     ChunkTracker,
                 )
@@ -1014,7 +1020,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # When autotune creates per-chunk TMS regions (nested inside the
         # outer context), add their tags for suspend/resume.
-        if self.config.autotune and HAVE_TORCH_MEMORY_SAVER:
+        if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
             self._uses_torch_memory_saver = True
             self._tms_tags.append(self.TMS_KV_TAG)
             if self.mamba_chunk_tracker is not None:

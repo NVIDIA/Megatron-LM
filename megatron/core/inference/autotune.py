@@ -213,14 +213,22 @@ def compute_optimal_params(
     upper_bound = gpu_free // max(profile.block_size_bytes, 1)
     upper_bound = (upper_bound // alignment) * alignment
 
+    # The CUDA graph pool is sized by the largest graph's activation.
+    # Since max_tokens >= max_requests, the largest graph has max_tokens
+    # tokens. We estimate this as activation(max_tokens). For the initial
+    # solve where max_tokens = max_requests, the CG pool = activation(R).
+    # This memory is permanently reserved after graph warmup.
     for candidate in range(upper_bound, 0, -alignment):
         activation_bytes = max(0, _interpolate(activation_table, candidate))
+        # CG pool = activation at the largest graph = activation(candidate)
+        # since max_tokens starts at max_requests in the base case.
+        cuda_graph_pool = activation_bytes  # same token count for decode-only
         metadata_bytes = (
             candidate * profile.per_request_bytes
             + candidate * profile.per_token_bytes  # max_tokens = max_requests
             + candidate * profile.mamba_memory_per_request
         )
-        remaining_for_kv = gpu_free - activation_bytes - metadata_bytes
+        remaining_for_kv = gpu_free - activation_bytes - cuda_graph_pool - metadata_bytes
         if remaining_for_kv <= 0:
             continue
         block_count = remaining_for_kv // profile.block_size_bytes
@@ -240,14 +248,10 @@ def compute_optimal_params(
         best_block_count = 2
 
     # Step 2: Determine max_tokens.
-    # The profile includes both decode samples (many requests × 1 token)
-    # and prefill samples (1 request × many tokens). The interpolator
-    # keeps the max activation at each token count, so it reflects
-    # the worst-case (prefill) cost.
     if max_requests >= elbow:
         # Case 1: saturated — max_tokens based on freed cache from
-        # completed requests. The activation budget for prefill is the
-        # decode activation + freed cache memory (converted via TMS).
+        # completed requests. With chunked prefill, freed KV blocks
+        # provide the activation budget for larger prefill chunks.
         if avg_sequence_length is None:
             max_kv_block_count = profile.max_kv_block_count
             avg_sequence_length = max_kv_block_count * profile.block_size_bytes // 2
@@ -265,6 +269,27 @@ def compute_optimal_params(
     # Align max_tokens.
     max_tokens = (max_tokens // tp_size) * tp_size
     max_tokens = max(max_tokens, max_requests)  # re-enforce after alignment
+
+    # When max_tokens > max_requests, the CG pool grows (largest graph
+    # is now at max_tokens, not max_requests). Verify the total still fits.
+    # If not, shrink max_tokens until it does.
+    while max_tokens > max_requests:
+        cg_pool = max(0, _interpolate(activation_table, max_tokens))
+        decode_act = max(0, _interpolate(activation_table, max_requests))
+        context_cost = (
+            best_block_count * profile.block_size_bytes
+            + max_requests * profile.mamba_memory_per_request
+            + max_requests * profile.per_request_bytes
+            + max_tokens * profile.per_token_bytes
+        )
+        total = decode_act + cg_pool + context_cost
+        if total <= gpu_free:
+            break
+        # Shrink max_tokens toward max_requests.
+        max_tokens = max(max_requests, max_tokens - alignment)
+
+    max_tokens = (max_tokens // tp_size) * tp_size
+    max_tokens = max(max_tokens, max_requests)
 
     # Derive buffer_size_gb. The context's auto-derive path expects
     # buffer_size_gb to contain BOTH mamba states AND KV blocks combined —

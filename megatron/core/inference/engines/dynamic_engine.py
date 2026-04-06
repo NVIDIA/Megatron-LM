@@ -270,6 +270,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+        # Log memory state after full initialization.
+        if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
+            free, total = torch.cuda.mem_get_info()
+            logging.info(
+                "Engine init complete — GPU memory: total %.1f GB, free %.1f GB, "
+                "allocated %.1f GB, reserved %.1f GB",
+                total / (1024 ** 3),
+                free / (1024 ** 3),
+                torch.cuda.memory_allocated() / (1024 ** 3),
+                torch.cuda.memory_reserved() / (1024 ** 3),
+            )
+
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
@@ -906,6 +918,14 @@ class DynamicInferenceEngine(AbstractEngine):
         # CUDA graphs are built by the caller (create_cuda_graphs) after we return.
 
         if rank == 0:
+            free_pre_cg, _ = torch.cuda.mem_get_info()
+            logging.info(
+                "Autotune: before CG build — free %.1f GB, allocated %.1f GB, "
+                "reserved %.1f GB",
+                free_pre_cg / (1024 ** 3),
+                torch.cuda.memory_allocated() / (1024 ** 3),
+                torch.cuda.memory_reserved() / (1024 ** 3),
+            )
             logging.info(
                 "\n"
                 "========== Autotune Complete ==========\n"
