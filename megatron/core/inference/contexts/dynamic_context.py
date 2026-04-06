@@ -40,7 +40,7 @@ from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata
-from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
+from .attention_context.mha_metadata import MHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
@@ -561,28 +561,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
-        # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
-
+        self.num_prefill_requests = 0
+        # Populated in initialize_all_tensors once the shared active_* tensors exist.
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
 
-        self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
-
-        self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
-
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
+        self.moe_routing_metadata = None
         if self.moe_enable_routing_replay:
             assert (
                 model_config.num_moe_experts is not None
@@ -863,7 +848,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Static tensor addresses of active slices to enable fast inference kernels.
         self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
+
+        self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+
+        # Cumulative tensors shared with MHAMetadata.
+        self.cu_active_request_query_lengths = torch.empty(
+            (self.max_requests + 1,), dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.cu_active_sequence_lengths = torch.empty(
+            (self.max_requests + 1,), dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -879,6 +875,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
         )
+
+        common_kwargs = dict(
+            max_requests=self.max_requests,
+            max_seqlen=self.max_sequence_length,
+            query_lengths_buf=self.active_request_query_lengths,
+            cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+            kv_seq_lengths_buf=self.active_sequence_lengths,
+            cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+            block_table_buf=self.active_request_to_kv_block_ids,
+        )
+        self.graph_attn_metadata["mha_metadata"] = MHAMetadata(**common_kwargs)
+        self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(**common_kwargs)
 
         ctx_manager = nullcontext()
         if self.unified_memory_level != 0:
@@ -1079,13 +1087,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_query_lengths[:batch_size].copy_(
             self.request_query_lengths[:batch_size]
         )
+        self.active_request_to_kv_block_ids[:batch_size].copy_(
+            self.request_to_kv_block_ids[:batch_size]
+        )
 
+        self.cu_active_request_query_lengths[0] = 0
         torch.cumsum(
             self.active_request_query_lengths[:batch_size],
             dim=0,
-            out=self.active_request_last_token_idxs[:batch_size],
+            out=self.cu_active_request_query_lengths[1 : batch_size + 1],
+        )
+        self.active_request_last_token_idxs[:batch_size].copy_(
+            self.cu_active_request_query_lengths[1 : batch_size + 1]
         )
         self.active_request_last_token_idxs[:batch_size] -= 1
+
+        self.build_active_kv_slices(batch_size)
+
+        if self.is_hybrid_model:
+            self.active_mamba_indices[:batch_size].copy_(
+                self.mamba_metadata.request_to_mamba_state_idx[:batch_size]
+            )
+
+    def build_active_kv_slices(self, batch_size: int):
+        """Build active slices of tensors mutated by `_rewind_kv_cache`.
+
+        Must be re-run after KV-cache rewind so that `active_sequence_lengths`
+        reflects post-rewind offsets rather than the pre-forward snapshot.
+        """
+        torch.add(
+            self.active_request_query_lengths[:batch_size],
+            self.request_kv_length_offsets[:batch_size],
+            out=self.active_sequence_lengths[:batch_size],
+        )
+        self.cu_active_sequence_lengths[0] = 0
+        torch.cumsum(
+            self.active_sequence_lengths[:batch_size],
+            dim=0,
+            out=self.cu_active_sequence_lengths[1 : batch_size + 1],
+        )
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
@@ -1097,12 +1137,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request[padding_token_slice] = 0
 
         # Request-level padding.
-        active_request_count = self.total_request_count - self.paused_request_count
-        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
-        self.active_request_query_lengths[padding_request_slice].fill_(
-            self.num_speculative_tokens + 1
+        self.active_attn_metadata["mha_metadata"].update(
+            batch_dimensions=self.attn_dimensions,
+            padded_batch_dimensions=self.padded_batch_dimensions,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
-        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1349,13 +1388,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
-        # Attention metadata reset is now handled by MHAMetadata.reset()
-        for attn_metadata in self.non_graph_attn_metadata.values():
-            attn_metadata.reset()
-        for attn_metadata in self.graph_attn_metadata.values():
-            attn_metadata.reset()
         self.active_attn_metadata = None
 
+        # TODO: This `reset_varlen_metadata()` should not be necessary.
         if self.is_hybrid_model:
             self.mamba_metadata.reset_varlen_metadata()
 
@@ -1740,13 +1775,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
             )
-        self.padded_active_token_count = self.padded_batch_dimensions.token_count
-        self.padded_active_request_count = self.padded_batch_dimensions.req_count
-        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
-
-        self.build_active_slices(self.padded_active_request_count)
-        self.pad_active_slices()
-
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
             if self.using_cuda_graph_this_step()
@@ -1766,22 +1794,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
-        batch_size = self.total_request_count - self.paused_request_count
-        assert self.active_attn_metadata is not None
-        self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=self.active_request_query_lengths[:batch_size],
-            request_kv_length_offsets=self.request_kv_length_offsets[:batch_size],
-            request_to_kv_block_ids=self.request_to_kv_block_ids[:batch_size],
-            batch_dimensions=attn_dimensions,
-            padded_batch_dimensions=self.padded_batch_dimensions,
-            num_speculative_tokens=self.num_speculative_tokens,
-        )
+        self.attn_dimensions = attn_dimensions
+        self.padded_active_token_count = self.padded_batch_dimensions.token_count
+        self.padded_active_request_count = self.padded_batch_dimensions.req_count
+        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        self.build_active_slices(self.padded_active_request_count)
+        self.pad_active_slices()
 
         if self.is_hybrid_model:
+            batch_size = self.total_request_count - self.paused_request_count
             token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
-            cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
-                "cu_query_seq_lengths"
-            ]
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
@@ -1791,7 +1814,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.update(
                 self.mamba_metadata.request_to_mamba_state_idx[:batch_size],
                 token_to_request_idx_view,
-                cu_seqlens,
+                self.cu_active_request_query_lengths,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
