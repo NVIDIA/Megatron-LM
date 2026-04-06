@@ -158,58 +158,64 @@ class TextGenerationController:
                 * -1
             )
 
-    def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
+    @staticmethod
+    def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
 
         Args:
+            tokenizer: The tokenizer to use.
             prompt (str): The input prompt.
+            add_BOS (bool): Whether to add a BOS token.
 
         Returns:
             List[int]: Returns the tokenized prompt.
         """
 
-        prompt_tokens = self.tokenizer.tokenize(prompt)
+        prompt_tokens = tokenizer.tokenize(prompt)
 
         if add_BOS:
-            assert self.tokenizer.bos is not None
+            assert tokenizer.bos is not None
 
-        while prompt_tokens and prompt_tokens[0] == self.tokenizer.bos:
+        while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
             prompt_tokens.pop(0)
 
         if add_BOS:
-            prompt_tokens = [self.tokenizer.bos] + prompt_tokens
+            prompt_tokens = [tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
 
-    def _detokenize(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+    @staticmethod
+    def detokenize(
+        tokenizer, tokens: List[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+    ) -> str:
         """
-        Detokenize a sequence of token IDs, handling skip_special_tokens for
-        different tokenizer APIs.
-
-        On the first call, inspects `self.tokenizer.detokenize` to see if it accepts
-        a `skip_special_tokens` keyword argument, and caches that result on `self`.
-        Subsequent calls will use the cached flag to invoke `detokenize` with the
-        correct signature (with or without `skip_special_tokens`).
+        Detokenize a sequence of token IDs, optionally removing trailing EOD
+        tokens and handling skip_special_tokens for different tokenizer APIs.
 
         Args:
+            tokenizer: The tokenizer to use for detokenization.
             tokens (List[int]): The token IDs to convert back to text.
+            remove_EOD (bool): Whether to remove trailing EOD tokens before
+                detokenization. Defaults to True.
             skip_special_tokens (bool): Whether to remove special tokens (e.g. BOS/EOS)
                 during detokenization. Only passed through if the tokenizer supports it.
 
         Returns:
             str: The detokenized string.
         """
-        # cache the check on first call
-        if not hasattr(self, "_detok_accepts_skip"):
-            sig_params = inspect.signature(self.tokenizer.detokenize).parameters.values()
-            self._detok_accepts_skip = any(
-                p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig_params
-            )
-        if self._detok_accepts_skip:
-            return self.tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+            while tokens and tokens[-1] == tokenizer.eod:
+                tokens = tokens[:-1]
+
+        sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
+        detok_accepts_skip = any(
+            p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig_params
+        )
+        if detok_accepts_skip:
+            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
         else:
-            return self.tokenizer.detokenize(tokens)
+            return tokenizer.detokenize(tokens)
 
     def detokenize_generations(
         self,
@@ -238,7 +244,10 @@ class TextGenerationController:
 
         if not detokenize_segments:
             tokens = tokens_gpu_tensor.tolist()
-            return self._detokenize(tokens, skip_special_tokens=skip_special_tokens), None
+            return (
+                self.detokenize(self.tokenizer, tokens, skip_special_tokens=skip_special_tokens),
+                None,
+            )
 
         prompts_plus_generations: List[str] = []
         prompts_plus_generations_segments: List[List[str]] = []
@@ -248,7 +257,7 @@ class TextGenerationController:
 
         for sequence_tokens, length in zip(tokens, lengths):
             sequence_tokens = sequence_tokens[:length]
-            detok_str = self._detokenize(sequence_tokens)
+            detok_str = self.detokenize(self.tokenizer, sequence_tokens)
             prompts_plus_generations.append(detok_str)
             offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
             words = [
@@ -257,7 +266,7 @@ class TextGenerationController:
 
             prompts_plus_generations_segments.append(words)
 
-        text = self._detokenize(tokens[0], skip_special_tokens=skip_special_tokens)
+        text = self.detokenize(self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens)
 
         return text, prompts_plus_generations_segments
 
@@ -1245,20 +1254,19 @@ class TextGenerationController:
             # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
 
-        # Slice to real tokens (remove CUDA padding)
-        stacked_routing = stacked_routing[:active_token_count]
+        # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
+        _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
+        stacked_routing = stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
         # Split by request along token dimension
         # stacked_routing has shape [active_token_count, num_layers, topk]
-        routing_splits = stacked_routing.split(active_query_lengths, dim=0)
+        routing_splits = np.split(
+            stacked_routing,
+            np.cumsum(active_query_lengths[:-1]),
+            axis=0,
+        )
 
-        # Map to request IDs
-        routing_indices_per_request = {}
-        for req_id, routing_split in zip(active_request_ids, routing_splits):
-            # routing_split has shape [num_tokens_for_request, num_layers, topk]
-            routing_indices_per_request[req_id] = routing_split
-
-        return routing_indices_per_request
+        return routing_splits
 
     def _store_routing_per_block(
         self, routing_indices_per_request: Optional[Dict[int, np.ndarray]]

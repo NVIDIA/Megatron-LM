@@ -1378,14 +1378,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # To pass kwargs unique to specific DDP classes.
-            ddp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                # Also pass the mixed-precision arguments for Megatron-FSDP only.
-                ddp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-                ddp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-                ddp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-
             model = [
                 DP(
                     config=config,
@@ -1394,7 +1386,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **ddp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -2855,7 +2846,7 @@ def train(
         # Capture CUDA Graphs.
         if (
             args.cuda_graph_impl == "transformer_engine"
-            and not cuda_graph_helper.graphs_created()
+            and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
@@ -2963,8 +2954,8 @@ def train(
                         and args.cuda_graph_warmup_steps == 0
                     ):
                         assert (
-                            cuda_graph_helper.graphs_created()
-                        ), "CUDA Graphs should have been created."
+                            cuda_graph_helper.capture_finished()
+                        ), "CUDA Graph capture should have been finished."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1

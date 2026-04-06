@@ -8,6 +8,7 @@ from enum import Enum, auto
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
+import uuid
 import numpy as np
 import torch
 
@@ -385,15 +386,14 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps.
-    # Stored as numpy array (int16/int32) on CPU.
+    # routing_indices is the concatenated result, set on finished requests only.
     routing_indices: Optional[np.ndarray] = None
     # routing_block_store_key is set when routing_indices are written to block store.
     # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.
     routing_block_store_key: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    _routing_indices_chunks: Optional[List[np.ndarray]] = field(default=None, repr=False)  # Internal storage for routin
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
@@ -415,6 +415,22 @@ class DynamicInferenceRequest(InferenceRequest):
             and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
+
+    def add_routing_indices(self, chunk: np.ndarray):
+        """Append a routing indices chunk to the staging list (O(1) in the critical path).
+
+        Args:
+            chunk (np.ndarray): Routing indices for this step, shape [num_tokens, num_layers, topk].
+        """
+        if self._routing_indices_chunks is None:
+            self._routing_indices_chunks = []
+        self._routing_indices_chunks.append(chunk)
+
+    def finalize_routing_chunks(self):
+        """Concatenate all staged routing chunks into routing_indices and delete the staging list."""
+        if self._routing_indices_chunks:
+            self.routing_indices = np.concatenate(self._routing_indices_chunks, axis=0)
+        self._routing_indices_chunks = None
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
@@ -458,9 +474,14 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        assert self._routing_indices_chunks is None, (
+            "Pending routing chunks during serialization. "
+            "Call finalize_routing_chunks() before serialize()."
+        )
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_routing_indices_chunks", None)
 
         # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
@@ -779,11 +800,11 @@ class DynamicInferenceRequestRecord:
             return
 
         routing_indices = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        req_id = str(self.requests[0].request_id)
+        blockstore_uuid = str(uuid.uuid4())
 
         ray.get(
             block_store_instance.put_numpy.remote(
-                req_id,
+                blockstore_uuid,
                 "moe_topk_indices",
                 routing_indices,
             )
@@ -792,12 +813,12 @@ class DynamicInferenceRequestRecord:
         routing_block_store_key = {
             "instance_rank": block_store_instance_rank,
             "instance_id": block_store_instance_id,
-            "req_id": req_id,
+            "req_id": blockstore_uuid,
             "key": "moe_topk_indices",
         }
 
         logging.info(
-            f"NeMo-RL block store put: req_id={req_id} "
+            f"NeMo-RL block store put: req_id={blockstore_uuid} "
             f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
             f"instance_id={block_store_instance_id}"
         )

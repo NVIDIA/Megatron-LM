@@ -567,10 +567,10 @@ class _ParamAndGradBucketGroup:
             # need to overlap communication.
             stream_context = torch.cuda.stream(self.communication_stream)
 
-            # The RS/AR communication stream needs to wait for the default stream
+            # The RS/AR communication stream needs to wait for the current stream
             # to complete its gradient computation before launching the next
             # gradient reduction collective.
-            self.communication_stream.wait_stream(torch.cuda.default_stream())
+            self.communication_stream.wait_stream(torch.cuda.current_stream())
         else:
             stream_context = nullcontext()
 
@@ -677,7 +677,7 @@ class _ParamAndGradBucketGroup:
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            torch.cuda.default_stream().wait_stream(self.communication_stream)
+            torch.cuda.current_stream().wait_stream(self.communication_stream)
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "

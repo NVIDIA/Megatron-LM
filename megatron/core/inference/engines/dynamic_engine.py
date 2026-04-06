@@ -46,10 +46,9 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
-    connect_to_ray_block_store,
-    prewarm_flashinfer_jit,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
+    connect_to_ray_block_store
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -197,6 +196,13 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
 
+        # Fail fast if block store is requested but prerequisites are missing.
+        if inference_config.store_routing_indices_in_ray_block_store:
+            assert model_config.moe_enable_routing_replay, (
+                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay."
+            )
+            connect_to_ray_block_store()  # validates ray + actor availability, then discards
+
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection
         else:
@@ -262,6 +268,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Routing replay config.
+        self._routing_replay_enabled = model_config.moe_enable_routing_replay
 
         # Routing indices dtype for numpy storage.
         _num_experts = model_config.num_moe_experts or 0
@@ -371,32 +380,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
-
-            # Pre-compile FlashInfer CUTLASS kernels before the warmup loop.
-            # JIT compilation can take several minutes on first run; doing it here
-            # prevents the warmup progress bar from appearing stuck at 0%.
-            # Only rank 0 compiles to avoid filelock contention across ranks;
-            # other ranks wait for the result via broadcast.
-            error_msg = None
-            if torch.distributed.get_rank() == 0:
-                try:
-                    prewarm_flashinfer_jit()
-                except Exception as e:
-                    error_msg = str(e)
-
-            # Broadcast success/failure to all ranks so they can fail together
-            # instead of hanging at a barrier.
-            result = torch.tensor(
-                [0 if error_msg is None else 1],
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-            torch.distributed.broadcast(result, src=0)
-            if result.item() == 1:
-                raise RuntimeError(
-                    f"FlashInfer CUTLASS kernel pre-compilation failed on rank 0"
-                    + (f": {error_msg}" if error_msg else "")
-                )
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -529,11 +512,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         # Connect to block store only on the mp coordinator rank.
-        if self.context.config.store_routing_indices_in_ray_block_store:
-            model_config = self.controller.inference_wrapped_model.model.config
-            assert model_config.moe_enable_routing_replay, (
-                "store_routing_indices_in_ray_block_store requires moe_enable_routing_replay to be enabled."
-            )
         if self.context.config.store_routing_indices_in_ray_block_store and self.is_mp_coordinator:
             conn = connect_to_ray_block_store()
             self.block_store_instance = conn.instance
@@ -847,6 +825,47 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
+    def _handle_failed_request(self, request_id: int):
+        """Handle a failed request by sending the reply immediately.
+
+        The request is added to failed_request_ids so that the next bookkeeping pass can return it.
+        """
+        request_entry = self.requests[request_id]
+        request = request_entry.record[-1]
+
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} failed to be added to the engine due to errors. "
+                f"Prompt Tokens: {len(request.prompt_tokens)} "
+                f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
+                f"Max sequence length: {self.context.max_sequence_length} "
+                f"Chunked prefill enabled: {self.enable_chunked_prefill}"
+            )
+
+        request.status = Status.FAILED
+        request.add_event_fail()
+        self.failed_request_ids.append(request_id)
+
+        # Send the reply immediately, because it may never get a chance to be sent again.
+        if self.use_coordinator and self.is_mp_coordinator:
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [request_entry.record.merge().serialize()]],
+                use_bin_type=True,
+            )
+            self.socket_for_receiving_requests.send(payload)
+        elif not self.use_coordinator:
+            if request.prompt is None:
+                request.prompt = self.controller.tokenizer.detokenize(
+                    request.prompt_tokens.tolist()
+                )
+            if request.generated_tokens:
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
+            else:
+                request.generated_text = ""
+        request_entry.future.set_result(request_entry.record)
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -929,23 +948,17 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ) or (request.sampling_params.num_tokens_to_generate < 0):
-            logging.error(
-                f"{request_id=} Invalid number of tokens to generate. Prompt len: {len(request.prompt_tokens)}, tokens to generate: {request.sampling_params.num_tokens_to_generate}, max seq len: {self.context.max_sequence_length}."
-            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
-            logging.error(
-                f"{request_id=} Prompt is longer than context.max_tokens. Prompt tokens: {len(request.prompt_tokens)}, context.max_tokens: {self.context.max_tokens}, chunked_prefill: {self.enable_chunked_prefill}"
-            )
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
-                self.controller.tokenize_prompt(stop_word, add_BOS=False)
+                self.controller.tokenize_prompt(self.controller.tokenizer, stop_word, add_BOS=False)
                 for stop_word in request.sampling_params.stop_words
             ]
             request.stop_word_ids = stop_word_ids
@@ -953,14 +966,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
-            self.failed_request_ids.append(request_id)
-            if self.rank == 0:
-                warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors. "
-                    f"Prompt Tokens: {len(request.prompt_tokens)} "
-                    f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
-                    f"Max sequence length: {self.context.max_sequence_length} "
-                )
+            self._handle_failed_request(request_id)
 
         return self.requests[request_id].future
 
@@ -986,9 +992,13 @@ class DynamicInferenceEngine(AbstractEngine):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
             try:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
+                prompt_token_ids = self.controller.tokenize_prompt(
+                    self.controller.tokenizer, prompt, sampling_params.add_BOS
+                )
             except TypeError:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt)
+                prompt_token_ids = self.controller.tokenize_prompt(
+                    self.controller.tokenizer, prompt
+                )
             tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
             )
@@ -1289,23 +1299,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
-            # Process routing indices if available (keyed by request_id)
+            # Process routing indices if available (list aligned with request_ids)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
             # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
-            if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
-            ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ].cpu().numpy().astype(self._routing_indices_dtype)  # [num_tokens, num_layers, topk]
-                if request.routing_indices is None:
-                    request.routing_indices = step_routing
-                else:
-                    request.routing_indices = np.concatenate(
-                        [request.routing_indices, step_routing], axis=0
-                    )
+            # add_routing_indices will simply append this step's routing chunk to a list 
+            # Later when we finish the request, we will assemble the full routing map 
+            # from these chunks.
+            if routing_indices_per_request is not None and req_idx < len(routing_indices_per_request):
+                step_routing = routing_indices_per_request[req_idx]  # [num_tokens, num_layers, topk]
+                request.add_routing_indices(step_routing)
+            
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1392,9 +1395,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 for i in range(self.num_speculative_tokens + 1):
                     end_idx = -i if i > 0 else None
                     if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        if i > 0:
-                            request.generated_tokens = request.generated_tokens[:-i]
-                        return True, i
+                        trim = (
+                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
+                        )
+                        if trim > 0:
+                            request.generated_tokens = request.generated_tokens[:-trim]
+                        return True, trim
         return False, 0
 
     def get_prefix_coordination_metrics(self) -> dict:
@@ -1791,14 +1797,14 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
 
-        # Failed requests.
+        # Failed requests. Status and events were already set in _handle_failed_request;
+        # here we just clean up the entry and include it in finished_request_records.
         for failed_request_id in self.failed_request_ids:
             failed_entry = self.requests.pop(failed_request_id)
-            failed_request = failed_entry.record[-1]
-            failed_request.status = Status.FAILED
-            failed_request.add_event_fail()
             finished_request_records.append(failed_entry.record)
-            failed_entry.future.set_result(failed_entry.record)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
         range_pop()
@@ -1811,13 +1817,23 @@ class DynamicInferenceEngine(AbstractEngine):
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
-                        request.prompt = self.controller.tokenizer.detokenize(
-                            request.prompt_tokens.tolist()
+                        request.prompt = self.controller.detokenize(
+                            self.controller.tokenizer,
+                            request.prompt_tokens.tolist(),
+                            remove_EOD=False,
                         )
-                    request.generated_text = self.controller.tokenizer.detokenize(
-                        request.generated_tokens
+                    request.generated_text = self.controller.detokenize(
+                        self.controller.tokenizer,
+                        request.generated_tokens,
+                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             range_pop()
+
+        # Finalize routing chunks on all sub-requests before block store dump or merge/serialize.
+        if self._routing_replay_enabled and finished_request_records:
+            for record in finished_request_records:
+                for req in record.requests:
+                    req.finalize_routing_chunks()
 
         # Dump routing indices to block store before coordinator communication.
         if getattr(self, 'block_store_instance', None) is not None and finished_request_records:
@@ -1829,17 +1845,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         # Handle necessary ZMQ DP coordinator communication.
-        if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
-            range_push("coordinator_communication")
-            payload = msgpack.packb(
-                [
-                    Headers.ENGINE_REPLY.value,
-                    [r.merge().serialize() for r in finished_request_records],
-                ],
-                use_bin_type=True,
-            )
-            self.socket_for_receiving_requests.send(payload)
-            range_pop()
+        # Failed request replies were already sent in _handle_failed_request,
+        # so only send completed records here.
+        if self.use_coordinator and self.is_mp_coordinator:
+            records_to_send = [
+                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+            ]
+            if records_to_send:
+                range_push("coordinator_communication")
+                payload = msgpack.packb(
+                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                    use_bin_type=True,
+                )
+                self.socket_for_receiving_requests.send(payload)
+                range_pop()
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
