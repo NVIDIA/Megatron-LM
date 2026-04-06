@@ -1197,7 +1197,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         total_tokens = len(request.prompt_tokens) + len(
                             request.generated_tokens
                         )
-                        request.routing_indices = self._reconstruct_routing_from_blocks(
+                        request.routing_indices = self.context.kv_block_allocator.reconstruct_routing_from_blocks(
                             block_ids, total_tokens - 1
                         )
 
@@ -1410,45 +1410,6 @@ class DynamicInferenceEngine(AbstractEngine):
             Dict with coordination stats including the number of scheduling waits.
         """
         return {"waits": self._prefix_coordination_waits}
-
-    def _reconstruct_routing_from_blocks(
-        self, block_ids: list[int], total_routing_tokens: int
-    ) -> Optional[np.ndarray]:
-        """Reconstruct routing indices from per-block storage.
-
-        Concatenates per-block routing ndarrays in block order, trimming the
-        last block to exactly ``total_routing_tokens`` entries.
-
-        Args:
-            block_ids: Ordered list of block IDs for the request.
-            total_routing_tokens: Expected number of routing tokens
-                (total_tokens - 1, since the last generated token has no
-                forward-pass routing).
-
-        Returns:
-            ndarray [total_routing_tokens, num_layers, topk] or None if any
-            block is missing routing data.
-        """
-        allocator = self.context.kv_block_allocator
-        block_size = self.context.block_size_tokens
-        routing_parts = []
-        tokens_collected = 0
-
-        for bid in block_ids:
-            routing = allocator.get_block_routing(bid)
-            if routing is None:
-                return None  # Missing routing data for this block
-            remaining = total_routing_tokens - tokens_collected
-            if remaining <= 0:
-                break
-            take = min(block_size, remaining)
-            routing_parts.append(routing[:take])
-            tokens_collected += take
-
-        if not routing_parts or tokens_collected != total_routing_tokens:
-            return None
-
-        return np.concatenate(routing_parts, axis=0)
 
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
         """Find farthest block with cached Mamba state by iterating from the end.

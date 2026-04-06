@@ -1047,9 +1047,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # total_routing_tokens = 2 full blocks + 5 partial = 2*bs + 5
         total_routing_tokens = 2 * bs + partial
 
-        # Create a stub engine to call _reconstruct_routing_from_blocks
-        engine = _StubEngine(ctx)
-        result = engine._reconstruct_routing_from_blocks(bids, total_routing_tokens)
+        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
 
         assert result is not None
         assert isinstance(result, np.ndarray)
@@ -1084,8 +1082,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Only store routing for the first block
         alloc.store_block_routing(bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16))
 
-        engine = _StubEngine(ctx)
-        result = engine._reconstruct_routing_from_blocks(bids, 2 * bs)
+        result = alloc.reconstruct_routing_from_blocks(bids, 2 * bs)
         assert result is None
 
     @pytest.mark.internal
