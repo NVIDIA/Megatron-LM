@@ -1940,7 +1940,9 @@ class TestDynamicInferenceEngine:
         env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
         # Create requests with top_n_logprobs enabled
-        top_n = 5
+        # top_n must be >= top_k so the sampled token is guaranteed to appear
+        # in the top-n dict for the consistency check below.
+        top_n = 10
         requests_to_add = []
         for request in env.requests:
             # Update sampling params to include top_n_logprobs
@@ -3177,7 +3179,9 @@ class TestDynamicInferenceEngine:
         unwrapped_model.forward = mock_deterministic_forward
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
-        top_n = 5
+        # top_n must be >= top_k so the sampled token is guaranteed to appear
+        # in the top-n dict for the consistency check below.
+        top_n = 10
         num_requests = 3
         prompt_lengths = [4, 6, 8]
         for i in range(num_requests):
@@ -3451,7 +3455,9 @@ class TestDynamicInferenceEngine:
 
         env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
-        top_n = 5
+        # top_n must be >= top_k so the sampled token is guaranteed to appear
+        # in the top-n dict for the consistency check below.
+        top_n = 10
         num_requests = 3
         prompt_lengths = [4, 6, 8]
         for i in range(num_requests):
