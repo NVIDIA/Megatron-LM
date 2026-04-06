@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ParamGroupOverride(TypedDict, total=False):
+class ParamGroupOverride(TypedDict):
     """Override values for a parameter group. These values may be optimizer-state/scheduler related.
 
     These are the values you see later in param_group.get(...) calls in the
@@ -25,7 +25,7 @@ class ParamGroupOverride(TypedDict, total=False):
 
     Example:
         >>> param_group_override = ParamGroupOverride(min_lr=1e-4, wd_mult=0.1)
-        >>> param_group_override == ParamGroupOverride(optimizer='muon')  # per-param optimizer
+        >>> param_group_override == ParamGroupOverride(newvar=3) # this is ok too
 
     """
 
@@ -34,7 +34,6 @@ class ParamGroupOverride(TypedDict, total=False):
     start_wd: float
     end_wd: float
     wd_mult: float
-    optimizer: str
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
