@@ -110,10 +110,27 @@ jobs:
             fi
           fi
 
-          # Always take main's pyproject.toml and uv.lock for lock consistency
-          git checkout origin/main -- pyproject.toml uv.lock
+          # Always take main's pyproject.toml and uv.lock for lock consistency.
+          # Also take main's versions of key training files that have deep
+          # semantic dependencies on conflict-resolved modules (arguments,
+          # optimizer, etc.). Without this, auto-merged dev code may reference
+          # APIs that main's versions removed.
+          FORCE_MAIN_FILES=(
+            pyproject.toml
+            uv.lock
+            megatron/training/training.py
+            megatron/training/initialize.py
+            megatron/training/utils.py
+            megatron/training/datasets/data_samplers.py
+            megatron/core/optimizer/layer_wise_optimizer.py
+          )
+          for f in "${FORCE_MAIN_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              git checkout origin/main -- "$f" 2>/dev/null || true
+            fi
+          done
           if ! git diff --cached --quiet; then
-            git commit -m "chore: use main's pyproject.toml and uv.lock for consistency"
+            git commit -m "chore: take main's versions of key integration files for consistency"
           fi
 
       - name: Push sync branch
@@ -136,7 +153,7 @@ jobs:
 
           ### Conflict resolution strategy
           - All merge conflicts resolved by preferring \`main\`
-          - \`pyproject.toml\` and \`uv.lock\` taken from \`main\` for lock-file consistency
+          - \`pyproject.toml\`, \`uv.lock\`, and key training/optimizer files taken from \`main\` to prevent semantic conflicts
 
           ### Action required
           - Review the changes and approve if CI passes
