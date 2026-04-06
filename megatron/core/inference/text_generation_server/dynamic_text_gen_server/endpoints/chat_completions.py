@@ -605,6 +605,16 @@ try:
             error_detail = "; ".join(failed_errors)
             status = 400 if has_nontransient_error else 500
             logger.error(f"Inference request(s) failed: {error_detail}")
+            
+            # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
+            if "MaxSequenceLengthOverflowError" in error_detail:
+                error_msg = (
+                    f"This model's maximum context length was exceeded. "
+                    f"Your messages resulted in {len(prompt_tokens)} tokens. "
+                    f"Please reduce the length of the messages. {error_detail}"
+                )
+                return Response(error_msg, status=400)
+
             return Response(f"Inference request(s) failed: {error_detail}", status=status)
 
         # --- 5. Format OpenAI Response ---
