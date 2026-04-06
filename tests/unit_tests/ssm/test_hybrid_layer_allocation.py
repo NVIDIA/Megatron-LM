@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
     ParsedHybridPattern,
     Symbols,
     get_hybrid_layer_counts,
@@ -346,28 +346,28 @@ class TestSelectPipelineSegment:
     is simply the vp_stage value.
     """
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_single_segment_no_vp(self, mock_log):
         """Single segment, no VPP."""
         layer_types, offset = select_pipeline_segment("M*M*", pp_group=None, vp_stage=None)
         assert layer_types == ['M', '*', 'M', '*']
         assert offset == 0
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_two_segments_vp0(self, mock_log):
         """Two segments, select first (vp_stage=0)."""
         layer_types, offset = select_pipeline_segment("M-M-|M-M*-", pp_group=None, vp_stage=0)
         assert layer_types == ['M', '-', 'M', '-']
         assert offset == 0
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_two_segments_vp1(self, mock_log):
         """Two segments, select second (vp_stage=1)."""
         layer_types, offset = select_pipeline_segment("M-M-|M-M*-", pp_group=None, vp_stage=1)
         assert layer_types == ['M', '-', 'M', '*', '-']
         assert offset == 4
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_four_segments(self, mock_log):
         """Four segments, verify each vp_stage selects correctly."""
         pattern = "MM|M*|M-|ME"
@@ -377,7 +377,7 @@ class TestSelectPipelineSegment:
             assert layer_types == expected_layers, f"Failed for vp_stage={vp_stage}"
             assert offset == expected_offset, f"Failed for vp_stage={vp_stage}"
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_segment(self, mock_log):
         """Empty segments are allowed for pipeline balancing."""
         layer_types, offset = select_pipeline_segment("||M*", pp_group=None, vp_stage=0)
@@ -388,7 +388,7 @@ class TestSelectPipelineSegment:
         assert layer_types == ['M', '*']
         assert offset == 0
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_uneven_segments(self, mock_log):
         """Segments of different lengths."""
         pattern = "MMM|M|MMMMM"
@@ -404,44 +404,44 @@ class TestSelectPipelineSegment:
         assert len(layer_types) == 5
         assert offset == 4
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_main_pattern(self, mock_log):
         """Empty main pattern produces one empty segment."""
         layer_types, offset = select_pipeline_segment("", pp_group=None, vp_stage=None)
         assert layer_types == []
         assert offset == 0
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_invalid_segment_raises(self, mock_log):
         """Invalid layer symbols in a segment should raise ValueError."""
         with pytest.raises(ValueError):
             select_pipeline_segment("MX|M*", pp_group=None, vp_stage=0)
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_out_of_range_segment_raises(self, mock_log):
         """Segment index out of range should raise ValueError."""
         with pytest.raises(ValueError, match="out of range"):
             select_pipeline_segment("M*|M*", pp_group=None, vp_stage=5)
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_logging_is_called(self, mock_log):
         """Verify that log_on_each_pipeline_stage is called."""
         select_pipeline_segment("M*M*", pp_group=None, vp_stage=None)
         mock_log.assert_called_once()
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_mutual_exclusivity_pipes_with_first_stage(self, mock_log):
         """Pipe separators + first_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
             select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, first_stage_layers=1)
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_mutual_exclusivity_pipes_with_last_stage(self, mock_log):
         """Pipe separators + last_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
             select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, last_stage_layers=1)
 
-    @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_segment_count_not_divisible_by_pp_size(self, mock_log):
         """Segment count not divisible by pp_size should raise ValueError."""
         mock_group = object()
@@ -475,8 +475,8 @@ class TestSelectPipelineSegmentLegacyFallback:
         with (
             patch('torch.distributed.get_rank', return_value=pp_rank),
             patch('torch.distributed.get_world_size', return_value=pp_size),
-            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'),
-            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank'),
+            patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage'),
+            patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_single_rank'),
         ):
             return select_pipeline_segment(
                 pattern,
@@ -578,8 +578,10 @@ class TestSelectPipelineSegmentLegacyFallback:
         with (
             patch('torch.distributed.get_rank', return_value=0),
             patch('torch.distributed.get_world_size', return_value=2),
-            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'),
-            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank') as mock_warn,
+            patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage'),
+            patch(
+                'megatron.core.models.hybrid.hybrid_layer_allocation.log_single_rank'
+            ) as mock_warn,
         ):
             select_pipeline_segment("M*M*", pp_group=mock_group, vp_stage=None)
             mock_warn.assert_called_once()

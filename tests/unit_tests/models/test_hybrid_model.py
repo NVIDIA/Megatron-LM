@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import os
 from datetime import timedelta
@@ -15,8 +15,8 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -37,9 +37,9 @@ class TestMambaModel:
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
-        self.model = MambaModel(
+        self.model = HybridModel(
             config=model_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
@@ -49,7 +49,7 @@ class TestMambaModel:
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.model, MambaModel)
+        assert isinstance(self.model, HybridModel)
 
         assert self.model.max_sequence_length == 4
 
@@ -105,9 +105,9 @@ class TestMambaModel:
             attention_backend=AttnBackend.flash,  # Needed for packed sequence
         )
         vocab_size = 100
-        model = MambaModel(
+        model = HybridModel(
             config=model_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=12,
             hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
@@ -212,7 +212,7 @@ class TestMambaModel:
     )
     @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
     def test_with_custom_process_groups(self, tmp_path, tp_size, cp_size, pp_size):
-        """Test MambaModel with custom process groups."""
+        """Test HybridModel with custom process groups."""
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             context_parallel_size=cp_size,
@@ -261,9 +261,9 @@ class TestMambaModel:
             pipeline_dtype=torch.bfloat16,
         )
 
-        model = MambaModel(
+        model = HybridModel(
             config=model_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=4,
             hybrid_layer_pattern=hybrid_layer_pattern,
@@ -293,7 +293,7 @@ class TestMambaModel:
 
 
 class TestMambaWithDynamicInference:
-    """Tests MambaModel with dynamic inference."""
+    """Tests HybridModel with dynamic inference."""
 
     @torch.inference_mode()
     def setup_method(self, method):
@@ -315,9 +315,9 @@ class TestMambaWithDynamicInference:
             fp8_recipe="tensorwise",
         )
 
-        self.model = MambaModel(
+        self.model = HybridModel(
             config=model_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
             hybrid_layer_pattern="M*",  # 1 Mamba, 1 attention
