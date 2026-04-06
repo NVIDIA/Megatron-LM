@@ -1210,7 +1210,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
-            if request_log_probs is not None and request_id not in self.stop_word_being_finished_ids:
+            if (
+                request_log_probs is not None
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -1244,7 +1247,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             # Same stop-word guard as log probs above.
-            if top_n_logprobs is not None and req_idx in top_n_logprobs and request_id not in self.stop_word_being_finished_ids:
+            if (
+                top_n_logprobs is not None
+                and req_idx in top_n_logprobs
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
                     request.prompt_top_n_logprobs = []
