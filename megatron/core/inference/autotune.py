@@ -75,7 +75,7 @@ def _interpolate(table: Dict[int, int], x: int) -> int:
     if x >= keys[-1]:
         if len(keys) >= 2:
             slope = (vals[-1] - vals[-2]) / max(keys[-1] - keys[-2], 1)
-            return int(vals[-1] + slope * (x - keys[-1]))
+            return max(0, int(vals[-1] + slope * (x - keys[-1])))
         return vals[-1]
 
     # Binary search for the enclosing interval.
@@ -188,6 +188,16 @@ def compute_optimal_params(
         gpu_free // (1024 ** 2),
     )
     logging.info("Autotune: compute elbow at %d tokens", elbow)
+    logging.info(
+        "Autotune: profile params — block_size=%d bytes, mamba/req=%d bytes (%.2f MB), "
+        "per_req=%d bytes, per_token=%d bytes, max_kv_blocks=%d",
+        profile.block_size_bytes,
+        profile.mamba_memory_per_request,
+        profile.mamba_memory_per_request / (1024 ** 2),
+        profile.per_request_bytes,
+        profile.per_token_bytes,
+        profile.max_kv_block_count,
+    )
 
     # Step 1: Find max_requests via decode constraint.
     # context_state(R) + activation_memory(R) ≤ gpu_free
@@ -204,7 +214,7 @@ def compute_optimal_params(
     upper_bound = (upper_bound // alignment) * alignment
 
     for candidate in range(upper_bound, 0, -alignment):
-        activation_bytes = _interpolate(activation_table, candidate)
+        activation_bytes = max(0, _interpolate(activation_table, candidate))
         metadata_bytes = (
             candidate * profile.per_request_bytes
             + candidate * profile.per_token_bytes  # max_tokens = max_requests
@@ -214,7 +224,8 @@ def compute_optimal_params(
         if remaining_for_kv <= 0:
             continue
         block_count = remaining_for_kv // profile.block_size_bytes
-        if block_count >= 2:  # need ≥ 1 active + 1 dummy
+        # Each request needs ≥ 1 KV block, plus 1 dummy block.
+        if block_count >= candidate + 1:
             max_requests = candidate
             best_block_count = block_count
             break
@@ -229,31 +240,26 @@ def compute_optimal_params(
         best_block_count = 2
 
     # Step 2: Determine max_tokens.
-    if max_requests >= elbow:
-        # Case 1: saturated — max_tokens based on freed cache from completed requests.
-        if avg_sequence_length is None:
-            max_kv_block_count = profile.max_kv_block_count
-            avg_sequence_length = max_kv_block_count * profile.block_size_bytes // 2
-        kv_bytes_per_token = profile.block_size_bytes // max(
-            profile.max_kv_block_count, 1
-        )
-        typical_freed_cache = avg_sequence_length * kv_bytes_per_token
-        decode_activation = _interpolate(activation_table, max_requests)
-        max_activation_budget = decode_activation + typical_freed_cache
-        max_tokens = _inverse_interpolate(activation_table, max_activation_budget)
-    else:
-        # Case 2: undersaturated — max_tokens at the elbow.
-        max_tokens = elbow
-
-    # Enforce invariant: max_tokens >= max_requests.
-    max_tokens = max(max_tokens, max_requests)
+    # NOTE: We currently only profile with decode requests (1 token per
+    # request). Prefill activations (full attention over prompt) are more
+    # expensive per token. Until we add prefill profiling, setting
+    # max_tokens > max_requests would generate CUDA graphs at token counts
+    # where the actual activation cost is unknown and may OOM.
+    # For now, set max_tokens = max_requests (the safe base case from our
+    # design: saturated decode uses max_tokens = max_requests, prefill
+    # happens via natural request completion with chunked prefill).
+    max_tokens = max_requests
 
     # Align max_tokens.
     max_tokens = (max_tokens // tp_size) * tp_size
     max_tokens = max(max_tokens, max_requests)  # re-enforce after alignment
 
-    # Derive buffer_size_gb from the block count that fits.
-    buffer_size_bytes = best_block_count * profile.block_size_bytes
+    # Derive buffer_size_gb. The context's auto-derive path expects
+    # buffer_size_gb to contain BOTH mamba states AND KV blocks combined —
+    # it carves mamba out of the buffer proportionally.
+    kv_bytes = best_block_count * profile.block_size_bytes
+    mamba_bytes = max_requests * profile.mamba_memory_per_request
+    buffer_size_bytes = kv_bytes + mamba_bytes
     buffer_size_gb = buffer_size_bytes / (1024 ** 3)
 
     logging.info(

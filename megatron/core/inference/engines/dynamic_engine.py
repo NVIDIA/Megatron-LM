@@ -443,281 +443,374 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @staticmethod
     def _force_free_context_tensors(context):
-        """Force-free all GPU tensors on a context by resizing storage to 0.
+        """Free GPU memory held by a context's TMS regions.
 
-        Needed because the caller of DynamicInferenceEngine() may still hold
-        a reference to the context object, preventing garbage collection.
+        Pauses all TMS tags (freeing physical pages) and clears TMS's
+        internal MemPool entries so that subsequent allocations with the
+        same tags start from a clean state.
+
+        Non-TMS tensors are left alone — they'll be garbage collected
+        when all references to the context are dropped.
         """
-        for key in list(vars(context).keys()):
-            value = getattr(context, key)
-            if isinstance(value, torch.Tensor) and value.is_cuda:
-                value.storage().resize_(0)
+        import gc
 
-    def _run_profiling_pass(
-        self, model_config, old_config, controller, profile,
-        max_requests, buffer_size_gb, token_counts,
-    ):
-        """Create a temporary context and run forward passes to collect
-        activation memory and timing samples.
-
-        On the first call, also populates the profile's memory accounting
-        constants from the actual context (avoiding recomputation errors).
-        The temporary context is freed after profiling.
-        """
-        from dataclasses import replace
-
-        from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-
-        profiling_config = replace(
-            old_config,
-            buffer_size_gb=buffer_size_gb,
-            max_requests=max_requests,
-            max_tokens=None,
-            autotune=False,
-        )
-        context = DynamicInferenceContext(model_config, profiling_config)
-        self.context = context
-        controller.inference_wrapped_model.inference_context = context
-        controller._reinit_for_context()
-        self.reset()
-
-        # Read actual memory accounting from the context (not recomputed).
-        if profile.block_size_bytes == 0:
-            profile.block_size_bytes = context.block_size_bytes
-            profile.max_kv_block_count = context.max_kv_block_count
-            # Include block table in per-request overhead.
-            profile.per_request_bytes += context.max_kv_block_count * 4
-            if context.is_hybrid_model:
-                # Compute actual mamba bytes per request from context shapes.
-                conv_bytes = (
-                    math.prod(context.mamba_conv_states_shape)
-                    * context.mamba_conv_states_dtype.itemsize
-                    * context.num_mamba_layers
-                )
-                ssm_bytes = (
-                    math.prod(context.mamba_ssm_states_shape)
-                    * context.mamba_ssm_states_dtype.itemsize
-                    * context.num_mamba_layers
-                )
-                profile.mamba_memory_per_request = conv_bytes + ssm_bytes
-            logging.info(
-                "Autotune: actual context params — block_size=%.2f MB, "
-                "mamba/request=%.2f MB, max_kv_blocks=%d",
-                profile.block_size_bytes / (1024 ** 2),
-                profile.mamba_memory_per_request / (1024 ** 2),
-                profile.max_kv_block_count,
-            )
-
-        for tc in token_counts:
-            decode_count = min(tc, context.max_requests)
-            batch_dim = InferenceBatchDimensions(
-                token_count=decode_count,
-                prefill_req_count=0,
-                decode_req_count=decode_count,
-            )
-
+        tms_tags = getattr(context, '_tms_tags', None) or []
+        if tms_tags:
             try:
-                input_ids, position_ids = controller._dynamic_step_context_init(
-                    construct_graph_dimensions=batch_dim
-                )
-            except Exception:
-                context.reset()
-                continue
+                from torch_memory_saver import torch_memory_saver as tms
 
-            baseline_bytes = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+                for tag in tms_tags:
+                    tms.pause(tag)
 
-            start_event.record()
-            with torch.inference_mode():
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
-            end_event.record()
-            torch.cuda.synchronize()
+                # Clear TMS's private MemPools so their virtual address
+                # reservations are released for new allocations.
+                mem_pools = tms._impl._mem_pools
+                for tag in tms_tags:
+                    for cpu_backup in (True, False):
+                        mem_pools.pop((tag, cpu_backup), None)
+            except (ImportError, AttributeError, KeyError):
+                pass
 
-            peak_bytes = torch.cuda.max_memory_allocated()
-            activation_bytes = peak_bytes - baseline_bytes
-            elapsed_ms = start_event.elapsed_time(end_event)
-            profile.add_sample(decode_count, activation_bytes, elapsed_ms)
-            logging.debug(
-                "Autotune: token_count=%d, activation=%.1f MB, time=%.1f ms",
-                decode_count,
-                activation_bytes / (1024 ** 2),
-                elapsed_ms,
-            )
-
-            context.reset()
-
-        # Free the profiling context.
-        self._force_free_context_tensors(context)
+        gc.collect()
         torch.cuda.empty_cache()
 
-    def _autotune_and_rebuild(self):
-        """Profile activation memory and compute throughput, then rebuild the
-        context with optimal parameters before CUDA graphs are created.
+    def _autotune_and_rebuild(self, profiling_context_fraction: float = 0.5):
+        """Profile activation memory on the existing context, then rebuild
+        with tuned parameters before CUDA graphs are created.
 
-        Runs standalone forward passes at various token counts (outside the
-        CUDA graph path) to build activation memory and throughput curves.
-        Then computes optimal (max_requests, max_tokens, buffer_size_gb) and
-        replaces the context so that the subsequent create_cuda_graphs() call
-        uses the tuned parameters directly.
+        Args:
+            profiling_context_fraction: Fraction of free GPU memory (after
+                workspace warmup) to use for the profiling context state.
+                The rest is left for activation memory during profiling
+                forward passes. Defaults to 0.5 (50/50 split).
         """
         from dataclasses import replace
 
         from megatron.core.inference.autotune import AutotuneProfile, compute_optimal_params
-        from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
         model_config = self.controller.inference_wrapped_model.model.config
         old_config = self.context.config
         controller = self.controller
 
-        # --- Free the initial context ---
-        # Force-free all GPU tensors — del self.context is insufficient because
-        # the caller may still hold a reference to the context object.
-        self._force_free_context_tensors(self.context)
-        torch.cuda.empty_cache()
-
         gpu_total = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).total_memory
-        mem_after_model = torch.cuda.memory_allocated()
-        free_bytes = gpu_total - mem_after_model
 
-        logging.info(
-            "Autotune: GPU total %.1f GB, model %.1f GB, free %.1f GB",
-            gpu_total / (1024 ** 3),
-            mem_after_model / (1024 ** 3),
-            free_bytes / (1024 ** 3),
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        # --- Step 1: Tiny context to measure workspace cost ---
+        # The first forward pass allocates one-time workspace buffers
+        # (cuBLAS, MoE expert weights). We need to measure this before
+        # we can size the real profiling context.
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+
+        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
+        alignment = max(tp_size, DynamicInferenceContext.REQUEST_ROUNDER)
+        tiny_max_requests = max(alignment, (16 // alignment) * alignment)
+        tiny_buffer_gb = 0.5  # minimal
+
+        tiny_config = replace(
+            old_config,
+            buffer_size_gb=tiny_buffer_gb,
+            max_requests=tiny_max_requests,
+            max_tokens=None,
+            autotune=False,
+            static_kv_memory_pointers=False,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        self.context = DynamicInferenceContext(model_config, tiny_config)
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
+        self.reset()
+
+        # Run one forward pass to trigger workspace allocation.
+        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        warmup_ok = False
+        try:
+            dummy = [DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.tensor([0], device=torch.cuda.current_device()),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            )]
+            self.context.add_dummy_requests_parallel(dummy)
+            self.context.initialize_attention_state()
+            input_ids, position_ids = self.context.current_input_and_position_ids()
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+            warmup_ok = True
+        except Exception as e:
+            if rank == 0:
+                logging.info("Autotune: workspace warmup failed: %r", e)
+        self.context.reset()
+
+        # Barrier: if workspace warmup failed on any rank, abort autotune.
+        if torch.distributed.is_initialized():
+            ok = torch.tensor(
+                [1 if warmup_ok else 0], dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
+            if ok.item() == 0:
+                logging.warning("Autotune: workspace warmup failed on at least one rank. "
+                                "Skipping autotune.")
+                return
+
+        # Measure free memory after workspace is allocated.
+        free_after_workspace, _ = torch.cuda.mem_get_info()
+        if rank == 0:
+            logging.info(
+                "Autotune: workspace warmup done. Free memory: %.1f GB",
+                free_after_workspace / (1024 ** 3),
+            )
+
+        # --- Step 2: Properly-sized profiling context ---
+        # Now we know how much memory workspace takes. Free the tiny context
+        # and create one sized from actual free memory.
+        # Read per-request cost from the tiny context before freeing it.
+        per_req_bytes = self.context.block_size_bytes
+        if self.context.is_hybrid_model:
+            conv_bytes = (
+                math.prod(self.context.mamba_conv_states_shape)
+                * self.context.mamba_conv_states_dtype.itemsize
+                * self.context.num_mamba_layers
+            )
+            ssm_bytes = (
+                math.prod(self.context.mamba_ssm_states_shape)
+                * self.context.mamba_ssm_states_dtype.itemsize
+                * self.context.num_mamba_layers
+            )
+            per_req_bytes += conv_bytes + ssm_bytes
+
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+
+        free_for_profiling, _ = torch.cuda.mem_get_info()
+        context_budget = int(free_for_profiling * profiling_context_fraction)
+        profiling_max_requests = max(alignment, context_budget // max(per_req_bytes, 1))
+        profiling_max_requests = (profiling_max_requests // alignment) * alignment
+
+        # All ranks must use the same profiling_max_requests to avoid NCCL
+        # deadlocks in MoE/TP all-to-all communication during forward passes.
+        if torch.distributed.is_initialized():
+            sync_tensor = torch.tensor(
+                [profiling_max_requests], dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MIN)
+            profiling_max_requests = int(sync_tensor.item())
+            profiling_max_requests = (profiling_max_requests // alignment) * alignment
+            profiling_max_requests = max(alignment, profiling_max_requests)
+
+        profiling_buffer_gb = max(0.1, (profiling_max_requests * per_req_bytes * 1.05) / (1024 ** 3))
+
+        profiling_config = replace(
+            old_config,
+            buffer_size_gb=profiling_buffer_gb,
+            max_requests=profiling_max_requests,
+            max_tokens=None,
+            autotune=False,
+            static_kv_memory_pointers=False,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        self.context = DynamicInferenceContext(model_config, profiling_config)
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
+        self.reset()
+
+        context = self.context
+
+        free_after_profiling_ctx, _ = torch.cuda.mem_get_info()
+        if rank == 0:
+            logging.info(
+                "Autotune: profiling context created (max_requests=%d, buffer=%.2f GB). "
+                "Free memory: %.1f GB",
+                context.max_requests,
+                profiling_buffer_gb,
+                free_after_profiling_ctx / (1024 ** 3),
+            )
+
+        # Compute mamba memory per request from the context.
+        mamba_memory_per_request = 0
+        if context.is_hybrid_model:
+            conv_bytes = (
+                math.prod(context.mamba_conv_states_shape)
+                * context.mamba_conv_states_dtype.itemsize
+                * context.num_mamba_layers
+            )
+            ssm_bytes = (
+                math.prod(context.mamba_ssm_states_shape)
+                * context.mamba_ssm_states_dtype.itemsize
+                * context.num_mamba_layers
+            )
+            mamba_memory_per_request = conv_bytes + ssm_bytes
+
+        mem_after_model = gpu_total - free_after_profiling_ctx
+
+        if rank == 0:
+            logging.info(
+                "Autotune: estimated model+runtime %.1f GB (GPU total %.1f GB)",
+                mem_after_model / (1024 ** 3),
+                gpu_total / (1024 ** 3),
         )
 
-        # --- Two-phase profiling ---
-        # Phase A: tiny context (few requests) to get activation-per-token slope.
-        # Phase B: larger context (sized from Phase A estimate) for full range.
-        # Memory accounting constants (block_size_bytes, mamba_memory_per_request)
-        # are populated from the actual Phase A context, not recomputed.
         profile = AutotuneProfile(
             gpu_total_bytes=gpu_total,
             memory_after_model_load_bytes=mem_after_model,
-            # per_request_bytes and per_token_bytes are conservative estimates.
-            # block_size_bytes, mamba_memory_per_request, max_kv_block_count are
-            # populated from the actual Phase A context in _run_profiling_pass.
-            per_request_bytes=DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
-            + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES,
+            block_size_bytes=context.block_size_bytes,
+            mamba_memory_per_request=mamba_memory_per_request,
+            max_kv_block_count=context.max_kv_block_count,
+            per_request_bytes=(
+                DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
+                + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES
+                + context.max_kv_block_count * 4
+            ),
             per_token_bytes=DynamicInferenceContext.PER_TOKEN_METADATA_BYTES,
         )
 
-        # Phase A: tiny context, small token counts.
-        phase_a_max_requests = 16
-        phase_a_buffer_gb = max(0.01, (free_bytes * 0.02) / (1024 ** 3))
-        phase_a_tokens = [1, 2, 4, 8, 16]
+        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
 
-        logging.info(
-            "Autotune: Phase A — tiny profiling context "
-            "(max_requests=%d, buffer=%.2f GB, tokens=%s)",
-            phase_a_max_requests,
-            phase_a_buffer_gb,
-            phase_a_tokens,
-        )
+        # --- Profile on the existing context ---
+        # Generate token counts: geometric spread from 1 up to max we can fit.
+        token_counts = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        t = 512
+        while t <= context.max_requests:
+            token_counts.append(t)
+            t += max(256, t // 4)
+        # Include the largest valid decode size.
+        if token_counts[-1] != context.max_requests:
+            token_counts.append(context.max_requests)
+        token_counts = sorted(set(tc for tc in token_counts if tc <= context.max_requests))
 
-        self._run_profiling_pass(
-            model_config, old_config, controller, profile,
-            max_requests=phase_a_max_requests,
-            buffer_size_gb=phase_a_buffer_gb,
-            token_counts=phase_a_tokens,
-        )
-
-        # Estimate activation bytes per token from Phase A.
-        if len(profile.token_counts) >= 2:
-            # Simple slope from the two largest successful samples.
-            sorted_samples = sorted(
-                zip(profile.token_counts, profile.peak_activation_bytes)
-            )
-            tc1, mem1 = sorted_samples[-2]
-            tc2, mem2 = sorted_samples[-1]
-            if tc2 > tc1:
-                bytes_per_token = (mem2 - mem1) / (tc2 - tc1)
-            else:
-                bytes_per_token = mem2 / max(tc2, 1)
-        elif len(profile.token_counts) == 1:
-            bytes_per_token = profile.peak_activation_bytes[0] / max(
-                profile.token_counts[0], 1
-            )
-        else:
-            logging.warning("Autotune: Phase A collected no samples, using conservative estimate")
-            bytes_per_token = free_bytes / 100  # very conservative
-
-        # Phase B: properly-sized context for full range.
-        # Estimate how many tokens we can safely fit.
-        safe_activation_budget = free_bytes * 0.8  # leave 20% margin
-        max_safe_tokens = max(16, int(safe_activation_budget / max(bytes_per_token, 1)))
-        phase_b_max_requests = min(max_safe_tokens, 8192)
-
-        # Size Phase B so context overhead (mamba + KV + metadata) stays
-        # under 50% of free memory, leaving room for activations.
-        block_bytes = max(profile.block_size_bytes, 1)
-        mamba_bytes = profile.mamba_memory_per_request
-        per_req_total = block_bytes + mamba_bytes + profile.per_request_bytes
-        # Max requests that fit in 50% of free memory (1 block per request).
-        max_from_memory = int((free_bytes * 0.5) / max(per_req_total, 1))
-        phase_b_max_requests = max(16, min(phase_b_max_requests, max_from_memory))
-        phase_b_buffer_gb = max(
-            0.01,
-            (phase_b_max_requests * block_bytes) / (1024 ** 3),
-        )
-
-        # Generate token counts for Phase B — geometric spread up to max_safe_tokens.
-        phase_b_tokens = []
-        t = phase_a_max_requests + 1  # start above Phase A range
-        while t <= max_safe_tokens:
-            phase_b_tokens.append(t)
-            t = max(t + 8, int(t * 1.5)) if t < 256 else t + max(16, t // 4)
-        if phase_b_tokens and phase_b_tokens[-1] != max_safe_tokens:
-            phase_b_tokens.append(max_safe_tokens)
-        # Clamp to phase_b_max_requests (can't exceed context capacity).
-        phase_b_tokens = sorted(set(
-            min(tc, phase_b_max_requests) for tc in phase_b_tokens
-        ))
-
-        if phase_b_tokens:
+        if rank == 0:
             logging.info(
-                "Autotune: Phase B — larger profiling context "
-                "(max_requests=%d, buffer=%.2f GB, %d token counts up to %d, "
-                "est. %.1f KB/token)",
-                phase_b_max_requests,
-                phase_b_buffer_gb,
-                len(phase_b_tokens),
-                phase_b_tokens[-1] if phase_b_tokens else 0,
-                bytes_per_token / 1024,
+                "Autotune: profiling %d token counts (max=%d) on existing context",
+                len(token_counts),
+                token_counts[-1] if token_counts else 0,
             )
 
-            self._run_profiling_pass(
-                model_config, old_config, controller, profile,
-                max_requests=phase_b_max_requests,
-                buffer_size_gb=phase_b_buffer_gb,
-                token_counts=phase_b_tokens,
-            )
+        for tc in token_counts:
+            # Add dummy decode requests and initialize attention state in
+            # eager mode. We don't pass construct_graph_dimensions because
+            # no CUDA graphs exist yet during profiling.
+            try:
+                from megatron.core.inference.inference_request import (
+                    DynamicInferenceRequest,
+                )
+                from megatron.core.inference.sampling_params import SamplingParams
 
-        logging.info("Autotune: collected %d total profiling samples", len(profile.token_counts))
+                dummy_requests = []
+                for i in range(tc):
+                    req = DynamicInferenceRequest(
+                        request_id=i,
+                        prompt_tokens=torch.tensor([0], device=torch.cuda.current_device()),
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=1,
+                            termination_id=-1,
+                        ),
+                    )
+                    dummy_requests.append(req)
+                context.add_dummy_requests_parallel(dummy_requests)
+                context.initialize_attention_state()
+                input_ids, position_ids = context.current_input_and_position_ids()
+                init_ok = True
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: context_init failed at tc=%d: %r", tc, e)
+                context.reset()
+                init_ok = False
+
+            # All ranks must agree before running the forward pass —
+            # if any rank failed context_init, all must skip to avoid
+            # NCCL deadlocks in MoE/TP collective ops.
+            if torch.distributed.is_initialized():
+                ready = torch.tensor(
+                    [1 if init_ok else 0], dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+                if ready.item() == 0:
+                    context.reset()
+                    continue
+            elif not init_ok:
+                continue
+
+            try:
+                baseline_bytes = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                with torch.inference_mode():
+                    controller._dynamic_step_forward_logits(input_ids, position_ids)
+                end_event.record()
+                torch.cuda.synchronize()
+
+                peak_bytes = torch.cuda.max_memory_allocated()
+                activation_bytes = peak_bytes - baseline_bytes
+                elapsed_ms = start_event.elapsed_time(end_event)
+                profile.add_sample(tc, activation_bytes, elapsed_ms)
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: forward failed at tc=%d: %r", tc, e)
+                torch.cuda.empty_cache()
+
+            context.reset()
+
+        if rank == 0:
+            logging.info("Autotune: collected %d profiling samples", len(profile.token_counts))
+
+        # Re-measure model+runtime memory AFTER profiling. The first forward
+        # pass allocates one-time workspace (cuBLAS, MoE expert weights) that
+        # persists. The solver must account for this.
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+        free_after_profiling, _ = torch.cuda.mem_get_info()
+        profile.memory_after_model_load_bytes = gpu_total - free_after_profiling
+        if rank == 0:
+            logging.info(
+                "Autotune: after profiling — model+runtime+workspace = %.1f GB "
+                "(free %.1f GB)",
+                profile.memory_after_model_load_bytes / (1024 ** 3),
+                free_after_profiling / (1024 ** 3),
+            )
 
         # --- Compute optimal parameters ---
-        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
         new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
             profile, tp_size=tp_size,
             request_rounder=DynamicInferenceContext.REQUEST_ROUNDER,
         )
 
+        # All ranks must use the same tuned parameters to avoid NCCL
+        # deadlocks during CUDA graph build and runtime (MoE/TP all-to-all).
+        if torch.distributed.is_initialized():
+            sync_tensor = torch.tensor(
+                [new_max_requests, new_max_tokens],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MIN)
+            new_max_requests = int(sync_tensor[0].item())
+            new_max_tokens = int(sync_tensor[1].item())
+            # Recompute buffer_size_gb from the synchronized max_requests.
+            kv_bytes = (new_max_requests + 1) * profile.block_size_bytes
+            mamba_bytes = new_max_requests * profile.mamba_memory_per_request
+            new_buffer_size_gb = (kv_bytes + mamba_bytes) / (1024 ** 3)
+
         # --- Rebuild context with tuned parameters ---
-        logging.info(
-            "Autotune: rebuilding context with max_requests=%d, max_tokens=%d, "
-            "buffer_size_gb=%.2f",
-            new_max_requests,
-            new_max_tokens,
-            new_buffer_size_gb,
-        )
+        if rank == 0:
+            logging.info(
+                "Autotune: rebuilding context with max_requests=%d, max_tokens=%d, "
+                "buffer_size_gb=%.2f",
+                new_max_requests,
+                new_max_tokens,
+                new_buffer_size_gb,
+            )
 
-        self._force_free_context_tensors(self.context)
-        torch.cuda.empty_cache()
-
+        # Context already freed above when re-measuring memory.
         tuned_config = replace(
             old_config,
             max_requests=new_max_requests,
@@ -733,9 +826,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # CUDA graphs are built by the caller (create_cuda_graphs) after we return.
 
-        logging.info(
-            "\n"
-            "========== Autotune Complete ==========\n"
+        if rank == 0:
+            logging.info(
+                "\n"
+                "========== Autotune Complete ==========\n"
             "  max_requests:    %d\n"
             "  max_tokens:      %d\n"
             "  buffer_size_gb:  %.2f\n"
