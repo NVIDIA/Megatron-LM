@@ -79,6 +79,34 @@ class TestMultiTokenPredictionLayer:
         )
         return config, mtp_block_spec
 
+    def test_mtp_detach_heads_config(self):
+        """Test that mtp_detach_heads config defaults to False."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        assert config.mtp_detach_heads is False
+
+    def test_constructor_with_detach_heads(self):
+        """Test construction of MTP module with mtp_detach_heads=True."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_detach_heads=True,
+        )
+        transformer_layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        assert isinstance(mtp, MultiTokenPredictionBlock)
+        assert mtp.config.mtp_detach_heads is True
+
     @pytest.mark.parametrize(('tp'), [(1), (2), (4)])
     def test_constructor_local(self, tp):
         """Test basic construction of MTP module."""
