@@ -266,8 +266,13 @@ def compute_optimal_params(
         # Case 2: undersaturated — max_tokens at the elbow.
         max_tokens = elbow
 
-    # Align max_tokens.
-    max_tokens = (max_tokens // tp_size) * tp_size
+    # Align max_tokens to TOKEN_ROUNDER (and TP) so that round_up_tokens()
+    # can never produce a value exceeding max_tokens — the token buffers are
+    # allocated for max_tokens, and any padded count beyond that silently
+    # truncates the slice, causing shape mismatches downstream.
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    token_rounder = math.ceil(DynamicInferenceContext.TOKEN_ROUNDER / tp_size) * tp_size
+    max_tokens = (max_tokens // token_rounder) * token_rounder
     max_tokens = max(max_tokens, max_requests)  # re-enforce after alignment
 
     # When max_tokens > max_requests, the CG pool grows (largest graph
@@ -288,7 +293,7 @@ def compute_optimal_params(
         # Shrink max_tokens toward max_requests.
         max_tokens = max(max_requests, max_tokens - alignment)
 
-    max_tokens = (max_tokens // tp_size) * tp_size
+    max_tokens = (max_tokens // token_rounder) * token_rounder
     max_tokens = max(max_tokens, max_requests)
 
     # Derive buffer_size_gb. The context's auto-derive path expects

@@ -1793,13 +1793,47 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens,
+                    self.round_up_tokens(self.active_token_count),
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
                 )
                 padded_decode_req_count = self.num_decode_requests
                 padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
+
+            # Sync padded dimensions across EP ranks so that MoE all-to-all
+            # communication sees identical tensor sizes on every rank.
+            # match_graph_config already calls adjust_batch_dims_for_expert_parallelism
+            # for the CG path, but when it returns None (eager mode) the
+            # synchronized result is discarded and we fall through to here
+            # with locally-computed dimensions that can differ across EP ranks.
+            ep_group = self.expert_model_parallel_group
+            if ep_group is not None:
+                from megatron.core.utils import get_pg_size
+
+                ep_size = get_pg_size(ep_group)
+                if ep_size > 1:
+                    sync_tensor = torch.tensor(
+                        [padded_token_count, padded_prefill_req_count, padded_decode_req_count],
+                        dtype=torch.int32,
+                        device=torch.cuda.current_device(),
+                    )
+                    torch.distributed.all_reduce(
+                        sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+                    )
+                    padded_token_count = int(sync_tensor[0].item())
+                    padded_prefill_req_count = int(sync_tensor[1].item())
+                    padded_decode_req_count = int(sync_tensor[2].item())
+
+            # Clamp to max_tokens after EP sync — the token buffers are
+            # allocated for max_tokens, so padded_token_count must not
+            # exceed it (otherwise [:padded_token_count] silently clamps
+            # to the buffer size, producing fewer tokens than expected).
+            padded_token_count = min(padded_token_count, self.max_tokens)
+
             self.padded_batch_dimensions = InferenceBatchDimensions(
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
