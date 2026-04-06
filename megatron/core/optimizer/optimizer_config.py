@@ -306,15 +306,6 @@ class OptimizerConfig:
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
-    adaptive_muon_moment2_method: str = "adamuon"
-    """The method to use for the moment2 update in Adaptive Muon optimizer."""
-
-    adaptive_muon_beta2: float = 0.95
-    """The beta2 parameter for the Adaptive Muon optimizer."""
-
-    adaptive_muon_eps: float = 1e-8
-    """The eps parameter for the Adaptive Muon optimizer."""
-
     #######################
     # Distributed optimizer
     #######################
