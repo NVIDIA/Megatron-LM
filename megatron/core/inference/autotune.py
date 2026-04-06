@@ -240,15 +240,27 @@ def compute_optimal_params(
         best_block_count = 2
 
     # Step 2: Determine max_tokens.
-    # NOTE: We currently only profile with decode requests (1 token per
-    # request). Prefill activations (full attention over prompt) are more
-    # expensive per token. Until we add prefill profiling, setting
-    # max_tokens > max_requests would generate CUDA graphs at token counts
-    # where the actual activation cost is unknown and may OOM.
-    # For now, set max_tokens = max_requests (the safe base case from our
-    # design: saturated decode uses max_tokens = max_requests, prefill
-    # happens via natural request completion with chunked prefill).
-    max_tokens = max_requests
+    # The profile includes both decode samples (many requests × 1 token)
+    # and prefill samples (1 request × many tokens). The interpolator
+    # keeps the max activation at each token count, so it reflects
+    # the worst-case (prefill) cost.
+    if max_requests >= elbow:
+        # Case 1: saturated — max_tokens based on freed cache from
+        # completed requests. The activation budget for prefill is the
+        # decode activation + freed cache memory (converted via TMS).
+        if avg_sequence_length is None:
+            max_kv_block_count = profile.max_kv_block_count
+            avg_sequence_length = max_kv_block_count * profile.block_size_bytes // 2
+        kv_bytes_per_token = profile.block_size_bytes // max(
+            profile.max_kv_block_count, 1
+        )
+        typical_freed_cache = avg_sequence_length * kv_bytes_per_token
+        decode_activation = max(0, _interpolate(activation_table, max_requests))
+        max_activation_budget = decode_activation + typical_freed_cache
+        max_tokens = _inverse_interpolate(activation_table, max_activation_budget)
+    else:
+        # Case 2: undersaturated — max_tokens at the elbow.
+        max_tokens = elbow
 
     # Align max_tokens.
     max_tokens = (max_tokens // tp_size) * tp_size

@@ -760,8 +760,87 @@ class DynamicInferenceEngine(AbstractEngine):
 
             context.reset()
 
+        # --- Prefill profiling ---
+        # Measure activation memory for prefill (1 request with long prompt).
+        # Prefill uses full attention over the prompt, so activation per token
+        # is higher than decode. The solver needs the worst case.
+        prefill_token_counts = []
+        t = context.max_requests  # start above decode range
+        max_prefill = context.max_tokens
+        while t <= max_prefill:
+            prefill_token_counts.append(t)
+            t += max(256, t // 4)
+        if prefill_token_counts and prefill_token_counts[-1] != max_prefill:
+            prefill_token_counts.append(max_prefill)
+
         if rank == 0:
-            logging.info("Autotune: collected %d profiling samples", len(profile.token_counts))
+            logging.info(
+                "Autotune: prefill profiling — %d token counts (up to %d)",
+                len(prefill_token_counts),
+                prefill_token_counts[-1] if prefill_token_counts else 0,
+            )
+
+        for tc in prefill_token_counts:
+            init_ok = False
+            try:
+                # 1 request with tc prompt tokens.
+                dummy = [DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.zeros(tc, dtype=torch.long,
+                                              device=torch.cuda.current_device()),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=1,
+                        termination_id=-1,
+                    ),
+                )]
+                context.add_dummy_requests_parallel(dummy, count_as_prefill=True)
+                context.initialize_attention_state()
+                input_ids, position_ids = context.current_input_and_position_ids()
+                init_ok = True
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: prefill init failed at tc=%d: %r", tc, e)
+                context.reset()
+
+            if torch.distributed.is_initialized():
+                ready = torch.tensor(
+                    [1 if init_ok else 0], dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+                if ready.item() == 0:
+                    context.reset()
+                    continue
+            elif not init_ok:
+                continue
+
+            try:
+                baseline_bytes = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                with torch.inference_mode():
+                    controller._dynamic_step_forward_logits(input_ids, position_ids)
+                end_event.record()
+                torch.cuda.synchronize()
+
+                peak_bytes = torch.cuda.max_memory_allocated()
+                activation_bytes = peak_bytes - baseline_bytes
+                elapsed_ms = start_event.elapsed_time(end_event)
+                profile.add_sample(tc, activation_bytes, elapsed_ms)
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: prefill forward failed at tc=%d: %r", tc, e)
+                torch.cuda.empty_cache()
+
+            context.reset()
+
+        if rank == 0:
+            logging.info("Autotune: collected %d total profiling samples "
+                         "(%d decode + prefill)", len(profile.token_counts),
+                         len(profile.token_counts))
 
         # Re-measure model+runtime memory AFTER profiling. The first forward
         # pass allocates one-time workspace (cuBLAS, MoE expert weights) that
