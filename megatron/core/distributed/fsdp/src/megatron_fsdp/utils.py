@@ -22,13 +22,6 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
-    import megatron.core.parallel_state as parallel_state
-
-    HAVE_MEGATRON_CORE = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_MEGATRON_CORE = False
-
-try:
     import einops
 
     HAVE_EINOPS = True
@@ -534,15 +527,8 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # AG groups: use explicit arguments if provided, otherwise fall back to parallel_state.
-        if fsdp_group_ag is not None:
-            self.fsdp_group_ag = fsdp_group_ag
-        elif HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
-            self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, independent_all_gather=True
-            )
-        else:
-            self.fsdp_group_ag = None
+        # AG groups: supplied via ProcessGroupCollection (Megatron-FSDP entrypoint).
+        self.fsdp_group_ag = fsdp_group_ag
         self.expt_fsdp_group_ag = expt_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (

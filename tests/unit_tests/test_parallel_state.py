@@ -534,44 +534,21 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
 
 
 def test_separate_all_gather_group():
-    """Test AG groups via both parallel_state globals and ProcessGroupCollection."""
-    # --- Path 1: global parallel_state (legacy fallback) ---
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=False)
-    assert not ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
-    Utils.destroy_model_parallel()
-
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=True)
-    assert ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
-
-    ag_group = ps.get_data_parallel_group(with_context_parallel=True, independent_all_gather=True)
-    regular_group = ps.get_data_parallel_group(
-        with_context_parallel=True, independent_all_gather=False
-    )
-    assert ag_group is not None
-    assert regular_group is not None
-    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
-    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
-    assert ag_ranks == regular_ranks
-    Utils.destroy_model_parallel()
-
-    # --- Path 2: explicit ProcessGroupCollection ---
+    """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
     Utils.initialize_model_parallel(context_parallel_size=world_size)
+
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
+    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    assert dp_cp_ag_group is not None
+    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
+    assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
+    assert dp_cp_ag_group != dp_cp_group, "AG group should be a different communicator"
 
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     pg_collection.dp_cp_ag = dp_cp_ag_group
-
     assert pg_collection.dp_cp_ag is not None
     assert pg_collection.dp_cp_ag == dp_cp_ag_group
-
-    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
-    regular_ranks = torch.distributed.get_process_group_ranks(pg_collection.dp_cp)
-    assert ag_ranks == regular_ranks, "AG group should have same ranks as dp-cp group"
-    assert dp_cp_ag_group != pg_collection.dp_cp, "AG group should be a different communicator"
 
     Utils.destroy_model_parallel()
 
