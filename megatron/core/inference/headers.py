@@ -13,16 +13,17 @@ class Headers(Enum):
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
     PAUSE = auto()
-    PAUSE_ACK = auto()
     UNPAUSE = auto()
     SUSPEND = auto()
     RESUME = auto()
+    SET_GENERATION_EPOCH = auto()
     STOP = auto()
-    STOP_ACK = auto()
+    DISCONNECT = auto()
+    SHUTDOWN = auto()
 
 
 class UnknownHeaderError(Exception):
     """A signal with an unrecognized header was received by the coordinator."""
 
-    def __init_(self, header):
+    def __init__(self, header):
         super().__init__(f"specialize for {header}.")
