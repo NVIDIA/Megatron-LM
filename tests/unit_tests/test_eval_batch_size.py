@@ -29,6 +29,7 @@ def create_test_args(**overrides):
     args.consumed_valid_samples = 0
     args.dataloader_type = "external"
     args.skip_train = False
+    args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
     args.perform_rl_step = False
@@ -114,7 +115,10 @@ class TestEvalBatchSizeDivisibility:
             eval_global_batch_size=64, eval_micro_batch_size=8, data_parallel_size=2
         )
         # 64 % (8 * 2) == 0 → should pass
-        assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+        assert (
+            args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+            == 0
+        )
 
     def test_invalid_divisibility_raises(self):
         """AssertionError when eval_global_batch_size is not divisible."""
@@ -123,9 +127,10 @@ class TestEvalBatchSizeDivisibility:
         )
         # 50 % (8 * 2) == 50 % 16 == 2 → should fail
         with pytest.raises(AssertionError, match="eval_global_batch_size"):
-            assert args.eval_global_batch_size % (
-                args.eval_micro_batch_size * args.data_parallel_size
-            ) == 0, (
+            assert (
+                args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+                == 0
+            ), (
                 f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
                 f"eval_micro_batch_size ({args.eval_micro_batch_size}) * "
                 f"data_parallel_size ({args.data_parallel_size})"
@@ -143,7 +148,10 @@ class TestEvalBatchSizeDivisibility:
         if args.eval_global_batch_size is None:
             args.eval_global_batch_size = args.global_batch_size
         # 32 % (2 * 1) == 0 → valid
-        assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+        assert (
+            args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size)
+            == 0
+        )
         assert args.eval_global_batch_size == 32
         assert args.eval_micro_batch_size == 2
 
@@ -194,10 +202,7 @@ class TestGetTrainValidTestNumSamples:
     def test_num_samples_with_skip_train(self):
         """With skip_train, eval_iters used directly (no multiplier from train_iters/eval_interval)."""
         args = create_test_args(
-            global_batch_size=32,
-            eval_global_batch_size=8,
-            skip_train=True,
-            eval_iters=10,
+            global_batch_size=32, eval_global_batch_size=8, skip_train=True, eval_iters=10
         )
         set_args(args)
         train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()

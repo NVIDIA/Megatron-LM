@@ -31,6 +31,7 @@ def create_test_args():
     args.consumed_valid_samples = 1
     args.dataloader_type = "external"
     args.skip_train = False
+    args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
     args.perform_rl_step = False
