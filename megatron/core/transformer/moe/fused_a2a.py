@@ -3,6 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from typing import Optional
+
 from megatron.core.utils import internal_api
 
 try:
@@ -280,11 +282,11 @@ def init_hybrid_ep_buffer(
     hidden_dim: int,
     seq_len: int,
     num_local_experts: int,
-    num_sms_dispatch_api: int,
-    num_sms_combine_api: int,
-    num_blocks_permute: int,
-    num_blocks_unpermute: int,
-    fp8_dispatch: bool,
+    num_sms_dispatch_api: Optional[int] = None,
+    num_sms_combine_api: Optional[int] = None,
+    num_blocks_permute: Optional[int] = None,
+    num_blocks_unpermute: Optional[int] = None,
+    fp8_dispatch: bool = False,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -303,29 +305,35 @@ def init_hybrid_ep_buffer(
             Maximum sequence length of the input tensor.
         num_local_experts (int):
             Number of local experts.
-        num_sms_dispatch_api (int):
+        num_sms_dispatch_api (Optional[int]):
             Number of SMs used by the dispatch API.
-        num_sms_combine_api (int):
+        num_sms_combine_api (Optional[int]):
             Number of SMs used by the combine API.
-        num_blocks_permute (int):
+        num_blocks_permute (Optional[int]):
             Number of blocks used by the permute part.
-        num_blocks_unpermute (int):
+        num_blocks_unpermute (Optional[int]):
             Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    kwargs = {}
+    if num_sms_dispatch_api is not None:
+        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+    if num_sms_combine_api is not None:
+        kwargs['num_sms_combine_api'] = num_sms_combine_api
+    if num_blocks_permute is not None:
+        kwargs['num_blocks_permute'] = num_blocks_permute
+    if num_blocks_unpermute is not None:
+        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=seq_len,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
-        num_sms_dispatch_api=num_sms_dispatch_api,
-        num_sms_combine_api=num_sms_combine_api,
-        num_blocks_permute=num_blocks_permute,
-        num_blocks_unpermute=num_blocks_unpermute,
+        **kwargs,
     )
 
 
@@ -350,10 +358,10 @@ class HybridEPDispatch(torch.autograd.Function):
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_blocks_permute=96,
-        num_blocks_unpermute=96,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
@@ -364,14 +372,14 @@ class HybridEPDispatch(torch.autograd.Function):
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
-            if fused:
+            if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
                 import inspect
 
                 sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
                 if 'fuse_permute_dispatch' not in sig.parameters:
                     raise RuntimeError(
-                        "Fused permute dispatch requires DeepEP hybrid-ep branch "
-                        "at commit a0d27f1 or later (PR #588). "
+                        "Fused permute dispatch or setting num_blocks_permute/num_blocks_unpermute "
+                        "requires DeepEP hybrid-ep branch at commit a0d27f1 or later (PR #588). "
                         "Please update: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep"
                     )
             init_hybrid_ep_buffer(
@@ -493,10 +501,10 @@ if HAVE_HYBRIDEP:
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_blocks_permute=96,
-        num_blocks_unpermute=96,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
@@ -516,13 +524,13 @@ if HAVE_HYBRIDEP:
                 Process group used for communication.
             num_local_experts (int):
                 Number of local experts.
-            num_sms_dispatch_api (int):
+            num_sms_dispatch_api (Optional[int]):
                 Number of SMs used by the dispatch API.
-            num_sms_combine_api (int):
+            num_sms_combine_api (Optional[int]):
                 Number of SMs used by the combine API.
-            num_blocks_permute (int):
+            num_blocks_permute (Optional[int]):
                 Number of blocks used by the permute part.
-            num_blocks_unpermute (int):
+            num_blocks_unpermute (Optional[int]):
                 Number of blocks used by the unpermute part.
             num_permuted_tokens (int):
                 Number of tokens after permute. HybridEP uses this to allocate buffers.

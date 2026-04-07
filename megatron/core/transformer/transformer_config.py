@@ -806,15 +806,19 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios,
-    16 SMs can generally achieve good bandwidth."""
+    moe_hybridep_num_sms: Optional[int] = None
+    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
+    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
 
-    moe_hybridep_num_blocks_permute: int = 96
-    """Number of blocks to use for permute part in HybridEP."""
+    moe_hybridep_num_blocks_permute: Optional[int] = None
+    """Number of CUDA thread blocks for the permute part in HybridEP.
+    When permute_fusion_into_hybridep is True, this sets the number
+    of SMs for the permute part (only 1 block per SM)."""
 
-    moe_hybridep_num_blocks_unpermute: int = 96
-    """Number of blocks to use for unpermute part in HybridEP."""
+    moe_hybridep_num_blocks_unpermute: Optional[int] = None
+    """Number of CUDA thread blocks for the unpermute part in HybridEP.
+    When permute_fusion_into_hybridep is True, this sets the number
+    of SMs for the unpermute part (only 1 block per SM)."""
 
     ##################
     # Context Parallel
