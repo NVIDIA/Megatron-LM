@@ -289,9 +289,9 @@ class MultiLatentAttention(Attention):
             value = value.contiguous()
 
         orig_v_dim = value.shape[-1] if value is not None else None
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         need_v_pad = (
-            packed_seq
+            thd_packed_seq
             and self.config.experimental_attention_variant is None
             and value is not None
             and query.shape[-1] != orig_v_dim
@@ -362,14 +362,13 @@ class MultiLatentAttention(Attention):
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
-        if packed_seq:
+        if thd_packed_seq:
             if need_v_pad:
-                if core_attn_out.ndim == 2 and value is not None:
+                if core_attn_out.ndim == 2:
                     core_attn_out = core_attn_out.reshape(
                         *core_attn_out.shape[:-1], -1, value.shape[-1]
                     )
-                if orig_v_dim is not None and query.shape[-1] != orig_v_dim:
-                    core_attn_out = core_attn_out[..., :orig_v_dim]
+                core_attn_out = core_attn_out[..., :orig_v_dim]
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
@@ -607,13 +606,13 @@ class MLASelfAttention(MultiLatentAttention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -622,7 +621,9 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                rotary_pos_emb, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=thd_packed_seq
+                )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:

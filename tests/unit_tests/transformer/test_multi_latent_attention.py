@@ -378,14 +378,14 @@ class TestParallelMLAAttention:
                 assert kv_compressed is not None
                 assert query.shape[-1] != value.shape[-1]
 
-            output, bias = mismatch_attention(
-                hidden_states, attention_mask, packed_seq_params=packed_seq_params
-            )
+                output, bias = mismatch_attention(
+                    hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                )
 
-            assert output.shape[0] == sequence_length
-            assert output.shape[1] == micro_batch_size
-            assert output.shape[2] == transformer_config.hidden_size
-            assert bias.shape[0] == transformer_config.hidden_size
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == transformer_config.hidden_size
+                assert bias.shape[0] == transformer_config.hidden_size
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
