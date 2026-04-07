@@ -97,7 +97,7 @@ class Range:
 class DistributedOptimizer(MixedPrecisionOptimizer):
     """Optimizer that shards state across data-parallel ranks.
 
-    This class reduces memory usage by distributing optimizer states (like 
+    This class reduces memory usage by distributing optimizer states (like
     momentum and variance buffers) across GPUs in the data-parallel group.
 
     Attributes:
@@ -231,9 +231,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        These mappings are partitioned according to data type. This method 
-        iterates through all buckets of a grad buffer to construct param 
-        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        These mappings are partitioned according to data type. This method
+        iterates through all buckets of a grad buffer to construct param
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket,
         where each shard is 1/dp_world_size of the bucket).
 
         Args:
@@ -483,33 +483,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad 
-        buffers, parameters, and parameter shard ranges, that is needed for 
-        converting between model param indexes and main parameter shard indexes. 
-        This method also updates the optimizer parameter groups with the 
+        The steps in this method create the core mapping between param and grad
+        buffers, parameters, and parameter shard ranges, that is needed for
+        converting between model param indexes and main parameter shard indexes.
+        This method also updates the optimizer parameter groups with the
         newly created shards.
 
         Args:
             optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
-                this can be None for BF16 training if no loss scale is used. 
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that
+                this can be None for BF16 training if no loss scale is used.
                 For FP16, a grad scaler is always required.
-            init_state_fn (Callable, optional): Function to initialize state in 
+            init_state_fn (Callable, optional): Function to initialize state in
                 the optimizer.
             model_chunks (List[MegatronModule]): List of model chunks to optimize.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
-                implementation of the distributed optimizer is centered on using 
-                a contiguous buffer for communicating grads & params between 
-                the model state and the optimizer state. For a detailed 
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The
+                implementation of the distributed optimizer is centered on using
+                a contiguous buffer for communicating grads & params between
+                the model state and the optimizer state. For a detailed
                 description, see `docs/source/distrib_optimizer.md`.
-            data_parallel_group (ProcessGroup): Data-parallel group used to 
+            data_parallel_group (ProcessGroup): Data-parallel group used to
                 all-gather params after optimizer.step().
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel
                 group used specifically for checkpoint loading and saving.
-            data_parallel_group_idx (int): Index in the data-parallel group 
+            data_parallel_group_idx (int): Index in the data-parallel group
                 used by distributed checkpointing logic.
-            distributed_optimizer_instance_id (int): Unique identifier for the 
+            distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
         """
 
@@ -2645,4 +2645,3 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
-    
