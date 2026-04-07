@@ -238,7 +238,79 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
-    TMS_TAG = "inference_context"
+    _tms_counter = 0  # unique suffix for TMS tags across context lifetimes
+
+    # Per-request metadata: 8 int32 tensors (request_ids, query_lengths, etc.)
+    PER_REQUEST_SCALAR_BYTES = 8 * 4
+    # Per-request tracking metadata: ~30 bytes (temperature, top_k, top_p, etc.)
+    PER_REQUEST_METADATA_BYTES = 30
+    # Per-token metadata: 6 int64 tensors (input_ids, pos_ids, request_idx, etc.)
+    PER_TOKEN_METADATA_BYTES = 6 * 8
+
+    @staticmethod
+    def compute_context_memory_params(model_config, inference_config):
+        """Compute memory accounting constants for the auto-tuner.
+
+        Returns a dict with:
+            block_size_bytes: bytes per KV cache block
+            mamba_memory_per_request: bytes per Mamba request (0 if not hybrid)
+            max_kv_block_count: max blocks per request
+            per_request_bytes: fixed metadata bytes per request slot
+            per_token_bytes: fixed metadata bytes per token slot
+        """
+        kv_dtype_size = model_config.params_dtype.itemsize
+        block_size_tokens = inference_config.block_size_tokens
+        num_layers = model_config.num_layers
+        pp_size = 1  # conservative; actual PP handled at context init
+
+        cache_mla_latent = getattr(model_config, 'qk_pos_emb_head_dim', 0) > 0
+        if cache_mla_latent:
+            kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+            block_size_bytes = (
+                kv_dtype_size * num_layers * block_size_tokens * kv_reduced_dim
+            )
+        else:
+            block_size_bytes = (
+                kv_dtype_size * 2 * num_layers * block_size_tokens
+                * model_config.num_attention_heads * model_config.kv_channels
+            )
+
+        max_kv_block_count = math.ceil(
+            inference_config.max_sequence_length / block_size_tokens
+        )
+
+        mamba_memory_per_request = 0
+        mamba_config = inference_config.mamba_inference_state_config
+        if mamba_config is not None:
+            layer_type_list = mamba_config.layer_type_list or []
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+            num_mamba_layers = sum(
+                1 for lt in layer_type_list if lt == Symbols.MAMBA
+            )
+            mamba_memory_per_request += (
+                math.prod(mamba_config.conv_states_shape)
+                * mamba_config.conv_states_dtype.itemsize
+            )
+            mamba_memory_per_request += (
+                math.prod(mamba_config.ssm_states_shape)
+                * mamba_config.ssm_states_dtype.itemsize
+            )
+            mamba_memory_per_request *= num_mamba_layers
+
+        per_request_bytes = (
+            DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
+            + max_kv_block_count * 4  # request_to_kv_block_ids (int32)
+            + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES
+        )
+        per_token_bytes = DynamicInferenceContext.PER_TOKEN_METADATA_BYTES
+
+        return {
+            'block_size_bytes': block_size_bytes,
+            'mamba_memory_per_request': mamba_memory_per_request,
+            'max_kv_block_count': max_kv_block_count,
+            'per_request_bytes': per_request_bytes,
+            'per_token_bytes': per_token_bytes,
+        }
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -249,6 +321,12 @@ class DynamicInferenceContext(BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Unique TMS tag names per context instance to avoid conflicts
+        # when TMS's C++ side retains old (paused) allocations under a tag.
+        DynamicInferenceContext._tms_counter += 1
+        suffix = DynamicInferenceContext._tms_counter
+        self.TMS_TAG = f"inference_context_{suffix}"
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -860,6 +938,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Allocate large non-graphed buffers.
+        self._tms_tags = []  # active TMS tags for suspend/resume
         need_static_addr = (
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -874,6 +953,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
             )
             self._uses_torch_memory_saver = True
+            self._tms_tags.append(self.TMS_TAG)
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
@@ -906,16 +986,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
             # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
-                tag = self.TMS_TAG
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
-                    )
-                torch_memory_saver.resume(tag)
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
-                    )
+                for tag in self._tms_tags:
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
+                        )
+                    torch_memory_saver.resume(tag)
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
+                        )
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                 self.reset_metadata()
             return
@@ -944,16 +1024,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            tag = self.TMS_TAG
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
-                )
-            torch_memory_saver.pause(tag)
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
-                )
+            for tag in self._tms_tags:
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
+                    )
+                torch_memory_saver.pause(tag)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
+                    )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -1639,7 +1719,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
