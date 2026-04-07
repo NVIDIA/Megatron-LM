@@ -110,27 +110,39 @@ jobs:
             fi
           fi
 
-          # Always take main's pyproject.toml and uv.lock for lock consistency.
-          # Also take main's versions of key training files that have deep
-          # semantic dependencies on conflict-resolved modules (arguments,
-          # optimizer, etc.). Without this, auto-merged dev code may reference
-          # APIs that main's versions removed.
-          FORCE_MAIN_FILES=(
-            pyproject.toml
-            uv.lock
-            megatron/training/training.py
-            megatron/training/initialize.py
-            megatron/training/utils.py
-            megatron/training/datasets/data_samplers.py
-            megatron/core/optimizer/layer_wise_optimizer.py
-          )
-          for f in "${FORCE_MAIN_FILES[@]}"; do
-            if [ -f "$f" ]; then
-              git checkout origin/main -- "$f" 2>/dev/null || true
+      - name: Prevent semantic conflicts
+        if: steps.check-sync.outputs.skip != 'true'
+        run: |
+          # After merging, auto-merged files from dev may reference APIs that
+          # main renamed or removed (e.g. DynamicCPDataLoaderWrapper vs
+          # HybridCPDataLoaderWrapper). To prevent these semantic conflicts,
+          # take main's version for ALL files that exist in both branches.
+          # Dev-only new files (not in main) are preserved.
+          echo "Taking main's version for all shared files..."
+          REVERTED=0
+          git diff --name-only origin/main...HEAD | while read -r f; do
+            if git cat-file -e "origin/main:$f" 2>/dev/null; then
+              git checkout origin/main -- "$f" 2>/dev/null && REVERTED=$((REVERTED+1)) || true
             fi
           done
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: take main's versions of key integration files for consistency"
+          echo "Reverted $REVERTED shared files to main's version."
+
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "chore: take main's version for all shared files to prevent semantic conflicts"
+          fi
+
+      - name: Run black on changed files
+        if: steps.check-sync.outputs.skip != 'true'
+        run: |
+          pip install 'black==24.*' --quiet
+          CHANGED=$(git diff --name-only origin/dev...HEAD -- '*.py' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "$CHANGED" | xargs black --config pyproject.toml 2>/dev/null || true
+            if ! git diff --quiet; then
+              git add -A
+              git commit -m "style: auto-format with black"
+            fi
           fi
 
       - name: Push sync branch
@@ -153,7 +165,8 @@ jobs:
 
           ### Conflict resolution strategy
           - All merge conflicts resolved by preferring \`main\`
-          - \`pyproject.toml\`, \`uv.lock\`, and key training/optimizer files taken from \`main\` to prevent semantic conflicts
+          - All files that exist in both branches use \`main\`'s version to prevent semantic conflicts
+          - Dev-only new files are preserved
 
           ### Action required
           - Review the changes and approve if CI passes
