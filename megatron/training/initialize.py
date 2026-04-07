@@ -23,7 +23,7 @@ from megatron.core.rerun_state_machine import (
     initialize_rerun_state_machine,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
-from megatron.core.utils import configure_nvtx_profiling, get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
@@ -120,12 +120,6 @@ def initialize_megatron(
     if args.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
-
-    # Enable NVTX range profiling when profiling is active.
-    # Must be done before model modules with @nvtx_decorator are imported,
-    # since the decorator captures _nvtx_enabled at decoration (import) time.
-    if args.profile:
-        configure_nvtx_profiling(True)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -376,7 +370,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                dynamic_context_parallel=args.dynamic_context_parallel,
+                hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,

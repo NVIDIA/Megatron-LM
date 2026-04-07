@@ -39,7 +39,6 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
-    is_torch_min_version,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -287,8 +286,7 @@ def report_memory(name):
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used and is_torch_min_version("2.6.0"):
-        # device usage is not supported in torch < 2.6.0
+    if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
@@ -580,7 +578,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
-        if args.dynamic_context_parallel:
+        if args.hybrid_context_parallel:
             seq_len = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             
@@ -610,7 +608,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['attention_mask'])
 
     else:
-        if args.dynamic_context_parallel:
+        if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = (seq_len.item())
@@ -633,7 +631,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
-            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.dynamic_context_parallel else (1, 1, shape[0], shape[0])
+            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
             attention_mask = torch.empty(
                 shape_attention_mask,
                 dtype=torch.bool,
@@ -647,7 +645,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         cu_seqlens = None
-        if args.dynamic_context_parallel or args.sft:
+        if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
@@ -660,7 +658,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             1,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
-        ) if args.dynamic_context_parallel else None
+        ) if args.hybrid_context_parallel else None
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
