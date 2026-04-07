@@ -388,7 +388,7 @@ class ScheduleNode:
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
         if self.free_input:
-            if torch.cuda.is_current_stream_capturing() and False:
+            if torch.cuda.is_current_stream_capturing():
                 # During CUDA graph capture, record_stream causes deferred frees that
                 # never resolve, inflating the private pool. Instead, defer the release
                 # to the next node on the OTHER stream that waits on our event.
@@ -431,7 +431,7 @@ class ScheduleNode:
 
         # output_grad maybe from another stream
         if output_grad:
-            if torch.cuda.is_current_stream_capturing() and False:
+            if torch.cuda.is_current_stream_capturing():
                 # During CUDA graph capture, defer the output_grad release instead of
                 # using record_stream. The grads were produced on a different stream
                 # and consumed on self.stream inside stream_acquire_context above.
@@ -489,7 +489,7 @@ class ScheduleNode:
         # to free. After event.wait(self.stream), all work on the OTHER stream
         # that recorded this event is guaranteed complete, so tensors produced
         # on that other stream can be safely freed.
-        if torch.cuda.is_current_stream_capturing() and False:
+        if torch.cuda.is_current_stream_capturing():
             DeferredReleaseRegistry.get_instance().drain(self.event, self.stream)
         if name:
             nvtx_range_push(name)
