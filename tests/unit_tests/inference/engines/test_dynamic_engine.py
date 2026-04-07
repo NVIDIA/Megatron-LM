@@ -705,6 +705,33 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_block_overflow_insufficient_kv_cache(self) -> None:
+        """Test that a request fails when KV cache blocks cannot fit the request's sequence."""
+        # Use a large max_sequence_length with a small buffer so that the total
+        # block count is smaller than what a single max-length request needs.
+        # With num_tokens_total=8192 and prompt_length=4, the request needs
+        # ceil(8192 / 256) = 32 blocks, but the small buffer only has ~8 blocks.
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=None,
+            num_tokens_total=8192,
+            max_sequence_length=8192,
+            context_buffer_size_gb=0.001,
+            context_block_size_tokens=256,
+            context_max_tokens=16384,
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+        env.engine._add_request(request)
+        assert request.status == Status.FAILED
+        assert list(env.engine.waiting_request_ids) == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
@@ -1640,6 +1667,76 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_prefix_caching_avoid_single_token_effective_chunk(self):
+        """
+        Test that prefix caching combined with chunked prefill avoids leaving exactly
+        1 token for the effective prefill chunk. A 1-token prefill chunk routes to
+        the Flash Attention decode kernel, which crashes due to shape mismatches.
+        """
+        block_size = 16
+        prompt_len = 17  # 1 full block (16) + 1 token
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=1,
+            context_max_tokens=256,
+            context_max_requests=2,
+            context_block_size_tokens=block_size,
+            max_sequence_length=128,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+
+        # Request A: Populate the prefix cache (set to generate 10 tokens so it stays active)
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # 1. Add, schedule, and step Request A to commit its blocks to the KV cache
+        env.engine._add_request(req_a)
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # Request B: Same prompt, added AFTER Req A's blocks are registered
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_a_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # 2. Add and schedule Request B. It will find the cached blocks immediately.
+        env.engine._add_request(req_b)
+        env.engine.schedule_waiting_requests()
+
+        # Verify that `_compute_prefix_match` successfully clamped the skip.
+        req_b_idx = ctx.request_ids.tolist().index(2)
+
+        assert ctx.request_query_lengths[req_b_idx].item() == 17, (
+            f"Expected effective chunk length to be backed off to 17, "
+            f"but got {ctx.request_query_lengths[req_b_idx].item()}."
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
@@ -2251,9 +2348,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -2376,9 +2471,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2462,9 +2555,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2549,9 +2640,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2667,9 +2756,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             # Predict wildly wrong tokens (+ 5) to guarantee rejection
             wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
@@ -2750,9 +2837,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(
-            hidden_states, next_token_ids, position_ids, depth, runtime_gather_output=True
-        ):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16

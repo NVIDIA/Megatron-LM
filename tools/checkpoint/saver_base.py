@@ -159,6 +159,14 @@ class MegatronCheckpointSaverBase:
 
         self.import_model_provider()
 
+        # Initialize torch.distributed with a minimal single-process backend so that
+        # process-group size queries (get_pg_size / get_tensor_model_parallel_group_if_none)
+        # return the fake groups below rather than falling back to world_size=1.
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault('MASTER_ADDR', 'localhost')
+            os.environ.setdefault('MASTER_PORT', '12356')
+            torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1)
+
         # fake initializing distributed
         mpu.set_tensor_model_parallel_world_size(self.args.target_tensor_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.args.target_pipeline_parallel_size)
@@ -172,12 +180,14 @@ class MegatronCheckpointSaverBase:
         fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
         fake_dp_group = _ConverterFakeProcessGroup(size=1)
+        fake_dp_ep_group = _ConverterFakeProcessGroup(size=1)
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
         mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
         mpu._DATA_PARALLEL_GROUP = fake_dp_group
         mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_ep_group
         
         try:
             import torch_llm_debug_tools

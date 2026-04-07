@@ -626,7 +626,8 @@ class FSDPDistributedIndex:
         """
         Retrieve an Megatron-FSDP-registered submesh by name(s).
         """
-        if isinstance(mesh_dim_names, str):
+        if isinstance(mesh_dim_names, str) or mesh_dim_names is None:
+            # Create tuple from singleton dim or None.
             mesh_dim_names = (mesh_dim_names,)
 
         # Construct submesh identifier: (*mesh_dim_names, is_expert_parallel)
@@ -636,30 +637,22 @@ class FSDPDistributedIndex:
         device_submesh = self.mesh_library.get(submesh_identifier, None)
 
         if device_submesh is None:
+            device_mesh = self.expt_device_mesh if is_expert_parallel else self.device_mesh
             # Warn about not specifying tp_dim for layers or frameworks that depend on this.
-            if self.tp_dim is None and not is_expert_parallel:
+            if self.tp_dim is None:
                 logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
+                    "[FSDPDistributedIndex] For TransformerEngine, or other "
+                    "machine learning frameworks like Megatron that assume "
                     "TP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial TP dimension by setting the TP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.device_mesh}"
+                    "Create a trivial TP dimension by setting the TP dimension "
+                    "size to 1 in the DeviceMesh.\n"
+                    f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
                 )
-            elif self.tp_dim is None and is_expert_parallel:
-                logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
-                    "ETP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial ETP dimension by setting the ETP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.expt_device_mesh}"
-                )
-
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No submesh with "
                 f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
-                f"has been registered with Megatron-FSDP."
+                f"has been registered with Megatron-FSDP.\n"
+                f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
             )
 
         return device_submesh
