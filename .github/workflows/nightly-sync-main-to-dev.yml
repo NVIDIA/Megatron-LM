@@ -15,8 +15,6 @@
 name: Nightly Sync Main to Dev
 
 on:
-  schedule:
-    - cron: "0 20 * * *"
   workflow_dispatch:
 
 concurrency:
