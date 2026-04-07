@@ -11,7 +11,7 @@
 
 *This is an experimental feature and may be changed.*
 
-`--pipeline-model-parallel-layout` takes a string that defines pipeline parallel partitioning. Use it to balance partitioning when for an imbalanced model. For example, to partition a DeepSeek-V3-style stack (61 decoder layers and one MTP layer) with PP16 and VPP2, pass arguments similar to the following:
+`--pipeline-model-parallel-layout` takes a string that defines pipeline parallel partitioning. Use it to balance partitioning for an imbalanced model. For example, to partition a DeepSeek-V3-style stack (61 decoder layers and one MTP layer) with PP16 and VPP2, pass arguments similar to the following:
 
 ```bash
 --pipeline-model-parallel-size 16
