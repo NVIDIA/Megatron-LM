@@ -547,4 +547,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
+        # During CUDA graph capture, drain any remaining deferred tensors that were
+        # not picked up by stream_acquire_context (e.g., tensors deferred by the last
+        # backward node with no subsequent node on the other stream to drain them).
+        # At this point both streams have been synchronized via wait_current_stream.
+        if torch.cuda.is_current_stream_capturing():
+            from megatron.core.pipeline_parallel.utils import DeferredReleaseRegistry
+
+            DeferredReleaseRegistry.get_instance().drain_all()
+
         return f_input

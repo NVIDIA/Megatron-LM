@@ -612,10 +612,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Need to record tensors created on comp stream to comm stream
-        node.layer_state.residual.record_stream(torch.cuda.current_stream())
-        if shared_expert_output is not None:
-            shared_expert_output.record_stream(torch.cuda.current_stream())
+        # Need to record tensors created on comp stream to comm stream.
+        # During CUDA graph capture, record_stream is skipped because these tensors
+        # are kept alive by the attn node's before_detached/detached tuples until
+        # backward, which is well after comm_stream finishes using them.
+        if not torch.cuda.is_current_stream_capturing():
+            node.layer_state.residual.record_stream(torch.cuda.current_stream())
+            if shared_expert_output is not None:
+                shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
