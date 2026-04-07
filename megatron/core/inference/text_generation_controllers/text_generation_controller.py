@@ -1266,7 +1266,7 @@ class TextGenerationController:
             axis=0,
         )
 
-        return routing_splits
+        return dict(zip(active_request_ids, routing_splits))
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
