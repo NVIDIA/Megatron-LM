@@ -974,8 +974,8 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA4 or HAVE_FA3 or is_fa_min_version(
-                "2.7.3"
+            assert (
+                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
