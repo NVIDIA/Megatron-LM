@@ -214,8 +214,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                model_config.mtp_use_repeated_layer or
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
