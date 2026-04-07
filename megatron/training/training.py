@@ -3494,7 +3494,7 @@ def evaluate(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -3681,8 +3681,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
+            effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
+            skipped_intervals = effective_start // args.eval_interval
             args.consumed_valid_samples = (
-                (args.iteration // args.eval_interval) * args.eval_iters * args.eval_global_batch_size
+                (args.iteration // args.eval_interval - skipped_intervals)
+                * args.eval_iters
+                * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
 
     # Get consumed train samples in this phase.
