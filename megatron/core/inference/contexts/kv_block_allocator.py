@@ -8,6 +8,12 @@ from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
+try:
+    from .kernels.block_allocator_gpu import triton_allocate_blocks, triton_release_blocks
+except ImportError:
+    triton_allocate_blocks = None
+    triton_release_blocks = None
+
 
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -41,7 +47,9 @@ class KVBlockAllocator:
         self.on_blocks_deregistered: Optional[Callable] = None
 
         self.total_count = total_count
-        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
+        self._total_avail_tensor = torch.tensor(
+            [total_count - 1], dtype=torch.int32, device=torch.cuda.current_device()
+        )  # -1 for dummy_block_idx (see below)
         self.paused_count = paused_count
         self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
         assert self.active_count >= 1  # ensures paused_count < total_count - 1
@@ -72,6 +80,15 @@ class KVBlockAllocator:
                 self.block_timestamps = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
                 )
+
+    @property
+    def total_avail(self):
+        """Current number of available blocks (CPU read from GPU scalar)."""
+        return self._total_avail_tensor.item()
+
+    @total_avail.setter
+    def total_avail(self, value):
+        self._total_avail_tensor.fill_(value)
 
     def __str__(self):
         return (
@@ -173,15 +190,28 @@ class KVBlockAllocator:
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
-        self.total_avail -= num_blocks
-        block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
-        assert num_blocks == block_ids.numel()
-
-        if self.enable_prefix_caching:
-            # Initialize ref counts for newly allocated blocks
-            self.block_ref_counts[block_ids] = 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        if triton_allocate_blocks is not None:
+            block_ids = torch.empty(num_blocks, dtype=torch.int32, device=self.block_bag.device)
+            has_pc = self.enable_prefix_caching
+            triton_allocate_blocks(
+                block_bag=self.block_bag,
+                total_avail_tensor=self._total_avail_tensor,
+                output=block_ids,
+                num_blocks=num_blocks,
+                ref_counts=self.block_ref_counts if has_pc else None,
+                has_prefix_cache=has_pc,
+            )
+            if has_pc and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
+        else:
+            self.total_avail -= num_blocks
+            block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
+            assert num_blocks == block_ids.numel()
+
+            if self.enable_prefix_caching:
+                self.block_ref_counts[block_ids] = 1
+                if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                    self.update_timestamps(block_ids)
 
         return block_ids
 
@@ -221,8 +251,16 @@ class KVBlockAllocator:
                     self.total_avail += num_unreg
         else:
             num_blocks = blocks.numel()
-            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
-            self.total_avail += num_blocks
+            if triton_release_blocks is not None:
+                triton_release_blocks(
+                    block_bag=self.block_bag,
+                    total_avail_tensor=self._total_avail_tensor,
+                    blocks=blocks,
+                    num_blocks=num_blocks,
+                )
+            else:
+                self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
+                self.total_avail += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
