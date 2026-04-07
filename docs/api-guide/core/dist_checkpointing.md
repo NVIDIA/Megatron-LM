@@ -123,6 +123,26 @@ You can combine formats to optimize both flexibility and performance:
    3. Save at least one checkpoint under the new model parallel configuration.
    4. (Optional) To continue the training with updated model parallelism and better checkpointing performance, stop training and switch back to ``dp_reshardable`` format by removing ``--dist-ckpt-optim-fully-reshardable``.
 
+## Async Checkpoint Saving Strategy
+
+The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations. 
+
+We are transitioning to a new async saving implementation based on the **NVRx (NVIDIA Resiliency Extension)** package. The legacy async strategy (referred to as **mcore**) is being deprecated.
+
+### Migration to NVRx
+
+- The **NVRx-based async strategy** will become the **default** in mcore v0.17.
+- The existing **mcore async strategy** is **deprecated** and will be removed in future versions.
+- A deprecation warning is emitted when using the mcore strategy.
+
+### Selecting Async Strategy
+
+`--async-strategy` flag is introduced to control the async strategy. To use legacy async strategy (**mcore**), set:
+
+```bash
+--async-strategy mcore
+```
+
 ## Subpackages
 
 ```{toctree}
