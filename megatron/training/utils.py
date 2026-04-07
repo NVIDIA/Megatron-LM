@@ -788,3 +788,12 @@ def get_nvtx_range():
         def dummy_range(msg, time=False, log_level=1):
             yield
         return dummy_range
+
+
+def has_nvrx_installed():
+    """Checks if nvidia-resiliency-ext is installed."""
+    try:
+        import nvidia_resiliency_ext
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
