@@ -1292,15 +1292,17 @@ class SelfAttention(Attention):
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
         default_norm_cls = None
-        if self.config.qk_layernorm and TENorm is not None:
-            default_norm_cls = TENorm
-        elif self.config.qk_l2_norm:
+        if self.config.qk_l2_norm:
             default_norm_cls = L2Norm
+        elif self.config.qk_layernorm and TENorm is not None:
+            default_norm_cls = TENorm
 
         q_norm_cls = submodules.q_layernorm or default_norm_cls
         k_norm_cls = submodules.k_layernorm or default_norm_cls
 
-        if self.config.qk_layernorm and (q_norm_cls is None or k_norm_cls is None):
+        if (self.config.qk_layernorm or self.config.qk_l2_norm) and (
+            q_norm_cls is None or k_norm_cls is None
+        ):
             raise RuntimeError(
                 "qk_layernorm requires Transformer Engine (for TENorm) or "
                 "q_layernorm/k_layernorm set in the spec."
