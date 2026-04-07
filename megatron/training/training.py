@@ -2872,7 +2872,7 @@ def train(
     if args.moe_expert_rank_capacity_factor is not None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
-            args,
+            config,
             copy_main_params,
             model,
             optimizer,
@@ -3388,7 +3388,7 @@ def evaluate(
     if args.moe_expert_rank_capacity_factor is not None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
-            args,
+            config,
             copy_main_params,
             model,
             None,
