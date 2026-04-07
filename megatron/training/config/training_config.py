@@ -103,6 +103,12 @@ class ValidationConfig:
     during training.
     """
 
+    start_eval_at_iter: int | None = None
+    """If set, evaluation will only start after this iteration number. Useful for skipping
+    evaluation during early training iterations when the model is not yet meaningful.
+    If not set, evaluation starts from the first eval_interval.
+    """
+
     eval_global_batch_size: int | None = None
     """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
     Must be divisible by (eval_micro_batch_size * data_parallel_size).

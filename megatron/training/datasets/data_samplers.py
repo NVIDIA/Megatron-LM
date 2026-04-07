@@ -30,10 +30,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
+    if args.dataloader_type == "external":
+        # External dataloaders are passed through. User is expected to provide a
+        # torch-compatible dataloader and define samplers, if needed.
+        return dataset
+
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
-    micro_batch_size = args.eval_micro_batch_size if is_eval else args.micro_batch_size
-    global_batch_size = args.eval_global_batch_size if is_eval else args.global_batch_size
+    micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
+    global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
 
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronPretrainingSampler(
@@ -70,10 +75,6 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
         )
-    elif args.dataloader_type == "external":
-        # External dataloaders are passed through. User is expected to provide a
-        # torch-compatible dataloader and define samplers, if needed.
-        return dataset
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
