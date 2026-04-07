@@ -44,7 +44,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         raise NotImplementedError("Derived class must implement get_dataset.")
 
     async def get_reward(
-        self, response: str, golden: Any, finish_reason: str | None = None
+        self, response: str, golden: Any, finish_reason: str
     ) -> float:
         """Given the LLM response and the golden data, provide a reward."""
         raise NotImplementedError("Derived class must implement get_reward")

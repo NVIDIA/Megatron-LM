@@ -41,5 +41,5 @@ class AIMEAgent(MathAgent):
         prompt = self.make_prefix(**golden, problem_key="Problem")
         return prompt, golden
 
-    async def get_reward(self, response, golden: dict, finish_reason: str | None = None) -> float:
+    async def get_reward(self, response, golden: dict, finish_reason: str) -> float:
         return self.compute_score(response, golden, golden_key="Answer", finish_reason=finish_reason)

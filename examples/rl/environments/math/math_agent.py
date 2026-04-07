@@ -51,8 +51,8 @@ class MathAgent(RewardOnlyAgent):
         self,
         response: str,
         golden: dict,
+        finish_reason: str,
         golden_key: str = "answer",
-        finish_reason: str | None = None,
     ) -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.
 
@@ -60,8 +60,6 @@ class MathAgent(RewardOnlyAgent):
         """
         # Generation that stopped cleanly (EOD or stop word) rather than
         # hitting the token limit is eligible for full reward.
-
-        # NOTE: finish_reason=None is treated as "stopped" here for backwards compatibility.
         stopped = finish_reason != "length"
 
         answer_tag_pattern = r'<answer>(.*?)</answer>'
