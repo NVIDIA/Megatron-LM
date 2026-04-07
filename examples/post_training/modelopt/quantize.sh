@@ -25,6 +25,11 @@ if [ -z ${MLM_MODEL_SAVE} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_SAVE})!\n"
 fi
 
+EXTRA_ARGS=(${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS})
+if [ -n "${MLM_PROMPTS}" ]; then
+    EXTRA_ARGS+=(--prompts "${MLM_PROMPTS}")
+fi
+
 if [ -z ${MLM_MODEL_CKPT} ]; then
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
         ${MODEL_ARGS} \
@@ -38,7 +43,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
-        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+        "${EXTRA_ARGS[@]}"
 else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
         ${MODEL_ARGS} \
@@ -52,5 +57,5 @@ else
         --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
-        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+        "${EXTRA_ARGS[@]}"
 fi
