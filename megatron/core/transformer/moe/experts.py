@@ -49,6 +49,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -772,6 +773,9 @@ class TEGroupedMLP(MegatronModule):
         except ImportError:
             return False  # Transformer Engine version is too old
 
+        if not is_te_min_version("2.14.0"):
+            return False
+
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
@@ -785,8 +789,6 @@ class TEGroupedMLP(MegatronModule):
             return False
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
-        if self.linear_fc1.need_backward_dw() or self.linear_fc2.need_backward_dw():
-            return False  # Delayed weight gradient compuation is not supported
 
         # Check activation
         if self.activation_func != F.silu or not self.config.gated_linear_unit:
@@ -801,18 +803,20 @@ class TEGroupedMLP(MegatronModule):
         ops = te.pytorch.ops.Sequential()
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
-        fc1_single_grouped_parameter = self.linear_fc1.single_grouped_parameter
+        fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
         fc1_weight_dtype = (
             self.linear_fc1.weight.dtype
-            if fc1_single_grouped_parameter
+            if fc1_single_grouped_weight
             else self.linear_fc1.weight0.dtype
         )
-        fc2_single_grouped_parameter = self.linear_fc2.single_grouped_parameter
+        fc2_single_grouped_weight = self.linear_fc2.single_grouped_weight
         fc2_weight_dtype = (
             self.linear_fc2.weight.dtype
-            if fc2_single_grouped_parameter
+            if fc2_single_grouped_weight
             else self.linear_fc2.weight0.dtype
         )
+        fc1_single_grouped_bias = self.linear_fc1.single_grouped_bias
+        fc2_single_grouped_bias = self.linear_fc2.single_grouped_bias
 
         # TODO:ksivamani: Why meta device?
         op = te.pytorch.ops.GroupedLinear(
@@ -823,18 +827,22 @@ class TEGroupedMLP(MegatronModule):
             device=torch.cuda.current_device(),
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_parameter=fc1_single_grouped_parameter,
+            single_grouped_weight=fc1_single_grouped_weight,
+            single_grouped_bias=fc1_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc1_single_grouped_parameter:
+        if fc1_single_grouped_weight:
             setattr(op, "weight", getattr(self.linear_fc1, "weight"))
 
         for idx in range(self.linear_fc1.num_gemms):
-            if not fc1_single_grouped_parameter:
+            if not fc1_single_grouped_weight:
                 setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
-            if self.linear_fc1.use_bias:
+            if self.linear_fc1.use_bias and not fc1_single_grouped_bias:
                 setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
+        if self.linear_fc1.use_bias and fc1_single_grouped_bias:
+            setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
         # Activation and post-multiply probs
@@ -844,7 +852,6 @@ class TEGroupedMLP(MegatronModule):
         ops.append(op)
 
         # FC2
-        has_bias = self.linear_fc2.use_bias
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
@@ -853,18 +860,22 @@ class TEGroupedMLP(MegatronModule):
             device=torch.cuda.current_device(),
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_parameter=fc2_single_grouped_parameter,
+            single_grouped_weight=fc2_single_grouped_weight,
+            single_grouped_bias=fc2_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc2_single_grouped_parameter:
+        if fc2_single_grouped_weight:
             setattr(op, "weight", getattr(self.linear_fc2, "weight"))
 
         for idx in range(self.linear_fc2.num_gemms):
-            if not fc2_single_grouped_parameter:
+            if not fc2_single_grouped_weight:
                 setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
-            if self.linear_fc2.use_bias:
+            if self.linear_fc2.use_bias and not fc2_single_grouped_bias:
                 setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
+        if self.linear_fc2.use_bias and fc2_single_grouped_bias:
+            setattr(op, "bias", getattr(self.linear_fc2, "bias"))
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -1230,6 +1241,14 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
+        if self._with_fused_impl and self.config.delay_wgrad_compute:
+            if self._fused_ops is not None:
+                (seq,) = self._fused_ops
+                fused_children = list(seq.children())
+                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
+            return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
