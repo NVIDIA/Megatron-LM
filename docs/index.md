@@ -38,8 +38,8 @@ get-started/releasenotes
 :hidden:
 :caption: Get Started
 
-get-started/quickstart
 get-started/install
+get-started/quickstart
 ```
 
 ```{toctree}
