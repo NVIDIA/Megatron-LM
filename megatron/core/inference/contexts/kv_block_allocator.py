@@ -14,6 +14,11 @@ except ImportError:
     triton_allocate_blocks = None
     triton_release_blocks = None
 
+try:
+    from .kernels.prefix_cache_gpu import GPUHashTable
+except ImportError:
+    GPUHashTable = None
+
 
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -67,7 +72,12 @@ class KVBlockAllocator:
             )
 
             # Hash-to-block mapping for O(1) prefix lookup
-            self.kv_hash_to_block_id: Dict[int, int] = {}
+            if GPUHashTable is not None:
+                self.kv_hash_to_block_id = GPUHashTable(
+                    self.total_count, device=torch.cuda.current_device()
+                )
+            else:
+                self.kv_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
@@ -309,7 +319,10 @@ class KVBlockAllocator:
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        if isinstance(self.kv_hash_to_block_id, dict):
+            self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        else:
+            self.kv_hash_to_block_id.insert(block_hashes, block_ids)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -323,16 +336,22 @@ class KVBlockAllocator:
         if num_blocks == 0:
             return
 
-        # Gather hashes via batched tensor indexing
+        # Gather hashes for Mamba callback (needs CPU-side data)
         block_ids_i64 = block_ids.to(torch.int64)
         hashes = self.block_hashes[block_ids_i64].tolist()
-
-        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
+
+        # Remove from hash-to-block mapping
+        if isinstance(self.kv_hash_to_block_id, dict):
+            deque(
+                map(
+                    self.kv_hash_to_block_id.pop,
+                    keys_to_delete & self.kv_hash_to_block_id.keys(),
+                ),
+                maxlen=0,
+            )
+        else:
+            self.kv_hash_to_block_id.delete_by_block_ids(block_ids, self.block_hashes)
 
         # Notify Mamba slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:

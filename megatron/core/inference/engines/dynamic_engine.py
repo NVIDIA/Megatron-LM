@@ -1466,10 +1466,10 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 # Add these hashes to pending.
-                if prefix_caching_enabled:
-                    for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
-                            pending_block_hashes.add(block_hash)
+                if prefix_caching_enabled and req.precomputed_block_hashes:
+                    pending_block_hashes.update(
+                        self._find_missing_hashes(req.precomputed_block_hashes)
+                    )
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1483,6 +1483,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    def _find_missing_hashes(self, precomputed_block_hashes):
+        """Find hashes not present in the KV cache, using batch GPU lookup if available."""
+        kv_ht = self.context.kv_block_allocator.kv_hash_to_block_id
+        if hasattr(kv_ht, 'lookup'):
+            import torch
+
+            h = torch.tensor(precomputed_block_hashes, dtype=torch.int64, device='cuda')
+            result = kv_ht.lookup(h)
+            return set(h[result == -1].tolist())
+        else:
+            return {bh for bh in precomputed_block_hashes if bh not in kv_ht}
 
     def schedule_chunked_prefill(self):
         """
@@ -1548,13 +1560,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
+                    if prefix_caching_enabled and req.precomputed_block_hashes:
+                        pending_block_hashes.update(
+                            self._find_missing_hashes(req.precomputed_block_hashes)
+                        )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1568,13 +1577,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
+                    if prefix_caching_enabled and req.precomputed_block_hashes:
+                        pending_block_hashes.update(
+                            self._find_missing_hashes(req.precomputed_block_hashes)
+                        )
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce

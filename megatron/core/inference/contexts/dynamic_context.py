@@ -2041,15 +2041,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         hashes = req.precomputed_block_hashes[start_block:end_block]
         kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
 
-        # Find longest KV prefix by iterating block hashes from end.
+        # Find longest KV prefix.
         # Parent-chained hashes guarantee: if hash at position N exists,
-        # all hashes 0..N also exist. So first match from end = longest prefix.
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in kv_hash_to_block:
-                num_matched = i + 1
-                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
-                parent_hash = hashes[num_matched - 1]
-                return matched_blocks, parent_hash
+        # all hashes 0..N also exist. So rightmost match = longest prefix.
+        if hasattr(kv_hash_to_block, 'lookup'):
+            # GPU batch lookup path
+            hash_tensor = torch.tensor(
+                hashes, dtype=torch.int64, device=self.request_ids.device
+            )
+            result_ids = kv_hash_to_block.lookup(hash_tensor)
+            match_mask = result_ids != -1
+            if not match_mask.any():
+                return [], 0
+            matched_indices = torch.nonzero(match_mask, as_tuple=True)[0]
+            num_matched = matched_indices[-1].item() + 1
+            matched_blocks = result_ids[:num_matched].tolist()
+            parent_hash = hashes[num_matched - 1]
+            return matched_blocks, parent_hash
+        else:
+            # CPU dict fallback path
+            for i in range(len(hashes) - 1, -1, -1):
+                if hashes[i] in kv_hash_to_block:
+                    num_matched = i + 1
+                    matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
+                    parent_hash = hashes[num_matched - 1]
+                    return matched_blocks, parent_hash
 
         return [], 0
 
