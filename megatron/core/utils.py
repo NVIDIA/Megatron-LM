@@ -52,13 +52,6 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
-try:
-    import nvtx
-
-    HAVE_NVTX = True
-except ImportError:
-    HAVE_NVTX = False
-
 logger = logging.getLogger(__name__)
 
 try:
