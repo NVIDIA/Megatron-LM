@@ -796,7 +796,10 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        # Use is_decode_only to choose the decode kernel vs the prefill varlen kernel.
+        # This is important for speculative decoding: during draft token verification in
+        # decode-only batches, max_seqlen_q > 1 but we still want the decode kernel.
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -834,12 +837,19 @@ class Attention(MegatronModule, ABC):
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
+            # Reshape q from packed (total_tokens, 1, nheads, headdim) to
+            # (batch, seqlen_q, nheads, headdim) as expected by the decode kernels.
+            # For standard decode seqlen_q=1 so total_tokens==batch and this is a no-op
+            # reshape. For speculative-decoding verification seqlen_q=num_spec+1.
+            num_requests = seqlens_k.shape[0]
+            q = q.view(num_requests, max_seqlen_q, q.shape[-2], q.shape[-1])
+
             # If using MLA we use the FlashMLA kernel
             if isinstance(self.config, MLATransformerConfig):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = 1  # Sequence length is 1 for decode
+                seq_len_q = max_seqlen_q
                 num_heads_q = self.num_attention_heads_per_partition
                 num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
 
@@ -879,6 +889,11 @@ class Attention(MegatronModule, ABC):
                         not self.batch_invariant_mode
                     ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
+
+            # Reshape back from (batch, seqlen_q, nheads, headdim) to
+            # (total_tokens, 1, nheads, headdim) to match the packed layout
+            # expected by the caller.
+            output_total = output_total.reshape(-1, 1, *output_total.shape[2:])
         return output_total
 
     def forward(
