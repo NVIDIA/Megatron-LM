@@ -59,6 +59,11 @@ except ImportError:
     triton_swap_bookkeeping = None
 
 try:
+    from .kernels.request_completion_kernel import triton_classify_and_release
+except ImportError:
+    triton_classify_and_release = None
+
+try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -2785,36 +2790,91 @@ class DynamicInferenceContext(BaseInferenceContext):
             _se[3][0].record()
 
         if finished_request_count > 0:
-            finished_idxs = (
-                torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-                + self.paused_request_count
-            )
-            self.release_memory_blocks_from_request_indexes(finished_idxs)
+            if triton_classify_and_release is not None:
+                finished_left, active_right, num_compact, finished_idxs_t, num_finished = (
+                    triton_classify_and_release(
+                        active_requests_mask=active_requests_mask,
+                        request_to_kv_block_ids=self.request_to_kv_block_ids,
+                        block_bag=self.kv_block_allocator.block_bag,
+                        total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                        block_ref_counts=(
+                            self.kv_block_allocator.block_ref_counts
+                            if self.enable_prefix_caching
+                            else None
+                        ),
+                        block_hashes=(
+                            self.kv_block_allocator.block_hashes
+                            if self.enable_prefix_caching
+                            else None
+                        ),
+                        active_request_count=active_request_count,
+                        paused_request_count=self.paused_request_count,
+                        max_kv_block_count=self.max_kv_block_count,
+                        has_prefix_cache=self.enable_prefix_caching,
+                    )
+                )
 
-            if active_request_count > 0:
-                finished_idxs_on_left = (
-                    torch.nonzero(active_requests_mask[:active_request_count] == 0, as_tuple=True)[
-                        0
-                    ]
+                # Mamba cleanup (stays in Python)
+                if num_finished > 0:
+                    finished_idxs = finished_idxs_t[:num_finished].to(torch.long)
+                    if self.is_hybrid_model:
+                        self.mamba_metadata.free_slots(finished_idxs)
+                    if self.mamba_slot_allocator is not None:
+                        sa = self.mamba_slot_allocator
+                        sa._intermediate_counts_gpu[finished_idxs] = 0
+                        sa._intermediate_offsets_gpu[finished_idxs] = 0
+                        sa._intermediate_block_ids_gpu[finished_idxs] = -1
+                        sa._eos_cache_block_id_gpu[finished_idxs] = -1
+
+                # Compact using existing tensor reorder kernel
+                if num_compact > 0:
+                    self._move_book_keeping_tensors(
+                        src_idxs=active_right[:num_compact].to(torch.long),
+                        dst_idxs=finished_left[:num_compact].to(torch.long),
+                        next_tokens=next_tokens,
+                        new_speculative_tokens=new_speculative_tokens,
+                    )
+                    self.request_to_kv_block_ids[
+                        active_right[:num_compact].to(torch.long)
+                    ] = -1
+                    if self.is_hybrid_model:
+                        self.mamba_metadata.request_to_mamba_state_idx[
+                            active_right[:num_compact].to(torch.long)
+                        ] = -1
+            else:
+                finished_idxs = (
+                    torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
                     + self.paused_request_count
                 )
-                active_idxs_on_right = (
-                    torch.nonzero(active_requests_mask[active_request_count:], as_tuple=True)[0]
-                    + active_request_count
-                    + self.paused_request_count
-                )
+                self.release_memory_blocks_from_request_indexes(finished_idxs)
 
-                self._move_book_keeping_tensors(
-                    src_idxs=active_idxs_on_right,
-                    dst_idxs=finished_idxs_on_left,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
+                if active_request_count > 0:
+                    finished_idxs_on_left = (
+                        torch.nonzero(
+                            active_requests_mask[:active_request_count] == 0, as_tuple=True
+                        )[0]
+                        + self.paused_request_count
+                    )
+                    active_idxs_on_right = (
+                        torch.nonzero(active_requests_mask[active_request_count:], as_tuple=True)[
+                            0
+                        ]
+                        + active_request_count
+                        + self.paused_request_count
+                    )
 
-                # Reset chunk ids for recently moved requests.
-                self.request_to_kv_block_ids[active_idxs_on_right] = -1
-                if self.is_hybrid_model:
-                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
+                    self._move_book_keeping_tensors(
+                        src_idxs=active_idxs_on_right,
+                        dst_idxs=finished_idxs_on_left,
+                        next_tokens=next_tokens,
+                        new_speculative_tokens=new_speculative_tokens,
+                    )
+
+                    self.request_to_kv_block_ids[active_idxs_on_right] = -1
+                    if self.is_hybrid_model:
+                        self.mamba_metadata.request_to_mamba_state_idx[
+                            active_idxs_on_right
+                        ] = -1
 
         if self._time_update_requests:
             _se[3][1].record()
