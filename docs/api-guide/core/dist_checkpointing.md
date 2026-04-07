@@ -143,6 +143,22 @@ We are transitioning to a new async saving implementation based on the **NVRx (N
 --async-strategy mcore
 ```
 
+### NVRx Dependency
+
+To use the NVRx-based async strategy, you must install the `nvidia-resiliency-ext` package.
+
+```bash
+git clone https://github.com/NVIDIA/nvidia-resiliency-ext
+cd nvidia-resiliency-ext
+pip install .
+```
+
+> [!NOTE]
+
+- If `nvidia-resiliency-ext` is not installed, the NVRx async strategy will not be available.
+- The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
+- It is strongly recommended to migrate to the NVRx strategy as soon as possible.
+
 ## Subpackages
 
 ```{toctree}
