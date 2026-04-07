@@ -573,7 +573,16 @@ def get_environment_rollouts(
     n_prompts: int,
     samples_per_group: int,
 ):
-    """Sample environment rollouts from an LLM.
+    """Obtain rollouts and broadcast them to all ranks.
+
+    This method is only called when non-zero ranks have insufficient rollouts in their buffer.
+    The first check this method does is whether rank 0 has sufficient pre-generated rollouts.
+        If not, then we sample rollouts from the LLM and broadcast them to all ranks.
+        If yes, we skip the rollout sampling and directly broadcast the buffer to all ranks.
+
+    `colocated_inference` is a helper that handles all of the details of using inference mode.
+    `get_environment_rollouts` is only responsible for getting rollouts to all ranks, which may
+        sometimes involve using `colocated_inference`, but not necessarily.
 
     Args:
         model: Model to sample from.
