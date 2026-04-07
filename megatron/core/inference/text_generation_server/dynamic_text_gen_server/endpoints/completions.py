@@ -4,13 +4,14 @@ import asyncio
 import logging
 import time
 
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -21,7 +22,9 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
-        req = request.get_json()
+        req = await request.get_json(force=True)
+        if req is None:
+            return "Invalid or missing JSON body", 400
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -84,6 +87,11 @@ try:
             # skip_prompt_log_probs=False ensures the engine computes logprobs for prompt tokens
             skip_prompt_log_probs = not (echo and return_log_probs)
 
+            # Parse stop sequences
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -92,6 +100,7 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                stop_words=stop,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -107,6 +116,7 @@ try:
                 top_n_logprobs=sampling_params.top_n_logprobs,
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                stop_words=sampling_params.stop_words,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
@@ -124,34 +134,51 @@ try:
                 f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        # --- 4. Format Response (matching old_completions.py) ---
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return f"Inference request(s) failed: {error_detail}", status
+
+        # --- 5. Format Response (matching old_completions.py) ---
         choices = []
 
         request_idx = 0
-        for record in batch_results:
-            result = record.merge()
-            full_text = result.generated_text or ""
+        for completed_request in batch_results:
+            result = unwrap_serialized_tensors(completed_request)
+            full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
             logprobs_data = None
             if sampling_params.return_log_probs:
                 # Get prompt tokens and logprobs
-                prompt_tokens_list = []
-                if result.prompt_tokens is not None:
-                    if hasattr(result.prompt_tokens, 'tolist'):
-                        prompt_tokens_list = result.prompt_tokens.tolist()
-                    else:
-                        prompt_tokens_list = list(result.prompt_tokens)
+                prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = getattr(result, 'prompt_log_probs', None) or []
-                prompt_top_n_logprobs = getattr(result, 'prompt_top_n_logprobs', None) or []
+                prompt_log_probs = result.get('prompt_log_probs') or []
+                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
 
                 # Get generated tokens and logprobs
-                generated_tokens_list = (
-                    list(result.generated_tokens) if result.generated_tokens else []
-                )
-                generated_log_probs = getattr(result, 'generated_log_probs', None) or []
-                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
+                generated_tokens_list = result["generated_tokens"] or []
+                generated_log_probs = result.get('generated_log_probs') or []
+                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -204,17 +231,19 @@ try:
                 }
 
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
-            if result.routing_indices is not None:
-                choices[-1]["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
+            if result["routing_indices"] is not None:
+                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                prompt_length = (
+                    len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
+                )
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
-                    ].tolist()
+                    ]
 
             request_idx += 1
 
         return jsonify({"choices": choices})
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")

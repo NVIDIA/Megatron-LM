@@ -20,7 +20,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather_fused,
     multimem_reduce_scatter,
 )
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -114,7 +114,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         topk = probs.size(-1)
         hidden_dim = hidden_states.size(-1)
 
-        result = get_global_symmetric_memory_buffer_ep().maybe_get_tensors(
+        result = SymmetricMemoryManager.get_buffer(
+            "ep", process_group=self.ep_group
+        ).maybe_get_tensors(
             [
                 (global_tokens * topk, routing_map.dtype),
                 (global_tokens * topk, probs.dtype),
@@ -150,9 +152,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
             dict: A dictionary with keys "handle" (symmetric memory handle, or
                 None if unavailable) and "tensor" (the allocated buffer, or None).
         """
-        symm_mem_buffer = get_global_symmetric_memory_buffer_ep().maybe_get_tensor(
-            list(x.size()), dtype=x.dtype
-        )
+        symm_mem_buffer = SymmetricMemoryManager.get_buffer(
+            "ep", process_group=self.ep_group
+        ).maybe_get_tensor(list(x.size()), dtype=x.dtype)
         return symm_mem_buffer
 
     def token_dispatch(self, hidden_states, probs):
@@ -303,7 +305,11 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         output = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
         # Check output only: if output is 16-byte divisible, input (world_size * output) is too.
-        nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(output)
+        nvls_eligible = (
+            self.triton_nvls_kernels_allowed
+            and output.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(output)
+        )
         rs_buffer = None
 
         if nvls_eligible:
@@ -317,10 +323,10 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
             # Use latency-optimized NVLS reduce-scatter
             multimem_reduce_scatter(output, rs_buffer["tensor"], rs_buffer["handle"])
-            return output
+            return output.to(torch.bfloat16)
         else:
             # Fallback to NCCL
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states, group=self.tp_ep_group
             )
-            return hidden_states
+            return hidden_states.to(torch.bfloat16)

@@ -120,9 +120,9 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
 
             if getattr(param, 'allreduce', True):
-                dense_params.append(param)
+                dense_params.append((param, name))
             else:
-                expert_parallel_params.append(param)
+                expert_parallel_params.append((param, name))
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -132,7 +132,7 @@ class DistributedDataParallel(_BaseDataParallel):
             param_and_grad_dtype_to_indices = {}
 
             # Group parameters by their gradient type.
-            for param in input_params:
+            for param, param_name in input_params:
                 assert param.requires_grad
 
                 param_dtype = param.dtype
@@ -147,7 +147,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
 
                 params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
-                params.append(param)
+                params.append((param, param_name))
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
                 # Get the index of each param among the params with same dtype, if a param is fp8,

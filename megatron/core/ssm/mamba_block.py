@@ -39,6 +39,7 @@ class MambaStackSubmodules:
     """
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
+    gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
@@ -148,6 +149,15 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        add_layer_offset=False,
+                    )
+                elif layer_type == LayerSymbols.GDN:
+                    layer = build_module(
+                        submodules.gdn_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                     )
                 else:

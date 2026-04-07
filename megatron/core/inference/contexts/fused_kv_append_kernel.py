@@ -1,8 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import triton
-import triton.language as tl
 from torch import Tensor
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 @triton.jit

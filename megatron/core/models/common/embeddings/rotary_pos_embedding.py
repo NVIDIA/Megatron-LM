@@ -240,7 +240,15 @@ class RotaryEmbedding(nn.Module):
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
         elif inference_context is not None:
-            rotary_seq_len = inference_context.max_sequence_length
+            # For dynamic batching, use the max of context's max_sequence_length and the actual
+            # input size to ensure rotary embeddings cover CUDA graph warmup token counts
+            context_max_seq_len = inference_context.max_sequence_length
+            input_seq_len = 0
+            if transformer_input is not None:
+                input_seq_len = transformer_input.size(0)
+            elif transformer is not None and transformer.input_tensor is not None:
+                input_seq_len = transformer.input_tensor.size(0)
+            rotary_seq_len = max(context_max_seq_len, input_seq_len)
         else:
             if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)

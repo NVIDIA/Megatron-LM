@@ -49,10 +49,19 @@ except ImportError:
 _results_queue = None
 
 
-def _get_write_results_queue():
+@_disable_gc()
+def get_write_results_queue(mp_mode: str = 'spawn') -> mp.Queue:
+    """Get or create a multiprocessing queue for write results.
+
+    Args:
+        mp_mode (str): Multiprocessing context mode. Defaults to 'spawn'.
+
+    Returns:
+        mp.Queue: Queue for collecting write results.
+    """
     global _results_queue
     if _results_queue is None:
-        ctx = mp.get_context("spawn")
+        ctx = mp.get_context(mp_mode)
         _results_queue = ctx.Manager().Queue()
     return _results_queue
 
@@ -134,7 +143,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_count += 1
             return file_name
 
-        def _clone_if_needed(ten: torch.Tensor):
+        def _clone_or_dequantize_if_needed(ten: torch.Tensor):
             """Clone if we detect incontiguous storage for CPU tensors
 
             Makes sure we perform a `clone` only if we detect incontiguous storage,
@@ -145,6 +154,11 @@ class FileSystemWriterAsync(FileSystemWriter):
             """
             ten = ten.detach()
             if ten.device.type != "cpu":
+                # We call ``dequantize`` if we detect a quantized tensor on GPU.
+                # This is a workaround to avoid the issue of quantized tensors not being
+                # supported by the async writer.
+                if ten.device.type == "cuda" and "dequantize" in type(ten).__dict__:
+                    ten = ten.dequantize()
                 # We do D2H later when the async_request is scheduled for both sync / async
                 # checkpointing
                 return ten
@@ -163,7 +177,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if item.type == WriteItemType.BYTE_IO
                 ]
                 tensor_data = [
-                    (item, _clone_if_needed(planner.resolve_data(item)))
+                    (item, _clone_or_dequantize_if_needed(planner.resolve_data(item)))
                     for item in bucket
                     if item.type != WriteItemType.BYTE_IO
                 ]
@@ -183,7 +197,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 len(self.write_buckets),
                 self.thread_count,
             )
-            self.results_queue = _get_write_results_queue()
+            self.results_queue = get_write_results_queue()
         else:
             self.results_queue = None
         end = time()

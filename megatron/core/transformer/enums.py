@@ -9,18 +9,9 @@ class ModelType(enum.Enum):
     """Model Type
 
     encoder_or_decoder for bert, gpt etc
-    encoder_and_decoder for multimodal , T5 etc
     """
 
     encoder_or_decoder = 1
-
-    @property
-    def encoder_and_decoder(self):
-        """Deprecated property - use encoder_or_decoder instead."""
-        raise ValueError(
-            "ModelType.encoder_and_decoder is deprecated. Please use ModelType.encoder_or_decoder "
-            "instead."
-        )
 
 
 class LayerType(enum.Enum):

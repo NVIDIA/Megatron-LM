@@ -288,6 +288,7 @@ def test_save_and_load_checkpoint_vpp(
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.async_strategy = "mcore"
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):

@@ -191,8 +191,12 @@ class MambaLayer(GraphableMegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        # Training and validation mode CUDA graphs
-        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+        # Training and validation mode CUDA graphs.
+        if (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs.get('inference_context') is None
+            and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
+        ):
             return True
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')

@@ -5,7 +5,7 @@ import logging
 import time
 from typing import List, Optional, Union
 
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -51,13 +51,16 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_address: str):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
         Args:
             inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
+            deserialize (bool): If True, deserialize completed requests
+                into DynamicInferenceRequest objects. If False (default), return
+                the raw serialized dict for lower overhead.
         """
         assert (
             HAVE_ZMQ
@@ -67,10 +70,16 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
+
+        # Prevent socket.send() from thread-blocking at >1000 concurrent requests
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0)
+
         socket.connect(inference_coordinator_address)
 
         self._loop = None
         self.socket = socket
+        self.deserialize = deserialize
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
@@ -93,7 +102,8 @@ class InferenceClient:
 
         Returns:
             asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequestRecord` object containing the completed result.
+            `DynamicInferenceRequest` object (if deserialize=True) or a raw
+            serialized dict (if deserialize=False) containing the completed result.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -131,10 +141,10 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
-                    completed_request = DynamicInferenceRequestRecord.deserialize(reply)
-                    completion_future.get_loop().call_soon_threadsafe(
-                        completion_future.set_result, completed_request
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
+                    completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -166,14 +176,15 @@ class InferenceClient:
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
+    def _send_signal_to_engines(self, signal, *args):
         """
         Sends a generic control signal to the inference coordinator.
 
         Args:
             signal: The signal to send, typically a value from the `Headers` enum.
+            *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value]
+        payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
@@ -190,9 +201,13 @@ class InferenceClient:
         """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def increment_staleness(self):
-        """Sends a signal to increment staleness on all in-flight requests."""
-        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+    def set_generation_epoch(self, generation_epoch: int):
+        """Sends a signal to stamp all in-flight requests with the given generation epoch.
+
+        Args:
+            generation_epoch: The current generation epoch number.
+        """
+        self._send_signal_to_engines(Headers.SET_GENERATION_EPOCH, generation_epoch)
 
     def suspend_engines(self):
         """Sends SUSPEND to all engines via coordinator. Requires PAUSED.

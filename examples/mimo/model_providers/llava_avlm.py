@@ -35,6 +35,7 @@ def model_provider_llava_avlm(
     add_decoder=True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    pg_collection=None,
 ):
     """
     Build a LLaVA-style Audio-Vision-Language MIMO model composed of:
@@ -154,7 +155,9 @@ def model_provider_llava_avlm(
     )
 
     # Create MIMO model
-    mimo_model = MimoModel(mimo_model_config)
+    cp_group = pg_collection.cp if pg_collection is not None else None
+    tp_group = pg_collection.tp if pg_collection is not None else None
+    mimo_model = MimoModel(mimo_model_config, cp_group=cp_group, tp_group=tp_group)
     print("*"*100)
     print_mimo_structure(mimo_model)
     print("*"*100)

@@ -194,17 +194,14 @@ class TestInferenceCUDAGraphTokenDispatcher:
 
     @classmethod
     def setup_class(cls):
-        from megatron.core.parallel_state import _set_global_symmetric_memory_buffer
-
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        _set_global_symmetric_memory_buffer()
 
     @classmethod
     def teardown_class(cls):
-        from megatron.core.parallel_state import destroy_global_symmetric_memory_buffer
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
-        destroy_global_symmetric_memory_buffer()
+        SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
     def _make_dispatcher(self, **config_overrides):
@@ -233,11 +230,20 @@ class TestInferenceCUDAGraphTokenDispatcher:
         assert dispatcher.ep_size == Utils.world_size
 
     def test_symmetric_memory_buffer_initialized(self):
-        """EP symmetric memory buffer is accessible after _set_global_symmetric_memory_buffer."""
-        from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
+        """EP symmetric memory buffer is lazily created via SymmetricMemoryManager."""
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
-        buf = get_global_symmetric_memory_buffer_ep()
+        # Buffer should not exist yet (lazy init)
+        assert not SymmetricMemoryManager.is_initialized("ep")
+
+        # Create it explicitly and verify
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+
+        buf = SymmetricMemoryManager.get_buffer(
+            "ep", process_group=get_expert_model_parallel_group()
+        )
         assert buf is not None
+        assert SymmetricMemoryManager.is_initialized("ep")
 
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(

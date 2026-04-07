@@ -3,8 +3,21 @@
 from typing import Optional
 
 import torch
-import triton  # type: ignore
-import triton.language as tl  # type: ignore
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 @triton.jit

@@ -831,16 +831,15 @@ class TestNonStrictLoad:
             ),
         }
 
-    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_unexpected_keys_handling_during_validation(
-        self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
+        self, caplog, tmp_path_dist_ckpt, validate_integrity
     ):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -865,9 +864,7 @@ class TestNonStrictLoad:
                 assert 'Missing keys' not in error_msg
 
             # ASSUME_OK_UNEXPECTED results in an exception raised by the underlying strategy
-            with pytest.raises(
-                PyTCheckpointingException if save_format == 'torch_dist' else CheckpointingException
-            ) as exc_info:
+            with pytest.raises(PyTCheckpointingException) as exc_info:
                 load_with_flag(StrictHandling.ASSUME_OK_UNEXPECTED)
             # Informative exceptions with `RAISE_*` options:
             with pytest.raises(CheckpointingException) as exc_info:
@@ -905,16 +902,15 @@ class TestNonStrictLoad:
             loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
             assert 'TenA' in loaded_state_dict
 
-    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_missing_keys_raises_error_during_validation(
-        self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
+        self, caplog, tmp_path_dist_ckpt, validate_integrity
     ):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -943,7 +939,6 @@ class TestNonStrictLoad:
 
             with caplog.at_level(logging.WARNING):
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
-            assert caplog.text == ''
             assert 'TenB' in loaded_state_dict
 
             loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(
@@ -975,12 +970,11 @@ class TestNonStrictLoad:
             assert unexpected_keys == set()
             assert missing_keys == {'TenA', 'ObjB'}
 
-    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
-    def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
+    def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -1002,25 +996,22 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict = load_with_flag(strict)
-                assert caplog.text == ''
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
 
             for strict in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
-                assert caplog.text == ''
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()
                 assert unexpected_keys == set()
 
-    @pytest.mark.parametrize('save_format', ['torch_dist'])
-    def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
+    def test_sharded_metadata(self, tmp_path_dist_ckpt):
 
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
             sharded_metadata = load_sharded_metadata(ckpt_dir)

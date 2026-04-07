@@ -45,12 +45,22 @@ inputs:
   PAT:
     description: "GitHub Personal Access Token"
     required: true
-  is_ci_workload:
-    description: "Is CI workload"
-    required: true
-  is_merge_group:
-    description: "Is merge group"
-    required: true
+  scope:
+    description: "Test scope (e.g. mr-github, mr-github-slim)"
+    required: false
+    default: "mr-github-slim"
+  n_repeat:
+    description: "Number of test repetitions"
+    required: false
+    default: "5"
+  lightweight:
+    description: "Enable lightweight mode"
+    required: false
+    default: "false"
+  platform:
+    description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
+    required: false
+    default: "dgx_h100"
 runs:
   using: "composite"
   steps:
@@ -59,22 +69,18 @@ runs:
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v6
 
     - name: Change ownership of /home/runner/
       shell: bash
       run: sudo chown -R $(whoami) /home/runner/
 
-    - name: Setup python
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
-
-    - name: Install uuidgen
+    - name: Setup python and install dependencies
       shell: bash -x -e -u -o pipefail {0}
       run: |
         apt-get update
-        apt-get install -y uuid-runtime
+        apt-get install -y python3.12 python3.12-venv uuid-runtime
+        curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
@@ -87,7 +93,6 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
-        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -96,7 +101,7 @@ runs:
           --model unit-tests \
           --test-case "${{ inputs.test_case }}" \
           --environment dev \
-          --platform dgx_h100 \
+          --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
@@ -105,39 +110,6 @@ runs:
         )
         echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
-
-    - name: Get PR info
-      id: get-pr-info
-      if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@main
-
-    - name: Install GH CLI
-      shell: bash -x -e -u -o pipefail {0}
-      run: |
-        apt-get update
-        apt-get install -y gh
-
-    - name: Has Run tests label
-      shell: bash -x -e -u -o pipefail {0}
-      id: has-run-tests-label
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-        HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
-        echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
-
-    - name: Has Run functional tests label
-      shell: bash -x -e -u -o pipefail {0}
-      id: has-run-functional-tests-label
-      env:
-        GH_TOKEN: ${{ github.token }}
-        IS_CI_WORKLOAD: ${{ inputs.is_ci_workload }}
-      run: |
-        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "$IS_CI_WORKLOAD"
-        HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
-        echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
     - name: Create run-script (e2e test)
       shell: bash -x -e -u -o pipefail {0}
@@ -150,32 +122,16 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
-        if [ "${{ inputs.is_merge_group }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --n-repeat 1
-          )
-        elif [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --enable-lightweight-mode
-            --n-repeat 1
-          )
-        elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --n-repeat 5
-          )
-        else
-          ARGS=(
-            --scope mr-github-slim
-            --n-repeat 5
-          )
+        ARGS=(
+          --scope ${{ inputs.scope }}
+          --n-repeat ${{ inputs.n_repeat }}
+        )
+        if [ "${{ inputs.lightweight }}" == "true" ]; then
+          ARGS+=(--enable-lightweight-mode)
         fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
-        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -184,7 +140,7 @@ runs:
           --model ${{ inputs.model }} \
           --test-case ${{ inputs.test_case }} \
           --environment dev \
-          --platform dgx_h100 \
+          --platform ${{ inputs.platform }} \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME

@@ -1,12 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import inspect
-
 from megatron.core import mpu
 from megatron.core.inference.communication_utils import broadcast_float_list
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.tokenization import tokenize_prompts
+from megatron.core.utils import accepts_parameter
 
 
 def run_mcore_engine(
@@ -60,18 +59,11 @@ def run_mcore_engine(
     for p, l in zip(context_tokens_tensor, context_length_tensor):
         tokenized_prompts.append(p[:l].cpu().numpy().tolist())
 
-    # detect if detokenize supports skip_special_tokens or **kwargs
-    sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
-    accepts_skip = any(
-        p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
-        for p in sig_params
-    )
-
     # Detokenize prompts into strings to pass through the engine
     detokenized_prompts = [
         (
             tokenizer.detokenize(p, skip_special_tokens=True)
-            if accepts_skip
+            if accepts_parameter(tokenizer.detokenize, "skip_special_tokens")
             else tokenizer.detokenize(p)
         )
         for p in tokenized_prompts

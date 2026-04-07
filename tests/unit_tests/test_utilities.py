@@ -91,7 +91,11 @@ class Utils:
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
         if not Utils.inited:
             return
-        torch.distributed.barrier()
+        try:
+            torch.distributed.barrier(timeout=timedelta(seconds=30))
+        except Exception:
+            Utils.inited = False
+            return
         ps.destroy_model_parallel()
         Utils.inited = False
 

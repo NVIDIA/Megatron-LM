@@ -58,22 +58,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Result
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: true
+          SKIPPING_IS_ALLOWED: false
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | test("build-and-test-wheels")))] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
-              echo "✅ All previous jobs completed successfully"
+              echo "✅ All build-and-test-wheels jobs completed successfully"
               exit 0
           else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
+              echo "❌ Found $FAILED_JOBS failed build-and-test-wheels job(s)"
               # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | test("build-and-test-wheels"))) | .name'
               exit 1
           fi

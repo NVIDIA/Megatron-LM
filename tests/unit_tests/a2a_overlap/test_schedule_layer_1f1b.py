@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -68,9 +69,8 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     for i in range(len(input_tensors)):
         input_tensors[i] = input_tensors[i].clone()
 
+    set_streams()
     event = torch.cuda.Event()
-    comp_stream = torch.cuda.current_stream()
-    comm_stream = torch.cuda.Stream(device="cuda")
     state = DummyState()
     state.is_mtp = False
     state.model = model
@@ -79,8 +79,8 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
             transformer_layer,
             event,
             state,
-            comp_stream,
-            comm_stream,
+            get_comp_stream,
+            get_comm_stream,
             extra_args={"is_moe": True, "enable_deepep": False},
         )
         for _ in range(microbatches)
@@ -183,8 +183,7 @@ def run_mtp_layer_a2a_overlap_with_capture(
     for i in range(len(hidden_states)):
         hidden_states[i] = hidden_states[i].clone()
 
-    comp_stream = torch.cuda.current_stream()
-    comm_stream = torch.cuda.Stream(device="cuda")
+    set_streams()
     layers = []
     for _ in range(microbatches):
         state = DummyState()
@@ -203,8 +202,8 @@ def run_mtp_layer_a2a_overlap_with_capture(
                 model.mtp.layers[0],
                 event,
                 state,
-                comp_stream,
-                comm_stream,
+                get_comp_stream,
+                get_comm_stream,
                 extra_args={
                     "is_moe": True,
                     "enable_deepep": False,
@@ -411,7 +410,6 @@ class TestA2AOverlap:
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -461,7 +459,6 @@ class TestA2AOverlap:
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
         if fp8_flag is not None:
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
             extra_kwargs["fp8"] = fp8_flag[0]

@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 try:
-    from flask import Blueprint, current_app, jsonify
+    from quart import Blueprint, current_app, jsonify
 
     bp = Blueprint('health_api', __name__)
 
@@ -35,4 +35,4 @@ try:
             return jsonify({"status": "error", "details": str(e)}), 500
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")

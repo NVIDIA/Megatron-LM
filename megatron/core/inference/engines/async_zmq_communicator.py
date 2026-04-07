@@ -26,13 +26,20 @@ class AsyncZMQCommunicator:
     on the CPU.
     """
 
-    def __init__(self, zmq_context: zmq.Context, process_group: dist.ProcessGroup):
+    def __init__(
+        self,
+        zmq_context: zmq.Context,
+        process_group: dist.ProcessGroup,
+        hostname: str | None = None,
+    ):
         """
         Constructor for AsyncZMQCommunicator. Sets up ZMQ sockets
         for communication among ranks in the given process group.
         Args:
             zmq_context (zmq.Context): ZMQ context to create sockets.
             process_group (dist.ProcessGroup): Process group for communication.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to socket.gethostname().
         """
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
@@ -41,7 +48,7 @@ class AsyncZMQCommunicator:
         src_rank = dist.get_process_group_ranks(process_group)[0]
 
         if self.is_leader:
-            local_ip = socket.gethostname()
+            local_ip = hostname or socket.gethostname()
             self.gather_sock = zmq_context.socket(zmq.PULL)
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
@@ -65,7 +72,7 @@ class AsyncZMQCommunicator:
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
 
-    async def all_reduce_max(self, *local_vals: int) -> int | tuple[int, ...]:
+    async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
 
         Packs all values into a single message so the communication cost
@@ -88,13 +95,21 @@ class AsyncZMQCommunicator:
 
             while len(rows) < self.world_size:
                 try:
-                    msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
+                    if async_op:
+                        msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
+                    else:
+                        msg = self.gather_sock.recv()
                     rows.append(struct.unpack(fmt, msg))
                 except zmq.Again:
                     await asyncio.sleep(0.001)
 
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
             self.bcast_sock.send(struct.pack(fmt, *maxes))
+            if not async_op:
+                await asyncio.sleep(
+                    0
+                )  # Yield control once to ensure that other coroutines can run.
+                # This might be needed for colocated RL.
             return maxes[0] if n == 1 else maxes
 
         else:
@@ -102,8 +117,16 @@ class AsyncZMQCommunicator:
 
             while True:
                 try:
-                    msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
+                    if async_op:
+                        msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
+                    else:
+                        msg = self.bcast_sock.recv()
                     result = struct.unpack(fmt, msg)
+                    if not async_op:
+                        await asyncio.sleep(
+                            0
+                        )  # Yield control once to ensure that other coroutines can run.
+                        # This might be needed for colocated RL.
                     return result[0] if n == 1 else result
                 except zmq.Again:
                     await asyncio.sleep(0.001)

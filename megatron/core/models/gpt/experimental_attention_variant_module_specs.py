@@ -397,6 +397,7 @@ def _get_self_attention_module_spec(
         use_te_activation_func=config.use_te_activation_func,
         use_kitchen_attention=config.use_kitchen_attention,
         kitchen_attention_backend=config.kitchen_attention_backend,
+        mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
     )
     attn_spec = layer_spec.submodules.self_attention
     if config.multi_latent_attention:

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import warnings
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -12,23 +13,18 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (TEDotProductAttention, TELayerNormColumnParallelLinear, TERowParallelLinear) = (
         None,
         None,
         None,
     )
-    HAVE_TE = False
 
 try:
     import apex  # pylint: disable=unused-import

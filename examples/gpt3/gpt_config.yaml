@@ -218,7 +218,6 @@ overlap_grad_reduce: False
 align_grad_reduce: True
 overlap_param_gather: False
 align_param_gather: False
-scatter_gather_tensors_in_pipeline: True
 local_rank: null
 lazy_mpu_init: null
 empty_unused_memory_level: 0

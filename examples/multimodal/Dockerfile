@@ -36,6 +36,8 @@ RUN uv pip install --system --no-cache --break-system-packages \
     # Additional dependencies for megatron-core[mlm]
     flask-restful \
     wandb \
+    bitstring \
+    filetype
     setuptools
 
 # Install CLIP from GitHub
