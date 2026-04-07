@@ -19,6 +19,10 @@ on:
     - cron: "0 20 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: nightly-sync-main-to-dev
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write
@@ -87,168 +91,127 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.PAT }}
-          trigger_phrase: ""
           direct_prompt: |
-            You are an automated sync bot. Your job is to merge `main` into `dev`, create a PR,
-            ensure all CI tests pass (fixing any failures), and mark the PR as ready for review.
+            You are an automated sync bot. Your job is to merge `main` into `dev`,
+            create a PR, ensure all CI tests pass (fixing any failures), and mark
+            the PR as ready for review.
 
             REPO: ${{ github.repository }}
             BRANCH: ${{ steps.vars.outputs.branch }}
             DATE: ${{ steps.vars.outputs.date }}
 
-            ## Step 1: Create the sync branch and merge
+            Read `.claude/skills/build-and-test/SKILL.md` and `CLAUDE.md` first to
+            understand the project's CI pipeline, testing infrastructure, and
+            contribution guidelines.
 
-            1. Create a new branch from `origin/dev`:
-               ```
-               git checkout -b $BRANCH origin/dev
-               ```
+            ---
 
-            2. Merge `origin/main` into it, prioritizing main on all conflicts:
-               ```
-               git merge origin/main -X theirs --no-edit
-               ```
+            ## Phase 1: Create the sync branch and merge
 
-            3. If the merge still has unresolved conflicts (exit code 1), resolve them
-               by reading each conflicted file, understanding both sides, and choosing
-               main's version. Stage and commit the resolution:
-               ```
-               git diff --name-only --diff-filter=U  # list conflicted files
-               # For each file: read it, resolve conflict markers favoring main, edit it
-               git add <resolved files>
-               git commit --no-edit
-               ```
+            Create a branch named `$BRANCH` from `origin/dev` and merge
+            `origin/main` into it.
 
-            4. After the merge, take main's version for ALL files that exist in both
-               branches. This prevents semantic conflicts where auto-merged dev code
-               references APIs that main renamed or removed:
-               ```
-               git diff --name-only origin/main...HEAD | while read -r f; do
-                 if git cat-file -e "origin/main:$f" 2>/dev/null; then
-                   git checkout origin/main -- "$f" 2>/dev/null || true
-                 fi
-               done
-               ```
+            **Merge strategy:**
+            - Use `git merge origin/main -X theirs --no-edit` so that main wins on
+              textual conflicts.
+            - If any conflicts remain unresolved (e.g. add/add), read each
+              conflicted file, understand both sides, and resolve by favoring main.
+            - **Do NOT blanket-override all shared files with main's version.**
+              Dev has features that are not yet in main (new classes, new modules,
+              new tests). The git merge preserves both sides' non-conflicting
+              additions, which is correct. Only intervene where there is an actual
+              conflict.
 
-            5. Restore files that exist in main but were deleted/renamed in dev:
-               ```
-               comm -23 \
-                 <(git ls-tree -r --name-only origin/main | sort) \
-                 <(git ls-tree -r --name-only HEAD | sort) \
-               | while read -r f; do
-                 git checkout origin/main -- "$f" 2>/dev/null || true
-               done
-               ```
+            **After merging, take main's version ONLY for these specific files**
+            that are known to have semantic conflicts (dev's versions reference
+            args/APIs that main removed or renamed):
+            - `pyproject.toml` and `uv.lock` (lock-file consistency for container build)
+            - `docker/Dockerfile.ci.dev` (build compatibility)
+            - `megatron/training/training.py` (references dev-only args)
+            - `megatron/training/initialize.py` (references dev-only args)
+            - `megatron/training/utils.py` (references dev-only args)
+            - `megatron/training/datasets/data_samplers.py` (references dev-only args)
+            - `megatron/core/optimizer/layer_wise_optimizer.py` (constructor signature)
 
-            6. Run `black` (version 24) on all changed Python files to fix formatting:
-               ```
-               pip install 'black==24.*' --quiet
-               CHANGED=$(git diff --name-only origin/dev...HEAD -- '*.py' | tr '\n' ' ')
-               black --config pyproject.toml $CHANGED
-               ```
+            Use: `git checkout origin/main -- <file>` for each.
 
-            7. Stage everything, commit, and push:
-               ```
-               git add -A
-               git commit -m "chore: nightly sync main into dev ($DATE)" --allow-empty
-               git push origin $BRANCH --force
-               ```
+            **Restore files that exist in main but were deleted/renamed in dev:**
+            Compare `git ls-tree` between `origin/main` and HEAD, and restore any
+            files from main that are missing (e.g. `hybrid_cp_schedule.py`).
 
-            ## Step 2: Create the PR
+            Run `black` (version 24, with `--config pyproject.toml`) on all changed
+            Python files to fix formatting differences.
 
-            Create a draft PR targeting `dev`:
-            ```
-            gh pr create \
-              --repo $REPO \
-              --base dev \
-              --head $BRANCH \
-              --draft \
-              --title "chore: nightly sync main into dev ($DATE)" \
-              --body "Automated nightly sync of main into dev. Conflicts resolved by prioritizing main."
-            ```
+            After editing imports in any Python files, run `isort` on those files
+            (see CLAUDE.md).
 
-            Save the PR number for later use.
+            Commit everything and push the branch.
 
-            ## Step 3: Trigger CI and iterate until all tests pass
+            ---
 
-            This is a loop. Repeat the following until CI passes:
+            ## Phase 2: Create the PR
 
-            1. Get the latest commit SHA:
-               ```
-               SHA=$(git rev-parse HEAD)
-               ```
+            Create a **draft** PR targeting `dev`:
+            - Title: `chore: nightly sync main into dev ($DATE)`
+            - Body: describe what was synced, how conflicts were resolved, and
+              that CI will be iterated on automatically.
 
-            2. Trigger CI by commenting on the PR:
-               ```
-               gh pr comment <PR_NUMBER> --repo $REPO --body "/ok to test $SHA"
-               ```
+            Save the PR number.
 
-            3. Wait for the CI run to appear and complete. Poll every 5 minutes:
-               ```
-               # Find the CICD run for this branch
-               sleep 60  # initial wait for run to appear
-               while true; do
-                 RUN_JSON=$(gh api "repos/$REPO/actions/runs?per_page=5&branch=pull-request/<PR_NUMBER>" \
-                   --jq '[.workflow_runs[] | select(.name == "CICD Megatron-LM")] | .[0]')
-                 STATUS=$(echo "$RUN_JSON" | jq -r '.status')
-                 CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
-                 RUN_ID=$(echo "$RUN_JSON" | jq -r '.id')
-                 if [ "$STATUS" = "completed" ]; then
-                   break
-                 fi
-                 echo "CI status: $STATUS. Waiting 5 minutes..."
-                 sleep 300
-               done
-               ```
+            ---
 
-            4. If CI passed (conclusion == "success"), go to Step 4.
+            ## Phase 3: Trigger CI and iterate until all tests pass
 
-            5. If CI failed, investigate and fix:
-               a. Get the list of failed jobs:
-                  ```
-                  gh run view $RUN_ID --repo $REPO 2>&1 | grep -E '^\s*X ' | head -20
-                  ```
+            Loop:
+            1. Get the HEAD commit SHA and comment on the PR:
+               `/ok to test <SHA>`
+            2. Wait for the `CICD Megatron-LM` workflow run on branch
+               `pull-request/<PR_NUMBER>` to complete. Poll the GitHub API every
+               5 minutes.
+            3. If the run **succeeded** → go to Phase 4.
+            4. If the run **failed** → investigate and fix:
+               - List failed jobs with `gh run view`.
+               - For each failed job, fetch its logs via `gh api repos/.../actions/jobs/<id>/logs`.
+               - Grep for `ImportError`, `ModuleNotFoundError`, `FAILED`,
+                 `would reformat`, `line-too-long`, `Traceback`, etc.
+               - Read the error, understand the root cause, and fix the code.
+               - Common issues from this sync:
+                 - **ImportError for a class/module**: A dev-only test imports a
+                   class from a shared file where we took main's version. Fix by
+                   checking whether the class was moved, renamed, or needs to be
+                   kept from dev's version of that file. Be surgical — restore only
+                   the missing class/function, not the entire file.
+                 - **black / pylint formatting**: Run `black --config pyproject.toml`
+                   on the offending files. For pylint long-line or
+                   missing-docstring, edit the file directly.
+                 - **Test assertion failures**: Read the test and the code under
+                   test. Fix the code or the test as appropriate.
+               - Commit fixes, push, and re-trigger CI.
+               - Repeat. Never give up.
 
-               b. For each failed job, get its logs:
-                  ```
-                  gh api repos/$REPO/actions/jobs/<JOB_ID>/logs 2>&1 | grep -E "Error|ImportError|ModuleNotFound|Traceback|cannot import|FAILED|would reformat|line-too-long" | head -30
-                  ```
+            ---
 
-               c. Read the error messages and fix the code. Common issues:
-                  - **ImportError / ModuleNotFoundError**: A file references a module that
-                    was renamed or deleted. Check if the module exists, find the correct
-                    name, and fix the import.
-                  - **black formatting**: Run `black --config pyproject.toml` on the files.
-                  - **pylint line-too-long**: Wrap long lines to stay under 100 chars.
-                  - **pylint missing-docstring**: Add one-line docstrings to methods.
-                  - **Test failures**: Read the test output carefully, understand what
-                    assertion failed, and fix the underlying code.
-
-               d. After fixing, commit and push:
-                  ```
-                  git add -A
-                  git commit -m "fix: address CI failure"
-                  git push origin $BRANCH --force
-                  ```
-
-               e. Go back to step 3.1 to re-trigger CI.
-
-            ## Step 4: Mark PR as ready for review
+            ## Phase 4: Mark PR as ready for review
 
             Once CI passes:
             ```
             gh pr ready <PR_NUMBER> --repo $REPO
-            gh pr comment <PR_NUMBER> --repo $REPO \
-              --body "All CI checks passed. This PR is ready for human review and merge."
             ```
+            Comment on the PR confirming all checks passed and it is ready for
+            human review.
 
-            ## Important notes
+            ---
 
-            - NEVER give up. Keep fixing and retrying until CI passes.
-            - Always prioritize main's code over dev's when resolving issues.
-            - Use `secrets.PAT` (already set as GH_TOKEN) for all GitHub operations.
-            - The CI pipeline triggers when you comment "/ok to test <sha>" on the PR.
-            - CI runs on `pull-request/<PR_NUMBER>` branches — use that pattern when querying.
-            - The git committer identity is svcnvidia-nemo-ci.
+            ## Rules
+
+            - **Prioritize main over dev** when there is a genuine conflict between
+              the two. But preserve dev-only additions (new files, new classes, new
+              tests) that do not conflict with main.
+            - Never give up. Keep fixing and retrying until CI passes.
+            - The CI pipeline triggers when you comment "/ok to test <sha>".
+            - CI runs appear on the `pull-request/<PR_NUMBER>` branch.
+            - The git committer identity is `svcnvidia-nemo-ci`.
+            - After editing imports, run `isort` on those files.
           claude_args: |
-            --allowedTools "Bash,Read,Edit,Write,Grep,Glob"
+            --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
             --model "claude-opus-4-6"
