@@ -3267,7 +3267,23 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
-    
+    group.add_argument(
+            '--megatron-fsdp-enable-fine-grained-param-gather',
+            action='store_true',
+            default=False,
+            dest='megatron_fsdp_enable_fine_grained_param_gather',
+            help=(
+                'If set, enables fine-grained parameter gathering for Megatron-FSDP. '
+                'This allows greater overlap between parameter all-gather operations and '
+                'forward computation, at the cost of additional communication calls. '
+                'For MXFP8, this helps save memory during fine-grained activation '
+                'recomputation, because MXFP8 forward and backward passes use different '
+                'parameter representations (rowwise data for forward, colwise data for '
+                'backward). Only the rowwise parameters of modules involved in '
+                'recomputation will be unsharded.'
+            ),
+        )
+
     return parser
 
 
