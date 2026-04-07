@@ -31,7 +31,6 @@ if HAVE_TE:
         fused_permute,
         fused_permute_and_pad_with_probs,
         fused_permute_with_probs,
-        fused_permute_and_pad_with_probs,
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
