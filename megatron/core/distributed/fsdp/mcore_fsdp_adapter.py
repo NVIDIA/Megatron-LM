@@ -231,6 +231,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # Check registry first
         for parallelism, types in self._MODULE_TYPE_REGISTRY.items():
             if module_type in types:
+                if parallelism == "row" and "bias" in param_name:
+                    return "replicated"
                 return parallelism
 
         # Fallback to inspecting module attributes
@@ -243,6 +245,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             if partition_dim == 0:
                 return "column"
             elif partition_dim == 1:
+                if "bias" in param_name:
+                    return "replicated"
                 return "row"
 
         # Fallback for normalization layers
@@ -254,6 +258,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             if module.parallel_mode == "column":
                 return "column"
             elif module.parallel_mode == "row":
+                if "bias" in param_name:
+                    return "replicated"
                 return "row"
             else:
                 return "replicated"
