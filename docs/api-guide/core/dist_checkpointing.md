@@ -153,7 +153,7 @@ cd nvidia-resiliency-ext
 pip install .
 ```
 
-> [!NOTE]
+> NOTE
 
 - If `nvidia-resiliency-ext` is not installed, the NVRx async strategy will not be available.
 - The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
