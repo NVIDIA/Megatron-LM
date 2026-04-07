@@ -53,6 +53,12 @@ except ImportError:
     triton_token_setup = None
 
 try:
+    from .kernels.tensor_reorder_kernel import triton_move_bookkeeping, triton_swap_bookkeeping
+except ImportError:
+    triton_move_bookkeeping = None
+    triton_swap_bookkeeping = None
+
+try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -2255,34 +2261,66 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
+    def _reorder_kernel_args(self):
+        """Return the fixed tensor arguments for the reorder kernel."""
+        return dict(
+            request_kv_length_offsets=self.request_kv_length_offsets,
+            request_in_prefill_status_tensor=self.request_in_prefill_status_tensor,
+            request_query_lengths=self.request_query_lengths,
+            request_output_lengths=self.request_output_lengths,
+            request_ids=self.request_ids,
+            request_kv_block_counts=self.request_kv_block_counts,
+            request_last_kv_block_id=self.request_last_kv_block_id,
+            request_last_kv_block_offset=self.request_last_kv_block_offset,
+            request_to_kv_block_ids=self.request_to_kv_block_ids,
+            request_metadata=self.request_metadata,
+            mamba_state_idx=(
+                self.mamba_metadata.request_to_mamba_state_idx if self.is_hybrid_model else None
+            ),
+            is_hybrid_model=self.is_hybrid_model,
+            num_speculative_tokens=self.num_speculative_tokens,
+            max_kv_block_count=self.max_kv_block_count,
+        )
+
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
     ):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
         """
-        self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
-        self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
-            src_idxs
-        ]
-        self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
-        self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
-        self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
-        if new_speculative_tokens is not None:
-            new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
-        self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
-        self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
-        self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
-        self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
-
-        for metadata_tensor in self.request_metadata.values():
-            metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
-
-        if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
-                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+        if triton_move_bookkeeping is not None:
+            triton_move_bookkeeping(
+                src_idxs=src_idxs,
+                dst_idxs=dst_idxs,
+                next_tokens=next_tokens,
+                new_speculative_tokens=new_speculative_tokens,
+                **self._reorder_kernel_args(),
             )
+        else:
+            self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
+            self.request_in_prefill_status_tensor[dst_idxs] = (
+                self.request_in_prefill_status_tensor[src_idxs]
+            )
+            self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
+            self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
+            self.request_ids[dst_idxs] = self.request_ids[src_idxs]
+            next_tokens[dst_idxs] = next_tokens[src_idxs]
+            if new_speculative_tokens is not None:
+                new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
+            self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
+            self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
+            self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
+            self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
+                src_idxs
+            ]
+
+            for metadata_tensor in self.request_metadata.values():
+                metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
+
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                    self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+                )
 
     def _swap_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
@@ -2290,29 +2328,36 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
-        tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
-        tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
-        tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
-        tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
-        tensor_swap(self.request_ids, src_idxs, dst_idxs)
-        tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
-        tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+        if triton_swap_bookkeeping is not None:
+            triton_swap_bookkeeping(
+                src_idxs=src_idxs,
+                dst_idxs=dst_idxs,
+                next_tokens=next_tokens,
+                new_speculative_tokens=new_speculative_tokens,
+                **self._reorder_kernel_args(),
+            )
+        else:
+            tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
+            tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+            tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
+            tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+            tensor_swap(self.request_ids, src_idxs, dst_idxs)
+            tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
+            tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
+            tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
+            tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
 
-        if next_tokens is not None:
-            tensor_swap(next_tokens, src_idxs, dst_idxs)
+            if next_tokens is not None:
+                tensor_swap(next_tokens, src_idxs, dst_idxs)
 
-        if new_speculative_tokens is not None:
-            # new_speculative_tokens has request dimension as second dimension,
-            # so swap on transposed view
-            tensor_swap(new_speculative_tokens.t(), src_idxs, dst_idxs)
+            if new_speculative_tokens is not None:
+                tensor_swap(new_speculative_tokens.t(), src_idxs, dst_idxs)
 
-        for metadata_tensor in self.request_metadata.values():
-            tensor_swap(metadata_tensor, src_idxs, dst_idxs)
+            for metadata_tensor in self.request_metadata.values():
+                tensor_swap(metadata_tensor, src_idxs, dst_idxs)
 
-        if self.is_hybrid_model:
-            tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
+            if self.is_hybrid_model:
+                tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
         """
@@ -2825,11 +2870,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     + active_requests_requiring_new_block_count
                     + self.paused_request_count
                 )
-                dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
-                src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
-                self._move_book_keeping_tensors(
-                    src_idxs=src_idxs,
-                    dst_idxs=dst_idxs,
+                self._swap_book_keeping_tensors(
+                    src_idxs=active_request_ids_on_left,
+                    dst_idxs=paused_requests_idxs_on_right,
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
