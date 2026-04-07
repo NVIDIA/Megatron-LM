@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator
 import torch
 
 from megatron.core.parallel_state import (
+    get_data_parallel_group,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
@@ -85,7 +86,7 @@ def add_mimo_args(parser):
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
     # Bagel-specific args
     group.add_argument('--text-cond-dropout-prob', type=float, default=0.1, help='Text conditional dropout probability')
-    group.add_argument('--vit-cond-dropout-prob', type=float, default=0.4, help='VIT conditional dropout probability')
+    group.add_argument('--vit-cond-dropout-prob', type=float, default=0.3, help='VIT conditional dropout probability')
     group.add_argument('--vae-cond-dropout-prob', type=float, default=0.3, help='VAE conditional dropout probability')
     # group.add_argument('--vae-image-downsample', type=int, default=16, help='VAE image downsample factor')
     group.add_argument('--max-latent-size', type=int, default=32, help='Maximum latent grid size (patches per side) for the VAE latent tensor.')
@@ -111,6 +112,20 @@ def add_mimo_args(parser):
     group.add_argument('--vae-path', type=str, default=None, help='Path to vae checkpoint')
     group.add_argument('--latent-patch-size', type=int, default=2, help='Spatial size (in VAE pixels) covered by each latent patch.')
     group.add_argument('--timestep-shift', type=float, default=1.0, help='Timestep shift for the diffusion model')
+
+    # Multimodal FLOPS estimation (for accurate throughput reporting)
+    group.add_argument('--vit-hidden-size', type=int, default=1152,
+                       help='ViT hidden size for FLOPS calculation')
+    group.add_argument('--vit-num-layers', type=int, default=26,
+                       help='ViT number of layers for FLOPS calculation')
+    group.add_argument('--vit-intermediate-size', type=int, default=4304,
+                       help='ViT MLP intermediate size for FLOPS calculation')
+    group.add_argument('--avg-vit-tokens-per-batch', type=int, default=4900,
+                       help='Average ViT tokens per micro-batch for FLOPS estimation')
+    group.add_argument('--avg-latent-tokens-per-batch', type=int, default=1024,
+                       help='Average VAE latent tokens per micro-batch for FLOPS estimation')
+    group.add_argument('--freeze-vit', action='store_true', default=False,
+                       help='Whether ViT is frozen (affects FLOPS: forward-only vs fwd+bwd)')
     return parser
 
 
@@ -196,47 +211,76 @@ def loss_func(loss_mask, output_tensor):
     if isinstance(output_tensor, dict):
         ce_loss = output_tensor.get('ce')
         mse_loss = output_tensor.get('mse')
-        # print(f"ce_loss: {ce_loss}, mse_loss: {mse_loss}")
+
+        # Match HF bagel: CE and MSE are normalized SEPARATELY by their own
+        # global token counts, then summed. Megatron schedule will later do
+        #   loss /= num_tokens /= num_microbatches
+        # and grad all-reduce averages across DP ranks (/dp_size).
+        # So we pre-compute the averaged loss here and return num_tokens=1
+        # to make the schedule's /num_tokens a no-op.
+
+        dp_group = get_data_parallel_group()
+        dp_size = torch.distributed.get_world_size(dp_group)
 
         total_loss = torch.tensor(0.0, device='cuda')
-        total_tokens = torch.tensor(0, dtype=torch.int, device='cuda')
 
-        # Cross-entropy loss for understanding tasks
+        # --- CE loss: separately normalized by global CE tokens ---
+        ce_loss_sum = torch.tensor(0.0, device='cuda')
+        ce_tokens = torch.tensor(0, dtype=torch.int, device='cuda')
         if ce_loss is not None:
-            # ce_loss is already per-token CE loss at ce_loss_indexes
-            # loss_mask contains weights at those positions
-            # Extract non-zero weights from loss_mask
-            weights = loss_mask.view(-1)
-            non_zero_mask = weights > 0
-            ce_weights = weights[non_zero_mask]
+            num_ce = ce_loss.numel()
+            ce_loss_sum = ce_loss.float().sum()
+            ce_tokens = torch.tensor(num_ce, dtype=torch.int, device='cuda')
+            # All-reduce to get global CE token count
+            global_ce_tokens = ce_tokens.clone().float()
+            torch.distributed.all_reduce(global_ce_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            global_ce_tokens = torch.clamp(global_ce_tokens, min=1.0)
+            # HF: ce = ce.sum() * world_size / total_ce_tokens
+            # After DDP grad avg (/dp_size): effective = ce.sum() / total_ce_tokens (global avg)
+            # We need schedule to produce the same. Schedule does: loss / num_tokens / num_microbatches,
+            # then grad avg /dp_size. With num_tokens=1, num_microbatches=1:
+            #   effective = loss / dp_size → so loss = ce_avg * dp_size
+            ce_avg = ce_loss_sum * dp_size / global_ce_tokens
+            total_loss = total_loss + ce_avg
 
-            # Make sure ce_loss and ce_weights have same length
-            if ce_loss.numel() == ce_weights.numel():
-                weighted_ce_loss = (ce_loss.float() * ce_weights).sum()
-                total_loss = total_loss + weighted_ce_loss
-                total_tokens = total_tokens + ce_weights.sum().to(torch.int)
-            else:
-                # Fallback: just sum the ce_loss
-                total_loss = total_loss + ce_loss.float().sum()
-                total_tokens = total_tokens + ce_loss.numel()
-
-        # MSE loss for generation tasks (if present)
+        # --- MSE loss: separately normalized by global MSE tokens ---
+        mse_loss_sum = torch.tensor(0.0, device='cuda')
+        mse_tokens = torch.tensor(0, dtype=torch.int, device='cuda')
         if mse_loss is not None:
-            mse_tokens = mse_loss.shape[0]
-            if mse_tokens == 0:
-                mse_tokens = 1
-            mse_tokens = torch.tensor(mse_tokens, dtype=torch.int, device='cuda')
-            total_tokens = total_tokens + mse_tokens
-            mse_loss = mse_loss.float().mean(dim=-1).sum()/mse_tokens.float()
-            total_loss = total_loss + mse_loss
+            num_mse = mse_loss.shape[0]
+            if num_mse == 0:
+                num_mse = 1
+            mse_tokens = torch.tensor(num_mse, dtype=torch.int, device='cuda')
+            mse_loss_sum = mse_loss.float().mean(dim=-1).sum()
+            # All-reduce to get global MSE token count
+            global_mse_tokens = mse_tokens.clone().float()
+            torch.distributed.all_reduce(global_mse_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            global_mse_tokens = torch.clamp(global_mse_tokens, min=1.0)
+            mse_avg = mse_loss_sum * dp_size / global_mse_tokens
+            total_loss = total_loss + mse_avg
 
-        # Ensure total_tokens is at least 1 to avoid division by zero
-        if total_tokens == 0:
-            total_tokens = torch.tensor(1, dtype=torch.int, device='cuda')
+        # num_tokens=1 so schedule's /num_tokens is a no-op (we already averaged above)
+        num_tokens = torch.tensor(1, dtype=torch.int, device='cuda')
 
-        reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.float().view(1)])
-        reporting_mse_loss = torch.cat([mse_loss.clone().detach().view(1), mse_tokens.float().view(1)])
-        return (total_loss.bfloat16(), total_tokens, {'lm loss': reporting_loss, 'mse loss': reporting_mse_loss})
+        # Reporting: CE and MSE are reported individually with [raw_sum, count] —
+        # training.py all-reduces these correctly to get per-token averages.
+        reporting_mse = torch.cat([mse_loss_sum.clone().detach().view(1), mse_tokens.float().view(1)])
+        reporting_ce = torch.cat([ce_loss_sum.clone().detach().view(1), ce_tokens.float().view(1)])
+        # Total loss reporting: must match HF's "ce_avg + mse_avg" (separately normalized).
+        # training.py does: all_reduce([sum, count]) then sum/count.
+        # Store [local_avg, 1/dp_size]. After all_reduce(SUM) across dp_size ranks:
+        #   sum = Σ local_avg_i = global_ce_sum/global_ce + global_mse_sum/global_mse
+        #   count = dp_size * (1/dp_size) = 1
+        #   result = (ce_avg + mse_avg) / 1 = ce_avg + mse_avg ✓
+        local_loss_avg = torch.tensor(0.0, device='cuda')
+        if ce_loss is not None:
+            local_loss_avg = local_loss_avg + ce_loss_sum.clone().detach() / global_ce_tokens
+        if mse_loss is not None:
+            local_loss_avg = local_loss_avg + mse_loss_sum.clone().detach() / global_mse_tokens
+        inv_dp = torch.tensor(1.0 / dp_size, device='cuda')
+        reporting_loss = torch.cat([local_loss_avg.view(1), inv_dp.view(1)])
+
+        return (total_loss.bfloat16(), num_tokens, {'loss': reporting_loss, 'mse': reporting_mse, 'ce': reporting_ce})
 
     # Standard MIMO output format (tensor)
     losses = output_tensor.float()
