@@ -114,22 +114,28 @@ jobs:
         if: steps.check-sync.outputs.skip != 'true'
         run: |
           # After merging, auto-merged files from dev may reference APIs that
-          # main renamed or removed (e.g. DynamicCPDataLoaderWrapper vs
-          # HybridCPDataLoaderWrapper). To prevent these semantic conflicts,
+          # main renamed or removed. To prevent these semantic conflicts,
           # take main's version for ALL files that exist in both branches.
           # Dev-only new files (not in main) are preserved.
           echo "Taking main's version for all shared files..."
-          REVERTED=0
           git diff --name-only origin/main...HEAD | while read -r f; do
             if git cat-file -e "origin/main:$f" 2>/dev/null; then
-              git checkout origin/main -- "$f" 2>/dev/null && REVERTED=$((REVERTED+1)) || true
+              git checkout origin/main -- "$f" 2>/dev/null || true
             fi
           done
-          echo "Reverted $REVERTED shared files to main's version."
+
+          # Restore files that exist in main but were deleted/renamed in dev
+          echo "Restoring main-only files that dev deleted..."
+          comm -23 \
+            <(git ls-tree -r --name-only origin/main | sort) \
+            <(git ls-tree -r --name-only HEAD | sort) \
+          | while read -r f; do
+            git checkout origin/main -- "$f" 2>/dev/null || true
+          done
 
           if ! git diff --cached --quiet || ! git diff --quiet; then
             git add -A
-            git commit -m "chore: take main's version for all shared files to prevent semantic conflicts"
+            git commit -m "chore: align all shared files with main to prevent semantic conflicts"
           fi
 
       - name: Run black on changed files
