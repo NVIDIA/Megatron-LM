@@ -1623,12 +1623,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
-            # When a rank matches a graph with prefill requests
-            # (inherited from a peer via MAX-reduce), update num_prefill_requests
-            # so that is_decode_only() returns the correct value and the
-            # attention layer routes to the right kernel (varlen vs decode).
-            if best_graph.prefill_req_count > 0 and self.num_prefill_requests == 0:
-                self.num_prefill_requests = best_graph.prefill_req_count
         else:
             if self.is_decode_only():
                 if self.num_speculative_tokens > 0:
