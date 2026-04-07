@@ -705,6 +705,33 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_block_overflow_insufficient_kv_cache(self) -> None:
+        """Test that a request fails when KV cache blocks cannot fit the request's sequence."""
+        # Use a large max_sequence_length with a small buffer so that the total
+        # block count is smaller than what a single max-length request needs.
+        # With num_tokens_total=8192 and prompt_length=4, the request needs
+        # ceil(8192 / 256) = 32 blocks, but the small buffer only has ~8 blocks.
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=None,
+            num_tokens_total=8192,
+            max_sequence_length=8192,
+            context_buffer_size_gb=0.001,
+            context_block_size_tokens=256,
+            context_max_tokens=16384,
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+        env.engine._add_request(request)
+        assert request.status == Status.FAILED
+        assert list(env.engine.waiting_request_ids) == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
