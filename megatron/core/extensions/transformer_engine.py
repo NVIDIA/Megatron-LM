@@ -1567,6 +1567,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         packed_seq_params.cp_group is not None
                     ), "cp_group is not set in packed_seq_params for dynamic CP"
                     self.cp_group = packed_seq_params.cp_group
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
                     super().set_context_parallel_group(
                         self.cp_group,
                         torch.distributed.get_process_group_ranks(self.cp_group),

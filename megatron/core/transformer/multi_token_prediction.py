@@ -1135,6 +1135,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
+        _orig_cp_group = self.cp_group
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            self.cp_group = packed_seq_params.cp_group
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1175,6 +1178,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
+        self.cp_group = _orig_cp_group
         return hidden_states, input_ids, position_ids
 
     def sharded_state_dict(
