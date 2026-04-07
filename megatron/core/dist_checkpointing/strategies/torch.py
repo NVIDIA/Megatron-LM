@@ -600,6 +600,7 @@ class TorchDistSaveShardedStrategy:
         thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
+        dtensor_format: Optional[bool] = False,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -619,6 +620,7 @@ class TorchDistSaveShardedStrategy:
         self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
+        self.dtensor_format = dtensor_format
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -664,6 +666,9 @@ class TorchDistSaveShardedStrategy:
 
         Returns: None
         """
+        if self.dtensor_format:
+            return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
+
         if async_strategy == "mcore":
             logger.warning(
                 "MCore's async save is deprecated and will be removed in the future releases. "
@@ -819,9 +824,10 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, dtensor_format: bool = True):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.dtensor_format = dtensor_format
 
     def load(
         self,
@@ -838,6 +844,9 @@ class TorchDistLoadShardedStrategy:
 
         Returns: loaded state dict
         """
+        if self.dtensor_format:
+            return torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
+
         flexible_shape_sharded_tensors = [
             sh_ten
             for sh_ten in nested_values(sharded_state_dict)

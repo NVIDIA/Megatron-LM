@@ -509,6 +509,9 @@ class CheckpointConfig:
     dist_ckpt_optim_fully_reshardable: bool = False
     """Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP) as opposed to plain DP reshardability."""
 
+    dist_ckpt_dtensor_format: bool = False
+    """Sets distributed checkpoint tensors fromat to torch's DTensor."""
+
     distrib_optim_fully_reshardable_mem_efficient: bool = False
     """During distributed optimizer checkpoint save and load tries to use as little memory as possible
     by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
@@ -541,3 +544,7 @@ class CheckpointConfig:
                 "nvidia-resiliency-ext is not installed. "
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
+
+        if self.dist_ckpt_dtensor_format:
+            assert self.ckpt_format == "torch_dist", \
+                "`dist-ckpt-dtensor-format` is only supported with `torch_dist` format."
