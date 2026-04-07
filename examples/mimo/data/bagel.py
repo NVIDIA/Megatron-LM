@@ -79,8 +79,8 @@ def bagel_dataloader_provider(train_val_test_num_samples):
     data_config = DataConfig(
         grouped_datasets=dataset_meta,
         text_cond_dropout_prob=getattr(args, 'text_cond_dropout_prob', 0.1),
-        vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.4),
-        vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.1),
+        vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.3),
+        vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.3),
         # vae_image_downsample=getattr(args, 'vae_image_downsample', 16),
         vae_image_downsample=vae_image_downsample,
         max_latent_size=getattr(args, 'max_latent_size', 32),
@@ -115,8 +115,8 @@ def bagel_dataloader_provider(train_val_test_num_samples):
         train_data_config = DataConfig(
             grouped_datasets=copy.deepcopy(dataset_meta),
             text_cond_dropout_prob=getattr(args, 'text_cond_dropout_prob', 0.1),
-            vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.4),
-            vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.1),
+            vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.3),
+            vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.3),
             vae_image_downsample=getattr(args, 'vae_image_downsample', 16),
             max_latent_size=getattr(args, 'max_latent_size', 32),
             vit_patch_size=getattr(args, 'vit_patch_size', 14),
@@ -148,8 +148,8 @@ def bagel_dataloader_provider(train_val_test_num_samples):
         valid_data_config = DataConfig(
             grouped_datasets=copy.deepcopy(dataset_meta),
             text_cond_dropout_prob=getattr(args, 'text_cond_dropout_prob', 0.1),
-            vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.4),
-            vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.1),
+            vit_cond_dropout_prob=getattr(args, 'vit_cond_dropout_prob', 0.3),
+            vae_cond_dropout_prob=getattr(args, 'vae_cond_dropout_prob', 0.3),
             vae_image_downsample=getattr(args, 'vae_image_downsample', 16),
             max_latent_size=getattr(args, 'max_latent_size', 32),
             vit_patch_size=getattr(args, 'vit_patch_size', 14),
@@ -293,6 +293,19 @@ def bagel_packed_batch_to_mimo_batch(packed_batch, diffusion_wrapper: DiffusionW
     # Otherwise, BlockMask will be created from split_lens and attn_modes
     if 'nested_attention_masks' in batch_dict:
         mimo_batch['nested_attention_masks'] = batch_dict['nested_attention_masks']
+
+    # Debug: print batch summary for comparison with HF
+    print(f"[MCORE-DATA] sequence_length={seq_len}")
+    print(f"[MCORE-DATA] input_ids(packed_text_ids) {input_ids.shape} sum={input_ids.sum().item()}")
+    print(f"[MCORE-DATA] packed_text_indexes {mimo_batch['packed_text_indexes'].shape} sum={mimo_batch['packed_text_indexes'].sum().item()}")
+    if 'packed_vit_token_indexes' in mimo_batch:
+        print(f"[MCORE-DATA] packed_vit_token_indexes {mimo_batch['packed_vit_token_indexes'].shape} sum={mimo_batch['packed_vit_token_indexes'].sum().item()}")
+    if 'ce_loss_indexes' in mimo_batch:
+        print(f"[MCORE-DATA] ce_loss_indexes {mimo_batch['ce_loss_indexes'].shape} sum={mimo_batch['ce_loss_indexes'].sum().item()}")
+    if 'packed_label_ids' in mimo_batch:
+        print(f"[MCORE-DATA] packed_label_ids {mimo_batch['packed_label_ids'].shape} sum={mimo_batch['packed_label_ids'].sum().item()}")
+    print(f"[MCORE-DATA] sample_lens {mimo_batch['sample_lens']}")
+    print("=" * 60)
 
     return mimo_batch
 
