@@ -1483,10 +1483,6 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
-        if args.optimizer == 'muon':
-            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
-            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
-
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
