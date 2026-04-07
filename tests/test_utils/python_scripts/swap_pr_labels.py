@@ -45,6 +45,67 @@ class PRReviewTracker:
         self.stage = self.get_stage(self.pr)
         self.org = self.github.get_organization(self.repo.organization.login)
         self._team_cache = {}
+        self._codeowner_rules = self._parse_codeowners()
+
+    def _parse_codeowners(self):
+        """Parse CODEOWNERS into ordered list of (pattern, teams) rules."""
+        rules = []
+        try:
+            with open(".github/CODEOWNERS") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    pattern = parts[0]
+                    teams = set()
+                    for part in parts[1:]:
+                        if part.startswith("@NVIDIA/"):
+                            teams.add(part.split("/", 1)[1])
+                    rules.append((pattern, teams))
+        except FileNotFoundError:
+            logger.warning("CODEOWNERS file not found")
+        logger.info(f"Parsed {len(rules)} CODEOWNERS rules")
+        return rules
+
+    @staticmethod
+    def _match_file(filepath, pattern):
+        """Check if a file path matches a CODEOWNERS pattern.
+
+        Rules:
+        - Trailing '/' means directory pattern: matches all files under that directory.
+        - Pattern containing '/' is path-relative: exact match or directory prefix.
+        - Pattern without '/' matches the filename component anywhere.
+        """
+        if pattern.endswith('/'):
+            return filepath.startswith(pattern)
+        if '/' in pattern:
+            return filepath == pattern or filepath.startswith(pattern + '/')
+        return filepath == pattern or filepath.endswith('/' + pattern)
+
+    def _get_required_teams(self, pr):
+        """Determine required review teams from CODEOWNERS rules and PR changed files.
+
+        Uses last-match-wins semantics per file, then unions across all files.
+        """
+        required_teams = set()
+        try:
+            changed_files = [f.filename for f in pr.get_files()]
+        except Exception as e:
+            logger.warning(f"Could not get changed files for PR #{pr.number}: {e}")
+            return required_teams
+
+        for filepath in changed_files:
+            matched_teams = None
+            for pattern, teams in self._codeowner_rules:
+                if self._match_file(filepath, pattern):
+                    matched_teams = teams
+            if matched_teams:
+                required_teams.update(matched_teams)
+                logger.info(f"  {filepath} → {matched_teams}")
+
+        logger.info(f"Required teams from CODEOWNERS: {required_teams}")
+        return required_teams
 
     def get_stage(self, pr):
         """Get current review stage."""
@@ -101,50 +162,49 @@ class PRReviewTracker:
             user for user, review in latest_reviews.items() if review.state == "CHANGES_REQUESTED"
         }
 
-        # 2. Get all currently pending review requests
-        try:
-            pending_users_req, pending_teams_req = pr.get_review_requests()
-            pending_individuals = {r.login for r in pending_users_req}
-            pending_team_slugs = {t.slug for t in pending_teams_req}
-        except Exception as e:
-            logger.warning(f"Could not get review requests for PR #{pr.number}: {e}")
-            pending_individuals = set()
-            pending_team_slugs = set()
-
-        # 3. Classify teams into expert vs final (excluded)
-        expert_team_slugs = pending_team_slugs - self.EXCLUDED_TEAMS
-        final_team_slugs = pending_team_slugs & self.EXCLUDED_TEAMS
-
-        # 4. Get team members
-        expert_team_members = self._get_teams_members(expert_team_slugs)
-        all_excluded_members = self._get_teams_members(self.EXCLUDED_TEAMS)
-
-        # 5. Compute pending expert reviewers
-        expert_non_approvers = non_approvers - all_excluded_members
-        pending_expert = (
-            pending_individuals | expert_team_members | expert_non_approvers
-        ) - approvers
-        logger.info(f"Pending expert reviewers: {pending_expert}")
-
-        # 6. Compute pending final reviewers
-        final_pending_members = self._get_teams_members(final_team_slugs)
-        final_non_approvers = non_approvers & all_excluded_members
-        pending_final = (final_pending_members | final_non_approvers) - approvers
-        logger.info(f"Pending final reviewers: {pending_final}")
-
-        # 7. Determine if final review is needed at all (excluded teams are assigned)
-        excluded_who_reviewed = (approvers | non_approvers) & all_excluded_members
-        needs_final_review = bool(final_team_slugs) or bool(excluded_who_reviewed)
-
-        # 8. Guard: if no reviewers exist at all, the review process hasn't started yet.
-        #    This prevents a race condition where the swap script runs before the oncall
-        #    reviewer is assigned (both trigger on ready_for_review concurrently).
-        has_any_reviewers = pending_individuals or pending_team_slugs or approvers or non_approvers
-        if not has_any_reviewers and self.stage == self.EXPERT_REVIEW:
-            logger.info(f"PR #{pr.number} has no reviewers assigned yet. Skipping.")
+        # 2. Determine required teams from CODEOWNERS + changed files
+        required_teams = self._get_required_teams(pr)
+        if not required_teams:
+            logger.info(f"PR #{pr.number}: no CODEOWNERS teams matched changed files. Skipping.")
             return
 
-        # 9. State machine: update labels based on current stage and pending reviewers
+        expert_required = required_teams - self.EXCLUDED_TEAMS
+        final_required = required_teams & self.EXCLUDED_TEAMS
+        logger.info(f"Expert teams required: {expert_required}")
+        logger.info(f"Final teams required: {final_required}")
+
+        # 3. Check which required teams still need approval (at least one member must approve)
+        #    If _get_team_members fails (returns {}), the team stays pending — conservative.
+        pending_expert_teams = set()
+        for team in expert_required:
+            members = self._get_team_members(team)
+            if not (members & approvers):
+                pending_expert_teams.add(team)
+
+        pending_final_teams = set()
+        for team in final_required:
+            members = self._get_team_members(team)
+            if not (members & approvers):
+                pending_final_teams.add(team)
+
+        # 4. Compute pending reviewers: unsatisfied team members + individual blockers
+        all_excluded_members = self._get_teams_members(self.EXCLUDED_TEAMS)
+        expert_non_approvers = non_approvers - all_excluded_members
+        final_non_approvers = non_approvers & all_excluded_members
+
+        pending_expert = (
+            self._get_teams_members(pending_expert_teams) | expert_non_approvers
+        ) - approvers
+        pending_final = (
+            self._get_teams_members(pending_final_teams) | final_non_approvers
+        ) - approvers
+
+        logger.info(f"Pending expert teams: {pending_expert_teams}, reviewers: {pending_expert}")
+        logger.info(f"Pending final teams: {pending_final_teams}, reviewers: {pending_final}")
+
+        needs_final_review = bool(final_required)
+
+        # 5. State machine: update labels based on current stage and pending reviewers
         if self.stage == self.APPROVED:
             self._handle_approved_stage(pr, pending_expert, pending_final)
         elif self.stage == self.FINAL_REVIEW:

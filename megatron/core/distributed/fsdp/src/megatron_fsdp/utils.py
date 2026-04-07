@@ -630,7 +630,8 @@ class FSDPDistributedIndex:
         """
         Retrieve an Megatron-FSDP-registered submesh by name(s).
         """
-        if isinstance(mesh_dim_names, str):
+        if isinstance(mesh_dim_names, str) or mesh_dim_names is None:
+            # Create tuple from singleton dim or None.
             mesh_dim_names = (mesh_dim_names,)
 
         # Construct submesh identifier: (*mesh_dim_names, is_expert_parallel)
@@ -640,30 +641,22 @@ class FSDPDistributedIndex:
         device_submesh = self.mesh_library.get(submesh_identifier, None)
 
         if device_submesh is None:
+            device_mesh = self.expt_device_mesh if is_expert_parallel else self.device_mesh
             # Warn about not specifying tp_dim for layers or frameworks that depend on this.
-            if self.tp_dim is None and not is_expert_parallel:
+            if self.tp_dim is None:
                 logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
+                    "[FSDPDistributedIndex] For TransformerEngine, or other "
+                    "machine learning frameworks like Megatron that assume "
                     "TP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial TP dimension by setting the TP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.device_mesh}"
+                    "Create a trivial TP dimension by setting the TP dimension "
+                    "size to 1 in the DeviceMesh.\n"
+                    f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
                 )
-            elif self.tp_dim is None and is_expert_parallel:
-                logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
-                    "ETP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial ETP dimension by setting the ETP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.expt_device_mesh}"
-                )
-
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No submesh with "
                 f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
-                f"has been registered with Megatron-FSDP."
+                f"has been registered with Megatron-FSDP.\n"
+                f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
             )
 
         return device_submesh
@@ -814,23 +807,31 @@ def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel.
     """
-    return getattr(param, "_mcore_tp", False) or getattr(param, "tensor_model_parallel", False)
+    return get_mcore_tensor_parallel_partition_dim(param) is not None
 
 
 def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel and duplicated.
     """
-    return getattr(param, "_tp_duplicated", False)
+    return get_mcore_tensor_parallel_partition_dim(param) is None
 
 
 def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
     """
     Get the partition dimension for a Megatron-Core tensor model parallel parameter.
     """
-    if is_mcore_tensor_model_parallel(param):
-        if hasattr(param, "_tp_partition_dim"):
-            return param._tp_partition_dim
-        else:
-            return param.partition_dim
+    if hasattr(param, "_tensor_parallel_mode"):
+        if param._tensor_parallel_mode == "column":
+            return 0
+        elif param._tensor_parallel_mode == "row":
+            return 1
     return None
+
+
+def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
+    """
+    Check if tensor parallelism is being used based on the distributed index.
+    """
+    tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
+    return tp_mesh.mesh.numel() > 1
