@@ -2224,6 +2224,10 @@ def nvtx_decorator(
 ) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
 
+    The ``_nvtx_enabled`` flag is checked at **call time**, so the decorator
+    works correctly even when applied before ``configure_nvtx_profiling()``
+    is called (e.g. at module-import time).
+
     Args:
         message (str, optional): Custom message for the NVTX range. If None, uses function path
         color (str, optional): Color for the NVTX range. Defaults to None
@@ -2242,11 +2246,19 @@ def nvtx_decorator(
     """
 
     def decorator(func: _Wrapped) -> _Wrapped:
-        if _nvtx_enabled:
-            return nvtx.annotate(
-                message=message or _nvtx_decorator_get_func_path(func), color=color
-            )(func)
-        return func
+        msg = message or _nvtx_decorator_get_func_path(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if _nvtx_enabled:
+                nvtx_range_push(msg)
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    nvtx_range_pop(msg)
+            return func(*args, **kwargs)
+
+        return wrapper  # type: ignore[return-value]
 
     return decorator
 
