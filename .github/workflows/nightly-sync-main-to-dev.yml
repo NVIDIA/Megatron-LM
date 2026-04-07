@@ -251,4 +251,4 @@ jobs:
             - The git committer identity is svcnvidia-nemo-ci.
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob"
-            --model "claude-sonnet-4-6"
+            --model "claude-opus-4-6"
