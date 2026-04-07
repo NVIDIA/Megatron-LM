@@ -103,6 +103,7 @@ dev = [
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
+    "flash-attn-4",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -206,6 +207,7 @@ transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", 
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "63154570cea17f8805a7fd15cc3b8cc2919ba575" }
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention.git", tag = "fa4-v4.0.0.beta7", subdirectory = "flash_attn/cute" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

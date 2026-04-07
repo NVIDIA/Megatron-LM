@@ -82,6 +82,13 @@ if not HAVE_FA3:
         pass
 
 try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     HAVE_FMLA = True
@@ -802,7 +809,20 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA3:
+            if HAVE_FA4:
+                output_total, _ = flash_attn4_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
+            elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 output_total = self._flash_attention_3_forward_wrapper(
@@ -863,22 +883,44 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                 )
             else:
-                flash_attn_args = {
-                    "q": q,
-                    "k_cache": k,
-                    "v_cache": v,
-                    "cache_seqlens": seqlens_k,
-                    "causal": True,
-                    "page_table" if HAVE_FA3 else "block_table": block_table,
-                    "num_splits": 0 if not self.batch_invariant_mode else 1,
-                }
-                if HAVE_FA3:
-                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                if HAVE_FA4:
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
+                    # Reshape q from (batch, 1, nheads, headdim) to (total_q, nheads, headdim)
+                    q_varlen = q.squeeze(1)
+                    output_total, _ = flash_attn4_varlen_func(
+                        q_varlen,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=1,
+                        max_seqlen_k=max_seqlen_k,
+                        seqused_k=seqlens_k,
+                        page_table=block_table,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                    )
+                    # Reshape back to (batch, 1, nheads, headdim)
+                    output_total = output_total.unsqueeze(1)
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
-                    output_total = flash_attn_with_kvcache(**flash_attn_args)
+                    flash_attn_args = {
+                        "q": q,
+                        "k_cache": k,
+                        "v_cache": v,
+                        "cache_seqlens": seqlens_k,
+                        "causal": True,
+                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    }
+                    if HAVE_FA3:
+                        output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                    else:
+                        assert (
+                            not self.batch_invariant_mode
+                        ), "Batch invariant mode is not supported for flash attention 2"
+                        output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
     def forward(
@@ -932,7 +974,7 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA3 or is_fa_min_version(
+            assert HAVE_FA4 or HAVE_FA3 or is_fa_min_version(
                 "2.7.3"
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
