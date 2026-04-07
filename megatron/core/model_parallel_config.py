@@ -278,6 +278,15 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
+
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
     EP overlap can increase peak memory usage when the overlapped forward module allocates 
