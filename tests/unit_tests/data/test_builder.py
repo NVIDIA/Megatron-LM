@@ -435,7 +435,7 @@ def test_fast_builder(
             args.test_data_path = test_file_prefixes
 
         if sequences_per_dataset:
-            args.path_to_sequences_per_dataset_json = os.path.join(
+            args.per_dataset_sequences_path = os.path.join(
                 temp_dir, "sequences_per_dataset.json"
             )
             sequences_per_dataset = build_sequences_per_dataset(args)
