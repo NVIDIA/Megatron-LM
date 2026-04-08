@@ -885,11 +885,11 @@ def prep_wandb_metrics(
     )
 
     # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - min(r) for g in policy_epoch for r in g]
-    rollout_kv_staleness = [current_iteration - min(r) for g in kv_cache_epoch for r in g]
+    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch for r in g]
+    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch for r in g]
     # Per-rollout staleness (newest token)
-    rollout_policy_last_token_staleness = [current_iteration - max(r) for g in policy_epoch for r in g]
-    rollout_kv_last_token_staleness = [current_iteration - max(r) for g in kv_cache_epoch for r in g]
+    rollout_policy_last_token_staleness = [current_iteration - r[-1] for g in policy_epoch for r in g]
+    rollout_kv_last_token_staleness = [current_iteration - r[-1] for g in kv_cache_epoch for r in g]
     # Per-token staleness
     per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
     per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
