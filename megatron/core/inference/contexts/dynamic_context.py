@@ -357,6 +357,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
+        if not self.cache_mla_latent:
+            assert self.block_size_tokens % 256 == 0, "block size should be a multiple of 256"
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
