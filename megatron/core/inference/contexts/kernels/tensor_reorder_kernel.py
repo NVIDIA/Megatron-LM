@@ -84,6 +84,8 @@ def _reorder_bookkeeping_kernel(
     meta_skip_prompt_log_probs_ptr,
     # Mamba
     mamba_state_idx_ptr,
+    # Guard pointer (GPU scalar count for sync-free launches)
+    num_valid_ptr,
     # Runtime scalar
     max_kv_blocks: tl.int32,
     # Compile-time constants
@@ -94,13 +96,18 @@ def _reorder_bookkeeping_kernel(
     NUM_SPEC: tl.constexpr,
     MAX_KV_BLOCKS: tl.constexpr,
     KV_TILE_SIZE: tl.constexpr,
+    USE_GUARD: tl.constexpr,
 ):
     """Fused move/swap kernel for all bookkeeping tensors.
 
-    Grid: (num_indices,)
+    Grid: (num_indices,) or (max_grid,) when USE_GUARD=True.
     Each program handles one src/dst index pair across ALL tensors.
     """
     idx = tl.program_id(0)
+    if USE_GUARD:
+        num_valid = tl.load(num_valid_ptr)
+        if idx >= num_valid:
+            return
     src = tl.load(src_idxs_ptr + idx).to(tl.int32)
     dst = tl.load(dst_idxs_ptr + idx).to(tl.int32)
 
@@ -179,6 +186,9 @@ def _launch_reorder_kernel(
     # Config
     num_speculative_tokens: int,
     max_kv_block_count: int,
+    # Sync-free guard: GPU scalar count pointer + max grid size
+    num_valid_ptr: Optional[Tensor] = None,
+    max_grid: int = 0,
 ) -> None:
     # Ensure index tensors are on GPU (callers sometimes pass CPU tensors)
     if src_idxs.device.type != "cuda":
@@ -186,7 +196,11 @@ def _launch_reorder_kernel(
     if dst_idxs.device.type != "cuda":
         dst_idxs = dst_idxs.cuda()
 
-    num_indices = src_idxs.shape[0]
+    use_guard = num_valid_ptr is not None
+    if use_guard:
+        num_indices = max_grid
+    else:
+        num_indices = src_idxs.shape[0]
     if num_indices == 0:
         return
 
@@ -208,6 +222,7 @@ def _launch_reorder_kernel(
     max_kv_blocks_rounded = ((max_kv_block_count + kv_tile_size - 1) // kv_tile_size) * kv_tile_size
 
     grid = (num_indices,)
+    guard_ptr = num_valid_ptr if use_guard else src_idxs  # dummy when not guarded
 
     _reorder_bookkeeping_kernel[grid](
         src_idxs,
@@ -238,6 +253,8 @@ def _launch_reorder_kernel(
         request_metadata["skip_prompt_log_probs"].view(torch.uint8),
         # Mamba
         mamba_ptr,
+        # Guard
+        guard_ptr,
         # Runtime scalar
         max_kv_block_count,
         # Constexprs
@@ -248,6 +265,7 @@ def _launch_reorder_kernel(
         NUM_SPEC=num_spec,
         MAX_KV_BLOCKS=max_kv_blocks_rounded,
         KV_TILE_SIZE=kv_tile_size,
+        USE_GUARD=use_guard,
     )
 
 
@@ -270,6 +288,8 @@ def triton_move_bookkeeping(
     is_hybrid_model: bool,
     num_speculative_tokens: int,
     max_kv_block_count: int,
+    num_valid_ptr: Optional[Tensor] = None,
+    max_grid: int = 0,
 ) -> None:
     """Fused move: tensor[dst_idxs] = tensor[src_idxs] for all bookkeeping tensors."""
     _launch_reorder_kernel(
@@ -292,6 +312,8 @@ def triton_move_bookkeeping(
         is_hybrid_model=is_hybrid_model,
         num_speculative_tokens=num_speculative_tokens,
         max_kv_block_count=max_kv_block_count,
+        num_valid_ptr=num_valid_ptr,
+        max_grid=max_grid,
     )
 
 

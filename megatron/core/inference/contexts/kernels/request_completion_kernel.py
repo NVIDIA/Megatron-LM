@@ -40,11 +40,15 @@ def _classify_and_release_kernel(
     num_compact_ptr,
     finished_idxs_ptr,
     num_finished_ptr,
+    # Scratchpad for sync-free mode (or dummy)
+    scratch_ptr,
     # Scalars
     mask_len: tl.int32,
     active_request_count: tl.int32,
     paused_request_count: tl.int32,
     max_kv_blocks: tl.int32,
+    # Compile-time: read counts from scratchpad instead of params
+    USE_SCRATCH: tl.constexpr,
     # Compile-time
     HAS_PREFIX_CACHE: tl.constexpr,
 ):
@@ -59,6 +63,10 @@ def _classify_and_release_kernel(
     Finished requests in the left partition pair with active requests in the right
     partition for the move-compaction step.
     """
+    if USE_SCRATCH:
+        active_request_count = tl.load(scratch_ptr + 0)  # SLOT_ACTIVE_COUNT
+        paused_request_count = tl.load(scratch_ptr + 2)  # SLOT_PAUSED_COUNT
+
     avail = tl.load(total_avail_ptr)
     fl_count = 0
     ar_count = 0
@@ -125,6 +133,7 @@ def triton_classify_and_release(
     out_num_compact: Optional[Tensor] = None,
     out_finished_idxs: Optional[Tensor] = None,
     out_num_finished: Optional[Tensor] = None,
+    scratch: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Classify finished requests, release blocks, compute compaction indices.
 
@@ -150,6 +159,9 @@ def triton_classify_and_release(
     ref_ptr = block_ref_counts if has_prefix_cache else dummy
     hash_ptr = block_hashes if has_prefix_cache else dummy
 
+    use_scratch = scratch is not None
+    scratch_ptr = scratch if use_scratch else block_bag  # dummy when not used
+
     _classify_and_release_kernel[(1,)](
         active_requests_mask,
         request_to_kv_block_ids,
@@ -163,11 +175,13 @@ def triton_classify_and_release(
         num_compact_buf,
         finished_idxs,
         num_finished_buf,
+        scratch_ptr,
         mask_len=mask_len,
         active_request_count=active_request_count,
         paused_request_count=paused_request_count,
         max_kv_blocks=max_kv_block_count,
         HAS_PREFIX_CACHE=has_prefix_cache,
+        USE_SCRATCH=use_scratch,
     )
 
     return finished_left, active_right, num_compact_buf, finished_idxs, num_finished_buf

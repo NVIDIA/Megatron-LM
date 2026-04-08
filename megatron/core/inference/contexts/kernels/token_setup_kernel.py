@@ -198,9 +198,14 @@ def _find_chunked_prefill_kernel(
     is_in_bounds_ptr,
     swap_src_ptr,
     swap_dst_ptr,
+    scratch_ptr,
     search_limit: tl.int32,
+    USE_SCRATCH: tl.constexpr,
 ):
     """Find the chunked prefill request and compute swap indices. Grid: (1,)."""
+    if USE_SCRATCH:
+        total_request_count = tl.load(scratch_ptr + 3)  # SLOT_TOTAL_COUNT
+
     found = -1
     i = 0
     while i < search_limit:
@@ -233,17 +238,28 @@ def triton_find_chunked_prefill(
     chunked_prefill_request_id: int,
     total_request_count: int,
     search_limit: int,
+    out_found_idx: Optional[Tensor] = None,
+    out_is_in_bounds: Optional[Tensor] = None,
+    out_swap_src: Optional[Tensor] = None,
+    out_swap_dst: Optional[Tensor] = None,
+    scratch: Optional[Tensor] = None,
 ) -> tuple:
     """Find chunked prefill request index and compute swap indices.
 
-    Returns:
-        (found_idx, is_in_bounds, swap_src, swap_dst)
+    If scratch is provided, reads total_request_count from scratchpad (no sync).
+    Returns (found_idx, is_in_bounds, swap_src, swap_dst) or None if scratch mode.
     """
     device = request_ids.device
-    found_idx_buf = torch.tensor([-1], dtype=torch.int32, device=device)
-    is_in_bounds_buf = torch.zeros(1, dtype=torch.int32, device=device)
-    swap_src_buf = torch.zeros(1, dtype=torch.int32, device=device)
-    swap_dst_buf = torch.zeros(1, dtype=torch.int32, device=device)
+    use_scratch = scratch is not None
+    found_idx_buf = out_found_idx if out_found_idx is not None else torch.tensor([-1], dtype=torch.int32, device=device)
+    is_in_bounds_buf = out_is_in_bounds if out_is_in_bounds is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    swap_src_buf = out_swap_src if out_swap_src is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    swap_dst_buf = out_swap_dst if out_swap_dst is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    if out_found_idx is not None:
+        out_found_idx.fill_(-1)
+    if out_is_in_bounds is not None:
+        out_is_in_bounds.zero_()
+    scratch_ptr = scratch if use_scratch else request_ids  # dummy
 
     _find_chunked_prefill_kernel[(1,)](
         request_ids,
@@ -253,9 +269,13 @@ def triton_find_chunked_prefill(
         is_in_bounds_buf,
         swap_src_buf,
         swap_dst_buf,
+        scratch_ptr,
         search_limit,
+        USE_SCRATCH=use_scratch,
     )
 
+    if use_scratch:
+        return None
     return (
         found_idx_buf.item(),
         is_in_bounds_buf.item(),

@@ -76,7 +76,32 @@ except ImportError:
     triton_evict_overflow = None
 
 try:
-    from .kernels.update_requests_kernel import triton_fused_counts
+    from .kernels.update_requests_kernel import (
+        SLOT_ACTIVE_COUNT,
+        SLOT_ACTIVE_TOKEN_COUNT,
+        SLOT_CHUNKED_FOUND_IDX,
+        SLOT_CHUNKED_IN_BOUNDS,
+        SLOT_DID_RESET,
+        SLOT_EVICT_COUNT,
+        SLOT_FINISHED_COUNT,
+        SLOT_NUM_COMPACT,
+        SLOT_NUM_FINISHED,
+        SLOT_PAUSE_NEEDING,
+        SLOT_PAUSED_COUNT,
+        SLOT_RESUME_COUNT_1,
+        SLOT_RESUME_COUNT_2,
+        SLOT_SWAP_COUNT,
+        SLOT_TOTAL_COUNT,
+        _compute_active_avail_kernel,
+        _init_counters_kernel,
+        _mamba_cleanup_kernel,
+        _reset_vacated_rows_kernel,
+        _update_counts_after_chunked_prefill_kernel,
+        _update_counts_after_evict_kernel,
+        _update_counts_after_pause_kernel,
+        _update_counts_after_resume_kernel,
+        triton_fused_counts,
+    )
 except ImportError:
     triton_fused_counts = None
 
@@ -917,6 +942,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._scratch_idx_c = torch.empty(_mr, dtype=torch.int32, device=_dev)
         self._scratch_idx_d = torch.empty(_mr, dtype=torch.int32, device=_dev)
         self._scratch_idx_e = torch.empty(_mr, dtype=torch.int32, device=_dev)
+        self._scratch_idx_f = torch.empty(_mr, dtype=torch.int32, device=_dev)
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -2332,7 +2358,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def _move_book_keeping_tensors(
-        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None,
+        num_valid_ptr=None, max_grid=0,
     ):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
@@ -2343,6 +2370,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dst_idxs=dst_idxs,
                 next_tokens=next_tokens,
                 new_speculative_tokens=new_speculative_tokens,
+                num_valid_ptr=num_valid_ptr,
+                max_grid=max_grid,
                 **self._reorder_kernel_args(),
             )
         else:
@@ -2793,6 +2822,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
 
+        # Ensure inputs are on the correct device (tests may pass CPU tensors)
+        _dev = self.request_ids.device
+        if active_requests_mask.device != _dev:
+            active_requests_mask = active_requests_mask.to(_dev)
+        if new_tokens.device != _dev:
+            new_tokens = new_tokens.to(_dev)
+        if new_speculative_tokens is not None and new_speculative_tokens.device != _dev:
+            new_speculative_tokens = new_speculative_tokens.to(_dev)
+
         if self._time_update_requests:
             _se[0][0].record()
 
@@ -2810,13 +2848,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = 1
 
         if triton_fused_counts is not None:
-            active_request_count, finished_request_count, _ = triton_fused_counts(
+            # Write counts to scratchpad slots (no CPU-GPU sync)
+            s = self._scratch_scalar_i32
+            triton_fused_counts(
                 active_requests_mask,
                 self.request_last_kv_block_offset,
                 self.paused_request_count,
                 self.block_size_tokens,
                 self.num_speculative_tokens,
+                out_active=s[SLOT_ACTIVE_COUNT : SLOT_ACTIVE_COUNT + 1],
+                out_finished=s[SLOT_FINISHED_COUNT : SLOT_FINISHED_COUNT + 1],
+                out_needs_block=s[15:16],  # spare slot, unused
             )
+            # Initialize paused_count and total_count on GPU
+            _init_counters_kernel[(1,)](s, paused_count=self.paused_request_count)
+            # Single batch sync: read active_count, finished_count, total_count
+            active_request_count = s[SLOT_ACTIVE_COUNT].item()
+            finished_request_count = s[SLOT_FINISHED_COUNT].item()
         else:
             active_request_count = (active_requests_mask == 1).sum().item()
             finished_request_count = (active_requests_mask == 0).sum().item()
@@ -2894,7 +2942,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if finished_request_count > 0:
             if triton_classify_and_release is not None:
                 # Use pre-allocated scratch buffers to avoid per-step allocations.
-                # Scalar outputs: _scratch_scalar_i32[0]=num_compact, [1]=num_finished
                 s = self._scratch_scalar_i32
                 finished_left, active_right, num_compact_buf, finished_idxs_t, num_finished_buf = (
                     triton_classify_and_release(
@@ -2918,17 +2965,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                         has_prefix_cache=self.enable_prefix_caching,
                         out_finished_left=self._scratch_idx_a,
                         out_active_right=self._scratch_idx_b,
-                        out_num_compact=s[0:1],
+                        out_num_compact=s[SLOT_NUM_COMPACT : SLOT_NUM_COMPACT + 1],
                         out_finished_idxs=self._scratch_idx_c,
-                        out_num_finished=s[1:2],
+                        out_num_finished=s[SLOT_NUM_FINISHED : SLOT_NUM_FINISHED + 1],
                     )
                 )
 
-                # Single sync to read both scalar outputs
-                num_compact = s[0].item()
-                num_finished = s[1].item()
+                # Sync to read scalar outputs (section 4 — needed for Mamba cleanup slicing)
+                num_compact = s[SLOT_NUM_COMPACT].item()
+                num_finished = s[SLOT_NUM_FINISHED].item()
 
-                # Mamba cleanup (stays in Python)
+                # Mamba cleanup
                 if num_finished > 0:
                     finished_idxs = finished_idxs_t[:num_finished].to(torch.long)
                     if self.is_hybrid_model:
@@ -2940,7 +2987,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         sa._intermediate_block_ids_gpu[finished_idxs] = -1
                         sa._eos_cache_block_id_gpu[finished_idxs] = -1
 
-                # Compact using existing tensor reorder kernel
+                # Compact
                 if num_compact > 0:
                     self._move_book_keeping_tensors(
                         src_idxs=active_right[:num_compact].to(torch.long),
@@ -3008,34 +3055,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_requiring_new_block = (
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
-
-            # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
             if (
                 chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
             ) != -1:
                 active_requests_requiring_new_block[
                     chunked_prefill_request_idx - self.paused_request_count
-                ] = 0  # chunked prefill should not be paused
+                ] = 0
             else:
                 max_allowed_active = min(
                     self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
                 )
                 if active_request_count > max_allowed_active:
-                    # Force-pause excess requests in a decode-only batch
                     active_requests_requiring_new_block[max_allowed_active:] = 1
-
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
             )
-
             if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
                     torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
                 ]
-
-            # Swap unfinished active requests on the left side with paused requests on the right side
-            # NOTE : We add paused request count because we concatenate
-            # paused tokens to the left at the beginning of update requests
             if (
                 active_requests_requiring_new_block_count > 0
                 and active_requests_requiring_new_block_count != active_request_count
@@ -3066,7 +3104,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
-
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
 
@@ -3078,63 +3115,137 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._time_update_requests:
             _se[5][0].record()
 
+        # Update scratchpad with current paused/active/total counts for sync-free section 6.
+        s = self._scratch_scalar_i32
+        s[SLOT_PAUSED_COUNT] = self.paused_request_count
+        s[SLOT_ACTIVE_COUNT] = active_request_count
+        s[SLOT_TOTAL_COUNT] = self.total_request_count
+
         # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
-        # This allows us to know which block tokens should go to if they don't cross the boundary.
-        # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
-        # for resumed requests, but we need the OLD block for tokens that don't cross.
         prev_last_block_ids = None
         if self.num_speculative_tokens > 0:
-            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
-            # (assigns new block IDs), but we need the old values later to determine
-            # which block tokens should go to when they don't cross a block boundary.
             prev_last_block_ids = self.request_last_kv_block_id.clone()
 
-        # 6.a. First, resume temporarily paused requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
+        # 6.a. First, resume temporarily paused requests (sync-free).
+        if triton_resume_and_allocate is not None:
+            active_avail_buf = s[15:16]  # spare slot
+            _compute_active_avail_kernel[(1,)](
+                self.request_kv_block_counts, s, active_avail_buf,
+                active_count_budget=self.kv_block_allocator.active_count,
+            )
+            max_allowed_active = min(
+                self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+            )
+            triton_resume_and_allocate(
+                last_kv_block_offset=self.request_last_kv_block_offset,
+                request_to_kv_block_ids=self.request_to_kv_block_ids,
+                request_kv_block_counts=self.request_kv_block_counts,
+                request_last_kv_block_id=self.request_last_kv_block_id,
+                block_bag=self.kv_block_allocator.block_bag,
+                total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                paused_request_count=self.paused_request_count,
+                active_request_count=active_request_count,
+                active_block_avail=0,  # unused when USE_SCRATCH
+                block_size_tokens=self.block_size_tokens,
+                num_speculative_tokens=self.num_speculative_tokens,
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                out_resume_count=s[SLOT_RESUME_COUNT_1 : SLOT_RESUME_COUNT_1 + 1],
+                scratch=s,
+            )
+            _update_counts_after_resume_kernel[(1,)](s, resume_slot=SLOT_RESUME_COUNT_1)
+        else:
+            active_request_count, newly_paused_request_ids = self.resume_paused_requests(
+                active_request_count, newly_paused_request_ids
+            )
 
-        # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(
-            active_request_count, next_tokens, new_speculative_tokens
-        )
+        # 6.b. Evict requests that overflow the paused buffer (sync-free).
+        evict_request_ids = None
+        if triton_evict_overflow is not None:
+            triton_evict_overflow(
+                kv_block_counts=self.request_kv_block_counts,
+                request_to_kv_block_ids=self.request_to_kv_block_ids,
+                request_ids=self.request_ids,
+                block_bag=self.kv_block_allocator.block_bag,
+                total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                block_ref_counts=(
+                    self.kv_block_allocator.block_ref_counts
+                    if self.enable_prefix_caching
+                    else None
+                ),
+                block_hashes=(
+                    self.kv_block_allocator.block_hashes
+                    if self.enable_prefix_caching
+                    else None
+                ),
+                paused_request_count=self.paused_request_count,
+                active_request_count=active_request_count,
+                total_request_count=self.total_request_count,
+                paused_block_limit=self.kv_block_allocator.paused_count,
+                max_kv_block_count=self.max_kv_block_count,
+                has_prefix_cache=self.enable_prefix_caching,
+                out_evict_count=s[SLOT_EVICT_COUNT : SLOT_EVICT_COUNT + 1],
+                out_evict_request_ids=self._scratch_idx_a,
+                out_evict_idxs=self._scratch_idx_b,
+                out_src_idxs=self._scratch_idx_c,
+                out_dst_idxs=self._scratch_idx_d,
+                out_swap_count=s[SLOT_SWAP_COUNT : SLOT_SWAP_COUNT + 1],
+                scratch=s,
+            )
+            _update_counts_after_evict_kernel[(1,)](s)
 
-        # 6.c. Resume any additional requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
+            # Swap (unconditional launch — kernel-side guard would be ideal,
+            # but _swap_book_keeping_tensors needs Python count; defer swap to post-sync)
+        else:
+            evict_request_ids = self.evict_overflow_paused_requests(
+                active_request_count, next_tokens, new_speculative_tokens
+            )
 
-        assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
-            "active_request_count == %d with no hidden chunked prefill." % active_request_count
-        )
+        # 6.c. Resume any additional requests (sync-free).
+        if triton_resume_and_allocate is not None:
+            _compute_active_avail_kernel[(1,)](
+                self.request_kv_block_counts, s, active_avail_buf,
+                active_count_budget=self.kv_block_allocator.active_count,
+            )
+            triton_resume_and_allocate(
+                last_kv_block_offset=self.request_last_kv_block_offset,
+                request_to_kv_block_ids=self.request_to_kv_block_ids,
+                request_kv_block_counts=self.request_kv_block_counts,
+                request_last_kv_block_id=self.request_last_kv_block_id,
+                block_bag=self.kv_block_allocator.block_bag,
+                total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                paused_request_count=self.paused_request_count,
+                active_request_count=active_request_count,
+                active_block_avail=0,
+                block_size_tokens=self.block_size_tokens,
+                num_speculative_tokens=self.num_speculative_tokens,
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                out_resume_count=s[SLOT_RESUME_COUNT_2 : SLOT_RESUME_COUNT_2 + 1],
+                scratch=s,
+            )
+            _update_counts_after_resume_kernel[(1,)](s, resume_slot=SLOT_RESUME_COUNT_2)
+        else:
+            active_request_count, newly_paused_request_ids = self.resume_paused_requests(
+                active_request_count, newly_paused_request_ids
+            )
 
-        # 6.d. Swap the chunked prefill request to the end of the active requests
-        # to obey the invariance.
+        # 6.d. Swap the chunked prefill request to the end (sync-free).
         if self.chunked_prefill_request_id != -1:
             if triton_find_chunked_prefill is not None:
-                found_idx, is_in_bounds, swap_src, swap_dst = triton_find_chunked_prefill(
+                triton_find_chunked_prefill(
                     request_ids=self.request_ids,
                     chunked_prefill_request_id=self.chunked_prefill_request_id,
                     total_request_count=self.total_request_count,
                     search_limit=self.max_requests,
+                    out_found_idx=s[SLOT_CHUNKED_FOUND_IDX : SLOT_CHUNKED_FOUND_IDX + 1],
+                    out_is_in_bounds=s[SLOT_CHUNKED_IN_BOUNDS : SLOT_CHUNKED_IN_BOUNDS + 1],
+                    out_swap_src=self._scratch_idx_e,
+                    out_swap_dst=self._scratch_idx_e[1:2],  # reuse adjacent slot
+                    scratch=s,
                 )
-                if found_idx >= 0:
-                    if is_in_bounds:
-                        self._swap_book_keeping_tensors(
-                            src_idxs=swap_src.to(torch.long),
-                            dst_idxs=swap_dst.to(torch.long),
-                            next_tokens=next_tokens,
-                            new_speculative_tokens=new_speculative_tokens,
-                        )
-                        active_request_count -= 1
-                        self.total_request_count -= 1
-                    elif found_idx != self.total_request_count:
-                        self._swap_book_keeping_tensors(
-                            src_idxs=swap_src.to(torch.long),
-                            dst_idxs=swap_dst.to(torch.long),
-                            next_tokens=None,
-                            new_speculative_tokens=None,
-                        )
+                _update_counts_after_chunked_prefill_kernel[(1,)](s)
+                # Swap is deferred to post-sync (needs found_idx/in_bounds as Python int)
             else:
                 chunked_prefill_request_idx = self.get_index_of_chunked_prefill_request(
                     safe=False
@@ -3170,18 +3281,85 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._time_update_requests:
             _se[5][1].record()
 
-        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        # =====================================================================
+        # Sync-free sections 6a-6d: single batch readback
+        # =====================================================================
+        if triton_resume_and_allocate is not None:
+            # Read all updated counters and deferred scalars in one batch
+            vals = s[:16].tolist()
+            active_request_count = vals[SLOT_ACTIVE_COUNT]
+            self.paused_request_count = vals[SLOT_PAUSED_COUNT]
+            self.total_request_count = vals[SLOT_TOTAL_COUNT]
+            evict_count = vals[SLOT_EVICT_COUNT]
+            swap_count = vals[SLOT_SWAP_COUNT]
+            resume_count_1 = vals[SLOT_RESUME_COUNT_1]
+            resume_count_2 = vals[SLOT_RESUME_COUNT_2]
+            chunked_found_idx = vals[SLOT_CHUNKED_FOUND_IDX]
+            chunked_in_bounds = vals[SLOT_CHUNKED_IN_BOUNDS]
+
+            # Extract newly_paused_request_ids from scratchpad (if detect_pause wrote them)
+            num_pause_needing = vals[SLOT_PAUSE_NEEDING]
+            if num_pause_needing > 0:
+                newly_paused_request_ids = self._scratch_idx_f[:num_pause_needing]
+
+            # Truncate newly_paused_request_ids by total resumed
+            total_resumed = resume_count_1 + resume_count_2
+            if newly_paused_request_ids is not None and total_resumed > 0:
+                if total_resumed >= len(newly_paused_request_ids):
+                    newly_paused_request_ids = None
+                else:
+                    newly_paused_request_ids = newly_paused_request_ids[:-total_resumed]
+
+            # Deferred eviction cleanup (Mamba + swap + reset)
+            if evict_count > 0:
+                evict_idxs = self._scratch_idx_b[:evict_count].to(torch.long)
+                if self.is_hybrid_model:
+                    self.mamba_metadata.free_slots(evict_idxs)
+                if self.mamba_slot_allocator is not None:
+                    sa = self.mamba_slot_allocator
+                    sa._intermediate_counts_gpu[evict_idxs] = 0
+                    sa._intermediate_offsets_gpu[evict_idxs] = 0
+                    sa._intermediate_block_ids_gpu[evict_idxs] = -1
+                    sa._eos_cache_block_id_gpu[evict_idxs] = -1
+                if swap_count > 0:
+                    self._swap_book_keeping_tensors(
+                        src_idxs=self._scratch_idx_c[:swap_count].to(torch.long),
+                        dst_idxs=self._scratch_idx_d[:swap_count].to(torch.long),
+                        next_tokens=next_tokens,
+                        new_speculative_tokens=new_speculative_tokens,
+                    )
+                evict_slice = slice(
+                    self.total_request_count, self.total_request_count + evict_count
+                )
+                self.request_to_kv_block_ids[evict_slice] = -1
+                if self.is_hybrid_model:
+                    self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
+                evict_request_ids = self._scratch_idx_a[:evict_count]
+
+            # Deferred chunked prefill swap
+            if self.chunked_prefill_request_id != -1 and chunked_found_idx >= 0:
+                swap_src = self._scratch_idx_e[0:1].to(torch.long)
+                swap_dst = self._scratch_idx_e[1:2].to(torch.long)
+                if chunked_in_bounds:
+                    self._swap_book_keeping_tensors(
+                        src_idxs=swap_src, dst_idxs=swap_dst,
+                        next_tokens=next_tokens,
+                        new_speculative_tokens=new_speculative_tokens,
+                    )
+                elif chunked_found_idx != self.total_request_count:
+                    self._swap_book_keeping_tensors(
+                        src_idxs=swap_src, dst_idxs=swap_dst,
+                        next_tokens=None, new_speculative_tokens=None,
+                    )
+
+        # 7. We make changes to the request book keeping tensors and setup the tokens for next iteration
         if self._time_update_requests:
             _se[6][0].record()
-
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
-            # Clone needed: next_tokens is a shared buffer that will be overwritten in
-            # the next iteration; paused_tokens must persist independently.
             self.paused_tokens = next_tokens[: self.paused_request_count].clone()
             if new_speculative_tokens is not None:
-                # Clone needed: same reason as paused_tokens above.
                 self.paused_speculative_tokens = new_speculative_tokens[
                     :, : self.paused_request_count
                 ].clone()

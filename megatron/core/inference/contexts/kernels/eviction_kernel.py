@@ -41,6 +41,8 @@ def _evict_overflow_kernel(
     src_idxs_ptr,
     dst_idxs_ptr,
     swap_count_ptr,
+    # Scratchpad
+    scratch_ptr,
     # Scalars
     paused_request_count: tl.int32,
     active_request_count: tl.int32,
@@ -49,11 +51,17 @@ def _evict_overflow_kernel(
     max_kv_blocks: tl.int32,
     # Compile-time
     HAS_PREFIX_CACHE: tl.constexpr,
+    USE_SCRATCH: tl.constexpr,
 ):
     """Detect overflow, select eviction candidates, release blocks, compute swap indices.
 
     Grid: (1,)
     """
+    if USE_SCRATCH:
+        paused_request_count = tl.load(scratch_ptr + 2)  # SLOT_PAUSED_COUNT
+        active_request_count = tl.load(scratch_ptr + 0)  # SLOT_ACTIVE_COUNT
+        total_request_count = tl.load(scratch_ptr + 3)  # SLOT_TOTAL_COUNT
+
     # Step 1: Compute paused_used = sum of block counts for paused requests
     paused_used = 0
     i = 0
@@ -177,6 +185,7 @@ def triton_evict_overflow(
     out_src_idxs: Optional[Tensor] = None,
     out_dst_idxs: Optional[Tensor] = None,
     out_swap_count: Optional[Tensor] = None,
+    scratch: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Detect overflow, evict, release blocks, compute swap indices.
 
@@ -202,6 +211,9 @@ def triton_evict_overflow(
     ref_ptr = block_ref_counts if has_prefix_cache else dummy
     hash_ptr = block_hashes if has_prefix_cache else dummy
 
+    use_scratch = scratch is not None
+    scratch_ptr = scratch if use_scratch else block_bag  # dummy
+
     _evict_overflow_kernel[(1,)](
         kv_block_counts,
         request_to_kv_block_ids,
@@ -217,12 +229,14 @@ def triton_evict_overflow(
         src_idxs,
         dst_idxs,
         swap_count_buf,
+        scratch_ptr,
         paused_request_count=paused_request_count,
         active_request_count=active_request_count,
         total_request_count=total_request_count,
         paused_block_limit=paused_block_limit,
         max_kv_blocks=max_kv_block_count,
         HAS_PREFIX_CACHE=has_prefix_cache,
+        USE_SCRATCH=use_scratch,
     )
 
     return evict_count_buf, evict_request_ids, evict_idxs, src_idxs, dst_idxs, swap_count_buf
