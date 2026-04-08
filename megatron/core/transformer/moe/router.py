@@ -825,7 +825,14 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
+        # The allgather_v dispatcher always needs dense [num_tokens, topk] output
+        # (expert indices), not the sparse [num_tokens, num_experts] boolean mask.
+        # Use dense output in both eager and graph modes so collectives stay consistent.
+        use_dense = (
+            self.is_inference_cuda_graphed_iteration
+            or self.config.inference_moe_cuda_graph_dispatcher == "allgather_v"
+        )
+        if self.training or not use_dense:
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)
