@@ -306,7 +306,7 @@ class TestDynamicInferenceEngine:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=256 if test_config.fp8 else 256,
+                hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=(
@@ -602,14 +602,14 @@ class TestDynamicInferenceEngine:
 
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
-            [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
-            [29, 16, 33, 93, 45, 76, 41, 74, 28, 17, 36, 2, 61, 6, 98, 76],
-            [35, 78, 54, 16, 79, 98, 22, 5, 43, 0, 1, 76, 77, 11, 25, 66],
-            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 40, 0, 64, 45],
-            [32, 5, 85, 75, 30, 68, 23, 16, 20, 26, 89, 20, 49, 28, 34, 81],
-            [62, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 74, 42, 80, 50, 53],
-            [82, 78, 78, 65, 26, 5, 97, 36, 26, 99],
-            [51, 70, 22, 1, 87, 42, 36, 26, 27, 67, 97, 32, 8, 80, 20, 43],
+            [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
+            [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
+            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
+            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
+            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 49, 28, 38, 81],
+            [33, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
+            [82, 78, 78, 65, 26, 5, 69, 36, 37, 99],
+            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
         ]
 
         mamba_expected_generated_tokens = [
@@ -3039,7 +3039,7 @@ class TestChunkedPrefillCudaGraphs:
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
-                hidden_size=256,
+                hidden_size=32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=cuda_graph_impl,
