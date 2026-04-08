@@ -3633,7 +3633,11 @@ def get_train_valid_test_num_samples():
             eval_iters = args.eval_iters
         else:
             assert args.train_iters is not None
-            eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+            total_eval_points = args.train_iters // args.eval_interval + 1
+            if args.start_eval_at_iter is not None:
+                skipped_eval_points = args.start_eval_at_iter // args.eval_interval
+                total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            eval_iters = total_eval_points * args.eval_iters
         eval_samples = eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
     test_samples = args.eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
 
@@ -3684,7 +3688,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // args.eval_interval
             args.consumed_valid_samples = (
-                (args.iteration // args.eval_interval - skipped_intervals)
+                max(0, args.iteration // args.eval_interval - skipped_intervals)
                 * args.eval_iters
                 * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
