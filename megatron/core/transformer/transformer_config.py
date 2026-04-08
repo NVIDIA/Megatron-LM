@@ -941,6 +941,37 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    inference_moe_cuda_graph_dispatcher: Literal['fused', 'allgather_v'] = "fused"
+    """Selects the CUDA-graph-compatible token dispatcher for inference MoE.
+    Options:
+    - 'fused' (default): AllGather + FlashInfer/CUTLASS fused MoE kernel.
+      The fused kernel handles token permutation internally. Requires FlashInfer.
+    - 'allgather_v': AllGather + Triton permute + grouped_mm + Triton unpermute
+      + ReduceScatter. Token counts per expert are computed on-device by Triton
+      kernels with no host-device synchronization, making the full pipeline
+      CUDA-graphable without FlashInfer. Supports BF16 and MXFP8 weights via
+      torch.nn.functional.grouped_mm / scaled_grouped_mm.
+
+      When EP > 1, the AllGather/ReduceScatter buffers are pinned to a fixed
+      maximum size (inference_moe_max_tokens * ep_size) so that all CUDA graphs
+      embed the same collective regardless of actual batch size. This allows
+      different EP ranks to independently select different CUDA graphs without
+      any cross-rank synchronization (no all-reduce for batch dimension matching).
+    """
+
+    inference_moe_max_tokens: Optional[int] = None
+    """Maximum tokens per EP rank for the 'allgather_v' dispatcher.
+
+    When set, the AllGather/ReduceScatter buffers are pinned to this size
+    (times ep_size), making the NCCL collectives identical across all CUDA
+    graphs. This eliminates the need for the all-reduce in
+    adjust_batch_dims_for_expert_parallelism — each EP rank can independently
+    select its own CUDA graph.
+
+    Should be set to cuda_graph_max_tokens (typically max_requests *
+    (num_speculative_tokens + 1)). Required when using 'allgather_v' with EP > 1.
+    """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -1205,6 +1236,11 @@ class TransformerConfig(ModelParallelConfig):
             assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            assert self.inference_moe_cuda_graph_dispatcher in ('fused', 'allgather_v'), (
+                f"inference_moe_cuda_graph_dispatcher must be 'fused' or 'allgather_v', "
+                f"got '{self.inference_moe_cuda_graph_dispatcher}'"
             )
 
             if self.cuda_graph_impl == "local":

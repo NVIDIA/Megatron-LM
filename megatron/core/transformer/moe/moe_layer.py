@@ -28,6 +28,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference_v import (
+    InferenceAllGatherVTokenDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
@@ -352,8 +355,16 @@ class MoELayer(BaseMoELayer):
         """Set up inference-optimized token dispatcher and state.
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
-        Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
-        which is swapped in during CUDA-graphed forward passes.
+        Creates an inference CUDA-graph token dispatcher alongside the standard
+        dispatcher, which is swapped in during CUDA-graphed forward passes.
+
+        The dispatcher type is selected by ``inference_moe_cuda_graph_dispatcher``:
+        - ``"fused"`` (default): AllGather + FlashInfer/CUTLASS fused MoE kernel.
+          Requires FlashInfer. The fused kernel handles permutation internally.
+        - ``"allgather_v"``: AllGather + Triton permute + grouped_mm + Triton
+          unpermute + ReduceScatter. No FlashInfer dependency. Token counts
+          are computed on-device by Triton kernels — fully CUDA-graphable
+          with no host-device synchronization.
         """
 
         assert self.config.moe_token_dispatcher_type == "alltoall", (
@@ -361,12 +372,22 @@ class MoELayer(BaseMoELayer):
             f"got '{self.config.moe_token_dispatcher_type}'"
         )
         self.is_inference_cuda_graphed_iteration = False
-        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
-            self.num_local_experts,
-            self.local_expert_indices,
-            config=self.config,
-            pg_collection=pg_collection,
-        )
+
+        dispatcher_type = self.config.inference_moe_cuda_graph_dispatcher
+        if dispatcher_type == "allgather_v":
+            self._inference_token_dispatcher = InferenceAllGatherVTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
+        else:
+            self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -499,10 +520,25 @@ class MoELayer(BaseMoELayer):
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
         ):
-            routing_map = self.token_dispatcher.routing_map
-            expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
-            )
+            # AllGatherV dispatcher: tokens are pre-permuted with Triton —
+            # pass expert_offsets and permutation_map for grouped_mm.
+            if isinstance(self.token_dispatcher, InferenceAllGatherVTokenDispatcher):
+                expert_output, mlp_bias = apply_module(self.experts)(
+                    dispatched_input,
+                    tokens_per_expert,
+                    permuted_probs,
+                    expert_offsets=self.token_dispatcher.expert_offsets,
+                    permutation_map=self.token_dispatcher.permutation_map,
+                )
+            else:
+                # Fused dispatcher: pass routing_map for FlashInfer.
+                routing_map = self.token_dispatcher.routing_map
+                expert_output, mlp_bias = apply_module(self.experts)(
+                    dispatched_input,
+                    tokens_per_expert,
+                    permuted_probs,
+                    routing_map=routing_map,
+                )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs

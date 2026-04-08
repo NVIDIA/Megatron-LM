@@ -638,7 +638,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(
-        self, hidden_states, probs, routing_map=None, tokens_per_expert=None, skip_permute=False
+        self,
+        hidden_states,
+        probs,
+        routing_map=None,
+        tokens_per_expert=None,
+        skip_permute=False,
+        expert_offsets=None,
+        permutation_map=None,
     ):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -654,6 +661,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             tokens_per_expert=tokens_per_expert,
             skip_permute=skip_permute,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            expert_offsets=expert_offsets,
+            permutation_map=permutation_map,
         )
         return output, None
 
@@ -663,22 +672,32 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: Optional[torch.Tensor],
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
+        expert_offsets: Optional[torch.Tensor] = None,
+        permutation_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward pass with four modes:
 
         - Training: delegates to parent TEGroupedMLP.
-        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
-          is not used in this path; the FlashInfer kernel operates directly on
-          routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + CUDA graphed + AllGatherV dispatcher: tokens are already
+          permuted and padded by Triton kernels. Uses grouped_mm with the
+          provided expert_offsets. No FlashInfer dependency.
+        - Inference + CUDA graphed + fused dispatcher: FlashInfer cutlass_fused_moe.
+          tokens_per_expert is not used; the kernel operates directly on routing_map.
+        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident
+          cumsum offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
             tokens_per_expert: [num_experts] number of tokens routed to each expert.
-                None when using the CUDA-graphed FlashInfer path.
+                None when using CUDA-graphed paths.
             permuted_probs: [num_tokens, topk] routing probabilities.
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
+            expert_offsets: [num_local_experts] int32 inclusive prefix sums of aligned
+                token counts. When provided, hidden_states are already permuted and
+                padded by the AllGatherV dispatcher's Triton kernels.
+            permutation_map: [output_size] int32, original token index or -1 for
+                padding. Required when expert_offsets is provided.
         """
 
         if self.training:
@@ -697,6 +716,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
+
+        # Pre-permuted path: tokens already grouped by expert with padding.
+        # Directly use grouped_mm with the provided offsets — no FlashInfer needed.
+        if expert_offsets is not None:
+            return self._mcore_fused_moe_forward(
+                permuted_local_hidden_states,
+                permuted_probs,
+                expert_offsets=expert_offsets,
+                permutation_map=permutation_map,
+            )
 
         resolved_backend = resolve_inference_grouped_gemm_backend(
             self.inference_grouped_gemm_backend,

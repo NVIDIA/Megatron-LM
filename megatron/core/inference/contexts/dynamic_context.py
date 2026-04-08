@@ -579,6 +579,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
+        # When the allgather_v dispatcher is active with fixed-max-buffer mode,
+        # EP ranks can independently select CUDA graphs — no cross-rank sync needed.
+        self._skip_ep_sync = (
+            getattr(model_config, "inference_moe_cuda_graph_dispatcher", "fused") == "allgather_v"
+            and getattr(model_config, "inference_moe_max_tokens", None) is not None
+        )
+
         # CUDA graph config list
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
@@ -1608,6 +1615,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
+            skip_ep_sync=self._skip_ep_sync,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

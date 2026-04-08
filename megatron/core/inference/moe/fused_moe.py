@@ -90,15 +90,22 @@ def mcore_fused_moe(
     tokens_per_expert: Optional[torch.Tensor] = None,
     skip_permute: bool = False,
     disable_fused_quant_kernels: bool = False,
+    expert_offsets: Optional[torch.Tensor] = None,
+    permutation_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused MoE: [permute ->] pad -> FC1 -> activation -> FC2 -> unpad [-> unpermute].
 
-    Two modes:
+    Three modes:
     - skip_permute=False (default): tokens are unpermuted. Requires routing_map.
       Performs full permute -> compute -> unpermute.
     - skip_permute=True: tokens are already permuted by the dispatcher. Requires
       tokens_per_expert. Pads to alignment, computes, then unpads. Probs are
       applied during unpad.
+    - expert_offsets is not None: tokens are already permuted AND padded by the
+      dispatcher (InferenceAllGatherVTokenDispatcher). Requires expert_offsets
+      (inclusive prefix sums for grouped_mm) and permutation_map (for padding-aware
+      activation). Performs only FC1 -> activation -> FC2. The caller handles
+      unpermute. This mode is fully CUDA-graphable with no host-device sync.
 
     Unless disable_fused_quant_kernels=True, when weights are MXFP8, uses fused
     kernels that combine permute/activation with MXFP8 quantization into single
@@ -108,7 +115,7 @@ def mcore_fused_moe(
         hidden_states: [num_tokens, hidden_size] BF16 input.
         probs: routing probabilities. Shape is [num_tokens, topk] when
             skip_permute=False, or [num_tokens] (already gathered) when
-            skip_permute=True.
+            skip_permute=True. Ignored when expert_offsets is provided.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
         activation_type: ActivationType enum (SQUARED_RELU).
@@ -120,9 +127,18 @@ def mcore_fused_moe(
         disable_fused_quant_kernels: if True, disable fused permute+quantize and
             activation+quantize kernels for MXFP8, using separate launches instead.
             Useful for debugging. Ignored when weights are BF16.
+        expert_offsets: [num_local_experts] int32 inclusive prefix sums of aligned
+            token counts, as produced by Triton compute_expert_offsets. When provided,
+            hidden_states must already be permuted and padded. FC1 -> activation -> FC2
+            is performed using these offsets and the raw output is returned (no unpermute).
+        permutation_map: [output_size] int32, original token index or -1 for padding.
+            Required when expert_offsets is provided. Used by the activation kernel to
+            skip padding rows.
 
     Returns:
-        [num_tokens, hidden_size] BF16 output.
+        [num_tokens, hidden_size] BF16 output (when expert_offsets is None), or
+        raw [output_size, hidden_size] expert output (when expert_offsets is provided,
+        caller handles unpermute).
     """
     assert (
         hidden_states.dtype == torch.bfloat16
@@ -132,6 +148,37 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+
+    # --- Pre-permuted + pre-padded path (AllGatherV dispatcher) ---
+    # Tokens are already in expert-grouped order with alignment padding.
+    # Just do FC1 -> activation -> FC2 using the provided offsets.
+    if expert_offsets is not None:
+        assert permutation_map is not None, (
+            "permutation_map is required when expert_offsets is provided"
+        )
+        offs = expert_offsets
+        if use_mxfp8:
+            assert (
+                HAVE_SCALED_GMM
+            ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
+            mm_fn_local = _mxfp8_grouped_mm
+            activation_fn = _get_activation_func(activation_type, fused_quant=use_fused_quant)
+            # Quantize input for MXFP8 path
+            hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
+        else:
+            assert (
+                HAVE_GROUPED_MM
+            ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
+            mm_fn_local = _bf16_grouped_mm
+            activation_fn = _get_activation_func(activation_type, fused_quant=False)
+
+        fc1_output = mm_fn_local(hidden_states, fc1_weight, offs)
+        activation_out = activation_fn(fc1_output, permutation_map)
+        if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
+            activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
+        fc2_output = mm_fn_local(activation_out, fc2_weight, offs)
+        # Return raw output — the dispatcher handles unpermute + prob weighting.
+        return fc2_output
 
     if use_mxfp8:
         assert (

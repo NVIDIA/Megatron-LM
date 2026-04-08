@@ -142,6 +142,7 @@ class InferenceBatchDimensions:
         decode_only_cuda_graphs: bool,
         smallest_non_decode_cuda_graph_size: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        skip_ep_sync: bool = False,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
@@ -153,6 +154,13 @@ class InferenceBatchDimensions:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            skip_ep_sync: If True, skip the all-reduce across EP ranks entirely and
+                return local_batch_dims unchanged.  Use this when the MoE dispatcher
+                pins AllGather/ReduceScatter to a fixed max buffer size (e.g.
+                ``inference_moe_cuda_graph_dispatcher='allgather_v'`` with
+                ``inference_moe_max_tokens`` set), so that NCCL collectives are
+                identical across all CUDA graphs and EP ranks can independently
+                select different graphs.
 
         Return:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with
@@ -161,6 +169,14 @@ class InferenceBatchDimensions:
         ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
+
+        # When the dispatcher uses fixed-max-size AllGather/ReduceScatter buffers,
+        # every CUDA graph embeds the same NCCL collective regardless of actual
+        # batch size.  EP ranks can independently match their own graph — no
+        # cross-rank synchronization is needed.
+        if skip_ep_sync:
+            return local_batch_dims
+
         # all reduce local work across expert model parallel group
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
@@ -500,6 +516,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        skip_ep_sync: bool = False,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -515,6 +532,10 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            skip_ep_sync: If True, skip the all-reduce across EP ranks in
+                adjust_batch_dims_for_expert_parallelism.  Use when the MoE dispatcher
+                uses fixed-max-size AllGather/ReduceScatter buffers so that EP ranks
+                can independently select different CUDA graphs.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -529,6 +550,7 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             ep_group=ep_group,
             smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
+            skip_ep_sync=skip_ep_sync,
         )
 
         if adjusted_batch_dim is None:
