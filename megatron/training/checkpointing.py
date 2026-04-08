@@ -978,13 +978,15 @@ def generate_state_dict(
             key = f"model{i}"
 
         if args.ckpt_format == "torch_dist":
-            model_sd = model[i].sharded_state_dict(
-                **(model_sd_kwargs or {
-                    "metadata": {
-                        "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
-                    }
-                })
-            )
+            if model_sd_kwargs is None:
+                metadata = {
+                    "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                }
+            if getattr(args, 'dist_ckpt_dtensor_format', True):
+                metadata = {}
+                metadata['singleton_local_shards'] = True
+            model_sd_kwargs = {"metadata": metadata}
+            model_sd = model[i].sharded_state_dict(**model_sd_kwargs)
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
 

@@ -142,6 +142,23 @@ def extract_sharded_base(
     return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase))
 
 
+def extract_sharded_base_or_dtensor(
+    sharded_state_dict: ShardedStateDict,
+) -> Tuple[ShardedStateDict, StateDict]:
+    from torch.distributed.tensor import DTensor
+    """Extract a dict consisting of only ShardedBase or DTensors from a given state dict.
+
+    Args:
+        sharded_state_dict: state dict possibly containing ShardedBase or DTensor objects
+
+    Returns:
+        Tuple[ShardedStateDict, StateDict]: tuple of:
+            - state dict with all ShardedBase and DTensor objects (keeping the original structure)
+            - state dict with all other objects (keeping the original state dict structure)
+    """
+    return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, (ShardedBase, DTensor)))
+
+
 def extract_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:

@@ -89,6 +89,8 @@ class ShardedTensor(ShardedBase):
     prepend_axis_num: int = 0
     allow_shape_mismatch: bool = False
     flattened_range: Optional[slice] = None
+    dtensor_ckpt_device_mesh: Optional['DeviceMesh'] = None
+    dtensor_ckpt_placements: Optional[List['Placement']] = None
 
     def __post_init__(self):
         self.validate_metadata_integrity()
@@ -317,6 +319,12 @@ class ShardedTensor(ShardedBase):
                 global_offset=global_offset,
             )
         ]
+    
+    def to_dtensor(self):
+        from torch.distributed.tensor import DTensor
+
+        assert self.dtensor_ckpt_device_mesh is not None
+        return DTensor.from_local(self.data, self.dtensor_ckpt_device_mesh, self.dtensor_ckpt_placements, run_check=False)
 
 
 def is_main_replica(replica_id: ReplicaId):
@@ -406,7 +414,7 @@ class ShardedObject(ShardedBase):
         return f"{self.__class__.__name__}(key='{self.key}')"
 
     @classmethod
-    def empty_from_unique_key(cls, unique_key, replica_id: ReplicaId = 0) -> "ShardedObject":
+    def empty_from_unique_key(cls, unique_key: str, replica_id: ReplicaId = 0) -> "ShardedObject":
         """Instantiates a ShardedObject from a unique key.
 
         Args:
@@ -428,6 +436,28 @@ class ShardedObject(ShardedBase):
             # element of global shape so set it to -1.
             shape += (-1,)
         return cls(key, None, shape, offset, replica_id)
+
+    @classmethod
+    def empty_from_key(cls, key: str, replica_id: ReplicaId = 0) -> 'ShardedObject':
+        """Instantiates a ShardedObject from key.
+
+        # TODO: explain.
+
+        Args:
+            key: ShardedObject key
+            replica_id: indicates local object replication wrt.
+                local objects in different processes
+
+        Returns:
+            a ShardedObject with data=None
+        """
+        if '/' in key:
+            # TODO: implement explicit validation
+            try:
+                return cls.empty_from_unique_key(key, replica_id)
+            except (TypeError, AssertionError):
+                pass
+        return cls(key, None, (1,), (0,), replica_id)
 
 
 FactoryBuildFn = Callable[[str, torch.Tensor, ReplicaId, Optional[slice]], ShardedStateDict]

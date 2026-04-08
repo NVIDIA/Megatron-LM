@@ -8,6 +8,7 @@ import warnings
 from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
@@ -39,7 +40,7 @@ from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
-from ..dict_utils import nested_values
+from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import (
     ShardedBase,
     ShardedObject,
@@ -403,6 +404,87 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+def translate_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict,
+                                           sh_ten_mode: str = 'dtensor') -> StateDict:
+    num_dtensor = 0
+    num_ckptable = 0
+    def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
+        nonlocal num_dtensor
+        nonlocal num_ckptable
+
+        if isinstance(x, ShardedTensor):
+            if sh_ten_mode == 'dtensor':
+                x = x.to_dtensor()
+                num_dtensor += 1
+            else:
+                raise NotImplementedError(f'sh_ten_mode: {sh_ten_mode}')
+        elif isinstance(x, ShardedObject):
+            if not all(dim_size == 1 for dim_size in x.global_shape):
+                raise RuntimeError("INTERNAL WARNING: ShardedObjects with non-trivial sharding won't be supported")
+        return x
+
+    dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
+    print(f'Translations: DTensor: {num_dtensor}, ShTen(_Checkpointable): {num_ckptable}.')
+    if num_dtensor > 0 and num_ckptable > 0:
+        print(f'Coexisting DTensors ({num_dtensor}) and ShTen(_Checkpointable) tensors ({num_ckptable}) discovered!.')
+    return sharded_state_dict
+
+
+# This stays, but could be simplified to a non-nested case if current code stays
+def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
+    def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
+        if isinstance(x, DTensor):
+            x = x.to_local()
+        elif isinstance(x, CheckpointableShardedTensor):
+            x = x._sh_ten.data
+        elif isinstance(x, ShardedObject):
+            x = x.data
+        return x
+
+    dict_list_map_inplace(dtensor_to_ten, state_dict)
+    return state_dict
+
+
+@dataclass
+class PlaceholderValue:
+    key: str
+
+
+def inject_placeholders(sharded_state_dict: ShardedStateDict) -> Dict[str, Any]:
+    """Replaces values in state dict with ValuePlaceholders.
+
+    Extracts all values from a given state dict to a flat dict, injecting
+    placeholders instead to allow later recovery with `fill_placeholders`.
+    """
+    # TODO: in order to handle arbitrary DTensors (without `.key` attribute)
+    #  an additional step computing FQNs might be needed (`traverse_state_dict`?)
+    #  which computes DTensor.key
+    extracted_values = {}
+
+    def _replace_with_placeholder(x: Union[ShardedBase, DTensor]):
+        if isinstance(x, DTensor):
+            if not hasattr(x, 'key'):
+                raise NotImplementedError(f'DTensors currently require `key` attribute, got: {x}')
+        elif not isinstance(x, ShardedBase):
+            raise RuntimeError(f'Unexpected type {x} during placeholders injection')
+
+        if x.key in extracted_values:
+            raise RuntimeError(f'Duplicated sharded key encountered: {x.key}')
+        extracted_values[x.key] = x
+        return PlaceholderValue(x.key)
+
+    dict_list_map_inplace(_replace_with_placeholder, sharded_state_dict)
+    return extracted_values
+
+
+def fill_placeholders(sharded_state_dict: ShardedStateDict, loaded_values: Dict[str, Any]) -> None:
+    """Inverse of `inject_placeholders`. """
+    def _fill_placeholder(x: PlaceholderValue):
+        assert isinstance(x, PlaceholderValue)
+        return loaded_values[x.key]
+    dict_list_map_inplace(_fill_placeholder, sharded_state_dict)
+
+
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -600,7 +682,7 @@ class TorchDistSaveShardedStrategy:
         thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
-        dtensor_format: Optional[bool] = False,
+        dtensor_format: Optional[bool] = True,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -667,6 +749,8 @@ class TorchDistSaveShardedStrategy:
         Returns: None
         """
         if self.dtensor_format:
+            values_to_save = inject_placeholders(sharded_state_dict)
+            values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
             return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
 
         if async_strategy == "mcore":
