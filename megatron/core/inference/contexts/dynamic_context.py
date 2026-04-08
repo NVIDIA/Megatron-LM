@@ -1719,9 +1719,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = min(
-                    self.max_tokens, self.round_up_tokens(self.active_token_count)
-                )
+                padded_token_count = self.round_up_tokens(self.active_token_count)
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
