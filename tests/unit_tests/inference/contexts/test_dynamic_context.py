@@ -1570,7 +1570,7 @@ class TestDynamicContext:
 
         # --- reset and run fast path ---
         ctx.reset()
-        ctx.add_dummy_requests_for_expert_parallel_step()
+        ctx.add_dummy_requests_for_expert_parallel_step(smallest)
 
         # 1. Scalar counts
         assert ctx.total_request_count == slow_total_request_count
