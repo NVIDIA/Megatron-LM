@@ -74,6 +74,20 @@ class MockState:
         return self.state_dict()
 
 
+class MockOptParamScheduler(MockState):
+    def __init__(self, state_dict):
+        super().__init__(state_dict)
+        self.num_steps = state_dict.get("num_steps", 0)
+        self.step_calls = []
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.num_steps = state_dict.get("num_steps", self.num_steps)
+
+    def step(self, increment=1):
+        self.step_calls.append(increment)
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -298,6 +312,78 @@ def test_load_checkpoint(
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch"])
+def test_load_checkpoint_override_opt_param_scheduler(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+):
+    """Test override_opt_param_scheduler behavior during checkpoint load."""
+    args = create_ckpt_load_args
+    args.ckpt_format = ckpt_format
+    args.use_distributed_optimizer = ckpt_format != "torch_dcp"
+    args.use_dist_ckpt = ckpt_format != "torch"
+    args.override_opt_param_scheduler = True
+    args.lr = 1.0
+    args.min_lr = 0.1
+    args.decoupled_lr = 0.5
+    args.decoupled_min_lr = 0.05
+    args.consumed_train_samples = 42
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
+    ) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        set_args(args)
+
+        # Create and save a checkpoint first.
+        iteration = 123
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)
+
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        optimizer.param_groups = [
+            {"is_decoupled_lr": False, "max_lr": -1.0, "min_lr": -1.0},
+            {"is_decoupled_lr": True, "max_lr": -1.0, "min_lr": -1.0},
+        ]
+        opt_param_scheduler = MockOptParamScheduler(
+            {"opt_param_scheduler": "scheduler_state", "num_steps": 3}
+        )
+        num_floating_point_operations_so_far = 456
+
+        save_checkpoint(
+            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+        )
+
+        # Create new model, optimizer, and scheduler instances to load into.
+        new_model = MockModel(config)
+        new_optimizer = MockState({"optimizer": "dummy1"})
+        new_optimizer.param_groups = [
+            {"is_decoupled_lr": False, "max_lr": -2.0, "min_lr": -2.0},
+            {"is_decoupled_lr": True, "max_lr": -2.0, "min_lr": -2.0},
+        ]
+        new_opt_param_scheduler = MockOptParamScheduler(
+            {"opt_param_scheduler": "dummy2", "num_steps": 0}
+        )
+
+        # Load checkpoint and verify runtime overrides are restored.
+        loaded_iter, loaded_flops = load_checkpoint(
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        )
+        assert loaded_iter == iteration
+        assert loaded_flops == num_floating_point_operations_so_far
+        assert new_optimizer.param_groups[0]["max_lr"] == args.lr
+        assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
+        assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
+        assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
+        assert new_opt_param_scheduler.num_steps == args.consumed_train_samples
+        assert new_opt_param_scheduler.step_calls[-1] == 0
+
+        # Ensure loading without optimizer/scheduler remains safe.
+        loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
+        assert loaded_iter_none == iteration
+        assert loaded_flops_none == num_floating_point_operations_so_far
 
 
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):

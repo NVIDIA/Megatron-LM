@@ -1927,8 +1927,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Optimizer state dict can overwrite per-group max_lr/min_lr values.
             # If scheduler override is requested, restore runtime lr bounds so
             # scheduler math does not stay pinned to checkpoint lr settings.
-            if args.override_opt_param_scheduler:
-                for param_group in optimizer.param_groups:
+            if (
+                args.override_opt_param_scheduler
+                and optimizer is not None
+                and not optimizer.is_stub_optimizer
+                and opt_param_scheduler is not None
+            ):
+                for param_group in getattr(optimizer, "param_groups", []):
                     if (
                         param_group.get('is_decoupled_lr', False)
                         and args.decoupled_lr is not None
