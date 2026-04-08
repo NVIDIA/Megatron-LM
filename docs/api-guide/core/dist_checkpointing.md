@@ -159,6 +159,12 @@ pip install .
 - The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
 - It is strongly recommended to migrate to the NVRx strategy as soon as possible.
 
+### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
+
+Starting from Megatron-LM v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
+
+Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
+
 ## Subpackages
 
 ```{toctree}
