@@ -203,7 +203,9 @@ class InferenceBatchDimensions:
             is_any_ep_rank_in_non_decode and num_speculative_tokens > 0
         )
         adjusted_prefill_req_count = (
-            int(sync_tensor[2].item()) if sync_request_counts else local_batch_dims.prefill_req_count
+            int(sync_tensor[2].item())
+            if sync_request_counts
+            else local_batch_dims.prefill_req_count
         )
         adjusted_decode_req_count = (
             int(sync_tensor[3].item()) if sync_request_counts else local_batch_dims.decode_req_count
