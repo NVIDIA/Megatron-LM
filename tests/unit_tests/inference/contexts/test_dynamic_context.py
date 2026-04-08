@@ -2844,10 +2844,6 @@ class TestDynamicContext:
     def test_speculative_boundary_crossing_at_max_kv_block_count(self):
         """Test that speculative pre-allocation works when a request has already
         filled all ceil(max_seq_len / block_size) KV blocks.
-
-        Regression test: without the +1 adjustment to max_kv_block_count for
-        speculative decoding, resume_paused_requests writes to
-        request_to_kv_block_ids[:, max_kv_block_count] which is out of bounds.
         """
 
         model_config = TransformerConfig(
