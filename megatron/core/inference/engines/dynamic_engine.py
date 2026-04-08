@@ -1645,9 +1645,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.schedule_waiting_requests()
 
         # Saving pre-step state, for printing output below.
-        # Can't use is_decode_only() here because padded_batch_dimensions
-        # hasn't been set yet for this step (that happens in initialize_attention_state).
-        is_decode_only = self.context.num_prefill_requests == 0
+        is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
             "max_requests": self.context.max_requests,
