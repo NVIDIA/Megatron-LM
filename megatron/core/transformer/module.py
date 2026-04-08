@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -226,6 +227,13 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def _is_thd_cuda_graph(self):
+        """Check if THD format with CUDA Graph is being used."""
+        return (
+            getattr(self.config, 'sequence_packing_scheduler', None) is not None
+            and self.config.cuda_graph_impl != "none"
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the layer.
@@ -233,25 +241,43 @@ class GraphableMegatronModule(MegatronModule):
         from the seq_length, micro_batch_size, and parallel config.
         Override this method if the module has other inputs.
 
+        For THD + CUDA Graph, hidden_states uses the padded max sequence length with
+        micro_batch_size=1 (packed sequence format).
+
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
-        # Calculate data shape related values.
         context_parallel_size = self.config.context_parallel_size
-        slen_per_cp = seq_length // context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
-        slen_per_cptp = (
-            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
-        )
 
-        static_inputs = {}
-        static_inputs["hidden_states"] = torch.ones(
-            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-            device=torch.cuda.current_device(),
-        )
+        if self._is_thd_cuda_graph():
+            assert self.config.max_seqlen_per_dp_cp_rank is not None, (
+                "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            )
+            max_T = self.config.max_seqlen_per_dp_cp_rank
+            slen_per_cptp = (
+                max_T // tensor_model_parallel_size if sequence_parallel else max_T
+            )
+            static_inputs = {}
+            static_inputs["hidden_states"] = torch.ones(
+                (slen_per_cptp, 1, self.config.hidden_size),
+                dtype=torch.bfloat16,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            slen_per_cp = seq_length // context_parallel_size
+            slen_per_cptp = (
+                slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
+            )
+            static_inputs = {}
+            static_inputs["hidden_states"] = torch.ones(
+                (slen_per_cptp, micro_batch_size, self.config.hidden_size),
+                dtype=torch.bfloat16,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
         return static_inputs
 
     def setup_manual_hooks(self, make_hook_func):
@@ -304,6 +330,23 @@ class GraphableMegatronModule(MegatronModule):
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
+        if os.getenv("THD_DEBUG_CG_IO", "0") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            hidden_shape = (
+                tuple(cudagraph_args[0].shape)
+                if len(cudagraph_args) > 0 and torch.is_tensor(cudagraph_args[0])
+                else 'na'
+            )
+            padding_mask = cudagraph_kwargs.get("padding_mask", None)
+            print(
+                f"[THD_DEBUG_CG_IO][replay] rank={rank} "
+                f"layer={getattr(self, 'layer_number', 'na')} "
+                f"microbatch={getattr(self, 'current_microbatch', 'na')} cg_index={cg_index} "
+                f"hidden_shape={hidden_shape} "
+                f"padding_mask_shape={tuple(padding_mask.shape) if torch.is_tensor(padding_mask) else 'na'}",
+                flush=True,
+            )
+
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
         return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
@@ -322,15 +365,6 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
-        if self.config.fine_grained_activation_offloading and getattr(
-            self, 'offload_module_in_cuda_graph', False
-        ):
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
-
-            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
-            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

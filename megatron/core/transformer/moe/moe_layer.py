@@ -561,6 +561,28 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # Align padding_mask to hidden_states sequence dimension before transpose.
+        # padding_mask arrives as [bsz, seq_length] but may need SP scatter when
+        # hidden_states is already TP-scattered (seq_length / TP).
+        if padding_mask is not None and padding_mask.shape[1] != hidden_states.shape[0]:
+            if (
+                self.config.sequence_parallel
+                and padding_mask.shape[1] % self.config.tensor_model_parallel_size == 0
+                and padding_mask.shape[1] // self.config.tensor_model_parallel_size
+                == hidden_states.shape[0]
+            ):
+                padding_mask = (
+                    tensor_parallel.scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous()
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+            else:
+                raise AssertionError(
+                    f"padding_mask shape {padding_mask.shape} cannot be aligned to "
+                    f"hidden_states sequence length {hidden_states.shape[0]}"
+                )
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()

@@ -316,7 +316,23 @@ class GPTModel(LanguageModule):
 
         # Decoder embedding.
         if decoder_input is not None:
-            pass
+            # For non-pre_process PP stages that receive decoder_input, scatter padding_mask
+            # to match the sequence-parallel partitioned hidden_states if needed.
+            if (
+                padding_mask is not None
+                and self.config.sequence_parallel
+                and padding_mask.shape[1] != decoder_input.shape[0]
+                and padding_mask.shape[1] % self.config.tensor_model_parallel_size == 0
+                and padding_mask.shape[1] // self.config.tensor_model_parallel_size
+                == decoder_input.shape[0]
+            ):
+                padding_mask = (
+                    tensor_parallel.scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous()
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
         elif self.pre_process:
             if padding_mask is not None:
                 assert padding_mask.shape == input_ids.shape, (

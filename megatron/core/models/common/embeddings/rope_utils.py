@@ -196,17 +196,19 @@ def _apply_rotary_pos_emb_thd(
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
-    """A baseline implementation of applying RoPE for `thd` format.
+    """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
+
+    Replaces the original Python-loop + .tolist() implementation with vectorized
+    CUDA operations. No GPU->CPU syncs, compatible with CUDA Graph capture.
 
     Args:
-        t (Tensor): Input tensor T is of shape [t, h, d]
-        cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
-        with shape [b + 1] and dtype torch.int32.
-        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
-        cp_group (torch.distributed.ProcessGroup): The context parallel group
+        t (Tensor): Input tensor of shape [total_tokens, h, d]
+        cu_seqlens (Tensor): Cumulative sequence lengths, shape [num_seqs + 1], int32.
+        freqs (Tensor): RoPE frequencies, shape [max_s, 1, 1, d] or [total_tokens, 1, 1, d]
+        cp_group: Context parallel group
 
     Returns:
-        Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
+        Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
     """
     if multi_latent_attention is not None:
         warnings.warn(
@@ -219,50 +221,43 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
-    # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
-    #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
-    #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
-        # CASE 1: Exact mapping with offsets
-        # Build packed freqs in one pass, then apply once to the whole packed tensor
-        sequence_splits = torch.split(t, seqlens)
-        freq_slices = []
-        for i, x in enumerate(sequence_splits):
-            # cu_seqlens[i] is the starting offset of this sequence in the original batch
-            seq_start_offset = cu_seqlens[i].item()
-            freq_slices.append(
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
-            )
+    total_tokens = t.shape[0]
+    device = t.device
 
-        freqs_packed = torch.cat(freq_slices, dim=0)
+    token_pos = torch.arange(total_tokens, device=device)
+    seq_idx = torch.searchsorted(cu_seqlens, token_pos, right=True) - 1
+    seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
 
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
-    else:
-        # CASE 2: Traditional mapping without offsets
-        # Build packed freqs for all sequences using the standard mapping, then apply once
-        sequence_splits = torch.split(t, seqlens)
-        freqs_packed = torch.cat(
-            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
-            dim=0,
+    seq_start = cu_seqlens[seq_idx]
+    local_pos = token_pos - seq_start
+
+    full_seqlen = (cu_seqlens[seq_idx + 1] - seq_start) * cp_size
+    chunk_size = (cu_seqlens[seq_idx + 1] - seq_start) // 2
+
+    if cp_size > 1:
+        is_first_half = local_pos < chunk_size
+        freq_pos = torch.where(
+            is_first_half,
+            cp_rank * chunk_size + local_pos,
+            full_seqlen - (cp_rank + 1) * chunk_size + (local_pos - chunk_size),
         )
+    else:
+        freq_pos = local_pos
 
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
+    if freqs.dim() >= 1 and freqs.size(0) > total_tokens:
+        freq_pos = freq_pos + seq_start * cp_size
+
+    freq_pos = freq_pos.clamp(min=0, max=freqs.shape[0] - 1)
+    freqs_packed = freqs[freq_pos]
+
+    return _apply_rotary_pos_emb_bshd(
+        t.unsqueeze(1),
+        freqs_packed,
+        rotary_interleaved=rotary_interleaved,
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        mscale=mscale,
+    ).squeeze(1)
 
 
 def apply_rotary_pos_emb(

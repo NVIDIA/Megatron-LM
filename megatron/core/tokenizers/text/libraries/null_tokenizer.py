@@ -82,6 +82,11 @@ class NullTokenizer:
         return self._eod_id
 
     @property
+    def pad_id(self):
+        """Returns id of padding token (same as eod for NullTokenizer)."""
+        return self._eod_id
+
+    @property
     def additional_special_tokens_ids(self):
         """ """
         return None
