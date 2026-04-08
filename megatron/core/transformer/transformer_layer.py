@@ -1802,30 +1802,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return output
 
-    def _te_cuda_graph_replay(self, *args, **kwargs):
-        """CUDA graph replay with hyper connection support for MoE partial capture.
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+        """Implementation of _te_cuda_graph_replay with hyper connection support.
+
+        Overrides the parent's _te_cuda_graph_replay_impl so that the
+        delay_offload_until_cuda_graph lifecycle (enter_replay/exit_replay) in
+        the parent's _te_cuda_graph_replay is preserved.
 
         During MoE partial CUDA graph capture, the graph outputs include HC state
         (mlp_hc_h_post, mlp_h_res) in addition to the base class outputs. This method
         extracts the HC state and uses it for post-processing after resuming the MoE forward.
         """
-        context = None
-        if self.config.cuda_graph_scope and CudaGraphScope.attn not in self.config.cuda_graph_scope:
-            hidden_states, context = self._forward_attention(*args, **kwargs)
-            args = (hidden_states,)
-            kwargs = {}
-
-        assert (kwargs.get('inference_context') is None) and (
-            kwargs.get('packed_seq_params') is None
-        ), (
-            "CUDA graph accepts only Tensor inputs. "
-            "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use cuda_graph_impl=local instead."
-        )
-
         cuda_graph_output = list(
             GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
         )
+
+        # Flush delayed offload groups from previous layers after graph replay.
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.flush_delayed_groups()
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
@@ -1837,6 +1831,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         ):
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
             output = cuda_graph_output.pop()
+            assert (
+                not self.config.overlap_moe_expert_parallel_comm
+            ), "EP overlap must be \
+                disabled when CUDA graph captures the whole MLP/MoE part."
         elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
             # Pop HC state (appended during capture in _forward_mlp).
             residual = cuda_graph_output.pop()
@@ -1860,11 +1858,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
                 )
                 for i, attr_name in enumerate(valid_cudagraph_attrs):
-                    hier_attr_name = attr_name.split('.')
-                    attr = self.mlp.token_dispatcher
-                    for name in hier_attr_name[:-1]:
-                        attr = getattr(attr, name)
-                    setattr(attr, hier_attr_name[-1], attr_outputs[i])
+                    self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
             else:
                 assert len(cuda_graph_output) == 3, (
                     "CUDA graph output should be [hidden_states, probs, routing_map], "
@@ -1880,6 +1874,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 routing_map=routing_map,
                 shared_expert_output=shared_expert_output,
             )
+            # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
+            # and should be skipped here.
+            if self.config.overlap_moe_expert_parallel_comm:
+                probs, routing_map = self.mlp.route(hidden_states)
+                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                nvtx_range_pop(suffix="mlp")
+                return residual, hidden_states, probs, shared_expert_output
             mlp_output_with_bias = self.mlp(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
