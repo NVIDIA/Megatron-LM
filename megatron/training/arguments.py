@@ -904,7 +904,7 @@ def validate_args(args, defaults={}):
 
     # Map string data-type to torch.dtype.
     dtype_map = {
-        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None,
+        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None, None: None,
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
@@ -1457,7 +1457,7 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
-        
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1509,7 +1509,6 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
@@ -1918,6 +1917,13 @@ def _add_inference_args(parser):
                        'block hash only. "longest_prefix" routes to the rank with '
                        'the longest matching prefix. "round_robin" ignores prefix '
                        'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
+                       type=float, default=0.5,
+                       dest='inference_dynamic_batching_prefix_caching_routing_alpha',
+                       help='Weight for prefix-aware routing score: '
+                       'score = alpha * match + (1 - alpha) * normalized_load. '
+                       'Higher alpha favors prefix cache hits; lower alpha '
+                       'favors load balance. Default: 0.5.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
@@ -2268,6 +2274,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-coefficient-type', type=str, default='quintic',
+                       help='Newton-Schulz coefficient type for the Muon optimizer. '
+                       'Valid types are discovered from the installed emerging_optimizers '
+                       'package (e.g. simple, quintic, polar_express, aol). '
+                       'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
@@ -2501,12 +2512,14 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'soap', "adaptive_muon", "lion"],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
+    group.add_argument('--optimizer-cuda-graph', action='store_true',
+                       help='Enable CUDA graph for optimizer step')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
@@ -2707,6 +2720,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
+                       help='List of param_name patterns (in Python\'s fnmatch format) to match against '
+                       'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
+                       'every parameter.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2717,9 +2734,6 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch param all-gathers simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_param_gather')
-    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
-                       help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
-                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
@@ -2735,7 +2749,7 @@ def _add_distributed_args(parser):
     group.add_argument('--create-all-gather-group', action='store_true',
                    help='Create a separate process group for all-gather operations '
                    'to overlap reduce-scatter and all-gather operations.')
-    group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
+    group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
     group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',

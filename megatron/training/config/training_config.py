@@ -67,6 +67,9 @@ class TrainingConfig:
     exit_signal_handler_for_dataloader: bool = False
     """Use signal handler for dataloader workers"""
 
+    exit_signal_handler_for_training: bool = False
+    """Shutdown the training when SIGINT or SIGTERM received to avoid unclear traceback"""
+
     manual_gc: bool = False
     """Disable the threshold-based default garbage collector and trigger the garbage collection
     manually. Manual garbage collection helps to align the timing of the collection across ranks
@@ -441,6 +444,9 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
+    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
+    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
@@ -523,3 +529,15 @@ class CheckpointConfig:
 
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
+
+    def __post_init__(self):
+        from megatron.training.utils import has_nvrx_installed
+
+        assert self.async_strategy in ["nvrx", "mcore"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+            assert has_nvrx_installed(), (
+                "nvidia-resiliency-ext is not installed. "
+                "Please, install nvidia-resiliency-ext to enable async save."
+            )

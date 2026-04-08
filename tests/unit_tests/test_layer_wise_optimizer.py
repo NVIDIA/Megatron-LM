@@ -10,9 +10,8 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -118,19 +117,14 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=use_layer_wise,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=use_layer_wise,
-            pg_collection=pg_collection,
-        )
+        optimizer = get_megatron_optimizer(optimizer_config, [model], pg_collection=pg_collection)
         return model, optimizer, pg_collection
 
     def create_model_and_optimizer_with_overlap_param_gather(
@@ -146,7 +140,7 @@ class TestLayerWiseOptimizer:
         """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
 
         This variant sets overlap_param_gather=True in DDP config and uses
-        get_megatron_muon_optimizer with layer_wise_distributed_optimizer=True,
+        get_megatron_optimizer with layer_wise_distributed_optimizer=True,
         enabling the bucket-based async param gather path.
 
         Args:
@@ -191,17 +185,17 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             overlap_param_gather=async_allgather,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_muon_optimizer(
+        optimizer = get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=[model],
             use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=True,
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
@@ -350,8 +344,34 @@ class TestLayerWiseOptimizer:
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
-        # get_megatron_muon_optimizer produces muon + adam chained optimizers
-        assert len(optimizer.chained_optimizers) >= 2, "Should have multiple chained optimizers"
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=False
+        )
+
+        # Split parameters into two groups for testing multiple optimizers
+        params = list(model.parameters())
+        mid_point = len(params) // 2
+        param_groups_1 = [{'params': params[:mid_point]}]
+        param_groups_2 = [{'params': params[mid_point:]}]
+
+        # Create two separate plain base optimizers (LayerWise wraps them itself)
+        base_optimizer_1 = torch.optim.Adam(param_groups_1, lr=optimizer_config.lr)
+        base_optimizer_2 = torch.optim.Adam(param_groups_2, lr=optimizer_config.lr)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+
+        optimizer = LayerWiseDistributedOptimizer(
+            [base_optimizer_1, base_optimizer_2], optimizer_config, pg_collection
+        )
+
+        assert len(optimizer.chained_optimizers) == 2, "Should have two chained optimizers"
 
         # Set gradients and test optimizer step - this will trigger allgather
         for param in model.parameters():
@@ -391,7 +411,7 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        # Create muon optimizer (non-layer-wise) — produces Float16-wrapped chained optimizers
+        # Create optimizer (non-layer-wise) — produces Float16-wrapped chained optimizers
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -399,12 +419,8 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             muon_tp_mode="duplicated",
         )
-        muon_optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
-            pg_collection=pg_collection,
+        muon_optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Extract a Float16-wrapped chained optimizer
@@ -412,7 +428,6 @@ class TestLayerWiseOptimizer:
         assert isinstance(wrapped_optimizer, Float16OptimizerWithFloat16Params)
 
         # Should raise TypeError when receiving already-wrapped Float16 optimizer
-        # Use a fresh config since get_megatron_muon_optimizer mutates config.optimizer
         lw_config = OptimizerConfig(
             optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=False
         )
