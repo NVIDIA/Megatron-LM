@@ -48,9 +48,10 @@ except ImportError:
     triton_append_key_value_cache = None
 
 try:
-    from .kernels.token_setup_kernel import triton_token_setup
+    from .kernels.token_setup_kernel import triton_find_chunked_prefill, triton_token_setup
 except ImportError:
     triton_token_setup = None
+    triton_find_chunked_prefill = None
 
 try:
     from .kernels.tensor_reorder_kernel import triton_move_bookkeeping, triton_swap_bookkeeping
@@ -3061,42 +3062,62 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.
-        if (
-            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=False)
-        ) != -1:
-            if chunked_prefill_request_idx < self.total_request_count:
-                # Chunked prefill request was active this step.
-                # Swap to the end of active, then hide it out of bounds.
-                self._swap_book_keeping_tensors(
-                    src_idxs=torch.tensor(
-                        [chunked_prefill_request_idx], device=self.request_ids.device
-                    ),
-                    dst_idxs=torch.tensor(
-                        [self.total_request_count - 1], device=self.request_ids.device
-                    ),
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
+        if self.chunked_prefill_request_id != -1:
+            if triton_find_chunked_prefill is not None:
+                found_idx, is_in_bounds, swap_src, swap_dst = triton_find_chunked_prefill(
+                    request_ids=self.request_ids,
+                    chunked_prefill_request_id=self.chunked_prefill_request_id,
+                    total_request_count=self.total_request_count,
+                    search_limit=self.max_requests,
                 )
-
-                # Explicitly decrement the active and total request counts here so that the chunked
-                # prefill request metadata is not updated. This will all be restored when the next
-                # chunk is added through add_request.
-                active_request_count -= 1
-                self.total_request_count -= 1
+                if found_idx >= 0:
+                    if is_in_bounds:
+                        self._swap_book_keeping_tensors(
+                            src_idxs=swap_src.to(torch.long),
+                            dst_idxs=swap_dst.to(torch.long),
+                            next_tokens=next_tokens,
+                            new_speculative_tokens=new_speculative_tokens,
+                        )
+                        active_request_count -= 1
+                        self.total_request_count -= 1
+                    elif found_idx != self.total_request_count:
+                        self._swap_book_keeping_tensors(
+                            src_idxs=swap_src.to(torch.long),
+                            dst_idxs=swap_dst.to(torch.long),
+                            next_tokens=None,
+                            new_speculative_tokens=None,
+                        )
             else:
-                # Chunked prefill request was inactive/hidden this step.
-                # Pull it to the new boundary so it doesn't drift.
-                if chunked_prefill_request_idx != self.total_request_count:
-                    self._swap_book_keeping_tensors(
-                        src_idxs=torch.tensor(
-                            [chunked_prefill_request_idx], device=self.request_ids.device
-                        ),
-                        dst_idxs=torch.tensor(
-                            [self.total_request_count], device=self.request_ids.device
-                        ),
-                        next_tokens=None,  # Do not swap next_tokens as these indices are out of bounds
-                        new_speculative_tokens=None,
-                    )
+                chunked_prefill_request_idx = self.get_index_of_chunked_prefill_request(
+                    safe=False
+                )
+                if chunked_prefill_request_idx != -1:
+                    if chunked_prefill_request_idx < self.total_request_count:
+                        self._swap_book_keeping_tensors(
+                            src_idxs=torch.tensor(
+                                [chunked_prefill_request_idx], device=self.request_ids.device
+                            ),
+                            dst_idxs=torch.tensor(
+                                [self.total_request_count - 1], device=self.request_ids.device
+                            ),
+                            next_tokens=next_tokens,
+                            new_speculative_tokens=new_speculative_tokens,
+                        )
+                        active_request_count -= 1
+                        self.total_request_count -= 1
+                    else:
+                        if chunked_prefill_request_idx != self.total_request_count:
+                            self._swap_book_keeping_tensors(
+                                src_idxs=torch.tensor(
+                                    [chunked_prefill_request_idx],
+                                    device=self.request_ids.device,
+                                ),
+                                dst_idxs=torch.tensor(
+                                    [self.total_request_count], device=self.request_ids.device
+                                ),
+                                next_tokens=None,
+                                new_speculative_tokens=None,
+                            )
 
         if self._time_update_requests:
             _se[5][1].record()

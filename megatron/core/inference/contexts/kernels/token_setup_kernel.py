@@ -2,6 +2,7 @@
 
 from typing import Optional
 
+import torch
 from torch import Tensor
 
 try:
@@ -186,3 +187,78 @@ def triton_token_setup(
     )
 
     return active_token_count
+
+
+@triton.jit
+def _find_chunked_prefill_kernel(
+    request_ids_ptr,
+    chunked_prefill_request_id: tl.int32,
+    total_request_count: tl.int32,
+    found_idx_ptr,
+    is_in_bounds_ptr,
+    swap_src_ptr,
+    swap_dst_ptr,
+    search_limit: tl.int32,
+):
+    """Find the chunked prefill request and compute swap indices. Grid: (1,)."""
+    found = -1
+    i = 0
+    while i < search_limit:
+        rid = tl.load(request_ids_ptr + i)
+        if rid == chunked_prefill_request_id:
+            found = i
+            i = search_limit  # break
+        else:
+            i += 1
+
+    tl.store(found_idx_ptr, found)
+
+    if found >= 0:
+        if found < total_request_count:
+            # Path A: in-bounds → swap to total_request_count - 1
+            tl.store(is_in_bounds_ptr, 1)
+            tl.store(swap_src_ptr, found)
+            tl.store(swap_dst_ptr, total_request_count - 1)
+        else:
+            # Path B: out-of-bounds → slide to total_request_count
+            tl.store(is_in_bounds_ptr, 0)
+            tl.store(swap_src_ptr, found)
+            tl.store(swap_dst_ptr, total_request_count)
+    else:
+        tl.store(is_in_bounds_ptr, 0)
+
+
+def triton_find_chunked_prefill(
+    request_ids: Tensor,
+    chunked_prefill_request_id: int,
+    total_request_count: int,
+    search_limit: int,
+) -> tuple:
+    """Find chunked prefill request index and compute swap indices.
+
+    Returns:
+        (found_idx, is_in_bounds, swap_src, swap_dst)
+    """
+    device = request_ids.device
+    found_idx_buf = torch.tensor([-1], dtype=torch.int32, device=device)
+    is_in_bounds_buf = torch.zeros(1, dtype=torch.int32, device=device)
+    swap_src_buf = torch.zeros(1, dtype=torch.int32, device=device)
+    swap_dst_buf = torch.zeros(1, dtype=torch.int32, device=device)
+
+    _find_chunked_prefill_kernel[(1,)](
+        request_ids,
+        chunked_prefill_request_id,
+        total_request_count,
+        found_idx_buf,
+        is_in_bounds_buf,
+        swap_src_buf,
+        swap_dst_buf,
+        search_limit,
+    )
+
+    return (
+        found_idx_buf.item(),
+        is_in_bounds_buf.item(),
+        swap_src_buf,
+        swap_dst_buf,
+    )
