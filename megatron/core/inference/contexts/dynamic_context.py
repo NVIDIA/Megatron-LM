@@ -64,6 +64,12 @@ except ImportError:
     triton_classify_and_release = None
 
 try:
+    from .kernels.block_pause_resume_kernel import triton_detect_pause, triton_resume_and_allocate
+except ImportError:
+    triton_detect_pause = None
+    triton_resume_and_allocate = None
+
+try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -2453,23 +2459,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
         resume_request_count = 0
-        if self.paused_request_count > 0:
+        if triton_resume_and_allocate is not None and self.paused_request_count > 0:
+            resume_request_count = triton_resume_and_allocate(
+                last_kv_block_offset=self.request_last_kv_block_offset,
+                request_to_kv_block_ids=self.request_to_kv_block_ids,
+                request_kv_block_counts=self.request_kv_block_counts,
+                request_last_kv_block_id=self.request_last_kv_block_id,
+                block_bag=self.kv_block_allocator.block_bag,
+                total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                paused_request_count=self.paused_request_count,
+                active_request_count=active_request_count,
+                active_block_avail=self.kv_block_allocator.get_active_avail(),
+                block_size_tokens=self.block_size_tokens,
+                num_speculative_tokens=self.num_speculative_tokens,
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+            )
+        elif self.paused_request_count > 0:
             active_block_count_avail = self.kv_block_allocator.get_active_avail()
-            # Clone not needed: flip() makes a copy.
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-            # Flip counts before cumsum, since paused requests are resumed from
-            # the right-most index, so we must count resumed blocks starting from
-            # the right side.
             paused_block_counts = paused_block_counts.flip(dims=[0])
 
-            # Check which paused requests will actually need a new block upon resuming
             offsets = self.request_last_kv_block_offset[: self.paused_request_count]
             needs_new_block = (
                 offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).to(paused_block_counts.dtype)
             needs_new_block = needs_new_block.flip(dims=[0])
 
-            # Add +1 ONLY to the block counts of requests that finished their previous memory block
             paused_block_counts += needs_new_block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
@@ -2477,7 +2493,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.total_avail,
             )
 
-            # Constrain resumptions by the maximum allowed active requests and tokens
             max_allowed_active = min(
                 self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
             )
@@ -2488,11 +2503,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
-        if resume_request_count > 0:
+        # (Triton path handles allocation inside the kernel; Python path does it here)
+        if triton_resume_and_allocate is None and resume_request_count > 0:
             resume_start = self.paused_request_count
             resume_end = self.paused_request_count + resume_request_count
 
-            # Check which resumed requests actually need a new block
             offsets = self.request_last_kv_block_offset[resume_start:resume_end]
             needs_new_block = offsets >= (self.block_size_tokens - 1 - self.num_speculative_tokens)
             num_new_blocks = needs_new_block.sum().item()
@@ -2501,7 +2516,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 assert num_new_blocks <= self.kv_block_allocator.total_avail
                 block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
 
-                # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
                 row_idx = resume_start + relative_row_idx
                 col_idx = self.request_kv_block_counts[row_idx]
