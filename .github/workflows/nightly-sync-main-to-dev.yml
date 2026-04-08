@@ -130,6 +130,9 @@ jobs:
             - `megatron/training/utils.py` (references dev-only args)
             - `megatron/training/datasets/data_samplers.py` (references dev-only args)
             - `megatron/core/optimizer/layer_wise_optimizer.py` (constructor signature)
+            - `megatron/core/datasets/data_schedule.py` (main's `training.py`
+              imports `HybridCPDataLoaderWrapper` which only exists in main's
+              version; dev's version has completely different classes)
 
             Use: `git checkout origin/main -- <file>` for each.
 
@@ -142,6 +145,12 @@ jobs:
 
             After editing imports in any Python files, run `isort` on those files
             (see CLAUDE.md).
+
+            **After formatting, run pylint on all changed `megatron/core/` files**
+            to catch missing-docstring and line-too-long violations before
+            pushing. Fix any violations found — e.g. the merge often introduces
+            pylint issues in `megatron/core/optimizer/grad_scaler.py` (missing
+            docstrings on abstract methods, long lines in docstrings).
 
             Commit everything and push the branch.
 
@@ -164,12 +173,15 @@ jobs:
             1. Get the HEAD commit SHA and comment on the PR:
                `/ok to test <SHA>`
             2. Wait for the `CICD Megatron-LM` workflow run on branch
-               `pull-request/<PR_NUMBER>` to complete. Poll the GitHub API every
-               5 minutes.
+               `pull-request/<PR_NUMBER>` to complete. Poll the GitHub API
+               every 2 minutes, checking for individual job failures as they
+               happen (don't wait for the entire run to finish). Use:
+               `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
+               and check for jobs with `conclusion == "failure"`.
             3. If the run **succeeded** → go to Phase 4.
-            4. If the run **failed** → investigate and fix:
-               - List failed jobs with `gh run view`.
-               - For each failed job, fetch its logs via `gh api repos/.../actions/jobs/<id>/logs`.
+            4. If any job **failed** → investigate and fix immediately:
+               - Fetch the failed job's logs via
+                 `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs`.
                - Grep for `ImportError`, `ModuleNotFoundError`, `FAILED`,
                  `would reformat`, `line-too-long`, `Traceback`, etc.
                - Read the error, understand the root cause, and fix the code.
@@ -178,7 +190,10 @@ jobs:
                    class from a shared file where we took main's version. Fix by
                    checking whether the class was moved, renamed, or needs to be
                    kept from dev's version of that file. Be surgical — restore only
-                   the missing class/function, not the entire file.
+                   the missing class/function, not the entire file. If a file's
+                   classes are completely different between main and dev (like
+                   `data_schedule.py`), take main's version entirely and note it
+                   as a new override candidate for Phase 1.
                  - **black / pylint formatting**: Run `black --config pyproject.toml`
                    on the offending files. For pylint long-line or
                    missing-docstring, edit the file directly.
