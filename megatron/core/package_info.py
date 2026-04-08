@@ -12,7 +12,7 @@ VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
 __shortversion__ = '.'.join(map(str, VERSION[:3]))
 __version__ = '.'.join(map(str, VERSION[:3])) + ''.join(VERSION[3:])
 
-import os as _os
+import os as _os  # noqa: I001
 import subprocess as _subprocess
 
 
