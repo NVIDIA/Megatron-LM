@@ -103,7 +103,7 @@ class TestDynamicInference:
         Utils.destroy_model_parallel()
 
     def _build_model(self):
-        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_rng_reset=True)
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
             num_layers=3,
             mtp_hybrid_override_pattern="ME*",
