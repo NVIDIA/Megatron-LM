@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator
 from typing import Generic, TypeVar
 
@@ -300,13 +301,26 @@ class GroupedRolloutGenerator(Agent, ABC):
 
 
 class RolloutStream(AsyncIterator):
-    """Wrapper around an async generator that supports non-blocking drain."""
+    """Wrapper around an async generator that supports non-blocking drain.
+
+    Items pulled by `drain` are stored in an internal buffer.
+    `__anext__` consumes from the buffer first, so you can drain, check `.buffered`,
+    and the items are still available for normal iteration.
+    """
 
     def __init__(self, inner):
         self._inner = inner
+        self._buffer: deque[RolloutGroup] = deque()
         self._pending_task = None
 
+    @property
+    def buffered(self):
+        """Number of items sitting in the internal buffer."""
+        return len(self._buffer)
+
     async def __anext__(self):
+        if self._buffer:
+            return self._buffer.popleft()
         if self._pending_task is not None:
             task = self._pending_task
             self._pending_task = None
@@ -314,12 +328,13 @@ class RolloutStream(AsyncIterator):
         return await self._inner.__anext__()
 
     async def aclose(self):
+        self._buffer.clear()
         if self._pending_task is not None:
             self._pending_task.cancel()
             self._pending_task = None
         await self._inner.aclose()
 
-    async def try_next(self):
+    async def _try_next(self):
         """Attempt to get next item without blocking."""
         assert self._pending_task is None, "previous pending task not consumed"
         inner_task = asyncio.ensure_future(self._inner.__anext__())
@@ -332,14 +347,16 @@ class RolloutStream(AsyncIterator):
             return None
 
     def drain(self, n, loop):
-        """Synchronously drain up to n items."""
-        items = []
-        for _ in range(n):
-            item = loop.run_until_complete(self.try_next())
+        """Pull up to n items into the internal buffer.
+
+        Stops at the first item that isn't available. Returns the total number of buffered items.
+        """
+        while self.buffered < n:
+            item = loop.run_until_complete(self._try_next())
             if item is None:
                 break
-            items.append(item)
-        return items
+            self._buffer.append(item)
+        return self.buffered
 
 
 class EvaluationAgent(Agent, ABC):

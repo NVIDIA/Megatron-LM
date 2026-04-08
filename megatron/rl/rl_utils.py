@@ -478,6 +478,52 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     return _ROLLOUT_GENERATOR
 
 
+def need_environment_rollouts(
+    buffered_rollouts,
+    iteration,
+    runtime_state,
+    grpo_iterations,
+    grpo_prompts_per_step,
+    grpo_group_size,
+    global_batch_size,
+    partial_rollouts
+):
+    """Determine whether get_environment_rollouts (inference) must be called.
+
+    When partial rollouts are enabled, speculatively drain rank 0's RolloutStream
+    in an attempt to obtain enough groups so that inference does not have to be run.
+    The verdict of whether or not inference is needed must be broadcast from rank 0.
+
+    Returns:
+        (need_new_rollouts, need_inference):
+            need_new_rollouts denotes whether we should enter get_environment_rollouts.
+            need_inference denotes whether we should enter colocated_inference to collect rollouts.
+    """
+    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
+    if not (
+        buffered_rollouts is None or
+        iteration == runtime_state.last_collection_iteration +
+        (grpo_iterations * global_batches_per_collection)
+    ):
+        return False, False
+
+    if not partial_rollouts or _ROLLOUT_GENERATOR is None:
+        return True, True
+
+    rank = torch.distributed.get_rank()
+    loop = get_asyncio_loop()
+
+    has_enough = False
+    if rank == 0:
+        _ROLLOUT_GENERATOR.drain(grpo_prompts_per_step, loop)
+        has_enough = _ROLLOUT_GENERATOR.buffered >= grpo_prompts_per_step
+
+    flag = torch.tensor([has_enough], device='cuda', dtype=torch.bool)
+    torch.distributed.broadcast(flag, src=0)
+
+    return True, not flag.item()
+
+
 def colocated_inference(model, inference_model, optimizer, n_prompts, samples_per_group, rank):
     """Enter inference mode and collect rollouts via the colocated inference engine.
 
@@ -516,6 +562,10 @@ def colocated_inference(model, inference_model, optimizer, n_prompts, samples_pe
             )
     else:
         inference_model = model
+
+    inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
+    pg_size = get_pg_size(inference_pg_collection.ep)
+    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
     rollouts = None
     with nvtx_range("rl/rollout-collection", time=True):
@@ -572,75 +622,45 @@ def get_environment_rollouts(
     optimizer: MegatronOptimizer,
     n_prompts: int,
     samples_per_group: int,
+    run_inference: bool,
 ):
-    """Obtain rollouts and broadcast them to all ranks.
+    """Collect rollouts and broadcast to all ranks.
 
-    This method is only called when non-zero ranks have insufficient rollouts in their buffer.
-    The first check this method does is whether rank 0 has sufficient pre-generated rollouts.
-        If not, then we sample rollouts from the LLM and broadcast them to all ranks.
-        If yes, we skip the rollout sampling and directly broadcast the buffer to all ranks.
-
-    `colocated_inference` is a helper that handles all of the details of using inference mode.
-    `get_environment_rollouts` is only responsible for getting rollouts to all ranks, which may
-        sometimes involve using `colocated_inference`, but not necessarily.
+    When `run_inference` is True, uses colocated_inference to collect rollouts through inference.
+    Otherwise, obtains buffered rollouts from the RolloutStream.
 
     Args:
         model: Model to sample from.
         inference_model: Inference model to use for inference.
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
+        run_inference: Whether to run colocated inference or consume buffered rollouts.
 
     Returns:
         GroupedRollouts object which is a nested list
         where each element being a list of rollouts of a group.
     """
-    args = get_args()
     nvtx_range = get_nvtx_range()
     # NOTE(jbarker): we need to double check this when using PP>1
     rank = torch.distributed.get_rank()
 
-    inference_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    pg_size = get_pg_size(inference_pg_collection.ep)
-    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
-
-    fast_drained = False
-
-    # Fast path: when partial rollouts are enabled and the generator already has
-    # pre-generated groups buffered, drain them without entering inference mode
-    # (skips optimizer offload, weight swap, CUDA graph toggle, etc.).
-    if args.rl_partial_rollouts and _ROLLOUT_GENERATOR is not None:
-        loop = get_asyncio_loop()
-        if rank == 0:
-            drained = _ROLLOUT_GENERATOR.drain(n_prompts, loop)
-            fast_drained = len(drained) >= n_prompts
-        # All ranks must agree on the path (full inference has collective ops)
-        flag = torch.tensor([fast_drained], device='cuda', dtype=torch.bool)
-        torch.distributed.broadcast(flag, src=0)
-        fast_drained = flag.item()
-
-        if fast_drained and rank == 0:
-            rollouts = drained[:n_prompts]
-
-    if not fast_drained:
+    if run_inference:
         rollouts = colocated_inference(
             model, inference_model, optimizer, n_prompts, samples_per_group, rank
         )
+    else:
+        loop = get_asyncio_loop()
+        rollouts = None
+        if rank == 0:
+            rollouts = [
+                loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
+            ]
 
-    # Shared broadcast + return path (used by both fast drain and full inference)
     if rank != 0:
         rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
     with nvtx_range("rl/sync-rollouts", time=True):
         torch.distributed.broadcast_object_list(rollouts, src=0)
     logger.debug(f"Got rollouts on rank {rank}")
-
-    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-        with open(
-            lang_rl_log_dir
-            + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.json',
-            'w',
-        ) as f:
-            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1615,17 +1635,35 @@ def get_grpo_data_iterator(
     runtime_state = get_rl_runtime_state()
     tokenizer = get_tokenizer()
 
-    # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
-    if (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration +
-        (grpo_iterations * global_batches_per_collection)
-    ):
+    args = get_args()
+    need_new_rollouts, need_infer = need_environment_rollouts(
+        buffered_rollouts,
+        iteration,
+        runtime_state,
+        grpo_iterations,
+        grpo_prompts_per_step,
+        grpo_group_size,
+        global_batch_size,
+        args.rl_partial_rollouts,
+    )
 
+    if need_new_rollouts:
         rollouts = get_environment_rollouts(
-            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size, need_infer,
         )
+
+        rank = torch.distributed.get_rank()
+        actual_inference_model = inference_model if inference_model is not None else model
+        inference_pg_collection = get_attr_wrapped_model(actual_inference_model[0], "pg_collection")
+        if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
+            with open(
+                lang_rl_log_dir
+                + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
+                + f'{Path(args.langrl_env_config).stem}.json',
+                'w',
+            ) as f:
+                json.dump([[r.model_dump() for r in group] for group in rollouts], f)
+
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,

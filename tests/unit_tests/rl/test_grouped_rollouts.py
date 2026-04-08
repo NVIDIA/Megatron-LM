@@ -140,11 +140,12 @@ class TestGroupedRollouts:
             assert sub_req.streaming == request.streaming
 
 
-    @pytest.mark.parametrize("buffered_groups, expect_colocated_call", [
-        pytest.param(6, False, id="drain_sufficient_skips_inference"),
-        pytest.param(1, True, id="drain_insufficient_calls_inference"),
+    @pytest.mark.parametrize("buffered_groups, partial_rollouts, expect_inference", [
+        pytest.param(6, True, False, id="drain_sufficient_skips_inference"),
+        pytest.param(1, True, True, id="drain_insufficient_calls_inference"),
+        pytest.param(6, False, True, id="non_partial_always_calls_inference"),
     ])
-    def test_get_environment_rollouts(self, buffered_groups, expect_colocated_call):
+    def test_get_environment_rollouts(self, buffered_groups, partial_rollouts, expect_inference):
         n_prompts = 4
 
         async def gen():
@@ -157,7 +158,7 @@ class TestGroupedRollouts:
             return nullcontext()
 
         mock_args = MagicMock()
-        mock_args.rl_partial_rollouts = True
+        mock_args.rl_partial_rollouts = partial_rollouts
         mock_args.curr_iteration = 1
         mock_args.langrl_env_config = "test.yaml"
 
@@ -172,17 +173,24 @@ class TestGroupedRollouts:
                 get_asyncio_loop=MagicMock(return_value=loop),
                 get_attr_wrapped_model=MagicMock(return_value=MagicMock()),
                 get_pg_size=MagicMock(return_value=1),
-                get_pg_rank=MagicMock(return_value=0),
-                lang_rl_log_dir=None,
                 _ROLLOUT_GENERATOR=stream,
             ), patch('torch.distributed.get_rank', return_value=0), \
                patch('torch.distributed.broadcast'), \
                patch('torch.distributed.broadcast_object_list'):
+                # Mirror the call pattern in get_grpo_data_iterator.
+                need_new, need_inference = rl_utils.need_environment_rollouts(
+                    None, 0, MagicMock(last_collection_iteration=0),
+                    grpo_iterations=1, grpo_prompts_per_step=n_prompts,
+                    grpo_group_size=1, global_batch_size=1,
+                    partial_rollouts=partial_rollouts,
+                )
+                assert need_new
                 rollouts = rl_utils.get_environment_rollouts(
                     model=[MagicMock()], inference_model=None,
                     optimizer=MagicMock(), n_prompts=n_prompts, samples_per_group=1,
+                    run_inference=need_inference,
                 )
-                assert mock_colocated.called == expect_colocated_call
+                assert mock_colocated.called == expect_inference
                 assert len(rollouts) == n_prompts
         finally:
             loop.run_until_complete(stream.aclose())
