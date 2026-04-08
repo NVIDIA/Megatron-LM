@@ -1406,7 +1406,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     elif config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
