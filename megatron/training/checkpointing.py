@@ -1509,6 +1509,8 @@ def load_args_from_checkpoint(
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_single_grouped_weight', force=True)
+    _set_arg('moe_single_grouped_bias', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
