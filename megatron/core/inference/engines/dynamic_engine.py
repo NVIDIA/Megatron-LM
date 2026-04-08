@@ -872,9 +872,11 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         # --- Compute optimal parameters ---
+        reserved_gb = getattr(self.context.config, 'autotune_reserved_gb', 0.0)
         new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
             profile, tp_size=tp_size,
             request_rounder=DynamicInferenceContext.REQUEST_ROUNDER,
+            reserved_memory_bytes=int(reserved_gb * (1024 ** 3)),
         )
 
         # All ranks must use the same tuned parameters to avoid NCCL

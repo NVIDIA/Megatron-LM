@@ -112,7 +112,7 @@ class TestAutotune:
         )
 
         # Budget: CG pool + runtime overhead + metadata + buffer must fit in gpu_free
-        gpu_free = (profile.gpu_total_bytes - profile.memory_after_model_load_bytes) * 0.95
+        gpu_free = profile.gpu_total_bytes - profile.memory_after_model_load_bytes
         activation_table = _build_activation_interpolator(
             profile.token_counts, profile.peak_activation_bytes
         )

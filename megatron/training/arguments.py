@@ -1857,6 +1857,11 @@ def _add_inference_args(parser):
                        help='Automatically tune inference memory parameters '
                        '(buffer_size_gb, mamba_memory_ratio, max_requests, '
                        'max_tokens) based on available GPU memory.')
+    group.add_argument('--inference-dynamic-batching-autotune-reserved-gb',
+                       type=float, default=0.0,
+                       help='GPU memory (GB) to reserve for non-inference use '
+                       '(e.g., RL training optimizer states and gradients). '
+                       'Subtracted from the autotune memory budget.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
                        help='Amount of on-GPU memory allocated for the KV cache. '

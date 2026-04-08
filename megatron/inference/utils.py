@@ -334,6 +334,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         autotune=getattr(args, 'inference_dynamic_batching_autotune', False),
+        autotune_reserved_gb=getattr(args, 'inference_dynamic_batching_autotune_reserved_gb', 0.0),
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
             if args.cuda_graph_impl == "local"

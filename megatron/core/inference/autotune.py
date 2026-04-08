@@ -94,7 +94,7 @@ def compute_optimal_params(
     profile: AutotuneProfile,
     tp_size: int = 1,
     request_rounder: int = 4,
-    safety_margin_fraction: float = 0.05,
+    reserved_memory_bytes: int = 0,
 ) -> Tuple[int, int, float]:
     """Solve for optimal (max_requests, max_tokens, buffer_size_gb) from profiling data.
 
@@ -107,10 +107,9 @@ def compute_optimal_params(
         profile: Profiling data from CUDA graph warmup.
         tp_size: Tensor parallel size (for alignment).
         request_rounder: Request count alignment (typically 4).
-        safety_margin_fraction: Fraction of free GPU memory to reserve for
-            TMS VMM overhead and allocator fragmentation. Defaults to 0.05
-            (5%). Runtime overhead from sampling and log-probs is computed
-            separately and added on top.
+        reserved_memory_bytes: Bytes to reserve for non-inference use (e.g.,
+            RL training optimizer states, gradients, caching allocator
+            headroom). Subtracted from the available GPU memory budget.
 
     Returns:
         (max_requests, max_tokens, buffer_size_gb) tuple.
@@ -123,19 +122,17 @@ def compute_optimal_params(
     if not activation_table:
         raise ValueError("No profiling data collected during autotune")
 
-    # Available GPU memory = total - model weights (approximated by memory
-    # used after model load, before context allocation).
+    # Available GPU memory = total - model weights - reserved.
     gpu_free_raw = profile.gpu_total_bytes - profile.memory_after_model_load_bytes
-    safety_margin = int(gpu_free_raw * safety_margin_fraction)
-    gpu_free = gpu_free_raw - safety_margin
+    gpu_free = gpu_free_raw - reserved_memory_bytes
 
     logging.info(
         "Autotune: GPU total %d MB, after model load %d MB, "
-        "free %d MB (reserving %d MB safety margin = %d MB usable)",
+        "free %d MB (reserving %d MB = %d MB usable)",
         profile.gpu_total_bytes // (1024 ** 2),
         profile.memory_after_model_load_bytes // (1024 ** 2),
         gpu_free_raw // (1024 ** 2),
-        safety_margin // (1024 ** 2),
+        reserved_memory_bytes // (1024 ** 2),
         gpu_free // (1024 ** 2),
     )
     logging.info(
