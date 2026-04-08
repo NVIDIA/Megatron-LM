@@ -22,23 +22,25 @@ class MegatronGradScaler(ABC):
 
     @property
     def scale(self):
+        """Return the current loss scale."""
         return self._scale
 
     @property
     def inv_scale(self):
+        """Return the inverse of the current loss scale."""
         return self._scale.double().reciprocal().float()
 
     @abstractmethod
     def update(self, found_inf: bool):
-        pass
+        """Update the loss scale based on whether inf was found."""
 
     @abstractmethod
     def state_dict(self):
-        pass
+        """Return the state dict for checkpointing."""
 
     @abstractmethod
     def load_state_dict(self, state_dict: Dict):
-        pass
+        """Load state dict from a checkpoint."""
 
 
 class ConstantGradScaler(MegatronGradScaler):
@@ -91,19 +93,7 @@ class DynamicGradScaler(MegatronGradScaler):
         growth_interval: int,
         hysteresis: int,
     ):
-        """
-        Grad scaler with dynamic scale that gets adjusted during training.
-
-        Args:
-            initial_scale (float): Initial loss scale value.
-            min_scale (float): Minimum loss scale value.
-            growth_factor (float): Factor to grow loss scale by if NaNs are not seen in `growth_interval`
-                training iterations. Must be greater than 1.
-            backoff_factor (float): Factor to decrease loss scale by if NaNs are seen in `hysteresis`
-                consecutive training iterations. Must be between 0 and 1.
-            growth_interval (int): Number of training iterations of no NaNs before loss scale is increased.
-            hysteresis (int): Number of training iterations of consecutive NaNs before loss scale is decreased.
-        """
+        """Initialize dynamic grad scaler with the given parameters."""
         super(DynamicGradScaler, self).__init__(initial_scale)
 
         # Lower bound on the scale.
