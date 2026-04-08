@@ -62,6 +62,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading": False,
     "cpu_offloading_activations": True,
     "cpu_offloading_double_buffering": False,
+    "cpu_offloading_retain_pinned_cpu_buffers": False,
     "cpu_offloading_num_layers": 0,
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
@@ -74,6 +75,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
@@ -113,6 +115,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
     "fp8_wgrad": True,
+    "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
@@ -281,8 +284,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
-    "inference_disable_torch_grouped_mm": False,
     "inference_disable_triton_nvls_kernels": False,
+    "moe_router_force_biased": None,
+    "inference_grouped_gemm_backend": "auto",
+    "inference_moe_disable_fused_quant_kernels": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
