@@ -1853,8 +1853,11 @@ class CudaGraphManager(torch.nn.Module):
                     return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         self.is_first_microbatch = False
-        # If forward only, next replay should be a forward pass as well
-        if is_inference_mode or not torch.is_grad_enabled():
+        # If forward only, next replay should be a forward pass as well.
+        # During warmup passes (fwd_graph_recorded is False), no _CudagraphRecordNode is inserted
+        # so no backward hook will reset the status. Keep FWD_READY so the same runner is reused
+        # across microbatches and _eager_warmup_pass_count accumulates correctly.
+        if is_inference_mode or not torch.is_grad_enabled() or not runner.fwd_graph_recorded:
             runner.status = _GraphStatus.FWD_READY
         else:
             runner.status = _GraphStatus.BWD_READY
