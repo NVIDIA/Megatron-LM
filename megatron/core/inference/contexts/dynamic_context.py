@@ -551,6 +551,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
+        # When a model uses both EP and Mamba, there are conflicting requirements for the
+        # token_count sync between different ranks.
+        # In order to fix this, we must prevent the request scheduler from using all `max_requests`
+        # requests slots, in order reserve extra slots.
+        model_sync_needs_reservation = (
+            self.expert_model_parallel_group is not None
+            and get_pg_size(self.expert_model_parallel_group) > 1
+            and self.is_hybrid_model
+        )
+        # One extra slot is sufficient for eager mode.
+        # `cuda_graph_mixed_prefill_count` extra slots are needed for graphed mode.
+        prefill_reservation = (
+            (inference_config.cuda_graph_mixed_prefill_count or 1)
+            if model_sync_needs_reservation
+            else 0
+        )
+        self.max_schedulable_requests = self.max_requests - prefill_reservation
+
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
         self.graph_attn_metadata = {}
@@ -1627,25 +1645,55 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only():
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
-                        self.max_requests, self.round_up_requests(self.num_decode_requests)
+                        self.max_schedulable_requests,
+                        self.round_up_requests(self.num_decode_requests),
                     )
-                    padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
+                    padded_token_count = min(
+                        self.max_tokens, padded_decode_req_count * (self.num_speculative_tokens + 1)
+                    )
                 else:
                     padded_token_count = min(
                         self.max_tokens,
-                        self.max_requests,
+                        self.max_schedulable_requests,
                         self.round_up_tokens(self.active_token_count),
                     )
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
                 )
                 padded_decode_req_count = self.num_decode_requests
                 padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
+            # Sync padded_token_count across EP ranks so that MoE all-to-all
+            # sees identical tensor sizes on every rank.
+            ep_group = self.expert_model_parallel_group
+            if ep_group is not None:
+                ep_size = get_pg_size(ep_group)
+                if ep_size > 1:
+                    sync_tensor = torch.tensor(
+                        [padded_token_count], dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    torch.distributed.all_reduce(
+                        sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+                    )
+                    padded_token_count = int(sync_tensor[0].item())
+
+            # Clamp to max_tokens; max_tokens may differ across EP ranks.
+            padded_token_count = min(padded_token_count, self.max_tokens)
+
+            # As discussed previously (see `model_sync_needs_reservation`),
+            # When a model uses both EP and Mamba, there are conflicting requirements.
+            # We must inject an extra phantom prefill to prevent tensor mismatches.
+            if self.is_hybrid_model:
+                decode_token_budget = padded_decode_req_count * (self.num_speculative_tokens + 1)
+                if padded_token_count > decode_token_budget and padded_prefill_req_count == 0:
+                    padded_prefill_req_count = 1
+
             self.padded_batch_dimensions = InferenceBatchDimensions(
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
@@ -1992,9 +2040,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
+        # Use max_schedulable_requests (which reserves extra slots for EP + Mamba).
         request_can_be_added = (
-            self.total_request_count < self.max_requests and self.paused_request_count == 0
+            self.total_request_count < self.max_schedulable_requests
+            and self.paused_request_count == 0
         )
 
         (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
