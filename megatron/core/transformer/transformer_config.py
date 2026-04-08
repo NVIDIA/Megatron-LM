@@ -1045,6 +1045,27 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
+    thd_cuda_graph_max_num_seqs: int = 32
+    """Maximum number of packed sequences per microbatch when using THD format with CUDA Graph.
+    cu_seqlens tensors will be padded to this size + 1."""
+
+    cuda_graph_dynamic_microbatches: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--cuda-graph-dynamic-microbatches"]}},
+    )
+    """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
+    number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
+    When enabled, capture builds a bounded number of graph slots and replay maps real
+    microbatch_id to slot_id by modulo."""
+
+    cuda_graph_num_microbatch_slots: Optional[int] = field(
+        default=None,
+        metadata={"argparse_meta": {"arg_names": ["--cuda-graph-num-microbatch-slots"]}},
+    )
+    """Number of CUDA graph slots to capture per layer for dynamic microbatch replay.
+    If None, an automatic slot count is derived from the PP/VPP schedule topology.
+    If set, the provided value must be >= the automatically derived safe minimum."""
+
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -2564,6 +2585,23 @@ class TransformerConfig(ModelParallelConfig):
                             self.cuda_graph_modules.append(CudaGraphModule.moe_router)
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
+
+                if self.cuda_graph_impl == "transformer_engine":
+                    if self.cuda_graph_dynamic_microbatches:
+                        if self.cuda_graph_num_microbatch_slots is not None:
+                            assert self.cuda_graph_num_microbatch_slots >= 1, (
+                                "cuda_graph_num_microbatch_slots must be >= 1 when "
+                                "cuda_graph_dynamic_microbatches is enabled."
+                            )
+                else:
+                    assert not self.cuda_graph_dynamic_microbatches, (
+                        "cuda_graph_dynamic_microbatches is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
+                    assert self.cuda_graph_num_microbatch_slots is None, (
+                        "cuda_graph_num_microbatch_slots is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
 
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
