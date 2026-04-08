@@ -22,7 +22,7 @@ def get_model_and_buffers(
     bias: bool,
     shared_embedding: bool,
     bucket_size: int,
-    use_distributed_optimizer: bool,
+    use_element_wise_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,
     num_distributed_optimizer_instances: int = 1,
@@ -31,7 +31,7 @@ def get_model_and_buffers(
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=grad_reduce_in_fp32,
-        use_distributed_optimizer=use_distributed_optimizer,
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
@@ -60,11 +60,14 @@ def get_model_and_buffers(
 
 
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
-@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("use_element_wise_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shared_embedding", [False, True])
 def test_bucket_sizes(
-    bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
+    bucket_size: Optional[int],
+    use_element_wise_distributed_optimizer: bool,
+    bias: bool,
+    shared_embedding: bool,
 ):
     Utils.initialize_model_parallel()
 
@@ -82,7 +85,7 @@ def test_bucket_sizes(
         bias=bias,
         shared_embedding=shared_embedding,
         bucket_size=bucket_size,
-        use_distributed_optimizer=use_distributed_optimizer,
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer,
         overlap_grad_reduce=True,
         average_in_collective=False,
     )
@@ -95,7 +98,7 @@ def test_bucket_sizes(
     ]
 
     def _pad_if_needed(numel_unpadded, divisor):
-        if use_distributed_optimizer:
+        if use_element_wise_distributed_optimizer:
             return math.ceil(numel_unpadded / divisor) * divisor
         return numel_unpadded
 
@@ -110,7 +113,7 @@ def test_bucket_sizes(
 
     if bucket_size is None:
         # If bucket_size is infinite (None), number of buckets should be 1.
-        if shared_embedding and use_distributed_optimizer:
+        if shared_embedding and use_element_wise_distributed_optimizer:
             assert len(param_and_grad_buffer.buckets) == 2
         else:
             assert len(param_and_grad_buffer.buckets) == 1
@@ -125,7 +128,7 @@ def test_bucket_sizes(
             if bias:  # Include bias term.
                 param_sizes.append(output_dim)
         # Create separate bucket for first parameter from reverse direction.
-        if shared_embedding and use_distributed_optimizer:
+        if shared_embedding and use_element_wise_distributed_optimizer:
             numel_in_each_bucket.append(param_sizes[-1])
             numel_padded_in_each_bucket.append(_pad_bucket_if_needed(param_sizes[-1]))
             param_sizes = param_sizes[:-1]
@@ -148,7 +151,7 @@ def test_bucket_sizes(
             f"Number of parameters in each bucket should be {numel_in_each_bucket}, "
             f"but is {actual_numel_in_each_bucket}"
         )
-        if use_distributed_optimizer:
+        if use_element_wise_distributed_optimizer:
             assert all(
                 [
                     x % parallel_state.get_data_parallel_world_size() == 0
@@ -184,7 +187,7 @@ def test_param_to_index_alignment_with_padding():
         bias=True,
         shared_embedding=False,
         bucket_size=None,  # single bucket
-        use_distributed_optimizer=True,  # enforces 64-element alignment
+        use_element_wise_distributed_optimizer=True,  # enforces 64-element alignment
         overlap_grad_reduce=True,
         average_in_collective=False,
     )
@@ -219,12 +222,12 @@ def test_param_to_index_alignment_with_padding():
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("use_element_wise_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
 @pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
 def test_grad_sync(
-    use_distributed_optimizer: bool,
+    use_element_wise_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,
     num_distributed_optimizer_instances: int,
@@ -233,7 +236,7 @@ def test_grad_sync(
         num_distributed_optimizer_instances=num_distributed_optimizer_instances
     )
     # Skip test if num_distributed_optimizer_instances > 1 and not using distributed optimizer
-    if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
+    if num_distributed_optimizer_instances > 1 and not use_element_wise_distributed_optimizer:
         pytest.skip("Multiple optimizer instances require distributed optimizer to be enabled")
 
     input_dim = 100
@@ -246,7 +249,7 @@ def test_grad_sync(
         bias=True,
         shared_embedding=False,
         bucket_size=None,  # Group all params into single bucket.
-        use_distributed_optimizer=use_distributed_optimizer,
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         average_in_collective=average_in_collective,
         num_distributed_optimizer_instances=num_distributed_optimizer_instances,
@@ -262,11 +265,11 @@ def test_grad_sync(
     # Data in param_and_grad_buffer.grad_data[0] is 1/DP.
     # When average_in_collective=False, the grad data is always first scaled by 1/DP and then
     # summed by AR/RS.
-    # When use_distributed_optimizer=True, only rank0's param_and_grad_buffer.grad_data[0] is
+    # When use_element_wise_distributed_optimizer=True, only rank0's param_and_grad_buffer.grad_data[0] is
     # updated; other ranks update another shard of grad_data while keeping
     # param_and_grad_buffer.grad_data[0] unchanged (=1/DP).
     if (
-        use_distributed_optimizer
+        use_element_wise_distributed_optimizer
         and (not average_in_collective)
         and parallel_state.get_data_parallel_rank(
             with_context_parallel=True, partial_data_parallel=True
@@ -339,7 +342,7 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
         bias=True,
         shared_embedding=False,
         bucket_size=None,
-        use_distributed_optimizer=True,  # This normally uses reduce-scatter.
+        use_element_wise_distributed_optimizer=True,  # This normally uses reduce-scatter.
         overlap_grad_reduce=False,
         average_in_collective=False,
     )
@@ -387,7 +390,7 @@ class TestFreeOverlapBuffers:
         Utils.initialize_model_parallel()
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=None,
@@ -483,7 +486,7 @@ class TestFP32LocalGradAccumulation:
             bias=True,
             shared_embedding=False,
             bucket_size=bucket_size,
-            use_distributed_optimizer=False,
+            use_element_wise_distributed_optimizer=False,
             overlap_grad_reduce=False,
             average_in_collective=False,
             grad_reduce_in_fp32=False,

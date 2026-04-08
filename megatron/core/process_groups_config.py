@@ -385,7 +385,7 @@ class ProcessGroupCollection:
                     intra_expt_dp_group = pg_collection.intra_expt_dp
                     inter_dist_opt_group = pg_collection.inter_dist_opt
 
-                if ddp_config.use_distributed_optimizer:
+                if ddp_config.use_element_wise_distributed_optimizer:
                     if not hasattr(pg_collection, 'intra_dist_opt'):
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
@@ -490,7 +490,7 @@ class ProcessGroupCollection:
                 ),
                 'intra_dist_opt_group': (
                     parallel_state.get_intra_distributed_optimizer_instance_group()
-                    if ddp_config.use_distributed_optimizer
+                    if ddp_config.use_element_wise_distributed_optimizer
                     else None
                 ),
             }

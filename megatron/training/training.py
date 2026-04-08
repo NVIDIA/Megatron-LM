@@ -48,7 +48,7 @@ from typing import Any, Optional, Dict
 
 import torch.distributed
 
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import ElementWiseDistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
 
@@ -784,7 +784,7 @@ def preprocess_common_state_dict(common_state_dict):
     preprocessed_common_state_dict['args'].pop('local_rank', None)
     preprocessed_common_state_dict['args'].pop('rank', None)
     if (
-        preprocessed_common_state_dict['args']['use_distributed_optimizer']
+        preprocessed_common_state_dict['args']['use_element_wise_distributed_optimizer']
         and "optimizer" in preprocessed_common_state_dict
     ):
         def reorder_inner_param_groups(optimizer_state_dict):
@@ -1803,7 +1803,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             if forward_pre_hook_enabled:
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    if isinstance(optim_instance, ElementWiseDistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
@@ -3720,6 +3720,6 @@ def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
     return (
         not args.use_megatron_fsdp
-        and (args.use_distributed_optimizer or 'dist' in args.optimizer)
+        and (args.use_element_wise_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
         and args.overlap_param_gather
     )

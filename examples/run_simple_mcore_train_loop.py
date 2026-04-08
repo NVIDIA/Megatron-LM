@@ -219,7 +219,7 @@ if __name__ == "__main__":
     ddp_config: DistributedDataParallelConfig = DistributedDataParallelConfig(
         grad_reduce_in_fp32=False,
         overlap_grad_reduce=False,
-        use_distributed_optimizer=False,
+        use_element_wise_distributed_optimizer=False,
     )
     gpt_model = DistributedDataParallel(
         config=config,

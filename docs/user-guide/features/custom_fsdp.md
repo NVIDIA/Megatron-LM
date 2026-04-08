@@ -111,7 +111,7 @@ model = FullyShardedDataParallel(
     fsdp_unit_modules = [TransformerLayer, LanguageModelEmbedding],
 )
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-optimizer = DistributedOptimizer(optimizer, [model], [model.param_and_grad_buffer])
+optimizer = ElementWiseDistributedOptimizer(optimizer, [model], [model.param_and_grad_buffer])
 
 # Training loop
 def train_step(inputs, labels):

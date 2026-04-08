@@ -339,7 +339,7 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
-class TestDistributedOptimizer:
+class TestElementWiseDistributedOptimizer:
     def setup_method(self, method):
         pass
 
@@ -395,7 +395,7 @@ class TestDistributedOptimizer:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
-            mock_args.use_distributed_optimizer = True
+            mock_args.use_element_wise_distributed_optimizer = True
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:

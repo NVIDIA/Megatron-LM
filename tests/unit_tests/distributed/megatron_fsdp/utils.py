@@ -75,7 +75,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         create_attention_mask_in_dataloader=True,
         lr=3e-5,
         min_lr=3e-5,
-        use_distributed_optimizer=True,
+        use_element_wise_distributed_optimizer=True,
         finalize_model_grads_func=finalize_model_grads,
     )
 

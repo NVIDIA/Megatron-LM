@@ -238,11 +238,11 @@ def test_cross_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
-@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("use_element_wise_distributed_optimizer", [False, True])
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.internal
-def test_param_norm_linear(use_distributed_optimizer: bool):
+def test_param_norm_linear(use_element_wise_distributed_optimizer: bool):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
 
@@ -252,7 +252,9 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
     model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    ddp_config = DistributedDataParallelConfig(
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer
+    )
     # Use dummy TransformerConfig which doesn't trigger __post_init__ assertions.
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
@@ -272,12 +274,12 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
 
         # Make sure norm is correct when `main_param` attribute is available.
         optimizer_config = OptimizerConfig(
-            bf16=True, use_distributed_optimizer=use_distributed_optimizer
+            bf16=True, use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer
         )
         _ = get_megatron_optimizer(optimizer_config, [model])
         for param in model.parameters():
             assert hasattr(param, 'main_param')
-            if use_distributed_optimizer:
+            if use_element_wise_distributed_optimizer:
                 assert getattr(param, 'main_param_sharded', False)
         assert training_util.calc_params_l2_norm(
             model, force_create_fp32_copy=False
@@ -290,11 +292,11 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 
-@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("use_element_wise_distributed_optimizer", [False, True])
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.internal
-def test_param_norm_moe(use_distributed_optimizer: bool):
+def test_param_norm_moe(use_element_wise_distributed_optimizer: bool):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
 
@@ -325,7 +327,9 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
     # Initialize the model with all 1.0 for weights.
     for param in model.parameters():
         param.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    ddp_config = DistributedDataParallelConfig(
+        use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer
+    )
     model = DistributedDataParallel(transformer_config, ddp_config, model)
     for param in model.parameters():
         assert param.requires_grad
@@ -339,7 +343,7 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
 
         # Make sure norm is correct when `main_param` attribute is available.
         optimizer_config = OptimizerConfig(
-            bf16=True, use_distributed_optimizer=use_distributed_optimizer
+            bf16=True, use_element_wise_distributed_optimizer=use_element_wise_distributed_optimizer
         )
         _ = get_megatron_optimizer(optimizer_config, [model])
         for param in model.parameters():
@@ -347,7 +351,7 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
             # Router weights are always fp32, so they won't have main_param.
             if param.dtype in [torch.bfloat16, torch.float16]:
                 assert hasattr(param, 'main_param')
-                if use_distributed_optimizer:
+                if use_element_wise_distributed_optimizer:
                     assert getattr(param, 'main_param_sharded', False)
         norm_no_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=False)
         norm_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=True)

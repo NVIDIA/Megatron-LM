@@ -15,7 +15,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import ElementWiseDistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -258,7 +258,7 @@ class TestFullyShardedDataParallel:
         optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
         grad_scaler = None
 
-        optimizer1 = DistributedOptimizer(
+        optimizer1 = ElementWiseDistributedOptimizer(
             optimizer=None,
             config=optimizer_config,
             grad_scaler=grad_scaler,
@@ -271,7 +271,7 @@ class TestFullyShardedDataParallel:
             distributed_optimizer_instance_id=0,
         )
 
-        optimizer2 = DistributedOptimizer(
+        optimizer2 = ElementWiseDistributedOptimizer(
             optimizer=None,
             config=optimizer_config,
             grad_scaler=grad_scaler,
@@ -417,7 +417,7 @@ class TestFullyShardedDataParallel:
         optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
         grad_scaler = None
 
-        optimizer1 = DistributedOptimizer(
+        optimizer1 = ElementWiseDistributedOptimizer(
             optimizer=None,
             config=optimizer_config,
             grad_scaler=grad_scaler,
@@ -430,7 +430,7 @@ class TestFullyShardedDataParallel:
             distributed_optimizer_instance_id=0,
         )
 
-        optimizer2 = DistributedOptimizer(
+        optimizer2 = ElementWiseDistributedOptimizer(
             optimizer=None,
             config=optimizer_config,
             grad_scaler=grad_scaler,
@@ -536,7 +536,7 @@ class TestFullyShardedDataParallel:
             else:
                 distributed_optimizer_instance_id = 0
 
-            distopt = DistributedOptimizer(
+            distopt = ElementWiseDistributedOptimizer(
                 optimizer=None,
                 config=optimizer_config,
                 grad_scaler=grad_scaler,
@@ -784,7 +784,7 @@ class TestMegatronFSDPE2E:
             distopt_spec_configs = copy.deepcopy(spec_configs)
             distopt_spec_configs["fp8_param_gather"] = False
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True, **distopt_spec_configs
+                use_element_wise_distributed_optimizer=True, **distopt_spec_configs
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(

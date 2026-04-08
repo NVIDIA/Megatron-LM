@@ -551,7 +551,7 @@ class TestRLUtils:
 
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
-            use_distributed_optimizer=True,
+            use_element_wise_distributed_optimizer=True,
             overlap_grad_reduce=False,
             bucket_size=None,  # Single bucket for simplicity
         )
@@ -610,7 +610,7 @@ class TestRLUtils:
 
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
-            use_distributed_optimizer=True,
+            use_element_wise_distributed_optimizer=True,
             overlap_grad_reduce=False,
             bucket_size=None,  # Single bucket for simplicity
         )
@@ -621,7 +621,7 @@ class TestRLUtils:
 
         # Create optimizer
         optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=True
+            optimizer='adam', bf16=True, use_element_wise_distributed_optimizer=True
         )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
 

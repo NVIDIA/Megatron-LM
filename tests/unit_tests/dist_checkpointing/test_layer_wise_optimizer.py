@@ -534,7 +534,7 @@ class TestLayerWiseOptimizer:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
-            mock_args.use_distributed_optimizer = False
+            mock_args.use_element_wise_distributed_optimizer = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:

@@ -101,7 +101,7 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
-    Provides a consistent interface for gradient management, parameter 
+    Provides a consistent interface for gradient management, parameter
     access, and state-dict handling across different optimization types.
 
     Args:
@@ -138,11 +138,10 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        
         """Collects gradients for norm calculation, filtering duplicates.
 
-        This method filters parameters based on whether the gradient is not None, 
-        the parameter is not shared (to avoid double-counting gradients), and 
+        This method filters parameters based on whether the gradient is not None,
+        the parameter is not shared (to avoid double-counting gradients), and
         the parameter is not a replica due to tensor model parallelism.
 
         Returns:
@@ -1206,15 +1205,15 @@ class ChainedOptimizer(MegatronOptimizer):
     ):
         metadata = kwargs.get('metadata') or {}
         # ChainedOptimizer should add its prefix to the tensor state keys only if
-        # DistributedOptimizer is used (non-empty 'distrib_optim_sharding_type') and uses
+        # ElementWiseDistributedOptimizer is used (non-empty 'distrib_optim_sharding_type') and uses
         # a non fully-reshardable format. For backward compatibility we also add it
         # if `chained_optim_avoid_prefix` is False.
-        from .distrib_optimizer import DistributedOptimizer
+        from .distrib_optimizer import ElementWiseDistributedOptimizer
 
         should_add_prefix = (
             "distrib_optim_sharding_type" in metadata
             and metadata["distrib_optim_sharding_type"]
-            not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+            not in ElementWiseDistributedOptimizer.checkpoint_fully_reshardable_formats
         ) or not metadata.get('chained_optim_avoid_prefix', False)
 
         if len(self.chained_optimizers) == 1:

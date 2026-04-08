@@ -24,7 +24,7 @@ class DistributedDataParallelConfig:
     PP stage will independently launch as needed.
     """
 
-    use_distributed_optimizer: bool = False
+    use_element_wise_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """

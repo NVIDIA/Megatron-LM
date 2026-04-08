@@ -439,7 +439,7 @@ class CheckpointConfig:
     fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
-    Makes DistributedOptimizer checkpoint non-reshardable."""
+    Makes ElementWiseDistributedOptimizer checkpoint non-reshardable."""
 
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""

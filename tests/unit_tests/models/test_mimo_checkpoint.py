@@ -74,8 +74,8 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
     )
     _randomize_params(mimo_model, seed)
 
-    # Use Float16Optimizer (not DistributedOptimizer) to exercise the MIMO-specific
-    # param_groups/grad_scaler extraction in sharded_state_dict. DistributedOptimizer
+    # Use Float16Optimizer (not ElementWiseDistributedOptimizer) to exercise the MIMO-specific
+    # param_groups/grad_scaler extraction in sharded_state_dict. ElementWiseDistributedOptimizer
     # handles its own checkpointing internally and our code is transparent to it.
     opt_config = OptimizerConfig(
         optimizer='adam',
@@ -83,7 +83,7 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=False,
+        use_element_wise_distributed_optimizer=False,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 

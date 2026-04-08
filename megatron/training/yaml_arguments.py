@@ -131,7 +131,7 @@ def validate_yaml(args, defaults={}):
                   'schedule does not support overlapping p2p communication')
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
+        assert args.use_element_wise_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'

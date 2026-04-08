@@ -124,7 +124,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.overlap_grad_reduce = False
     args.overlap_param_gather_with_optimizer_step = False
     args.fp8_param_gather = False
-    args.use_distributed_optimizer = True
+    args.use_element_wise_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
@@ -204,7 +204,7 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_element_wise_distributed_optimizer=dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
     )
@@ -303,7 +303,7 @@ def setup_moe_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_element_wise_distributed_optimizer=dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
     )
