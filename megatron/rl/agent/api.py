@@ -33,7 +33,22 @@ class RolloutRequest(Request):
 
 
 class GroupedRolloutRequest(Request):
-    """Request to agent to generate grouped Rollouts."""
+    """Request to agent to generate grouped Rollouts.
+
+    Attributes:
+        num_groups: Number of rollout groups to generate per batch.
+        rollouts_per_group: Number of rollouts within each group.
+        inference_interface: Interface used for model inference during rollout generation.
+        validation: Whether this is a validation (not training) request.
+        filter_groups_with_same_reward: Drop groups where all rollouts have identical rewards.
+        streaming: If True, generate groups indefinitely until the consumer stops iterating.
+            If False, generate exactly `num_groups` groups and stop.
+        enforce_order: If True, yield groups in staleness-preserving order for forced-lag
+            training. In the steady state, complete batches are yielded in strict sequential order
+            so that the consumer always trains on the oldest available rollouts first.
+            During warmup (the first `num_workers` batches), all batches are equally-stale,
+            so this parameter is ignored and groups are yielded immediately as they complete.
+    """
 
     num_groups: int
     rollouts_per_group: int
