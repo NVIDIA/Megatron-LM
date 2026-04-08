@@ -142,6 +142,7 @@ class InferenceBatchDimensions:
         decode_only_cuda_graphs: bool,
         smallest_non_decode_cuda_graph_size: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        num_speculative_tokens: int = 0,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
@@ -190,16 +191,23 @@ class InferenceBatchDimensions:
         if is_any_ep_rank_in_non_decode and decode_only_cuda_graphs:
             return None  # indicate no match, run in eager mode
 
-        # If strict matching is enabled, we sync the request counts across EP ranks
-        # to ensure the graph captures the maximum needed capacity.
-        # TODO(ksanthanam): Add functional test for this scenario
+        adjusted_token_count = int(sync_tensor[0].item())
+
+        # Sync request counts across EP ranks when strict matching is enabled
+        # or when speculative tokens are used.  With speculative tokens,
+        # decode-only graphs have token counts of decode_req_count * (spec+1)
+        # which creates a different granularity than mixed graphs (raw sizes).
+        # Without syncing, decode-only ranks and prefill ranks search different
+        # graph pools and may pick graphs with different token counts.
+        sync_request_counts = strict or (
+            is_any_ep_rank_in_non_decode and num_speculative_tokens > 0
+        )
         adjusted_prefill_req_count = (
-            int(sync_tensor[2].item()) if strict else local_batch_dims.prefill_req_count
+            int(sync_tensor[2].item()) if sync_request_counts else local_batch_dims.prefill_req_count
         )
         adjusted_decode_req_count = (
-            int(sync_tensor[3].item()) if strict else local_batch_dims.decode_req_count
+            int(sync_tensor[3].item()) if sync_request_counts else local_batch_dims.decode_req_count
         )
-        adjusted_token_count = int(sync_tensor[0].item())
 
         # When any EP rank has prefill requests (non-strict mode), elevate
         # the token count to be >= the smallest prefill/mixed cuda graph.
@@ -500,6 +508,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        num_speculative_tokens: int = 0,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -529,6 +538,7 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             ep_group=ep_group,
             smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
+            num_speculative_tokens=num_speculative_tokens,
         )
 
         if adjusted_batch_dim is None:

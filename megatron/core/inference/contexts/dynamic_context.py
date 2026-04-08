@@ -1630,6 +1630,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

@@ -40,7 +40,7 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
     return graph_list
 
 
-def _match(real, graph_list, ep_group, strict=False, decode_only=False):
+def _match(real, graph_list, ep_group, strict=False, decode_only=False, num_speculative_tokens=0):
     return CUDAGraphBatchDimensionBuilder.match_graph_config(
         real_batch_dim=real,
         cuda_graph_batch_dimensions_list=graph_list,
@@ -48,6 +48,7 @@ def _match(real, graph_list, ep_group, strict=False, decode_only=False):
         decode_only_cuda_graphs=decode_only,
         ep_group=ep_group,
         smallest_non_decode_cuda_graph_size=min(MIXED_PREFILL_COUNT, MAX_REQUESTS),
+        num_speculative_tokens=num_speculative_tokens,
     )
 
 
@@ -438,7 +439,9 @@ class TestSpeculativeDecodingBatchDimensions:
         token_count = decode_reqs * (num_speculative_tokens + 1)
         real = BD(token_count=token_count, prefill_req_count=0, decode_req_count=decode_reqs)
 
-        result = _match(real, graph_list, ep_group=ep_group)
+        result = _match(
+            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
+        )
 
         # All ranks should end up syncing to the maximum requirement and picking the same graph
         _assert_consistent_across_ranks(result, ep_group)
@@ -498,7 +501,9 @@ class TestSpeculativeDecodingBatchDimensions:
                 decode_req_count=decode_reqs,
             )
 
-        result = _match(real, graph_list, ep_group=ep_group)
+        result = _match(
+            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
+        )
 
         # All ranks must agree on a graph after EP sync.
         _assert_consistent_across_ranks(result, ep_group)
@@ -551,7 +556,9 @@ class TestSpeculativeDecodingBatchDimensions:
             # Prefill-only: forces even ranks out of decode-only graph.
             real = BD(token_count=32, prefill_req_count=2, decode_req_count=0)
 
-        result = _match(real, graph_list, ep_group=ep_group)
+        result = _match(
+            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
+        )
 
         _assert_consistent_across_ranks(result, ep_group)
         # After EP sync, a graph must be found (mixed graphs accommodate both).
