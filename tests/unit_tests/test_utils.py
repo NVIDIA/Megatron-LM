@@ -171,7 +171,7 @@ def test_nvtx_decorator():
     def nvtx_decorated_function():
         execution_tracker['decorated'] = True
 
-    @util.nvtx_decorator(message="test_nvtx_decorator", color="red")
+    @util.nvtx_decorator(message="test_nvtx_decorator")
     def nvtx_decorated_function_with_message():
         execution_tracker['decorated_with_message'] = True
 
