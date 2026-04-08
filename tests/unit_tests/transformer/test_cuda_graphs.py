@@ -929,9 +929,7 @@ class TestPartialCudaGraph:
             args.num_layers_at_end_in_bf16 = 1
 
         for key, value in kwargs.items():
-            assert hasattr(args, key) or hasattr(TransformerConfig, key), (
-                f"Unknown argument: {key}"
-            )
+            assert hasattr(args, key) or hasattr(TransformerConfig, key), f"Unknown argument: {key}"
             setattr(args, key, value)
 
         validate_args(args)

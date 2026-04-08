@@ -924,19 +924,13 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
         # mHC + MoE with expert offloading
         (["expert_fc1", "moe_act"], ["attn", "moe_router", "moe_preprocess"], True),
         # mHC + MoE with combined offloading
-        (
-            ["core_attn", "attn_proj", "expert_fc1", "moe_act"],
-            ["attn", "moe_router"],
-            True,
-        ),
+        (["core_attn", "attn_proj", "expert_fc1", "moe_act"], ["attn", "moe_router"], True),
         # mHC + delay_offload_until_cuda_graph=False
         (["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], False),
     ],
 )
 def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
-    offload_modules: List[str],
-    cuda_graph_scope: List[str],
-    delay_offload: bool,
+    offload_modules: List[str], cuda_graph_scope: List[str], delay_offload: bool
 ):
     """
     Test mHC (Hyper Connection) + fine-grained activation offloading + CUDA graph.
