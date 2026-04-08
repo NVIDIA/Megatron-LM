@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -90,6 +91,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.is_first_microbatch = True
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -325,6 +327,18 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
                 with inner_quant_context:
+                    if (
+                        self.is_first_microbatch
+                        and os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1"
+                    ):
+                        from megatron.core.extensions.transformer_engine import qtype_debug_log
+
+                        layer_no = layer.layer_number
+                        if isinstance(layer, TransformerLayer):
+                            qtype_debug_log(f"[{layer_no}] transformer layer (may be moe)")
+                        else:
+                            qtype_debug_log(f"[{layer_no}] mamba layer")
+
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
@@ -348,6 +362,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 # for cross-attention, and is not needed in our model.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+        self.is_first_microbatch = False
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
