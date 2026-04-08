@@ -1325,10 +1325,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
                     "moe_grouped_gemm=True."
                 )
-            if not is_te_min_version("1.9.0.dev0"):
+            if not is_te_min_version("2.14.0"):
                 raise ValueError(
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
-                    f"transformer-engine>=1.9.0, but your version is {get_te_version()}."
+                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
