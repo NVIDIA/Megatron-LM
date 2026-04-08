@@ -115,7 +115,8 @@ class TestBlockPauseResumeKernel:
         resume_count = triton_resume_and_allocate(
             offsets, kv_block_ids, kv_block_counts, last_kv_block_id,
             block_bag, avail_t,
-            paused, active, block_size, num_spec, max_requests, 1024,
+            paused, active, avail_t.item(),
+            block_size, num_spec, max_requests, 1024,
         )
 
         assert resume_count == 2
@@ -138,7 +139,8 @@ class TestBlockPauseResumeKernel:
         resume_count = triton_resume_and_allocate(
             offsets, kv_block_ids, kv_block_counts, last_kv_block_id,
             block_bag, avail_t,
-            2, 3, 64, 0, 16, 1024,
+            2, 3, 0,  # active_block_avail=0 (no blocks)
+            64, 0, 16, 1024,
         )
 
         assert resume_count == 0
@@ -155,7 +157,8 @@ class TestBlockPauseResumeKernel:
         resume_count = triton_resume_and_allocate(
             offsets, kv_block_ids, kv_block_counts, last_kv_block_id,
             block_bag, avail_t,
-            0, 3, 64, 0, 16, 1024,
+            0, 3, 63,  # active_block_avail=63
+            64, 0, 16, 1024,
         )
 
         assert resume_count == 0

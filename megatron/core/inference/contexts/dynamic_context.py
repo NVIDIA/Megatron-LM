@@ -70,6 +70,11 @@ except ImportError:
     triton_resume_and_allocate = None
 
 try:
+    from .kernels.eviction_kernel import triton_evict_overflow
+except ImportError:
+    triton_evict_overflow = None
+
+try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -2550,16 +2555,78 @@ class DynamicInferenceContext(BaseInferenceContext):
             (torch.Tensor) Evicted request ids.
         """
 
-        # Overflow paused block count.
+        if triton_evict_overflow is not None:
+            evict_count, evict_ids_t, evict_idxs_t, src_t, dst_t, swap_count = (
+                triton_evict_overflow(
+                    kv_block_counts=self.request_kv_block_counts,
+                    request_to_kv_block_ids=self.request_to_kv_block_ids,
+                    request_ids=self.request_ids,
+                    block_bag=self.kv_block_allocator.block_bag,
+                    total_avail_tensor=self.kv_block_allocator._total_avail_tensor,
+                    block_ref_counts=(
+                        self.kv_block_allocator.block_ref_counts
+                        if self.enable_prefix_caching
+                        else None
+                    ),
+                    block_hashes=(
+                        self.kv_block_allocator.block_hashes
+                        if self.enable_prefix_caching
+                        else None
+                    ),
+                    paused_request_count=self.paused_request_count,
+                    active_request_count=active_request_count,
+                    total_request_count=self.total_request_count,
+                    paused_block_limit=self.kv_block_allocator.paused_count,
+                    max_kv_block_count=self.max_kv_block_count,
+                    has_prefix_cache=self.enable_prefix_caching,
+                )
+            )
+
+            if evict_count == 0:
+                return None
+
+            # Mamba cleanup (Python)
+            evict_idxs = evict_idxs_t[:evict_count].to(torch.long)
+            if self.is_hybrid_model:
+                self.mamba_metadata.free_slots(evict_idxs)
+            if self.mamba_slot_allocator is not None:
+                sa = self.mamba_slot_allocator
+                sa._intermediate_counts_gpu[evict_idxs] = 0
+                sa._intermediate_offsets_gpu[evict_idxs] = 0
+                sa._intermediate_block_ids_gpu[evict_idxs] = -1
+                sa._eos_cache_block_id_gpu[evict_idxs] = -1
+
+            # Swap using existing tensor reorder kernel
+            if swap_count > 0:
+                self._swap_book_keeping_tensors(
+                    src_idxs=src_t[:swap_count].to(torch.long),
+                    dst_idxs=dst_t[:swap_count].to(torch.long),
+                    next_tokens=next_tokens,
+                    new_speculative_tokens=new_speculative_tokens,
+                )
+
+            # Update counters
+            self.paused_request_count -= evict_count
+            self.total_request_count -= evict_count
+
+            # Reset finished region
+            evict_slice = slice(
+                self.total_request_count, self.total_request_count + evict_count
+            )
+            self.request_to_kv_block_ids[evict_slice] = -1
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
+
+            return evict_ids_t[:evict_count]
+
+        # --- Python fallback ---
         overflow_paused_block_count = (
             self.kv_block_allocator.get_paused_used() - self.kv_block_allocator.paused_count
         )
 
-        # Nothing to evict?
         if overflow_paused_block_count <= 0:
             return None
 
-        # Overflow paused block count.
         paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
         valid_paused_request_count = torch.nonzero(
@@ -2567,14 +2634,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         ).numel()
         overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
 
-        # Nothing to evict? (Similar to checking overflow_paused_block_count
-        # above, but here we allow up to one paused request to overflow into the
-        # active buffer.
         if overflow_paused_request_count == 0:
             return None
 
-        # Evict request count. (Flip paused_block_counts because evictions are
-        # counted from the right-most paused requests.
         paused_block_counts = paused_block_counts[-overflow_paused_request_count:].flip(dims=[0])
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
         remaining_paused_request_counts = torch.arange(
@@ -2587,23 +2649,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
         evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
 
-        # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
         evict_end_idx = self.paused_request_count
         evict_request_idxs = torch.arange(
             evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
         )
-        # Clone needed: subsequent release_memory_blocks_from_request_indexes and
-        # _swap_book_keeping_tensors calls mutate self.request_ids in place.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
-        # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
-        # Move evicted requests to the right of active requests, while minimizing
-        # movement.
         if evict_request_count < active_request_count:
-            # Swap all evicted requests with right-most active requests.
             src_idxs = torch.arange(
                 self.paused_request_count - evict_request_count,
                 self.paused_request_count,
@@ -2615,7 +2670,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
         else:
-            # Swap all active requests with left-most evicted requests.
             src_idxs = torch.arange(
                 self.paused_request_count - evict_request_count,
                 self.paused_request_count - evict_request_count + active_request_count,
@@ -2627,7 +2681,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
 
-        # Swap evicted and active requests.
         self._swap_book_keeping_tensors(
             src_idxs=src_idxs,
             dst_idxs=dst_idxs,
@@ -2635,11 +2688,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_speculative_tokens=new_speculative_tokens,
         )
 
-        # Update tracking vars.
         self.paused_request_count -= evict_request_count
         self.total_request_count -= evict_request_count
 
-        # Reset unused block ids.
         evict_slice = slice(
             self.total_request_count, self.total_request_count + evict_request_count
         )
