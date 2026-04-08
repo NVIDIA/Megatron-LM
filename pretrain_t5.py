@@ -71,7 +71,7 @@ def model_provider(
     add_decoder=True,
     config=None,
     pg_collection=None,
-) -> Union[megatron.legacy.model.T5Model, T5Model]:
+) -> T5Model:
     """Builds the model.
 
     Args:
@@ -89,59 +89,49 @@ def model_provider(
     
     if config is None:
         config = core_transformer_config_from_args(args)
-    if args.use_legacy_models:
-        model = megatron.legacy.model.T5Model(
-            config=config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-            add_encoder=add_encoder,
-            add_decoder=add_decoder,
+
+    encoder_config = deepcopy(config)
+    encoder_config.num_layers = args.encoder_num_layers
+
+    if args.pipeline_model_parallel_size > 1:
+        raise ValueError("Pipeline parallelism is not supported for T5.")
+
+    encoder_layers_per_pipeline = (
+        encoder_config.num_layers // encoder_config.pipeline_model_parallel_size
+    )
+    decoder_layers_per_pipeline = config.num_layers // config.pipeline_model_parallel_size
+
+    if args.transformer_impl == "local":
+        en_block_spec = get_t5_encoder_with_local_block_spec(encoder_layers_per_pipeline)
+        de_block_spec = get_t5_decoder_with_local_block_spec(decoder_layers_per_pipeline)
+    elif args.transformer_impl == "transformer_engine":
+        en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
+            encoder_layers_per_pipeline
         )
-    else:
-        encoder_config = deepcopy(config)
-        encoder_config.num_layers = args.encoder_num_layers
-
-        if args.pipeline_model_parallel_size > 1:
-            raise ValueError("Pipeline parallelism is not supported for T5.")
-
-        encoder_layers_per_pipeline = (
-            encoder_config.num_layers // encoder_config.pipeline_model_parallel_size
+        de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(
+            decoder_layers_per_pipeline
         )
-        decoder_layers_per_pipeline = config.num_layers // config.pipeline_model_parallel_size
 
-        if args.transformer_impl == "local":
-            en_block_spec = get_t5_encoder_with_local_block_spec(encoder_layers_per_pipeline)
-            de_block_spec = get_t5_decoder_with_local_block_spec(decoder_layers_per_pipeline)
-        elif args.transformer_impl == "transformer_engine":
-            en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
-                encoder_layers_per_pipeline
-            )
-            de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(
-                decoder_layers_per_pipeline
-            )
-
-        print_rank_0('building T5 model ...')
-        model = T5Model(
-            config=config,
-            encoder_config=encoder_config,
-            transformer_encoder_layer_spec=en_block_spec,
-            transformer_decoder_layer_spec=de_block_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            relative_attention_num_buckets=args.relative_attention_num_buckets,
-            relative_attention_max_distance=args.relative_attention_max_distance,
-            add_encoder=add_encoder,
-            add_decoder=add_decoder,
-        )
+    print_rank_0('building T5 model ...')
+    model = T5Model(
+        config=config,
+        encoder_config=encoder_config,
+        transformer_encoder_layer_spec=en_block_spec,
+        transformer_decoder_layer_spec=de_block_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        relative_attention_num_buckets=args.relative_attention_num_buckets,
+        relative_attention_max_distance=args.relative_attention_max_distance,
+        add_encoder=add_encoder,
+        add_decoder=add_decoder,
+    )
 
     return model
 
