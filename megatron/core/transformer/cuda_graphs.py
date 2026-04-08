@@ -590,38 +590,20 @@ class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
 
-    ## FORWARD — 2-event (Graph N → N+1):
-    #   runner_N.stream:  GEMM ──fce_compute.record──▶ _wait_side_streams(ag) ──fce.record
-    #   ag_stream:                AG(weight) ──────────────────────────────▶ ag_event.record
-    #   main_stream:       fce_compute.wait ──▶ [PP send/recv / overlap] ── fce.wait ──▶ trigger N+1
-    #                                            ↑ overlaps with AG tail ↑   ↑ ag_event guaranteed recorded before N+1 starts ↑
-
-    #   where:  fce_compute = fwd_compute_completion_event  (fires after GEMM, before AG drains)
-    #           fce         = fwd_completion_event           (fires after AG fully drained)
-
-
-    ## BACKWARD — 2-event (Graph N → N+1):
-    #   runner_N.stream:  GEMM ──bce_compute.record──▶ wait_async_comms ──▶ _wait_side_streams(ag, rs) ──▶ add_(wgrad_rs) ──bce.record
-    #   rs_stream:                RS(wgrad) ──────────────────────────────────────────────────────────▶ RS done
-    #   main_stream:         bce_compute.wait ──▶ [PP send/recv / overlap] ─────────────────── bce.wait ──▶ trigger N+1
-    #                                              ↑ overlaps with RS tail ↑                    ↑ RS + add_ guaranteed done before N+1 starts ↑
-
-    #   where:  bce_compute = bwd_compute_completion_event  (fires after GEMM, before RS drains)
-    #           bce         = bwd_completion_event           (fires after full RS + add_ done)
-
-    ## Key symmetry: both passes use the same pattern —
-    #   early event  → unblock main for PP overlap with side-stream work
-    #   late event   → guarantee side-stream fully done before next graph starts
-
-    # Forward: AG-completion event produced by the previous graph's fwd replay.
-    # Consumed (and cleared) at the start of the next graph's replay so that
-    # runner_N+1.stream is gated behind the AG side-stream finishing, while
-    # main_stream is free to overlap inter-graph work with the AG tail.
-    _pending_fwd_ag_event: "torch.cuda.Event | None" = None
-    # Backward: bwd_completion_event from the previous graph's replay (full ag+RS done).
-    # Consumed before the next backward graph launches so graph N+1 doesn't start until
-    # graph N's RS is fully complete.
-    _pending_bwd_ag_event: "torch.cuda.Event | None" = None
+    ## 1-event scheme (fwd and bwd):
+    #   runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──completion_event.record
+    #   ag_stream:        AG ──────────────────────▶ ag_event.record
+    #   main_stream:                                                   completion_event.wait ▶ [next work]
+    #                                                                   ↑ serialized after AG ↑
+    #
+    # main_stream only unblocks after ag/rs streams are fully drained, so eager ops that
+    # follow (e.g. expert GEMMs reading the weight buffer) are guaranteed to see completed data.
+    #
+    # Pros: simple, race-free — no extra fences needed between graph replays and eager ops.
+    # Cons: cannot overlap AG(grouped-fc1) with EP all-to-all in dispatch_with_permute.
+    #       A 2-event scheme (early unblock after GEMM, late event after AG drain) could
+    #       recover that overlap, but requires explicit fences in both fwd and bwd eager
+    #       expert compute paths to prevent use-before-ready on the weight buffer.
 
     # bwd_completion_events for all active parameter_sharding runners, keyed by id(event).
     # Accumulated during the backward pass; drained by drain_etp_rs_stream() before
@@ -679,27 +661,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         if runner.parameter_sharding:
-            # Consume the AG-completion event left by the previous graph.  Waiting here
-            # (before runner.stream.wait_stream) ensures runner_N+1.stream inherits the
-            # ordering: it will not start until the previous graph's AG side-stream has
-            # fully drained and ag_event(iter K) is recorded.
-            if _CudagraphReplayNode._pending_fwd_ag_event is not None:
-                torch.cuda.current_stream().wait_event(
-                    _CudagraphReplayNode._pending_fwd_ag_event
-                )
-                _CudagraphReplayNode._pending_fwd_ag_event = None
             wait_async_comms()
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
                 runner.fwd_graph.replay()
-            # Unblock main_stream early (after GEMM, before AG tail finishes) so that
-            # inter-graph work (PP send/recv etc.) can overlap with the AG side-stream.
-            torch.cuda.current_stream().wait_event(runner.fwd_compute_completion_event)
-            # Store the AG-completion event for the next graph's pre-replay to consume.
-            if runner.parameter_sharding:
-                _CudagraphReplayNode._pending_fwd_ag_event = runner.fwd_completion_event
+            torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
         else:
             runner.fwd_graph.replay()
 
@@ -736,22 +704,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_output_grad.copy_(user_output_grad)
 
         if runner.parameter_sharding:
-            if _CudagraphReplayNode._pending_bwd_ag_event is not None:
-                torch.cuda.current_stream().wait_event(
-                    _CudagraphReplayNode._pending_bwd_ag_event
-                )
-                _CudagraphReplayNode._pending_bwd_ag_event = None
             wait_async_comms()
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
-            torch.cuda.current_stream().wait_event(runner.bwd_compute_completion_event)
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
             if runner.parameter_sharding:
-                # Chain graphs: next backward graph waits for graph N's full RS completion
-                # before launching, and drain_etp_rs_stream() fences the last layer's event.
-                _CudagraphReplayNode._pending_bwd_ag_event = runner.bwd_completion_event
+                # Accumulate for drain_etp_rs_stream() in finalize_model_grads.
                 _CudagraphReplayNode._bwd_completion_events[id(runner.bwd_completion_event)] = (
                     runner.bwd_completion_event
                 )
@@ -855,23 +816,7 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.parameter_sharding:
                 self.use_stream = True
                 self.stream = torch.cuda.Stream()
-                # fwd_compute_completion_event fires after GEMM (before AG side-stream drains).
-                # main_stream waits on this first so it can overlap inter-graph work (PP send/recv
-                # etc.) with the AG tail.
-                self.fwd_compute_completion_event = torch.cuda.Event(
-                    external=True, interprocess=True
-                )
-                # fwd_completion_event fires after _wait_side_streams, i.e. after the AG
-                # side-stream is fully drained.  The *next* graph's pre-replay consumes this
-                # event before launching runner_N+1.stream, guaranteeing ag_event(iter K) is
-                # recorded before runner_N+1 calls ag_event.wait().
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
-                self.bwd_compute_completion_event = torch.cuda.Event(
-                    external=True, interprocess=True
-                )
-                # bwd_completion_event fires after the full backward (ag + RS + add_) is done.
-                # Used for both inter-graph ordering (_pending_bwd_ag_event) and as the
-                # finalize fence in drain_etp_rs_stream().
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self._register_side_stream(self.fwd_side_streams, get_ag_stream())
                 self._register_side_stream(self.bwd_side_streams, get_ag_stream())
@@ -1141,20 +1086,6 @@ class _CudaGraphRunner(torch.nn.Module):
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
 
-                    # Two-event scheme for ETP + use_stream:
-                    #
-                    # fwd_compute_completion_event — fires right after GEMM (before AG drains).
-                    #   main_stream waits on this first, unblocking early so inter-graph work
-                    #   (PP send/recv, etc.) can overlap with the AG tail on ag_stream.
-                    #
-                    # fwd_completion_event — fires after wait_async_comms + _wait_side_streams,
-                    #   i.e. only once ag_event(iter K) is recorded on ag_stream.
-                    #   The *next* graph's pre-replay consumes this before launching
-                    #   runner_N+1.stream, ensuring ag_event.wait() in Graph N+1 sees a
-                    #   fresh event rather than a stale one from iter K-1.
-                    if self.use_stream and self.parameter_sharding:
-                        self.fwd_compute_completion_event.record()
-
                     if self.parameter_sharding:
                         wait_async_comms()
 
@@ -1287,9 +1218,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
-
-            if self.use_stream and self.parameter_sharding:
-                self.bwd_compute_completion_event.record()
 
             if self.parameter_sharding:
                 wait_async_comms()
