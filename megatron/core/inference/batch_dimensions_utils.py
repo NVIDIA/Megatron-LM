@@ -208,7 +208,9 @@ class InferenceBatchDimensions:
             else local_batch_dims.prefill_req_count
         )
         adjusted_decode_req_count = (
-            int(sync_tensor[3].item()) if sync_request_counts else local_batch_dims.decode_req_count
+            int(sync_tensor[3].item())
+            if sync_request_counts
+            else local_batch_dims.decode_req_count
         )
 
         # When any EP rank has prefill requests (non-strict mode), elevate
