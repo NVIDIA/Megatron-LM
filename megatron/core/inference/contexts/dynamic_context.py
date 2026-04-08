@@ -1003,8 +1003,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def is_decode_only(self) -> bool:
         """
         Return if this iteration we run decode only implementation.
+
+        Uses padded_batch_dimensions rather than num_prefill_requests because
+        the padded dimensions reflect the post-expert-parallel sync state.
         """
-        return self.num_prefill_requests == 0
+        return self.padded_batch_dimensions.prefill_req_count == 0
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -1510,43 +1513,56 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
-    def add_dummy_requests_for_expert_parallel_step(self) -> None:
+    def add_dummy_requests_for_expert_parallel_step(
+        self, graph_dimensions: InferenceBatchDimensions
+    ) -> None:
         """Minimal context setup so an EP rank with no real requests can replay
         an already-captured cuda graph without crashing or corrupting memory.
 
         This is the fast alternative to add_dummy_requests_for_cudagraph_capture
         (which goes through the heavyweight add_dummy_requests_parallel path).
 
-        We setup minimal state such the initialize_attention_state and the forward
+        We setup minimal state such that initialize_attention_state and the forward
         pass can run without error.
 
+        Called AFTER the EP sync so graph_dimensions reflects the agreed-upon graph.
         """
-        smallest_cuda_graph_dimensions = min(
-            [x for x in self.cuda_graph_batch_dimensions_list if x.prefill_req_count == 0]
-        )
-        # the smallest cuda graph is decode only.
-        assert smallest_cuda_graph_dimensions.prefill_req_count == 0
-
-        N = smallest_cuda_graph_dimensions.decode_req_count
-        tokens_per_request = self.num_speculative_tokens + 1
-        T = smallest_cuda_graph_dimensions.token_count  # N * tokens_per_request
+        N_decode = graph_dimensions.decode_req_count
+        N_prefill = graph_dimensions.prefill_req_count
+        N = N_decode + N_prefill
+        tokens_per_decode_request = self.num_speculative_tokens + 1
+        T = graph_dimensions.token_count
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
 
         # 1. Request counts and token count.
-        #    With speculative decoding each decode request has (num_speculative_tokens + 1) tokens.
         self.total_request_count = N
         self.active_token_count = T
-        self.num_prefill_requests = 0
+        self.num_prefill_requests = N_prefill
 
         # 2. Per-request state consumed by mha_metadata.update().
-        self.request_query_lengths[0:N].fill_(tokens_per_request)
+        #    Decode requests come first, followed by prefill requests.
+        self.request_query_lengths[0:N_decode].fill_(tokens_per_decode_request)
+        if N_prefill > 0:
+            prefill_tokens = T - N_decode * tokens_per_decode_request
+            per_prefill_tokens = prefill_tokens // N_prefill
+            rem_prefill_tokens = prefill_tokens % N_prefill
+            self.request_query_lengths[N_decode:N].fill_(per_prefill_tokens)
+            if rem_prefill_tokens > 0:
+                self.request_query_lengths[N_decode : N_decode + rem_prefill_tokens] += 1
+
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
-        self.token_to_local_position_within_kv_block[0:T] = (
-            torch.arange(T, device=self.token_to_block_idx.device) % tokens_per_request
+        # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
+        query_lengths = self.request_query_lengths[0:N]
+        starts = torch.cumsum(query_lengths, dim=0) - query_lengths
+        # Per-token start offset: e.g. starts [0,3], query_lengths [3,2] -> [0,0,0,3,3]
+        per_token_start = torch.repeat_interleave(starts, query_lengths)
+        positions = torch.arange(T, device=query_lengths.device) - per_token_start
+        self.token_to_local_position_within_kv_block[0:T] = torch.remainder(
+            positions, self.block_size_tokens
         )
 
         if self.is_hybrid_model:
@@ -1558,7 +1574,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=self.token_to_request_idx.device,
                     dtype=self.token_to_request_idx.dtype,
                 ),
-                tokens_per_request,
+                self.request_query_lengths[0:N],
             )
 
             # 5. Mamba state: allocate slots for dummy requests.
@@ -1587,17 +1603,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
         ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
-        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
-        if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step()
-        elif self.is_creating_cuda_graphs:
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture.
+        # EP dummy requests are added AFTER the EP sync below.
+        if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        batch_dimensions = InferenceBatchDimensions(
-            token_count=self.active_token_count,
-            prefill_req_count=self.num_prefill_requests,
-            decode_req_count=self.num_decode_requests,
-        )
+        if is_expert_parallel_dummy_cuda_graph_step:
+            # No real requests on this EP rank. Pass empty dimensions so the EP
+            # all-reduce in match_graph_config picks up the real ranks' values.
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=0, prefill_req_count=0, decode_req_count=0,
+            )
+        else:
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+            )
 
         self.batch_dimensions = batch_dimensions
 
@@ -1621,10 +1643,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             # will directly call the model forward pass with a single token.
             return
 
+        # Add dummy requests AFTER the EP sync so they match the resolved graph.
+        if is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(best_graph)
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+            )
+            self.batch_dimensions = batch_dimensions
+
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            if self.is_decode_only():
+            # Can't use is_decode_only() here because padded_batch_dimensions
+            # hasn't been set yet for this step (we're computing it now).
+            if self.num_prefill_requests == 0:
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
                         self.max_requests, self.round_up_requests(self.num_decode_requests)

@@ -616,8 +616,7 @@ class Attention(MegatronModule, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+            if getattr(self.config, "cache_mla_latents", None) and not inference_context.is_decode_only():
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
@@ -796,7 +795,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
