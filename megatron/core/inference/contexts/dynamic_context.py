@@ -521,8 +521,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
 
-        # Block ids.
+        # Block ids. With speculative decoding, blocks are pre-allocated when the
+        # last block offset >= block_size - 1 - num_speculative_tokens, so we may
+        # need one extra block beyond what max_sequence_length alone requires.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
+        if self.num_speculative_tokens > 0:
+            self.max_kv_block_count += 1
 
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
