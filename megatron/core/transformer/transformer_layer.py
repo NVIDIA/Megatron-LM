@@ -1854,9 +1854,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     cuda_graph_output[2:],
                 )
                 valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
-                assert len(attr_outputs) == len(valid_cudagraph_attrs), (
-                    f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
-                )
+                assert len(attr_outputs) == len(
+                    valid_cudagraph_attrs
+                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
                 for i, attr_name in enumerate(valid_cudagraph_attrs):
                     self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
             else:
