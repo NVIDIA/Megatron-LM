@@ -593,11 +593,14 @@ def _build_gpt_model_with_cuda_graph(
     cuda_graph_warmup_steps: int,
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
+    enable_hyper_connections: bool = False,
+    num_residual_streams: int = 4,
 ) -> GPTModel:
     """Build a GPTModel with CUDA Graph support and fine-grained activation offloading."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -605,8 +608,8 @@ def _build_gpt_model_with_cuda_graph(
         use_cpu_initialization=True,
         attention_backend=AttnBackend.unfused,
         bf16=True,
-        # Recompute
-        recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
+        # Recompute (note: "mhc" recompute is incompatible with offloading)
+        recompute_modules=recompute_modules,
         recompute_granularity="selective",
         # MoE
         num_moe_experts=num_experts,
@@ -622,6 +625,9 @@ def _build_gpt_model_with_cuda_graph(
         cuda_graph_scope=cuda_graph_scope,
         cuda_graph_warmup_steps=cuda_graph_warmup_steps,
         use_te_rng_tracker=True,
+        # Hyper Connection settings
+        enable_hyper_connections=enable_hyper_connections,
+        num_residual_streams=num_residual_streams,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -630,6 +636,7 @@ def _build_gpt_model_with_cuda_graph(
             moe_grouped_gemm=num_experts is not None,
             moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
+            enable_hyper_connection=enable_hyper_connections,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -898,6 +905,180 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
         # In some cases, graph capture overhead may offset offload savings.
         assert saved_mib >= -DELTA, (
             f"Offloading with CUDA graph significantly increased memory: "
+            f"saved={saved_mib:.2f}MiB (negative means increase)"
+        )
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
+)
+@pytest.mark.parametrize(
+    "offload_modules, cuda_graph_scope, delay_offload",
+    [
+        # mHC + MoE with attention CUDA graph + attn offloading
+        (["core_attn", "attn_proj"], ["attn", "moe_router"], True),
+        # mHC + MoE with expert offloading
+        (["expert_fc1", "moe_act"], ["attn", "moe_router", "moe_preprocess"], True),
+        # mHC + MoE with combined offloading
+        (
+            ["core_attn", "attn_proj", "expert_fc1", "moe_act"],
+            ["attn", "moe_router"],
+            True,
+        ),
+        # mHC + delay_offload_until_cuda_graph=False
+        (["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], False),
+    ],
+)
+def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
+    offload_modules: List[str],
+    cuda_graph_scope: List[str],
+    delay_offload: bool,
+):
+    """
+    Test mHC (Hyper Connection) + fine-grained activation offloading + CUDA graph.
+
+    This validates that the fix to HyperConnectionTransformerLayer._te_cuda_graph_replay_impl
+    correctly preserves the delay_offload_until_cuda_graph lifecycle (enter_replay /
+    flush_delayed_groups / exit_replay) from the parent class.
+
+    Note: "mhc" recompute is incompatible with fine_grained_activation_offloading,
+    so mhc recompute is NOT enabled here. HC still functions, just without the mHC-specific
+    selective recompute optimization.
+    """
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_experts = 4
+    num_layers = 4
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 512
+    seq_length = 512
+    micro_batch_size = 2
+    device = torch.device("cuda")
+    cuda_graph_warmup_steps = 3
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline: mHC + CUDA graph enabled, offloading disabled
+        _reset_cuda_memory()
+        base_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=False,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+        ).cuda()
+        base_model.train()
+
+        base_logits, base_grads, base_peak = _run_iters_with_cuda_graph(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) Test: mHC + CUDA graph enabled + offloading enabled
+        off_interface.reset_instance()
+
+        off_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            delay_offload_until_cuda_graph=delay_offload,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+        ).cuda()
+        off_model.train()
+
+        off_logits, off_grads, off_peak = _run_iters_with_cuda_graph(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks
+        assert torch.allclose(
+            off_logits, base_logits, rtol=1e-2, atol=1e-2
+        ), f"mHC logits mismatch: max_diff={torch.max(torch.abs(off_logits - base_logits))}"
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(
+                go, gb, rtol=1e-2, atol=1e-2
+            ), f"mHC grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
+
+        # 4) Memory and sanity checks
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        print(
+            f"mHC + CUDA Graph + Offload test (delay={delay_offload}): "
+            f"base_peak={base_peak/(1024**2):.2f}MiB, "
+            f"off_peak={off_peak/(1024**2):.2f}MiB, "
+            f"saved={saved_mib:.2f}MiB"
+        )
+
+        assert not torch.isnan(off_logits).any(), "NaN detected in mHC logits"
+        assert not torch.isinf(off_logits).any(), "Inf detected in mHC logits"
+
+        for name, g in off_grads.items():
+            if g is not None:
+                assert not torch.isnan(g).any(), f"NaN detected in mHC grad for {name}"
+                assert not torch.isinf(g).any(), f"Inf detected in mHC grad for {name}"
+
+        assert saved_mib >= -DELTA, (
+            f"mHC offloading with CUDA graph significantly increased memory: "
             f"saved={saved_mib:.2f}MiB (negative means increase)"
         )
 
