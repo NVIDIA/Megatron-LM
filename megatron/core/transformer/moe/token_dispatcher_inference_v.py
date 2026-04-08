@@ -15,11 +15,14 @@ torch.nn.functional.grouped_mm. It avoids any host-device synchronization:
   5. Triton unpermute kernel scatters weighted expert outputs back.
   6. ReduceScatter combines contributions across EP ranks.
 
-When ``inference_moe_max_tokens`` is set, AllGather/ReduceScatter buffers are
-pinned to a fixed maximum size.  This makes the NCCL collectives identical
+When ``inference_moe_max_tokens`` is set (automatically derived from
+``--inference-dynamic-batching-max-tokens``), AllGather/ReduceScatter buffers
+are pinned to a fixed maximum size.  This makes the NCCL collectives identical
 across every CUDA graph, so different EP ranks can independently select
 different graphs without any cross-rank synchronization -- the all-reduce in
 ``adjust_batch_dims_for_expert_parallelism`` is no longer required.
+
+Selected via ``--moe-token-dispatcher-type allgather_v``.
 
 The "V" (variable) refers to the fact that each expert receives a data-dependent
 number of tokens, computed on-device without cross-rank synchronization.
@@ -97,8 +100,9 @@ class InferenceAllGatherVTokenDispatcher(MoEAllGatherTokenDispatcher):
         if self.ep_size > 1 and self._max_tokens_per_rank is None:
             raise ValueError(
                 "inference_moe_max_tokens must be set when using the 'allgather_v' "
-                "dispatcher with EP > 1.  Set it to cuda_graph_max_tokens "
-                "(typically max_requests * (num_speculative_tokens + 1))."
+                "dispatcher with EP > 1.  It is automatically derived from "
+                "--inference-dynamic-batching-max-tokens (or max_requests * "
+                "(num_speculative_tokens + 1)).  Make sure one of these is set."
             )
 
         # Cached between dispatch_postprocess and combine_preprocess.

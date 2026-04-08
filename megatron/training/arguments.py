@@ -1718,6 +1718,17 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['moe_latent_size'] = args.moe_latent_size
 
+    # For the allgather_v dispatcher, derive inference_moe_max_tokens from the
+    # dynamic batching max_tokens so users don't need a separate flag.
+    if getattr(args, 'moe_token_dispatcher_type', None) == 'allgather_v':
+        max_tokens = getattr(args, 'inference_dynamic_batching_max_tokens', None)
+        max_requests = getattr(args, 'inference_dynamic_batching_max_requests', None)
+        if max_tokens is not None:
+            kw_args['inference_moe_max_tokens'] = max_tokens
+        elif max_requests is not None:
+            num_spec = getattr(args, 'num_speculative_tokens', 0) or 0
+            kw_args['inference_moe_max_tokens'] = max_requests * (num_spec + 1)
+
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
         # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
@@ -3107,6 +3118,13 @@ def _add_moe_args(parser):
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     # Token dispatcher arguments
+    group.add_argument('--moe-token-dispatcher-type', type=str,
+                       choices=['allgather', 'alltoall', 'flex', 'allgather_v'],
+                       default='allgather',
+                       help='Token dispatcher type for MoE layers. '
+                       '"allgather_v" is an inference-optimized dispatcher that uses '
+                       'Triton-based permutation with fixed-max-buffer AllGather/ReduceScatter, '
+                       'eliminating EP rank synchronization for CUDA graph matching.')
     # MoE communication overlap arguments
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,

@@ -275,22 +275,28 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
             )
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "allgather":
+        # Initialize token dispatcher.
+        # 'allgather_v' is inference-only; for the base (training) dispatcher
+        # we use alltoall since _setup_inference_mode swaps in the real
+        # InferenceAllGatherVTokenDispatcher during CUDA-graphed iterations.
+        base_dispatcher_type = config.moe_token_dispatcher_type
+        if base_dispatcher_type == "allgather_v":
+            base_dispatcher_type = "alltoall"
+        if base_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
-        elif config.moe_token_dispatcher_type == "alltoall":
+        elif base_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
-        elif config.moe_token_dispatcher_type == "flex":
+        elif base_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
@@ -358,7 +364,8 @@ class MoELayer(BaseMoELayer):
         Creates an inference CUDA-graph token dispatcher alongside the standard
         dispatcher, which is swapped in during CUDA-graphed forward passes.
 
-        The dispatcher type is selected by ``inference_moe_cuda_graph_dispatcher``:
+        The dispatcher type is selected by ``inference_moe_cuda_graph_dispatcher``
+        (auto-derived from ``moe_token_dispatcher_type`` in TransformerConfig):
         - ``"fused"`` (default): AllGather + FlashInfer/CUTLASS fused MoE kernel.
           Requires FlashInfer. The fused kernel handles permutation internally.
         - ``"allgather_v"``: AllGather + Triton permute + grouped_mm + Triton
@@ -367,8 +374,8 @@ class MoELayer(BaseMoELayer):
           with no host-device synchronization.
         """
 
-        assert self.config.moe_token_dispatcher_type == "alltoall", (
-            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
+        assert self.config.moe_token_dispatcher_type in ("alltoall", "allgather_v"), (
+            f"Inference-optimized MoE requires 'alltoall' or 'allgather_v' dispatcher, "
             f"got '{self.config.moe_token_dispatcher_type}'"
         )
         self.is_inference_cuda_graphed_iteration = False

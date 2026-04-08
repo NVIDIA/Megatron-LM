@@ -747,9 +747,12 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex', 'allgather_v'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather','alltoall' and 'flex'."""
+    Options are 'allgather', 'alltoall', 'flex', and 'allgather_v'.
+    'allgather_v' is an inference-optimized dispatcher that uses Triton-based
+    permutation with fixed-max-buffer AllGather/ReduceScatter, eliminating
+    EP rank synchronization for CUDA graph matching."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -943,20 +946,15 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_moe_cuda_graph_dispatcher: Literal['fused', 'allgather_v'] = "fused"
     """Selects the CUDA-graph-compatible token dispatcher for inference MoE.
+
+    Auto-derived from ``moe_token_dispatcher_type`` in ``__post_init__``:
+    - ``moe_token_dispatcher_type='allgather_v'`` → ``'allgather_v'``
+    - anything else → ``'fused'``
+
     Options:
     - 'fused' (default): AllGather + FlashInfer/CUTLASS fused MoE kernel.
-      The fused kernel handles token permutation internally. Requires FlashInfer.
     - 'allgather_v': AllGather + Triton permute + grouped_mm + Triton unpermute
-      + ReduceScatter. Token counts per expert are computed on-device by Triton
-      kernels with no host-device synchronization, making the full pipeline
-      CUDA-graphable without FlashInfer. Supports BF16 and MXFP8 weights via
-      torch.nn.functional.grouped_mm / scaled_grouped_mm.
-
-      When EP > 1, the AllGather/ReduceScatter buffers are pinned to a fixed
-      maximum size (inference_moe_max_tokens * ep_size) so that all CUDA graphs
-      embed the same collective regardless of actual batch size. This allows
-      different EP ranks to independently select different CUDA graphs without
-      any cross-rank synchronization (no all-reduce for batch dimension matching).
+      + ReduceScatter. No FlashInfer dependency. Fully CUDA-graphable.
     """
 
     inference_moe_max_tokens: Optional[int] = None
@@ -968,8 +966,9 @@ class TransformerConfig(ModelParallelConfig):
     adjust_batch_dims_for_expert_parallelism — each EP rank can independently
     select its own CUDA graph.
 
-    Should be set to cuda_graph_max_tokens (typically max_requests *
-    (num_speculative_tokens + 1)). Required when using 'allgather_v' with EP > 1.
+    Automatically populated from --inference-dynamic-batching-max-tokens (or
+    max_requests * (num_speculative_tokens + 1)) when --moe-token-dispatcher-type
+    is 'allgather_v'. Required when using 'allgather_v' with EP > 1.
     """
 
     mrope_section: Optional[List[int]] = None
@@ -1237,6 +1236,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
             )
+
+            # Auto-derive inference_moe_cuda_graph_dispatcher from
+            # moe_token_dispatcher_type so users only need one CLI flag.
+            if self.moe_token_dispatcher_type == "allgather_v":
+                self.inference_moe_cuda_graph_dispatcher = "allgather_v"
 
             assert self.inference_moe_cuda_graph_dispatcher in ('fused', 'allgather_v'), (
                 f"inference_moe_cuda_graph_dispatcher must be 'fused' or 'allgather_v', "
