@@ -161,7 +161,7 @@ pip install .
 
 ### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
 
-Starting from Megatron-LM v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
+Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
 
 Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
 
