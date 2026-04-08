@@ -14,7 +14,7 @@ This feature is intended for research teams exploring RL post-training and other
 
 ## Key Features
 
-- **Training-Inference Consistency** - Eliminates numerical differences by using the same kernels and parallelization for both training and inference
+- **Training-Inference Consistency** - Minimizes numerical differences between training and inference within a single framework
 - **Batch-Invariant Mode** - Provides bitwise identical results for dense models regardless of batch configuration (`--batch-invariant-mode`). Note: MoE models may still have minor numerical differences
 - **FP8 Consistency** - Maintains precision alignment for FP8 workflows across training and inference
 - **Native Integration** - No framework handoffs or external dependencies required
@@ -84,11 +84,8 @@ Consistent teacher-student computations for distillation workflows:
 Megatron in-framework inference prioritizes numerical consistency over throughput. **Performance is not expected to match dedicated inference engines**:
 
 - **Lower throughput** than vLLM, SGLang, or TensorRT-LLM
-- **No continuous batching optimizations** found in production inference engines
-- **Limited inference optimizations** - kernel optimizations are actively underway
+- **Continuous batching** supported; kernel optimizations are actively underway
 - **Research-focused** - designed for correctness, not production serving
-
-This is an intentional design tradeoff: Megatron in-framework inference uses the same code paths as training to guarantee numerical consistency, at the cost of inference performance.
 
 ## Resources
 
