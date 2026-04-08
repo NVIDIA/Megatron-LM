@@ -276,28 +276,33 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize token dispatcher.
-        # 'allgather_v' is inference-only; for the base (training) dispatcher
-        # we use alltoall since _setup_inference_mode swaps in the real
-        # InferenceAllGatherVTokenDispatcher during CUDA-graphed iterations.
-        base_dispatcher_type = config.moe_token_dispatcher_type
-        if base_dispatcher_type == "allgather_v":
-            base_dispatcher_type = "alltoall"
-        if base_dispatcher_type == "allgather":
+        # 'allgather_v' uses the same InferenceAllGatherVTokenDispatcher for both
+        # eager and CUDA-graph modes — this ensures EP collectives (AllGather /
+        # ReduceScatter) are consistent regardless of whether a rank replays a
+        # graph or falls back to eager (e.g. dummy EP ranks).
+        if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
-        elif base_dispatcher_type == "alltoall":
+        elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
-        elif base_dispatcher_type == "flex":
+        elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
+        elif config.moe_token_dispatcher_type == "allgather_v":
+            self.token_dispatcher = InferenceAllGatherVTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
@@ -382,12 +387,12 @@ class MoELayer(BaseMoELayer):
 
         dispatcher_type = self.config.inference_moe_cuda_graph_dispatcher
         if dispatcher_type == "allgather_v":
-            self._inference_token_dispatcher = InferenceAllGatherVTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
+            # The base dispatcher is already InferenceAllGatherVTokenDispatcher
+            # (set in __init__), which uses the same AllGather/ReduceScatter
+            # collectives in both eager and graph modes.  No swap needed —
+            # set _inference_token_dispatcher to None so
+            # set_inference_cuda_graphed_iteration skips the swap.
+            self._inference_token_dispatcher = None
         else:
             self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
                 self.num_local_experts,
@@ -523,29 +528,28 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if (
+        if isinstance(self.token_dispatcher, InferenceAllGatherVTokenDispatcher):
+            # AllGatherV dispatcher: tokens are pre-permuted with Triton —
+            # pass expert_offsets and permutation_map for grouped_mm.
+            expert_output, mlp_bias = apply_module(self.experts)(
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                expert_offsets=self.token_dispatcher.expert_offsets,
+                permutation_map=self.token_dispatcher.permutation_map,
+            )
+        elif (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
         ):
-            # AllGatherV dispatcher: tokens are pre-permuted with Triton —
-            # pass expert_offsets and permutation_map for grouped_mm.
-            if isinstance(self.token_dispatcher, InferenceAllGatherVTokenDispatcher):
-                expert_output, mlp_bias = apply_module(self.experts)(
-                    dispatched_input,
-                    tokens_per_expert,
-                    permuted_probs,
-                    expert_offsets=self.token_dispatcher.expert_offsets,
-                    permutation_map=self.token_dispatcher.permutation_map,
-                )
-            else:
-                # Fused dispatcher: pass routing_map for FlashInfer.
-                routing_map = self.token_dispatcher.routing_map
-                expert_output, mlp_bias = apply_module(self.experts)(
-                    dispatched_input,
-                    tokens_per_expert,
-                    permuted_probs,
-                    routing_map=routing_map,
-                )
+            # Fused dispatcher: pass routing_map for FlashInfer.
+            routing_map = self.token_dispatcher.routing_map
+            expert_output, mlp_bias = apply_module(self.experts)(
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                routing_map=routing_map,
+            )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs
