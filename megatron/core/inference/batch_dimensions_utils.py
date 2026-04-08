@@ -222,6 +222,8 @@ class InferenceBatchDimensions:
         # produce inconsistent token counts across EP ranks.
         if is_any_ep_rank_in_non_decode and not strict:
             adjusted_token_count = max(adjusted_token_count, smallest_non_decode_cuda_graph_size)
+            # Also need to allow it to enter mixed mode to actually access higher token count.
+            adjusted_prefill_req_count = max(adjusted_prefill_req_count, 1)
 
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=adjusted_token_count,
@@ -298,6 +300,8 @@ class CUDAGraphBatchDimensionBuilder:
         )
         # Make sure divisible by TP size
         cuda_graph_step_size = round_up_to_nearest_multiple(cuda_graph_step_size, tp_size)
+        # Ensure non-zero step size (can happen when max_tokens < num_cuda_graphs).
+        cuda_graph_step_size = max(cuda_graph_step_size, tp_size)
 
         # round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
@@ -394,11 +398,9 @@ class CUDAGraphBatchDimensionBuilder:
             ):
                 cuda_graph_max_tokens = max_tokens
 
-            assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
-                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests *"
-                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)}). "
-                "This is required for correctly syncing EP ranks: "
-                f"prefill and decode graph pools must have the same token count granularity."
+            assert cuda_graph_max_tokens >= max_requests * (num_speculative_tokens + 1), (
+                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must be >= max_requests * "
+                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)})."
             )
 
             if num_cuda_graphs != -1:

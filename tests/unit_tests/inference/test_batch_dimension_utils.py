@@ -116,6 +116,77 @@ class TestCUDAGraphTokenCountAlignment:
         )
 
 
+class TestGenerateCUDAGraphEdgeCases:
+    """Single-process tests for graph generation edge cases."""
+
+    def test_generate_cuda_graph_edge_cases(self):
+        """Edge cases in graph generation:
+        max_tokens > max_requests, small max_tokens, step_size floor, speculative decoding.
+        """
+
+        # max_tokens > max_requests: decode graphs capped, prefill graphs span full budget
+        g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=1,
+            num_cuda_graphs=8,
+            cuda_graph_max_tokens=512,
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=64,
+            max_tokens=512,
+            max_sequence_length=4096,
+            use_cuda_graphs_for_non_decode_steps=True,
+        )
+        decode_graphs = [g for g in g_list if g.prefill_req_count == 0]
+        prefill_graphs = [g for g in g_list if g.prefill_req_count > 0]
+        assert all(g.token_count <= 64 for g in decode_graphs)
+        assert prefill_graphs and max(g.token_count for g in prefill_graphs) > 64
+
+        # max_tokens < num_cuda_graphs: step_size could round to zero
+        g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=1,
+            num_cuda_graphs=32,
+            cuda_graph_max_tokens=10,
+            cuda_graph_mixed_prefill_request_count=0,
+            max_requests=10,
+            max_tokens=10,
+            max_sequence_length=4096,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        assert len(g_list) > 0 and all(g.token_count > 0 for g in g_list)
+
+        # Step size >= tp_size for various TP sizes
+        for tp_size in (1, 2, 4, 8):
+            g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=tp_size,
+                num_cuda_graphs=64,
+                cuda_graph_max_tokens=tp_size,
+                cuda_graph_mixed_prefill_request_count=0,
+                max_requests=tp_size,
+                max_tokens=tp_size,
+                max_sequence_length=4096,
+                use_cuda_graphs_for_non_decode_steps=False,
+            )
+            assert len(g_list) > 0
+            for g in g_list:
+                assert g.token_count % tp_size == 0
+
+        # Speculative decoding with max_tokens >> max_requests * (spec+1)
+        for num_spec in (1, 3, 7):
+            g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=1,
+                num_cuda_graphs=8,
+                cuda_graph_max_tokens=1024,
+                cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+                max_requests=32,
+                max_tokens=1024,
+                max_sequence_length=4096,
+                use_cuda_graphs_for_non_decode_steps=True,
+                num_speculative_tokens=num_spec,
+            )
+            for g in [g for g in g_list if g.prefill_req_count == 0]:
+                assert g.token_count == g.decode_req_count * (num_spec + 1)
+                assert g.decode_req_count <= 32
+
+
 class TestMatchGraphConfigWithEP:
     """Tests for match_graph_config with expert parallelism.
 
