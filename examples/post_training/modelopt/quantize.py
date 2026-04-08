@@ -253,12 +253,14 @@ def get_modelopt_torch_quantization_config():
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
-    fp8_config = {"enable": True, "num_bits": (4, 3), "axis": None}
+    fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
         "enable": True,
+        "cfg": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+        },
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
