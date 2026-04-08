@@ -45,11 +45,17 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    enable_hyper_connections: bool = False,
+    num_residual_streams: int = 4,
+    mhc_recompute_layer_num: Optional[int] = None,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    if enable_hyper_connections and mhc_recompute_layer_num is not None:
+        recompute_modules.append("mhc")
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -58,7 +64,7 @@ def _build_gpt_model(
         attention_backend=AttnBackend.unfused,
         bf16=True,
         # Recompute
-        recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
+        recompute_modules=recompute_modules,
         recompute_granularity="selective",
         # MoE
         num_moe_experts=num_experts,
@@ -67,6 +73,10 @@ def _build_gpt_model(
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        # Hyper Connection settings
+        enable_hyper_connections=enable_hyper_connections,
+        num_residual_streams=num_residual_streams,
+        mhc_recompute_layer_num=mhc_recompute_layer_num,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -74,6 +84,7 @@ def _build_gpt_model(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
+            enable_hyper_connection=enable_hyper_connections,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -1074,6 +1085,148 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
         assert saved_mib >= -DELTA, (
             f"mHC offloading with CUDA graph significantly increased memory: "
             f"saved={saved_mib:.2f}MiB (negative means increase)"
+        )
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.flaky_in_dev
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_mhc_recompute_with_non_conflicting_offload_modules():
+    """
+    Test that mHC recompute ('mhc' in recompute_modules) works correctly with
+    offload modules that do NOT overlap with mHC checkpoints.
+
+    mHC checkpoints wrap input_layernorm (inside attn_norm) and pre_mlp_layernorm
+    (inside mlp_norm). Other offload modules (qkv_linear, core_attn, attn_proj,
+    expert_fc1, moe_act) live inside self_attention/MLP which are not wrapped by
+    mHC checkpoints, so there is no backward hook ordering conflict.
+    """
+    offload_modules = ["qkv_linear", "core_attn", "attn_proj", "expert_fc1", "moe_act"]
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_experts = 4
+    num_layers = 8
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 1024
+    seq_length = 1024
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline: mHC + mhc recompute, no offloading
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=False,
+            enable_hyper_connections=True,
+            mhc_recompute_layer_num=2,
+        ).cuda()
+        base_model.train()
+
+        _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        base_logits, base_grads, base_peak = _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) mHC + mhc recompute + offloading (non-conflicting modules only)
+        off_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            enable_hyper_connections=True,
+            mhc_recompute_layer_num=2,
+        ).cuda()
+        off_model.train()
+
+        _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        off_interface.reset()
+
+        _reset_cuda_memory()
+        off_logits, off_grads, off_peak = _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3), (
+            f"mHC recompute + offload logits mismatch: "
+            f"max_diff={torch.max(torch.abs(off_logits - base_logits))}"
+        )
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), (
+                f"mHC recompute + offload grad mismatch for {name}: "
+                f"max_diff={torch.max(torch.abs(go - gb))}"
+            )
+
+        # 4) Memory checks
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        assert saved_mib > 0.0, (
+            f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
+            f"but got saved={saved_mib:.2f}MiB"
+        )
+        print(
+            f"mHC recompute + offload ({offload_modules}): "
+            f"saved={saved_mib:.2f}MiB"
         )
 
     finally:

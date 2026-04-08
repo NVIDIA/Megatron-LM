@@ -1535,13 +1535,25 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "'mhc' is in recompute_modules."
                 )
-            if self.fine_grained_activation_offloading:
-                raise ValueError(
-                    "'mhc' in recompute_modules is incompatible with "
-                    "fine_grained_activation_offloading. The mHC recompute hook fires "
-                    "before the offloading backward chunk is initialized, causing "
-                    "tensor_pop on a None chunk. Disable one of them."
-                )
+            if self.fine_grained_activation_offloading and self.offload_modules:
+                # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
+                # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
+                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # the backward chunk, so tensor_pop hits a None chunk for these modules.
+                # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
+                # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
+                # checkpoints, so they are safe to use with mHC recompute.
+                _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
+                conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
+                if conflicting:
+                    raise ValueError(
+                        f"'mhc' in recompute_modules is incompatible with "
+                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"before the offloading backward chunk is initialized for these "
+                        f"modules, causing tensor_pop on a None chunk. Remove "
+                        f"{conflicting} from offload_modules or remove 'mhc' from "
+                        f"recompute_modules."
+                    )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
