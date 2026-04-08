@@ -782,3 +782,12 @@ def get_nvtx_range():
                 timers(msg, log_level=log_level).stop()
 
     return nvtx_range
+
+
+def has_nvrx_installed():
+    """Checks if nvidia-resiliency-ext is installed."""
+    try:
+        import nvidia_resiliency_ext
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False

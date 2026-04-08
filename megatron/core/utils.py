@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -83,6 +83,10 @@ _mamba_ssm_version = None
 _causal_conv1d_version = None
 
 
+_Wrapped = TypeVar('_Wrapped', bound=Callable)
+"""A function or class which has been wrapped by a decorator."""
+
+
 @contextmanager
 def null_decorator(*args, **kwargs):
     """
@@ -120,7 +124,7 @@ def experimental_fn(introduced_with_version: str):
     """
     logged_functions = set()
 
-    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(func: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -186,7 +190,7 @@ def experimental_cls(introduced_with_version: str):
     """
     logged_classes = set()
 
-    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(cls: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -489,6 +493,12 @@ def is_flashinfer_min_version(version, check_equality=True):
     if check_equality:
         return flashinfer_version >= PkgVersion(version)
     return flashinver_version > PkgVersion(version)
+
+
+def accepts_parameter(func: Callable, name: str) -> bool:
+    """Check if a callable accepts a parameter with the given name or **kwargs."""
+    params = inspect.signature(func).parameters.values()
+    return any(p.name == name or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -2209,7 +2219,9 @@ def _nvtx_decorator_get_func_path(func):
     return f"{module.__name__}.{caller_func}"
 
 
-def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+def nvtx_decorator(
+    message: Optional[str] = None, color: Optional[str] = None
+) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
 
     Args:
@@ -2229,7 +2241,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: _Wrapped) -> _Wrapped:
         if _nvtx_enabled and HAVE_NVTX:
             return nvtx.annotate(
                 message=message or _nvtx_decorator_get_func_path(func), color=color
@@ -2372,7 +2384,7 @@ def deprecated(
     removal_version: Optional[str] = None,
     alternative: Optional[str] = None,
     reason: Optional[str] = None,
-) -> Callable:
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Mark a function as deprecated.
 
@@ -2401,7 +2413,7 @@ def deprecated(
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: _Wrapped) -> _Wrapped:
         # Add metadata
         func._deprecated = True
         func._deprecated_version = version
@@ -2432,7 +2444,7 @@ def deprecated(
     return decorator
 
 
-def internal_api(func: Callable) -> Callable:
+def internal_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as internal API (not for external use).
 
@@ -2465,7 +2477,7 @@ def internal_api(func: Callable) -> Callable:
     return func
 
 
-def experimental_api(func: Callable) -> Callable:
+def experimental_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as experimental API.
 
@@ -2499,8 +2511,8 @@ def experimental_api(func: Callable) -> Callable:
 
 
 def deprecate_args(
-    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
-):
+    *deprecated_keys: str, message="Argument '{name}' has been deprecated and should not be used."
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Intercepts specific keyword arguments to raise a custom TypeError.
 
@@ -2509,7 +2521,7 @@ def deprecate_args(
         message: Custom error message string. Use {name} as a placeholder.
     """
 
-    def decorator(func):
+    def decorator(func: _Wrapped) -> _Wrapped:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Check if any deprecated key is present in kwargs
