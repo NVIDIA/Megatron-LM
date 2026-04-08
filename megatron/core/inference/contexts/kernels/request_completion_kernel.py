@@ -120,20 +120,31 @@ def triton_classify_and_release(
     paused_request_count: int,
     max_kv_block_count: int,
     has_prefix_cache: bool,
-) -> Tuple[Tensor, Tensor, int, Tensor, int]:
+    out_finished_left: Optional[Tensor] = None,
+    out_active_right: Optional[Tensor] = None,
+    out_num_compact: Optional[Tensor] = None,
+    out_finished_idxs: Optional[Tensor] = None,
+    out_num_finished: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Classify finished requests, release blocks, compute compaction indices.
 
     Returns:
-        (finished_left, active_right, num_compact, finished_idxs, num_finished)
+        (finished_left, active_right, num_compact_buf, finished_idxs, num_finished_buf)
+        All GPU tensors. Caller reads .item() when needed.
     """
     device = active_requests_mask.device
     mask_len = active_requests_mask.shape[0]
 
-    finished_left = torch.empty(mask_len, dtype=torch.int32, device=device)
-    active_right = torch.empty(mask_len, dtype=torch.int32, device=device)
-    num_compact_buf = torch.zeros(1, dtype=torch.int32, device=device)
-    finished_idxs = torch.empty(mask_len, dtype=torch.int32, device=device)
-    num_finished_buf = torch.zeros(1, dtype=torch.int32, device=device)
+    finished_left = out_finished_left if out_finished_left is not None else torch.empty(mask_len, dtype=torch.int32, device=device)
+    active_right = out_active_right if out_active_right is not None else torch.empty(mask_len, dtype=torch.int32, device=device)
+    num_compact_buf = out_num_compact if out_num_compact is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    finished_idxs = out_finished_idxs if out_finished_idxs is not None else torch.empty(mask_len, dtype=torch.int32, device=device)
+    num_finished_buf = out_num_finished if out_num_finished is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    # Reset scalar outputs (may be reused from previous step)
+    if out_num_compact is not None:
+        out_num_compact.zero_()
+    if out_num_finished is not None:
+        out_num_finished.zero_()
 
     dummy = block_bag
     ref_ptr = block_ref_counts if has_prefix_cache else dummy
@@ -159,7 +170,4 @@ def triton_classify_and_release(
         HAS_PREFIX_CACHE=has_prefix_cache,
     )
 
-    num_compact = num_compact_buf.item()
-    num_finished = num_finished_buf.item()
-
-    return finished_left, active_right, num_compact, finished_idxs, num_finished
+    return finished_left, active_right, num_compact_buf, finished_idxs, num_finished_buf

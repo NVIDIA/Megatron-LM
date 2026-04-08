@@ -240,11 +240,12 @@ def triton_resume_and_allocate(
     num_speculative_tokens: int,
     max_requests: int,
     max_tokens: int,
+    out_resume_count: Optional[Tensor] = None,
 ) -> int:
     """Determine resume count and allocate blocks for resumed requests.
 
     Returns:
-        resume_request_count
+        resume_request_count (Python int)
     """
     if paused_request_count == 0:
         return 0
@@ -254,7 +255,9 @@ def triton_resume_and_allocate(
     max_allowed_active = min(max_requests, max_tokens // (num_speculative_tokens + 1))
     max_allowed_resume = max(0, max_allowed_active - active_request_count)
 
-    resume_count_buf = torch.zeros(1, dtype=torch.int32, device=last_kv_block_offset.device)
+    resume_count_buf = out_resume_count if out_resume_count is not None else torch.zeros(1, dtype=torch.int32, device=last_kv_block_offset.device)
+    if out_resume_count is not None:
+        out_resume_count.zero_()
 
     _resume_and_allocate_kernel[(1,)](
         last_kv_block_offset,

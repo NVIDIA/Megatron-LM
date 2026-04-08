@@ -171,21 +171,32 @@ def triton_evict_overflow(
     paused_block_limit: int,
     max_kv_block_count: int,
     has_prefix_cache: bool,
-) -> Tuple[int, Tensor, Tensor, Tensor, Tensor, int]:
+    out_evict_count: Optional[Tensor] = None,
+    out_evict_request_ids: Optional[Tensor] = None,
+    out_evict_idxs: Optional[Tensor] = None,
+    out_src_idxs: Optional[Tensor] = None,
+    out_dst_idxs: Optional[Tensor] = None,
+    out_swap_count: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Detect overflow, evict, release blocks, compute swap indices.
 
     Returns:
-        (evict_count, evict_request_ids, evict_idxs, src_idxs, dst_idxs, swap_count)
+        (evict_count_buf, evict_request_ids, evict_idxs, src_idxs, dst_idxs, swap_count_buf)
+        All GPU tensors. Caller reads .item() when needed.
     """
     device = kv_block_counts.device
     max_out = max(paused_request_count, 1)
 
-    evict_count_buf = torch.zeros(1, dtype=torch.int32, device=device)
-    evict_request_ids = torch.empty(max_out, dtype=torch.int32, device=device)
-    evict_idxs = torch.empty(max_out, dtype=torch.int32, device=device)
-    src_idxs = torch.empty(max_out, dtype=torch.int32, device=device)
-    dst_idxs = torch.empty(max_out, dtype=torch.int32, device=device)
-    swap_count_buf = torch.zeros(1, dtype=torch.int32, device=device)
+    evict_count_buf = out_evict_count if out_evict_count is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    evict_request_ids = out_evict_request_ids if out_evict_request_ids is not None else torch.empty(max_out, dtype=torch.int32, device=device)
+    evict_idxs = out_evict_idxs if out_evict_idxs is not None else torch.empty(max_out, dtype=torch.int32, device=device)
+    src_idxs = out_src_idxs if out_src_idxs is not None else torch.empty(max_out, dtype=torch.int32, device=device)
+    dst_idxs = out_dst_idxs if out_dst_idxs is not None else torch.empty(max_out, dtype=torch.int32, device=device)
+    swap_count_buf = out_swap_count if out_swap_count is not None else torch.zeros(1, dtype=torch.int32, device=device)
+    if out_evict_count is not None:
+        out_evict_count.zero_()
+    if out_swap_count is not None:
+        out_swap_count.zero_()
 
     dummy = block_bag
     ref_ptr = block_ref_counts if has_prefix_cache else dummy
@@ -214,7 +225,4 @@ def triton_evict_overflow(
         HAS_PREFIX_CACHE=has_prefix_cache,
     )
 
-    evict_count = evict_count_buf.item()
-    swap_count = swap_count_buf.item()
-
-    return evict_count, evict_request_ids, evict_idxs, src_idxs, dst_idxs, swap_count
+    return evict_count_buf, evict_request_ids, evict_idxs, src_idxs, dst_idxs, swap_count_buf

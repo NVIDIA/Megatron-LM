@@ -76,6 +76,11 @@ except ImportError:
     triton_evict_overflow = None
 
 try:
+    from .kernels.update_requests_kernel import triton_fused_counts
+except ImportError:
+    triton_fused_counts = None
+
+try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -901,6 +906,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # Pre-allocated scratch buffers for kernel outputs (phase 9 optimization).
+        # Avoids per-step torch.empty/zeros allocations in kernel wrappers.
+        _dev = torch.cuda.current_device()
+        _mr = self.max_requests
+        self._scratch_scalar_i32 = torch.zeros(16, dtype=torch.int32, device=_dev)
+        self._scratch_idx_a = torch.empty(_mr, dtype=torch.int32, device=_dev)
+        self._scratch_idx_b = torch.empty(_mr, dtype=torch.int32, device=_dev)
+        self._scratch_idx_c = torch.empty(_mr, dtype=torch.int32, device=_dev)
+        self._scratch_idx_d = torch.empty(_mr, dtype=torch.int32, device=_dev)
+        self._scratch_idx_e = torch.empty(_mr, dtype=torch.int32, device=_dev)
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -2557,7 +2573,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         if triton_evict_overflow is not None:
-            evict_count, evict_ids_t, evict_idxs_t, src_t, dst_t, swap_count = (
+            s = self._scratch_scalar_i32
+            evict_count_buf, evict_ids_t, evict_idxs_t, src_t, dst_t, swap_count_buf = (
                 triton_evict_overflow(
                     kv_block_counts=self.request_kv_block_counts,
                     request_to_kv_block_ids=self.request_to_kv_block_ids,
@@ -2580,8 +2597,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                     paused_block_limit=self.kv_block_allocator.paused_count,
                     max_kv_block_count=self.max_kv_block_count,
                     has_prefix_cache=self.enable_prefix_caching,
+                    out_evict_count=s[2:3],
+                    out_evict_request_ids=self._scratch_idx_a,
+                    out_evict_idxs=self._scratch_idx_b,
+                    out_src_idxs=self._scratch_idx_c,
+                    out_dst_idxs=self._scratch_idx_d,
+                    out_swap_count=s[3:4],
                 )
             )
+
+            # Single sync for both scalars
+            evict_count = s[2].item()
+            swap_count = s[3].item()
 
             if evict_count == 0:
                 return None
@@ -2782,8 +2809,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             # We must keep it active so that the next iteration will add a new chunk to it.
             active_requests_mask[-1] = 1
 
-        active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
+        if triton_fused_counts is not None:
+            active_request_count, finished_request_count, _ = triton_fused_counts(
+                active_requests_mask,
+                self.request_last_kv_block_offset,
+                self.paused_request_count,
+                self.block_size_tokens,
+                self.num_speculative_tokens,
+            )
+        else:
+            active_request_count = (active_requests_mask == 1).sum().item()
+            finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
             active_request_count + finished_request_count + self.paused_request_count
             == self.total_request_count
@@ -2857,7 +2893,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if finished_request_count > 0:
             if triton_classify_and_release is not None:
-                finished_left, active_right, num_compact, finished_idxs_t, num_finished = (
+                # Use pre-allocated scratch buffers to avoid per-step allocations.
+                # Scalar outputs: _scratch_scalar_i32[0]=num_compact, [1]=num_finished
+                s = self._scratch_scalar_i32
+                finished_left, active_right, num_compact_buf, finished_idxs_t, num_finished_buf = (
                     triton_classify_and_release(
                         active_requests_mask=active_requests_mask,
                         request_to_kv_block_ids=self.request_to_kv_block_ids,
@@ -2877,8 +2916,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                         paused_request_count=self.paused_request_count,
                         max_kv_block_count=self.max_kv_block_count,
                         has_prefix_cache=self.enable_prefix_caching,
+                        out_finished_left=self._scratch_idx_a,
+                        out_active_right=self._scratch_idx_b,
+                        out_num_compact=s[0:1],
+                        out_finished_idxs=self._scratch_idx_c,
+                        out_num_finished=s[1:2],
                     )
                 )
+
+                # Single sync to read both scalar outputs
+                num_compact = s[0].item()
+                num_finished = s[1].item()
 
                 # Mamba cleanup (stays in Python)
                 if num_finished > 0:
