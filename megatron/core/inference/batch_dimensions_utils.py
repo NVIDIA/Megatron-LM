@@ -329,6 +329,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
         num_speculative_tokens: int = 0,
+        skip_ep_sync: bool = False,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -394,12 +395,17 @@ class CUDAGraphBatchDimensionBuilder:
             ):
                 cuda_graph_max_tokens = max_tokens
 
-            assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
-                f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests *"
-                f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)}). "
-                "This is required for correctly syncing EP ranks: "
-                f"prefill and decode graph pools must have the same token count granularity."
-            )
+            # When EP ranks sync batch dimensions, prefill and decode graph
+            # pools must use the same token granularity.  With skip_ep_sync
+            # (allgather_v dispatcher), ranks select graphs independently so
+            # cuda_graph_max_tokens can be larger (e.g. max_tokens).
+            if not skip_ep_sync:
+                assert cuda_graph_max_tokens == max_requests * (num_speculative_tokens + 1), (
+                    f"cuda_graph_max_tokens ({cuda_graph_max_tokens}) must equal max_requests *"
+                    f"(num_speculative_tokens + 1) ({max_requests * (num_speculative_tokens + 1)}). "
+                    "This is required for correctly syncing EP ranks: "
+                    f"prefill and decode graph pools must have the same token count granularity."
+                )
 
             if num_cuda_graphs != -1:
                 # if -1, no need to adjust. This will be taken care of in

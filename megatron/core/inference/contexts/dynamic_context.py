@@ -590,17 +590,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
         )
+        # With the allgather_v dispatcher, CUDA graphs can handle up to
+        # max_tokens because EP ranks select graphs independently (no sync).
+        # Otherwise, cuda_graph_max_tokens is capped at max_requests to keep
+        # prefill and decode graph pools at the same token granularity.
+        if self._skip_ep_sync:
+            cuda_graph_max_tokens = self.max_tokens
+        else:
+            cuda_graph_max_tokens = self.max_requests * (self.num_speculative_tokens + 1)
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_requests * (self.num_speculative_tokens + 1),
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
+                skip_ep_sync=self._skip_ep_sync,
             )
         )
 
