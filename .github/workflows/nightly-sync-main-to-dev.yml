@@ -130,21 +130,30 @@ jobs:
             - `megatron/training/utils.py` (references dev-only args)
             - `megatron/training/datasets/data_samplers.py` (references dev-only args)
             - `megatron/core/optimizer/layer_wise_optimizer.py` (constructor signature)
-            - `megatron/core/datasets/data_schedule.py` (main's `training.py`
-              imports `HybridCPDataLoaderWrapper` which only exists in main's
-              version; dev's version has completely different classes)
 
             Use: `git checkout origin/main -- <file>` for each.
+
+            **Special handling for `megatron/core/datasets/data_schedule.py`:**
+            Main and dev have completely different classes in this file. Main has
+            `HybridCPDataLoaderWrapper` (imported by main's `training.py`). Dev
+            has `BasePackingScheduler`, `DpBalancedScheduler`,
+            `DefaultDynamicCPScheduler`, `wrap_data_iterator`, and
+            `get_batch_on_this_rank_for_sequence_packing` (imported by
+            `pretrain_gpt.py` and `tests/unit_tests/test_sequence_packing.py`).
+            **Do NOT take either version wholesale.** Instead, keep dev's file
+            and append main's `HybridCPDataLoaderWrapper` class (plus any
+            missing imports like `BalancedCPScheduler`, `Any`, `List`) at the
+            end. Then run `black` and `isort` on the result.
 
             **Restore files that exist in main but were deleted/renamed in dev:**
             Compare `git ls-tree` between `origin/main` and HEAD, and restore any
             files from main that are missing (e.g. `hybrid_cp_schedule.py`).
 
-            Run `black` (version 24, with `--config pyproject.toml`) on all changed
-            Python files to fix formatting differences.
-
-            After editing imports in any Python files, run `isort` on those files
-            (see CLAUDE.md).
+            Run `black` (version 24, with `--config pyproject.toml`) on **all**
+            changed Python files (relative to `origin/dev`) to fix formatting.
+            Then run `isort` on the same set of files. Order matters: black
+            first, then isort — running them in the wrong order can undo
+            isort's work.
 
             **After formatting, run pylint on all changed `megatron/core/` files**
             to catch missing-docstring and line-too-long violations before
@@ -169,11 +178,28 @@ jobs:
 
             ## Phase 3: Trigger CI and iterate until all tests pass
 
+            **Important CI architecture notes:**
+            - `Nemo_CICD_Test` is a downstream **gate job** that aggregates
+              results from unit tests, integration tests, and other jobs. If
+              it fails, investigate the upstream jobs it depends on — do NOT
+              debug `Nemo_CICD_Test` itself.
+            - Integration tests (H100, GB200) may be skipped for non-maintainer
+              PRs. This is expected; the `Nemo_CICD_Test` gate will fail as a
+              result, but that is not a sync issue.
+            - `tests/unit_tests/conftest.py` imports from
+              `megatron.training.training`, so a single broken import in
+              `training.py` (or anything it transitively imports) will cascade
+              and fail **ALL** test suites. If you see every test job failing
+              with an `ImportError`, check the import chain from `training.py`
+              first.
+
             Loop:
             1. Get the HEAD commit SHA and comment on the PR:
                `/ok to test <SHA>`
-            2. Wait for the `CICD Megatron-LM` workflow run on branch
-               `pull-request/<PR_NUMBER>` to complete. Poll the GitHub API
+            2. Find the CI run: use `gh run list` with `--json` and filter
+               for `headBranch == "pull-request/<PR_NUMBER>"` (note: `gh run
+               list` does not support a `--branch` flag). Wait for the `CICD
+               Megatron-LM` workflow run to complete. Poll the GitHub API
                every 2 minutes, checking for individual job failures as they
                happen (don't wait for the entire run to finish). Use:
                `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
@@ -200,17 +226,33 @@ jobs:
                  - **Test assertion failures**: Read the test and the code under
                    test. Fix the code or the test as appropriate.
                - Commit fixes, push, and re-trigger CI.
-               - Repeat. Never give up.
+               - Repeat until all fixable issues are resolved.
+
+            **Handling pre-existing failures:**
+            If a test failure is NOT caused by the sync (i.e. the same test code
+            and function signatures exist identically on `dev` or `main` and the
+            failure would reproduce there too), do NOT attempt to fix it. Instead:
+            1. Verify it is pre-existing by comparing the test file and the code
+               it calls between `origin/main`, `origin/dev`, and your branch.
+            2. Note the failure as pre-existing and move on.
+            3. After the CI run completes, update the PR description with a
+               section titled "Pre-existing test failures (NOT caused by this
+               sync)" documenting each such failure: the test name, the error
+               message, and the evidence that it is pre-existing.
+            4. Also comment on the PR summarizing these pre-existing failures so
+               reviewers are aware.
 
             ---
 
             ## Phase 4: Mark PR as ready for review
 
-            Once CI passes:
+            Once all sync-related CI issues are fixed (pre-existing failures
+            are acceptable):
             ```
             gh pr ready <PR_NUMBER> --repo $REPO
             ```
-            Comment on the PR confirming all checks passed and it is ready for
+            Comment on the PR confirming which checks passed, listing any
+            pre-existing failures that remain, and stating it is ready for
             human review.
 
             ---
@@ -220,7 +262,8 @@ jobs:
             - **Prioritize main over dev** when there is a genuine conflict between
               the two. But preserve dev-only additions (new files, new classes, new
               tests) that do not conflict with main.
-            - Never give up. Keep fixing and retrying until CI passes.
+            - Keep fixing and retrying sync-related issues until they pass.
+              For pre-existing failures, document them and move on (see Phase 3).
             - The CI pipeline triggers when you comment "/ok to test <sha>".
             - CI runs appear on the `pull-request/<PR_NUMBER>` branch.
             - The git committer identity is `svcnvidia-nemo-ci`.
