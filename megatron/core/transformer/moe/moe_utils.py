@@ -1007,8 +1007,8 @@ def clear_aux_losses_tracker() -> None:
     get_moe_metrics_tracker().clear()
 
 
-class SaveOverloadFactorFunction(torch.autograd.Function):
-    """Autograd function to save overload factor data for forward and backward passes."""
+class RecordDispatchTokenCountsFunction(torch.autograd.Function):
+    """Autograd hook: record post-dispatch token totals for overload reporting (see ``report()``)."""
 
     @staticmethod
     def forward(
@@ -1018,12 +1018,12 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
         local_balanced_token_count: torch.Tensor,
         layer_number: Optional[int],
     ):
-        """Forward pass: save overload factor data.
+        """Record actual token total and balanced count on forward; pass ``tensor`` through.
 
         Args:
             tensor: Tensor in the autograd graph (e.g. ``dispatched_input``) — pass-through.
             tokens_per_expert: Per-local-expert counts from ``dispatch_postprocess`` (any device).
-            local_balanced_token_count: Scalar float, ``routing_map.shape[0] * topk`` pre-dispatch.
+            local_balanced_token_count: Scalar float, ``num_local_tokens * topk`` (token rows from forward ``hidden_states``).
             layer_number: Layer index (1-based).
 
         Returns:
@@ -1032,14 +1032,13 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
         if layer_number is None:
             return tensor
 
-        tokens_on_rank = tokens_per_expert.detach().sum()
-        if not tokens_on_rank.is_floating_point():
-            tokens_on_rank = tokens_on_rank.float()
-        tokens_on_rank = tokens_on_rank.to(device=tensor.device, dtype=torch.float32).reshape(())
+        tokens_on_rank = tokens_per_expert.detach().sum().to(
+            device=tensor.device, dtype=torch.float32
+        )
 
         balanced = local_balanced_token_count.detach().to(
             device=tensor.device, dtype=torch.float32
-        ).reshape(())
+        )
 
         tracker = get_moe_overload_factor_tracker()
         tracker.record_fwd(layer_number, tokens_on_rank, balanced)
@@ -1056,34 +1055,30 @@ class SaveOverloadFactorFunction(torch.autograd.Function):
         return grad_output, None, None, None
 
 
-def save_overload_factor_to_tracker(
+def record_dispatch_token_counts(
     tensor: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     local_balanced_token_count: torch.Tensor,
     layer_number: Optional[int],
-    tp_ep_group: torch.distributed.ProcessGroup,
-    dp_group: torch.distributed.ProcessGroup,
 ) -> torch.Tensor:
-    """Wrap ``tensor`` to record post-dispatch token totals for overload factor reporting.
+    """Wrap ``tensor`` with an autograd hook that records dispatch token counts for overload metrics.
 
-    Records ``tokens_per_expert.sum()`` on this rank and the pre-dispatch **balanced token
-    count** scalar. See ``MoEOverloadFactorTracker.report()``.
+    Records ``tokens_per_expert.sum()`` on this rank and the **balanced token count** scalar.
+    Overload factors are computed later in ``MoEOverloadFactorTracker.report()``. Process groups
+    must already be registered on the global tracker (``MoELayer`` does this in ``__init__``
+    when ``log_overload_factor`` is enabled).
 
     Args:
         tensor: Tensor in the autograd graph (typically ``dispatched_input``).
         tokens_per_expert: Output of ``dispatch_postprocess`` (per-expert counts).
-        local_balanced_token_count: Scalar float tensor, ``shape[0] * moe_router_topk``.
+        local_balanced_token_count: Scalar float tensor,
+            ``num_local_tokens * moe_router_topk`` (``num_local_tokens`` from MoE forward ``hidden_states`` shape).
         layer_number: Layer index (1-based).
-        tp_ep_group: TP × EP process group.
-        dp_group: Data-parallel group for cross-replica stats.
 
     Returns:
         ``tensor`` unchanged.
     """
-    get_moe_overload_factor_tracker().set_process_groups(
-        tp_ep_group=tp_ep_group, dp_group=dp_group
-    )
-    return SaveOverloadFactorFunction.apply(
+    return RecordDispatchTokenCountsFunction.apply(
         tensor, tokens_per_expert, local_balanced_token_count, layer_number
     )
 
