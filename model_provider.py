@@ -16,14 +16,10 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
-import megatron.legacy.model  # isort: skip
-
-# NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
-
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
-) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
+) -> Union[GPTModel, MambaModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -34,7 +30,7 @@ def model_provider(
         post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
 
     Returns:
-        Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]: The returned model
+        Union[GPTModel, MambaModel]: The returned model
     """
     args = get_args()
 
