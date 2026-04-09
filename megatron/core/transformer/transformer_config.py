@@ -839,8 +839,9 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, None means no token
-    will be dropped. The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
+    exceeding this budget will be dropped. None means no token will be dropped. 
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1104,19 +1105,18 @@ class TransformerConfig(ModelParallelConfig):
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
     
     moe_paged_stash: bool = False
-    """If True, enable paged stash for all routed-expert activations needed for backward
-    (requires fused grouped GEMM via use_transformer_engine_op_fuser)."""
+    """If True, enable paged stash for all routed-expert activations needed for backward"""
 
     moe_paged_stash_page_size: int = 64
     """Number of tokens per page for paged stash memory management."""
 
-    stash_buffer_size_factor_cuda: float = 1.10
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
     """Scale factor for paged stash CUDA buffer allocation. Sign selects sizing: positive = avg-based,
     negative = actual-max. Magnitude is headroom (e.g. 1.10 = 10%)."""
 
-    stash_buffer_size_factor_cpu: float = 0.0
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
     """Scale factor for paged stash host buffer. 0 disables host buffer. Same sign convention as
-    stash_buffer_size_factor_cuda: positive = avg-based, negative = actual-max; scale = abs(factor)."""
+    moe_paged_stash_buffer_size_factor_cuda: positive = avg-based, negative = actual-max; scale = abs(factor)."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1428,8 +1428,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_expert_rank_capacity_factor is not None:
             if not self.use_transformer_engine_op_fuser:
                 raise ValueError(
-                    "moe_expert_rank_capacity_factor requires "
-                    "use_transformer_engine_op_fuser to be enabled."
+                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
+                    "be enabled."
                 )
             if self.moe_flex_dispatcher_backend != "hybridep":
                 raise ValueError(
@@ -1693,10 +1693,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_paged_stash:
             assert not self.cpu_offloading, (
                 "moe_paged_stash cannot be enabled with cpu_offloading."
-            )
-            assert self.use_transformer_engine_op_fuser, (
-                "moe_paged_stash currently only works with fused grouped GEMM through "
-                "use_transformer_engine_op_fuser."
             )
             assert self.moe_expert_rank_capacity_factor is not None, (
                 "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "

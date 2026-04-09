@@ -122,8 +122,8 @@ class MoEModelTestContainer:
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
             activation_func=kwargs.get("activation_func", F.gelu),
             moe_router_force_biased=kwargs.get("moe_router_force_biased", None),
-            stash_buffer_size_factor_cuda=0.5,
-            stash_buffer_size_factor_cpu=1.5,
+            moe_paged_stash_buffer_size_factor_cuda=0.5,
+            moe_paged_stash_buffer_size_factor_cpu=1.5,
         )
         self.moe_layers = [
             self._create_moe_layer(layer_number=i) for i in range(num_layers)
@@ -346,8 +346,8 @@ class TestPagedStashingOverBudget:
 
         overflow = check_paged_stash_overflow()
         num_layers = len(container.moe_layers)
-        stash_cuda = container.config.stash_buffer_size_factor_cuda
-        stash_cpu = container.config.stash_buffer_size_factor_cpu
+        stash_cuda = container.config.moe_paged_stash_buffer_size_factor_cuda
+        stash_cpu = container.config.moe_paged_stash_buffer_size_factor_cpu
         stash_buffer_size = num_tokens * num_layers * (stash_cuda + stash_cpu)
 
         total_tokens = 0

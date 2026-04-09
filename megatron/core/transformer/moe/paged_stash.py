@@ -727,8 +727,8 @@ class PagedStashManager:
 
     def allocate_stash_buffers(
         self,
-        stash_buffer_size_factor_cuda: float = 1.10,
-        stash_buffer_size_factor_cpu: float = 0.0,
+        moe_paged_stash_buffer_size_factor_cuda: float = 1.10,
+        moe_paged_stash_buffer_size_factor_cpu: float = 0.0,
     ):
         """Allocate stash buffers organized by [dtype][hidden_size]."""
         self.stash_buffers = {}
@@ -741,8 +741,8 @@ class PagedStashManager:
         else:
             self.host_spill.zero_()
 
-        cuda_factor = stash_buffer_size_factor_cuda
-        cpu_factor = stash_buffer_size_factor_cpu
+        cuda_factor = moe_paged_stash_buffer_size_factor_cuda
+        cpu_factor = moe_paged_stash_buffer_size_factor_cpu
 
         # Both factors use the same sign convention:
         # - positive: size based on avg_num_tokens-derived maxima
@@ -1051,7 +1051,7 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
-    config: optional TransformerConfig; if provided, stash_buffer_size_factor_cuda/cpu and
+    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu and
     moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
     """
     stash_manager = PagedStashManager.get_instance()
@@ -1069,21 +1069,21 @@ def paged_stash_reset(enabled=True, config=None):
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
-        cuda_factor = config.stash_buffer_size_factor_cuda if config is not None else 1.10
-        cpu_factor = config.stash_buffer_size_factor_cpu if config is not None else 0.0
+        cuda_factor = config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
+        cpu_factor = config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
         stash_manager.allocate_stash_buffers(
-            stash_buffer_size_factor_cuda=cuda_factor,
-            stash_buffer_size_factor_cpu=cpu_factor,
+            moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
+            moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
         )
     elif stash_manager.status == 'captured':
         # Buffers may have been released after a PagedStashRunner fallback; reallocate using
         # the same capture-derived maxima and current config factors.
         if stash_manager.stash_buffers is None:
-            cuda_factor = config.stash_buffer_size_factor_cuda if config is not None else 1.10
-            cpu_factor = config.stash_buffer_size_factor_cpu if config is not None else 0.0
+            cuda_factor = config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
+            cpu_factor = config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
             stash_manager.allocate_stash_buffers(
-                stash_buffer_size_factor_cuda=cuda_factor,
-                stash_buffer_size_factor_cpu=cpu_factor,
+                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
+                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
             )
 
     if stash_manager.status == 'captured':
@@ -1294,7 +1294,7 @@ class PagedStashRunner:
                         logging.INFO,
                         "Paged stash: spilled activations to pinned host "
                         f"on {host_spill_ranks} rank(s) (CUDA stash full). "
-                        "Consider increasing stash_buffer_size_factor_cuda for potentially better performance.",
+                        "Consider increasing moe_paged_stash_buffer_size_factor_cuda for potentially better performance.",
                     )
                 for mlp in self.moe_layers:
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
@@ -1319,7 +1319,7 @@ class PagedStashRunner:
                     logging.INFO,
                     "Paged stash: stashing buffer overflow "
                     f"on {stash_overflow_ranks} rank(s). "
-                    "Consider increasing stash_buffer_size_factor_cuda or stash_buffer_size_factor_cpu.",
+                    "Consider increasing moe_paged_stash_buffer_size_factor_cuda or moe_paged_stash_buffer_size_factor_cpu.",
                 )
             self.prepare_for_rerun(is_training=training)
         return result
