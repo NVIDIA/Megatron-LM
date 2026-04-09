@@ -163,7 +163,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
-        self._fix_tensor_parallel_attributes(module)
         self._set_te_module_quantization_ctx(module)
 
         super().__init__(
