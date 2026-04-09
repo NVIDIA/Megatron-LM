@@ -47,6 +47,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    get_model_weight_bytes,
+    measure_hbm_bandwidth,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -261,6 +263,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+        # Measure HBM bandwidth and model weight memory for SOL latency reporting.
+        self._model_weight_bytes = get_model_weight_bytes(
+            self.controller.inference_wrapped_model.model
+        )
+        self._measured_hbm_bandwidth = measure_hbm_bandwidth()
+        if torch.distributed.get_rank() == 0:
+            logging.info(
+                f"SOL latency baseline: model weights = "
+                f"{self._model_weight_bytes / 1e9:.2f} GB, "
+                f"measured HBM bandwidth = "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+            )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -1845,6 +1860,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_blocks_matched
                 )
 
+            # Add SOL latency metrics for decode-only steps.
+            if context_state["is_decode_only"]:
+                state_bytes = self.context.get_active_state_memory_bytes()
+                sol_latency_s = (
+                    (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
+                )
+                sol_pct = sol_latency_s / step_time * 100.0
+                metrics['inference/sol_latency_pct'] = float(sol_pct)
+                metrics['inference/sol_latency_ms'] = float(sol_latency_s * 1000)
+
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
             else:
@@ -1908,6 +1933,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_blocks_matched,
                 )
             if context_state["is_decode_only"]:
+                state_bytes = self.context.get_active_state_memory_bytes()
+                sol_latency_s = (
+                    (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
+                )
+                sol_pct = sol_latency_s / step_time * 100.0
+                output_str += (
+                    " ... SOL: %.1f%% (proj %.3f ms = "
+                    "(%.2f gb weights + %.2f gb state) / %.0f gb/s)"
+                    % (
+                        sol_pct,
+                        sol_latency_s * 1000,
+                        self._model_weight_bytes / 1e9,
+                        state_bytes / 1e9,
+                        self._measured_hbm_bandwidth / 1e9,
+                    )
+                )
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 

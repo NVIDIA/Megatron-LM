@@ -3198,3 +3198,32 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
         }
+
+    def get_active_state_memory_bytes(self) -> int:
+        """Compute state tensor memory (KV cache + Mamba state) for active requests.
+
+        Returns:
+            Total state memory in bytes for the current active batch.
+        """
+        # KV cache: active blocks * per-block bytes
+        active_kv_blocks = self.kv_block_allocator.get_active_used()
+        kv_bytes = active_kv_blocks * self.block_size_bytes
+
+        # Mamba state: active requests * per-request Mamba memory
+        # Mirrors the mamba_states_memory_per_request calculation in __init__.
+        mamba_bytes = 0
+        if self.is_hybrid_model:
+            active_requests = self.get_active_request_count()
+            per_request = (
+                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+                + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+            ) * self.num_mamba_layers
+            if self.num_speculative_tokens > 0:
+                intermediate_per_request = (
+                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                ) * self.num_mamba_layers * (self.num_speculative_tokens + 1)
+                per_request += intermediate_per_request
+            mamba_bytes = active_requests * per_request
+
+        return kv_bytes + mamba_bytes

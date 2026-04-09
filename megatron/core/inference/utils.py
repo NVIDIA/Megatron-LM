@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -38,6 +39,76 @@ def device_memory_summary() -> str:
         f"alloc={alloc/M:.0f}MiB private={private/M:.0f}MiB "
         f"resv-alloc={(resv-alloc)/M:.0f}MiB resv={resv/M:.0f}MiB dev_mem={dev_mem/M:.0f}MiB"
     )
+
+
+def measure_hbm_bandwidth(device=None, iters=50):
+    """Measure observed GPU HBM bandwidth using L2-cache-busting tensor copies.
+
+    Allocates multiple tensor pairs whose total working set exceeds 2x the L2 cache,
+    then times round-trip copies to measure sustained memory bandwidth.
+
+    Args:
+        device: CUDA device (defaults to current device).
+        iters: Number of copy iterations for timing.
+
+    Returns:
+        Measured bandwidth in bytes per second.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+
+    props = torch.cuda.get_device_properties(device)
+    l2_cache_bytes = getattr(props, 'l2_cache_size', 64 * 1024 * 1024)
+
+    # Use a large tensor (256 MB) to amortize launch overhead and bust L2 cache
+    n = 64 * 1024 * 1024  # 64M float32 elements = 256 MB
+    tensor_bytes = n * 4
+
+    # Enough tensors so total working set > 2x L2 cache
+    k = max(2, int((l2_cache_bytes * 2) // tensor_bytes) + 1)
+
+    xs = [torch.randn(n, dtype=torch.float32, device=device) for _ in range(k)]
+    zs = [torch.empty_like(x) for x in xs]
+
+    # Warmup
+    for i in range(k):
+        zs[i].copy_(xs[i])
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        for i in range(k):
+            zs[i].copy_(xs[i])
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    # Each copy reads + writes the tensor: 2 * tensor_bytes per copy
+    total_bytes = iters * k * 2 * tensor_bytes
+    bandwidth_bytes_per_sec = total_bytes / elapsed_s
+
+    del xs, zs
+    torch.cuda.empty_cache()
+
+    return bandwidth_bytes_per_sec
+
+
+def get_model_weight_bytes(model):
+    """Compute total bytes of model parameters on GPU.
+
+    Args:
+        model: A PyTorch model (possibly wrapped).
+
+    Returns:
+        Total parameter memory in bytes.
+    """
+    total = 0
+    for p in model.parameters():
+        total += p.nelement() * p.element_size()
+    return total
 
 
 class Counter:
