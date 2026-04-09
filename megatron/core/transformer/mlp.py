@@ -408,6 +408,28 @@ def apply_swiglu_sharded_factory(
             v_key = key
 
         tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        kwargs = {}
+        from torch.distributed import DeviceMesh, get_process_group_ranks
+        from torch.distributed.distributed_c10d import _get_group_tag
+        from torch.distributed.tensor.placement_types import Shard, Replicate
+        from megatron.core import parallel_state
+        process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        mesh_shape = (parallel_state.get_data_parallel_world_size(with_context_parallel=True),)
+        with torch.device("cpu"):
+            group_ranks = get_process_group_ranks(process_group)
+            mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
+
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(process_group), group_ranks,
+                process_group.group_name)
+        ]
+        placements = [Replicate()]
+
+        kwargs.update(dict(
+            dtensor_ckpt_device_mesh=device_mesh,
+            dtensor_ckpt_placements=placements
+        ))
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,
@@ -416,6 +438,7 @@ def apply_swiglu_sharded_factory(
                 offset_w,
                 replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
+                **kwargs,
             ),
             ShardedTensor.from_rank_offsets(
                 v_key,
@@ -424,6 +447,7 @@ def apply_swiglu_sharded_factory(
                 offset_v,
                 replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
+                **kwargs,
             ),
         ]
 

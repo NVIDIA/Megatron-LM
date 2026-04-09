@@ -729,10 +729,15 @@ class TorchDistSaveShardedStrategy:
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "nvrx" if HAVE_NVRX else "mcore"
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
-        async_request.execute_sync()
-        del async_request
+        if self.dtensor_format:
+            values_to_save = inject_placeholders(sharded_state_dict)
+            values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
+            return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
+        else:
+            strategy = "nvrx" if HAVE_NVRX else "mcore"
+            async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
+            async_request.execute_sync()
+            del async_request
 
     def async_save(
         self,
@@ -748,11 +753,6 @@ class TorchDistSaveShardedStrategy:
 
         Returns: None
         """
-        if self.dtensor_format:
-            values_to_save = inject_placeholders(sharded_state_dict)
-            values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
-            return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
-
         if async_strategy == "mcore":
             logger.warning(
                 "MCore's async save is deprecated and will be removed in the future releases. "
