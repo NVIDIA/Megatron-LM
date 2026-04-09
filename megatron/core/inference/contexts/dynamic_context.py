@@ -458,7 +458,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_needed = inference_config.max_requests * self.mamba_states_memory_per_request
+            mamba_memory_needed = (
+                inference_config.max_requests * self.mamba_states_memory_per_request
+            )
             assert mamba_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests. "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "

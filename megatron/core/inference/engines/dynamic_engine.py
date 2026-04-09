@@ -1737,21 +1737,6 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             kvcache_util_stats = None
 
-        mamba_state_info = {}
-        if self.context.is_hybrid_model:
-            active_reqs = self.context.get_active_request_count()
-            paused_reqs = self.context.paused_request_count
-            mamba_state_info = {
-                "mamba_active_requests": active_reqs,
-                "mamba_paused_requests": paused_reqs,
-                "mamba_max_requests": self.context.max_requests,
-                "mamba_num_layers": self.context.num_mamba_layers,
-            }
-            if self.context.mamba_slot_allocator is not None:
-                alloc = self.context.mamba_slot_allocator
-                mamba_state_info["mamba_cache_slots_used"] = alloc.max_slots - alloc.free_count
-                mamba_state_info["mamba_cache_slots_total"] = alloc.max_slots
-
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
@@ -1763,7 +1748,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_paused_block_count": self.context.kv_block_allocator.paused_count,
             "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
             "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
-            **mamba_state_info,
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
@@ -1785,9 +1769,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if self._measured_tp_allreduce_bw > 0
             else 0
         )
-        moe_topk = (
-            self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
-        )
+        moe_topk = self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
         a2a_dim = self._model_config.moe_latent_size or self._model_config.hidden_size
         a2a_token_bytes = a2a_dim * self._model_config.params_dtype.itemsize
         a2a_vol = 2 * self._num_moe_layers * batch_tokens * moe_topk * a2a_token_bytes
