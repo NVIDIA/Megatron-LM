@@ -834,7 +834,7 @@ def preprocess_common_state_dict(common_state_dict):
 
 
 def pretrain(
-    full_config: PretrainConfigContainer,
+    cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
     model_provider,
     model_type,
@@ -922,7 +922,7 @@ def pretrain(
         set_ideal_affinity_for_current_gpu()
 
 
-    if full_config.logger.log_progress:
+    if cfg_container.logger.log_progress:
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
@@ -1002,7 +1002,7 @@ def pretrain(
     one_logger_utils.on_pretrain_start()
 
     # Context used for persisting some state between checkpoint saves.
-    if full_config.checkpoint.non_persistent_ckpt_type == 'local':
+    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
         try:
             from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
                 LocalCheckpointManager,
@@ -1020,16 +1020,16 @@ def pretrain(
                 "checkpointing but was not found. Please ensure it is installed."
             )
 
-        if full_config.checkpoint.replication:
+        if cfg_container.checkpoint.replication:
             repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                full_config.checkpoint.replication_jump, full_config.checkpoint.replication_factor
+                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
             )
         else:
             repl_strategy = None
 
         checkpointing_context = {
             'local_checkpoint_manager': LocalCheckpointManager(
-                full_config.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
+                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
             )
         }
     else:
@@ -1162,8 +1162,8 @@ def pretrain(
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        full_config.train.train_iters,
-        full_config.validation.skip_train,
+        cfg_container.train.train_iters,
+        cfg_container.validation.skip_train,
         args.do_train,
         args.do_valid,
         args.do_test,
@@ -1182,15 +1182,15 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not full_config.validation.skip_train or args.perform_rl_step:
-        if full_config.validation.skip_train:
+    if not cfg_container.validation.skip_train or args.perform_rl_step:
+        if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
             print_rank_0('training ...')
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (full_config.train.train_iters or 0) > 0:
+        if args.do_train and (cfg_container.train.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
@@ -1207,7 +1207,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not full_config.validation.skip_train and full_config.checkpoint.save and iteration != 0 and iteration % full_config.checkpoint.save_interval != 0:
+        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -1245,7 +1245,7 @@ def pretrain(
                 rl_eval_model,
                 optimizer,
                 iteration,
-                write_to_tensorboard=not full_config.validation.skip_train,
+                write_to_tensorboard=not cfg_container.validation.skip_train,
                 training_model=rl_training_model,
             )
         else:
@@ -1253,7 +1253,7 @@ def pretrain(
                 prefix, forward_step_func,
                 valid_data_iterator, model,
                 iteration, process_non_loss_data_func, model_cfg,
-                verbose=True, write_to_tensorboard=not full_config.validation.skip_train,
+                verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func
             )
 
@@ -1268,7 +1268,7 @@ def pretrain(
             process_non_loss_data_func,
             model_cfg,
             verbose=True,
-            write_to_tensorboard=not full_config.validation.skip_train,
+            write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
         )
 
