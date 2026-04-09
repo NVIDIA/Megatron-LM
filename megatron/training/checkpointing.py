@@ -462,7 +462,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving {grad_label} "
                  f"from iteration {iteration:7d}")
 
-    if mpu.get_expert_data_parallel_rank() == 0:
+    if min(mpu.get_data_parallel_rank(), mpu.get_expert_data_parallel_rank()) == 0:
         # Create saving directory.
         ep_rank = mpu.get_expert_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -599,7 +599,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_expert_data_parallel_rank() == 0 \
+            or min(mpu.get_data_parallel_rank(), mpu.get_expert_data_parallel_rank()) == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
