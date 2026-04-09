@@ -295,6 +295,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
+    "moe_single_grouped_weight": False,
+    "moe_single_grouped_bias": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
