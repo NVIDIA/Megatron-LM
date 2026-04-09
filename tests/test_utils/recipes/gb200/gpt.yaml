@@ -161,7 +161,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr-github]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr]
     products:
@@ -186,7 +186,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr-github]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline]
     products:
