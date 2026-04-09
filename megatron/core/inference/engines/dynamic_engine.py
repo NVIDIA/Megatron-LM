@@ -48,6 +48,9 @@ from megatron.core.inference.utils import (
     Counter,
     await_process_call,
     get_model_weight_bytes,
+    get_num_moe_layers,
+    measure_allreduce_bandwidth,
+    measure_alltoall_bandwidth,
     measure_hbm_bandwidth,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -269,13 +272,56 @@ class DynamicInferenceEngine(AbstractEngine):
             self.controller.inference_wrapped_model.model
         )
         self._measured_hbm_bandwidth = measure_hbm_bandwidth()
-        if torch.distributed.get_rank() == 0:
-            logging.info(
-                f"SOL latency baseline: model weights = "
-                f"{self._model_weight_bytes / 1e9:.2f} GB, "
-                f"measured HBM bandwidth = "
-                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+
+        # Cache model-config fields needed for per-step communication volume.
+        model_config = controller.inference_wrapped_model.model.config
+        tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
+        ep_size = model_config.expert_model_parallel_size
+        pp_size = get_pg_size(self.pg_collection.pp) if self.pg_collection.pp else 1
+
+        self._sol_hidden_size = model_config.hidden_size
+        self._sol_dtype_bytes = model_config.params_dtype.itemsize
+        self._sol_tp_size = tp_size
+        self._sol_ep_size = ep_size
+        layers_per_stage = model_config.num_layers // max(pp_size, 1)
+        self._sol_num_moe_layers = get_num_moe_layers(model_config, max(pp_size, 1))
+        self._sol_num_dense_layers = layers_per_stage - self._sol_num_moe_layers
+        self._sol_moe_topk = model_config.moe_router_topk if model_config.num_moe_experts else 0
+
+        # Measure TP allreduce bandwidth.
+        if tp_size > 1 and self.pg_collection.tp is not None:
+            self._measured_tp_allreduce_bw = measure_allreduce_bandwidth(self.pg_collection.tp)
+        else:
+            self._measured_tp_allreduce_bw = 0
+
+        # Measure EP all-to-all bandwidth.
+        if ep_size > 1 and self.context.expert_model_parallel_group is not None:
+            self._measured_ep_alltoall_bw = measure_alltoall_bandwidth(
+                self.context.expert_model_parallel_group
             )
+        else:
+            self._measured_ep_alltoall_bw = 0
+
+        if torch.distributed.get_rank() == 0:
+            sol_parts = [
+                f"model weights = {self._model_weight_bytes / 1e9:.2f} GB",
+                f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 1e9:.0f} GB/s",
+            ]
+            if self._measured_tp_allreduce_bw > 0:
+                sol_parts.append(
+                    f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size})"
+                )
+            if self._measured_ep_alltoall_bw > 0:
+                sol_parts.append(
+                    f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
+                    f"(ep={ep_size})"
+                )
+            sol_parts.append(
+                f"layers/stage={layers_per_stage} "
+                f"(dense={self._sol_num_dense_layers}, moe={self._sol_num_moe_layers})"
+            )
+            logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -1896,12 +1942,38 @@ class DynamicInferenceEngine(AbstractEngine):
             if context_state["is_decode_only"]:
                 kv_bytes, mamba_bytes = self.context.get_active_state_memory_breakdown()
                 state_bytes = kv_bytes + mamba_bytes
-                sol_latency_s = (
+                sol_mem_s = (
                     (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
                 )
+
+                # Communication SOL: TP allreduce + EP all-to-all.
+                batch_tokens = context_state["active_token_count"]
+                msg_bytes = batch_tokens * self._sol_hidden_size * self._sol_dtype_bytes
+                # Dense layers: 2 allreduces (attn + MLP); MoE layers: 1 allreduce (attn only).
+                num_allreduces = 2 * self._sol_num_dense_layers + self._sol_num_moe_layers
+                sol_tp_comm_s = (
+                    (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
+                    if self._measured_tp_allreduce_bw > 0
+                    else 0
+                )
+                # MoE layers: 2 all-to-all ops (dispatch + combine) per layer.
+                a2a_vol = (
+                    2 * self._sol_num_moe_layers * batch_tokens * self._sol_moe_topk
+                    * self._sol_hidden_size * self._sol_dtype_bytes
+                )
+                sol_ep_comm_s = (
+                    (a2a_vol / self._measured_ep_alltoall_bw)
+                    if self._measured_ep_alltoall_bw > 0
+                    else 0
+                )
+
+                sol_latency_s = sol_mem_s + sol_tp_comm_s + sol_ep_comm_s
                 sol_pct = sol_latency_s / step_time * 100.0
                 metrics['inference/sol_latency_pct'] = float(sol_pct)
                 metrics['inference/sol_latency_ms'] = float(sol_latency_s * 1000)
+                metrics['inference/sol_mem_ms'] = float(sol_mem_s * 1000)
+                metrics['inference/sol_tp_comm_ms'] = float(sol_tp_comm_s * 1000)
+                metrics['inference/sol_ep_comm_ms'] = float(sol_ep_comm_s * 1000)
                 metrics['inference/sol_kv_bytes'] = float(kv_bytes)
                 metrics['inference/sol_mamba_bytes'] = float(mamba_bytes)
 
@@ -1982,17 +2054,37 @@ class DynamicInferenceEngine(AbstractEngine):
             if context_state["is_decode_only"]:
                 kv_bytes, mamba_bytes = self.context.get_active_state_memory_breakdown()
                 state_bytes = kv_bytes + mamba_bytes
-                sol_latency_s = (
+                sol_mem_s = (
                     (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
                 )
+
+                # Communication SOL: TP allreduce + EP all-to-all.
+                batch_tokens = context_state["active_token_count"]
+                msg_bytes = batch_tokens * self._sol_hidden_size * self._sol_dtype_bytes
+                num_allreduces = 2 * self._sol_num_dense_layers + self._sol_num_moe_layers
+                sol_tp_comm_s = (
+                    (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
+                    if self._measured_tp_allreduce_bw > 0
+                    else 0
+                )
+                a2a_vol = (
+                    2 * self._sol_num_moe_layers * batch_tokens * self._sol_moe_topk
+                    * self._sol_hidden_size * self._sol_dtype_bytes
+                )
+                sol_ep_comm_s = (
+                    (a2a_vol / self._measured_ep_alltoall_bw)
+                    if self._measured_ep_alltoall_bw > 0
+                    else 0
+                )
+
+                sol_latency_s = sol_mem_s + sol_tp_comm_s + sol_ep_comm_s
                 sol_pct = sol_latency_s / step_time * 100.0
+
+                # Build the memory component string.
                 if mamba_bytes > 0:
-                    output_str += (
-                        " ... SOL: %.1f%% (proj %.3f ms = "
-                        "(%.2f gb weights + %.2f gb kv + %.2f gb mamba) / %.0f gb/s)"
+                    mem_str = (
+                        "(%.2f gb weights + %.2f gb kv + %.2f gb mamba) / %.0f gb/s"
                         % (
-                            sol_pct,
-                            sol_latency_s * 1000,
                             self._model_weight_bytes / 1e9,
                             kv_bytes / 1e9,
                             mamba_bytes / 1e9,
@@ -2000,16 +2092,37 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     )
                 else:
-                    output_str += (
-                        " ... SOL: %.1f%% (proj %.3f ms = "
-                        "(%.2f gb weights + %.2f gb state) / %.0f gb/s)"
+                    mem_str = (
+                        "(%.2f gb weights + %.2f gb state) / %.0f gb/s"
                         % (
-                            sol_pct,
-                            sol_latency_s * 1000,
                             self._model_weight_bytes / 1e9,
                             state_bytes / 1e9,
                             self._measured_hbm_bandwidth / 1e9,
                         )
+                    )
+
+                # Build the communication component string.
+                comm_parts = []
+                if sol_tp_comm_s > 0:
+                    comm_parts.append("tp_ar %.3f ms" % (sol_tp_comm_s * 1000))
+                if sol_ep_comm_s > 0:
+                    comm_parts.append("ep_a2a %.3f ms" % (sol_ep_comm_s * 1000))
+
+                if comm_parts:
+                    output_str += (
+                        " ... SOL: %.1f%% (proj %.3f ms = mem %.3f ms [%s] + comm [%s])"
+                        % (
+                            sol_pct,
+                            sol_latency_s * 1000,
+                            sol_mem_s * 1000,
+                            mem_str,
+                            " + ".join(comm_parts),
+                        )
+                    )
+                else:
+                    output_str += (
+                        " ... SOL: %.1f%% (proj %.3f ms = %s)"
+                        % (sol_pct, sol_latency_s * 1000, mem_str)
                     )
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)

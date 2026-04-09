@@ -140,6 +140,146 @@ def get_model_weight_bytes(model):
     return sum(seen_storages.values())
 
 
+def get_num_moe_layers(model_config, pp_size):
+    """Compute the number of MoE layers on this pipeline-parallel stage.
+
+    Uses ``num_moe_experts`` and ``moe_layer_freq`` from the config to determine
+    which of the ``num_layers // pp_size`` local layers are MoE layers.
+
+    Args:
+        model_config: TransformerConfig with num_layers, num_moe_experts, moe_layer_freq.
+        pp_size: Pipeline parallel size.
+
+    Returns:
+        Number of MoE layers on this PP stage (0 if the model is not MoE).
+    """
+    if model_config.num_moe_experts is None:
+        return 0
+
+    layers_per_stage = model_config.num_layers // pp_size
+    freq = model_config.moe_layer_freq
+
+    if isinstance(freq, list):
+        # Custom pattern list — count nonzero entries for the local stage slice.
+        # The pattern repeats over num_layers; take the local slice.
+        pattern = (freq * math.ceil(model_config.num_layers / max(len(freq), 1)))[
+            : model_config.num_layers
+        ]
+        # Assume stage 0 gets the first layers_per_stage layers.  For a true
+        # per-stage count we would need the PP rank, but the volume estimate is
+        # the same across stages for a uniform model.
+        return sum(1 for v in pattern[:layers_per_stage] if v != 0)
+    else:
+        # Integer frequency: 1 means every layer is MoE, N means 1-in-N.
+        if freq <= 0:
+            return 0
+        return sum(1 for i in range(layers_per_stage) if (i % freq) == 0)
+
+
+def measure_allreduce_bandwidth(group, device=None, iters=50):
+    """Measure NCCL allreduce bandwidth for a given process group.
+
+    Uses a large tensor to amortise launch overhead and measure sustained
+    allreduce throughput.  Returns *algorithm bandwidth* (message_bytes / time),
+    which is the right divisor when the caller already knows the logical message
+    size it needs to allreduce.
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the TP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of allreduce iterations for timing.
+
+    Returns:
+        Measured allreduce algorithm bandwidth in bytes per second, or 0 if
+        the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # 64 M float32 elements = 256 MB — same size as HBM bandwidth test.
+    n = 64 * 1024 * 1024
+    tensor_bytes = n * 4
+    buf = torch.randn(n, dtype=torch.float32, device=device)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.all_reduce(buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.all_reduce(buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
+def measure_alltoall_bandwidth(group, device=None, iters=50):
+    """Measure NCCL all-to-all bandwidth for a given process group.
+
+    Uses ``all_to_all_single`` with a large tensor to measure sustained
+    throughput.  Returns algorithm bandwidth (total_bytes_sent / time).
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the EP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of all-to-all iterations for timing.
+
+    Returns:
+        Measured all-to-all algorithm bandwidth in bytes per second, or 0 if
+        the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # Total tensor: 256 MB, evenly split across ranks.
+    n_total = 64 * 1024 * 1024  # float32 elements
+    # Round down to a multiple of world so the split is even.
+    n_total = (n_total // world) * world
+    tensor_bytes = n_total * 4
+
+    send_buf = torch.randn(n_total, dtype=torch.float32, device=device)
+    recv_buf = torch.empty_like(send_buf)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del send_buf, recv_buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
 class Counter:
     """A simple counter class
 
