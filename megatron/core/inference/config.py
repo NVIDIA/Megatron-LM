@@ -156,6 +156,13 @@ class InferenceConfig:
     state tensors for each KV cache block. Only used for hybrid models.
     """
 
+    autotune: bool = False
+    """Automatically tune inference memory parameters based on available GPU memory."""
+
+    autotune_reserved_gb: float = 0.0
+    """GPU memory (GB) to reserve for non-inference use (e.g., RL training).
+    Subtracted from the available memory budget before the solver runs."""
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.

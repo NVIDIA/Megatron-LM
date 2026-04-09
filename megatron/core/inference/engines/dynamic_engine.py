@@ -226,6 +226,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
+        self.autotune = inference_config.autotune
         # Initialize engine.
         self.reset()
 
@@ -259,8 +260,23 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
+        # Auto-tune parameters before building CUDA graphs.
+        if self.autotune:
+            self._autotune_and_rebuild()
+
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+        # Log memory state after full initialization.
+        if torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True:
+            free, total = torch.cuda.mem_get_info()
+            logging.info(
+                "Engine init complete: GPU memory: total %.1f GB, "
+                "used %.1f GB, free %.1f GB",
+                total / (1024 ** 3),
+                (total - free) / (1024 ** 3),
+                free / (1024 ** 3),
+            )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -418,6 +434,523 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+
+    @staticmethod
+    def _force_free_context_tensors(context):
+        """Free GPU memory held by a context's TMS regions.
+
+        Pauses all TMS tags (freeing physical pages). The MemPool entries
+        are left intact to avoid corrupting TMS's internal state: freed
+        virtual address reservations are harmless (CUDA VA space is 256 TB).
+
+        Non-TMS tensors are left alone: they'll be garbage collected
+        when all references to the context are dropped.
+        """
+        import gc
+
+        tms_tags = getattr(context, '_tms_tags', None) or []
+        if tms_tags:
+            try:
+                from torch_memory_saver import torch_memory_saver as tms
+
+                for tag in tms_tags:
+                    tms.pause(tag)
+            except (ImportError, AttributeError, KeyError):
+                pass
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _autotune_and_rebuild(self, profiling_context_fraction: float = 0.5):
+        """Profile activation memory on the existing context, then rebuild
+        with tuned parameters before CUDA graphs are created.
+
+        Args:
+            profiling_context_fraction: Fraction of free GPU memory (after
+                workspace warmup) to use for the profiling context state.
+                The rest is left for activation memory during profiling
+                forward passes. Defaults to 0.5 (50/50 split).
+        """
+        from dataclasses import replace
+
+        from megatron.core.inference.autotune import AutotuneProfile, compute_optimal_params
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        old_config = self.context.config
+        controller = self.controller
+
+        gpu_total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        # --- Step 1: Tiny context to measure workspace cost ---
+        # The first forward pass allocates one-time workspace buffers
+        # (cuBLAS, MoE expert weights). We need to measure this before
+        # we can size the real profiling context.
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+
+        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
+        alignment = max(tp_size, DynamicInferenceContext.REQUEST_ROUNDER)
+        tiny_max_requests = max(alignment, (16 // alignment) * alignment)
+        tiny_buffer_gb = 0.5  # minimal
+
+        tiny_config = replace(
+            old_config,
+            buffer_size_gb=tiny_buffer_gb,
+            max_requests=tiny_max_requests,
+            max_tokens=None,
+            autotune=False,
+            static_kv_memory_pointers=False,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        self.context = DynamicInferenceContext(model_config, tiny_config)
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
+        self.reset()
+
+        # Run one forward pass to trigger workspace allocation.
+        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        warmup_ok = False
+        try:
+            dummy = [DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.ones(1, dtype=torch.long, device=torch.cuda.current_device()),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            )]
+            self.context.add_dummy_requests_parallel(dummy)
+            self.context.initialize_attention_state()
+            input_ids, position_ids = self.context.current_input_and_position_ids()
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+            warmup_ok = True
+        except Exception as e:
+            if rank == 0:
+                logging.info("Autotune: workspace warmup failed: %r", e)
+        self.context.reset()
+
+        # Barrier: if workspace warmup failed on any rank, abort autotune.
+        if torch.distributed.is_initialized():
+            ok = torch.tensor(
+                [1 if warmup_ok else 0], dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
+            if ok.item() == 0:
+                logging.warning("Autotune: workspace warmup failed on at least one rank. "
+                                "Skipping autotune.")
+                return
+
+        # Measure free memory after workspace is allocated.
+        free_after_workspace, _ = torch.cuda.mem_get_info()
+        if rank == 0:
+            logging.info(
+                "Autotune: workspace warmup done. Free memory: %.1f GB",
+                free_after_workspace / (1024 ** 3),
+            )
+
+        # --- Step 2: Properly-sized profiling context ---
+        # Now we know how much memory workspace takes. Free the tiny context
+        # and create one sized from actual free memory.
+        # Read per-request cost from the tiny context before freeing it.
+        per_req_bytes = self.context.block_size_bytes
+        if self.context.is_hybrid_model:
+            conv_bytes = (
+                math.prod(self.context.mamba_conv_states_shape)
+                * self.context.mamba_conv_states_dtype.itemsize
+                * self.context.num_mamba_layers
+            )
+            ssm_bytes = (
+                math.prod(self.context.mamba_ssm_states_shape)
+                * self.context.mamba_ssm_states_dtype.itemsize
+                * self.context.num_mamba_layers
+            )
+            per_req_bytes += conv_bytes + ssm_bytes
+
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+
+        free_for_profiling, _ = torch.cuda.mem_get_info()
+        context_budget = int(free_for_profiling * profiling_context_fraction)
+        profiling_max_requests = max(alignment, context_budget // max(per_req_bytes, 1))
+        profiling_max_requests = (profiling_max_requests // alignment) * alignment
+
+        # All ranks must use the same profiling_max_requests to avoid NCCL
+        # deadlocks in MoE/TP all-to-all communication during forward passes.
+        if torch.distributed.is_initialized():
+            sync_tensor = torch.tensor(
+                [profiling_max_requests], dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MIN)
+            profiling_max_requests = int(sync_tensor.item())
+            profiling_max_requests = (profiling_max_requests // alignment) * alignment
+            profiling_max_requests = max(alignment, profiling_max_requests)
+
+        profiling_buffer_gb = max(0.1, (profiling_max_requests * per_req_bytes * 1.05) / (1024 ** 3))
+
+        profiling_config = replace(
+            old_config,
+            buffer_size_gb=profiling_buffer_gb,
+            max_requests=profiling_max_requests,
+            max_tokens=None,
+            autotune=False,
+            static_kv_memory_pointers=False,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        self.context = DynamicInferenceContext(model_config, profiling_config)
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
+        self.reset()
+
+        context = self.context
+
+        free_after_profiling_ctx, _ = torch.cuda.mem_get_info()
+        if rank == 0:
+            logging.info(
+                "Autotune: profiling context created (max_requests=%d, buffer=%.2f GB). "
+                "Free memory: %.1f GB",
+                context.max_requests,
+                profiling_buffer_gb,
+                free_after_profiling_ctx / (1024 ** 3),
+            )
+
+        # Compute mamba memory per request from the context.
+        mamba_memory_per_request = 0
+        if context.is_hybrid_model:
+            conv_bytes = (
+                math.prod(context.mamba_conv_states_shape)
+                * context.mamba_conv_states_dtype.itemsize
+                * context.num_mamba_layers
+            )
+            ssm_bytes = (
+                math.prod(context.mamba_ssm_states_shape)
+                * context.mamba_ssm_states_dtype.itemsize
+                * context.num_mamba_layers
+            )
+            mamba_memory_per_request = conv_bytes + ssm_bytes
+
+        mem_after_model = gpu_total - free_after_profiling_ctx
+
+        if rank == 0:
+            logging.info(
+                "Autotune: estimated model+runtime %.1f GB (GPU total %.1f GB)",
+                mem_after_model / (1024 ** 3),
+                gpu_total / (1024 ** 3),
+        )
+
+        profile = AutotuneProfile(
+            gpu_total_bytes=gpu_total,
+            memory_after_model_load_bytes=mem_after_model,
+            block_size_bytes=context.block_size_bytes,
+            mamba_memory_per_request=mamba_memory_per_request,
+            max_kv_block_count=context.max_kv_block_count,
+            per_request_bytes=(
+                DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
+                + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES
+                + context.max_kv_block_count * 4
+            ),
+            per_token_bytes=DynamicInferenceContext.PER_TOKEN_METADATA_BYTES,
+        )
+
+        tp_size = max(getattr(model_config, 'tensor_model_parallel_size', 1), 1)
+
+        # --- Profile on the existing context ---
+        # Generate token counts: geometric spread from 1 up to max we can fit.
+        token_counts = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        t = 512
+        while t <= context.max_requests:
+            token_counts.append(t)
+            t += max(256, t // 4)
+        # Include the largest valid decode size.
+        if token_counts[-1] != context.max_requests:
+            token_counts.append(context.max_requests)
+        token_counts = sorted(set(tc for tc in token_counts if tc <= context.max_requests))
+
+        if rank == 0:
+            logging.info(
+                "Autotune: profiling %d token counts (max=%d) on existing context",
+                len(token_counts),
+                token_counts[-1] if token_counts else 0,
+            )
+
+        overhead_samples = []  # list of (batch_size, overhead_bytes)
+        for tc in token_counts:
+            # Add dummy decode requests and measure forward-only activation.
+            # Also try sampling after forward to measure runtime overhead.
+            try:
+                from megatron.core.inference.inference_request import DynamicInferenceRequest
+                from megatron.core.inference.sampling_params import SamplingParams
+
+                dummy_requests = []
+                for i in range(tc):
+                    req = DynamicInferenceRequest(
+                        request_id=i,
+                        prompt_tokens=torch.ones(1, dtype=torch.long, device=torch.cuda.current_device()),
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=1,
+                            termination_id=-1,
+                        ),
+                    )
+                    dummy_requests.append(req)
+                context.add_dummy_requests_parallel(dummy_requests)
+                init_ok = True
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: context_init failed at tc=%d: %r", tc, e)
+                context.reset()
+                init_ok = False
+
+            # All ranks must agree before running the forward pass —
+            # if any rank failed context_init, all must skip to avoid
+            # NCCL deadlocks in MoE/TP collective ops.
+            if torch.distributed.is_initialized():
+                ready = torch.tensor(
+                    [1 if init_ok else 0], dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+                if ready.item() == 0:
+                    context.reset()
+                    continue
+            elif not init_ok:
+                continue
+
+            try:
+                baseline_bytes = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                with torch.inference_mode():
+                    input_ids, position_ids = controller._dynamic_step_context_init()
+                    logits = controller._dynamic_step_forward_logits(input_ids, position_ids)
+                end_event.record()
+                torch.cuda.synchronize()
+
+                peak_bytes = torch.cuda.max_memory_allocated()
+                fwd_activation = peak_bytes - baseline_bytes
+                elapsed_ms = start_event.elapsed_time(end_event)
+                profile.add_sample(tc, fwd_activation, elapsed_ms)
+
+                # Try sampling on top to measure runtime overhead.
+                # max_memory_allocated is a high-water mark, so if sampling
+                # pushes it higher, we capture the full-step peak.
+                try:
+                    with torch.inference_mode():
+                        controller._dynamic_step_sample_bookkeeping()
+                        controller._dynamic_step_sample_logits(logits)
+                    torch.cuda.synchronize()
+                    full_step_peak = torch.cuda.max_memory_allocated() - baseline_bytes
+                    overhead = max(0, full_step_peak - fwd_activation)
+                    if tc > 0:
+                        overhead_samples.append((tc, overhead))
+                except Exception:
+                    pass  # sampling OOMed or failed: we still have the forward data
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: forward failed at tc=%d: %r", tc, e)
+                torch.cuda.empty_cache()
+
+            context.reset()
+
+        # Compute per-request runtime overhead from collected samples.
+        # Use the median per-request overhead to be robust to outliers.
+        if overhead_samples:
+            per_req_overheads = sorted(oh // tc for tc, oh in overhead_samples)
+            profile.runtime_overhead_per_request = per_req_overheads[len(per_req_overheads) // 2]
+            if rank == 0:
+                logging.info(
+                    "Autotune: runtime overhead measured at %d batch sizes, "
+                    "median %.2f MB/req",
+                    len(overhead_samples),
+                    profile.runtime_overhead_per_request / (1024 ** 2),
+                )
+        elif rank == 0:
+            logging.info("Autotune: no runtime overhead samples collected "
+                         "(sampling failed at all batch sizes)")
+
+        # --- Prefill profiling ---
+        # Measure activation memory for prefill (1 request with long prompt).
+        # Prefill uses full attention over the prompt, so activation per token
+        # is higher than decode. The solver needs the worst case.
+        prefill_token_counts = []
+        t = context.max_requests  # start above decode range
+        max_prefill = context.max_tokens
+        while t <= max_prefill:
+            prefill_token_counts.append(t)
+            t += max(256, t // 4)
+        if prefill_token_counts and prefill_token_counts[-1] != max_prefill:
+            prefill_token_counts.append(max_prefill)
+
+        if rank == 0:
+            logging.info(
+                "Autotune: prefill profiling: %d token counts (up to %d)",
+                len(prefill_token_counts),
+                prefill_token_counts[-1] if prefill_token_counts else 0,
+            )
+
+        for tc in prefill_token_counts:
+            init_ok = False
+            try:
+                # 1 request with tc prompt tokens.
+                dummy = [DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.ones(tc, dtype=torch.long,
+                                             device=torch.cuda.current_device()),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=1,
+                        termination_id=-1,
+                    ),
+                )]
+                context.add_dummy_requests_parallel(dummy, count_as_prefill=True)
+                init_ok = True
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: prefill init failed at tc=%d: %r", tc, e)
+                context.reset()
+
+            if torch.distributed.is_initialized():
+                ready = torch.tensor(
+                    [1 if init_ok else 0], dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+                if ready.item() == 0:
+                    context.reset()
+                    continue
+            elif not init_ok:
+                continue
+
+            try:
+                baseline_bytes = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                with torch.inference_mode():
+                    input_ids, position_ids = controller._dynamic_step_context_init()
+                    controller._dynamic_step_forward_logits(input_ids, position_ids)
+                end_event.record()
+                torch.cuda.synchronize()
+
+                peak_bytes = torch.cuda.max_memory_allocated()
+                activation_bytes = peak_bytes - baseline_bytes
+                elapsed_ms = start_event.elapsed_time(end_event)
+                profile.add_sample(tc, activation_bytes, elapsed_ms)
+            except Exception as e:
+                if rank == 0:
+                    logging.info("Autotune: prefill forward failed at tc=%d: %r", tc, e)
+                torch.cuda.empty_cache()
+
+            context.reset()
+
+        if rank == 0:
+            logging.info("Autotune: collected %d total profiling samples "
+                         "(%d decode + prefill)", len(profile.token_counts),
+                         len(profile.token_counts))
+
+        # Re-measure model+runtime memory AFTER profiling. The first forward
+        # pass allocates one-time workspace (cuBLAS, MoE expert weights) that
+        # persists. The solver must account for this.
+        self._force_free_context_tensors(self.context)
+        torch.cuda.empty_cache()
+        free_after_profiling, _ = torch.cuda.mem_get_info()
+        profile.memory_after_model_load_bytes = gpu_total - free_after_profiling
+        if rank == 0:
+            logging.info(
+                "Autotune: after profiling: model+runtime+workspace = %.1f GB "
+                "(free %.1f GB)",
+                profile.memory_after_model_load_bytes / (1024 ** 3),
+                free_after_profiling / (1024 ** 3),
+            )
+
+        # --- Compute optimal parameters ---
+        reserved_gb = getattr(self.context.config, 'autotune_reserved_gb', 0.0)
+        new_max_requests, new_max_tokens, new_buffer_size_gb = compute_optimal_params(
+            profile, tp_size=tp_size,
+            request_rounder=DynamicInferenceContext.REQUEST_ROUNDER,
+            reserved_memory_bytes=int(reserved_gb * (1024 ** 3)),
+        )
+
+        # All ranks must use the same tuned parameters to avoid NCCL
+        # deadlocks during CUDA graph build and runtime (MoE/TP all-to-all).
+        # Sync max_requests, max_tokens, and buffer_size_gb (as int bytes)
+        # via MIN so every rank can support the chosen values.
+        if torch.distributed.is_initialized():
+            buffer_size_bytes_int = int(new_buffer_size_gb * (1024 ** 3))
+            sync_tensor = torch.tensor(
+                [new_max_requests, new_max_tokens, buffer_size_bytes_int],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MIN)
+            new_max_requests = int(sync_tensor[0].item())
+            new_max_tokens = int(sync_tensor[1].item())
+            new_buffer_size_gb = int(sync_tensor[2].item()) / (1024 ** 3)
+
+        # --- Rebuild context with tuned parameters ---
+        if rank == 0:
+            logging.info(
+                "Autotune: rebuilding context with max_requests=%d, max_tokens=%d, "
+                "buffer_size_gb=%.2f",
+                new_max_requests,
+                new_max_tokens,
+                new_buffer_size_gb,
+            )
+
+        # Context already freed above when re-measuring memory.
+        tuned_config = replace(
+            old_config,
+            max_requests=new_max_requests,
+            max_tokens=new_max_tokens,
+            buffer_size_gb=new_buffer_size_gb,
+            autotune=False,
+        )
+        self.context = DynamicInferenceContext(model_config, tuned_config)
+        controller.inference_wrapped_model.inference_context = self.context
+        controller._reinit_for_context()
+        self.autotune = False
+        self.reset()
+
+        # CUDA graphs are built by the caller (create_cuda_graphs) after we return.
+
+        if rank == 0:
+            free_pre_cg, total_pre_cg = torch.cuda.mem_get_info()
+            logging.info(
+                "Autotune: before CG build: GPU total %.1f GB, "
+                "used %.1f GB, free %.1f GB",
+                total_pre_cg / (1024 ** 3),
+                (total_pre_cg - free_pre_cg) / (1024 ** 3),
+                free_pre_cg / (1024 ** 3),
+            )
+            logging.info(
+                "\n"
+                "========== Autotune Complete ==========\n"
+            "  max_requests:    %d\n"
+            "  max_tokens:      %d\n"
+            "  buffer_size_gb:  %.2f\n"
+            "\n"
+            "To reproduce without autotune, replace\n"
+            "  --inference-dynamic-batching-autotune\n"
+            "with:\n"
+            "  --inference-dynamic-batching-max-requests %d \\\n"
+            "  --inference-dynamic-batching-max-tokens %d \\\n"
+            "  --inference-dynamic-batching-buffer-size-gb %.2f\n"
+            "=======================================",
+            new_max_requests,
+            new_max_tokens,
+            new_buffer_size_gb,
+            new_max_requests,
+            new_max_tokens,
+            new_buffer_size_gb,
+        )
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
