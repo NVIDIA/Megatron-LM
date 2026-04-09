@@ -17,8 +17,12 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import HAVE_TE
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import is_torch_min_version
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, is_torch_min_version
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -679,6 +683,12 @@ class TestMegatronFSDPE2E:
                 - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
                 - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
                 - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
+                - cuda_graph_impl (str): CUDA graph backend. "transformer_engine" enables TE CUDA graphs.
+                  The model and warmup steps run on a non-default side stream so AccumulateGrad nodes
+                  are never on the legacy default stream (avoids cudaErrorStreamCaptureImplicit).
+                - cuda_graph_warmup_steps (int): Warmup iterations before CUDA graph capture. Default: 0.
+                  Consumed locally; not forwarded to make_moe_args_model_and_optimizer.
+                - cuda_graph_scope (list[CudaGraphScope]): Scopes to capture; forwarded to TransformerConfig.
         Returns:
             list: A list of length train_iters containing the per-step language-model loss values
             (the value appended from output[-1] each iteration). Loss objects are returned as produced
@@ -707,6 +717,8 @@ class TestMegatronFSDPE2E:
         EP = kwargs.get("expert_model_parallel_size", 1)
         ETP = kwargs.get("expert_tensor_parallel_size", 1)
         OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+        CUDA_GRAPH_IMPL = kwargs.get("cuda_graph_impl", "none")
+        CUDA_GRAPH_WARMUP_STEPS = kwargs.pop("cuda_graph_warmup_steps", 0)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -718,22 +730,33 @@ class TestMegatronFSDPE2E:
         )
         DP_GROUP = mpu.get_data_parallel_group()
 
-        # Set manual seed for reproducibility
+        # Set manual seed for reproducibility. When using TE CUDA graphs,
+        # re-initialize the RNG tracker with te_rng_tracker=True.
         set_manual_seed(seed)
+        if CUDA_GRAPH_IMPL == "transformer_engine":
+            model_parallel_cuda_manual_seed(
+                seed, te_rng_tracker=True, use_cudagraphable_rng=True, force_reset_rng=True
+            )
+
+        # When using TE CUDA graphs, switch to a non-default side stream BEFORE
+        # model initialization. AccumulateGrad nodes are associated with the CUDA
+        # stream current at creation time.  If they are created on the legacy/default
+        # stream (stream 0), TE's backward capture (which runs on an internal non-
+        # default capture stream) triggers cudaErrorStreamCaptureImplicit when the
+        # autograd engine tries to synchronize the default stream with the capture
+        # stream. Initializing the model and running warmup steps on a non-default
+        # side stream ensures AccumulateGrad is never on stream 0.
+        te_side_stream = None
+        if CUDA_GRAPH_IMPL == "transformer_engine":
+            te_side_stream = torch.cuda.Stream()
+            te_side_stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(te_side_stream)
 
         # Create model and optimizer
         model_chunks, optim = make_moe_args_model_and_optimizer(
             ut_filename="test_mcore_fully_sharded_data_parallel.py",
-            micro_batch_size=MICRO_BATCH_SIZE,
-            global_batch_size=GLOBAL_BATCH_SIZE,
-            vocab_size=VOCAB_SIZE,
             padded_vocab_size=VOCAB_SIZE,
-            seq_length=MAX_SEQ_LEN,
             sequence_parallel=TP > 1,
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            num_layers_per_virtual_pipeline_stage=VPP,
-            train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
         megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
@@ -761,10 +784,25 @@ class TestMegatronFSDPE2E:
             num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
         )
 
+        # Create CUDA graph helper (after model is built).
+        cuda_graph_helper = None
+        if CUDA_GRAPH_IMPL == "transformer_engine":
+            config = get_attr_wrapped_model(model_chunks[0], 'config')
+            cuda_graph_helper = TECudaGraphHelper(
+                model=model_chunks,
+                config=config,
+                seq_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                optimizers=[optim],
+            )
+
         outputs = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        for i in range(NUM_TRAINING_STEPS):
+            if cuda_graph_helper is not None and i == CUDA_GRAPH_WARMUP_STEPS:
+                cuda_graph_helper.create_cudagraphs()
+
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
@@ -788,6 +826,9 @@ class TestMegatronFSDPE2E:
 
             # Collect loss
             outputs.append(output[-1])
+
+        if cuda_graph_helper is not None and cuda_graph_helper.graphs_created():
+            cuda_graph_helper.delete_cuda_graphs()
 
         Utils.destroy_model_parallel()
 
@@ -896,6 +937,69 @@ class TestMegatronFSDPE2E:
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                     ),
                 )
+
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        "parallel_config",
+        [
+            pytest.param({}, id="default"),
+            pytest.param({"tensor_model_parallel_size": 2}, id="TP2"),
+            pytest.param(
+                {"expert_model_parallel_size": 2, "expert_tensor_parallel_size": 2}, id="EP2_ETP2"
+            ),
+        ],
+    )
+    def test_cudagraph_alignment_with_fsdp(self, parallel_config):
+        """CUDA graph replay must produce numerically identical loss to eager FSDP execution.
+
+        Parametrized over parallelism configurations. For each config, runs one eager
+        baseline then verifies all CUDA graph scopes produce bit-identical losses.
+        """
+        SCOPES = [
+            [CudaGraphScope.attn],
+            [CudaGraphScope.attn, CudaGraphScope.moe_router, CudaGraphScope.moe_preprocess],
+            [CudaGraphScope.moe_router],
+        ]
+        FSDP_COMMON = dict(
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            fsdp_double_buffer=True,
+            fsdp_db_use_persist_buf_on_alloc_fail=True,
+        )
+
+        reference_outputs = TestMegatronFSDPE2E._training_loop(**FSDP_COMMON, **parallel_config)
+
+        for scope in SCOPES:
+            outputs = TestMegatronFSDPE2E._training_loop(
+                **FSDP_COMMON,
+                **parallel_config,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_scope=scope,
+                cuda_graph_warmup_steps=3,
+            )
+            if torch.distributed.get_rank() == 0:
+                for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
+                    loss = output["lm loss"]
+                    ref_loss = ref_output["lm loss"]
+                    assert_close(
+                        loss,
+                        ref_loss,
+                        atol=0,
+                        rtol=0,
+                        msg=(
+                            f"CUDA graph loss mismatch at step {step} "
+                            f"(parallel={parallel_config}, scope={[s.name for s in scope]}): "
+                            f"cuda_graph={loss.item():.6f}, eager={ref_loss.item():.6f}"
+                            f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                        ),
+                    )
 
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
