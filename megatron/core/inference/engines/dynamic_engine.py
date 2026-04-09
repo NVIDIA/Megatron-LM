@@ -56,8 +56,8 @@ from megatron.core.inference.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -1788,13 +1788,15 @@ class DynamicInferenceEngine(AbstractEngine):
             else 0
         )
         a2a_vol = (
-            2 * self._sol_num_moe_layers * batch_tokens * self._sol_moe_topk
-            * self._sol_hidden_size * self._sol_dtype_bytes
+            2
+            * self._sol_num_moe_layers
+            * batch_tokens
+            * self._sol_moe_topk
+            * self._sol_hidden_size
+            * self._sol_dtype_bytes
         )
         sol_ep_comm_s = (
-            (a2a_vol / self._measured_ep_alltoall_bw)
-            if self._measured_ep_alltoall_bw > 0
-            else 0
+            (a2a_vol / self._measured_ep_alltoall_bw) if self._measured_ep_alltoall_bw > 0 else 0
         )
         sol_latency_s = sol_mem_s + sol_tp_comm_s + sol_ep_comm_s
         sol_pct = sol_latency_s / step_time * 100.0

@@ -3220,9 +3220,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             ) * self.num_mamba_layers
             if self.num_speculative_tokens > 0:
                 intermediate_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-                ) * self.num_mamba_layers * (self.num_speculative_tokens + 1)
+                    (
+                        math.prod(self.mamba_conv_states_shape)
+                        * self.mamba_conv_states_dtype.itemsize
+                        + math.prod(self.mamba_ssm_states_shape)
+                        * self.mamba_ssm_states_dtype.itemsize
+                    )
+                    * self.num_mamba_layers
+                    * (self.num_speculative_tokens + 1)
+                )
                 per_request += intermediate_per_request
             mamba_bytes = active_requests * per_request
 

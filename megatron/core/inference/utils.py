@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import math
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -138,8 +137,6 @@ def get_model_weight_bytes(model):
                 if hasattr(attr, 'scale') and isinstance(attr.scale, torch.Tensor):
                     _account_tensor(attr.scale)
     return sum(seen_storages.values())
-
-
 
 
 def measure_allreduce_bandwidth(group, device=None, iters=50):

@@ -12,7 +12,6 @@ import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.tensor_parallel import (
-    RowParallelLinear,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
