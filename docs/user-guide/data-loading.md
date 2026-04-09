@@ -134,7 +134,7 @@ When data lives on S3 or MSC rather than a POSIX filesystem:
 
 **Symptom: Metadata server errors or slow `open()` calls**
 - Likely cause: Thousands of ranks simultaneously opening per-dataset files for metadata.
-- Fix: Use `--per-dataset-sequences-path` to consolidate metadata into a single JSON file. Also consolidate small dataset files using `tools/merge_datasets.py`.
+- Fix: Use `--per-dataset-sequences-path` to consolidate metadata into a single JSON file.
 
 **Symptom: Spike in I/O at training start, then normal**
 - Likely cause: All ranks simultaneously memory-mapping index files after the barrier.
@@ -142,10 +142,9 @@ When data lives on S3 or MSC rather than a POSIX filesystem:
 
 **Symptom: Slow data loading during training (not just startup)**
 - Run with `--mock-data` to confirm the dataloader is the bottleneck.
-- Check `--num-workers` is > 0 to hide prefetching behind the training step.
-- Verify data is on fast storage (local SSD or high-bandwidth parallel filesystem).
+- If startup, not steady-state throughput, is the main issue, try `--dataloader-defer-npy-index-mmap`.
+- If you are blending many dataset prefixes, try `--per-dataset-sequences-path`.
 - Test with `--no-mmap-bin-files` -- the optimal setting depends on your filesystem.
-- Check if datasets are split across many small files. Merge to 10 GB+ per file with `tools/merge_datasets.py`.
 
 ## Related Resources
 
