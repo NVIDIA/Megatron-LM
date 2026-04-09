@@ -111,22 +111,32 @@ def get_model_weight_bytes(model):
         Total weight memory in bytes on GPU.
     """
     seen_storages = {}  # storage data_ptr -> nbytes
+
+    def _account_tensor(tensor):
+        """Add a CUDA tensor's storage to the seen set."""
+        if tensor.is_cuda:
+            ptr = tensor.untyped_storage().data_ptr()
+            seen_storages[ptr] = tensor.untyped_storage().nbytes()
+
     for module in model.modules():
         # nn.Parameter objects
         for tensor in module._parameters.values():
             if tensor is not None and tensor.is_cuda:
-                ptr = tensor.untyped_storage().data_ptr()
-                seen_storages[ptr] = tensor.untyped_storage().nbytes()
+                _account_tensor(tensor)
         # Registered buffers (e.g., concatenated expert weight buffers)
         for tensor in module._buffers.values():
             if tensor is not None and tensor.is_cuda:
-                ptr = tensor.untyped_storage().data_ptr()
-                seen_storages[ptr] = tensor.untyped_storage().nbytes()
-        # Plain tensor attributes (e.g., MXFP8Tensor weights)
+                _account_tensor(tensor)
+        # Plain tensor attributes and quantized tensor wrappers.
+        # MXFP8Tensor is not a torch.Tensor subclass — it wraps .data and .scale
+        # tensors and is stored as a plain attribute via setattr().
         for attr in module.__dict__.values():
-            if isinstance(attr, torch.Tensor) and attr.is_cuda:
-                ptr = attr.untyped_storage().data_ptr()
-                seen_storages[ptr] = attr.untyped_storage().nbytes()
+            if isinstance(attr, torch.Tensor):
+                _account_tensor(attr)
+            elif hasattr(attr, 'data') and isinstance(attr.data, torch.Tensor):
+                _account_tensor(attr.data)
+                if hasattr(attr, 'scale') and isinstance(attr.scale, torch.Tensor):
+                    _account_tensor(attr.scale)
     return sum(seen_storages.values())
 
 
