@@ -15,6 +15,7 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
@@ -25,7 +26,14 @@ from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    mamba_state_selective_copy,
+    prepare_next_forward_pass,
+    verify_speculative_tokens,
+)
 from megatron.core.inference.utils import (
     get_attention_mask,
     set_decode_expert_padding,
@@ -49,23 +57,6 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
     unwrap_model,
-)
-
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
-    HAVE_TE = True
-
-except ImportError:
-    HAVE_TE = False
-
-from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
-from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
-from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
-    mamba_state_selective_copy,
-    prepare_next_forward_pass,
-    verify_speculative_tokens,
 )
 
 
