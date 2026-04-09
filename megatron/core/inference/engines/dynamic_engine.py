@@ -2102,11 +2102,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                 # Build the communication component string.
+                tp_ar_total_bytes = num_allreduces * msg_bytes
                 comm_parts = []
                 if sol_tp_comm_s > 0:
-                    comm_parts.append("tp_ar %.3f ms" % (sol_tp_comm_s * 1000))
+                    comm_parts.append(
+                        "tp_ar %.3f ms (%.2f mb / %.1f gb/s)"
+                        % (
+                            sol_tp_comm_s * 1000,
+                            tp_ar_total_bytes / 1e6,
+                            self._measured_tp_allreduce_bw / 1e9,
+                        )
+                    )
                 if sol_ep_comm_s > 0:
-                    comm_parts.append("ep_a2a %.3f ms" % (sol_ep_comm_s * 1000))
+                    comm_parts.append(
+                        "ep_a2a %.3f ms (%.2f mb / %.1f gb/s)"
+                        % (
+                            sol_ep_comm_s * 1000,
+                            a2a_vol / 1e6,
+                            self._measured_ep_alltoall_bw / 1e9,
+                        )
+                    )
 
                 if comm_parts:
                     output_str += (
