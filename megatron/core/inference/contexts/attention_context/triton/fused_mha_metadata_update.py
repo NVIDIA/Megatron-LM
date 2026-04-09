@@ -1,19 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
-"""Fused Triton kernel for MHA metadata update.
-
-Replaces 13+ separate CUDA operations (copies, fills, cumsums, additions) in
-``MHAMetadata.update()`` with a single kernel launch for the 1D buffer
-computations:
-
-1. Copy + pad ``query_lengths`` → ``query_lengths_buf``
-2. Cumsum + copy + pad → ``cu_query_seq_lengths_buf``
-3. Add (kv_offsets + query_lengths) + copy + pad → ``kv_seq_lengths_buf``
-4. Cumsum + copy + pad → ``cu_kv_seq_lengths_buf``
-
-The 2D ``block_table`` copy+pad is left to the caller.
-"""
-
 import torch
 
 try:
