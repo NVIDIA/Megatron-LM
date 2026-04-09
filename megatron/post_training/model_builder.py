@@ -67,22 +67,22 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             )  # Useful for cases like QAD
             config_path = None
 
+    args_dict = vars(args).copy()
+
     if config_path is not None:
         with open(config_path) as f:
             config = yaml.safe_load(f)
-    else:
-        config = {}
 
-    args_dict = vars(get_args()).copy()
-    del args_dict["kv_channels"]  # not recalculated if present
-    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
-    if "flextron" in args_dict:
-        config["flextron"] = False
-    if "enable_router" in args_dict:
-        config["enable_router"] = False
-    if "freeze_model" in args_dict:
-        config["freeze_model"] = False
-    args_dict.update(config)
+        del args_dict["kv_channels"]  # not recalculated if present
+        # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+        if "flextron" in args_dict:
+            args_dict["flextron"] = False
+        if "enable_router" in args_dict:
+            args_dict["enable_router"] = False
+        if "freeze_model" in args_dict:
+            args_dict["freeze_model"] = False
+
+        args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
     if (args_dict.get('hybrid_override_pattern') is not None
