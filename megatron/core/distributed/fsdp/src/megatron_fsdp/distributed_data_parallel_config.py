@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -118,6 +120,39 @@ class DistributedDataParallelConfig:
       For symmetric registration with large models, the registration itself can take 
       a significant amount of time. This option minimizes the number of registration calls
       to minimize the registration time.
+    """
+
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
+      gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
+      main gradients to parameter dtype for `.grad`.
     """
 
     def __post_init__(self):

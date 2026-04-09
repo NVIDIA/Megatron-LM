@@ -101,6 +101,7 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -184,7 +185,7 @@ def fully_shard_model(
 
         mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
             Megatron-FSDP mixed-precision config that controls compute and communication precision.
-            Defaults to FP32 for main weights, main gradients, and gradient communication buffers.
+            Default values are defined in `megatron_fsdp.MixedPrecisionPolicy`.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -246,6 +247,10 @@ def fully_shard_model(
             when using MXFP8 parameters with activation recomputation. Specifically, it
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
+
+        use_decoupled_grad (bool):
+            If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
+            of `Parameter.grad`. Defaults to False.
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -341,6 +346,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
     )
 
     # Create FSDPDistributedIndex.
@@ -641,6 +647,7 @@ def fully_shard(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -689,6 +696,7 @@ def fully_shard(
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
+        use_decoupled_grad=use_decoupled_grad,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

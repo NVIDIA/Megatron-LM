@@ -8,10 +8,15 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
@@ -19,9 +24,7 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
@@ -34,10 +37,19 @@ try:
         fused_unpermute,
         te_general_gemm,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_unpermute,
+        te_general_gemm,
+    ) = (None, None, None, None, None, None, None, None, None, None)
 
 
 # MOE logging
@@ -1227,6 +1239,55 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
         torch.Tensor: The random logits.
     """
     return RandomSTE.apply(logits)
+
+
+@internal_api
+class RandomSTEShared(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
+    When std < 0, caches and reuses values per layer.
+    """
+
+    _cache = {}
+
+    @staticmethod
+    def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
+        # Check cache if reuse mode (negative std)
+        if std < 0 and layer_number in RandomSTEShared._cache:
+            return logits + RandomSTEShared._cache[layer_number]
+
+        # Generate random bias with shared seed across all ranks
+        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
+
+        # Cache if reuse mode
+        if std < 0 and layer_number is not None:
+            RandomSTEShared._cache[layer_number] = bias
+
+        return logits + bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
+        return grad_output, None, None
+
+
+def apply_biased_logits(logits, std, layer_number=None):
+    """
+    Apply random bias to logits. All ranks get the same random values.
+
+    Args:
+        logits: Input logits tensor [num_tokens, num_experts]
+        std: Standard deviation for random bias. If negative, generate once
+             per layer and reuse (using abs(std) as actual std).
+        layer_number: Layer number for caching when std is negative.
+    """
+    logits = apply_random_logits(logits)
+    return RandomSTEShared.apply(logits, std, layer_number)
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
