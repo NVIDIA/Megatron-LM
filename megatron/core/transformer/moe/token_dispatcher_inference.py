@@ -11,6 +11,7 @@ Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
 on Hopper+ GPUs with BF16, with automatic fallback to NCCL.
 """
 
+import logging
 from typing import List, Optional
 
 import torch
@@ -231,6 +232,20 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 ag_buffers["hidden_states"].view(hidden_dtype).view(global_tokens, hidden_dim)
             )
         else:
+            # Log why NVLS was not used
+            # if not self.triton_nvls_kernels_allowed:
+            #     reason = "triton_nvls_kernels_allowed=False (inference_disable_triton_nvls_kernels set)"
+            # elif not nvls_eligible:
+            #     reasons = []
+            #     for name, t in [("hidden_states", hidden_states), ("probs", probs), ("routing_map", self.routing_map)]:
+            #         nbytes = t.element_size() * t.numel()
+            #         if nbytes % 16 != 0:
+            #             reasons.append(f"{name} nbytes={nbytes} not 16-byte aligned (shape={tuple(t.shape)}, dtype={t.dtype})")
+            #     reason = f"tensors not NVLS eligible: {'; '.join(reasons) if reasons else 'device not NVLS capable'}"
+            # else:
+            #     reason = "symmetric memory allocation failed (handle=None) — EP group may not be within NVLink domain"
+            # logging.info(f"[token_dispatcher] NVLS fallback to NCCL: {reason}")
+            # #exit()
             # Fallback to NCCL for all tensors
             with torch.no_grad():
                 self.routing_map = gather_from_sequence_parallel_region(

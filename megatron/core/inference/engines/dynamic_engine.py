@@ -1643,7 +1643,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
         # Generate tokens.
-        range_push("Prefill" if not is_decode_only else "Decode")
+        range_push(f"Prefill-{self.context.active_token_count}" if not is_decode_only else f"Decode-{self.context.active_token_count}")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
