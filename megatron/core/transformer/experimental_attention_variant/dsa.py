@@ -438,6 +438,7 @@ class DSAFunction(torch.autograd.Function):
         tp_group,  # process group or None
         use_unfused,  # bool
     ):
+        """Run stateless indexer and sparse attention forward."""
         assert tp_group is None or tp_group.size() == 1  # TP not supported yet
         assert query.ndim == 4
         sq, b = query.shape[:2]
@@ -484,6 +485,7 @@ class DSAFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        """Compute sparse attn and indexer gradients."""
         (query, key, index_q, index_k, weights, topk_indices, index_score, o, lse, offsets) = (
             ctx.saved_tensors
         )
