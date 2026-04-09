@@ -64,3 +64,18 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: dist.ProcessGroup,
+    packed_seq_params: PackedSeqParams = None,
+) -> dist.ProcessGroup:
+    """Return the dynamic CP group from packed_seq_params when available, else the static one.
+
+    Dynamic CP assigns a per-microbatch CP group that may differ from the
+    process-group stored at model construction time.  This helper centralises
+    the resolution logic used by GPTModel, GatedDeltaNet, and MTP layers.
+    """
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        return packed_seq_params.cp_group
+    return static_cp_group
