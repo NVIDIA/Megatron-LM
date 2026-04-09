@@ -1463,13 +1463,7 @@ def validate_args(args, defaults={}):
             args.cuda_graph_impl == "none"
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
-    if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_buffer_size_gb is not None
-        assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
-    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
-       assert args.moe_pad_experts_for_cuda_graph_inference, \
-        "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
 
     # MoE upcycling check
     if args.moe_use_upcycling:
