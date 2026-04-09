@@ -395,7 +395,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_memory_per_request *= self.num_mamba_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
                 self.mamba_states_memory_per_request += intermediate_memory_per_request
-        mamba_states_memory_per_request = self.mamba_states_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -446,7 +445,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_bytes = total_memory * mamba_memory_ratio
-            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request)
+            mamba_max_requests = int(mamba_memory_bytes // self.mamba_states_memory_per_request)
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
@@ -459,7 +458,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            mamba_memory_needed = inference_config.max_requests * self.mamba_states_memory_per_request
             assert mamba_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests. "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "
@@ -477,11 +476,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes + self.mamba_states_memory_per_request
             )
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes + self.mamba_states_memory_per_request
             )
 
         # If using pipeline parallelism synchronize the total block count in case the
@@ -3200,7 +3199,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             'max_requests': int(self.max_requests),
         }
 
-    def get_active_state_memory_breakdown(self) -> Tuple[int, int]:
+    def get_active_state_memory_bytes(self) -> Tuple[int, int]:
         """Compute state tensor memory for active requests, broken down by type.
 
         Returns:
@@ -3216,12 +3215,3 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_bytes = self.get_active_request_count() * self.mamba_states_memory_per_request
 
         return kv_bytes, mamba_bytes
-
-    def get_active_state_memory_bytes(self) -> int:
-        """Compute state tensor memory (KV cache + Mamba state) for active requests.
-
-        Returns:
-            Total state memory in bytes for the current active batch.
-        """
-        kv_bytes, mamba_bytes = self.get_active_state_memory_breakdown()
-        return kv_bytes + mamba_bytes

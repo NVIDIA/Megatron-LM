@@ -274,22 +274,19 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         self._measured_hbm_bandwidth = measure_hbm_bandwidth()
 
-        # Cache model-config fields needed for per-step communication volume.
-        model_config = controller.inference_wrapped_model.model.config
+        # Cache model topology fields needed for per-step SOL communication volume.
+        self._model_config = controller.inference_wrapped_model.model.config
         unwrapped_model = controller.inference_wrapped_model.model
         tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
-        ep_size = model_config.expert_model_parallel_size
+        ep_size = self._model_config.expert_model_parallel_size
 
-        self._sol_hidden_size = model_config.hidden_size
-        self._sol_dtype_bytes = model_config.params_dtype.itemsize
         # Count TP allreduces and MoE layers by inspecting the model directly.
-        self._sol_num_tp_allreduces = len(
+        self._num_tp_allreduces = len(
             [m for m in unwrapped_model.modules() if is_row_parallel_linear(m)]
         )
-        self._sol_num_moe_layers = len(
+        self._num_moe_layers = len(
             [m for m in unwrapped_model.modules() if isinstance(m, MoELayer)]
         )
-        self._sol_moe_topk = model_config.moe_router_topk if model_config.num_moe_experts else 0
 
         # Measure TP allreduce bandwidth.
         if tp_size > 1 and self.pg_collection.tp is not None:
@@ -313,12 +310,12 @@ class DynamicInferenceEngine(AbstractEngine):
             if self._measured_tp_allreduce_bw > 0:
                 sol_parts.append(
                     f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
-                    f"(tp={tp_size}, {self._sol_num_tp_allreduces} allreduces/step)"
+                    f"(tp={tp_size}, {self._num_tp_allreduces} allreduces/step)"
                 )
             if self._measured_ep_alltoall_bw > 0:
                 sol_parts.append(
                     f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
-                    f"(ep={ep_size}, {self._sol_num_moe_layers} MoE layers)"
+                    f"(ep={ep_size}, {self._num_moe_layers} MoE layers)"
                 )
             logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 
@@ -1775,26 +1772,25 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _compute_sol_metrics(self, context_state, step_time):
         """Compute SOL (speed-of-light) latency metrics for decode-only steps."""
-        kv_bytes, mamba_bytes = self.context.get_active_state_memory_breakdown()
+        kv_bytes, mamba_bytes = self.context.get_active_state_memory_bytes()
         state_bytes = kv_bytes + mamba_bytes
         sol_mem_s = (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
 
         batch_tokens = context_state["active_token_count"]
-        msg_bytes = batch_tokens * self._sol_hidden_size * self._sol_dtype_bytes
-        num_allreduces = self._sol_num_tp_allreduces
+        hidden_bytes = self._model_config.hidden_size * self._model_config.params_dtype.itemsize
+        msg_bytes = batch_tokens * hidden_bytes
+        num_allreduces = self._num_tp_allreduces
         sol_tp_comm_s = (
             (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
             if self._measured_tp_allreduce_bw > 0
             else 0
         )
-        a2a_vol = (
-            2
-            * self._sol_num_moe_layers
-            * batch_tokens
-            * self._sol_moe_topk
-            * self._sol_hidden_size
-            * self._sol_dtype_bytes
+        moe_topk = (
+            self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
         )
+        a2a_dim = self._model_config.moe_latent_size or self._model_config.hidden_size
+        a2a_token_bytes = a2a_dim * self._model_config.params_dtype.itemsize
+        a2a_vol = 2 * self._num_moe_layers * batch_tokens * moe_topk * a2a_token_bytes
         sol_ep_comm_s = (
             (a2a_vol / self._measured_ep_alltoall_bw) if self._measured_ep_alltoall_bw > 0 else 0
         )
