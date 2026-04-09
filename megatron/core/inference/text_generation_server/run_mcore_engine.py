@@ -81,10 +81,11 @@ def run_mcore_engine(
 
     result = engine.generate(inference_requests=requests)
 
-    # Only post-process on first stage.
-    if mpu.is_pipeline_first_stage():
+    # Only post-process on the server rank (first stage with prompts)
+    if mpu.is_pipeline_first_stage() and prompts is not None:
         response_dict = {
-            "text": [x.prompt + x.generated_text for x in result],
+            # Send original prompts, not x.prompt, to circumvent tokenization artifacts
+            "text": [p + x.generated_text for p, x in zip(prompts, result)],
             "tokens": [x.prompt_tokens + x.generated_tokens.tolist() for x in result],
         }
         if sampling_params.return_log_probs:
