@@ -32,7 +32,6 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
-from megatron.training.arguments import parse_and_validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
@@ -40,9 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 def initialize_megatron(
-    extra_args_provider=None,
-    args_defaults={},
-    ignore_unknown_args=False,
     allow_no_cuda=False,
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
@@ -62,7 +58,7 @@ def initialize_megatron(
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    args = parse_and_validate_args(extra_args_provider=extra_args_provider, ignore_unknown_args=ignore_unknown_args, args_defaults=args_defaults)
+    args = get_args()
 
     # set logging level
     setup_logging()
