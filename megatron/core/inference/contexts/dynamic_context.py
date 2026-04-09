@@ -377,15 +377,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         assert self.block_size_bytes > 0
 
-        mamba_states_memory_per_request = 0
+        self.mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
+            self.mamba_states_memory_per_request += (
                 math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
             )
-            mamba_states_memory_per_request += (
+            self.mamba_states_memory_per_request += (
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_mamba_layers
+            self.mamba_states_memory_per_request *= self.num_mamba_layers
             if self.num_speculative_tokens > 0:
                 # Add memory for intermediate conv and SSM states
                 intermediate_memory_per_request = (
@@ -394,7 +394,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 intermediate_memory_per_request *= self.num_mamba_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
-                mamba_states_memory_per_request += intermediate_memory_per_request
+                self.mamba_states_memory_per_request += intermediate_memory_per_request
+        mamba_states_memory_per_request = self.mamba_states_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -3209,28 +3210,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_kv_blocks = self.kv_block_allocator.get_active_used()
         kv_bytes = active_kv_blocks * self.block_size_bytes
 
-        # Mamba state: active requests * per-request Mamba memory
-        # Mirrors the mamba_states_memory_per_request calculation in __init__.
+        # Mamba state: active requests * per-request Mamba memory (computed once in __init__).
         mamba_bytes = 0
         if self.is_hybrid_model:
-            active_requests = self.get_active_request_count()
-            per_request = (
-                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-            ) * self.num_mamba_layers
-            if self.num_speculative_tokens > 0:
-                intermediate_per_request = (
-                    (
-                        math.prod(self.mamba_conv_states_shape)
-                        * self.mamba_conv_states_dtype.itemsize
-                        + math.prod(self.mamba_ssm_states_shape)
-                        * self.mamba_ssm_states_dtype.itemsize
-                    )
-                    * self.num_mamba_layers
-                    * (self.num_speculative_tokens + 1)
-                )
-                per_request += intermediate_per_request
-            mamba_bytes = active_requests * per_request
+            mamba_bytes = self.get_active_request_count() * self.mamba_states_memory_per_request
 
         return kv_bytes, mamba_bytes
 
