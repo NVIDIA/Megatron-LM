@@ -3,6 +3,8 @@
 """Pretrain utilities."""
 import argparse
 import time
+
+from megatron.training.config.container import PretrainConfigContainer
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -832,6 +834,7 @@ def preprocess_common_state_dict(common_state_dict):
 
 
 def pretrain(
+    full_config: PretrainConfigContainer,
     train_valid_test_dataset_provider,
     model_provider,
     model_type,
@@ -911,7 +914,6 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
-    full_config = pretrain_container_from_args(args)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (

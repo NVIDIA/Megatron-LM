@@ -4,6 +4,8 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
+from megatron.training.argument_utils import pretrain_container_from_args
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -413,7 +415,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    pretrain(
+    full_config = pretrain_container_from_args(args)
+    pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
