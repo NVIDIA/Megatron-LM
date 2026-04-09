@@ -12,13 +12,17 @@ import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.tensor_parallel import (
-    ColumnParallelLinear,
     RowParallelLinear,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_te_version, is_row_parallel_linear, is_te_min_version
+from megatron.core.utils import (
+    get_te_version,
+    is_column_parallel_linear,
+    is_row_parallel_linear,
+    is_te_min_version,
+)
 
 # Check if Transformer Engine is installed
 HAVE_TE = False
@@ -171,18 +175,6 @@ def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
         return 32
     else:
         return 16
-
-
-def is_column_parallel_linear(module):
-    """Returns whether the given module is a ColumnParallelLinear layer."""
-    if HAVE_TE and (
-        isinstance(module, TEColumnParallelLinear)
-        or isinstance(module, TELayerNormColumnParallelLinear)
-    ):
-        return True
-    elif isinstance(module, ColumnParallelLinear):
-        return True
-    return False
 
 
 """
