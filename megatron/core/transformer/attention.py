@@ -821,6 +821,7 @@ class Attention(MegatronModule, ABC):
                     page_table=block_table,
                     softmax_scale=softmax_scale,
                     causal=True,
+                    num_splits=1,
                 )
             elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -901,6 +902,7 @@ class Attention(MegatronModule, ABC):
                         page_table=block_table,
                         softmax_scale=softmax_scale,
                         causal=True,
+                        num_splits=1,
                     )
                     # Reshape back to (batch, 1, nheads, headdim)
                     output_total = output_total.unsqueeze(1)
