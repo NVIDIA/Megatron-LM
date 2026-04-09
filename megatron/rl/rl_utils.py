@@ -577,13 +577,6 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
-    if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
-            with nvtx_range("rl/restore/grad-buffers", time=True):
-                model[0].restore_grad_buffers()
-            with nvtx_range("rl/restore/optimizer-state", time=True):
-                optimizer.restore_from_cpu()
-
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
             lang_rl_log_dir
@@ -1540,6 +1533,7 @@ def get_grpo_data_iterator(
     sequence_packing: bool,
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
+    optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1585,6 +1579,13 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
+        if optimizer_is_on_cpu:
+            nvtx_range = get_nvtx_range()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
