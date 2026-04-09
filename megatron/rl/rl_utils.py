@@ -459,37 +459,39 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         # Autotune parallel generation tasks based on engine capacity.
-        engine = inference_interface._inference_engine
-        max_requests = engine.context.max_requests
-        dp_size = len(dist.get_process_group_ranks(engine.pg_collection.dp))
-        G = args.grpo_group_size
-        P = args.grpo_prompts_per_step
-        max_effective_tasks = max(1, dp_size * max_requests // G)
-        max_effective_lag = max_effective_tasks / P - 1
-        if args.rl_desired_lag is None:
-            args.rl_parallel_generation_tasks = max_effective_tasks
-            print_rank_0(
-                f"Autotuned rl-desired-lag={max_effective_lag:.2f} "
-                f"({max_effective_tasks} parallel tasks; "
-                f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
-        else:
-            actual_lag = args.rl_parallel_generation_tasks / P - 1
-            print_rank_0(
-                f"Using rl-desired-lag={args.rl_desired_lag} "
-                f"(actual={actual_lag:.2f}, {args.rl_parallel_generation_tasks} parallel tasks; "
-                f"max effective lag={max_effective_lag:.2f}; "
-                f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
-            if args.rl_parallel_generation_tasks > max_effective_tasks:
+        if streaming:
+            engine = inference_interface._inference_engine
+            max_requests = engine.context.max_requests
+            dp_size = len(dist.get_process_group_ranks(engine.pg_collection.dp))
+            G = args.grpo_group_size
+            P = args.grpo_prompts_per_step
+            max_effective_tasks = max(1, dp_size * max_requests // G)
+            max_effective_lag = max_effective_tasks / P - 1
+            if args.rl_desired_lag is None:
+                args.rl_parallel_generation_tasks = max_effective_tasks
+                args.rl_desired_lag = max_effective_lag
                 print_rank_0(
-                    f"WARNING: --rl-desired-lag {args.rl_desired_lag} oversubscribes the "
-                    f"inference engine (max effective lag is {max_effective_lag:.2f}). "
-                    f"Additional lag beyond that point has no benefit.")
-        if max_effective_lag < 0:
-            print_rank_0(
-                f"WARNING: max effective lag is {max_effective_lag:.2f} (negative) — "
-                f"the inference engine cannot hold even one training step's worth of "
-                f"rollouts ({max_effective_tasks} tasks < P={P}). Even fully-synchronous "
-                f"GRPO would oversubscribe. Consider scaling up inference resources.")
+                    f"Autotuned rl-desired-lag={max_effective_lag:.2f} "
+                    f"({max_effective_tasks} parallel tasks; "
+                    f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
+            else:
+                actual_lag = args.rl_parallel_generation_tasks / P - 1
+                print_rank_0(
+                    f"Using rl-desired-lag={args.rl_desired_lag} "
+                    f"(actual={actual_lag:.2f}, {args.rl_parallel_generation_tasks} parallel tasks; "
+                    f"max effective lag={max_effective_lag:.2f}; "
+                    f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
+                if args.rl_parallel_generation_tasks > max_effective_tasks:
+                    print_rank_0(
+                        f"WARNING: --rl-desired-lag {args.rl_desired_lag} oversubscribes the "
+                        f"inference engine (max effective lag is {max_effective_lag:.2f}). "
+                        f"Additional lag beyond that point has no benefit.")
+            if max_effective_lag < 0:
+                print_rank_0(
+                    f"WARNING: max effective lag is {max_effective_lag:.2f} (negative) — "
+                    f"the inference engine cannot hold even one training step's worth of "
+                    f"rollouts ({max_effective_tasks} tasks < P={P}). Even fully-synchronous "
+                    f"GRPO would oversubscribe. Consider scaling up inference resources.")
 
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
@@ -504,7 +506,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            enforce_order=args.rl_use_strict_lag,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR

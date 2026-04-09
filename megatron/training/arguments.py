@@ -432,7 +432,6 @@ def validate_args(args, defaults={}):
             tasks = max(1, round((args.rl_desired_lag + 1) * P))
             args.rl_parallel_generation_tasks = tasks
             args.rl_generation_batch_size = gcd(tasks, P) if args.rl_use_strict_lag else 1
-            args.rl_enforce_generation_order = args.rl_use_strict_lag
         else:
             # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
             assert args.rl_num_parallel_generations is None \
@@ -474,8 +473,8 @@ def validate_args(args, defaults={}):
                     args.rl_generation_batch_size = 1
                 args.rl_parallel_generation_tasks = 512
 
-            # Derive enforce_order after all resolution is complete.
-            args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+            # Derive strict lag from legacy batch size for enforce_order.
+            args.rl_use_strict_lag = (args.rl_generation_batch_size > 1)
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -2323,7 +2322,8 @@ def _add_rl_args(parser):
                             'steps worth of prompt groups are in flight simultaneously. '
                             'Requires --rl-partial-rollouts. '
                             'Mutually exclusive with --rl-num-parallel-generations, '
-                            '--rl-num-parallel-generation-batches, and --rl-parallel-generation-tasks.')
+                            '--rl-num-parallel-generation-batches, --rl-parallel-generation-tasks, '
+                            'and --rl-generation-batch-size.')
     group.add_argument('--rl-use-strict-lag', action='store_true', default=False,
                        help='Enforce strict ordering of generation batches so that the lag is '
                             'deterministic rather than non-strict. When set, rollouts are yielded '
