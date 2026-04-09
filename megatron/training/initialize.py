@@ -43,7 +43,6 @@ def initialize_megatron(
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
-    parsed_args=None,
     store=None,
 ):
     """Set global variables, initialize distributed, and
