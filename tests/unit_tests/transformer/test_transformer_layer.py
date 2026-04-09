@@ -91,9 +91,7 @@ class TestParallelTransformerLayer:
             input_hidden_states = torch.randn((sequence_length, micro_batch_size, hidden_size))
             input_hidden_states = input_hidden_states.cuda()
 
-            attention_mask = torch.ones(
-                (1, 1, sequence_length, sequence_length), dtype=bool
-            ).cuda()
+            attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
             # Test chunked prefill: chunks=1 vs chunks=4 should be identical
             parallel_transformer_layer.eval()
