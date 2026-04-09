@@ -19,11 +19,7 @@ class TemporaryBucketAllocator:
         self.buckets = {}
 
     def allocate(
-        self,
-        param_group_id: int,
-        size: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        self, param_group_id: int, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
         if param_group_id not in self.buckets:
             self.buckets[param_group_id] = Bucket(

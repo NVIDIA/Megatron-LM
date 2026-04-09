@@ -1,14 +1,12 @@
 """Unit tests for TemporaryBucketAllocator. Pure CPU, no torch.distributed."""
 
 import sys
-import torch
+
 import pytest
+import torch
 
 sys.path.insert(0, "/home/tongliu/tongliu/megatron/fsdp/Megatron-LM")
-from megatron.core.distributed.fsdp_refactor.src.allocator import (
-    Bucket,
-    TemporaryBucketAllocator,
-)
+from megatron.core.distributed.fsdp_refactor.src.allocator import Bucket, TemporaryBucketAllocator
 
 
 def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:
@@ -30,16 +28,22 @@ def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:
     """
 
     # ---- Phase 1: allocate ----
-    b0 = allocator.allocate(param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu"))
+    b0 = allocator.allocate(
+        param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu")
+    )
     assert b0.data.numel() == 1024
     assert b0.data.dtype == torch.float32
     assert 0 in allocator.buckets
 
-    b0_again = allocator.allocate(param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu"))
+    b0_again = allocator.allocate(
+        param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu")
+    )
     assert b0_again is b0
     assert b0_again.data.data_ptr() == b0.data.data_ptr()
 
-    b1 = allocator.allocate(param_group_id=1, size=512, dtype=torch.bfloat16, device=torch.device("cpu"))
+    b1 = allocator.allocate(
+        param_group_id=1, size=512, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
     assert b1 is not b0
     assert b1.data.numel() == 512
     assert b1.data.dtype == torch.bfloat16
@@ -56,7 +60,9 @@ def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:
     allocator.free(999)
 
     # ---- Phase 3: re-allocate ----
-    b0_new = allocator.allocate(param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu"))
+    b0_new = allocator.allocate(
+        param_group_id=0, size=1024, dtype=torch.float32, device=torch.device("cpu")
+    )
     assert b0_new.data.numel() == 1024
     assert 0 in allocator.buckets
 

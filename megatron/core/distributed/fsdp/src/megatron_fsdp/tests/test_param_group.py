@@ -17,10 +17,10 @@ import torch.nn as nn
 sys.path.insert(0, "/home/tongliu/tongliu/megatron/fsdp/Megatron-LM")
 from megatron.core.distributed.fsdp_refactor.src.param_group import ParameterGroup
 
-
 # ------------------------------------------------------------------ #
 #  Process group — init once per pytest session, shared by all tests
 # ------------------------------------------------------------------ #
+
 
 @pytest.fixture(scope="session", autouse=True)
 def dist_env():
@@ -38,20 +38,23 @@ def dist_env():
 #  Test model — contains bf16 and uint8 (simulated fp8) params
 # ------------------------------------------------------------------ #
 
+
 class MixedDtypeLayer(nn.Module):
     """A toy layer with large matrices, small biases, and quantized projections."""
+
     def __init__(self):
         super().__init__()
-        self.linear1 = nn.Linear(256, 512, bias=False)       # bf16, shape [512, 256]
-        self.linear2 = nn.Linear(512, 256, bias=True)         # bf16, shape [256, 512] + bias [256]
-        self.norm = nn.LayerNorm(256)                          # bf16, weight [256] + bias [256]
-        self.quant_proj = nn.Linear(256, 128, bias=False)      # uint8, shape [128, 256]
-        self.quant_gate = nn.Linear(256, 64, bias=False)       # uint8, shape [64, 256]
+        self.linear1 = nn.Linear(256, 512, bias=False)  # bf16, shape [512, 256]
+        self.linear2 = nn.Linear(512, 256, bias=True)  # bf16, shape [256, 512] + bias [256]
+        self.norm = nn.LayerNorm(256)  # bf16, weight [256] + bias [256]
+        self.quant_proj = nn.Linear(256, 128, bias=False)  # uint8, shape [128, 256]
+        self.quant_gate = nn.Linear(256, 64, bias=False)  # uint8, shape [64, 256]
 
 
 # ------------------------------------------------------------------ #
 #  Helpers
 # ------------------------------------------------------------------ #
+
 
 def _build_groups(strategy):
     """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
@@ -83,8 +86,12 @@ def _build_groups(strategy):
         if not params:
             continue
         pg = ParameterGroup(
-            params=params, fsdp_unit_id=0, dp_group=dp_group,
-            device=device, sharding_strategy=strategy, param_group_id=gid,
+            params=params,
+            fsdp_unit_id=0,
+            dp_group=dp_group,
+            device=device,
+            sharding_strategy=strategy,
+            param_group_id=gid,
         )
         pg.init_buffers()
         groups.append(pg)
@@ -102,16 +109,17 @@ def _flags(s):
     - grad_distributed: True for optim_grads and optim_grads_params
     """
     return {
-        "no_shard":           (False, True,  False, False),
-        "optim":              (True,  True,  False, False),
-        "optim_grads":        (True,  True,  False, True),
-        "optim_grads_params": (True,  True,  True,  True),
+        "no_shard": (False, True, False, False),
+        "optim": (True, True, False, False),
+        "optim_grads": (True, True, False, True),
+        "optim_grads_params": (True, True, True, True),
     }[s]
 
 
 # ------------------------------------------------------------------ #
 #  PyTorch reference — thin wrappers around torch.distributed
 # ------------------------------------------------------------------ #
+
 
 class Ref:
     @staticmethod
@@ -138,6 +146,7 @@ class Ref:
 # ------------------------------------------------------------------ #
 #  Part 1: init_buffers — verify buffer creation and shard correctness
 # ------------------------------------------------------------------ #
+
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_init_buffers(strategy):
@@ -180,6 +189,7 @@ def test_init_buffers(strategy):
 #  Part 2: unshard + reshard — verify all-gather and cleanup
 # ------------------------------------------------------------------ #
 
+
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_unshard_reshard(strategy):
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
@@ -219,6 +229,7 @@ def test_unshard_reshard(strategy):
 #  Part 3: reduce_grad — verify all-reduce / reduce-scatter
 # ------------------------------------------------------------------ #
 
+
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)
@@ -247,7 +258,9 @@ def test_reduce_grad(strategy):
             # Pre-populate the allocator so reduce_grad sees the data
             bucket = gbuf.allocator.allocate(
                 param_group_id=gbuf.buffer_index.param_group_id,
-                size=full_size, dtype=gbuf.dtype, device=device,
+                size=full_size,
+                dtype=gbuf.dtype,
+                device=device,
             )
             bucket.data.copy_(full)
 

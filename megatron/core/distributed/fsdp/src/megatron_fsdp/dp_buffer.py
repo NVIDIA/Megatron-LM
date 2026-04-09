@@ -14,15 +14,10 @@ class BufferIndex:
     Each DataParallelBuffer owns its own independent BufferIndex instance.
     """
 
-    ItemIndex = namedtuple(
-        "ItemIndex", ["global_data_index", "size", "item_id", "shape"]
-    )
-    BucketMeta = namedtuple(
-        "BucketMeta", ["global_data_index", "size", "items"]
-    )
+    ItemIndex = namedtuple("ItemIndex", ["global_data_index", "size", "item_id", "shape"])
+    BucketMeta = namedtuple("BucketMeta", ["global_data_index", "size", "items"])
     ShardMeta = namedtuple(
-        "ShardMeta",
-        ["global_data_index", "local_data_index", "bucket_data_index", "size"],
+        "ShardMeta", ["global_data_index", "local_data_index", "bucket_data_index", "size"]
     )
 
     def __init__(
@@ -38,10 +33,10 @@ class BufferIndex:
         self.param_group_id = param_group_id
         self.is_distributed = is_distributed
         self.item_index_map, self.bucket_meta = self._build_layout(
-            param_shapes, dp_world_size, chunk_size_factor, sharding_strategy,
+            param_shapes, dp_world_size, chunk_size_factor, sharding_strategy
         )
         self.shard_meta = self._build_shard_meta(
-            self.bucket_meta, is_distributed, dp_world_size, dp_rank,
+            self.bucket_meta, is_distributed, dp_world_size, dp_rank
         )
 
     # ------------------------------------------------------------------ #
@@ -67,10 +62,7 @@ class BufferIndex:
 
         def add_item(item_id, shape, offset, index_map):
             index_map[item_id] = cls.ItemIndex(
-                global_data_index=offset,
-                size=shape.numel(),
-                item_id=item_id,
-                shape=shape,
+                global_data_index=offset, size=shape.numel(), item_id=item_id, shape=shape
             )
 
         fragment_items = []
@@ -273,9 +265,7 @@ class DataParallelBuffer:
     def init_data(self, data: torch.Tensor) -> None:
         """Bind an externally allocated tensor as the persistent storage."""
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
-        assert data.numel() == self.data_size, (
-            f"size mismatch: {data.numel()} vs {self.data_size}"
-        )
+        assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
 
     def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
@@ -298,7 +288,9 @@ class DataParallelBuffer:
         return self.data[start:end]
 
     @torch.no_grad()
-    def unshard(self, async_op: bool = True) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
+    def unshard(
+        self, async_op: bool = True
+    ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
         """All-gather the full buffer from all shards and rebind param.data.
 
         After the all-gather completes, each param's .data is pointed to
@@ -353,9 +345,7 @@ class DataParallelBuffer:
         For non-distributed buffers: all-reduce in-place.
         """
         if not self.is_distributed:
-            work = torch.distributed.all_reduce(
-                self.data, group=self.dp_group, async_op=async_op,
-            )
+            work = torch.distributed.all_reduce(self.data, group=self.dp_group, async_op=async_op)
             return work
 
         bucket = self.allocator.allocate(
@@ -370,10 +360,7 @@ class DataParallelBuffer:
         grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
         work = torch.distributed.reduce_scatter_tensor(
-            output=grad_shard,
-            input=full_grad,
-            group=self.dp_group,
-            async_op=async_op,
+            output=grad_shard, input=full_grad, group=self.dp_group, async_op=async_op
         )
 
         if not async_op:

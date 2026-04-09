@@ -25,9 +25,7 @@ class ParameterGroup:
         allocator: Optional[TemporaryBucketAllocator] = None,
     ):
         self.params = params
-        self.param_idx: Dict[torch.nn.Parameter, int] = {
-            p: i for i, p in enumerate(params)
-        }
+        self.param_idx: Dict[torch.nn.Parameter, int] = {p: i for i, p in enumerate(params)}
         # TODO: validate that all params have the same device/dtype/require_grad
         self.device = params[0].device
         self.dtype = params[0].dtype
@@ -124,7 +122,5 @@ class ParameterGroup:
                 data = p.detach()
 
             self.dist_params.append(
-                torch.nn.Parameter(
-                    make_uneven_dtensor(data, p.shape, self.mesh, placements)
-                )
+                torch.nn.Parameter(make_uneven_dtensor(data, p.shape, self.mesh, placements))
             )

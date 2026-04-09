@@ -14,7 +14,8 @@
 
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
-from .fully_shard_v2 import fully_shard as fully_shard_v2, FSDPModule
+from .fully_shard_v2 import FSDPModule
+from .fully_shard_v2 import fully_shard as fully_shard_v2
 from .megatron_fsdp import MegatronFSDP
 from .mixed_precision import MixedPrecisionPolicy
 from .package_info import (

@@ -1,17 +1,12 @@
 import functools
-from typing import Any, Callable, Dict, List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
-from torch.distributed.utils import (
-    _apply_to_tensors,
-    _cast_forward_inputs,
-    _p_assert,
-    _to_kwargs,
-)
 
 from .param_group import ParameterGroup
 
@@ -32,26 +27,13 @@ def fully_shard(
             "Please do not call fully_shard on the same module more than once."
         )
 
-    fsdp_sub_modules = []
-    for name, child in module.named_modules():
-        if isinstance(child, FSDPModule):
-            fsdp_sub_modules.append(child)
-
-    if len(fsdp_sub_modules) > 0:
-        ignored_params = set() if ignored_params is None else ignored_params
-        for fsdp_sub_module in fsdp_sub_modules:
-            ignored_params.update(fsdp_sub_module.parameters())
-
-    fsdp_param_groups = _get_module_fsdp_param_groups(
-        module, mesh, ignored_params=ignored_params
-    )
-
     # Make the module class as FSDPModule and register the FSDP forward/backward hooks
     cls = module.__class__
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    module._init_named_param_groups(fsdp_param_groups)
+    module._init_named_param_groups(mesh, ignored_params)
+    module._init_fsdp_state()
     _register_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
@@ -62,9 +44,17 @@ def fully_shard(
 
     return module
 
+
 class FSDPModule(nn.Module):
 
-    def _init_named_param_groups(self, fsdp_param_groups):
+    def _init_named_param_groups(self, mesh, ignored_params):
+        ignored_params = ignored_params or set()
+        for _, child in self.named_modules():
+            if child is not self and isinstance(child, FSDPModule):
+                ignored_params.update(child.parameters())
+
+        fsdp_param_groups = _get_module_fsdp_param_groups(self, mesh, ignored_params=ignored_params)
+
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
         param_to_name = {p: n for n, p in self.named_parameters()}
         self._named_param_groups = []
@@ -74,6 +64,13 @@ class FSDPModule(nn.Module):
                 param_name = param_to_name[param]
                 param_names.append(param_name)
             self._named_param_groups.append((param_names, fsdp_param_group))
+
+    def _init_fsdp_state(self):
+        setattr(self, "_fsdp_state", _FSDPState())
+        for child in self.modules():
+            if child is not self and isinstance(child, FSDPModule):
+                child._init_fsdp_state()
+                child._fsdp_state._is_root = False
 
     def unshard(self):
         self.param_to_name = {p: n for n, p in self.named_parameters()}
@@ -90,6 +87,13 @@ class FSDPModule(nn.Module):
 
             for name, param in zip(param_names, fsdp_param_group.dist_params):
                 _replace_module_parameter(self, name, param)
+
+
+class _FSDPState:
+
+    def __init__(self):
+        self._is_root = True
+        self._post_backward_callback_queued = False
 
 
 def _get_module_fsdp_param_groups(
@@ -164,11 +168,13 @@ def _register_backward_pre_hook(module: FSDPModule):
         # on the output tensor(s).
         return module.register_forward_hook(forward_hook)
 
-    def param_groups_unshard(module, grads):
+    def pre_backward_hook(module, grads):
+        if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
+            _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
-        module, custom_backward_handler=param_groups_unshard
+        module, custom_backward_handler=pre_backward_hook
     )
 
 
@@ -233,6 +239,32 @@ def _register_backward_hook(module: FSDPModule):
 
     module._mfsdp_backward_hook = module.register_forward_pre_hook(
         functools.partial(_register_post_backward_hook, post_backward), with_kwargs=True
+    )
+
+
+def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module) -> None:
+    """
+    Registers the post-backward final callback that runs at the end of the
+    backward pass. This should be called from the root FSDP instance at the
+    beginning of the pre-backward.
+    """
+    assert state._is_root, "Only the root FSDP instance should register the post-backward callback"
+    if state._post_backward_callback_queued:
+        return
+
+    def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module) -> None:
+        # Reshard all FSDP modules after the backward pass is done.
+        for module in root_module.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+
+        # Reset the flag
+        root_state._post_backward_callback_queued = False
+
+    # Trace does not need this callback
+    state._post_backward_callback_queued = True
+    Variable._execution_engine.queue_callback(
+        functools.partial(_post_backward_final_callback, state, module)
     )
 
 
