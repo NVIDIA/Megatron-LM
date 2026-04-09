@@ -898,14 +898,14 @@ class Attention(MegatronModule, ABC):
                         softmax_scale = self.softmax_scale
                     else:
                         softmax_scale = q.shape[-1] ** -0.5
-                    # Reshape q from (batch, 1, nheads, headdim) to (total_q, nheads, headdim)
-                    q_varlen = q.squeeze(1)
+                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
+                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     output_total, _ = flash_attn4_varlen_func(
                         q_varlen,
                         k,
                         v,
                         cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=1,
+                        max_seqlen_q=tokens_per_request,
                         max_seqlen_k=max_seqlen_k,
                         seqused_k=seqlens_k,
                         page_table=block_table,
@@ -913,8 +913,10 @@ class Attention(MegatronModule, ABC):
                         causal=True,
                         num_splits=1,
                     )
-                    # Reshape back to (batch, 1, nheads, headdim)
-                    output_total = output_total.unsqueeze(1)
+                    # Reshape back to (B, S, H, D)
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
                 else:
                     flash_attn_args = {
                         "q": q,
