@@ -297,6 +297,22 @@ class OptimizerConfig:
     """Second beta coefficient for Lion optimizer (used in momentum EMA update).
     Defaults to 0.98."""
 
+    # FlashAdamW.
+    flashadamw_master_weight_bits: Optional[int] = 24
+    """Number of bits for FlashAdamW master weights. Valid values: 24, 32, or None.
+    24 uses BF16 + INT8 error correction (~3 bytes/param master weight).
+    32 uses BF16 + INT16 error correction (~4 bytes/param master weight).
+    None disables master weight error correction (pure BF16, no correction).
+    Defaults to 24."""
+
+    flashadamw_quantize: bool = True
+    """If true, quantize FlashAdamW optimizer states to INT8, reducing memory from
+    8 bytes/param (fp32 exp_avg + exp_avg_sq) to ~2 bytes/param. Defaults to True."""
+
+    flashadamw_compress_state_dict: bool = False
+    """If true, save FlashAdamW optimizer states in quantized INT8 format in checkpoints,
+    reducing checkpoint size by ~50% compared to BF16. Defaults to False."""
+
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 

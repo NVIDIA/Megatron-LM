@@ -595,6 +595,31 @@ def _get_megatron_optimizer_based_on_param_groups(
                             else:
                                 opt.initialize_state(p)
 
+        elif config.optimizer == 'flashadamw':
+            try:
+                from flashoptim import FlashAdamW
+            except ImportError:
+                raise ImportError(
+                    "FlashAdamW optimizer requires flashoptim >= 0.1.3. "
+                    "Install it with: pip install 'flashoptim>=0.1.3'"
+                )
+            optimizer = FlashAdamW(
+                param_groups,
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+                master_weight_bits=config.flashadamw_master_weight_bits,
+                quantize=config.flashadamw_quantize,
+                compress_state_dict=config.flashadamw_compress_state_dict,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.step_param(p, group)
+
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:
                 raise ImportError(
@@ -896,7 +921,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'flashadamw'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

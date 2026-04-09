@@ -1503,6 +1503,21 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
+    # FlashAdamW optimizer validation.
+    if args.optimizer == 'flashadamw':
+        if args.flashadamw_no_master_weight_bits:
+            args.flashadamw_master_weight_bits = None
+        assert not args.use_distributed_optimizer, (
+            '--optimizer flashadamw is not compatible with --use-distributed-optimizer. '
+            'FlashAdamW manages its own master weights internally.'
+        )
+        assert not args.use_precision_aware_optimizer, (
+            '--optimizer flashadamw is not compatible with --use-precision-aware-optimizer.'
+        )
+        assert not args.optimizer_cpu_offload, (
+            '--optimizer flashadamw is not compatible with --optimizer-cpu-offload.'
+        )
+
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -2268,6 +2283,23 @@ def _add_regularization_args(parser):
     group.add_argument('--lion-beta2', type=float, default=0.98,
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
+    group.add_argument('--flashadamw-master-weight-bits', type=int, default=24,
+                       choices=[24, 32],
+                       help='Number of bits for FlashAdamW master weight precision. '
+                       '24 uses BF16 + INT8 error correction (~3 bytes/param). '
+                       '32 uses BF16 + INT16 error correction (~4 bytes/param). '
+                       'Defaults to 24.')
+    group.add_argument('--flashadamw-no-master-weight-bits', action='store_true', default=False,
+                       help='Disable FlashAdamW master weight error correction (pure BF16 '
+                       'master weights, sets master_weight_bits=None). Saves the most memory '
+                       'but may impact convergence.')
+    group.add_argument('--flashadamw-no-quantize', action='store_false', dest='flashadamw_quantize',
+                       default=True,
+                       help='Disable FlashAdamW INT8 optimizer state quantization. '
+                       'Uses full-precision optimizer states (8 bytes/param instead of 2).')
+    group.add_argument('--flashadamw-compress-state-dict', action='store_true', default=False,
+                       help='Save FlashAdamW optimizer states in quantized INT8 format in '
+                       'checkpoints, reducing checkpoint size by ~50%% compared to BF16.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2484,7 +2516,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'flashadamw'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
