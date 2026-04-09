@@ -305,16 +305,20 @@ class GatedDeltaNet(MegatronModule):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Prefer cu_seqlens_q_padded if available, otherwise use cu_seqlens_q
-            if packed_seq_params.cu_seqlens_q_padded is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-            else:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            # Prefer cu_seqlens_kv_padded if available, otherwise use cu_seqlens_kv
-            if packed_seq_params.cu_seqlens_kv_padded is not None:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-            else:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            # Resolve cu_seqlens with alignment padding handling.
+            # See: https://github.com/NVIDIA/Megatron-LM/issues/4194
+            cu_seqlens_q = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q,
+                seq_len,
+                "cu_seqlens_q",
+            )
+            cu_seqlens_kv = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_kv_padded,
+                packed_seq_params.cu_seqlens_kv,
+                seq_len,
+                "cu_seqlens_kv",
+            )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
@@ -563,6 +567,42 @@ class GatedDeltaNet(MegatronModule):
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.sigmoid()
         return g, beta
+
+    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
+        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        if cu_seqlens_padded is not None:
+            return cu_seqlens_padded
+
+        if self.cp_size <= 1:
+            return cu_seqlens_actual
+
+        total_cu = cu_seqlens_actual[-1].item()
+        if total_cu >= total_seq_len:
+            return cu_seqlens_actual
+
+        # Alignment padding exists but padded cu_seqlens not provided
+        num_seqs = cu_seqlens_actual.shape[0] - 1
+        if num_seqs == 1:
+            # Single sequence: safe to extend to cover trailing padding
+            cu_seqlens = cu_seqlens_actual.clone()
+            cu_seqlens[-1] = total_seq_len
+            logger.warning(
+                "GDN: %s_padded not provided. Auto-extending single-sequence "
+                "cu_seqlens from %d to %d to cover alignment padding.",
+                name,
+                total_cu,
+                total_seq_len,
+            )
+            return cu_seqlens
+
+        raise ValueError(
+            f"GDN packed sequence with CP > 1 requires {name}_padded when "
+            f"alignment padding is present ({name}[-1]={total_cu} < "
+            f"total_sequence_length={total_seq_len}). Per-sequence padded "
+            f"boundaries cannot be inferred from the total tensor length. "
+            f"Please set {name}_padded in PackedSeqParams. "
+            f"See https://github.com/NVIDIA/Megatron-LM/issues/4194"
+        )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
