@@ -21,7 +21,7 @@ Megatron builds three index arrays for each dataset: a **document index** (shuff
 2. All ranks synchronize at a `torch.distributed.barrier()`.
 3. **All other ranks** load the cached indices via memory-mapped reads (`numpy.load(mmap_mode='r')`).
 
-After initialization, data access is **read-only and lock-free**. Every data-parallel rank reads a disjoint, contiguous chunk of the shuffle index. No cross-rank coordination is needed during training because all ranks derive the same deterministic permutation from a shared random seed.
+After initialization, data access is **read-only and lock-free**. Each data-parallel rank consumes a disjoint subset of samples, and no cross-rank coordination is needed during training because all ranks derive the same deterministic permutation from a shared random seed.
 
 ## The Problem at 256+ Nodes
 
@@ -41,26 +41,49 @@ Before tuning data loading, establish a performance ceiling by running with `--m
 
 A common issue at scale is having datasets split across many small file prefixes. Thousands of 100 MB files perform significantly worse than tens of 10 GB+ files, both for building dataset caches and for runtime file access.
 
-Use the merge tool to consolidate:
+Use the merge tool to consolidate datasets stored as many small prefixes in one directory:
 
 ```bash
-python tools/merge_datasets.py --input <small-files-prefix> --output <merged-prefix>
+python tools/merge_datasets.py \
+    --input /path/to/input-directory \
+    --output-prefix /path/to/output/merged
 ```
 
 **Target at least 10 GB per file.** This reduces the number of file descriptors, metadata lookups, and index-building work at initialization.
 
-### Step 2: Pre-warm the dataset cache
+### Step 2: Pre-build the dataset cache
 
-Build the index cache as a separate step before training. This can be done either within the first training job (the traditional approach -- rank 0 builds, others wait) or as a dedicated pre-build step:
+Build the GPT dataset cache as a separate step before training. This avoids the usual "rank 0 builds, everyone else waits" startup path and is the recommended workflow for large jobs:
 
 ```bash
-# Pre-build per-dataset sequence counts
-python tools/build_sequences_per_dataset.py \
+python tools/prepare_cache.py \
     --data-path <your-data-config> \
-    --output sequences.json
+    --split 99,1,0 \
+    --data-cache-path /path/to/cache \
+    --global-batch-size <global-batch-size> \
+    --seq-length <seq-length> \
+    ...
 ```
 
-### Step 3: Launch training with optimized data loading
+If your later training job does not set `--global-batch-size`, or you are preparing the cache on a machine that does not match the future training topology, also pass:
+
+```bash
+--prepare-cache-world-size <future-world-size>
+```
+
+This keeps the prepared cache aligned with the sample counts expected by training.
+
+### Step 3: Optionally pre-build per-dataset metadata
+
+When blending many datasets, generate the `--per-dataset-sequences-path` JSON ahead of time to avoid one metadata read per file prefix at startup:
+
+```bash
+python tools/build_sequences_per_dataset.py \
+    --data-path <your-data-config> \
+    --per-dataset-sequences-path sequences.json
+```
+
+### Step 4: Launch training with optimized data loading
 
 Once the cache is ready, enable the fast-path flags:
 
@@ -80,7 +103,7 @@ torchrun --nproc_per_node=8 --nnodes=512 ... pretrain_gpt.py \
 |------|---------|----------------|-------------|
 | `--dataloader-fast-cache-load` | off | **On** | Skips the rank-0 barrier by assuming the cache already exists. All ranks build their dataset views in parallel. This is the single biggest win at scale. |
 | `--dataloader-defer-npy-index-mmap` | off | **On** | Defers memory-mapping of `.npy` index files until first access. When combined with `--num-workers > 0`, index loading is overlapped with the training iteration rather than blocking startup. |
-| `--per-dataset-sequences-path` | None | **Set** | Points to a JSON file mapping each dataset path to its `(sequence_count, document_count)`. Replaces per-file metadata reads with a single JSON lookup. Critical when blending hundreds of datasets. Generate with `tools/build_sequences_per_dataset.py`. See the [PR description](https://github.com/NVIDIA/Megatron-LM/pull/2445) for the expected file format. |
+| `--per-dataset-sequences-path` | None | **Set when blending many datasets** | Points to a JSON file mapping each dataset path to its `(sequence_count, document_count)`. Replaces per-file metadata reads with a single JSON lookup. Generate with `tools/build_sequences_per_dataset.py`. |
 | `--data-cache-path` | None | **Set** | Directory where index `.npy` files are cached. Must be on shared storage for multi-node jobs so all ranks can read it. |
 | `--num-workers` | 2 | **Keep as small as necessary** | Number of DataLoader worker processes. The goal is to satisfy: *time to process a batch > time to prepare a batch*. This hides dataloader work behind the training step. Increasing beyond what's needed wastes CPU and memory. |
 | `--no-mmap-bin-files` | mmap on | **Test both** | Memory-mapping `.bin` files leverages the OS page cache, but the optimal setting is filesystem-dependent. Some large-scale production configurations disable mmap. Test with and without to determine what works best for your storage. |
@@ -89,10 +112,10 @@ torchrun --nproc_per_node=8 --nnodes=512 ... pretrain_gpt.py \
 
 When data lives on S3 or MSC rather than a POSIX filesystem:
 
-- **Index files** (`.idx`) are small and downloaded once by rank 0, then shared via the filesystem cache.
+- **Index files** (`.idx`) are cached locally under `object_storage_cache_path`.
 - **Binary data files** (`.bin`) are streamed on-demand in 256 MB chunks, avoiding the need to download entire files.
 - Set `--no-mmap-bin-files` since memory-mapping doesn't apply to object storage.
-- The rank-0-builds-then-barrier pattern still applies for index construction.
+- Ensure the index-cache path is visible wherever the later dataset construction will run.
 
 ## Scaling Characteristics
 
@@ -100,14 +123,14 @@ When data lives on S3 or MSC rather than a POSIX filesystem:
 |--------|----------|-------------|
 | **Cross-rank contention** | None after init | All index files are read-only; `numpy.memmap` uses OS page cache with no locking |
 | **Sampling determinism** | All ranks produce the same permutation | Shared `numpy.random.RandomState(seed)` with epoch-based seed variation |
-| **Data-parallel sharding** | Each DP rank gets a disjoint chunk | `indices[dp_rank :: dp_size]` -- no overlap, no coordination |
+| **Data-parallel sharding** | Each DP rank gets a disjoint subset of samples | No overlap during training; assignment happens in the sampler rather than via extra dataset coordination |
 | **Index broadcast** | Via shared filesystem, not collectives | Rank 0 writes `.npy` files; other ranks read them. No explicit `torch.distributed.broadcast` |
 
 ## Troubleshooting
 
 **Symptom: Training hangs at startup for minutes**
 - Likely cause: Rank 0 is building indices while all other ranks wait at the barrier.
-- Fix: Pre-warm the cache and enable `--dataloader-fast-cache-load`.
+- Fix: Pre-build the cache with `tools/prepare_cache.py` and enable `--dataloader-fast-cache-load`.
 
 **Symptom: Metadata server errors or slow `open()` calls**
 - Likely cause: Thousands of ranks simultaneously opening per-dataset files for metadata.
@@ -127,6 +150,7 @@ When data lives on S3 or MSC rather than a POSIX filesystem:
 ## Related Resources
 
 - [PR #2445](https://github.com/NVIDIA/Megatron-LM/pull/2445): Original implementation of fast cache load, deferred mmap, and per-dataset sequences optimizations.
-- [PR #4080](https://github.com/NVIDIA/Megatron-LM/pull/4080): Dedicated script for pre-building dataset caches (pending review).
+- [PR #4080](https://github.com/NVIDIA/Megatron-LM/pull/4080): Adds `tools/prepare_cache.py` for offline GPT dataset cache preparation.
+- [`tools/prepare_cache.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/prepare_cache.py): Pre-build GPT dataset caches ahead of training.
 - [`tools/merge_datasets.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/merge_datasets.py): Merge multiple small dataset files into larger ones.
 - [`tools/build_sequences_per_dataset.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/build_sequences_per_dataset.py): Generate the `--per-dataset-sequences-path` JSON file.
