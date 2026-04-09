@@ -932,7 +932,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-
+    dtensor_format = kwargs.pop('dtensor_format', False)
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
@@ -968,7 +968,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    if kwargs.get("dtensor_format", True):
+    if dtensor_format:
         from torch.distributed import DeviceMesh, get_process_group_ranks
         from torch.distributed.distributed_c10d import _get_group_tag
         from torch.distributed.tensor.placement_types import Shard, Replicate
@@ -1025,7 +1025,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-
+    dtensor_format = kwargs.pop('dtensor_format', False)
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
@@ -1049,7 +1049,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    if kwargs.get("dtensor_format", True):
+    if dtensor_format:
         from torch.distributed import DeviceMesh, get_process_group_ranks
         from torch.distributed.distributed_c10d import _get_group_tag
         from torch.distributed.tensor.placement_types import Shard, Replicate

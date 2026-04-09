@@ -509,13 +509,13 @@ class CheckpointConfig:
     dist_ckpt_optim_fully_reshardable: bool = False
     """Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP) as opposed to plain DP reshardability."""
 
-    dist_ckpt_dtensor_format: bool = True
-    """Sets distributed checkpoint tensors fromat to torch's DTensor."""
-
     distrib_optim_fully_reshardable_mem_efficient: bool = False
     """During distributed optimizer checkpoint save and load tries to use as little memory as possible
     by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
+
+    dist_ckpt_dtensor_format: bool = False
+    """Sets distributed checkpoint tensors fromat to torch's DTensor."""
 
     save_tokenizer_assets: bool = True
     """Save tokenizer files to checkpoint directory. When enabled, saves all tokenizer artifacts

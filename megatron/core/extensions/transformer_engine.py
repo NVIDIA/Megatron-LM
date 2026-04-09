@@ -899,6 +899,7 @@ class TELinear(te.pytorch.Linear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            dtensor_format=metadata.get("dtensor_format", False),
         )
 
     def backward_dw(self):
@@ -1116,6 +1117,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            dtensor_format=metadata.get("dtensor_format", False),
         )
 
     @override
@@ -1226,6 +1228,7 @@ class TEColumnParallelLinear(TELinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            dtensor_format=metadata.get("dtensor_format", False),
         )
 
     @override
@@ -1330,6 +1333,7 @@ class TERowParallelLinear(TELinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            dtensor_format=metadata.get("dtensor_format", False),
         )
 
     @override
@@ -1666,6 +1670,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            dtensor_format=metadata.get("dtensor_format", False),
         )
 
 
@@ -2013,6 +2018,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     new_sharded_offsets,
                     tp_group=self._tp_group,
                     dp_cp_group=metadata["dp_cp_group"],
+                    dtensor_format=metadata.get("dtensor_format", False),
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
