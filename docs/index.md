@@ -48,6 +48,7 @@ get-started/quickstart
 :caption: Basic Usage
 
 user-guide/data-preparation
+user-guide/data-loading
 user-guide/training-examples
 user-guide/parallelism-guide
 ```
