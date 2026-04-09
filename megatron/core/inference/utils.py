@@ -145,8 +145,8 @@ def get_model_weight_bytes(model):
 def measure_allreduce_bandwidth(group, device=None, iters=50):
     """Measure NCCL allreduce bandwidth for a given process group.
 
-    Uses a large tensor to amortise launch overhead and measure sustained
-    allreduce throughput.  Returns *algorithm bandwidth* (message_bytes / time),
+    Uses a large tensor to amortize launch overhead and measure sustained
+    allreduce throughput. Returns *algorithm bandwidth* (message_bytes / time),
     which is the right divisor when the caller already knows the logical message
     size it needs to allreduce.
 
@@ -197,7 +197,7 @@ def measure_alltoall_bandwidth(group, device=None, iters=50):
     """Measure NCCL all-to-all bandwidth for a given process group.
 
     Uses ``all_to_all_single`` with a large tensor to measure sustained
-    throughput.  Returns algorithm bandwidth (total_bytes_sent / time).
+    throughput. Returns algorithm bandwidth (total_bytes_sent / time).
 
     Args:
         group: ``torch.distributed.ProcessGroup`` (e.g. the EP group).

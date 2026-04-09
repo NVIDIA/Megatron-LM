@@ -142,7 +142,7 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
-    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
+    for power, suffix in [(4, "TiB"), (3, "GiB"), (2, "MiB"), (1, "KiB"), (0, "bytes")]:
         suffix_bytes = 1024**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
@@ -318,7 +318,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if self._measured_ep_alltoall_bw > 0:
                 sol_parts.append(
                     f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
-                    f"(ep={ep_size}, {self._sol_num_moe_layers} moe layers)"
+                    f"(ep={ep_size}, {self._sol_num_moe_layers} MoE layers)"
                 )
             logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 

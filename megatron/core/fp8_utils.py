@@ -185,9 +185,6 @@ def is_column_parallel_linear(module):
     return False
 
 
-# is_row_parallel_linear moved to megatron.core.utils; re-exported above.
-
-
 """
 The code below abstracts the functionalities needed for implementing "--fp8-param-gather" into
 several functions. It provides different implementations for each function based on different
