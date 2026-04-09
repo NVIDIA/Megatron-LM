@@ -1564,6 +1564,15 @@ def validate_args(args, defaults={}):
         args.cpu_offloading = True
 
     # CUDA Graphs
+    if args.cuda_graph_scope == "full" or (
+        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
+    ):
+        if isinstance(args.cuda_graph_scope, list):
+            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
+        args.cuda_graph_scope = []
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
+        )
     if args.cuda_graph_impl != "none":
         if (
             "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
@@ -1579,16 +1588,20 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
-    
+        if "full_iteration" not in args.cuda_graph_scope and args.use_megatron_fsdp:
+            assert args.fsdp_double_buffer, (
+                "CUDA Graph requires --fsdp-double-buffer when using Megatron-FSDP. "
+                "Without double buffer, FSDP parameter buffers addresses are dynamic across "
+                "iterations, causing numerical errors during graph replay."
+            )
+            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
+                "CUDA Graph with Megatron-FSDP and MoE requires "
+                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
+                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
+                "You may disable this assertion if you are sure there is no allocation failure "
+                "in the CUDA graph scope."
+            )
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
         
@@ -2730,6 +2743,12 @@ def _add_distributed_args(parser):
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--fsdp-db-use-persist-buf-on-alloc-fail', action='store_true',
+                       help="Whether to fall back to persistent buffer when a bucket does not fit FSDP double buffer "
+                        "size. If true, FSDP will use the persistently allocated buffer for the bucket that does not "
+                        "fit, it will enable NCCL user buffer with the cost of more memory usage. If false, FSDP will "
+                        "use dynamic memory allocator, NCCL user buffer won't be enabled, which usually leads to low "
+                        "performance.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
