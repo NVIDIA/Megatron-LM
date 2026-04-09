@@ -3153,7 +3153,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def log_probs_decode_softmax_kernel(
         self, logits: Tensor, new_tokens: Tensor, request_indices: Tensor, padded_arange: Tensor
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Tensor]:
         """Graphable post-forward: gather logits and compute decode log probs.
 
         Args:
@@ -3161,6 +3161,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_tokens (shape [total_active_requests]): newly-generated tokens
             request_indices (shape [padded_active_requests]): indices of requests to select
             padded_arange (shape [padded_active_requests]): arange for padded indexing
+
+        Returns:
+            (selected_log_probs, selected_logits)
         """
         # Insert the newly-generated tokens.
         selected_tokens = new_tokens[request_indices]
@@ -3169,11 +3172,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Softmax using the high-memory, low-latency, implementation.
         log_softmax_result = F.log_softmax(selected_logits, dim=-1)
         selected_log_probs = log_softmax_result[padded_arange, selected_tokens]
-        return selected_log_probs
+        return selected_log_probs, selected_logits
 
     def log_probs_decode_extract(
-        self, request_indices: Tensor, selected_log_probs: Tensor, log_prob_request_count: int
-    ) -> List[Optional[List[float]]]:
+        self,
+        request_indices: Tensor,
+        selected_log_probs: Tensor,
+        log_prob_request_count: int,
+        selected_logits: Optional[Tensor] = None,
+        top_n_max: int = 0,
+    ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract decode log-prob kernel outputs into a per-request list."""
         active_request_count = self.total_request_count - self.paused_request_count
 
@@ -3182,7 +3190,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         result: List[Optional[List[float]]] = [None] * active_request_count
         for i, req_idx in enumerate(req_idx_list):
             result[req_idx] = [lp_list[i]]
-        return result
+
+        top_n_dict = None
+        if top_n_max > 0 and selected_logits is not None:
+            # Softmax using the low-memory, LSE, implementation.
+            raw = selected_logits[:log_prob_request_count]
+            lse = torch.logsumexp(raw, dim=-1, keepdim=True)
+            top_n_v, top_n_i = torch.topk(raw, k=top_n_max, dim=-1)
+            top_n_v = top_n_v - lse
+            top_n_dict = self._build_top_n_dict_decode(req_idx_list, top_n_v, top_n_i)
+        return result, top_n_dict
 
     def log_probs_prefill_indexing_kernel(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Graphable pre-forward: build per-token indices for prefill log probs.
@@ -3259,7 +3276,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         cu_masked_lengths: Tensor,
         token_log_probs: Tensor,
         log_prob_request_count: int,
-    ) -> List[Optional[List[float]]]:
+        top_n_max: int = 0,
+        logits: Optional[Tensor] = None,
+        logit_indices: Optional[Tensor] = None,
+    ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract prefill log-prob kernel outputs into a per-request list."""
         active_request_count = self.total_request_count - self.paused_request_count
 
@@ -3274,7 +3294,69 @@ class DynamicInferenceContext(BaseInferenceContext):
         result: List[Optional[List[float]]] = [None] * active_request_count
         for i, req_idx in enumerate(req_idx_list):
             result[req_idx] = per_request[i].tolist()
-        return result
+
+        top_n_dict = None
+        if top_n_max > 0 and logits is not None and logit_indices is not None:
+            # Softmax using the low-memory, LSE, implementation.
+            raw = logits.squeeze(0)[logit_indices[:selected_token_count]].float()
+            lse = torch.logsumexp(raw, dim=-1, keepdim=True)
+            top_n_v, top_n_i = torch.topk(raw, k=top_n_max, dim=-1)
+            top_n_v = top_n_v - lse
+            top_n_dict = self._build_top_n_dict_prefill(
+                req_idx_list, masked_lengths_cpu, top_n_v, top_n_i
+            )
+        return result, top_n_dict
+
+    def _build_top_n_dict_decode(
+        self, req_idx_list: List[int], top_n_values: Tensor, top_n_indices: Tensor
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Build per-request top-n dict for decode mode."""
+        active_request_count = self.total_request_count - self.paused_request_count
+        top_n_per_req: List[int] = self.active_request_metadata["top_n_logprobs"][
+            :active_request_count
+        ].tolist()
+        top_n_v_cpu = top_n_values.cpu()
+        top_n_i_cpu = top_n_indices.cpu()
+        result: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
+        for i, req_idx in enumerate(req_idx_list):
+            n = top_n_per_req[req_idx]
+            if n > 0:
+                result[req_idx] = [(top_n_v_cpu[i, :n], top_n_i_cpu[i, :n])]
+        return result if result else None
+
+    def _build_top_n_dict_prefill(
+        self,
+        req_idx_list: List[int],
+        masked_lengths_cpu: List[int],
+        top_n_values: Tensor,
+        top_n_indices: Tensor,
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Build per-request top-n dict for prefill mode."""
+        active_request_count = self.total_request_count - self.paused_request_count
+        top_n_per_req: List[int] = self.active_request_metadata["top_n_logprobs"][
+            :active_request_count
+        ].tolist()
+        skip_prompt_per_req: List[bool] = self.active_request_metadata["skip_prompt_log_probs"][
+            :active_request_count
+        ].tolist()
+        top_n_v_cpu = top_n_values.cpu()
+        top_n_i_cpu = top_n_indices.cpu()
+        result: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
+        token_offset = 0
+        for i, req_idx in enumerate(req_idx_list):
+            req_len = masked_lengths_cpu[i]
+            n = top_n_per_req[req_idx]
+            if n > 0:
+                if skip_prompt_per_req[req_idx] and req_len > 1:
+                    last = token_offset + req_len - 1
+                    result[req_idx] = [(top_n_v_cpu[last, :n], top_n_i_cpu[last, :n])]
+                else:
+                    result[req_idx] = [
+                        (top_n_v_cpu[token_offset + j, :n], top_n_i_cpu[token_offset + j, :n])
+                        for j in range(req_len)
+                    ]
+            token_offset += req_len
+        return result if result else None
 
     def calculate_log_probs(
         self,
@@ -3284,7 +3366,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         log_prob_request_count: int = 0,
         accepted_tokens: Optional[Tensor] = None,
         accepted_token_counts: Optional[Tensor] = None,
-    ) -> List[Optional[List[float]]]:
+        top_n_max: int = 0,
+    ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Calculate log probs for active requests that want them.
 
         This is a graph-unaware entry point that runs all kernels eagerly.
@@ -3298,12 +3381,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_prob_request_count (int): Number of requests wanting log probs.
             accepted_tokens (Optional[Tensor]): Speculative-verified token IDs.
             accepted_token_counts (Optional[Tensor]): Per-decode-request accepted counts.
+            top_n_max (int): Maximum top-n logprobs requested across the batch.
 
         Returns:
-            Per-request log probs list (None for requests not wanting log probs).
+            (per_request_log_probs, top_n_dict) tuple.
         """
         if log_prob_request_count == 0:
-            return []
+            return [], None
 
         if self.num_speculative_tokens > 0:
             assert accepted_tokens is not None and accepted_token_counts is not None, (
@@ -3311,19 +3395,34 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "num_speculative_tokens > 0"
             )
             return self.calculate_log_probs_speculative(
-                logits, new_tokens, only_last_token_logits, accepted_tokens, accepted_token_counts
+                logits,
+                new_tokens,
+                only_last_token_logits,
+                accepted_tokens,
+                accepted_token_counts,
+                top_n_max,
             )
 
         if only_last_token_logits or self.is_decode_only():
             ri, padded_arange = self.log_probs_decode_indexing_kernel()
-            slp = self.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
-            return self.log_probs_decode_extract(ri, slp, log_prob_request_count)
+            slp, sl = self.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
+            return self.log_probs_decode_extract(
+                ri, slp, log_prob_request_count, selected_logits=sl, top_n_max=top_n_max
+            )
         else:
             ri, cu_ml, li, li_range, mt = self.log_probs_prefill_indexing_kernel()
             slp = self.log_probs_prefill_softmax_kernel(
                 logits, new_tokens, ri, cu_ml, li, li_range, mt
             )
-            return self.log_probs_prefill_extract(ri, cu_ml, slp, log_prob_request_count)
+            return self.log_probs_prefill_extract(
+                ri,
+                cu_ml,
+                slp,
+                log_prob_request_count,
+                top_n_max=top_n_max,
+                logits=logits,
+                logit_indices=li,
+            )
 
     def log_probs_speculative_softmax_kernel(self, logits: Tensor) -> Tuple[Tensor, Tensor]:
         """Graphable post-forward: log-softmax over all speculative logit rows.
@@ -3394,8 +3493,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         prefill_gathered: Tensor,
         accepted_token_counts: Tensor,
         result: List[Optional[List[float]]],
-    ) -> None:
-        """CPU extraction for speculative log probs. Populates result in-place."""
+        logits: Optional[Tensor] = None,
+        top_n_max: int = 0,
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """CPU extraction for speculative log probs. Populates result in-place.
+
+        Returns:
+            top_n_dict if top_n_max > 0, else None.
+        """
         num_decode = self.num_decode_requests
         num_prefill = self.total_request_count - self.paused_request_count - num_decode
 
@@ -3409,6 +3514,32 @@ class DynamicInferenceContext(BaseInferenceContext):
             if mask_cpu[i]:
                 result[i] = decode_gathered_cpu[i, : accepted_counts_cpu[i] + 1].tolist()
 
+        top_n_dict: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
+
+        # Decode top-n
+        if top_n_max > 0 and logits is not None and num_decode > 0:
+            spec_plus_one = self.num_speculative_tokens + 1
+            raw_decode = logits.squeeze(0)[: num_decode * spec_plus_one].float()
+            raw_reshaped = raw_decode.reshape(num_decode, spec_plus_one, -1)
+            # Softmax using the low-memory, LSE, implementation.
+            lse = torch.logsumexp(raw_reshaped, dim=-1, keepdim=True)
+            top_n_v, top_n_i = torch.topk(raw_reshaped, k=top_n_max, dim=-1)
+            top_n_v = top_n_v - lse
+            top_n_v_cpu = top_n_v.cpu()
+            top_n_i_cpu = top_n_i.cpu()
+            top_n_per_req_cpu: List[int] = self.active_request_metadata["top_n_logprobs"].tolist()
+            for i in range(num_decode):
+                if not mask_cpu[i]:
+                    continue
+                req_top_n = top_n_per_req_cpu[i]
+                if req_top_n == 0:
+                    continue
+                n_emitted = accepted_counts_cpu[i] + 1
+                top_n_dict[i] = [
+                    (top_n_v_cpu[i, j, :req_top_n], top_n_i_cpu[i, j, :req_top_n])
+                    for j in range(n_emitted)
+                ]
+
         # Materialized prefill: single log prob per request.
         prefill_gathered_cpu = prefill_gathered[:num_prefill].cpu()
         prefill_mask_cpu: List[bool] = self.active_request_metadata["return_log_probs"][
@@ -3417,6 +3548,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         for i in range(num_prefill):
             if prefill_mask_cpu[i]:
                 result[num_decode + i] = [prefill_gathered_cpu[i].item()]
+
+        # Materialized prefill top-n
+        if top_n_max > 0 and logits is not None and num_prefill > 0:
+            spec_plus_one = self.num_speculative_tokens + 1
+            raw_decode_len = num_decode * spec_plus_one
+            raw_prefill = logits.squeeze(0)[raw_decode_len : raw_decode_len + num_prefill].float()
+            # Softmax using the low-memory, LSE, implementation.
+            lse = torch.logsumexp(raw_prefill, dim=-1, keepdim=True)
+            top_n_v, top_n_i = torch.topk(raw_prefill, k=top_n_max, dim=-1)
+            top_n_v = top_n_v - lse
+            top_n_v_cpu = top_n_v.cpu()
+            top_n_i_cpu = top_n_i.cpu()
+            top_n_per_req_cpu2: List[int] = self.active_request_metadata["top_n_logprobs"].tolist()
+            for i in range(num_prefill):
+                req_idx = num_decode + i
+                if not prefill_mask_cpu[i]:
+                    continue
+                req_top_n = top_n_per_req_cpu2[req_idx]
+                if req_top_n == 0:
+                    continue
+                top_n_dict[req_idx] = [(top_n_v_cpu[i, :req_top_n], top_n_i_cpu[i, :req_top_n])]
+
+        return top_n_dict if top_n_dict else None
 
     def log_probs_spec_prefill_indexing_kernel(
         self,
@@ -3454,7 +3608,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         only_last_token_logits: bool,
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
-    ) -> List[Optional[List[float]]]:
+        top_n_max: int = 0,
+    ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Graph-unaware speculative log-prob calculation; parallel to `calculate_log_probs`."""
         active_request_count = self.total_request_count - self.paused_request_count
         num_decode = self.num_decode_requests
@@ -3465,8 +3620,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         decode_gathered, prefill_gathered = self.log_probs_speculative_gather_kernel(
             decode_log_probs, prefill_log_probs, new_tokens, accepted_tokens, accepted_token_counts
         )
-        self.log_probs_speculative_extract(
-            decode_gathered, prefill_gathered, accepted_token_counts, result
+        top_n_dict = self.log_probs_speculative_extract(
+            decode_gathered,
+            prefill_gathered,
+            accepted_token_counts,
+            result,
+            logits=logits,
+            top_n_max=top_n_max,
         )
 
         # When we materialize prefill logits we need an entirely separate calculation.
@@ -3475,12 +3635,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             slp = self.log_probs_prefill_softmax_kernel(
                 logits, new_tokens, ri, cu_ml, li, li_range, mt
             )
-            prefill_result = self.log_probs_prefill_extract(ri, cu_ml, slp, count_gpu.item())
+            prefill_result, prefill_top_n = self.log_probs_prefill_extract(
+                ri,
+                cu_ml,
+                slp,
+                count_gpu.item(),
+                top_n_max=top_n_max,
+                logits=logits,
+                logit_indices=li,
+            )
             for i, lp in enumerate(prefill_result):
                 if lp is not None:
                     result[i] = lp
+            if prefill_top_n:
+                if top_n_dict is None:
+                    top_n_dict = prefill_top_n
+                else:
+                    top_n_dict.update(prefill_top_n)
 
-        return result
+        return result, top_n_dict
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.

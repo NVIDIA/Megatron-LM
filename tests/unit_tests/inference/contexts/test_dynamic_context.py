@@ -1098,7 +1098,7 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
 
         # Call the function for prefill
-        prefill_log_probs = dynamic_context.calculate_log_probs(
+        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
             prefill_logits, prefill_new_tokens, log_prob_request_count=num_active_requests
         )
 
@@ -1144,7 +1144,7 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
 
-        decode_log_probs = dynamic_context.calculate_log_probs(
+        decode_log_probs, _ = dynamic_context.calculate_log_probs(
             decode_logits, decode_new_tokens, log_prob_request_count=num_active_requests
         )
 
@@ -1207,7 +1207,7 @@ class TestDynamicContext:
             :num_active_requests_mixed_step
         ] = True
 
-        mixed_step_log_probs = dynamic_context.calculate_log_probs(
+        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
             mixed_step_logits,
             mixed_step_new_tokens,
             log_prob_request_count=num_active_requests_mixed_step,
@@ -1267,6 +1267,133 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @rounder_override(64)
+    def test_calculate_top_n_logprobs(self, skip_prompt_log_probs: bool):
+        """Exercise the top-n path of calculate_log_probs for prefill and decode.
+
+        The top-n computation is folded into the same graphable kernel as the log-softmax,
+        so this validates:
+          - the per-request dict structure (entry count, tuple arity),
+          - skip_prompt_log_probs=True trims prefill to the last token only,
+          - values/indices match a reference torch.topk over the log-softmax.
+        """
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        # Three requests with different prompt lengths.
+        request_lengths = [10, 5, 7]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=1001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active_requests = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        total_active_tokens = dynamic_context.active_token_count
+        vocab_size = 50000
+        top_n = 5
+
+        def _set_active_metadata(n: int):
+            # build_active_slices (run from initialize_attention_state) overwrites
+            # active_request_metadata from request_metadata, so we patch it after.
+            dynamic_context.active_request_metadata["top_n_logprobs"][:n].fill_(top_n)
+            dynamic_context.active_request_metadata["skip_prompt_log_probs"][:n].fill_(
+                skip_prompt_log_probs
+            )
+            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+            dynamic_context.active_request_metadata["return_log_probs"][:n] = True
+
+        prefill_logits = torch.randn(
+            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
+        )
+        prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        _set_active_metadata(num_active_requests)
+
+        _, top_n_dict = dynamic_context.calculate_log_probs(
+            prefill_logits,
+            prefill_new_tokens,
+            log_prob_request_count=num_active_requests,
+            top_n_max=top_n,
+        )
+
+        assert top_n_dict is not None and len(top_n_dict) == num_active_requests
+        expected_log_softmax = torch.nn.functional.log_softmax(prefill_logits.squeeze(0), dim=-1)
+        token_offset = 0
+        for i, req_len in enumerate(request_lengths):
+            entry = top_n_dict[i]
+            expected_count = 1 if skip_prompt_log_probs else req_len
+            assert (
+                len(entry) == expected_count
+            ), f"request {i}: expected {expected_count} tuples, got {len(entry)}"
+            # Each tuple has (values, indices) of shape [top_n].
+            for values, indices in entry:
+                assert values.shape == (top_n,)
+                assert indices.shape == (top_n,)
+
+            # Validate values match a reference topk over the correct logit rows.
+            if skip_prompt_log_probs:
+                row_idxs = [token_offset + req_len - 1]
+            else:
+                row_idxs = list(range(token_offset, token_offset + req_len))
+            for j, row_idx in enumerate(row_idxs):
+                expected = torch.topk(expected_log_softmax[row_idx], k=top_n)
+                got_values, got_indices = entry[j]
+                torch.testing.assert_close(got_values, expected.values.cpu())
+                torch.testing.assert_close(got_indices, expected.indices.cpu())
+            token_offset += req_len
+
+        # ── Decode step ──
+        active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
+        )
+
+        decode_logits = torch.randn(
+            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
+        )
+        decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        _set_active_metadata(num_active_requests)
+
+        _, decode_top_n = dynamic_context.calculate_log_probs(
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=num_active_requests,
+            top_n_max=top_n,
+        )
+
+        assert decode_top_n is not None and len(decode_top_n) == num_active_requests
+        decode_expected = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
+        for i in range(num_active_requests):
+            entry = decode_top_n[i]
+            assert len(entry) == 1  # decode: exactly one token per request
+            values, indices = entry[0]
+            assert values.shape == (top_n,) and indices.shape == (top_n,)
+            expected = torch.topk(decode_expected[i], k=top_n)
+            torch.testing.assert_close(values, expected.values.cpu())
+            torch.testing.assert_close(indices, expected.indices.cpu())
 
     @pytest.mark.internal
     @rounder_override(64)

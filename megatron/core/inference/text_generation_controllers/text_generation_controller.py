@@ -1323,7 +1323,8 @@ class TextGenerationController:
         """Calculate log probs from logits."""
         # No extra GPU sync needed; the `_pre_forward_bookkeeping_event` guaranteed correct data.
         log_prob_request_count = self._log_prob_count_pinned.item()
-        if log_prob_request_count == 0 and self._top_n_max_pinned.item() == 0:
+        top_n_max = self._top_n_max_pinned.item()
+        if log_prob_request_count == 0 and top_n_max == 0:
             return None, None
 
         context = self.inference_wrapped_model.inference_context
@@ -1339,38 +1340,48 @@ class TextGenerationController:
 
         if context.num_speculative_tokens > 0:
             return self._calculate_log_probs_speculative(
-                context, logits, new_tokens, log_prob_request_count, eager
+                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
             )
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
             return self._calculate_log_probs_decode(
-                context, logits, new_tokens, log_prob_request_count, eager
+                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
             )
         else:
             return self._calculate_log_probs_prefill(
-                context, logits, new_tokens, log_prob_request_count, eager
+                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
             )
 
     def _calculate_log_probs_decode(
-        self, context, logits, new_tokens, log_prob_request_count, eager
+        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
         """Run decode softmax kernel (post-forward) and extract results."""
         ri, padded_arange = self._log_probs_decode_idx
-        slp = context.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
-        return context.log_probs_decode_extract(ri, slp, log_prob_request_count)
+        slp, sl = context.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
+        return context.log_probs_decode_extract(
+            ri, slp, log_prob_request_count, selected_logits=sl, top_n_max=top_n_max
+        )
 
     def _calculate_log_probs_prefill(
-        self, context, logits, new_tokens, log_prob_request_count, eager
+        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
         """Run prefill softmax kernel (post-forward) and extract results."""
         ri, cu_ml, li, li_range, mt = self._log_probs_prefill_idx
         slp = context.log_probs_prefill_softmax_kernel(
             logits, new_tokens, ri, cu_ml, li, li_range, mt
         )
-        return context.log_probs_prefill_extract(ri, cu_ml, slp, log_prob_request_count)
+        return context.log_probs_prefill_extract(
+            ri,
+            cu_ml,
+            slp,
+            log_prob_request_count,
+            top_n_max=top_n_max,
+            logits=logits,
+            logit_indices=li,
+        )
 
     def _calculate_log_probs_speculative(
-        self, context, logits, new_tokens, log_prob_request_count, eager
+        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
         """Wrap speculative kernels and extract results."""
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1388,8 +1399,13 @@ class TextGenerationController:
             self._accepted_tokens_per_request,
             self._accepted_token_counts_per_request,
         )
-        context.log_probs_speculative_extract(
-            decode_gathered, prefill_gathered, self._accepted_token_counts_per_request, result
+        top_n_dict = context.log_probs_speculative_extract(
+            decode_gathered,
+            prefill_gathered,
+            self._accepted_token_counts_per_request,
+            result,
+            logits=logits,
+            top_n_max=top_n_max,
         )
 
         # Full prefill overwrites materialized-prefill results when needed.
@@ -1398,12 +1414,25 @@ class TextGenerationController:
             slp = context.log_probs_prefill_softmax_kernel(
                 logits, new_tokens, ri, cu_ml, li, li_range, mt
             )
-            prefill_result = context.log_probs_prefill_extract(ri, cu_ml, slp, count_gpu.item())
+            prefill_result, prefill_top_n = context.log_probs_prefill_extract(
+                ri,
+                cu_ml,
+                slp,
+                count_gpu.item(),
+                top_n_max=top_n_max,
+                logits=logits,
+                logit_indices=li,
+            )
             for i, lp in enumerate(prefill_result):
                 if lp is not None:
                     result[i] = lp
+            if prefill_top_n:
+                if top_n_dict is None:
+                    top_n_dict = prefill_top_n
+                else:
+                    top_n_dict.update(prefill_top_n)
 
-        return result
+        return result, top_n_dict
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
