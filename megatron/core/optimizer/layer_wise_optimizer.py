@@ -175,9 +175,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                                 bucket_list.append(param)
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
-            if self.expt_dp_params_list is not None:
-                for group in model_chunk.expert_parallel_bucket_groups:
-                    for bucket in group.buckets:
+            for group in model_chunk.expert_parallel_bucket_groups:
+                for bucket in group.buckets:
+                    if self.expt_dp_params_list is not None:
                         bucket_params_list = [
                             [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
                         ]
@@ -187,7 +187,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                             for param in full_params_list:
                                 if param in bucket.params:
                                     bucket_list.append(param)
-                        bucket.set_layerwise_params_list(bucket_params_list)
+                    else:
+                        # expt_dp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
+                    bucket.set_layerwise_params_list(bucket_params_list)
 
     @torch.no_grad()
     def allgather_params(self) -> None:
