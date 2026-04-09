@@ -293,6 +293,12 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
+    # Prep for checkpoint conversion.
+    if args.ckpt_convert_format is not None:
+        assert args.ckpt_convert_save is not None
+        assert args.load is not None
+        args.exit_on_missing_checkpoint = True
+
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
         'Currently only global and local checkpoints are supported'

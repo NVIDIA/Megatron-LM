@@ -71,12 +71,6 @@ def initialize_megatron(
     else:
         args = parsed_args
 
-    # Prep for checkpoint conversion.
-    if args.ckpt_convert_format is not None:
-        assert args.ckpt_convert_save is not None
-        assert args.load is not None
-        args.exit_on_missing_checkpoint = True
-
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
         assert (
             args.load is not None or args.pretrained_checkpoint is not None
