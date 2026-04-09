@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
@@ -26,7 +27,13 @@ try:
 except ImportError:
     hadamard_transform = None
 
-from megatron.core.transformer.experimental_attention_variant.dsa_fused_kernels import DSAFunction
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_kernels import (
+    indexer_bwd_interface,
+    indexer_topk_reducesum_interface,
+    sparse_mla_bwd_interface,
+    sparse_mla_fwd_interface,
+    sparse_mla_topk_reducesum_interface,
+)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -389,9 +396,166 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights, _ = self.linear_weights_proj(x)
-        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
+        weights = weights * (self.index_n_heads**-0.5)
 
         return q, k, weights
+
+
+def _sbhd_to_thd(tensor):
+    s, b, *rest = tensor.shape
+    return tensor.transpose(0, 1).reshape(b * s, *rest).contiguous()
+
+
+def _thd_to_sbhd(tensor, s, b):
+    return tensor.reshape(b, s, *tensor.shape[1:]).transpose(0, 1).contiguous()
+
+
+class DSAFunction(torch.autograd.Function):
+    """Autograd function for DSA with indexer.
+
+    Combines indexer forward/backward and sparse MLA forward/backward into a single
+    autograd function. Handles sbhd <-> thd format conversion internally.
+
+    Forward:
+      1. indexer_topk_reducesum -> topk_indices, index_score
+      2. sparse_mla_fwd -> output, lse
+
+    Backward:
+      1. sparse_mla_topk_reducesum -> attn_score (for indexer loss gradient)
+      2. sparse_mla_bwd -> dq, dk (MLA gradients from upstream do)
+      3. indexer_bwd -> dindex_q, dweights, dindex_k (indexer loss gradients, scaled by loss_coeff)
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query,  # [s, b, np, hn]
+        key,  # [s, b, 1, hn]
+        index_q,  # [s, b, index_h, index_d]
+        index_k,  # [s, b, index_d]
+        weights,  # [s, b, index_h]
+        offsets,  # [b+1] int32 cumulative sequence lengths
+        topk,  # int
+        v_channels,  # int
+        sm_scale,  # float
+        loss_coeff,  # float
+        loss_logger,  # callable or None
+        tp_group,  # process group or None
+        use_unfused,  # bool
+    ):
+        assert tp_group is None or tp_group.size() == 1  # TP not supported yet
+        assert query.ndim == 4
+        sq, b = query.shape[:2]
+        if offsets is None:
+            offsets = torch.arange(0, b + 1, dtype=torch.int32, device=query.device) * sq
+        else:
+            assert b == 1
+
+        query = _sbhd_to_thd(query)
+        key = _sbhd_to_thd(key)
+        index_q = _sbhd_to_thd(index_q)
+        index_k = _sbhd_to_thd(index_k)
+        weights = _sbhd_to_thd(weights)
+
+        # 1. Indexer forward: topk selection + index score
+        topk_indices, index_score = indexer_topk_reducesum_interface(
+            index_q, weights, index_k, topk, offsets, use_unfused=use_unfused
+        )
+
+        # 2. Sparse MLA forward
+        o, lse = sparse_mla_fwd_interface(
+            query,
+            key,
+            topk_indices.unsqueeze(-2),
+            offsets,
+            sm_scale=sm_scale,
+            d_v=v_channels,
+            use_unfused=use_unfused,
+        )
+
+        ctx.save_for_backward(
+            query, key, index_q, index_k, weights, topk_indices, index_score, o, lse, offsets
+        )
+        ctx.sq = sq
+        ctx.b = b
+        ctx.v_channels = v_channels
+        ctx.sm_scale = sm_scale
+        ctx.loss_coeff = loss_coeff
+        ctx.loss_logger = loss_logger
+        ctx.use_unfused = use_unfused
+
+        o = _thd_to_sbhd(o, sq, b)
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        (query, key, index_q, index_k, weights, topk_indices, index_score, o, lse, offsets) = (
+            ctx.saved_tensors
+        )
+
+        do = _sbhd_to_thd(do)
+
+        # 1. Compute attn_score for indexer backward
+        attn_score = sparse_mla_topk_reducesum_interface(
+            query,
+            key,
+            topk_indices.unsqueeze(-2),
+            lse,
+            offsets,
+            dim_v=ctx.v_channels,
+            sm_scale=ctx.sm_scale,
+            use_unfused=ctx.use_unfused,
+        ).squeeze(-2)
+
+        # Log indexer loss
+        if ctx.loss_logger is not None:
+            log_index = F.log_softmax(index_score, dim=-1, dtype=torch.float32)
+            kl_loss = F.kl_div(
+                log_index.clip(-100, 0),
+                attn_score.log().clip(-100, 0),
+                log_target=True,
+                reduction="sum",
+            )
+            ctx.loss_logger(kl_loss * ctx.loss_coeff)
+
+        # 2. Sparse MLA backward
+        dq, dk = sparse_mla_bwd_interface(
+            query,
+            key,
+            o,
+            do,
+            topk_indices.unsqueeze(-2),
+            lse,
+            offsets,
+            sm_scale=ctx.sm_scale,
+            d_v=ctx.v_channels,
+            use_unfused=ctx.use_unfused,
+        )
+
+        # 3. Indexer backward
+        dindex_q, dweights, dindex_k = indexer_bwd_interface(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            offsets,
+            use_unfused=ctx.use_unfused,
+        )
+
+        # Scale indexer gradients by loss_coeff
+        dindex_q *= ctx.loss_coeff
+        dweights *= ctx.loss_coeff
+        dindex_k *= ctx.loss_coeff
+
+        dq = _thd_to_sbhd(dq, ctx.sq, ctx.b)
+        dk = _thd_to_sbhd(dk, ctx.sq, ctx.b)
+        dindex_q = _thd_to_sbhd(dindex_q, ctx.sq, ctx.b)
+        dindex_k = _thd_to_sbhd(dindex_k, ctx.sq, ctx.b)
+        dweights = _thd_to_sbhd(dweights, ctx.sq, ctx.b)
+
+        return dq, dk, dindex_q, dindex_k, dweights, None, None, None, None, None, None, None, None
 
 
 class DSAttention(MegatronModule):
@@ -468,6 +632,7 @@ class DSAttention(MegatronModule):
 
         use_unfused = getattr(self.config, "attention_backend", None) == AttnBackend.unfused
         indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        indexer_sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
         cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
@@ -481,6 +646,10 @@ class DSAttention(MegatronModule):
                 loss=loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )
 
+        topk = min(self.indexer.index_topk, query.size(0))
+        if not indexer_sparse_loss:
+            topk = query.size(0)
+
         output = DSAFunction.apply(
             query,
             key,
@@ -488,7 +657,7 @@ class DSAttention(MegatronModule):
             k,
             weights,
             cu_seqlens,
-            self.indexer.index_topk,
+            topk,
             self.v_channels,
             self.softmax_scale,
             indexer_loss_coeff,
