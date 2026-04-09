@@ -18,7 +18,7 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import get_te_version, is_row_parallel_linear, is_te_min_version
 
 # Check if Transformer Engine is installed
 HAVE_TE = False
@@ -185,13 +185,7 @@ def is_column_parallel_linear(module):
     return False
 
 
-def is_row_parallel_linear(module):
-    """Returns whether the given module is a RowParallelLinear layer."""
-    if HAVE_TE and isinstance(module, TERowParallelLinear):
-        return True
-    elif isinstance(module, RowParallelLinear):
-        return True
-    return False
+# is_row_parallel_linear moved to megatron.core.utils; re-exported above.
 
 
 """

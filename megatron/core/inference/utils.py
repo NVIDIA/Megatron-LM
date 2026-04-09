@@ -140,22 +140,6 @@ def get_model_weight_bytes(model):
     return sum(seen_storages.values())
 
 
-def get_num_moe_layers(model):
-    """Count the number of MoE layers on this rank by inspecting the model.
-
-    Walks the module tree and counts ``MoELayer`` instances.
-
-    Args:
-        model: A PyTorch model (possibly wrapped).
-
-    Returns:
-        Number of MoE layers found in the model.
-    """
-    count = 0
-    for module in model.modules():
-        if isinstance(module, MoELayer):
-            count += 1
-    return count
 
 
 def measure_allreduce_bandwidth(group, device=None, iters=50):

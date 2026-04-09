@@ -48,7 +48,6 @@ from megatron.core.inference.utils import (
     Counter,
     await_process_call,
     get_model_weight_bytes,
-    get_num_moe_layers,
     measure_allreduce_bandwidth,
     measure_alltoall_bandwidth,
     measure_hbm_bandwidth,
@@ -57,6 +56,7 @@ from megatron.core.inference.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -67,6 +67,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    is_row_parallel_linear,
     trace_async_exceptions,
 )
 
@@ -275,19 +276,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Cache model-config fields needed for per-step communication volume.
         model_config = controller.inference_wrapped_model.model.config
+        unwrapped_model = controller.inference_wrapped_model.model
         tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
         ep_size = model_config.expert_model_parallel_size
-        pp_size = get_pg_size(self.pg_collection.pp) if self.pg_collection.pp else 1
 
         self._sol_hidden_size = model_config.hidden_size
         self._sol_dtype_bytes = model_config.params_dtype.itemsize
-        self._sol_tp_size = tp_size
-        self._sol_ep_size = ep_size
-        self._sol_num_moe_layers = get_num_moe_layers(
-            controller.inference_wrapped_model.model
+        # Count TP allreduces and MoE layers by inspecting the model directly.
+        self._sol_num_tp_allreduces = len(
+            [m for m in unwrapped_model.modules() if is_row_parallel_linear(m)]
         )
-        layers_per_stage = model_config.num_layers // max(pp_size, 1)
-        self._sol_num_dense_layers = layers_per_stage - self._sol_num_moe_layers
+        self._sol_num_moe_layers = len(
+            [m for m in unwrapped_model.modules() if isinstance(m, MoELayer)]
+        )
         self._sol_moe_topk = model_config.moe_router_topk if model_config.num_moe_experts else 0
 
         # Measure TP allreduce bandwidth.
@@ -312,17 +313,13 @@ class DynamicInferenceEngine(AbstractEngine):
             if self._measured_tp_allreduce_bw > 0:
                 sol_parts.append(
                     f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
-                    f"(tp={tp_size})"
+                    f"(tp={tp_size}, {self._sol_num_tp_allreduces} allreduces/step)"
                 )
             if self._measured_ep_alltoall_bw > 0:
                 sol_parts.append(
                     f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
-                    f"(ep={ep_size})"
+                    f"(ep={ep_size}, {self._sol_num_moe_layers} moe layers)"
                 )
-            sol_parts.append(
-                f"layers/stage={layers_per_stage} "
-                f"(dense={self._sol_num_dense_layers}, moe={self._sol_num_moe_layers})"
-            )
             logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 
     def reset(self) -> None:
@@ -1951,8 +1948,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Communication SOL: TP allreduce + EP all-to-all.
                 batch_tokens = context_state["active_token_count"]
                 msg_bytes = batch_tokens * self._sol_hidden_size * self._sol_dtype_bytes
-                # Dense layers: 2 allreduces (attn + MLP); MoE layers: 1 allreduce (attn only).
-                num_allreduces = 2 * self._sol_num_dense_layers + self._sol_num_moe_layers
+                # One allreduce per RowParallelLinear outside MoE layers.
+                num_allreduces = self._sol_num_tp_allreduces
                 sol_tp_comm_s = (
                     (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
                     if self._measured_tp_allreduce_bw > 0
@@ -2051,7 +2048,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Communication SOL: TP allreduce + EP all-to-all.
                 batch_tokens = context_state["active_token_count"]
                 msg_bytes = batch_tokens * self._sol_hidden_size * self._sol_dtype_bytes
-                num_allreduces = 2 * self._sol_num_dense_layers + self._sol_num_moe_layers
+                num_allreduces = self._sol_num_tp_allreduces
                 sol_tp_comm_s = (
                     (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
                     if self._measured_tp_allreduce_bw > 0
