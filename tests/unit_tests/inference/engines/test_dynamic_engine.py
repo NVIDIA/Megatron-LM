@@ -3234,8 +3234,8 @@ class TestDynamicInferenceEngine:
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         # Verify counters start at zero.
-        assert env.engine._spec_tokens_proposed == 0
-        assert env.engine._spec_tokens_accepted == 0
+        assert sum(env.engine._spec_tokens_proposed_per_pos) == 0
+        assert sum(env.engine._spec_tokens_accepted_per_pos) == 0
         assert env.engine._spec_steps == 0
 
         # Add first request and run through prefill + some decode steps.
@@ -3247,15 +3247,15 @@ class TestDynamicInferenceEngine:
 
         # Step 1: prefill for request 0 — should NOT count as a spec step.
         env.engine.step_modern()
-        proposed_after_prefill = env.engine._spec_tokens_proposed
-        accepted_after_prefill = env.engine._spec_tokens_accepted
+        proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
+        accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
 
         # Step 2: decode for request 0 — should count spec tokens.
         env.engine.step_modern()
-        assert env.engine._spec_tokens_proposed > proposed_after_prefill, (
-            "Decode step should have incremented _spec_tokens_proposed"
+        assert sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill, (
+            "Decode step should have incremented _spec_tokens_proposed_per_pos"
         )
-        assert env.engine._spec_tokens_accepted > accepted_after_prefill, (
+        assert sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill, (
             "With deterministic mock, decode step should have accepted spec tokens"
         )
 
@@ -3267,9 +3267,9 @@ class TestDynamicInferenceEngine:
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         )
 
-        proposed_before_mixed = env.engine._spec_tokens_proposed
+        proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
         env.engine.step_modern()
-        proposed_after_mixed = env.engine._spec_tokens_proposed
+        proposed_after_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
 
         # In the mixed step, only the decode request (req 0) should contribute to
         # proposed count, NOT the prefilling request (req 1). With 2 spec tokens and
@@ -3285,15 +3285,31 @@ class TestDynamicInferenceEngine:
             env.engine.step_modern()
 
         # Stats should be cumulative (non-zero after all requests finish).
-        assert env.engine._spec_tokens_proposed > 0
-        assert env.engine._spec_tokens_accepted > 0
+        total_proposed = sum(env.engine._spec_tokens_proposed_per_pos)
+        total_accepted = sum(env.engine._spec_tokens_accepted_per_pos)
+        assert total_proposed > 0
+        assert total_accepted > 0
         assert env.engine._spec_steps > 0
 
         # With deterministic mock (all tokens accepted), acceptance rate should be 100%.
-        acceptance_rate = env.engine._spec_tokens_accepted / env.engine._spec_tokens_proposed
+        acceptance_rate = total_accepted / total_proposed
         assert acceptance_rate == 1.0, (
             f"Expected 100% acceptance with deterministic mock, got {acceptance_rate * 100:.1f}%"
         )
+
+        # With deterministic mock, every position should have 100% acceptance.
+        for pos in range(test_config.num_speculative_tokens):
+            assert env.engine._spec_tokens_proposed_per_pos[pos] > 0, (
+                f"Position {pos} should have proposals"
+            )
+            pos_rate = (
+                env.engine._spec_tokens_accepted_per_pos[pos]
+                / env.engine._spec_tokens_proposed_per_pos[pos]
+            )
+            assert pos_rate == 1.0, (
+                f"Expected 100% acceptance at position {pos} with deterministic mock, "
+                f"got {pos_rate * 100:.1f}%"
+            )
 
 
     @pytest.mark.internal
